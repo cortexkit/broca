@@ -693,7 +693,7 @@ struct BindCompletion {
     identity: BrocaBindIdentity,
     bind: BindObservation,
     cancel: CancellationToken,
-    refusal: Option<broca_core::AdoptionRefusal>,
+    refusal: Result<Option<broca_core::AdoptionRefusal>, ServeError>,
 }
 
 impl SubscriptionSlot {
@@ -1459,7 +1459,7 @@ async fn handle_control_request(
                 identity,
                 bind,
                 cancel,
-                refusal: None,
+                refusal: Ok(None),
             };
             // Keep the bind unacknowledged until its history authorizes the stamp. The read
             // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
@@ -1784,7 +1784,23 @@ async fn finish_bind(
         return Ok(());
     }
     routes.pending_binds.remove(&completed.channel);
-    if let Some(refusal) = completed.refusal {
+    let refusal = match completed.refusal {
+        Ok(refusal) => refusal,
+        // The adoption check could not read the session's history. Refuse the bind as a
+        // transient failure rather than acknowledge a scope the history might forbid.
+        Err(error) => {
+            return send_serve_error(
+                writer,
+                completed.header.ver,
+                0,
+                0,
+                completed.header.corr,
+                &error,
+            )
+            .await;
+        }
+    };
+    if let Some(refusal) = refusal {
         let body = serde_json::to_vec(&adoption_refused(&refusal))
             .map_err(|e| ServeIoError(e.to_string()))?;
         return send_error_bytes(
@@ -5422,7 +5438,10 @@ mod tests {
 
     struct HeldBindRead {
         entered: tokio::sync::Notify,
-        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        /// Holds the first history read until the test releases it. A bind may read again
+        /// after that (a store without range proofs is then decoded whole), and those later
+        /// reads return at once.
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
         finished: tokio::sync::Notify,
         records: Vec<broca_wal::FramedRecord>,
     }
@@ -5438,9 +5457,12 @@ mod tests {
             &self,
             _: &BrocaBindIdentity,
         ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
-            self.entered.notify_one();
-            self.release.lock().unwrap().recv().unwrap();
-            self.finished.notify_one();
+            let gate = self.release.lock().unwrap().take();
+            if let Some(gate) = gate {
+                self.entered.notify_one();
+                gate.recv().unwrap();
+                self.finished.notify_one();
+            }
             Ok(self.records.clone())
         }
     }
@@ -5623,7 +5645,7 @@ mod tests {
         let (release, read_gate) = std::sync::mpsc::channel();
         let store = Arc::new(HeldBindRead {
             entered: tokio::sync::Notify::new(),
-            release: std::sync::Mutex::new(read_gate),
+            release: std::sync::Mutex::new(Some(read_gate)),
             finished: tokio::sync::Notify::new(),
             records,
         });
@@ -5775,6 +5797,50 @@ mod tests {
         ingress.goodbye(2).await;
         assert_eq!(ingress.routes.by_channel[&7].0, 1);
         ingress.assert_delivery(&sink, 1, 10).await;
+    }
+
+    /// A WAL store whose every record read fails, so no ownership source can answer.
+    struct UnreadableBindHistory;
+
+    impl broca_core::WalStore for UnreadableBindHistory {
+        fn open(
+            &self,
+            _: &BrocaBindIdentity,
+        ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+            panic!("bind ownership must not open an actor")
+        }
+        fn read_records(
+            &self,
+            _: &BrocaBindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            Err(broca_wal::WalError::Io(std::io::Error::other(
+                "injected unreadable history",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn stamped_bind_with_unreadable_history_is_refused_not_published() {
+        let registry = Arc::new(LineageRegistry::new_with_reader(
+            Arc::new(RefusingOpener),
+            Arc::new(UnreadableBindHistory),
+            None,
+        ));
+        let mut ingress = BindIngress::new(registry);
+        ingress.bind(1, "unreadable", true).await;
+        ingress.complete_bind().await;
+        let refused = next_written(&mut ingress.written).await;
+        assert_eq!(
+            (refused.header.ty, refused.header.corr),
+            (FrameType::Error, 1)
+        );
+        let body = serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap();
+        assert_eq!(body["code"], "open_failed", "{body}");
+        assert_eq!(body["detail"]["class"], "transient", "{body}");
+        assert!(
+            !ingress.routes.by_channel.contains_key(&7),
+            "a bind whose adoption check could not run must not be published"
+        );
     }
 
     #[tokio::test]
@@ -5975,7 +6041,7 @@ mod tests {
         let release = ReleaseBindRead(Some(release));
         let store = Arc::new(HeldBindRead {
             entered: tokio::sync::Notify::new(),
-            release: std::sync::Mutex::new(read_gate),
+            release: std::sync::Mutex::new(Some(read_gate)),
             finished: tokio::sync::Notify::new(),
             records: vec![],
         });
@@ -6097,7 +6163,7 @@ mod tests {
                     scope: broca_protocol::SendScope::Unstamped,
                 },
                 cancel,
-                refusal: None,
+                refusal: Ok(None),
             },
             &writer,
             &mut routes,

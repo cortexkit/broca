@@ -658,12 +658,16 @@ async fn bind_unknown_history_is_not_reported_as_unowned() {
     let fixture = Fixture::new();
     fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
     let projected = snapshot(&fixture);
+    let whole_log = projected.checkpoint.as_ref().unwrap().ownership.clone();
     let (registry, wal, _) = registry(&fixture, Ok(Some(projected)));
     wal.fault.store(2, Ordering::Relaxed);
-    assert!(registry
-        .session_ownership_for_bind(&fixture.session)
-        .await
-        .is_none());
+    // Every range read is unproven here, but the store's plain record read still works: the
+    // bind answer is the whole log's, not an unowned session and not unknown.
+    assert_eq!(
+        registry.session_ownership_for_bind(&fixture.session).await,
+        whole_log
+    );
+    assert!(wal.requests.lock().unwrap().contains(&(0, None)));
 
     let (registry, _, _) = self::registry(&fixture, Err("store unavailable".into()));
     let path = fixture.wal.wal_path(&fixture.session);
@@ -699,6 +703,11 @@ impl WalStore for CountingWal {
     fn read_records(&self, session: &LineageKey) -> Result<Vec<FramedRecord>, broca_wal::WalError> {
         self.reads.lock().unwrap().push(0);
         self.requests.lock().unwrap().push((0, None));
+        if self.fault.load(Ordering::Relaxed) == 10 {
+            return Err(broca_wal::WalError::Io(std::io::Error::other(
+                "injected whole-log read failure",
+            )));
+        }
         let records = self.inner.read_records(session)?;
         self.decoded_seqs
             .lock()
@@ -735,7 +744,7 @@ impl WalStore for CountingWal {
                 )))
             };
         }
-        if self.fault.load(Ordering::Relaxed) == 2 {
+        if matches!(self.fault.load(Ordering::Relaxed), 2 | 10) {
             return Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()));
         }
         if self.fault.load(Ordering::Relaxed) == 5 && through.is_some() {
@@ -1736,28 +1745,41 @@ async fn ownership_suffix_read_failure_never_tries_another_snapshot() {
             let fixture = Fixture::new();
             fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
             let projected = snapshot(&fixture);
+            let whole_log = projected.checkpoint.as_ref().unwrap().ownership.clone();
             let (registry, wal, store) = registry(&fixture, Ok(None));
             registry.owner_ownership(&fixture.session).await.unwrap();
             *store.snapshot.lock().unwrap() = Ok(Some(projected));
             store.reads.store(0, Ordering::Relaxed);
             wal.requests.lock().unwrap().clear();
             wal.fault.store(fault, Ordering::Relaxed);
-            if bind {
-                assert!(
-                    registry
-                        .session_ownership_for_bind(&fixture.session)
-                        .await
-                        .is_none(),
-                    "a failed suffix cannot fall through to a different snapshot: fault {fault}"
+            let ownership = if bind {
+                registry.session_ownership_for_bind(&fixture.session).await
+            } else {
+                registry.owner_ownership(&fixture.session).await.ok()
+            };
+            assert_eq!(
+                store.reads.load(Ordering::Relaxed),
+                0,
+                "a failed suffix cannot fall through to a different snapshot: fault {fault}"
+            );
+            let requests = wal.requests.lock().unwrap().clone();
+            if bind && fault == 8 {
+                // A suffix whose coverage cannot be proven is not a failed read. Bind decodes
+                // the whole live log with the store's plain read (the `(0, None)` request),
+                // never the stored projection.
+                assert_eq!(
+                    ownership, whole_log,
+                    "an unproven suffix falls back to the whole log, not a different snapshot"
                 );
+                assert_eq!(requests.len(), 2, "{requests:?}");
+                assert_eq!(requests[1], (0, None), "{requests:?}");
             } else {
                 assert!(
-                    registry.owner_ownership(&fixture.session).await.is_err(),
+                    ownership.is_none(),
                     "a failed suffix cannot fall through to a different snapshot: fault {fault}"
                 );
+                assert_eq!(requests.len(), 1, "{requests:?}");
             }
-            assert_eq!(store.reads.load(Ordering::Relaxed), 0);
-            assert_eq!(wal.requests.lock().unwrap().len(), 1);
         }
     }
 }
@@ -1769,16 +1791,75 @@ async fn ownership_first_episode_read_failure_never_tries_another_snapshot() {
         let fixture = Fixture::new();
         fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
         let projected = snapshot(&fixture);
+        let whole_log = projected.checkpoint.as_ref().unwrap().ownership.clone();
         let (registry, wal, store) = registry(&fixture, Ok(None));
         registry.owner_ownership(&fixture.session).await.unwrap();
         *store.snapshot.lock().unwrap() = Ok(Some(projected));
         store.reads.store(0, Ordering::Relaxed);
         wal.requests.lock().unwrap().clear();
         wal.fault.store(fault, Ordering::Relaxed);
-        assert!(registry.session_ownership_for_bind(&fixture.session).await.is_none(),
+        let ownership = registry.session_ownership_for_bind(&fixture.session).await;
+        assert_eq!(store.reads.load(Ordering::Relaxed), 0,
             "a failed first-episode read cannot fall through to a different snapshot: fault {fault}");
-        assert_eq!(store.reads.load(Ordering::Relaxed), 0);
-        assert_eq!(wal.requests.lock().unwrap().len(), 2);
+        let requests = wal.requests.lock().unwrap().clone();
+        if fault == 9 {
+            // An unproven first-episode frame is not a failed read: bind decodes the whole
+            // live log (the trailing `(0, None)` request), never the stored projection.
+            assert_eq!(
+                ownership, whole_log,
+                "an unproven first episode falls back to the whole log, not a different snapshot"
+            );
+            assert_eq!(requests.len(), 3, "{requests:?}");
+            assert_eq!(requests[2], (0, None), "{requests:?}");
+        } else {
+            assert!(ownership.is_none(),
+                "a failed first-episode read cannot fall through to a different snapshot: fault {fault}");
+            assert_eq!(requests.len(), 2, "{requests:?}");
+        }
+    }
+}
+
+/// A stamped bind into a session recorded without a principal must be refused, whichever
+/// source answers. When no source can read the history, the bind is refused as a transient
+/// failure: "unknown" must never read as "nothing refuses the stamp".
+#[tokio::test]
+async fn bind_adoption_refuses_when_ownership_is_unknown() {
+    let stamp = broca_protocol::BindScope {
+        scope: SessionScope {
+            flow_id: None,
+            sender: None,
+            ..scope("core")
+        },
+        owner_authorized: true,
+    };
+    // 0: every read proven; 8: the suffix is unproven, so the whole log is decoded;
+    // 6: the suffix read fails; 10: every range is unproven and the whole-log read fails.
+    for fault in [0, 8, 6, 10] {
+        let fixture = Fixture::new();
+        fixture.append(&[started(&fixture.session, None, None), finished()]);
+        let (registry, wal, _) = registry(&fixture, Ok(None));
+        registry.owner_ownership(&fixture.session).await.unwrap();
+        wal.fault.store(fault, Ordering::Relaxed);
+        let decided = registry
+            .bind_adoption_refusal(&fixture.session, Some(&reserved("core")), &stamp)
+            .await;
+        match fault {
+            0 | 8 => assert_eq!(
+                decided.unwrap(),
+                Some(broca_core::AdoptionRefusal::NoRecordedPrincipal),
+                "fault {fault}"
+            ),
+            _ => assert!(
+                matches!(
+                    decided,
+                    Err(crate::serve::ServeError::Open(
+                        _,
+                        Some(broca_protocol::ErrorClass::Transient)
+                    ))
+                ),
+                "unreadable ownership must refuse the bind, not accept it: fault {fault}: {decided:?}"
+            ),
+        }
     }
 }
 

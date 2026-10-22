@@ -1630,17 +1630,19 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
-    /// The adoption check a stamped `route.bind` gets before it is acknowledged: `Some` when
+    /// The adoption check a stamped `route.bind` gets before it is acknowledged: `Ok(Some)` when
     /// the bound session was recorded without a scope and its history refuses the stamp. Only
     /// adoption is decided here; every other scope rule is decided on each send, since an
-    /// episode can be written between the bind and the send. The default knows no history.
+    /// episode can be written between the bind and the send. `Err` when the history cannot be
+    /// read, so whether it refuses the stamp is unknown: the bind is refused rather than
+    /// accepted. The default implementation has no history source and returns no refusal.
     async fn bind_adoption_refusal(
         &self,
         _session: &LineageKey,
         _principal: Option<&broca_protocol::BindPrincipal>,
         _scope: &broca_protocol::BindScope,
-    ) -> Option<broca_core::AdoptionRefusal> {
-        None
+    ) -> Result<Option<broca_core::AdoptionRefusal>, ServeError> {
+        Ok(None)
     }
 
     /// `session.import` — durably seed an empty lineage without provider execution.
@@ -2516,15 +2518,26 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::BindScope,
-    ) -> Option<broca_core::AdoptionRefusal> {
-        let ownership = self.session_ownership_for_bind(session).await?;
+    ) -> Result<Option<broca_core::AdoptionRefusal>, ServeError> {
+        let ownership = match self.bind_ownership(session).await {
+            crate::registry::BindOwnership::Known(ownership) => ownership,
+            crate::registry::BindOwnership::NoHistorySource => return Ok(None),
+            // Unknown history must not read as "nothing refuses the stamp": that would let a
+            // bind adopt a scope its history forbids whenever the history could not be read.
+            crate::registry::BindOwnership::Unreadable(reason) => {
+                return Err(ServeError::Open(
+                    format!("route.bind adoption check: session history unreadable: {reason}"),
+                    Some(broca_protocol::ErrorClass::Transient),
+                ));
+            }
+        };
         match broca_core::decide_scope(
             &ownership,
             principal,
             &broca_protocol::SendScope::Stamped(scope.clone()),
         ) {
-            Err(broca_core::ScopeRefusal::AdoptionRefused(refusal)) => Some(refusal),
-            _ => None,
+            Err(broca_core::ScopeRefusal::AdoptionRefused(refusal)) => Ok(Some(refusal)),
+            _ => Ok(None),
         }
     }
 
