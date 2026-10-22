@@ -2266,10 +2266,15 @@ async fn automatic_keep_warm_shares_the_real_manual_warm_flight() {
     release.notify_one();
     manual.await.unwrap().unwrap();
     fixture.wait_warms(2).await;
-    assert_eq!(
-        fixture.warm_requests(),
-        2,
-        "a skipped automatic tick reschedules after the manual warm"
+    // At least one automatic warm must follow the manual one. Not an exact count: with
+    // `hold_automatic` set the fixture runs the driver on a 200 ms cadence, so once the
+    // rescheduled tick succeeds the next one is due 200 ms later, and the server counts its
+    // body before broca records it. A loaded runner showed 3 here. Nothing was sent while the
+    // manual warm was in flight; the exact count of 1 above pins that.
+    let sent = fixture.warm_requests();
+    assert!(
+        sent >= 2,
+        "a skipped automatic tick reschedules after the manual warm: {sent} warm requests"
     );
     fixture.finish_held().await;
 }
