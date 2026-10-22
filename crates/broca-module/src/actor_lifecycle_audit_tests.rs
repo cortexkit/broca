@@ -119,8 +119,8 @@ impl broca_wal::Wal for FailableWal {
     }
 }
 
-/// Completes runs immediately, or holds every run before its admission until released and then
-/// refuses it, the way a frozen dependency route that never comes up does.
+/// Completes runs immediately, or holds every run before its admission until the test releases
+/// it and then refuses that admission, like a tool route the run depends on never coming up.
 struct ProbeExecutor {
     hold_admission: bool,
     release: tokio::sync::Notify,
