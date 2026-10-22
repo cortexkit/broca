@@ -1798,8 +1798,8 @@ async fn catch_panic<F: std::future::Future>(task: F) -> Result<F::Output, ()> {
     .await
 }
 
-/// The message of the refusal that answers a request whose task panicked. Fixed text: a panic
-/// payload can carry arbitrary internal state, so it never reaches the caller.
+/// The fixed refusal message used when a route request task or a bind's adoption check panics.
+/// A panic payload can carry arbitrary internal state, so it is never reported.
 const REQUEST_PANICKED_MESSAGE: &str = "the request failed inside broca before it was answered";
 
 /// Run one route request's task, answering its correlation with a transient refusal if the
@@ -7168,7 +7168,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // The refusal and the PONG race on egress; take what arrives, in correlation order.
+        // The refusal and the PONG may arrive in either order: collect both and tell them
+        // apart by correlation.
         let mut frames = Vec::new();
         while frames.len() < 2 {
             match tokio::time::timeout(std::time::Duration::from_secs(5), written.recv()).await {

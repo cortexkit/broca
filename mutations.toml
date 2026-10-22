@@ -2653,8 +2653,8 @@ target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
 expect_red = ["plan_admission::plan_model_different_id_refuses_before_fetch_or_write", "plan_admission::plan_model_later_send_mismatch_refuses_before_fetch_or_write"]
 file = "crates/broca-module-serve/src/serve.rs"
-old = "    broca_fetch_plan::admit::check_plan_model(\n        &parsed,\n        &model.provider,\n        &model.model,\n        model.variant.as_deref(),\n    )?;"
-new = "    let _ = model; // NON-VACUITY BREAK: production model check removed"
+old = "            broca_fetch_plan::admit::check_plan_model(\n                &parsed,\n                &model.provider,\n                &model.model,\n                model.variant.as_deref(),\n            )?;\n            None"
+new = "            let _ = model; // NON-VACUITY BREAK: production model check removed\n            None"
 
 # These three daemon-backed controls require ck-subc, fake-aft-stub and ck fixture binaries.
 # Cargo's integration-test build also refreshes the edited ck-broca binary.
