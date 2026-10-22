@@ -19995,7 +19995,8 @@ select = "expected"
 test_file = "crates/broca-store/src/session_refs/tests.rs"
 expect_red = ["session_refs::tests::census_quarantines_damage_and_commits_healthy_coverage_across_restarts"]
 file = "crates/broca-store/src/session_refs/census.rs"
-old = '''                            tx.execute("INSERT INTO agent_data_census_unreadable(address,reason) VALUES(?1,?2)
+old = '''                            tx.execute("INSERT INTO agent_data_census_unreadable(address,reason)
+                                SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM agent_data_census WHERE address=?1 AND covered=0)
                                 ON CONFLICT(address) DO UPDATE SET reason=excluded.reason", rusqlite::params![address, reason])?;'''
 new = "                            let _ = (address, reason); // NON-VACUITY BREAK: forget the unreadable address on restart."
 
@@ -20009,8 +20010,8 @@ select = "expected"
 test_file = "crates/broca-store/src/session_refs/tests.rs"
 expect_red = ["session_refs::tests::census_quarantines_damage_and_commits_healthy_coverage_across_restarts"]
 file = "crates/broca-store/src/session_refs/census.rs"
-old = "    if !pending && counts.unreadable == 0 {"
-new = "    if true || (!pending && counts.unreadable == 0) { // NON-VACUITY BREAK: attest incomplete history."
+old = "            counts.complete = !pending && counts.unreadable == 0;"
+new = "            counts.complete = true || (!pending && counts.unreadable == 0); // NON-VACUITY BREAK: attest incomplete history."
 
 [[control]]
 id = "wal-range-no-unused-feature-api"
@@ -20053,3 +20054,85 @@ expect_red = ["file_wal::tests::preencoded_append_uses_encoder_bytes_for_precise
 file = "crates/broca-wal/src/framing.rs"
 old = "    if bytes != expected.as_slice() {"
 new = "    if !matches!(decode_next(bytes), DecodeStep::Record { framed, consumed } if consumed == bytes.len() && framed.seq == seq && framed.fence == fence && &framed.record == record) { // NON-VACUITY BREAK: trust decoded equality instead of encoder bytes."
+
+[[control]]
+id = "store-census-late-error-respects-coverage"
+guards = "A failed read from an overlapping census cannot quarantine an address another pass has already covered"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::overlapping_census_late_unreadable_cannot_undo_committed_coverage"]
+file = "crates/broca-store/src/session_refs/census.rs"
+old = "                                SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM agent_data_census WHERE address=?1 AND covered=0)"
+new = "                                VALUES(?1,?2) /* NON-VACUITY BREAK: persist an older error after coverage committed */"
+
+[[control]]
+id = "store-census-counts-only-uncovered-errors"
+guards = "Obsolete unreadable observations for covered addresses do not prevent census completion"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::overlapping_census_late_unreadable_cannot_undo_committed_coverage"]
+file = "crates/broca-store/src/session_refs/census.rs"
+old = "         JOIN agent_data_census c ON c.address=u.address WHERE c.covered=0"
+new = "         JOIN agent_data_census c ON c.address=u.address WHERE 1=1 /* NON-VACUITY BREAK: count errors for already covered history */"
+
+[[control]]
+id = "store-census-unobserved-is-not-covered"
+guards = "An address missing from this pass's inventory stays explicitly unverified until a WAL source is read"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::census_unobserved_inventory_address_remains_uncovered_until_verified"]
+file = "crates/broca-store/src/session_refs/census.rs"
+old = '''                actions.push(Action::Unreadable(
+                    address,
+                    "inventory_unobserved: this pass did not establish a current WAL source".into(),
+                ));'''
+new = "                actions.push(Action::Covered(address)); // NON-VACUITY BREAK: invent verified coverage from an inventory miss."
+
+[[control]]
+id = "store-census-done-marker-needs-covered-addresses"
+guards = "A stale done marker cannot skip uncovered census work introduced by an overlapping pass"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::census_unobserved_inventory_address_remains_uncovered_until_verified"]
+file = "crates/broca-store/src/session_refs/census.rs"
+old = '''        "SELECT EXISTS(SELECT 1 FROM agent_data_census_done)
+         AND NOT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)",'''
+new = '''        "SELECT EXISTS(SELECT 1 FROM agent_data_census_done)", // NON-VACUITY BREAK: trust a stale completion marker.'''
+
+[[control]]
+id = "store-session-refs-uncovered-never-absent"
+guards = "Session-ref lookup does not turn an uncovered address into authoritative absence under a stale census marker"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::census_unobserved_inventory_address_remains_uncovered_until_verified"]
+file = "crates/broca-store/src/session_refs.rs"
+old = "             AND NOT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)"
+new = "             AND 1=1 /* NON-VACUITY BREAK: let a stale marker attest an uncovered address */"
+
+[[control]]
+id = "store-census-overlap-completion-idempotent"
+guards = "Overlapping completed census passes can publish the same completion marker without a uniqueness failure"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/session_refs/tests.rs"
+expect_red = ["session_refs::tests::overlapping_census_late_unreadable_cannot_undo_committed_coverage"]
+file = "crates/broca-store/src/session_refs/census.rs"
+old = "INSERT OR IGNORE INTO agent_data_census_done VALUES(1)"
+new = "INSERT INTO agent_data_census_done VALUES(1) /* NON-VACUITY BREAK: reject an overlapping completion */"

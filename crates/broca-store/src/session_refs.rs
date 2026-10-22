@@ -129,7 +129,9 @@ impl SqliteStore {
             "SELECT EXISTS(SELECT 1 FROM agent_data_projection WHERE id=1 AND backfilled=1)
              AND EXISTS(SELECT 1 FROM agent_data_census_done WHERE id=1)
              AND NOT EXISTS(SELECT 1 FROM agent_data_pending_session)
-             AND NOT EXISTS(SELECT 1 FROM agent_data_census_unreadable)",
+             AND NOT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)
+             AND NOT EXISTS(SELECT 1 FROM agent_data_census_unreadable u
+                 JOIN agent_data_census c ON c.address=u.address WHERE c.covered=0)",
             [],
             |row| row.get(0),
         )?;

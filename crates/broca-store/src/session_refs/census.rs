@@ -24,6 +24,23 @@ enum Action {
     Unreadable(String, String),
 }
 
+#[cfg(test)]
+type AfterReadHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_READ_HOOK: std::cell::RefCell<Option<AfterReadHook>> = const { std::cell::RefCell::new(None) };
+}
+
+fn pending_unreadable_count(conn: &Connection) -> Result<u64, StoreError> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM agent_data_census_unreadable u
+         JOIN agent_data_census c ON c.address=u.address WHERE c.covered=0",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 fn pace_duration(elapsed: std::time::Duration, enabled: bool) {
     if enabled {
         std::thread::sleep(elapsed.saturating_mul(3));
@@ -40,7 +57,8 @@ pub(super) fn run(
     let start = Instant::now();
     let mut counts = CensusCounts::default();
     let done: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agent_data_census_done)",
+        "SELECT EXISTS(SELECT 1 FROM agent_data_census_done)
+         AND NOT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)",
         [],
         |row| row.get(0),
     )?;
@@ -116,7 +134,15 @@ pub(super) fn run(
             if !attempted.insert(address.clone()) {
                 continue;
             }
-            if addresses.contains(&address) {
+            if !addresses.contains(&address) {
+                actions.push(Action::Unreadable(
+                    address,
+                    "inventory_unobserved: this pass did not establish a current WAL source".into(),
+                ));
+                processed += 1;
+                continue;
+            }
+            {
                 let represented: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM agent_data_session_ref WHERE address=?1)
                     AND NOT EXISTS(SELECT 1 FROM agent_data_census_inflight WHERE address=?1)",
@@ -165,6 +191,10 @@ pub(super) fn run(
             processed += 1;
             std::thread::yield_now();
         }
+        #[cfg(test)]
+        if let Some(hook) = AFTER_READ_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
         let read_work = work.elapsed();
         let mut written = 0;
         while written < actions.len() {
@@ -199,7 +229,12 @@ pub(super) fn run(
                             )?;
                         }
                         Action::Unreadable(address, reason) => {
-                            tx.execute("INSERT INTO agent_data_census_unreadable(address,reason) VALUES(?1,?2)
+                            // Another pass may have verified this address after our failed read.
+                            // Its committed coverage wins over the older error observation.
+                            tx.execute("DELETE FROM agent_data_census_unreadable WHERE address=?1
+                                AND NOT EXISTS(SELECT 1 FROM agent_data_census WHERE address=?1 AND covered=0)", [address])?;
+                            tx.execute("INSERT INTO agent_data_census_unreadable(address,reason)
+                                SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM agent_data_census WHERE address=?1 AND covered=0)
                                 ON CONFLICT(address) DO UPDATE SET reason=excluded.reason", rusqlite::params![address, reason])?;
                         }
                     }
@@ -210,39 +245,35 @@ pub(super) fn run(
         }
         pace_duration(read_work, paced);
         if limit.is_some_and(|limit| processed >= limit) {
-            counts.unreadable = conn.query_row(
-                "SELECT count(*) FROM agent_data_census_unreadable",
-                [],
-                |row| row.get(0),
-            )?;
+            counts.unreadable = pending_unreadable_count(conn)?;
             counts.elapsed_ms = start.elapsed().as_millis();
             return Ok(counts);
         }
     }
-    counts.unreadable = conn.query_row(
-        "SELECT count(*) FROM agent_data_census_unreadable",
-        [],
-        |row| row.get(0),
+    // Publish the marker from the same writer snapshot as the pending/error
+    // counts, so another pass cannot certify newly queued, uncovered work.
+    write_batch(
+        conn,
+        &[()],
+        &mut counts.writes,
+        paced,
+        |tx, _| {
+            counts.unreadable = pending_unreadable_count(tx)?;
+            let pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)",
+                [],
+                |row| row.get(0),
+            )?;
+            counts.complete = !pending && counts.unreadable == 0;
+            if counts.complete {
+                tx.execute("INSERT OR IGNORE INTO agent_data_census_done VALUES(1)", [])?;
+            } else {
+                tx.execute("DELETE FROM agent_data_census_done", [])?;
+            }
+            Ok(())
+        },
+        |_, _| Ok(()),
     )?;
-    let pending: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)",
-        [],
-        |row| row.get(0),
-    )?;
-    if !pending && counts.unreadable == 0 {
-        write_batch(
-            conn,
-            &[()],
-            &mut counts.writes,
-            paced,
-            |tx, _| {
-                tx.execute("INSERT INTO agent_data_census_done VALUES(1)", [])?;
-                Ok(())
-            },
-            |_, _| Ok(()),
-        )?;
-        counts.complete = true;
-    }
     counts.elapsed_ms = start.elapsed().as_millis();
     tracing::info!(
         addresses = counts.addresses,

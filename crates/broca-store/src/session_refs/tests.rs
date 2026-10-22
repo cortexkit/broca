@@ -245,6 +245,161 @@ fn locked_projection_keeps_admission_and_repair_recovers_session() {
 }
 
 #[test]
+fn overlapping_census_late_unreadable_cannot_undo_committed_coverage() {
+    let root = broca_test_support::scratch_root().join("census-overlap-late-unreadable");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("run-index.db");
+    let store = SqliteStore::open(&db).unwrap();
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    let session = BindIdentity::new("/census/project", "broca", "overlap");
+    wal.open(&session)
+        .unwrap()
+        .append(1, &started(&session, false), true)
+        .unwrap();
+    let address = session_addr(&session);
+    let path = wal.wal_path(&session);
+    let original = std::fs::read(&path).unwrap();
+    let mut damaged = original.clone();
+    damaged[21] ^= 1;
+    std::fs::write(&path, damaged).unwrap();
+    backfill(&store.conn.lock().unwrap()).unwrap();
+
+    let root_b = root.clone();
+    let db_b = db.clone();
+    let b_completed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let b_observed = b_completed.clone();
+    census::AFTER_READ_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // Pass A has read damaged bytes but has not committed its error. Pass B
+            // verifies repaired bytes and commits Covered before A resumes its write.
+            std::fs::write(path, original).unwrap();
+            let mut conn_b = rusqlite::Connection::open(db_b).unwrap();
+            crate::busy::configure_writer_connection(&conn_b).unwrap();
+            let covered =
+                census::run(&mut conn_b, &ReadOnlyWalReader::new(&root_b), None, false).unwrap();
+            assert!(covered.complete);
+            b_observed.set(true);
+        }))
+    });
+    let mut conn_a = rusqlite::Connection::open(&db).unwrap();
+    crate::busy::configure_writer_connection(&conn_a).unwrap();
+    let late = census::run(&mut conn_a, &ReadOnlyWalReader::new(&root), None, false).unwrap();
+    assert!(b_completed.get());
+    assert!(late.complete);
+    assert_eq!(late.unreadable, 0);
+    let unreadable: u64 = conn_a
+        .query_row(
+            "SELECT count(*) FROM agent_data_census_unreadable",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        unreadable, 0,
+        "a stale failed read must not quarantine an address another pass covered"
+    );
+
+    // Obsolete observations left for already covered addresses do not count as
+    // pending damage or make a complete projection permanently unverifiable.
+    conn_a
+        .execute(
+            "INSERT INTO agent_data_census_unreadable VALUES(?1,'obsolete error')",
+            [&address],
+        )
+        .unwrap();
+    conn_a
+        .execute("DELETE FROM agent_data_census_done", [])
+        .unwrap();
+    let resumed = census::run(&mut conn_a, &ReadOnlyWalReader::new(&root), None, false).unwrap();
+    assert!(resumed.complete);
+    assert_eq!(resumed.unreadable, 0);
+    let reference = agent_session_ref(&session);
+    let refs = store
+        .session_refs([reference.as_str()].into_iter())
+        .unwrap();
+    assert!(refs.complete);
+    assert_eq!(refs.sessions[&reference].1, session);
+}
+
+#[test]
+fn census_unobserved_inventory_address_remains_uncovered_until_verified() {
+    let root = broca_test_support::scratch_root().join("census-unobserved-address");
+    std::fs::create_dir_all(root.join("wal")).unwrap();
+    let store = SqliteStore::open(root.join("run-index.db")).unwrap();
+    let session = BindIdentity::new("/census/project", "broca", "unobserved");
+    let address = session_addr(&session);
+    let reference = agent_session_ref(&session);
+    backfill(&store.conn.lock().unwrap()).unwrap();
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_data_census(address) VALUES(?1)",
+            [&address],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO agent_data_census_done VALUES(1)", [])
+            .unwrap();
+    }
+    assert!(
+        !store
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap()
+            .complete,
+        "a stale done marker cannot attest a still-uncovered address"
+    );
+    let missing = census::run(
+        &mut store.conn.lock().unwrap(),
+        &ReadOnlyWalReader::new(&root),
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(!missing.complete);
+    assert_eq!(missing.unreadable, 1);
+    {
+        let conn = store.conn.lock().unwrap();
+        let covered: bool = conn
+            .query_row(
+                "SELECT covered FROM agent_data_census WHERE address=?1",
+                [&address],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !covered,
+            "not observed in an inventory is not proof of verified coverage"
+        );
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM agent_data_census_unreadable WHERE address=?1",
+                [&address],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(reason.starts_with("inventory_unobserved:"));
+    }
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    wal.open(&session)
+        .unwrap()
+        .append(1, &started(&session, false), true)
+        .unwrap();
+    let verified = census::run(
+        &mut store.conn.lock().unwrap(),
+        &ReadOnlyWalReader::new(&root),
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(verified.complete);
+    assert_eq!(verified.unreadable, 0);
+    let refs = store
+        .session_refs([reference.as_str()].into_iter())
+        .unwrap();
+    assert!(refs.complete);
+    assert_eq!(refs.sessions[&reference].1, session);
+}
+
+#[test]
 fn census_quarantines_damage_and_commits_healthy_coverage_across_restarts() {
     let root = broca_test_support::scratch_root().join("census-quarantine-restart");
     std::fs::create_dir_all(&root).unwrap();
