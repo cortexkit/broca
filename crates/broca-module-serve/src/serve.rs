@@ -3397,6 +3397,14 @@ async fn send_serve_error(
                 .with_detail(serde_json::json!({"field": "delivery"}));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
+        ServeError::TemplatePartGone { slot } => {
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::TEMPLATE_PART_GONE,
+                err.to_string(),
+            )
+            .with_detail(serde_json::json!({ "slot": slot }));
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::SendIdReuse { .. } => "send_id_reuse",
         ServeError::Transient(_) => "transient",
         ServeError::BaselineRequired => "baseline_required",

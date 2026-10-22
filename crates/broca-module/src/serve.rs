@@ -1383,6 +1383,11 @@ pub enum ServeError {
         code: &'static str,
         message: String,
     },
+    /// A template send whose `part_tag` slot names a part the transcript does not show, refused
+    /// `template_part_gone` with the slot named in its detail.
+    TemplatePartGone {
+        slot: String,
+    },
     /// A deterministic send identity was reused with a different frozen request field.
     SendIdReuse {
         differing: String,
@@ -1501,6 +1506,10 @@ impl std::fmt::Display for ServeError {
                 outcome,
             } => write!(f, "submission '{submission_id}' ended {outcome}"),
             ServeError::DeliveryRefused { message, .. } => f.write_str(message),
+            ServeError::TemplatePartGone { slot } => write!(
+                f,
+                "the template's {slot} slot names a part the transcript does not show"
+            ),
             ServeError::SendIdReuse { differing } => write!(
                 f,
                 "send_id was already used with different {differing}; retries must be byte-identical"
@@ -2294,6 +2303,7 @@ impl ServeHandler for crate::LineageRegistry {
             SendOutcome::DeliveryRefused { code, message, .. } => {
                 Err(ServeError::DeliveryRefused { code, message })
             }
+            SendOutcome::TemplatePartGone { slot } => Err(ServeError::TemplatePartGone { slot }),
             SendOutcome::SendIdReuse { differing } => Err(ServeError::SendIdReuse {
                 differing: differing.to_owned(),
             }),
