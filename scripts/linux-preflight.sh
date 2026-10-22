@@ -16,7 +16,12 @@ source scripts/portable-test-selection.conf
 for name in "${portable_unit_exclusions[@]}"; do echo "unit exclusion (CI/Mac only): $name"; done
 printf 'integration selection (fixture families stay in CI/Mac):\n%s\n' "$portable_integration_filter"
 
-features=(-F broca-provider/live -F broca-catalog/live -F broca-module-serve/test-clock)
+features=(
+  -F broca-provider/live
+  -F broca-provider/test-harness
+  -F broca-catalog/live
+  -F broca-module-serve/test-clock
+)
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets "${features[@]}" -- -D warnings
 cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-gnu "${features[@]}" -- -D warnings

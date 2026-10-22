@@ -14,6 +14,9 @@ fn assert_provider_unavailable_terminal(outcome: &RunOutcome, scenario: &str) {
     assert_eq!(err.class, ErrorClass::ProviderUnavailable, "{scenario}");
     assert_eq!(err.status, None, "{scenario} should not be an HTTP error");
     assert_eq!(outcome.summary.reason, RunFinishReason::Error, "{scenario}");
+    assert_eq!(outcome.summary.retries_used, 5, "{scenario} retry budget");
+    #[cfg(feature = "test-harness")]
+    assert_eq!(outcome.retry_waits.len(), 5, "{scenario} transport retries");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -29,6 +32,8 @@ async fn truncated_stream_mid_text_finalizes_on_eof() {
     }"#;
 
     let spec = RunSpec::new(fixtures).prompt("Return text that will be truncated.");
+    #[cfg(feature = "test-harness")]
+    let spec = spec.with_virtual_retry_waits();
     let Some(outcome) =
         run_family_e2e(OpenAiChat, openai_chat_frozen_config("mock-model"), spec).await
     else {
@@ -69,6 +74,8 @@ async fn truncated_stream_mid_tool_call() {
     let spec = RunSpec::new(fixtures)
         .prompt("Call the lookup tool, then summarize.")
         .tool("lookup", "LOOKUP-RESULT");
+    #[cfg(feature = "test-harness")]
+    let spec = spec.with_virtual_retry_waits();
     let Some(outcome) =
         run_family_e2e(OpenAiChat, openai_chat_frozen_config("mock-model"), spec).await
     else {
@@ -108,6 +115,8 @@ async fn mid_stream_disconnect_is_error() {
     }"#;
 
     let spec = RunSpec::new(fixtures).prompt("Return text, but disconnect mid-stream.");
+    #[cfg(feature = "test-harness")]
+    let spec = spec.with_virtual_retry_waits();
     let Some(outcome) =
         run_family_e2e(OpenAiChat, openai_chat_frozen_config("mock-model"), spec).await
     else {
@@ -118,6 +127,9 @@ async fn mid_stream_disconnect_is_error() {
         .first_error()
         .expect("mid-stream disconnect should surface a provider error");
     assert_eq!(err.class, ErrorClass::ProviderUnavailable);
+    assert_eq!(outcome.summary.retries_used, 5);
+    #[cfg(feature = "test-harness")]
+    assert_eq!(outcome.retry_waits.len(), 5);
     assert!(
         err.message.contains("stream chunk"),
         "disconnect should map through transport_error; message was {:?}",
