@@ -7184,13 +7184,13 @@ new = '''    .len() as u64 * 0 + overhead // NON-VACUITY BREAK: omit terminal fr
 
 [[control]]
 id = "retention-reuses-measured-frame"
-guards = "the file writer writes the measured retained frame without encoding it again"
+guards = "the file writer validates the supplied measured frame rather than silently discarding it and re-encoding the record"
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-wal/src/file_wal.rs"
-expect_red = ["file_wal::tests::preencoded_append_reuses_the_measured_frame_bytes"]
+expect_red = ["file_wal::tests::preencoded_mismatches_leave_wal_and_floor_unchanged"]
 file = "crates/broca-wal/src/file_wal.rs"
 old = "self.append_frame(fence, record, sync, Some(frame))"
 new = "let _ = frame; self.append_frame(fence, record, sync, None) // NON-VACUITY BREAK"
@@ -20040,3 +20040,16 @@ new = '''    let mut whole_history = Vec::new(); // NON-VACUITY BREAK: buffer th
     file.read_to_end(&mut whole_history).map_err(WalError::Io)?;
     let mut file = std::io::Cursor::new(whole_history);
     let mut scan = PrefixScan {'''
+
+[[control]]
+id = "wal-preencoded-compares-encoder-bytes"
+guards = "Preencoded append validation compares deterministic encoder bytes, not potentially lossy decoded record equality"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::preencoded_append_uses_encoder_bytes_for_precise_floats_and_present_nulls"]
+file = "crates/broca-wal/src/framing.rs"
+old = "    if bytes != expected.as_slice() {"
+new = "    if !matches!(decode_next(bytes), DecodeStep::Record { framed, consumed } if consumed == bytes.len() && framed.seq == seq && framed.fence == fence && &framed.record == record) { // NON-VACUITY BREAK: trust decoded equality instead of encoder bytes."

@@ -4297,11 +4297,57 @@ mod tests {
     }
 
     #[test]
+    fn preencoded_append_uses_encoder_bytes_for_precise_floats_and_present_nulls() {
+        let path = tmp("preencoded-precise-null");
+        let mut wal = FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(path.with_extension("floor"));
+        let mut record = run_started(1);
+        let WalRecord::ModelStepFinished { hooks, .. } = &mut record else {
+            unreachable!()
+        };
+        *hooks = Some(Box::new(crate::record::Hooks {
+            original: Some(serde_json::Value::Null),
+            final_value: Some(serde_json::json!({"precise": 1.2345678901234567})),
+            ops: Vec::new(),
+            unavailable: None,
+        }));
+        let frame = encode(1, 7, &record).unwrap();
+        assert!(frame
+            .windows(b"1.2345678901234567".len())
+            .any(|bytes| bytes == b"1.2345678901234567"));
+        assert!(frame
+            .windows(br#""original":null"#.len())
+            .any(|bytes| bytes == br#""original":null"#));
+        let before = std::fs::metadata(&path).unwrap().len() as usize;
+        assert_eq!(
+            wal.append_preencoded(7, &record, true, frame.clone())
+                .unwrap(),
+            1
+        );
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(&written[before..before + frame.len()], frame.as_slice());
+
+        let next = run_started(2);
+        let pretty = serde_json::to_vec_pretty(&next).unwrap();
+        let noncanonical = crate::framing::encode_payload(2, 7, &pretty).unwrap();
+        assert!(
+            wal.append_preencoded(7, &next, true, noncanonical).is_err(),
+            "equal decoded values are not the encoder's measured bytes"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+        assert_eq!(
+            wal.append_preencoded(7, &next, true, encode(2, 7, &next).unwrap())
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn preencoded_append_reuses_the_measured_frame_bytes() {
         let path = tmp("preencoded");
         let record = run_started(1);
-        let payload = serde_json::to_string_pretty(&record).unwrap();
-        let frame = crate::framing::encode_payload(1, 1, payload.as_bytes()).unwrap();
+        let frame = encode(1, 1, &record).unwrap();
         let mut wal = FileWal::open(&path).unwrap();
         let before = std::fs::metadata(&path).unwrap().len() as usize;
         wal.append_preencoded(1, &record, true, frame.clone())
