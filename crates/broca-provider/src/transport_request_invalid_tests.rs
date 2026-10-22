@@ -7,6 +7,7 @@ use super::*;
 const OPENAI_INVALID_SCHEMA_BODY: &str = r#"{"error":{"message":"Invalid schema for response_format 'result': In context=(), 'required' is required to be supplied and to be an array including every key in properties. Missing 'reason'.","type":"invalid_request_error","param":"text.format.schema","code":"invalid_json_schema"}}"#;
 const ANTHROPIC_INVALID_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0.tool_use.input: Input should be a valid dictionary"}}"#;
 const GOOGLE_INVALID_BODY: &str = r#"{"error":{"code":400,"message":"Invalid JSON payload received. Unknown name \"foo\" at 'generation_config': Cannot find field.","status":"INVALID_ARGUMENT"}}"#;
+const OPENCODE_GO_MISSING_SESSION_ID_BODY: &str = r#"{"type":"error","error":{"type":"MissingSessionID","message":"Request is missing x-opencode-session and cannot be routed efficiently."}}"#;
 
 /// Classify `body` as each family's live path does (the frozen family supplied) and as a caller
 /// with only the body does (no family), and require both to agree.
@@ -148,6 +149,19 @@ fn more_specific_400_codes_are_not_relabelled() {
     assert_eq!(error.provider_subcode, None);
 }
 
+#[test]
+fn opencode_go_missing_session_id_400_is_permanent_with_its_error_class() {
+    let error = classify_both(
+        400,
+        OPENCODE_GO_MISSING_SESSION_ID_BODY,
+        WireFamilyId::OpenAiChat,
+    );
+    assert_eq!(error.class, ErrorClass::Permanent);
+    assert_eq!(error.provider_code.as_deref(), Some("MissingSessionID"));
+    assert!(!error.class.step_reissuable());
+    assert!(!error.is_request_invalid());
+}
+
 /// A 400 without the request-validation discriminator, and the discriminator on another status,
 /// get no typed code.
 #[test]
@@ -229,6 +243,53 @@ async fn an_openai_request_invalid_400_ends_the_step_without_retry() {
         events.push(event);
     }
     assert_request_invalid(terminal_error(&events), Some("invalid_json_schema"));
+    assert_eq!(server.request_bodies().len(), 1);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        NormalizedEvent::Control(ProviderControl::Error {
+            retries_used: 0,
+            ..
+        })
+    )));
+}
+
+/// Go's missing-session refusal is terminal even when the next scripted response would succeed.
+#[tokio::test]
+async fn an_opencode_go_missing_session_id_400_ends_the_step_without_retry() {
+    let server = ScriptedServer::start(vec![
+        ScriptResponse::Http {
+            status: 400,
+            headers: vec![("content-type", "application/json")],
+            body: OPENCODE_GO_MISSING_SESSION_ID_BODY.as_bytes(),
+        },
+        ScriptResponse::Http {
+            status: 200,
+            headers: vec![("content-type", "text/event-stream")],
+            body: concat!(
+                "data: {\"type\":\"chunk\",\"choices\":[{\"delta\":{\"content\":\"unexpected retry\"},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+        },
+    ])
+    .await;
+    let mut frozen = crate::families::openai_chat_frozen_config("minimax-m3.1-flash-free");
+    frozen.base_url = Some(server.url.clone());
+    frozen.opencode_go_session_id = Some("3b2715c1-0437-47a0-8d08-1dd5bf847ca8".into());
+    let provider = LiveProvider::new(crate::families::OpenAiChat, frozen, AuthHandle::None);
+    let mut rx = provider.start_step(
+        StepId(1),
+        Arc::new(CallOptions::new(Vec::new())),
+        CancellationToken::new(),
+        None,
+    );
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let error = terminal_error(&events);
+    assert_eq!(error.class, ErrorClass::Permanent);
+    assert_eq!(error.provider_code.as_deref(), Some("MissingSessionID"));
     assert_eq!(server.request_bodies().len(), 1);
     assert!(events.iter().any(|event| matches!(
         event,

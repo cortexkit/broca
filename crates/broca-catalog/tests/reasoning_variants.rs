@@ -126,6 +126,7 @@ mod gated {
             reasoning_echo: None,
             provider_text_state: None,
             structured_output: None,
+            ..Default::default()
         };
         let resolved = if method == AuthMethod::Chatgpt {
             resolve_chatgpt_pause_provider_with_client(

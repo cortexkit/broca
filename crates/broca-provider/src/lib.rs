@@ -21,6 +21,7 @@ pub mod credential_refresh;
 pub mod families;
 pub mod hash;
 pub mod normalize;
+mod opencode_go;
 pub mod policy;
 pub mod reasoning;
 pub mod registry;

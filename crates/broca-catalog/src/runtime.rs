@@ -186,6 +186,7 @@ struct DraftServingProvider {
 #[derive(Clone)]
 struct ServingModel {
     display_name: String,
+    base_url: Option<String>,
     cost: CostSchedule,
     context_limit: Option<u64>,
     /// The model's published maximum output, `None` when fusiform serves null (its spelling of
@@ -217,6 +218,7 @@ impl Default for ServingModel {
     fn default() -> Self {
         Self {
             display_name: String::new(),
+            base_url: None,
             cost: CostSchedule::default(),
             context_limit: None,
             output_limit: None,
@@ -237,9 +239,11 @@ impl ServingModel {
         model: &ModelSpec,
         model_family: WireFamilyId,
         provider_family: WireFamilyId,
+        base_url: Option<String>,
     ) -> Self {
         Self {
             display_name: model.display_name.clone(),
+            base_url,
             cost: model.cost.clone(),
             context_limit: model.limits.context,
             output_limit: model.limits.max_output,
@@ -452,6 +456,18 @@ impl CatalogSnapshot {
         model_id: &str,
     ) -> Option<(ProviderSpec, ModelSpec)> {
         self.0.catalog.model_for_serving(provider_id, model_id)
+    }
+
+    /// Resolve a model using a previously recorded family instead of today's overlay pin.
+    pub(crate) fn model_for_serving_with_family(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        family: WireFamilyId,
+    ) -> Option<(ProviderSpec, ModelSpec)> {
+        self.0
+            .catalog
+            .model_for_serving_with_family(provider_id, model_id, family)
     }
 
     /// The model's `model.kind`: `Some(kind)` when the catalog states one, `None` when it does
@@ -724,9 +740,16 @@ impl ServingCatalog {
                 else {
                     continue;
                 };
+                let model_base_url = (model_provider.base_url != spec.base_url)
+                    .then(|| model_provider.base_url.clone());
                 models.insert(
                     model_id.clone(),
-                    ServingModel::from_spec(&model, model_provider.wire_family, *provider_family),
+                    ServingModel::from_spec(
+                        &model,
+                        model_provider.wire_family,
+                        *provider_family,
+                        model_base_url,
+                    ),
                 );
             }
             providers.insert(provider_id.clone(), ServingProvider { spec, models });
@@ -783,12 +806,32 @@ impl ServingCatalog {
     ) -> Option<(ProviderSpec, ModelSpec)> {
         let (provider, model) = self.provider_and_model(provider_id, model_id)?;
         let family = model.wire_family.unwrap_or(provider.spec.wire_family);
-        let provider_spec = if family == provider.spec.wire_family {
+        let mut provider_spec = if family == provider.spec.wire_family {
             provider.spec.clone()
         } else {
             serving_provider_spec(provider_id, family, provider.spec.base_url.clone())
         };
+        if let Some(base_url) = &model.base_url {
+            provider_spec.base_url.clone_from(base_url);
+        }
         Some((provider_spec, model.to_spec(model_id)))
+    }
+
+    fn model_for_serving_with_family(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        family: WireFamilyId,
+    ) -> Option<(ProviderSpec, ModelSpec)> {
+        let (provider, model) = self.provider_and_model(provider_id, model_id)?;
+        let base_url = model
+            .base_url
+            .clone()
+            .unwrap_or_else(|| provider.spec.base_url.clone());
+        Some((
+            serving_provider_spec(provider_id, family, base_url),
+            model.to_spec(model_id),
+        ))
     }
 
     fn is_withdrawn(&self, provider_id: &str, model_id: &str) -> bool {
@@ -923,6 +966,8 @@ struct RuntimeModelOverlay {
     #[serde(default)]
     wire_family: Patch<Option<WireFamilyId>>,
     #[serde(default)]
+    base_url: Patch<Option<String>>,
+    #[serde(default)]
     limit: Patch<Option<RuntimeLimitOverlay>>,
 }
 
@@ -949,6 +994,9 @@ impl RuntimeModelOverlay {
         }
         if let Patch::Set(value) = self.wire_family {
             model.wire_family = value;
+        }
+        if let Patch::Set(value) = &self.base_url {
+            model.base_url.clone_from(value);
         }
         match &self.limit {
             Patch::Set(None) => {
@@ -1041,6 +1089,7 @@ fn serving_model_from_facts(
 ) -> Result<ServingModel, CatalogError> {
     Ok(ServingModel {
         display_name: String::new(),
+        base_url: None,
         cost: warm_cost_fact(facts),
         context_limit: context_fact(identity, facts)?,
         output_limit: output_fact(identity, facts)?,
@@ -3009,6 +3058,44 @@ mod tests {
             model.capabilities.structured_output,
             CapabilityFlag::Known(true)
         );
+    }
+
+    #[test]
+    fn runtime_model_pin_selects_its_family_and_base_url() {
+        let mut response = response(10);
+        let facts = response.models["anthropic/claude-sonnet-4-5"].clone();
+        response
+            .models
+            .insert("opencode-go/gpt-6-luna".into(), facts.clone());
+        response
+            .models
+            .insert("opencode-go/minimax-m3".into(), facts);
+        let overlay: RuntimeOverlay = serde_json::from_str(
+            r#"{"patch":{"opencode-go":{
+                "base_url":"https://opencode.ai/inference/go/v1",
+                "wire_family":"openai_chat",
+                "models":{
+                    "gpt-6-luna":{"wire_family":"openai_responses"},
+                    "minimax-m3":{
+                        "wire_family":"anthropic_messages",
+                        "base_url":"https://opencode.ai/inference/go"
+                    }
+                }
+            }}}"#,
+        )
+        .unwrap();
+        let (catalog, _) =
+            ServingCatalog::from_fusiform_with_overlay(&response.models, overlay).unwrap();
+        let (provider, _) = catalog
+            .model_for_serving("opencode-go", "gpt-6-luna")
+            .unwrap();
+        assert_eq!(provider.wire_family, WireFamilyId::OpenAiResponses);
+        assert_eq!(provider.base_url, "https://opencode.ai/inference/go/v1");
+        let (provider, _) = catalog
+            .model_for_serving("opencode-go", "minimax-m3")
+            .unwrap();
+        assert_eq!(provider.wire_family, WireFamilyId::AnthropicMessages);
+        assert_eq!(provider.base_url, "https://opencode.ai/inference/go");
     }
 
     #[test]

@@ -13,7 +13,10 @@
 
 use std::collections::BTreeSet;
 
-use broca_protocol::CallOptions;
+use broca_protocol::{
+    content::{ContentBlock, Message, Role},
+    CallOptions,
+};
 use broca_provider::{
     families::{
         earlier_renderer_versions, renderer_version_for, reproduces_renderer_version,
@@ -112,6 +115,35 @@ fn golden(family: WireFamilyId) -> Option<Golden> {
     })
 }
 
+fn openai_chat_v4_call_options() -> CallOptions {
+    CallOptions::new(vec![
+        Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "question".into(),
+            }],
+        ),
+        Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::Reasoning {
+                    text: "earlier thinking".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+        ),
+        Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "again".into(),
+            }],
+        ),
+    ])
+}
+
 fn legacy_pins() -> Vec<Value> {
     serde_json::from_str(LEGACY_PINS).expect("legacy pins are JSON")
 }
@@ -165,9 +197,21 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
         serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/google_codeassist_v6.json"))
             .expect("Code Assist v6 pins are JSON"),
     );
-    let opts = legacy_call_options();
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!(
+            "../fixtures/pre_chat_reasoning_policy.json"
+        ))
+        .expect("OpenAI Chat v4 pins are JSON"),
+    );
+    let legacy_opts = legacy_call_options();
+    let chat_v4_opts = openai_chat_v4_call_options();
     let mut proven = BTreeSet::new();
     for family in all_families() {
+        let opts = if family == WireFamilyId::OpenAiChat {
+            &chat_v4_opts
+        } else {
+            &legacy_opts
+        };
         for version in declared_reproducible(family) {
             let family_id = serde_json::to_value(family).unwrap();
             let cases: Vec<&Value> = pins
@@ -189,7 +233,7 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
                 // field, so the resume's blob comparison sees the recorded blob unchanged.
                 assert_eq!(serde_json::to_value(&frozen).unwrap(), case["frozen"]);
                 assert_eq!(
-                    String::from_utf8(renderer(family).render(&frozen, &opts)).unwrap(),
+                    String::from_utf8(renderer(family).render(&frozen, opts)).unwrap(),
                     case["body"].as_str().unwrap(),
                     "{family:?} v{version}: the current code no longer renders the pinned bytes"
                 );

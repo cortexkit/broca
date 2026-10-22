@@ -298,6 +298,7 @@ mod gated {
                     reasoning_echo: None,
                     provider_text_state: None,
                     structured_output: None,
+                    ..Default::default()
                 },
             )
             .unwrap_or_else(|error| panic!("episode resolves: {error}"))

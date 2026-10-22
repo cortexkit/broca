@@ -62,6 +62,9 @@ const BROCA_USER_AGENT: &str = concat!("broca/", env!("CARGO_PKG_VERSION"));
 /// Broca's user-agent follows its generated body identity. Native Claude Code gateways
 /// retain their own client's user-agent instead of copying either Broca identity.
 fn user_agent_headers(frozen: &FrozenRenderConfig) -> Vec<(String, String)> {
+    if frozen.opencode_go_session_id.is_some() {
+        return Vec::new();
+    }
     if matches!(
         frozen.system_prompt,
         SystemPromptPolicy::RequiredIdentityLead { .. }
@@ -341,14 +344,15 @@ impl WireFamily for AnthropicMessages {
         }
         let base = frozen.base_url.as_deref().unwrap_or(DEFAULT_BASE);
         let url = format!("{}/v1/messages", base.trim_end_matches('/'));
-        let mut headers = vec![
+        let mut headers = crate::opencode_go::request_headers(frozen);
+        headers.extend([
             (
                 "anthropic-version".to_string(),
                 ANTHROPIC_VERSION.to_string(),
             ),
             ("content-type".to_string(), "application/json".to_string()),
             ("accept".to_string(), "application/json".to_string()),
-        ];
+        ]);
         headers.extend(user_agent_headers(frozen));
         // The anthropic-beta header is policy-driven: the OAuth beta only on the OAuth
         // (identity-lead) shape, never on a plain api-key request.

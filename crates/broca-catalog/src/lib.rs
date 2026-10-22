@@ -473,6 +473,12 @@ impl Catalog {
         let mut provider_spec = map_provider(provider_id, entry, model_family, raw_policy);
         // The serving spec speaks for THIS model: carry the per-model family.
         provider_spec.wire_family = model_family;
+        // Mixed-protocol providers can pin a model to its own endpoint root. OpenCode Go's
+        // roots intentionally follow Pi 1.4.0 (`/inference/go/v1` and `/inference/go`); its
+        // current docs list `/openai/v1`, `/google/v1beta`, and `/anthropic` alternatives.
+        if let Some(base_url) = model_entry.get("base_url").and_then(Value::as_str) {
+            provider_spec.base_url = base_url.to_string();
+        }
         Some((provider_spec, map_model(model_id, model_entry, raw_policy)))
     }
 }
@@ -666,8 +672,8 @@ fn map_provider(
     }
 }
 
-/// Stateless Responses continuations carry encrypted reasoning in the durable transcript rather
-/// than depending on a provider's response store. These flags become part of the frozen config.
+/// OpenAI, xAI and Meta request the encrypted reasoning items their stateless replay needs.
+/// These options freeze with the request.
 fn provider_static_options(provider_id: &str, family: WireFamilyId) -> Value {
     // Meta's Responses protocol, "Reasoning items in multi-turn input", documents the same
     // stateless encrypted replay contract: https://dev.meta.ai/docs/protocols/responses#reasoning-items
@@ -1142,6 +1148,26 @@ mod tests {
     }
 
     #[test]
+    fn per_model_base_url_override() {
+        let overlay = json!({
+            "add": {
+                "openai-ish": {
+                    "id": "openai-ish", "api": "https://x/v1", "wire_family": "openai_chat",
+                    "models": {
+                        "chat-model": {
+                            "id": "chat-model", "name": "Chat",
+                            "base_url": "https://x/chat/v1"
+                        }
+                    }
+                }
+            }
+        });
+        let catalog = Catalog::from_json_str(&base().to_string(), &overlay.to_string()).unwrap();
+        let (provider, _) = catalog.model("openai-ish", "chat-model").unwrap();
+        assert_eq!(provider.base_url, "https://x/chat/v1");
+    }
+
+    #[test]
     fn overlay_patch_missing_target_errors() {
         let overlay = json!({ "patch": { "nonexistent": { "name": "x" } } });
         assert_eq!(
@@ -1316,6 +1342,70 @@ mod tests {
                 spec.base_url, want_base,
                 "{provider} base_url must be the pinned overlay host the endpoint POSTs to"
             );
+        }
+    }
+
+    #[cfg(feature = "bundled-catalog")]
+    #[test]
+    fn opencode_go_models_use_their_pinned_pi_protocol_and_endpoint() {
+        let cases = [
+            (
+                "gpt-6-luna",
+                WireFamilyId::OpenAiResponses,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
+                "gemini-4-argon-contributor",
+                WireFamilyId::Gemini,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
+                "claude-haiku-5-5",
+                WireFamilyId::AnthropicMessages,
+                "https://opencode.ai/inference/go",
+            ),
+            (
+                "gpt-5.6-luna",
+                WireFamilyId::OpenAiResponses,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
+                "grok-4.7",
+                WireFamilyId::OpenAiResponses,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
+                "minimax-m3",
+                WireFamilyId::AnthropicMessages,
+                "https://opencode.ai/inference/go",
+            ),
+            (
+                "qwen3.8-max",
+                WireFamilyId::AnthropicMessages,
+                "https://opencode.ai/inference/go",
+            ),
+            (
+                "kimi-k2.7-code",
+                WireFamilyId::OpenAiChat,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
+                "qwen3.5-plus",
+                WireFamilyId::OpenAiChat,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
+                "qwen3.6-plus",
+                WireFamilyId::OpenAiChat,
+                "https://opencode.ai/inference/go/v1",
+            ),
+        ];
+        for (model_id, family, base_url) in cases {
+            let (provider, _) = catalog()
+                .model("opencode-go", model_id)
+                .unwrap_or_else(|| panic!("opencode-go/{model_id} must be in the bundled catalog"));
+            assert_eq!(provider.wire_family, family, "{model_id} protocol pin");
+            assert_eq!(provider.base_url, base_url, "{model_id} endpoint pin");
         }
     }
 

@@ -47,6 +47,10 @@ fn frozen() -> FrozenRenderConfig {
         bedrock_reasoning: false,
         structured_output: None,
         claude_code_persona: None,
+        opencode_go_session_id: None,
+        opencode_go_reasoning_signature: false,
+        opencode_go_qwen_thinking: false,
+        opencode_go_deepseek_thinking: false,
     }
 }
 
