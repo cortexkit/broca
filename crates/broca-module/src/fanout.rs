@@ -1513,6 +1513,7 @@ mod tests {
         final_step_finish_reason: Option<FinishReason>,
     ) -> broca_core::ProjectionSeed {
         broca_core::ProjectionSeed {
+            open_episode_span: None,
             deferred_calls: None,
             watermark_seq,
             anchor: Some(anchor),

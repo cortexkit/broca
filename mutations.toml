@@ -24228,3 +24228,51 @@ expect_red = ["compaction::view::tests::removing_a_model_origin_does_not_make_a_
 file = "crates/broca-core/src/compaction/view.rs"
 old = "(original.origin.is_some()"
 new = "(false /* NON-VACUITY BREAK: ignore origin removal */"
+
+[[control]]
+id = "model-page-tool-results-use-projected-episode-history"
+guards = "model pages with tool results use projected episode history rather than silently replaying the complete WAL"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-store --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-store/src/conformance/model_history.rs"
+expect_red = ["conformance::model_history::model_tool_pages_match_full_replay_without_reading_the_complete_wal"]
+file = "crates/broca-core/src/context/model_page.rs"
+old = "|| !window_complete;"
+new = "|| !window_complete || raw.iter().any(|m| m.role == broca_protocol::Role::Tool); // NON-VACUITY BREAK: replay on any tool result"
+
+[[control]]
+id = "model-page-missing-episode-history-replays"
+guards = "missing projection episode metadata means full replay, never empty repetition counters"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-store --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-store/src/conformance/model_history.rs"
+expect_red = ["conformance::model_history::missing_episode_metadata_means_replay_and_projection_repairs_it"]
+file = "crates/broca-core/src/context/model_page.rs"
+old = "history.map_or(snapshot.prefix_len == 0, |history| {"
+new = "history.map_or(true, |history| { // NON-VACUITY BREAK: missing history is empty history"
+
+[[control]]
+id = "model-store-page-bounds-the-episode-prefix"
+guards = "a model store page expands only to the requested episode, not ordinal zero"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-store --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-store/src/conformance/model_history.rs"
+expect_red = ["conformance::model_history::model_store_reads_begin_at_the_pages_episode_not_at_ordinal_zero"]
+file = "crates/broca-store/src/lib.rs"
+old = "start = episode_start;"
+new = "start = { let _ = episode_start; 0 }; // NON-VACUITY BREAK: read the entire prefix"
+
+[[control]]
+id = "model-projection-continues-the-open-episode"
+guards = "seeded projection keeps the episode's original counter boundary across a mid-episode watermark"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-store --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-store/src/conformance/model_history.rs"
+expect_red = ["conformance::model_history::model_tool_pages_match_full_replay_without_reading_the_complete_wal"]
+file = "crates/broca-core/src/replay.rs"
+old = "            seed.open_episode_span"
+new = "            None // NON-VACUITY BREAK: reset counters at the watermark"

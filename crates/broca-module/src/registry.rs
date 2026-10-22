@@ -3097,18 +3097,10 @@ impl LineageRegistry {
         } else {
             broca_core::ReadView::Raw
         };
-        // Repeated-tool-call warnings require counters from before the page's range.
-        // Supply the full stored prefix; core folds warnings before slicing the view.
-        let store_from = if model.is_some() {
-            Some(0)
-        } else {
-            from_ordinal
-        };
-        let store_limit = if model.is_some() {
-            broca_core::SESSION_READ_MAX_LIMIT
-        } else {
-            capped_limit
-        };
+        // Model reads expand this page to its episode's guidance history inside the store's
+        // snapshot transaction; raw reads continue to fetch exactly the requested range.
+        let store_from = from_ordinal;
+        let store_limit = capped_limit;
         let mut attribution_backfill = false;
         let mut snapshot = match reader.store.clone() {
             Some(store) => {

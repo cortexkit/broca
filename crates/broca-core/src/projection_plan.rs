@@ -142,6 +142,8 @@ impl ProjectionPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedProjection {
+    pub episode_spans: Vec<std::ops::Range<u64>>,
+    pub open_episode_span: Option<u64>,
     pub expected_watermark: u64,
     pub expected_lineage_id: Option<String>,
     pub reset: bool,
@@ -350,6 +352,8 @@ pub fn plan_projection(
         retries_used,
         last_run_id,
         admission_checkpoint,
+        episode_spans,
+        open_episode_span,
     ) = if let Some(seed) = seed.filter(|seed| {
         // A seed stored before the ownership summary existed (or before it recorded the frozen
         // plan manifest) cannot carry it forward: the summary covers every episode, and the
@@ -376,6 +380,8 @@ pub fn plan_projection(
             delta.retries_used,
             delta.last_run_id,
             delta.admission_checkpoint,
+            delta.episode_spans,
+            delta.open_episode_span,
         )
     } else {
         // Legacy or malformed checkpoint metadata asks the caller for a complete WAL read;
@@ -390,6 +396,8 @@ pub fn plan_projection(
             .map(|framed| framed.record.clone())
             .collect();
         let prefix_state = replay(&up_to)?;
+        let (episode_spans, open_episode_span) =
+            crate::replay::projected_episode_spans(&prefix_state, 0, None);
         let admission_checkpoint = AdmissionCheckpointV1::from_frames(&up_to_frames)?;
         let last_run_id = admission_checkpoint
             .last_episode
@@ -406,6 +414,8 @@ pub fn plan_projection(
             prefix_state.retries_used,
             last_run_id,
             admission_checkpoint,
+            episode_spans,
+            open_episode_span,
         )
     };
 
@@ -516,6 +526,8 @@ pub fn plan_projection(
     let lineage_id = incoming_lineage_id.or_else(|| expected_lineage_id.clone());
 
     Ok(ProjectionPlan::Write(Box::new(PreparedProjection {
+        episode_spans,
+        open_episode_span,
         expected_watermark,
         expected_lineage_id,
         reset,

@@ -33,7 +33,7 @@ fn records(session: &BindIdentity) -> Vec<FramedRecord> {
     records
 }
 
-fn compaction_message(seq: u64, kind: CompactionMessageKind) -> FramedRecord {
+pub(super) fn compaction_message(seq: u64, kind: CompactionMessageKind) -> FramedRecord {
     let setup = kind == CompactionMessageKind::Setup;
     let replacement = Arc::new(vec![Message::new(
         Role::User,
@@ -101,15 +101,29 @@ fn assert_model_snapshot(snapshot: &StorePageSnapshot, records: &[FramedRecord])
     let checkpoint = AdmissionCheckpointV1::from_frames(&prefix).unwrap();
     let replay = replay(&records_only(&prefix)).unwrap();
     assert_eq!(snapshot.compaction, checkpoint.compaction);
+    // A model snapshot omits replaced input, but includes the complete episode history
+    // needed by its first visible message. Derive that start independently from WAL replay.
+    let visible = checkpoint
+        .compaction
+        .as_ref()
+        .and_then(CompactionCheckpoint::state)
+        .and_then(|state| state.applied.as_ref())
+        .map_or(0, |applied| applied.range.to as usize);
+    let start = replay
+        .episode_step_spans
+        .iter()
+        .flatten()
+        .find(|span| span.contains(&visible))
+        .map_or(visible, |span| span.start);
     assert_eq!(
         snapshot
             .rows
             .iter()
             .map(|row| row.message.clone())
             .collect::<Vec<_>>(),
-        replay.prompt,
+        replay.prompt[start..],
     );
-    assert_eq!(snapshot.prefix_len, snapshot.rows.len() as u64);
+    assert_eq!(snapshot.prefix_len, (start + snapshot.rows.len()) as u64);
 }
 
 /// Replacement state and transcript rows share one watermark. An uncommitted turn or

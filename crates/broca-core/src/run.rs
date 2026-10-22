@@ -9776,6 +9776,7 @@ mod tests {
             context_management: None,
         };
         let seed = crate::ProjectionSeed {
+            open_episode_span: Some(1),
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,

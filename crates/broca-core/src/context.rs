@@ -100,9 +100,20 @@ pub struct StorePageRow {
     pub run: Option<crate::RunAttribution>,
 }
 
+/// Rebuildable model-guidance coordinates captured with a page's rows and watermark.
+/// Missing metadata means replay, not an episode without repeated calls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelHistory {
+    pub spans: Vec<std::ops::Range<u64>>,
+    pub open_span: Option<u64>,
+    /// The exact ordinal ranges the store read, including episode history and lookahead.
+    pub row_ranges: Vec<std::ops::Range<u64>>,
+}
+
 /// The metadata and requested rows captured by one store transaction for `session.read`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePageSnapshot {
+    pub model_history: Option<ModelHistory>,
     pub watermark_seq: u64,
     /// WAL identity represented by the materialized rows. Without a known matching
     /// WAL identity, readers must discard these rows and replay the complete WAL.
@@ -136,6 +147,7 @@ pub struct StorePageSnapshot {
 impl StorePageSnapshot {
     pub fn empty() -> Self {
         Self {
+            model_history: None,
             last_title: None,
             deferred_calls: None,
             watermark_seq: 0,
@@ -2423,6 +2435,7 @@ mod tests {
             })
             .collect();
         StorePageSnapshot {
+            model_history: None,
             last_title: None,
             deferred_calls: None,
             compaction: None,
