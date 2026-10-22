@@ -78,6 +78,8 @@ impl Announced {
 /// `session.read` returns it. `None` for a message without an ordinal.
 pub fn transcript_message(message: &Message) -> Option<TranscriptMessage> {
     let ordinal = message.ordinal?;
+    #[cfg(test)]
+    super::carried_encoding_tests::note_encoded();
     Some(TranscriptMessage::new(
         ordinal,
         format!("m{ordinal}"),
@@ -182,9 +184,20 @@ fn assemble_judged(
             ViewRange::Replace { from, to, bytes } => {
                 let values: Vec<Value> = serde_json::from_str(bytes)
                     .map_err(|_| AssemblyProblem::Rejected(ViewProblem::ReplacementNotArray))?;
+                let candidates: Vec<_> = values.iter().filter_map(native_schema_message).collect();
                 let carried: Option<Vec<Message>> = stored.map(|stored| {
-                    transcript(stored)
-                        .filter(|m| m.ordinal.is_some_and(|o| o >= *from && o < *to))
+                    transcript(ordinal_range(stored, *from, *to))
+                        // A different role or content cannot be an unchanged signed copy, nor
+                        // an otherwise unchanged message with its model origin removed.
+                        .filter(|original| {
+                            candidates.iter().any(|candidate| {
+                                candidate.role == original.role
+                                    && candidate.content == original.content
+                                    && (original.origin.is_some()
+                                        || candidate.origin.is_some()
+                                        || candidate.content.iter().any(super::is_signed))
+                            })
+                        })
                         .cloned()
                         .collect()
                 });
@@ -421,13 +434,11 @@ pub fn decide_at(
     prefix_bound: bool,
     run_start: bool,
 ) -> Decision {
-    let entries: BTreeMap<u64, TranscriptMessage> = transcript(prompt)
-        .filter_map(transcript_message)
-        .map(|entry| (entry.ordinal, entry))
-        .collect();
     let current = state.view.as_ref().map(|applied| applied.view.view_version);
     match dispose_fetched(view, ready, current, lineage_id, |ordinal| {
-        entries.get(&ordinal).cloned()
+        transcript(ordinal_range(prompt, ordinal, ordinal.saturating_add(1)))
+            .next()
+            .and_then(transcript_message)
     }) {
         ViewDisposition::Apply => {}
         ViewDisposition::Stale => return Decision::Stale,

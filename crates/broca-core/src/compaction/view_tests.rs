@@ -93,6 +93,91 @@ fn ordinal_ranges_bound_the_work_to_the_requested_window() {
 }
 
 #[test]
+fn view_validation_encodes_only_requested_entries_and_possible_signed_copies() {
+    let prompt = stamped(vec![text(Role::User, "hidden"); 10_000]);
+    let (view, ready) = make_view(
+        2,
+        9_998,
+        vec![ViewRange::replace(
+            0,
+            9_999,
+            replace_bytes(&[text(Role::User, "summary")]),
+        )],
+    );
+    let (decision, encodings) = crate::compaction::carried_encoding_tests::measure(|| {
+        decide(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &prompt,
+            &prompt,
+            false,
+        )
+    });
+    assert!(matches!(decision, Decision::Apply(_)), "{decision:?}");
+    assert_eq!(
+        encodings, 2,
+        "only the coverage anchor and the replacement need encoding"
+    );
+}
+
+#[test]
+fn removing_a_model_origin_does_not_make_a_stored_copy_provider_authored() {
+    let raw = stamped(vec![
+        text(Role::User, "q"),
+        assistant(vec![ContentBlock::Text {
+            text: "answer".into(),
+        }]),
+        text(Role::User, "next"),
+    ]);
+    let mut stripped = raw[1].clone();
+    stripped.origin = None;
+    let (view, ready) = make_view(
+        2,
+        1,
+        vec![ViewRange::replace(
+            0,
+            2,
+            replace_bytes(&[text(Role::User, "summary"), stripped]),
+        )],
+    );
+    assert_eq!(
+        decide(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &tagged(&raw),
+            &raw,
+            false
+        ),
+        Decision::Rejected(ViewProblem::ReplacementNotArray)
+    );
+    let (view, ready) = make_view(
+        2,
+        1,
+        vec![ViewRange::replace(
+            0,
+            2,
+            replace_bytes(&[text(Role::User, "summary"), raw[1].clone()]),
+        )],
+    );
+    assert!(matches!(
+        decide(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &tagged(&raw),
+            &raw,
+            false
+        ),
+        Decision::Apply(_)
+    ));
+}
+
+#[test]
 fn indexed_render_keeps_interior_system_messages_and_episode_coordinates() {
     let prompt = stamped(vec![
         text(Role::User, "hidden"),

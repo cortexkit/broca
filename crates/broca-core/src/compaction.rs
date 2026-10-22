@@ -923,6 +923,12 @@ mod carried_encoding_tests {
         ENCODED.with(|cell| cell.set(cell.get() + 1));
     }
 
+    pub(super) fn measure<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        ENCODED.with(|cell| cell.set(0));
+        let result = run();
+        (result, ENCODED.with(std::cell::Cell::get))
+    }
+
     fn text(role: Role, text: String) -> Message {
         Message::new(role, vec![ContentBlock::Text { text }])
     }

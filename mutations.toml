@@ -24192,3 +24192,39 @@ expect_red = ["context::tests::resume_prompt_reserves_room_for_new_turns"]
 file = "crates/broca-core/src/context.rs"
 old = "prefix.prefix.len() + tail_state.prompt.len() + 256"
 new = "prefix.prefix.len() + tail_state.prompt.len() /* NON-VACUITY BREAK: no growth headroom */"
+
+[[control]]
+id = "compaction-view-lookups-encode-only-requested-ordinals"
+guards = "view disposition serializes only the transcript ordinals the role requests"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::view_validation_encodes_only_requested_entries_and_possible_signed_copies"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "transcript(ordinal_range(prompt, ordinal, ordinal.saturating_add(1)))\n            .next()\n            .and_then(transcript_message)"
+new = "transcript(prompt).filter_map(transcript_message).find(|message| message.ordinal == ordinal) /* NON-VACUITY BREAK: serialize the prefix */"
+
+[[control]]
+id = "compaction-view-copies-only-possible-signed-content"
+guards = "a replacement does not clone or encode every stored message it replaces"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::view_validation_encodes_only_requested_entries_and_possible_signed_copies"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "candidates.iter().any(|candidate| {"
+new = "true || candidates.iter().any(|candidate| { // NON-VACUITY BREAK: clone all replaced messages"
+
+[[control]]
+id = "compaction-view-origin-removal-is-not-authorship"
+guards = "selective copy validation still refuses a stored model message whose origin was merely removed"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::removing_a_model_origin_does_not_make_a_stored_copy_provider_authored"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "(original.origin.is_some()"
+new = "(false /* NON-VACUITY BREAK: ignore origin removal */"
