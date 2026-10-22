@@ -706,9 +706,12 @@ fi
 # release (26 broca artifacts with verifying sidecars on 2026-09-18, all equally placeable to a
 # gate that only checks sidecars), so this file is the one statement of which one is armed.
 # Overwritten on every stage via rename-into-place, so it can never name two artifacts and can
-# never be older than the last hand-off. The placement gate reads it and refuses a path whose
-# sha differs; a rollback bypasses explicitly. Format is one line, shasum-shaped plus a UTC
-# stamp, so `shasum -c` on the first two fields still verifies the named artifact.
+# never be older than the last hand-off. prune-staging.py reads it so pruning always keeps the
+# armed artifact. place-release.sh does NOT read it: the placement gate checks the artifact it is
+# handed (file kind, signature, dSYM, smoke run, WAL feature floor), not whether that artifact
+# is the current one, so the card must name the exact path printed below. Format is one line,
+# shasum-shaped plus a UTC stamp, so `shasum -c` on the first two fields still verifies the
+# named artifact.
 CURRENT="$SEAM/ck-broca.current"
 printf '%s  %s  %s\n' "$STAGED_SHA" "$(basename "$STAGED")" "$(date -u +%Y%m%dT%H%M%SZ)" > "$CURRENT.tmp"
 chmod 600 "$CURRENT.tmp"

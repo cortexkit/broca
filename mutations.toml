@@ -23030,7 +23030,7 @@ new = """                    exited_at = None  # NON-VACUITY BREAK: wait for the
 
 [[control]]
 id = "ci-concurrency-keeps-master-and-nightly-runs"
-guards = "a master push and the nightly CI run neither share a concurrency group nor cancel master runs"
+guards = "a master push and the nightly CI run on master never share a concurrency group"
 platforms = ["linux", "macos"]
 runner = "command"
 command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
@@ -23038,8 +23038,21 @@ test_count_pattern = "Ran {count} test"
 test_file = "scripts/test-ci-pipeline.py"
 expect_red = ["WorkflowGraph.test_master_and_nightly_runs_are_never_cancelled_by_each_other"]
 file = ".github/workflows/ci.yml"
-old = "  group: ci-${{ github.event_name }}-${{ github.ref }}"
-new = "  group: ci-${{ github.ref }} # NON-VACUITY BREAK: push and schedule share a group"
+old = '''  group: ci-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/train/')) && format('-{0}', github.sha) || '' }}'''
+new = '''  group: ci-${{ github.ref }} # NON-VACUITY BREAK: push and schedule share a group'''
+
+[[control]]
+id = "ci-concurrency-groups-master-runs-by-commit"
+guards = "a master push between two others keeps its own CI run instead of being dropped as an older pending run"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_master_and_nightly_runs_are_never_cancelled_by_each_other"]
+file = ".github/workflows/ci.yml"
+old = '''  group: ci-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/train/')) && format('-{0}', github.sha) || '' }}'''
+new = '''  group: ci-${{ github.event_name }}-${{ github.ref }} # NON-VACUITY BREAK: one group for every master commit'''
 
 [[control]]
 id = "ci-shard-wait-covers-producer-budget"
@@ -23069,3 +23082,118 @@ expect_red = [
 file = "scripts/ci-status.sh"
 old = '    runs = [r for r in runs if r.get("event") == event]'
 new = '    pass  # NON-VACUITY BREAK: judge every event'
+
+[[control]]
+id = "live-runs-refuses-an-ambiguous-daemon-process"
+guards = "the restart gate refuses when several processes match the daemon, instead of taking the first one's start time"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "-c", "import importlib.util, sys, unittest; sys.path.insert(0, 'scripts'); spec = importlib.util.spec_from_file_location('test_live_runs', 'scripts/test-live-runs.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName(sys.argv[1], module)); sys.exit(0 if result.wasSuccessful() else 1)", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-live-runs.py"
+expect_red = ["LiveRunsGateTests.test_two_matching_processes_refuse_instead_of_picking_one"]
+file = "scripts/live-runs.py"
+old = "        if len(pids) > 1:"
+new = "        if False:  # NON-VACUITY BREAK: take the first match"
+
+[[control]]
+id = "live-runs-never-matches-its-own-process"
+guards = "the restart gate never reads its own process as the daemon when its command line names the pattern"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "-c", "import importlib.util, sys, unittest; sys.path.insert(0, 'scripts'); spec = importlib.util.spec_from_file_location('test_live_runs', 'scripts/test-live-runs.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName(sys.argv[1], module)); sys.exit(0 if result.wasSuccessful() else 1)", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-live-runs.py"
+expect_red = ["LiveRunsGateTests.test_the_scripts_own_process_is_never_a_match"]
+file = "scripts/live-runs.py"
+old = "    return [pid for pid in found if pid != str(os.getpid())]"
+new = "    return found  # NON-VACUITY BREAK: keep this script's own pid"
+
+[[control]]
+id = "nextest-group-prefixes-name-real-modules"
+guards = "a nextest group prefix that names no module of its test binary is reported"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-nextest-groups.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-nextest-groups.py"
+expect_red = ["NextestGroupTests.test_every_prefix_names_a_declared_module"]
+file = ".config/nextest.toml"
+old = "|tool_call_cancel_real_daemon|tool_fault_spine)::/)))'"
+new = "|tool_call_cancel_real_daemon|tool_fault_spine|transform_spine)::/)))' # NON-VACUITY BREAK: a module that does not exist"
+
+[[control]]
+id = "nextest-real-daemon-modules-are-capped"
+guards = "every broca-subc integration module that boots the real daemon is in the subc_spine cap"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-nextest-groups.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-nextest-groups.py"
+expect_red = ["NextestGroupTests.test_every_real_daemon_module_is_in_the_subc_spine_cap"]
+file = ".config/nextest.toml"
+old = "test(/^(aimock_real_aft|compaction_routes|consent_ops|dogfood|hook_routes|multi_module_spine|resume_spine|scope_outbound_real_daemon|tool_call_cancel_real_daemon|tool_fault_spine)::/)))'"
+new = "test(/^(aimock_real_aft|consent_ops|dogfood|hook_routes|multi_module_spine|resume_spine|scope_outbound_real_daemon|tool_call_cancel_real_daemon|tool_fault_spine)::/)))' # NON-VACUITY BREAK: compaction_routes leaves the cap"
+
+[[control]]
+id = "nextest-five-mock-test-takes-the-aimock-group"
+guards = "the test that boots five aimock processes holds every aimock slot while it runs"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-nextest-groups.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-nextest-groups.py"
+expect_red = ["NextestGroupTests.test_the_five_mock_test_takes_the_whole_aimock_group"]
+file = ".config/nextest.toml"
+old = "threads-required = 4"
+new = "threads-required = 1 # NON-VACUITY BREAK: five mocks in one slot"
+
+[[control]]
+id = "rig-stdio-guard-sees-inline-daemon-tests"
+guards = "an inline lib test that starts the real daemon without the owned-stdio rig helper is reported"
+runner = "cargo"
+package = "broca-test-support"
+target = "--test rig_stdio_guard"
+test_file = "crates/broca-test-support/tests/rig_stdio_guard.rs"
+expect_red = ["rig_children_use_owned_stdio_logs"]
+file = "crates/broca-module-serve/src/role_plane_tests.rs"
+old = '''        broca_test_support::tokio_rig_command(&daemon_bin, &root, "daemon")?'''
+new = '''        tokio::process::Command::new(broca_test_support::ckdev_command(&source, &root).get_program()) // NON-VACUITY BREAK: bypass the rig helper'''
+
+[[control]]
+id = "rig-stdio-guard-refuses-a-scan-without-inline-sources"
+guards = "the rig stdio guard fails when it stops reading inline test sources, instead of passing on less"
+runner = "cargo"
+package = "broca-test-support"
+target = "--test rig_stdio_guard"
+test_file = "crates/broca-test-support/tests/rig_stdio_guard.rs"
+expect_red = ["rig_children_use_owned_stdio_logs"]
+file = "crates/broca-test-support/tests/rig_stdio_guard.rs"
+old = '''        rust_files(&crate_dir.join("src"), &mut files);'''
+new = '''        rust_files(&crate_dir.join("no-such-src"), &mut files); // NON-VACUITY BREAK: inline test sources are no longer read'''
+
+[[control]]
+id = "provider-stream-floor-test-runs-its-body-in-the-child"
+guards = "the stream-floor test runs its assertions in a child process that sees the floor, so no test in the lib binary writes the floor variables"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::stream_floor_breach_is_transient_and_not_reissued"]
+file = "crates/broca-provider/src/transport.rs"
+old = '''                .env("BROCA_MIN_STREAM_BYTES_PER_SEC", "50")'''
+new = '''                .env("BROCA_MIN_STREAM_BYTES_PER_SEC_UNUSED", "50") // NON-VACUITY BREAK: the child gets no floor'''
+
+[[control]]
+id = "provider-stream-floor-child-must-run-a-test"
+guards = "a stream-floor child that matched no test fails the parent instead of passing it"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::stream_floor_breach_is_transient_and_not_reissued"]
+file = "crates/broca-provider/src/transport.rs"
+old = '''        const NAME: &str = "transport::tests::stream_floor_breach_is_transient_and_not_reissued";'''
+new = '''        const NAME: &str = "transport::tests::stream_floor_breach_is_transient_and_not_reissued_renamed"; // NON-VACUITY BREAK'''

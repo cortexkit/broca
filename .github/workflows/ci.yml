@@ -21,10 +21,12 @@ on:
 
 concurrency:
   # The event is part of the group, so a master push and the nightly run on master never
-  # cancel each other. Only pull requests and train branches cancel a superseded run: every
-  # master commit keeps its own result, because release tagging reads the CI result of the
-  # exact commit it tags.
-  group: ci-${{ github.event_name }}-${{ github.ref }}
+  # cancel each other. Pull requests and train branches share one group per ref and cancel a
+  # superseded run. Every other run (master pushes, the nightly) gets a group of its own commit:
+  # GitHub keeps one pending run per group and drops an older pending one, so a shared master
+  # group would lose the result of a commit pushed between two others, and release tagging
+  # reads the CI result of the exact commit it tags.
+  group: ci-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/train/')) && format('-{0}', github.sha) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/train/') }}
 
 env:

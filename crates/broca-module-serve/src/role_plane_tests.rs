@@ -63,10 +63,11 @@ async fn session_close_releases_hook_and_compaction_routes() {
     std::fs::create_dir_all(&runtime).unwrap();
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(&config, r#"{"version":1,"modules":{}}"#).unwrap();
-    let mut daemon = broca_test_support::retry_executable_file_busy(|| {
-        tokio::process::Command::new(
-            broca_test_support::ckdev_command(source.clone(), &root).get_program(),
-        )
+    // The rig helper sends the daemon's output to log files under `root`, and RigChild kills and
+    // reaps it on every exit path and prints those logs if the test fails.
+    let daemon_bin = broca_test_support::ckdev_binary(&source, &root);
+    let daemon = broca_test_support::retry_executable_file_busy(|| {
+        broca_test_support::tokio_rig_command(&daemon_bin, &root, "daemon")?
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_DATA_HOME", root.join("data"))
@@ -78,6 +79,7 @@ async fn session_close_releases_hook_and_compaction_routes() {
         .spawn()
     })
     .unwrap();
+    let daemon = broca_test_support::RigChild::new(daemon, &root, "daemon");
     let connection = runtime.join("subc-connection.json");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     while !connection.exists() {
@@ -131,6 +133,5 @@ async fn session_close_releases_hook_and_compaction_routes() {
         executor.on_session_close(&bind).await;
     }
     serving.abort();
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
+    drop(daemon);
 }

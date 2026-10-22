@@ -24,8 +24,11 @@
 //!   AFT_ARGS         whitespace-split args for the aft module (default none).
 //!   AFT_MODULE_ID    the subc module id for aft (default "aft").
 //!
-//! Skips cleanly (never a silent pass) when AIMOCK_BASE_URL or the binaries are
-//! absent.
+//! No CI lane hosts aimock for this test or stages a real `aft`, so it is
+//! `#[ignore]`d: the default run reports it as ignored instead of returning early
+//! and counting as a pass. Run it explicitly (`--run-ignored only`, or
+//! `cargo test -- --ignored`) with the variables above set; when run, a missing
+//! prerequisite fails the test.
 
 use crate::common;
 
@@ -47,17 +50,17 @@ use tokio::sync::mpsc;
 use common::{wait_for_aft, ModuleSpec, Rig};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an aimock at AIMOCK_BASE_URL and a real aft at AFT_BIN; run explicitly"]
 async fn loop_drives_aimock_through_real_aft() {
     // ── env / gating ───────────────────────────────────────────────
-    let Ok(base_url) = std::env::var("AIMOCK_BASE_URL") else {
-        eprintln!("SKIP aimock_real_aft: AIMOCK_BASE_URL unset (the harness hosts aimock).");
-        return;
-    };
+    // Only an explicit run reaches here, so a missing prerequisite is a failure: returning
+    // early would report a pass for a loop that never ran.
+    let base_url = std::env::var("AIMOCK_BASE_URL")
+        .expect("aimock_real_aft: AIMOCK_BASE_URL must name the aimock this run talks to");
     let aft_bin = std::env::var("AFT_BIN").map(std::path::PathBuf::from).ok();
-    let Some(aft_bin) = aft_bin.filter(|p| p.exists()) else {
-        eprintln!("SKIP aimock_real_aft: AFT_BIN unset or missing (need the real aft binary).");
-        return;
-    };
+    let aft_bin = aft_bin
+        .filter(|p| p.exists())
+        .expect("aimock_real_aft: AFT_BIN must name an existing real aft binary");
     let model = std::env::var("AIMOCK_MODEL").unwrap_or_else(|_| "mock-model".to_string());
     let module_id = std::env::var("AFT_MODULE_ID").unwrap_or_else(|_| "aft".to_string());
     let tool_name = std::env::var("AFT_TOOL").unwrap_or_else(|_| "read".to_string());
@@ -79,9 +82,9 @@ async fn loop_drives_aimock_through_real_aft() {
         args: aft_args,
         env: vec![],
     };
-    let Some(rig) = Rig::start_with_module("aimock-aft", module).await else {
-        return; // subc-core or aft binary absent → skipped with a message
-    };
+    let rig = Rig::start_with_module("aimock-aft", module)
+        .await
+        .expect("aimock_real_aft: the real subc daemon could not be started (set SUBC_CORE_BIN)");
 
     // The file AFT will read. It lives at the project_root (the rig dir), which is
     // what the run binds to — AFT sandboxes reads to that root, so the model asks

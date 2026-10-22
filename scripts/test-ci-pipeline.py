@@ -157,6 +157,12 @@ class WorkflowGraph(unittest.TestCase):
         concurrency = self.workflow('ci.yml')['concurrency']
         self.assertIn('${{ github.event_name }}', concurrency['group'])
         self.assertIn('${{ github.ref }}', concurrency['group'])
+        # A shared master group keeps one pending run and drops the older one, so master and
+        # nightly runs are grouped by commit. (`cond && '' || x` always yields x in GitHub's
+        # expressions, so the commit suffix must be the truthy arm.)
+        self.assertIn("${{ (github.event_name != 'pull_request' && "
+                      "!startsWith(github.ref, 'refs/heads/train/')) && "
+                      "format('-{0}', github.sha) || '' }}", concurrency['group'])
         self.assertEqual(
             concurrency['cancel-in-progress'],
             "${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/train/') }}",

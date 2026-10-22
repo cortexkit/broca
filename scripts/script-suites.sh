@@ -87,6 +87,8 @@ suites=(
     scripts/lib/test_liveness.py
     # Every suite file in scripts/ is listed in one of the arrays in this file.
     scripts/test-script-suites.py
+    # nextest's resource groups select modules that exist and every module they must cap.
+    scripts/test-nextest-groups.py
     # Vendored Cingulate consent contract: checksums, pins and broca's mapping.
     crates/broca-subc/tests/fixtures/consent/verify.py
 )
