@@ -224,6 +224,16 @@ struct Run {
 }
 
 async fn run(store: &FileWalStore, steer: bool) -> Run {
+    run_with(store, steer, None).await
+}
+
+/// [`run`], with `ordered` (a send with an ordered `delivery` list) already queued for the turn
+/// when it starts, so its first step boundary decides it.
+async fn run_with(
+    store: &FileWalStore,
+    steer: bool,
+    ordered: Option<broca_core::delivery_order::OrderedSend>,
+) -> Run {
     let request = request();
     let session = request.session.clone();
     let writer = Arc::new(WalHandle::spawn(store.open(&session).unwrap(), 1).unwrap());
@@ -232,6 +242,9 @@ async fn run(store: &FileWalStore, steer: bool) -> Run {
         writer: Arc::new(Mutex::new(Some(writer.clone()))),
         sent: Arc::new(std::sync::atomic::AtomicBool::new(!steer)),
     };
+    if let Some(send) = ordered {
+        steering.inbox.seed_ordered(vec![send]);
+    }
     let on_dispatch = steering.clone();
     let plane = StubToolPlane::new().with_tool("lookup", move |_| {
         on_dispatch.deliver();
@@ -364,8 +377,10 @@ fn store_with(records: &[FramedRecord], name: &str) -> FileWalStore {
     store
 }
 
-fn load_fixture_records() -> Vec<FramedRecord> {
-    let store = FileWalStore::new(scratch("load"));
+/// The frozen fixture's records, read through a scratch copy named for `name`: each test copies
+/// into its own directory, because tests run in parallel and `scratch` clears the directory first.
+fn load_fixture_records(name: &str) -> Vec<FramedRecord> {
+    let store = FileWalStore::new(scratch(&format!("load-{name}")));
     let session = request().session;
     let path = store.wal_path(&session);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -404,7 +419,7 @@ async fn a_session_written_under_the_stored_ledger_keeps_its_exact_bytes() {
     }
     let expected: Value =
         serde_json::from_str(&std::fs::read_to_string(fixture("expected.json")).unwrap()).unwrap();
-    let records = load_fixture_records();
+    let records = load_fixture_records("exact-bytes");
     assert_eq!(
         json!(wal_tags(&records)),
         expected["wal_tags"],
@@ -442,6 +457,99 @@ async fn a_session_written_under_the_stored_ledger_keeps_its_exact_bytes() {
     );
 }
 
+/// Every request `resumed` sent is byte for byte the request a rebuild from its WAL gives for the
+/// same step. `cut` is the index of the resumed run's first own record.
+fn assert_resumed_matches_rebuilt(label: &str, resumed: &Run, cut: usize) {
+    let steps: Vec<usize> = step_boundaries(&resumed.records)
+        .into_iter()
+        .filter(|at| *at >= cut)
+        .collect();
+    assert_eq!(
+        steps.len(),
+        resumed.calls.len(),
+        "{label}: one step per request"
+    );
+    for (n, (live, at)) in resumed.calls.iter().zip(steps).enumerate() {
+        assert_eq!(
+            request_text(&rebuilt(&resumed.records, at)),
+            request_text(live),
+            "{label}: request {n} differs from its rebuild"
+        );
+    }
+}
+
+/// The first number the resumed run stamped on a record that `holds` matches.
+fn stamped(records: &[FramedRecord], holds: impl Fn(&WalRecord) -> bool) -> u64 {
+    records
+        .iter()
+        .filter(|frame| holds(&frame.record))
+        .find_map(|frame| frame.record.runner_tags().first()?.parts.first().copied())
+        .expect("the resumed run stamps the record under the stored-ledger rules")
+}
+
+/// A run frozen under the stored-ledger rules and resumed by a later build still numbers a steer
+/// that joins it by its record: the queued message carries the number its `Steered` record was
+/// stamped with, so every request the resumed run sends equals its rebuild and shows that number.
+#[tokio::test]
+async fn a_resumed_stored_ledger_run_renders_a_steer_live_as_its_rebuild() {
+    let records = load_fixture_records("steer");
+    let cut = cut_at(&records);
+    let resumed = run(&store_with(&records[..cut], "resume-steer"), true).await;
+    assert_resumed_matches_rebuilt("steer", &resumed, cut);
+    let tag = stamped(&resumed.records[cut..], |record| {
+        matches!(record, WalRecord::Steered { .. })
+    });
+    let last = request_text(
+        resumed
+            .calls
+            .last()
+            .expect("the resumed run sent a request"),
+    );
+    assert!(
+        last.contains(&format!("§{tag}§ also check the docs")),
+        "the steer shows its stamped number: {last}"
+    );
+}
+
+/// The same for a queued send whose ordered `delivery` list lets it join the resumed run as a
+/// steer: the delivered message carries the number its `SendDelivered` record was stamped with.
+#[tokio::test]
+async fn a_resumed_stored_ledger_run_renders_a_steer_delivery_live_as_its_rebuild() {
+    let records = load_fixture_records("steer-delivery");
+    let cut = cut_at(&records);
+    let send = broca_core::delivery_order::OrderedSend {
+        submission_id: SubmissionId("send-in-order".into()),
+        order: broca_protocol::DeliveryOrder {
+            modes: vec![broca_protocol::DeliveryMode::Steer],
+            dedupe_key: None,
+            expires_at_ms: None,
+            template: None,
+        },
+        principal: None,
+        input: vec![Message::new(Role::User, vec![text("a note sent in order")])],
+    };
+    let resumed = run_with(
+        &store_with(&records[..cut], "resume-delivery"),
+        false,
+        Some(send),
+    )
+    .await;
+    assert_resumed_matches_rebuilt("steer delivery", &resumed, cut);
+    let tag = stamped(&resumed.records[cut..], |record| {
+        matches!(record, WalRecord::SendDelivered { .. })
+    });
+    let first = request_text(
+        resumed
+            .calls
+            .first()
+            .expect("the resumed run sent a request"),
+    );
+    assert!(
+        first.contains(&format!("§{tag}§ a note sent in order")),
+        "the delivered send shows its stamped number: {first}"
+    );
+}
+
 /// The first run on such a session after the switch runs under the computed rules
 /// (`runner-tags/v2`) without renumbering anything a reader has seen: every stored number stays
 /// on its part, so the transcript's earlier reads hold, and the new run's counted parts are
@@ -449,7 +557,7 @@ async fn a_session_written_under_the_stored_ledger_keeps_its_exact_bytes() {
 /// before and the new ones by the computed rules.
 #[tokio::test]
 async fn the_first_run_after_the_switch_counts_on_from_the_stored_high_water() {
-    let records = load_fixture_records();
+    let records = load_fixture_records("switch");
     let high_water = *wal_tags(&records).iter().max().expect("stored numbers");
     let before = transcript(&records);
     let store = store_with(&records, "switch");
