@@ -1895,8 +1895,8 @@ test_file = "scripts/test-place-release-gate.py"
 expect_red = ["LinuxDeployTests.test_linux_process_start_uses_proc_not_bsd_date"]
 platforms = ["linux"]
 file = "scripts/live-runs.py"
-old = '        if sys.platform.startswith("linux"):'
-new = "        if False:  # NON-VACUITY BREAK: restore BSD date on Linux"
+old = '    if sys.platform.startswith("linux"):'
+new = "    if False:  # NON-VACUITY BREAK: restore BSD date on Linux"
 
 [[control]]
 id = "linux-local-gate-rigs"
@@ -23247,3 +23247,35 @@ expect_red = ["WorkflowGraph.test_production_clock_code_is_linted_and_tested_and
 file = ".github/workflows/ci.yml"
 old = "        run: cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast"
 new = "        run: cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast -F broca-module-serve/test-clock # NON-VACUITY BREAK"
+
+[[control]]
+id = "crash-harness-observed-wal-forwards-the-byte-budget"
+guards = "the crash harness's observed WAL gives the writer production's byte budget, not the trait default of none"
+runner = "cargo"
+package = "broca-crash-harness"
+target = "--test it"
+test_file = "crates/broca-crash-harness/tests/it/observed_wal_fidelity.rs"
+expect_red = ["observed_wal_fidelity::observed_wrappers_forward_every_production_override"]
+file = "crates/broca-crash-harness/src/wal.rs"
+old = """    fn append_budget(&self) -> Option<(u64, u64, u64)> {
+        self.inner.append_budget()
+    }
+"""
+new = """    // NON-VACUITY BREAK: the byte budget falls back to the trait default
+"""
+
+[[control]]
+id = "crash-harness-observed-store-forwards-tombstone-floors"
+guards = "the crash harness's observed store reports production's retired-tag floor, not the trait default of 1"
+runner = "cargo"
+package = "broca-crash-harness"
+target = "--test it"
+test_file = "crates/broca-crash-harness/tests/it/observed_wal_fidelity.rs"
+expect_red = ["observed_wal_fidelity::observed_wrappers_forward_every_production_override"]
+file = "crates/broca-crash-harness/src/wal.rs"
+old = """    fn retired_tag_floor(&self, session: &BindIdentity) -> Result<u64, WalError> {
+        WalStore::retired_tag_floor(&self.inner, session)
+    }
+"""
+new = """    // NON-VACUITY BREAK: the retired-tag floor falls back to the trait default
+"""

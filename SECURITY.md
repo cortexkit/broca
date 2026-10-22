@@ -51,7 +51,7 @@ can set them, so protect that configuration like the vault and the binaries.
 
 | Variable | Default when unset | Effect when set |
 |---|---|---|
-| `BROCA_AUTH_SOURCE` | `vault`: credentials come from the credential vault through the grant boundary above | `opencode` reads provider tokens from the OpenCode auth file (`~/.local/share/opencode/auth.json`) instead. That file is not covered by vault grants: any process running as the same user can read it. Any other non-empty value refuses startup. |
+| `BROCA_AUTH_SOURCE` | `vault`: credentials come from the credential vault through the grant boundary above | `opencode` reads provider tokens from the OpenCode auth file (`~/.local/share/opencode/auth.json`) instead. That file is not covered by vault grants: any process running as the same user can read it. Any other value that is not blank after trimming refuses startup. |
 | `BROCA_PROVIDER_BASE_URL` | each run's endpoint comes from the model catalog | Every run is sent to this base URL instead, authenticated with no credential, and the vault is never opened. Meant for local mock providers; prompts and tool results go to whatever answers at that URL. |
 | `BROCA_DUMP_REQUEST_DIR` | no request dumps | Every rendered model request of a non-ephemeral session is written to this directory **unredacted**: full prompts, tool arguments and tool results. Files and the directory are created owner-only, and old dumps are swept by size and age, but the contents are as sensitive as the WAL. broca logs a warning naming the directory when the first dump is written. |
 
