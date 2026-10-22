@@ -1062,7 +1062,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every publication the publisher made, as `(kind, run_id)`.
+    /// Every publication the publisher made, as `(kind, run_id)`. A `run.skipped` marker spans
+    /// runs and carries no `run_id` header, so it is recorded with an empty one.
     #[derive(Default)]
     struct RecordingBus(Mutex<Vec<(String, String)>>);
 
@@ -1075,7 +1076,7 @@ pub(crate) mod tests {
             let mut seen = self.0.lock().unwrap();
             seen.push((
                 event.headers["kind"].clone(),
-                event.headers["run_id"].clone(),
+                event.headers.get("run_id").cloned().unwrap_or_default(),
             ));
             Ok(cortexkit_bus_trait::PublishReceipt::new(
                 seen.len() as u64,
