@@ -19,6 +19,11 @@ mod pause_continue;
 mod projection;
 mod queue_crash;
 mod replay;
+// The read-only corpus scan example, compiled here so its tests run with this binary. Its
+// `main` is unused in this build.
+#[allow(dead_code)]
+#[path = "../../examples/replay-corpus-scan.rs"]
+mod replay_corpus_scan;
 mod resume_exec;
 mod run_loop;
 mod run_loop_terminal_paths;

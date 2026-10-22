@@ -112,22 +112,26 @@ impl ReadOnlyWalReader {
             if let Some(hook) = AFTER_LIVE_PATH_HOOK.with(|hook| hook.borrow_mut().take()) {
                 hook();
             }
-            // One open handle answers both presence and content. A file unlinked after
-            // `live_path` (a fold archiving it) reads as absent, never as an empty WAL, so the
-            // lookup continues to the archives and, failing them, reports disappearance below.
-            let range = broca_wal::file_wal::read_records_range(
-                &path,
-                DEFAULT_MAX_READ_BYTES,
-                0,
-                None,
-                None,
-            )?;
-            let len = range.complete_byte_end.unwrap_or(0);
-            match range.into_records() {
-                broca_wal::WalRangeRecords::Complete(records)
-                | broca_wal::WalRangeRecords::Partial(records)
-                | broca_wal::WalRangeRecords::Unknown(records) => return Ok((records, len)),
-                broca_wal::WalRangeRecords::Absent => {}
+            // A file unlinked after `live_path` (a fold archiving it) reads as absent, never as
+            // an empty WAL, so the lookup continues to the archives and, failing them, reports
+            // disappearance below. The byte count is the size of the file this read opened; it
+            // only feeds the census's bytes-read tally.
+            let len = match std::fs::File::open(&path) {
+                Ok(file) => Some(file.metadata().map_err(WalError::Io)?.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(WalError::Io(error)),
+            };
+            if let Some(len) = len {
+                let range = broca_wal::file_wal::read_records_range(
+                    &path,
+                    DEFAULT_MAX_READ_BYTES,
+                    0,
+                    None,
+                    None,
+                )?;
+                if let Some(records) = proven_census_records(range.into_records())? {
+                    return Ok((records, len));
+                }
             }
         }
         let ordinary = broca_wal::archive::read_newest_member(
@@ -199,6 +203,26 @@ impl ReadOnlyWalReader {
     }
 }
 
+/// The records a census may count for a live WAL read, or `None` when the file was absent.
+///
+/// The census marks an address covered from whatever this returns, so only a read that
+/// observed the whole file qualifies. A `Partial` or `Unknown` answer cannot prove that no
+/// session ref is missing; it is an error, which the census records as an unreadable address
+/// and retries, leaving coverage incomplete.
+fn proven_census_records(
+    records: broca_wal::WalRangeRecords<Vec<broca_wal::FramedRecord>>,
+) -> Result<Option<Vec<broca_wal::FramedRecord>>, WalError> {
+    match records {
+        broca_wal::WalRangeRecords::Complete(records) => Ok(Some(records)),
+        broca_wal::WalRangeRecords::Absent => Ok(None),
+        broca_wal::WalRangeRecords::Partial(_) | broca_wal::WalRangeRecords::Unknown(_) => {
+            Err(WalError::Io(std::io::Error::other(
+                "census read did not observe the whole live WAL; coverage stays open",
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +272,32 @@ mod tests {
             other => panic!("a vanished live WAL must not read as empty: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Only a read that observed the whole file may be counted; a partial or undetermined read
+    /// is an error the census quarantines, so "could not tell" never certifies coverage.
+    #[test]
+    fn only_a_complete_live_read_is_counted() {
+        use broca_wal::WalRangeRecords;
+        let frame = broca_wal::FramedRecord {
+            seq: 1,
+            fence: 1,
+            record: WalRecord::TurnFinished {
+                step_id: broca_protocol::StepId(1),
+            },
+        };
+        assert_eq!(
+            proven_census_records(WalRangeRecords::Complete(vec![frame.clone()])).unwrap(),
+            Some(vec![frame.clone()])
+        );
+        assert_eq!(
+            proven_census_records(WalRangeRecords::Absent).unwrap(),
+            None
+        );
+        assert!(proven_census_records(WalRangeRecords::Partial(vec![frame.clone()])).is_err());
+        assert!(
+            proven_census_records(WalRangeRecords::Unknown(vec![frame])).is_err(),
+            "an undetermined read must not be counted as the whole WAL"
+        );
     }
 }

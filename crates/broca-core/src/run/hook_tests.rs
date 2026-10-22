@@ -2536,3 +2536,6 @@ async fn cut_step_shutdown_fallback_keeps_exact_rejection_counts() {
     }
     let _ = writer.shutdown().await;
 }
+
+#[path = "dispatch_cancel_tests.rs"]
+mod dispatch_cancel_tests;

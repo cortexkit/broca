@@ -1217,13 +1217,17 @@ pub fn budget_replay_seed_is_valid(seed: &ProjectionSeed) -> bool {
     max_fired_threshold.is_none_or(|threshold| state.tool_call_count >= threshold)
 }
 
+/// The `CorruptLineage` reason replay gives when a tool batch or tool-calling step would
+/// replace an uncommitted batch that holds call evidence. Read-only scanners match on it to
+/// tell this refusal from other corrupt lineages.
+pub const OVERLAPPING_BATCH_REASON: &str = "a tool batch opened over an uncommitted batch that \
+     already holds dispatch intents, Prepared calls or results";
+
 /// A tool batch or tool-calling step that would replace an open batch holding call evidence.
 fn overlapping_batch_error(run_id: Option<&RunId>) -> ReplayError {
     ReplayError::CorruptLineage {
         episode_run_id: run_id.cloned().unwrap_or_else(|| RunId("unknown".into())),
-        reason: "a tool batch opened over an uncommitted batch that already holds dispatch \
-                 intents, Prepared calls or results"
-            .into(),
+        reason: OVERLAPPING_BATCH_REASON.into(),
     }
 }
 

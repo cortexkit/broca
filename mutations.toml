@@ -18837,14 +18837,14 @@ platforms = ["linux", "macos"]
 test_file = "crates/broca-store/src/session_refs/tests.rs"
 expect_red = ["session_refs::tests::census_over_read_only_state_root_never_changes_logs_or_manifest"]
 file = "crates/broca-core/src/wal_writer/projection_reader.rs"
-old = """            let range = broca_wal::file_wal::read_records_range(
-                &path,
-                DEFAULT_MAX_READ_BYTES,
-                0,
-                None,
-                None,
-            )?;"""
-new = """            let range = broca_wal::WalRangeRead::without_anchors(broca_wal::FileWal::open(&path)?.replay()?); /* NON-VACUITY BREAK: use writer recovery in census */"""
+old = """                let range = broca_wal::file_wal::read_records_range(
+                    &path,
+                    DEFAULT_MAX_READ_BYTES,
+                    0,
+                    None,
+                    None,
+                )?;"""
+new = """                let range = broca_wal::WalRangeRead::without_anchors(broca_wal::FileWal::open(&path)?.replay()?); /* NON-VACUITY BREAK: use writer recovery in census */"""
 
 [[control]]
 id = "agent-data-indexed-fence-precedes-intent"
@@ -22635,5 +22635,48 @@ test_file = "crates/broca-core/src/wal_writer/projection_reader.rs"
 expect_red = ["wal_writer::projection_reader::tests::live_wal_unlinked_after_resolution_is_not_an_empty_read"]
 expect_message = "a vanished live WAL must not read as empty"
 file = "crates/broca-core/src/wal_writer/projection_reader.rs"
-old = "                broca_wal::WalRangeRecords::Absent => {}"
-new = "                broca_wal::WalRangeRecords::Absent => return Ok((Vec::new(), 0)), // NON-VACUITY BREAK: certify a vanished WAL as empty."
+old = "                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,"
+new = "                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)), // NON-VACUITY BREAK: certify a vanished WAL as empty."
+
+[[control]]
+id = "core-plain-dispatch-cancel-refuses-batch-before-start"
+guards = "A caller cancellation set before a plain batch starts refuses the whole batch: no route opened, no dispatch intent written"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/dispatch_cancel_tests.rs"
+expect_red = ["run::hook_tests::dispatch_cancel_tests::a_cancel_before_the_batch_starts_opens_no_route_and_writes_no_intent"]
+expect_message = "the tool plane was told a cancelled batch started"
+file = "crates/broca-core/src/run.rs"
+old = "    let batch_refusal = if stop_is_requested(stop) || cancelled_before_batch {"
+new = "    let batch_refusal = if stop_is_requested(stop) || (false && cancelled_before_batch) { // NON-VACUITY BREAK: start a batch the caller already cancelled."
+
+[[control]]
+id = "core-census-reader-counts-only-complete-reads"
+guards = "The census reader counts only a live read that observed the whole file; an undetermined read is an error the census quarantines"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/projection_reader.rs"
+expect_red = ["wal_writer::projection_reader::tests::only_a_complete_live_read_is_counted"]
+expect_message = "an undetermined read must not be counted as the whole WAL"
+file = "crates/broca-core/src/wal_writer/projection_reader.rs"
+old = "        broca_wal::WalRangeRecords::Partial(_) | broca_wal::WalRangeRecords::Unknown(_) => {"
+new = """        broca_wal::WalRangeRecords::Unknown(records) => Ok(Some(records)), // NON-VACUITY BREAK: count an undetermined read.
+        broca_wal::WalRangeRecords::Partial(_) => {"""
+
+[[control]]
+id = "core-replay-corpus-scan-classifies-overlap"
+guards = "The read-only corpus scan reports lineages refused for an overlapping batch separately, with the refusing record's sequence"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/examples/replay-corpus-scan.rs"
+expect_red = ["replay_corpus_scan::tests::scan_counts_each_outcome_and_changes_no_file"]
+expect_message = "refused_overlapping_batch=0"
+file = "crates/broca-core/examples/replay-corpus-scan.rs"
+old = "                if reason == OVERLAPPING_BATCH_REASON =>"
+new = "                if false && reason == OVERLAPPING_BATCH_REASON => // NON-VACUITY BREAK: file overlap refusals with the others."
