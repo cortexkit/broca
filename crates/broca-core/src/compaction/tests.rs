@@ -720,7 +720,10 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
             Ok(Some(self.0.clone()))
         }
     }
-    struct Reads<'a>(&'a Shared, AtomicUsize);
+    // The stored snapshot and the WAL agree on lineage, so the identity check passes and the
+    // missing compaction summary is the only thing that can force the complete read.
+    let lineage = crate::projection_plan_tests::incoming_lineage();
+    struct Reads<'a>(&'a Shared, AtomicUsize, broca_wal::WalLineageId);
     impl crate::WalStore for Reads<'_> {
         fn open(&self, _: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
             unreachable!()
@@ -736,16 +739,18 @@ async fn admission_and_model_page_absent_compaction_summary_force_complete_reads
             _: Option<u64>,
             _: Option<&broca_wal::WalByteAnchor>,
         ) -> Result<broca_wal::WalRangeRead, WalError> {
-            Ok(broca_wal::WalRangeRead::without_anchors(vec![]))
+            let mut range = broca_wal::WalRangeRead::without_anchors(vec![]);
+            range.lineage_id = Some(self.2);
+            Ok(range)
         }
     }
     let store = Store(crate::AdmissionStoreSnapshot {
         watermark_seq: head,
-        lineage_id: None,
+        lineage_id: Some(lineage.to_string()),
         anchor: None,
         checkpoint: Some(checkpoint),
     });
-    let reads = Reads(&shared, AtomicUsize::new(0));
+    let reads = Reads(&shared, AtomicUsize::new(0), lineage);
     let snapshot = crate::load_prior_wal_snapshot(&reads, &bind(), head, Some(&store)).unwrap();
     assert_eq!(reads.1.load(Ordering::SeqCst), 1);
     assert_eq!(snapshot.base_watermark, 0);
