@@ -69,6 +69,13 @@ pub struct FrozenStructuredOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     pub delivery: SchemaDelivery,
+    /// Whether schema instructions that join an existing system message start with a blank
+    /// line. OpenAI Chat and Responses concatenate a system message's text blocks with nothing
+    /// between them, so without the break the instructions run straight on from the caller's
+    /// last sentence. Set when a run is admitted; runs admitted before the break existed lack
+    /// the field and keep rendering the instructions without it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub instructions_paragraph_break: bool,
 }
 
 impl FrozenStructuredOutput {
@@ -250,6 +257,7 @@ mod tests {
             reason: None,
             profile: Some("xai".into()),
             delivery: SchemaDelivery::Strict,
+            instructions_paragraph_break: false,
         }
     }
 

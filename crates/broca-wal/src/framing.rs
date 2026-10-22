@@ -192,6 +192,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STEP_TRANSFORMS_FEATURE,
     STRUCTURED_OUTPUT_FEATURE,
     STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
+    STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
     TOOL_REPLY_FEATURE,
 ];
 
@@ -284,6 +285,13 @@ pub const STRUCTURED_OUTPUT_FEATURE: &str = "structured-output/v1";
 /// A schema compilation refusal changes every subsequent request. Older readers must not
 /// skip the downgrade and resume sending the strict grammar the provider already refused.
 pub const STRUCTURED_OUTPUT_DOWNGRADE_FEATURE: &str = "structured-output-downgrade/v1";
+
+/// The feature a `RunStarted` or `RunConfigRefrozen` requires when its frozen render config's
+/// `structured_output.instructions_paragraph_break` is true. That flag puts a blank line before
+/// schema instructions appended to the system message. A reader without it would read the flag
+/// as absent and resume the run without the blank line: different request bytes from the ones
+/// the run was admitted with, a prompt-cache miss, and a different structured-output prompt.
+pub const STRUCTURED_OUTPUT_PARAGRAPH_FEATURE: &str = "structured-output-paragraph/v1";
 
 /// A tool declared on `session.send` that carries its own reply deadline (`Tool::reply`), frozen
 /// in a `RunStarted`'s tools or held in a `Queued` request's. A reader without it must refuse
@@ -956,6 +964,7 @@ mod tests {
                 STEP_TRANSFORMS_FEATURE,
                 STRUCTURED_OUTPUT_FEATURE,
                 STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
+                STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
                 TOOL_REPLY_FEATURE,
             ]
         );
@@ -982,6 +991,73 @@ mod tests {
         assert_eq!(STEER_QUEUE_FEATURE, "steer-queue/v1");
         assert_eq!(STEP_TRANSFORMS_FEATURE, "step-transforms/v1");
         assert_eq!(STRUCTURED_OUTPUT_FEATURE, "structured-output/v1");
+        assert_eq!(
+            STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
+            "structured-output-paragraph/v1"
+        );
+    }
+
+    /// A run start or refreeze whose frozen structured output carries the instructions
+    /// paragraph break requires its own feature, so an older reader refuses the WAL by that
+    /// name instead of resuming the run without the break. A frozen structured output without
+    /// the flag, or with it false, requires nothing new.
+    #[test]
+    fn structured_output_paragraph_break_is_must_understand() {
+        // Serialized from the protocol type, so renaming its field cannot leave this gate
+        // looking for a key the writer no longer emits.
+        use broca_protocol::structured_output::{FrozenStructuredOutput, Mode, SchemaDelivery};
+        let so = serde_json::to_value(FrozenStructuredOutput {
+            mode: Mode::FinalText,
+            name: "result".into(),
+            schema_jcs: "{}".into(),
+            enforcement: "best_effort".into(),
+            reason: Some("route_unsupported".into()),
+            profile: None,
+            delivery: SchemaDelivery::Unconstrained,
+            instructions_paragraph_break: true,
+        })
+        .unwrap();
+        let mut run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/tmp/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"}});
+        run["config"]["frozen_render_config"] = serde_json::json!({"structured_output": so});
+        let mut refrozen = serde_json::json!({"type":"run_config_refrozen","renderer_version":1,"frozen_render_config":{"structured_output": so}});
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != STRUCTURED_OUTPUT_PARAGRAPH_FEATURE)
+            .collect();
+        for value in [run.clone(), refrozen.clone()] {
+            let record: WalRecord = serde_json::from_value(value).unwrap();
+            let required = record.required_features();
+            assert!(required.contains(&STRUCTURED_OUTPUT_PARAGRAPH_FEATURE));
+            assert!(required.contains(&STRUCTURED_OUTPUT_FEATURE));
+            let bytes = encode(1, 1, &record).unwrap();
+            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+            assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [STRUCTURED_OUTPUT_PARAGRAPH_FEATURE])
+            );
+        }
+
+        // Without the flag (absent or false) the frame requires only structured-output/v1,
+        // which every reader of structured-output runs already has.
+        for flag in [None, Some(false)] {
+            for (value, pointer) in [
+                (&mut run, "/config/frozen_render_config/structured_output"),
+                (&mut refrozen, "/frozen_render_config/structured_output"),
+            ] {
+                let so = value.pointer_mut(pointer).unwrap();
+                match flag {
+                    None => {
+                        so.as_object_mut()
+                            .unwrap()
+                            .remove("instructions_paragraph_break");
+                    }
+                    Some(flag) => so["instructions_paragraph_break"] = serde_json::json!(flag),
+                }
+                let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
+                assert_eq!(record.required_features(), &[STRUCTURED_OUTPUT_FEATURE]);
+            }
+        }
     }
 
     #[test]

@@ -1002,11 +1002,8 @@ impl BedrockStreamNormalizer {
         let event_type = match frame_kind {
             BedrockFrameKind::Event(event_type) => event_type,
             BedrockFrameKind::Error { code, message } => {
-                self.content_observer.observe(
-                    "error",
-                    Some(&payload.to_string()),
-                    frame.payload.len(),
-                );
+                self.content_observer
+                    .observe_value("error", &payload, frame.payload.len());
                 out.push(NormalizedEvent::Control(ProviderControl::Error {
                     error: bedrock_error(code, &payload, message),
                     retries_used: 0,
@@ -1015,9 +1012,9 @@ impl BedrockStreamNormalizer {
             }
         };
         let (event_type, event_payload) = event_type_and_payload(event_type, &payload);
-        self.content_observer.observe(
+        self.content_observer.observe_value(
             event_type.as_deref().unwrap_or("unknown"),
-            Some(&event_payload.to_string()),
+            event_payload,
             frame.payload.len(),
         );
         match event_type.as_deref().unwrap_or("") {
@@ -1899,6 +1896,56 @@ mod tests {
                     if *step_id == StepId(10)
             )));
         }
+    }
+
+    /// Content telemetry classifies each event-stream frame from the JSON the normalizer has
+    /// already parsed: no frame is serialized back to text and parsed a second time, for
+    /// ordinary events or modeled errors, and classification still sees the payload.
+    #[test]
+    fn content_telemetry_reuses_each_parsed_frame_payload() {
+        let mut body = Vec::new();
+        body.extend(test_event_stream_message(
+            "messageStart",
+            br#"{"role":"assistant"}"#,
+        ));
+        body.extend(test_event_stream_message(
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"text":"hi"}}"#,
+        ));
+        body.extend(test_event_stream_message_with_headers(
+            &[
+                (":message-type", "exception"),
+                (":exception-type", "throttlingException"),
+                (":content-type", "application/json"),
+            ],
+            br#"{"message":"too many requests"}"#,
+        ));
+        let mut normalizer = BedrockStreamNormalizer::new(StepId(11));
+        normalizer.push(&body).expect("frames decode");
+
+        assert_eq!(
+            normalizer.content_observer.text_payloads_parsed, 0,
+            "every frame payload must reach content telemetry already parsed"
+        );
+        let progress = normalizer.content_progress();
+        assert!(
+            progress.first_content_at_ms.is_some(),
+            "the text delta still counts as content: {progress:?}"
+        );
+        let counts: BTreeMap<_, _> = progress
+            .event_types
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tally| (tally.event_type, (tally.count, tally.unknown)))
+            .collect();
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                ("contentBlockDelta".to_owned(), (1, None)),
+                ("error".to_owned(), (1, None)),
+                ("messageStart".to_owned(), (1, None)),
+            ])
+        );
     }
 }
 

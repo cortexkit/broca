@@ -455,6 +455,61 @@ fn instructions_without_a_system_message_keep_renderer_positions_aligned() {
     assert_eq!(prepared.declared_markers[0].message_index, 1);
 }
 
+/// Every string value in a rendered body, depth first.
+fn strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => out.push(text.clone()),
+        Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
+        Value::Object(members) => members.values().for_each(|item| strings(item, out)),
+        _ => {}
+    }
+}
+
+/// OpenAI Chat and Responses join a system message's text blocks with nothing between them, so
+/// schema instructions appended to the caller's system text must bring their own break. A newly
+/// decided run starts them on a new paragraph; a decision recorded before the break existed
+/// keeps rendering its original, unbroken bytes on resume.
+#[test]
+fn openai_instructions_start_a_new_paragraph_only_for_newly_decided_runs() {
+    let mut kimi = openai_chat_frozen_config("kimi-k3");
+    kimi.base_url = Some("https://api.moonshot.ai/v1".into());
+    let responses = openai_responses_frozen_config("gpt-6-luna");
+    // Kimi's Chat route has no schema encoding; `oneOf` is outside OpenAI's strict subset.
+    for (family, frozen, provider, schema) in [
+        (&OpenAiChat as &dyn WireFamily, kimi, "moonshotai", closed()),
+        (&OpenAiResponses, responses, "openai", one_of()),
+    ] {
+        let (fresh, decided) = with_structured_output(frozen, provider, Mode::FinalText, schema);
+        assert_eq!(decided.delivery, SchemaDelivery::Unconstrained);
+        assert!(decided.instructions_paragraph_break);
+        let mut rendered = Vec::new();
+        strings(&body(family, &fresh, &opts(false)), &mut rendered);
+        assert!(
+            rendered
+                .iter()
+                .any(|text| text.contains("You report on cities.\n\nYour final answer must")),
+            "{rendered:?}"
+        );
+
+        // A decision recorded without the field reads back without the break.
+        let mut recorded = serde_json::to_value(&decided).unwrap();
+        recorded
+            .as_object_mut()
+            .unwrap()
+            .remove("instructions_paragraph_break");
+        let mut legacy = fresh.clone();
+        legacy.structured_output = Some(serde_json::from_value(recorded).unwrap());
+        let mut rendered = Vec::new();
+        strings(&body(family, &legacy, &opts(false)), &mut rendered);
+        assert!(
+            rendered
+                .iter()
+                .any(|text| text.contains("You report on cities.Your final answer must")),
+            "{rendered:?}"
+        );
+    }
+}
+
 /// Claude Sonnet 5.5 and Opus 5.5 refuse every forcing `tool_choice` with an HTTP 400, with or
 /// without thinking (measured in live probes, October 2026). A `submit_tool` run never sends one to the Anthropic family,
 /// whatever the caller asked for.

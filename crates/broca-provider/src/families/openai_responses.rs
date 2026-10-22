@@ -17,6 +17,7 @@
 //!    `input_tokens`). Sources: OpenAI API reference / streaming guide / prompt-caching
 //!    guide, openai-python `responses/*` types.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use broca_protocol::{
@@ -118,21 +119,55 @@ impl WireFamily for OpenAiResponses {
 /// cache hints are applied by `OpenAiResponses::shape` so the codex backend can keep
 /// its own run-session cache key as the single cache-key authority.
 pub(crate) fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    build_prepared_request_body(frozen, opts).body
+}
+
+/// The shared Responses body together with the inputs it was rendered from, so the ChatGPT
+/// wrapper can finish the body without preparing the request or planning effort a second
+/// time: each of those clones the prompt or parses every episode's frozen config.
+pub(crate) struct PreparedRequestBody<'a> {
+    pub body: Value,
+    /// The request as structured output prepares it.
+    pub prepared: Cow<'a, CallOptions>,
+    /// The ChatGPT effort anchor planned over `prepared`; `None` when no plan applies.
+    pub effort_anchor: Option<String>,
+}
+
+pub(crate) fn build_prepared_request_body<'a>(
+    frozen: &FrozenRenderConfig,
+    opts: &'a CallOptions,
+) -> PreparedRequestBody<'a> {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
-    let opts = prepared.as_ref();
-    let view = crate::families::compaction_view(frozen.family_id, opts);
+    // The plan reads only the episode history, which the compaction view below leaves as it
+    // is, so planning over the prepared request gives the same plan as over that view.
+    let (effort_anchor, updates) =
+        match super::openai_responses_chatgpt::effort_plan(frozen, prepared.as_ref()) {
+            Some((anchor, updates)) => (Some(anchor), updates),
+            None => (None, Vec::new()),
+        };
+    let body = render_prepared_body(frozen, prepared.as_ref(), &updates);
+    PreparedRequestBody {
+        body,
+        prepared,
+        effort_anchor,
+    }
+}
+
+fn render_prepared_body(
+    frozen: &FrozenRenderConfig,
+    prepared: &CallOptions,
+    updates: &[super::openai_responses_chatgpt::EffortUpdate],
+) -> Value {
+    let view = crate::families::compaction_view(frozen.family_id, prepared);
     let opts = view.as_ref();
     let name_map = crate::tool_name_alias::ToolNameMap::build(&opts.tools, &opts.prompt);
-    let updates = super::openai_responses_chatgpt::effort_plan(frozen, opts)
-        .map(|(_, updates)| updates)
-        .unwrap_or_default();
     let input = convert_input_items(
         &opts.prompt,
         frozen.system_prompt.clone(),
         &name_map,
-        &updates,
+        updates,
         &ReplayPolicy {
             target_model: opts.target_model.as_ref(),
             target_family: frozen.family_id,

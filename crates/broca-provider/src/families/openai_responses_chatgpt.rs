@@ -23,7 +23,9 @@ use broca_protocol::{
     provider::NormalizedEvent, request::CallOptions, EncryptedReasoningFormat, StepId,
 };
 
-use crate::families::openai_responses::{build_request_body, OpenAiResponsesNormalizer};
+use crate::families::openai_responses::{
+    build_prepared_request_body, OpenAiResponsesNormalizer, PreparedRequestBody,
+};
 use crate::wire::{
     AuthHandle, FrozenRenderConfig, HttpMethod, HttpRequest, NormalizeError, StreamNormalizer,
     WireFamily,
@@ -48,6 +50,13 @@ pub(crate) struct EffortUpdate {
     pub synthetic_user: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many effort plans this thread has computed past the model check. Each one parses
+    /// every episode's frozen config, so tests use this to show a render plans once.
+    pub(crate) static EFFORT_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn effort_plan(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
@@ -63,6 +72,8 @@ pub(crate) fn effort_plan(
     {
         return None;
     }
+    #[cfg(test)]
+    EFFORT_PLANS.with(|plans| plans.set(plans.get() + 1));
     let configs: Vec<FrozenRenderConfig> = opts
         .render_episodes
         .iter()
@@ -124,7 +135,11 @@ impl WireFamily for OpenAiResponsesChatgpt {
         // The body STARTS from the shared OpenAI-Responses builder, then applies the codex
         // backend's deltas — the ways the codex/responses backend is STRICTER than the
         // platform /responses API (mirrors opencode's codex transform exactly):
-        let mut body = build_request_body(frozen, opts);
+        let PreparedRequestBody {
+            mut body,
+            prepared,
+            effort_anchor,
+        } = build_prepared_request_body(frozen, opts);
         // store:false — the codex backend REJECTS a request without it ("Store must be set
         // to false"). The platform Responses API defaults store on the server side; codex
         // enforces it in the body.
@@ -157,10 +172,9 @@ impl WireFamily for OpenAiResponsesChatgpt {
             }
             reasoning["effort"] = serde_json::Value::String(effort.clone());
         }
-        // The shared builder plans effort over the request as structured output prepares it,
-        // so the anchor is computed over the same prompt positions here.
-        let prepared = crate::structured_output::prepare(frozen, opts);
-        if let Some((anchor, _)) = effort_plan(frozen, prepared.as_ref()) {
+        // The shared builder planned effort over the request as structured output prepares
+        // it, so the anchor covers the same prompt positions as the body's input.
+        if let Some(anchor) = effort_anchor {
             body["reasoning"]["effort"] = serde_json::json!(anchor);
         }
         if let Some(service_tier) = &frozen.service_tier {
@@ -341,6 +355,83 @@ mod tests {
         assert_eq!(
             responses, codex,
             "codex body == platform Responses body − max_output_tokens + store:false"
+        );
+    }
+
+    #[test]
+    fn codex_body_prepares_the_request_and_plans_effort_once_per_render() {
+        use broca_protocol::request::EpisodeRenderInput;
+        use broca_protocol::structured_output::{Mode, StructuredOutput};
+
+        let config = |effort: &str| {
+            let mut frozen = openai_responses_chatgpt_frozen_config("gpt-6");
+            frozen.reasoning = crate::policy::ReasoningPolicy::OpenAiResponsesReasoning {
+                effort: effort.into(),
+                summary: Some("auto".into()),
+            };
+            frozen.chatgpt_effort_updates = true;
+            frozen
+        };
+        let mut frozen = config("low");
+        frozen.structured_output = Some(
+            crate::structured_output::decide(
+                frozen.family_id,
+                "openai",
+                None,
+                crate::spec::CapabilityFlag::Known(true),
+                &StructuredOutput::new(Mode::SubmitTool, serde_json::json!({"type": "object"})),
+            )
+            .unwrap(),
+        );
+        let text =
+            |role, text: &str| Message::new(role, vec![ContentBlock::Text { text: text.into() }]);
+        let mut request = CallOptions::new(vec![
+            text(Role::User, "ping"),
+            text(Role::Assistant, "pong"),
+            text(Role::User, "again"),
+        ]);
+        request.render_episodes = std::sync::Arc::new(
+            vec![
+                EpisodeRenderInput {
+                    prompt_start: 0,
+                    first_user: Some(0),
+                    frozen_config: serde_json::to_value(config("high")).unwrap(),
+                },
+                EpisodeRenderInput {
+                    prompt_start: 2,
+                    first_user: Some(2),
+                    frozen_config: serde_json::to_value(&frozen).unwrap(),
+                },
+            ]
+            .into(),
+        );
+
+        crate::structured_output::PREPARED_COPIES.with(|copies| copies.set(0));
+        EFFORT_PLANS.with(|plans| plans.set(0));
+        let body: serde_json::Value =
+            serde_json::from_slice(&OpenAiResponsesChatgpt.render(&frozen, &request)).unwrap();
+
+        assert_eq!(
+            crate::structured_output::PREPARED_COPIES.with(|copies| copies.get()),
+            1,
+            "one render copies the request for structured output once"
+        );
+        assert_eq!(
+            EFFORT_PLANS.with(|plans| plans.get()),
+            1,
+            "one render plans effort once"
+        );
+        // The anchor and the submit tool both come from that single preparation.
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "submit_result"));
+        assert!(
+            body["input"].to_string().contains("configuration_update"),
+            "the later episode's effort still goes out as an input update: {}",
+            body["input"]
         );
     }
 
