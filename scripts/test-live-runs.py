@@ -26,7 +26,7 @@ live_runs = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = live_runs
 SPEC.loader.exec_module(live_runs)
 
-EXPECTED_SUITE_ANCHORS = 14
+EXPECTED_SUITE_ANCHORS = 19
 
 # Session logs written by the real runner for a resume close-out: two dispatched calls with no
 # result, the resume's `resume_started` record, an `outcome_unknown` result for each, and the
@@ -208,11 +208,70 @@ class LiveRunsGateTests(unittest.TestCase):
         self.assertEqual(code, 1, out + err)
         self.assertIn("live runs          1", out)
 
+    DAEMON = "/home/u/.local/share/cortexkit/bin/ck-broca"
+
+    def matches(self, processes: dict[int, list[str]]) -> list[str]:
+        """matching_pids over a fake /proc holding each pid's argv as its cmdline file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = pathlib.Path(tmp)
+            for pid, argv in processes.items():
+                (proc / str(pid)).mkdir()
+                (proc / str(pid) / "cmdline").write_bytes(
+                    b"".join(os.fsencode(arg) + b"\0" for arg in argv)
+                )
+            (proc / "self").mkdir()  # non-numeric entries are not processes
+            return live_runs.matching_pids("bin/ck-broca", proc_root=proc)
+
     def test_the_scripts_own_process_is_never_a_match(self) -> None:
-        own = str(os.getpid())
-        reply = unittest.mock.Mock(stdout=f"{own}\n4242\n")
-        with unittest.mock.patch.object(live_runs.subprocess, "run", return_value=reply):
-            self.assertEqual(live_runs.matching_pids("bin/ck-broca"), ["4242"])
+        own = os.getpid()
+        self.assertEqual(
+            self.matches({own: [self.DAEMON, "--subc", "c"], 4242: [self.DAEMON, "--subc", "c"]}),
+            ["4242"],
+        )
+
+    def test_a_later_argument_naming_the_daemon_path_is_not_a_match(self) -> None:
+        self.assertEqual(
+            self.matches({
+                111: [self.DAEMON, "--subc", "/run/subc-connection.json"],
+                222: ["bash", "-c", f"sleep 5; cp x {self.DAEMON}"],
+                333: ["tail", "-f", f"{self.DAEMON}.log"],
+                444: ["python3", "scripts/live-runs.py", "--process", "bin/ck-broca"],
+            }),
+            ["111"],
+        )
+
+    def test_the_rollback_command_deploy_prints_is_not_a_match(self) -> None:
+        # deploy.sh's rollback_command: `<repo>/scripts/place-release.sh --staged <backup>
+        # --dest $HOME/.local/share/cortexkit/bin/ck-broca --restart --live-approved`. Its
+        # `#!/usr/bin/env bash` shebang leaves bash as argv[0]; an explicit `bash <script>` too.
+        rollback = [
+            "/home/u/src/broca/scripts/place-release.sh", "--staged",
+            "/home/u/.local/share/cortexkit/rollback/ck-broca.20261022T101500Z",
+            "--dest", self.DAEMON, "--restart", "--live-approved",
+        ]
+        daemon = {111: [self.DAEMON, "--subc", "/run/subc-connection.json"]}
+        self.assertEqual(self.matches({**daemon, 555: ["/bin/bash", *rollback]}), ["111"])
+        self.assertEqual(self.matches({**daemon, 556: ["bash", *rollback]}), ["111"])
+
+    def test_two_daemon_executables_still_refuse(self) -> None:
+        # The control: two daemon-executable entries both match, and the gate refuses to pick.
+        two = {111: [self.DAEMON, "--subc", "/run/a.json"], 112: [self.DAEMON, "--subc", "/run/b.json"]}
+        self.assertEqual(self.matches(two), ["111", "112"])
+        with unittest.mock.patch.object(live_runs, "matching_pids", return_value=["111", "112"]):
+            with self.assertRaises(live_runs.AmbiguousProcess):
+                live_runs.process_start_epoch("bin/ck-broca")
+
+    def test_an_unreadable_process_of_this_user_is_unknown_not_absent(self) -> None:
+        # It might be the daemon, so skipping it could hide the real boot time.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = pathlib.Path(tmp)
+            (proc / "9" / "cmdline").mkdir(parents=True)  # reading it fails with an OSError
+            with self.assertRaises(live_runs.AmbiguousProcess):
+                live_runs.matching_pids("bin/ck-broca", proc_root=proc)
+
+    def test_an_executable_path_with_spaces_is_read_whole(self) -> None:
+        spaced = "/tmp/linux deploy x/bin/ck-broca"
+        self.assertEqual(self.matches({7: [spaced, "--subc", "c"], 8: ["/bin/sh", spaced]}), ["7"])
 
     def test_resume_started_neither_seals_nor_opens_a_run(self) -> None:
         # The crash-orphan pass writes `resume_started` before it seals a run. A sealed

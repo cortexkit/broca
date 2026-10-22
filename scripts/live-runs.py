@@ -246,17 +246,69 @@ def _self_test() -> int:
 
 
 class AmbiguousProcess(Exception):
-    """More than one process matches the daemon pattern, so none of them is known to be it."""
+    """The daemon's process cannot be identified: several match, or one of this user's
+    processes hides its command line."""
 
 
-def matching_pids(pattern: str) -> list[str]:
-    """PIDs whose command line matches `pattern`, leaving out this script's own process."""
-    found = subprocess.run(
-        ["pgrep", "-f", pattern], capture_output=True, text=True, check=False
-    ).stdout.split()
-    # pgrep leaves itself out but not its caller, and this script's own command line names the
-    # pattern whenever --process is given on it.
-    return [pid for pid in found if pid != str(os.getpid())]
+def process_table(proc_root: pathlib.Path | None = None) -> list[tuple[str, str]]:
+    """(pid, argv[0]) for every process whose command line can be read.
+
+    On Linux argv[0] comes from /proc/<pid>/cmdline, which keeps argument boundaries, so an
+    executable path containing spaces is read exactly. Elsewhere it is the first word of
+    `ps`'s command column, the same rule place-release.sh's running-image.sh uses on macOS; an
+    executable path with a space is cut there and never matches, and the gate then refuses as
+    if broca were not running. `proc_root` lets tests supply a fake /proc.
+    """
+    root = proc_root or pathlib.Path("/proc")
+    if proc_root is not None or (sys.platform.startswith("linux") and root.is_dir()):
+        rows = []
+        for entry in root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / "cmdline").read_bytes()
+            except OSError as error:
+                # A process that exited since the listing, or another user's, is not the daemon
+                # this account supervises. One of this user's that is still running but cannot
+                # be read might be, so it is unknown, as in running-image.sh.
+                try:
+                    owner = entry.stat().st_uid
+                except OSError:
+                    continue
+                if owner == os.geteuid():
+                    raise AmbiguousProcess(
+                        f"cannot read the command line of pid {entry.name}: {error}"
+                    ) from error
+                continue
+            if raw:
+                rows.append((entry.name, os.fsdecode(raw.split(b"\0", 1)[0])))
+        return sorted(rows, key=lambda row: int(row[0]))
+    listing = subprocess.run(
+        ["ps", "-A", "-ww", "-o", "pid=,command="], capture_output=True, text=True, check=False
+    ).stdout
+    rows = []
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].isdigit():
+            rows.append((fields[0], fields[1]))
+    return rows
+
+
+def matching_pids(pattern: str, proc_root: pathlib.Path | None = None) -> list[str]:
+    """PIDs of processes whose EXECUTABLE (argv[0]) matches `pattern`.
+
+    Only argv[0] is tested. Matching anywhere in the command line, as `pgrep -f` does, also
+    counted processes that merely name the daemon's path in an argument: the rollback
+    `place-release.sh ... --dest <path>/bin/ck-broca --restart` that deploy.sh prints, a
+    `tail` of a log beside the binary, or this script run with --process. That second match
+    made the restart gate refuse, so the rollback refused itself.
+    """
+    own = str(os.getpid())
+    return [
+        pid
+        for pid, argv0 in process_table(proc_root)
+        if pid != own and re.search(pattern, argv0)
+    ]
 
 
 def start_epoch(pid: str) -> int | None:

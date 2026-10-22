@@ -23106,8 +23106,25 @@ test_count_pattern = "Ran {count} test"
 test_file = "scripts/test-live-runs.py"
 expect_red = ["LiveRunsGateTests.test_the_scripts_own_process_is_never_a_match"]
 file = "scripts/live-runs.py"
-old = "    return [pid for pid in found if pid != str(os.getpid())]"
-new = "    return found  # NON-VACUITY BREAK: keep this script's own pid"
+old = "        if pid != own and re.search(pattern, argv0)"
+new = "        if re.search(pattern, argv0)  # NON-VACUITY BREAK: keep this script's own pid"
+
+[[control]]
+id = "live-runs-matches-the-daemon-executable-only"
+guards = "the restart gate counts only processes whose executable is the daemon, so a rollback naming the daemon's path in its arguments does not refuse itself"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "-c", "import importlib.util, sys, unittest; sys.path.insert(0, 'scripts'); spec = importlib.util.spec_from_file_location('test_live_runs', 'scripts/test-live-runs.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName(sys.argv[1], module)); sys.exit(0 if result.wasSuccessful() else 1)", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-live-runs.py"
+expect_red = [
+    "LiveRunsGateTests.test_a_later_argument_naming_the_daemon_path_is_not_a_match",
+    "LiveRunsGateTests.test_the_rollback_command_deploy_prints_is_not_a_match",
+    "LiveRunsGateTests.test_an_executable_path_with_spaces_is_read_whole",
+]
+file = "scripts/live-runs.py"
+old = """                rows.append((entry.name, os.fsdecode(raw.split(b"\\0", 1)[0])))"""
+new = """                rows.append((entry.name, os.fsdecode(raw.replace(b"\\0", b" "))))  # NON-VACUITY BREAK: match anywhere in the command line"""
 
 [[control]]
 id = "nextest-group-prefixes-name-real-modules"
