@@ -22522,3 +22522,266 @@ expect_message = "found no conversation"
 file = "crates/broca-subc/src/connection.rs"
 old = "        RouteTarget::ToolProvider { .. } if declares_compaction_provider(role_versions) => {\n            identity.harness.as_str()\n        }"
 new = "        RouteTarget::ToolProvider { .. } if declares_compaction_provider(role_versions) => {\n            TOOL_MODULE_HARNESS // NON-VACUITY BREAK: restore the tool-module harness on compaction routes.\n        }"
+
+[[control]]
+id = "actor-idle-backstop-drains-terminal-lane"
+guards = "The idle-tick liveness backstop delivers a run terminal published after the tick was chosen instead of synthesizing Panicked and tearing the actor down"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
+expect_red = ["actor::lifecycle_audit_tests::idle_tick_backstop_delivers_a_terminal_published_after_the_tick_was_chosen"]
+expect_message = "a delivered terminal must not be replaced"
+file = "crates/broca-module/src/actor.rs"
+old = """        while let Ok(terminal) = self.terminal_rx.try_recv() {
+            if self.handle_cmd(terminal).await {
+                return true;
+            }
+        }
+"""
+new = """        // NON-VACUITY BREAK: declare the terminal lost without draining the terminal lane.
+"""
+
+[[control]]
+id = "actor-expiry-close-runs-session-close-once"
+guards = "After an expiry close released the lease, the actor loop's following teardown does not run the executor session close a second time"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
+expect_red = ["actor::lifecycle_audit_tests::expiry_found_by_a_command_closes_the_session_once"]
+expect_message = "the executor's session close runs once per generation"
+file = "crates/broca-module/src/actor.rs"
+old = """        if self.lease.is_none() {
+            return;
+        }
+        self.stop_active_run().await;"""
+new = """        // NON-VACUITY BREAK: repeat the whole teardown after an ordered close.
+        self.stop_active_run().await;"""
+
+[[control]]
+id = "actor-slotless-close-tears-down-writer-and-lease"
+guards = "An idle close that finds its registry slot gone still shuts the writer down and releases the lease before the actor exits"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
+expect_red = ["actor::lifecycle_audit_tests::idle_close_without_its_registry_slot_still_shuts_down_writer_and_lease"]
+expect_message = "the session writer is shut down before the actor exits"
+file = "crates/broca-module/src/actor.rs"
+old = """            // still drains would let a replacement actor append beside it.
+            self.emergency_teardown().await;
+            return true;"""
+new = """            // still drains would let a replacement actor append beside it.
+            return true; // NON-VACUITY BREAK: exit without tearing down writer and lease."""
+
+[[control]]
+id = "actor-slotless-expiry-backs-off"
+guards = "An expiry that cannot claim the registry slot schedules its retry in the future instead of leaving the elapsed deadline armed"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
+expect_red = ["actor::lifecycle_audit_tests::expiry_without_its_registry_slot_backs_off"]
+expect_message = "the retry is scheduled in the future"
+file = "crates/broca-module/src/actor.rs"
+old = """            // retry after the same back-off as a failed read.
+            self.retention_deadline = Some(now_ms.saturating_add(1000));"""
+new = """            // NON-VACUITY BREAK: keep the elapsed deadline armed."""
+
+[[control]]
+id = "actor-recovery-propagates-move-fence-io-errors"
+guards = "Startup recovery treats only move refusals as nothing to recover; an unreadable move fence fails into the recovery back-off"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
+expect_red = ["actor::lifecycle_audit_tests::recovery_does_not_treat_an_unreadable_move_fence_as_nothing_to_recover"]
+expect_message = "got Ok(())"
+file = "crates/broca-module/src/actor.rs"
+old = """                Err(error) => Err(format!("session move check failed: {error}")),"""
+new = """                Err(_) => Ok(()), // NON-VACUITY BREAK: an unreadable move fence reads as nothing to recover."""
+
+[[control]]
+id = "actor-import-preflight-reads-on-blocking-pool"
+guards = "The active-session import retry preflight reads the WAL on the blocking pool, not on the actor's runtime thread"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
+expect_red = ["actor::lifecycle_audit_tests::active_import_retry_preflight_reads_off_the_runtime_thread"]
+expect_message = "the preflight read blocked the runtime thread"
+file = "crates/broca-module/src/actor.rs"
+old = """            let preflight = spawn_blocking(JobKind::WalRead, move || {
+                let result =
+                    broca_core::check_import_retry(&request, store.as_ref(), &preflight_writer);
+                (request, result)
+            })
+            .await;"""
+new = """            // NON-VACUITY BREAK: read the WAL on the actor's runtime thread.
+            let preflight: Result<_, String> = Ok({
+                let result =
+                    broca_core::check_import_retry(&request, store.as_ref(), &preflight_writer);
+                (request, result)
+            });"""
+
+[[control]]
+id = "actor-restart-admission-answers-parked-resume-requests"
+guards = "Every restart admission answers ResumeRestart requests parked during it, not only startup restart recovery"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
+expect_red = ["actor::lifecycle_audit_tests::resume_restart_parked_during_another_restart_admission_is_answered"]
+expect_message = "the parked resume request is answered when the admission ends"
+file = "crates/broca-module/src/actor.rs"
+old = """        if restart_resuming && !self.restart_recovery_owns_waiters {"""
+new = """        if false && restart_resuming && !self.restart_recovery_owns_waiters { // NON-VACUITY BREAK: leave parked resume requests unanswered."""
+
+[[control]]
+id = "actor-restart-admission-stops-on-nested-writer-poison"
+guards = "A command served inside a restart admission that finds the writer poisoned ends that admission instead of letting it keep waiting to admit"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
+expect_red = ["actor::lifecycle_audit_tests::restart_admission_stops_when_a_nested_command_finds_the_writer_poisoned"]
+expect_message = "the restart admission stops once a served command sees the poisoned writer"
+file = "crates/broca-module/src/actor.rs"
+old = """                    if self.writer_poisoned {
+                        break Err(StartRunFailure::Infrastructure(
+                            "session writer was poisoned during restart admission".into(),
+                        ));
+                    }"""
+new = """                    // NON-VACUITY BREAK: keep admitting under a poisoned writer."""
+
+[[control]]
+id = "actor-queued-send-survives-clearing-budget-denials"
+guards = "A durably queued send denied for stale caps, unresolved spend or a lagging or realigning cap mirror stays queued; only hard-cap and unavailable-index denials fail it"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
+expect_red = ["actor::lifecycle_audit_tests::queued_sends_survive_budget_denials_that_clear_by_waiting"]
+expect_message = "must stay queued"
+file = "crates/broca-module/src/actor.rs"
+old = """            Self::UnresolvedSpend
+            | Self::ExportSourceMismatch
+            | Self::TrailingWatermark
+            | Self::Stale => true,
+            Self::HardCapExceeded | Self::ExportIndexUnavailable => false,"""
+new = """            Self::TrailingWatermark => true, // NON-VACUITY BREAK: only the trailing watermark keeps a queued send.
+            Self::UnresolvedSpend
+            | Self::ExportSourceMismatch
+            | Self::Stale
+            | Self::HardCapExceeded
+            | Self::ExportIndexUnavailable => false,"""
+
+[[control]]
+id = "core-model-page-sizes-each-entry-once"
+guards = "Model-view page sizing serializes each entry once instead of re-serializing every accepted entry for each added group"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/context/model_page.rs"
+expect_red = ["context::model_page::tests::sizing_a_model_page_serializes_each_entry_once"]
+expect_message = "a 200-entry page serialized"
+file = "crates/broca-core/src/context/model_page.rs"
+old = """        let candidate_bytes = page_bytes(
+            candidate_count,
+            candidate_entry_bytes,
+            serialized_page_bytes(
+                &[],
+                lineage_id.as_deref(),
+                candidate_next,
+                head,
+                compaction_id.as_deref(),
+                version,
+            ),
+        );"""
+new = """        // NON-VACUITY BREAK: re-serialize every accepted entry for each added group.
+        let _ = candidate_entry_bytes;
+        let mut candidate: Vec<&ModelEntry> = messages.iter().collect();
+        candidate.extend(group.entries.iter());
+        let candidate_bytes = serialized_page_bytes(
+            &candidate,
+            lineage_id.as_deref(),
+            candidate_next,
+            head,
+            compaction_id.as_deref(),
+            version,
+        );"""
+
+[[control]]
+id = "core-model-page-running-size-is-exact"
+guards = "The running model-page size counts the array separators, so it equals the serialized reply and the byte cap holds exactly"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/context/model_page.rs"
+expect_red = ["context::model_page::tests::model_page_sizing_matches_the_serialized_reply_to_the_byte"]
+expect_message = "one byte under the cap holds the last group back"
+file = "crates/broca-core/src/context/model_page.rs"
+old = """    empty_envelope_bytes
+        .saturating_add(entry_bytes)
+        .saturating_add(count.saturating_sub(1) as u64)"""
+new = """    let _ = count; // NON-VACUITY BREAK: forget the separators between entries.
+    empty_envelope_bytes.saturating_add(entry_bytes)"""
+
+[[control]]
+id = "core-compaction-replacement-encodes-carried-once"
+guards = "Validating a compaction replacement encodes each carried and each replacement message once, not both sides per comparison"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction.rs"
+expect_red = ["compaction::carried_encoding_tests::replacement_validation_encodes_each_message_once"]
+expect_message = "each carried and each replacement message is encoded exactly once"
+file = "crates/broca-core/src/compaction.rs"
+old = "    let unchanged = carried.encoded.contains(&candidate);"
+new = "    let _ = candidate; let unchanged = carried.messages.iter().any(|original| encoded(original) == encoded(&message)); // NON-VACUITY BREAK: encode both sides per comparison."
+
+[[control]]
+id = "core-export-catch-up-holds-one-session-wal"
+guards = "Boot export catch-up emits every missing run of one session before reading the next session's WAL, so only one WAL is resident at a time"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/context.rs"
+expect_red = ["context::catch_up_tests::catch_up_reads_each_missing_session_once_and_emits_it_before_reading_the_next"]
+expect_message = "every missing run of one session is emitted before the next session's WAL is read"
+file = "crates/broca-core/src/context.rs"
+old = """    for (session, run_ids) in sessions {
+        let records = wal_store.read_records(&session).map_err(|error| {
+            ExportError::Storage(format!(
+                "read WAL for missed export run {}: {error}",
+                run_ids[0].0
+            ))
+        })?;
+        for run_id in &run_ids {"""
+new = """    // NON-VACUITY BREAK: load every session's WAL before emitting any.
+    let mut loaded = Vec::new();
+    for (session, run_ids) in sessions {
+        let records = wal_store.read_records(&session).map_err(|error| {
+            ExportError::Storage(format!(
+                "read WAL for missed export run {}: {error}",
+                run_ids[0].0
+            ))
+        })?;
+        loaded.push((records, run_ids));
+    }
+    for (records, run_ids) in loaded {
+        for run_id in &run_ids {"""

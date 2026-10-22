@@ -66,6 +66,8 @@ fn serialized_page_bytes(
     compaction_id: Option<&str>,
     version: Option<u64>,
 ) -> u64 {
+    #[cfg(test)]
+    tests::note_entries_serialized(messages.len());
     broca_protocol::serialized_json_bytes(&SerializedPage {
         messages,
         lineage_id,
@@ -77,6 +79,23 @@ fn serialized_page_bytes(
         compaction_id,
         version,
     })
+}
+
+/// Serialized bytes of one page entry, exactly as it appears inside the page's `messages` array.
+fn entry_bytes(entry: &ModelEntry) -> u64 {
+    #[cfg(test)]
+    tests::note_entries_serialized(1);
+    broca_protocol::serialized_json_bytes(entry)
+}
+
+/// Exact serialized size of a page holding `count` entries whose own serialized sizes sum to
+/// `entry_bytes`, given the size of the same page with an empty `messages` array. Compact JSON
+/// writes an array as `[` + entries joined by `,` + `]`, so the entries add their own bytes plus
+/// one separator between each pair; the brackets are already in the empty envelope.
+fn page_bytes(count: usize, entry_bytes: u64, empty_envelope_bytes: u64) -> u64 {
+    empty_envelope_bytes
+        .saturating_add(entry_bytes)
+        .saturating_add(count.saturating_sub(1) as u64)
 }
 
 fn entry(message: Message) -> ModelEntry {
@@ -294,18 +313,28 @@ fn assemble(
     let mut atomic_groups = Vec::new();
     let mut next_from_ordinal = None;
     let groups_len = groups.len();
+    // Serialized bytes of every entry accepted so far. Each entry is measured once; the page's
+    // size is then this sum plus the envelope and the array's separators (see `page_bytes`).
+    let mut accepted_entry_bytes = 0u64;
     for (group_index, mut group) in groups.into_iter().enumerate().skip(first_group) {
         let candidate_count = messages.len().saturating_add(group.entries.len());
         let candidate_next = (group_index + 1 < groups_len).then_some(group.next_ordinal);
-        let mut candidate: Vec<&ModelEntry> = messages.iter().collect();
-        candidate.extend(group.entries.iter());
-        let candidate_bytes = serialized_page_bytes(
-            &candidate,
-            lineage_id.as_deref(),
-            candidate_next,
-            head,
-            compaction_id.as_deref(),
-            version,
+        let candidate_entry_bytes = group
+            .entries
+            .iter()
+            .map(entry_bytes)
+            .fold(accepted_entry_bytes, u64::saturating_add);
+        let candidate_bytes = page_bytes(
+            candidate_count,
+            candidate_entry_bytes,
+            serialized_page_bytes(
+                &[],
+                lineage_id.as_deref(),
+                candidate_next,
+                head,
+                compaction_id.as_deref(),
+                version,
+            ),
         );
         if !messages.is_empty() && (candidate_count > limit || candidate_bytes > max_bytes) {
             next_from_ordinal = Some(group.anchor);
@@ -318,6 +347,7 @@ fn assemble(
         };
         messages.append(&mut group.entries);
         atomic_groups.push(descriptor);
+        accepted_entry_bytes = candidate_entry_bytes;
         next_from_ordinal = candidate_next;
     }
     Ok(ModelPage {
@@ -559,5 +589,95 @@ mod tests {
         )
         .unwrap();
         assert_eq!(page.messages[0].message.content, [opaque, answer]);
+    }
+
+    thread_local! {
+        /// Page entries serialized on this thread, by either the whole-page or per-entry path.
+        static ENTRIES_SERIALIZED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn note_entries_serialized(count: usize) {
+        ENTRIES_SERIALIZED.with(|cell| cell.set(cell.get() + count));
+    }
+
+    fn entries_serialized_during(run: impl FnOnce()) -> usize {
+        ENTRIES_SERIALIZED.with(|cell| cell.set(0));
+        run();
+        ENTRIES_SERIALIZED.with(std::cell::Cell::get)
+    }
+
+    fn numbered_messages(count: u64) -> Vec<Message> {
+        (0..count)
+            .map(|ordinal| {
+                let mut message = text(Role::User, format!("message {ordinal}"));
+                message.ordinal = Some(ordinal);
+                message
+            })
+            .collect()
+    }
+
+    fn page_of(raw: Vec<Message>, limit: u64, max_bytes: Option<u64>) -> ModelPage {
+        assemble(
+            raw,
+            None,
+            &ModelPageRequest {
+                from_ordinal: Some(0),
+                limit: Some(limit),
+                max_bytes,
+                ..ModelPageRequest::default()
+            },
+            Some("lineage-1".into()),
+            Some(crate::Cursor::new(7, 0)),
+        )
+        .unwrap()
+    }
+
+    fn reply_bytes(page: &ModelPage) -> u64 {
+        let refs: Vec<_> = page.messages.iter().collect();
+        serialized_page_bytes(
+            &refs,
+            page.lineage_id.as_deref(),
+            page.next_from_ordinal,
+            page.head,
+            page.compaction_id.as_deref(),
+            page.version,
+        )
+    }
+
+    /// Sizing a page measures each entry once. Re-serializing every accepted entry for each
+    /// added group made a full page cost quadratic serializer work on every model-view read.
+    #[test]
+    fn sizing_a_model_page_serializes_each_entry_once() {
+        let raw = numbered_messages(200);
+        let mut page = None;
+        let serialized = entries_serialized_during(|| page = Some(page_of(raw, 500, None)));
+        assert_eq!(page.unwrap().messages.len(), 200);
+        assert!(
+            serialized <= 200,
+            "a 200-entry page serialized {serialized} entries while sizing"
+        );
+    }
+
+    /// The running size is the exact size of the reply: a byte cap equal to a page's serialized
+    /// size admits every group, and one byte less holds the last group back.
+    #[test]
+    fn model_page_sizing_matches_the_serialized_reply_to_the_byte() {
+        let raw = numbered_messages(12);
+        let full = page_of(raw.clone(), 500, None);
+        assert_eq!(full.messages.len(), 12);
+        assert_eq!(full.next_from_ordinal, None);
+        let exact = reply_bytes(&full);
+
+        let at_cap = page_of(raw.clone(), 500, Some(exact));
+        assert_eq!(at_cap.messages.len(), 12, "a reply of exactly the cap fits");
+
+        let under_cap = page_of(raw, 500, Some(exact - 1));
+        assert_eq!(
+            under_cap.messages.len(),
+            11,
+            "one byte under the cap holds the last group back"
+        );
+        assert_eq!(under_cap.next_from_ordinal, Some(11));
+        assert!(reply_bytes(&under_cap) < exact);
     }
 }

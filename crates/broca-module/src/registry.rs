@@ -5775,6 +5775,19 @@ impl RegistryHandle {
     pub(crate) fn repair_retention(&self, key: &LineageKey) {
         self.inner.repairs.insert(key);
     }
+
+    /// Publish `handle` as the open generation for `key`, so an actor a test builds directly
+    /// can claim and commit its own close through the real slot state machine.
+    #[cfg(test)]
+    pub(crate) fn publish_open_slot_for_test(&self, key: &LineageKey, handle: ActorHandle) {
+        self.inner.slots.lock().unwrap().insert(
+            key.clone(),
+            Entry::Open {
+                gen: handle.gen,
+                handle,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
