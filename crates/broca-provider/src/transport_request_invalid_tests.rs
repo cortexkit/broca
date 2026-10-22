@@ -8,6 +8,7 @@ const OPENAI_INVALID_SCHEMA_BODY: &str = r#"{"error":{"message":"Invalid schema 
 const ANTHROPIC_INVALID_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0.tool_use.input: Input should be a valid dictionary"}}"#;
 const GOOGLE_INVALID_BODY: &str = r#"{"error":{"code":400,"message":"Invalid JSON payload received. Unknown name \"foo\" at 'generation_config': Cannot find field.","status":"INVALID_ARGUMENT"}}"#;
 const OPENCODE_GO_MISSING_SESSION_ID_BODY: &str = r#"{"type":"error","error":{"type":"MissingSessionID","message":"Request is missing x-opencode-session and cannot be routed efficiently."}}"#;
+const OPENCODE_GO_USAGE_LIMIT_BODY: &str = r#"{"type":"error","error":{"type":"GoUsageLimitError","message":"Subscription quota exceeded. You can continue using free models."},"metadata":{"workspace":"wrk_fixture","limitName":"5 hour"}}"#;
 
 /// Classify `body` as each family's live path does (the frozen family supplied) and as a caller
 /// with only the body does (no family), and require both to agree.
@@ -290,6 +291,173 @@ async fn an_opencode_go_missing_session_id_400_ends_the_step_without_retry() {
     let error = terminal_error(&events);
     assert_eq!(error.class, ErrorClass::Permanent);
     assert_eq!(error.provider_code.as_deref(), Some("MissingSessionID"));
+    assert_eq!(server.request_bodies().len(), 1);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        NormalizedEvent::Control(ProviderControl::Error {
+            retries_used: 0,
+            ..
+        })
+    )));
+}
+
+#[test]
+fn opencode_go_usage_limit_429_is_account_limit_exhausted_and_logged_safely() {
+    let response_headers = crate::wire::ResponseHeaders::new([
+        ("retry-after", "19380"),
+        ("content-type", "application/json"),
+        ("x-request-id", "request-id-fixture"),
+        ("authorization", "not-a-credential"),
+        ("set-cookie", "not-a-credential"),
+    ]);
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let error = super::super::classify_http_error_in_family(
+        429,
+        OPENCODE_GO_USAGE_LIMIT_BODY,
+        Some(19_380.0),
+        None,
+        Some(WireFamilyId::OpenAiChat),
+        None,
+    );
+    let error = super::super::classify_account_limit_exhausted(
+        WireFamilyId::OpenAiChat,
+        429,
+        &response_headers,
+        OPENCODE_GO_USAGE_LIMIT_BODY,
+        now,
+        error,
+    );
+    assert_eq!(error.class, ErrorClass::Transient);
+    assert_eq!(error.provider_code.as_deref(), Some(ACCOUNT_LIMIT_EXHAUSTED));
+    assert_eq!(error.resets_at_ms, Some(1_700_019_380_000));
+    assert_eq!(error.resets_at_source.as_deref(), Some("retry_after"));
+    assert_eq!(error.limit_window.as_deref(), Some("5 hour"));
+    assert!(error.is_account_limit_exhausted());
+
+    for limit_window in ["weekly", "monthly"] {
+        let window_body = OPENCODE_GO_USAGE_LIMIT_BODY.replace("5 hour", limit_window);
+        let error = super::super::classify_http_error_in_family(
+            429,
+            &window_body,
+            Some(19_380.0),
+            None,
+            Some(WireFamilyId::OpenAiChat),
+            None,
+        );
+        let error = super::super::classify_account_limit_exhausted(
+            WireFamilyId::OpenAiChat,
+            429,
+            &response_headers,
+            &window_body,
+            now,
+            error,
+        );
+        assert_eq!(error.limit_window.as_deref(), Some(limit_window));
+    }
+
+    let error = super::super::classify_http_error_in_family(
+        429,
+        OPENCODE_GO_USAGE_LIMIT_BODY,
+        None,
+        None,
+        Some(WireFamilyId::OpenAiChat),
+        None,
+    );
+    let no_reset_header = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
+    let error = super::super::classify_account_limit_exhausted(
+        WireFamilyId::OpenAiChat,
+        429,
+        &no_reset_header,
+        OPENCODE_GO_USAGE_LIMIT_BODY,
+        now,
+        error,
+    );
+    assert!(error.is_account_limit_exhausted());
+    assert_eq!(error.resets_at_ms, None, "do not infer a reset from the window name");
+
+    let request_headers = vec![
+        ("authorization".into(), "not-a-credential".into()),
+        ("x-api-key".into(), "not-a-credential".into()),
+        ("x-opencode-client".into(), "pi".into()),
+        ("x-opencode-session".into(), "session-id-fixture".into()),
+    ];
+    let fields = super::super::opencode_go_refusal_log_fields(
+        &request_headers,
+        429,
+        &response_headers,
+        OPENCODE_GO_USAGE_LIMIT_BODY,
+    )
+    .expect("Go refusal has a safe log record");
+    assert_eq!(fields.status, 429);
+    assert_eq!(fields.body_error_code, Some("GoUsageLimitError"));
+    assert_eq!(
+        fields.safe_headers,
+        vec![
+            ("retry-after".into(), "19380".into()),
+            ("content-type".into(), "application/json".into()),
+            ("x-request-id".into(), "request-id-fixture".into()),
+        ]
+    );
+    assert!(!format!("{fields:?}").contains("not-a-credential"));
+
+    let generic = super::super::classify_http_error_in_family(
+        429,
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"try later"}}"#,
+        Some(19_380.0),
+        None,
+        Some(WireFamilyId::OpenAiChat),
+        None,
+    );
+    let generic = super::super::classify_account_limit_exhausted(
+        WireFamilyId::OpenAiChat,
+        429,
+        &response_headers,
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"try later"}}"#,
+        now,
+        generic,
+    );
+    assert_eq!(generic.class, ErrorClass::Transient);
+    assert!(!generic.is_account_limit_exhausted());
+}
+
+/// A quota-window refusal ends this Go step without retrying the same capped model.
+#[tokio::test]
+async fn an_opencode_go_usage_limit_429_ends_the_step_without_retry() {
+    let server = ScriptedServer::start(vec![
+        ScriptResponse::Http {
+            status: 429,
+            headers: vec![
+                ("content-type", "application/json"),
+                ("retry-after", "19380"),
+            ],
+            body: OPENCODE_GO_USAGE_LIMIT_BODY.as_bytes(),
+        },
+        ScriptResponse::Http {
+            status: 200,
+            headers: vec![("content-type", "text/event-stream")],
+            body: concat!("data: [DONE]\n\n").as_bytes(),
+        },
+    ])
+    .await;
+    let mut frozen = crate::families::openai_chat_frozen_config("deepseek-v4-pro");
+    frozen.base_url = Some(server.url.clone());
+    frozen.opencode_go_session_id = Some("session-id-fixture".into());
+    let provider = LiveProvider::new(crate::families::OpenAiChat, frozen, AuthHandle::None);
+    let mut rx = provider.start_step(
+        StepId(1),
+        Arc::new(CallOptions::new(Vec::new())),
+        CancellationToken::new(),
+        None,
+    );
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let error = terminal_error(&events);
+    assert_eq!(error.class, ErrorClass::Transient);
+    assert_eq!(error.provider_code.as_deref(), Some(ACCOUNT_LIMIT_EXHAUSTED));
+    assert_eq!(error.limit_window.as_deref(), Some("5 hour"));
+    assert!(error.resets_at_ms.is_some());
     assert_eq!(server.request_bodies().len(), 1);
     assert!(events.iter().any(|event| matches!(
         event,

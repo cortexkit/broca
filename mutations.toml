@@ -23871,3 +23871,21 @@ old = '''        "gpt-6-luna": {
           "wire_family": "openai_responses"
         },'''
 new = '''        "gpt-6-luna": {},'''
+
+
+[[control]]
+id = "opencode-go-usage-limit-account-wall"
+guards = "Only the documented GoUsageLimitError window body maps a 429 to account_limit_exhausted"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_request_invalid_tests.rs"
+expect_red = ["transport::tests::request_invalid::opencode_go_usage_limit_429_is_account_limit_exhausted_and_logged_safely"]
+expect_message = "account_limit_exhausted"
+file = "crates/broca-provider/src/transport.rs"
+old = '''        || body.pointer("/error/type").and_then(Value::as_str) != Some("GoUsageLimitError")'''
+new = '''        || body.pointer("/error/type").and_then(Value::as_str) == Some("GoUsageLimitError") // NON-VACUITY BREAK: decline Go quota classification.'''
+
+
