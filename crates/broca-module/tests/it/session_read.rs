@@ -177,8 +177,10 @@ impl WalStore for ZeroRangeCountingWalStore {
 
 /// A WAL store that reports no file identity, as `FileWalStore` does on Windows, where the
 /// standard library exposes no stable file id. The read path keys its cached flush proof on
-/// that identity, so without one every idle read must take a fresh flush barrier. Wrapping a
-/// real store lets a Unix run take the same read path a Windows run takes.
+/// that identity, so without one an idle read that finds WAL records past the stored
+/// watermark must take a fresh flush barrier. Wrapping a real store lets a Unix run take the
+/// durability branch a Windows run takes; range reads still go to the Unix store, which can
+/// return byte anchors where Windows returns none.
 struct NoFileIdentityWalStore {
     inner: Arc<dyn WalStore>,
 }
@@ -808,9 +810,10 @@ async fn unidentified_store_snapshot_replays_once_then_reads_incrementally() {
     assert_unidentified_store_snapshot_repair(&rig, &key, &zero_range_reads, file_identity).await;
 }
 
-/// The read path a Windows host takes, reproduced on any host by hiding the WAL file identity
-/// from the registry's reader. The first read pays two sequence-zero range reads there; every
-/// later read is incremental.
+/// The durability branch a Windows host takes, exercised on any host by hiding the WAL file
+/// identity from the registry's reader. The first read pays two sequence-zero range reads
+/// there; every later read requests only the WAL sequences after the repaired prefix's
+/// watermark.
 #[tokio::test]
 async fn unidentified_store_snapshot_without_file_identity_takes_its_own_flush_proof() {
     let (rig, zero_range_reads) =
