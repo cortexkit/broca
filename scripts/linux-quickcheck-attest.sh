@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the crate quickcheck on Linux and record the exact staged tree it verified.
+# Run the crate quickcheck on Linux and record the exact working tree it verified.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,17 +24,33 @@ while IFS= read -r crate; do
 done < <(printf '%s\n' "$@" | LC_ALL=C sort -u)
 crate_list=$(IFS=,; printf '%s' "${crates[*]}")
 
-if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
-  echo "linux-quickcheck-attest: stage the intended tree and remove unstaged or untracked inputs first" >&2
-  exit 2
-fi
+scratch_root="${TMPDIR:-$root/target/scratch}"
+mkdir -p "$scratch_root"
+scratch=$(mktemp -d "$scratch_root/broca-linux-attest.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+objects="$scratch/objects"
+mkdir -p "$objects"
+alternate_objects=$(git rev-parse --git-path objects)
+[[ "$alternate_objects" == /* ]] || alternate_objects="$root/$alternate_objects"
 
-tree=$(git write-tree)
+# The remote build checkout keeps .git read-only. Build the candidate tree with a private index
+# and object directory so hashing the working tree never writes into Git's shared metadata.
+candidate_tree() {
+  local index="$scratch/index"
+  rm -f "$index" "$index.lock"
+  GIT_INDEX_FILE="$index" GIT_OBJECT_DIRECTORY="$objects" \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="$alternate_objects" git read-tree HEAD
+  GIT_INDEX_FILE="$index" GIT_OBJECT_DIRECTORY="$objects" \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="$alternate_objects" git add -A
+  GIT_INDEX_FILE="$index" GIT_OBJECT_DIRECTORY="$objects" \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES="$alternate_objects" git write-tree
+}
+
+tree=$(candidate_tree)
 echo "linux-quickcheck-attest: checking tree $tree for crates $crate_list"
 ./scripts/quickcheck.sh "${crates[@]}"
 
-if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]] \
-    || [[ "$(git write-tree)" != "$tree" ]]; then
+if [[ "$(candidate_tree)" != "$tree" ]]; then
   echo "linux-quickcheck-attest: tree changed during quickcheck; no attestation written" >&2
   exit 1
 fi
