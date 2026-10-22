@@ -738,7 +738,16 @@ sends `RouteBindAck`, so a client's first request after the acknowledgement find
 A route `GOODBYE` closes only the channel/epoch it names. A pending replacement can be
 canceled without closing the published route or its stream, and closing the published
 route does not cancel authorization of a different pending epoch. After the replacement
-is accepted, a `GOODBYE` naming the old epoch is stale.
+is accepted, a `GOODBYE` naming the old epoch is stale; accepting the replacement is what
+ends the old epoch's subscribe stream.
+
+A stream unit whose frame would exceed the transport frame limit (4 MiB including the header),
+or that cannot be encoded at all, is never put on the wire. The stream ends with a typed
+`subscribe_unit_undeliverable` Error and no `StreamEnd`. Its detail names `reason`
+(`too_large` or `unencodable`), the unit's control `cursor` (`{wal_seq, sub_index}`, or null for
+a display event), and for `too_large` the `frame_bytes` and `limit`. The served bytes are pinned
+by `crates/broca-module-serve/tests/golden/subscribe_unit_undeliverable.too_large.json`.
+For a control unit, resubscribing from before its cursor reaches the same unit again.
 
 Route requests authorize the caller before method parameter validation or migration
 checks. In particular, an unauthorized `session.subscribe` reports the authorization

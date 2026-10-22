@@ -135,6 +135,10 @@ pub struct SendPlan {
     /// no episode when the serve layer checked it; the actor freezes it only if the session
     /// still has none when the send is admitted.
     pub manifest: Option<Arc<broca_wal::PlanManifest>>,
+    /// The checked plan, present when the send left its model to the session. The serve layer
+    /// cannot know that model, so the actor checks the plan's model-bearing items against the
+    /// session's frozen model once it is resolved, refusing `plan_model_mismatch` there.
+    pub model_check: Option<Arc<broca_fetch_plan::Plan>>,
 }
 
 /// A command to the actor. Each carries a reply channel; the actor NEVER silently drops a
@@ -2980,6 +2984,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // a retry under the same key with another plan is refused by name like any later send.
         // The identical plan changes nothing: the send goes on as an ordinary later send.
         let carries_plan = plan.is_some();
+        let deferred_model_check = plan.as_ref().and_then(|plan| plan.model_check.clone());
         if let Some(plan) = plan {
             let ownership = match self.load_ownership().await {
                 Ok(ownership) => ownership,
@@ -3316,6 +3321,30 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Ok(true) => return SendOutcome::Retracted { submission_id },
                     Ok(false) => {}
                     Err(error) => return SendOutcome::Error(error),
+                }
+            }
+        }
+
+        // A send that left its model to the session is checked against the plan's model-bearing
+        // items here, with the model it inherits: the latest episode's frozen model, which
+        // `record_frozen_model` and run start also take. It runs after the same-key receipts
+        // above, so a retry of an admitted send keeps its answer even if a later episode
+        // changed the session's model.
+        if let Some(plan) = deferred_model_check {
+            let checkpoint = match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Transient(error),
+            };
+            // With no episode there is no model to inherit; admission refuses the send for its
+            // missing model further on.
+            if let Some(episode) = &checkpoint.last_episode {
+                if let Err(refusal) = broca_fetch_plan::admit::check_plan_model(
+                    &plan,
+                    episode.config.model.provider_module_id.as_str(),
+                    &episode.config.model.model_id,
+                    episode.config.variant.as_deref(),
+                ) {
+                    return SendOutcome::PlanRefused(refusal);
                 }
             }
         }

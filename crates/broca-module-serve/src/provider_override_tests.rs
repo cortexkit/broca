@@ -1475,6 +1475,70 @@ async fn later_persona_admissions_inherit_the_ordinal_without_reading_wal_bytes(
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A fresh Claude Code episode whose prompt history cannot be read is refused through the
+/// admission ack with that read's permanent Config cause. The actor treats a dropped ack as
+/// "run ended before admission", an unclassified infrastructure failure that hides the cause.
+#[tokio::test]
+async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
+    use broca_core::WalStore as _;
+    let root = broca_test_support::scratch_root()
+        .join(format!("broca-prompt-ack-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let (executor, server) = stand_in_executor(&root).await;
+    // An absent auth file: no operator credential is read, and the episode is not API-key auth,
+    // so it speaks as Claude Code.
+    let executor = executor
+        .with_claude_code_install_id(Some("install-test".into()))
+        .with_opencode_auth_path(root.join("absent-auth.json"));
+    let mut req = drift_request(&root);
+    req.input = vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text { text: "hello".into() }],
+    )];
+    let store = FileWalStore::new(root.join("wal"));
+    let wal = store.open(&req.session).unwrap();
+    let mut prior_snapshot = broca_core::load_prior_wal_snapshot(
+        &store,
+        &req.session,
+        0,
+        None::<&broca_store::SqliteStore>,
+    )
+    .unwrap();
+    // The snapshot claims durable history the empty WAL does not hold, so counting prompts
+    // through it fails.
+    prior_snapshot.head_seq = 5;
+    let (ack, admitted) = tokio::sync::oneshot::channel();
+    let job = RunJob {
+        conversation_key: None,
+        req,
+        auth: None,
+        writer: Arc::new(broca_core::WalHandle::spawn(wal, 1).unwrap()),
+        kind: RunKind::AppendEpisode,
+        skip_materialization: true,
+        control: Default::default(),
+        prior_snapshot,
+        on_admitted: Some(ack),
+    };
+    let (out, _events) = tokio::sync::mpsc::channel(8);
+    let result = executor.execute(job, out).await;
+    assert!(
+        matches!(&result, Err(RunError::Config(message)) if message.contains("prompt history read failed")),
+        "the executor returns the read failure: {:?}",
+        result.as_ref().err()
+    );
+    match admitted.await {
+        Ok(Err(RunError::Config(message))) => assert!(
+            message.contains("prompt history read failed"),
+            "the ack carries the read failure: {message}"
+        ),
+        other => panic!("the admission ack must carry the Config refusal, got {other:?}"),
+    }
+    drop(executor);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Resolve a ChatGPT (codex) episode for `openai/gpt-5.3-codex` the way the executor does. On a
 /// resume, `recorded` is the episode's RunConfig and each restored input is read from it through
 /// the executor's own reader; `restore_text_state` turns off the provider-text-state restore so

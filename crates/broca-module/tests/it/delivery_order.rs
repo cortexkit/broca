@@ -481,6 +481,7 @@ fn plan_naming(sender: &str, idle_start: bool) -> broca_module::actor::SendPlan 
             fetches: vec![],
             declarations: vec![],
         })),
+        model_check: None,
     }
 }
 

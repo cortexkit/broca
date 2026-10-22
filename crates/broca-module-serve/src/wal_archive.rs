@@ -127,7 +127,6 @@ impl WalArchiveConfig {
         //
         // A feature whose whole contract is "something happens later, by itself" must say
         // so when it arms, or its first report is 24 hours after the question is asked.
-        let started = SystemTime::now();
         // PRINT WHAT THIS CALL WILL DO, not what the module's constants say. The wording
         // named the MONOTONIC clock, which was true when the line was written and false
         // an hour later when the schedule moved to a wall-clock decision against the
@@ -165,27 +164,39 @@ impl WalArchiveConfig {
                 tokio::time::sleep(poll).await;
                 WAL_ARCHIVE_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let probe = root.clone();
-                let reference = match spawn_blocking(JobKind::Archive, move || last_pass(&probe))
-                    .await
-                {
-                    Ok(value) => value.unwrap_or(started),
+                let last = match spawn_blocking(JobKind::Archive, move || last_pass(&probe)).await {
+                    Ok(value) => value,
                     Err(e) => {
                         tracing::warn!(target: "archive", "WAL archive schedule probe failed: {e}");
                         continue;
                     }
                 };
-                let elapsed = SystemTime::now()
-                    .duration_since(reference)
-                    .unwrap_or_default();
-                if elapsed < interval {
-                    continue;
-                }
-                tracing::info!(
+                match last {
+                    Some(reference) => {
+                        let elapsed = SystemTime::now()
+                            .duration_since(reference)
+                            .unwrap_or_default();
+                        if elapsed < interval {
+                            continue;
+                        }
+                        tracing::info!(
+                            target: "archive",
+                            "WAL archive pass due: {}s since the last pass, interval {}s",
+                            elapsed.as_secs(),
+                            interval.as_secs()
+                        );
+                    }
+                    // No usable pass timestamp was found under this root (none was ever
+                    // recorded, or the archive directories cannot be read), so there is no
+                    // durable anchor to measure from. Measuring from this process's start would let a daemon
+                    // restarted more often than the interval wait forever, and with no first
+                    // pass no anchor would ever appear. The first poll of uptime is the grace
+                    // period; the pass it runs records the anchor every later decision uses.
+                    None => tracing::info!(
                         target: "archive",
-                        "WAL archive pass due: {}s since the last pass, interval {}s",
-                    elapsed.as_secs(),
-                    interval.as_secs()
-                );
+                        "WAL archive pass due: no earlier pass is recorded under this root"
+                    ),
+                }
                 let root = root.clone();
                 match spawn_blocking(JobKind::Archive, move || scheduled_pass(&root, self)).await {
                     Ok(Ok(_)) => {}
@@ -206,9 +217,10 @@ impl WalArchiveConfig {
 /// An operator's `store-maintenance wal-fold` writes the same names, so a manual fold
 /// postpones the scheduled one exactly as a scheduled fold would.
 ///
-/// `None` means no pass exists yet, NOT "long ago": the caller falls back to its
-/// own start time, so a tree that has never folded waits a full interval rather than
-/// folding on the first poll.
+/// `None` means no usable pass timestamp was found (none recorded yet, or the archive
+/// directories are unreadable), NOT "long ago": the caller runs the pass on its
+/// first poll, which records the anchor, rather than measuring an interval from its own
+/// start time, which a daemon restarted more often than the interval would never reach.
 fn last_pass(root: &Path) -> Option<SystemTime> {
     let newest = ["wal-archive", "wal-archive-durable"]
         .into_iter()
@@ -568,8 +580,8 @@ mod tests {
         std::fs::create_dir_all(&archive).unwrap();
         assert!(
             last_pass(root.path()).is_none(),
-            "no container means no pass has run, NOT a pass long ago -- the caller falls \
-             back to its own start time, so a never-folded tree still waits a full interval"
+            "no container means no pass has run, NOT a pass long ago -- the caller runs the \
+             first pass on its first poll rather than inventing an anchor"
         );
         std::fs::write(archive.join("fold-1000.ark"), b"").unwrap();
         std::fs::write(archive.join("fold-9000.ark"), b"").unwrap();
@@ -693,13 +705,15 @@ mod tests {
         );
     }
 
-    /// A tree that has never folded must NOT fold on the first poll.
+    /// A tree that has never folded runs its first pass on the first poll, then waits for the
+    /// interval measured from the anchor that pass recorded.
     ///
-    /// The poll is short by design, so without the wall-clock check a fresh daemon would
-    /// scan every session every hour. This runs in real time with a 50 ms poll against a
-    /// 24-hour interval: several polls must pass and produce no archive.
+    /// The first pass used to wait a full interval from the process's own start, so a daemon
+    /// restarted more often than the interval never ran it and never gained an anchor. The
+    /// short poll must still not fold every time: this runs in real time with a 20 ms poll
+    /// against a 24-hour interval, and exactly one pass may be recorded.
     #[tokio::test]
-    async fn a_fresh_tree_does_not_fold_before_the_interval() {
+    async fn a_never_folded_tree_folds_once_on_its_first_poll() {
         let root = TempRoot::new().unwrap();
         std::fs::create_dir(root.path().join("wal")).unwrap();
         let task = WalArchiveConfig { days: Some(30) }
@@ -710,11 +724,24 @@ mod tests {
             )
             .unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
-        assert!(
-            !root.path().join("wal-archive").exists(),
-            "folded before the interval elapsed"
-        );
         task.abort();
+        let passes = std::fs::read_dir(root.path().join("wal-archive"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|ext| ext == "ark" || ext == "journal")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            passes, 1,
+            "a never-folded tree must run exactly one pass, on its first poll"
+        );
     }
 
     #[test]

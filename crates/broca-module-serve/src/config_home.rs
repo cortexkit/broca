@@ -95,8 +95,9 @@ pub fn config_home() -> ConfigHome {
 /// `explicit_env` is the file's own override (`BROCA_CONFIG_PATH` and friends) and stays
 /// EXCLUSIVE: a file override never falls back to a discovered path. Its provenance travels
 /// with the path so loaders can distinguish an absent optional file from a broken override.
-/// Auth-method and vault-handle loaders reject missing overrides; cache and billing loaders
-/// retain their existing shipped-default policy for missing files.
+/// Auth-method and vault-handle loaders reject missing overrides. The `broca.jsonc` loaders
+/// keep shipped defaults for a missing file; boot refuses a missing named `broca.jsonc` first,
+/// through [`require_explicit_file`].
 pub fn config_file_with(
     env: impl Fn(&str) -> Option<OsString>,
     explicit_env: &str,
@@ -122,10 +123,78 @@ pub fn config_file(explicit_env: &str, file_name: &str) -> ConfigHome {
     config_file_with(|key| std::env::var_os(key), explicit_env, file_name)
 }
 
+/// Refuse a file override that names no file.
+///
+/// Every loader of a shared file such as `broca.jsonc` treats a missing file as "no
+/// overrides" and keeps shipped defaults, which is right for the discovered default path.
+/// For a path the operator named, absence is almost always a typo, and taking defaults would
+/// silently drop every override in the file (account selection, credential aliases, provider
+/// endpoints, archiving) while health stays green. Boot checks the named file once, before
+/// any loader runs, so the refusal names the variable and the path.
+pub fn require_explicit_file_with(
+    env: impl Fn(&str) -> Option<OsString>,
+    explicit_env: &str,
+    file_name: &str,
+) -> Result<(), String> {
+    let ConfigHome::Resolved {
+        path,
+        explicit: true,
+    } = config_file_with(env, explicit_env, file_name)
+    else {
+        return Ok(());
+    };
+    match std::fs::metadata(&path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "{explicit_env} names {} but no file is there; refusing to start with shipped \
+             defaults in place of that file's overrides",
+            path.display()
+        )),
+        Err(error) => Err(format!(
+            "{explicit_env} names {}, which cannot be checked: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// `require_explicit_file_with` against the real process environment.
+pub fn require_explicit_file(explicit_env: &str, file_name: &str) -> Result<(), String> {
+    require_explicit_file_with(|key| std::env::var_os(key), explicit_env, file_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A named file that is not there refuses, naming the variable and the path; a named file
+    /// that exists, and a discovered default path that does not, are both accepted.
+    #[test]
+    fn a_named_config_file_must_exist() {
+        let dir =
+            std::env::temp_dir().join(format!("broca-explicit-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("broca.jsonc");
+        std::fs::write(&present, b"{}").unwrap();
+        let missing = dir.join("brcoa.jsonc");
+        let named = |path: &std::path::Path| {
+            let path = path.to_owned();
+            move |key: &str| (key == "BROCA_CONFIG_PATH").then(|| path.clone().into_os_string())
+        };
+        let error = require_explicit_file_with(named(&missing), "BROCA_CONFIG_PATH", "broca.jsonc")
+            .expect_err("a named file that is not there must refuse");
+        assert!(error.contains("BROCA_CONFIG_PATH"), "{error}");
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        require_explicit_file_with(named(&present), "BROCA_CONFIG_PATH", "broca.jsonc").unwrap();
+        let home = dir.join("no-config-here");
+        require_explicit_file_with(
+            |key| (key == "HOME").then(|| home.clone().into_os_string()),
+            "BROCA_CONFIG_PATH",
+            "broca.jsonc",
+        )
+        .expect("a discovered default path may be absent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, String> = pairs

@@ -605,7 +605,7 @@ struct Inner {
     read_proofs: Mutex<BoundedSessionCache<ReadProof>>,
     /// Dispatch facts of committed tool turns already worked out, per session; see
     /// [`DispatchCache`].
-    dispatch_cache: Mutex<HashMap<LineageKey, DispatchCache>>,
+    dispatch_cache: Mutex<BoundedSessionCache<DispatchCache>>,
     /// Immutable first senders learned from the admission index or durable WAL. Empty sessions
     /// are never cached, since their next write may freeze a sender.
     frozen_senders: Mutex<BoundedSessionCache<Option<broca_protocol::BindPrincipal>>>,
@@ -874,7 +874,9 @@ struct DispatchCache {
     covered: u64,
 }
 
-/// Sessions whose dispatch facts are kept at most; past it the cache starts over.
+/// Sessions whose dispatch facts are kept at most. A new session past it evicts only the
+/// session cached longest ago, so a reader paging many sessions does not discard every other
+/// session's facts and force each of them back into a whole-WAL replay.
 const DISPATCH_CACHE_SESSIONS: usize = 4096;
 
 /// One `session.read` snapshot: the page, plus what the same snapshot says beyond it.
@@ -1142,7 +1144,7 @@ impl LineageRegistry {
                 opener,
                 reader: wal_store.map(|wal_store| ReadSources { wal_store, store }),
                 read_proofs: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
-                dispatch_cache: Mutex::new(HashMap::new()),
+                dispatch_cache: Mutex::new(BoundedSessionCache::new(DISPATCH_CACHE_SESSIONS)),
                 frozen_senders: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 live_ownership: Mutex::new(HashMap::new()),
                 owner_snapshots: Mutex::new(OwnerSnapshots::default()),
@@ -2788,17 +2790,22 @@ impl LineageRegistry {
         ordinals: &[u64],
         prompt_len: u64,
     ) -> Result<std::collections::BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>, OpenError> {
-        let lookup = |cache: &mut HashMap<LineageKey, DispatchCache>| {
-            if cache.len() >= DISPATCH_CACHE_SESSIONS && !cache.contains_key(key) {
-                cache.clear();
+        let lookup = |cache: &mut BoundedSessionCache<DispatchCache>| {
+            if cache
+                .get(key)
+                .is_none_or(|entry| entry.lineage_id != lineage_id)
+            {
+                cache.insert(
+                    key.clone(),
+                    DispatchCache {
+                        lineage_id: lineage_id.to_owned(),
+                        ..DispatchCache::default()
+                    },
+                );
             }
-            let entry = cache.entry(key.clone()).or_default();
-            if entry.lineage_id != lineage_id {
-                *entry = DispatchCache {
-                    lineage_id: lineage_id.to_owned(),
-                    ..DispatchCache::default()
-                };
-            }
+            let entry = cache
+                .get(key)
+                .expect("the session's entry was just ensured");
             // The page's tail can include an open tool turn. Its facts change as results
             // arrive, so only the full replay's committed turns belong in the cache.
             let mut found = std::collections::BTreeMap::new();
@@ -2826,8 +2833,10 @@ impl LineageRegistry {
         let all = broca_core::tool_call_dispatches(&records)
             .map_err(|error| OpenError::Open(format!("replay failed: {error}")))?;
         let mut cache = self.inner.dispatch_cache.lock().unwrap();
-        let entry = cache.entry(key.clone()).or_default();
-        if entry.lineage_id == lineage_id {
+        if let Some(entry) = cache
+            .get_mut(key)
+            .filter(|entry| entry.lineage_id == lineage_id)
+        {
             entry.by_ordinal.extend(all);
             entry.covered = entry.covered.max(prompt_len);
         }

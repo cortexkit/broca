@@ -2653,8 +2653,8 @@ target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
 expect_red = ["plan_admission::plan_model_different_id_refuses_before_fetch_or_write", "plan_admission::plan_model_later_send_mismatch_refuses_before_fetch_or_write"]
 file = "crates/broca-module-serve/src/serve.rs"
-old = "    broca_fetch_plan::admit::check_plan_model(\n        &parsed,\n        &model.provider,\n        &model.model,\n        model.variant.as_deref(),\n    )?;"
-new = "    let _ = model; // NON-VACUITY BREAK: production model check removed"
+old = "            broca_fetch_plan::admit::check_plan_model(\n                &parsed,\n                &model.provider,\n                &model.model,\n                model.variant.as_deref(),\n            )?;\n            None"
+new = "            let _ = model; // NON-VACUITY BREAK: production model check removed\n            None"
 
 # These three daemon-backed controls require ck-subc, fake-aft-stub and ck fixture binaries.
 # Cargo's integration-test build also refreshes the edited ck-broca binary.
@@ -16367,13 +16367,21 @@ features = ["test-clock"]
 test_file = "crates/broca-module-serve/tests/agent_data.rs"
 expect_red = ["boot_keeps_an_unreadable_cut_pending_and_status_read_only"]
 only = false
+# The property is held at two layers: an unavailable door leaves the cut (the agent-data move's
+# durable state file) with its operation pending, and boot reconciliation isolates any per-cut
+# failure. The break removes both.
+[[control.edits]]
 file = "crates/broca-module/src/cut_state.rs"
-old = '''"cut boot reconciliation remains pending"
-                        );
-                        continue;'''
-new = '''"cut boot reconciliation remains pending"
-                        );
-                        return Err(error); // NON-VACUITY BREAK'''
+old = "            if let Err(error) = self.reconcile_boot_cut(&path, artifacts).await {"
+new = "            self.reconcile_boot_cut(&path, artifacts).await?; // NON-VACUITY BREAK: one cut fails boot.\n            if let Err(error) = Ok::<(), ErrorBody>(()) {"
+[[control.edits]]
+file = "crates/broca-module/src/cut_state.rs"
+old = """"cut boot reconciliation remains pending"
+                    );
+                    return Ok(());"""
+new = """"cut boot reconciliation remains pending"
+                    );
+                    return Err(error); // NON-VACUITY BREAK: an unavailable door fails the cut."""
 
 [[control]]
 id = "agent-data-activation-uses-durable-import"
@@ -23812,3 +23820,232 @@ expect_red = ["plan_fetch_real_daemon::a_plan_is_fetched_through_the_real_daemon
 file = "crates/broca-fetch-plan/src/refusal.rs"
 old = "detail.extend(provider_detail.clone());"
 new = "let _ = provider_detail; // NON-VACUITY BREAK: drop provider refusal details."
+
+[[control]]
+id = "serve-prompt-history-failure-reaches-admission-ack"
+guards = "A fresh Claude Code episode whose prompt history cannot be read is refused through the admission ack with its Config cause, never by dropping the ack"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+select = "expected"
+test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
+expect_red = ["executor::tests::an_unreadable_prompt_history_is_refused_through_the_admission_ack"]
+expect_message = "the admission ack must carry the Config refusal"
+file = "crates/broca-module-serve/src/main.rs"
+old = "                        Ok(ordinal) => ordinal,\n                        Err(error) => {\n                            if let Some(ack) = job.on_admitted {"
+new = "                        Ok(ordinal) => ordinal,\n                        Err(error) => {\n                            if let Some(ack) = job.on_admitted.filter(|_| false) { // NON-VACUITY BREAK: drop the admission ack unsent."
+
+[[control]]
+id = "session-cli-run-finished-json-names-run"
+guards = "The broca-session --json-events run_finished event carries the terminal's durable run_id so a resumed run's terminal can be attributed"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin broca-session"
+select = "expected"
+test_file = "crates/broca-module-serve/src/bin/broca-session.rs"
+expect_red = ["tests::run_finished_json_names_its_run"]
+expect_message = "the JSON terminal must carry its durable run id"
+file = "crates/broca-module-serve/src/bin/broca-session.rs"
+old = '"run_id": run_id.as_ref().map(|id| &id.0), "reason": format!("{reason:?}")'
+new = '"run_id": run_id.as_ref().filter(|_| false).map(|id| &id.0), "reason": format!("{reason:?}") /* NON-VACUITY BREAK: drop the run id */'
+
+[[control]]
+id = "serve-replacement-bind-retires-old-stream"
+guards = "Publishing a replacement route generation cancels the stream the replaced generation opened, whose own GOODBYE is ignored afterwards"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::accepted_replacement_retires_the_old_generation_stream"]
+expect_message = "the replaced generation's stream must end when the replacement is published"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if let Some(slot) = routes.subscribe_cancel.remove(&completed.channel) {\n        slot.route.cancel();\n    }"
+new = "    if let Some(slot) = routes.subscribe_cancel.get(&completed.channel).filter(|_| false) { // NON-VACUITY BREAK: keep the old generation's stream.\n        slot.route.cancel();\n    }"
+
+[[control]]
+id = "registry-dispatch-cache-evicts-one-session"
+guards = "A full tool-turn dispatch cache evicts only its oldest session, so other sessions' committed facts are not forced back into whole-WAL replays"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::a_full_dispatch_cache_evicts_one_session_not_all"]
+expect_message = "a session still cached is answered without reading its WAL"
+file = "crates/broca-module/src/registry.rs"
+old = "            if cache\n                .get(key)\n                .is_none_or(|entry| entry.lineage_id != lineage_id)\n            {"
+new = "            if cache.get(key).is_none() && cache.entries.len() >= DISPATCH_CACHE_SESSIONS { // NON-VACUITY BREAK: start the whole cache over.\n                *cache = BoundedSessionCache::new(DISPATCH_CACHE_SESSIONS);\n            }\n            if cache\n                .get(key)\n                .is_none_or(|entry| entry.lineage_id != lineage_id)\n            {"
+
+[[control]]
+id = "wal-archive-first-pass-not-anchored-to-boot"
+guards = "A WAL tree that has never folded runs its first scheduled pass on the first poll instead of waiting an interval from process start, which a frequently restarted daemon never reaches"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/wal_archive.rs"
+expect_red = ["wal_archive::tests::a_never_folded_tree_folds_once_on_its_first_poll"]
+expect_message = "a never-folded tree must run exactly one pass, on its first poll"
+file = "crates/broca-module-serve/src/wal_archive.rs"
+old = "                    None => tracing::info!(\n                        target: \"archive\",\n                        \"WAL archive pass due: no earlier pass is recorded under this root\"\n                    ),"
+new = "                    None => continue, // NON-VACUITY BREAK: never run a first pass."
+
+[[control]]
+id = "catalog-failed-poll-retries-promptly"
+guards = "A failed fusiform catalog poll is retried on a short capped backoff rather than after the full 30-minute refresh interval"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
+expect_red = ["catalog_refresh::tests::a_failed_poll_retries_on_a_capped_backoff", "catalog_refresh::tests::an_unreachable_fusiform_at_boot_is_polled_again_promptly"]
+file = "crates/broca-module-serve/src/catalog_refresh.rs"
+old = "    if consecutive_failures == 0 {\n        return CATALOG_POLL_INTERVAL;\n    }"
+new = "    if consecutive_failures == 0 || true { // NON-VACUITY BREAK: wait the full interval after a failure too.\n        return CATALOG_POLL_INTERVAL;\n    }"
+
+[[control]]
+id = "serve-request-panic-stays-local"
+guards = "A panic inside one route request task is confined to that request; the module connection keeps serving and ends normally"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::a_panicking_request_does_not_end_the_connection"]
+# Two layers hold the property: the request task catches its own panic, and the serve loop
+# confines a task failure that escapes. The break removes both.
+[[control.edits]]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,\n                \"route request task panicked; answering it with a transient refusal\""
+new = "        Err(()) if true => panic!(\"request task panicked\"), // NON-VACUITY BREAK: let the panic escape the task.\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,\n                \"route request task panicked; answering it with a transient refusal\""
+[[control.edits]]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                    Err(e) => tracing::error!(\n                        target: \"wire.ingress\",\n                        \"route request task failed; dropping only that request: {e}\"\n                    ),"
+new = "                    Err(e) => break Err(ServeIoError(format!(\"route request task failed: {e}\"))), // NON-VACUITY BREAK: one panic ends the connection."
+
+[[control]]
+id = "cut-boot-isolates-damaged-cut"
+guards = "One damaged or foreign cut file is logged and left fenced instead of aborting boot reconciliation and daemon start"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/cut_state/tests.rs"
+expect_red = ["cut_state::tests::a_damaged_cut_file_does_not_stop_boot_reconciliation"]
+expect_message = "one damaged cut file must not fail boot reconciliation"
+file = "crates/broca-module/src/cut_state.rs"
+old = "            if let Err(error) = self.reconcile_boot_cut(&path, artifacts).await {"
+new = "            self.reconcile_boot_cut(&path, artifacts).await?; // NON-VACUITY BREAK: one bad cut fails the pass.\n            if let Err(error) = Ok::<(), ErrorBody>(()) {"
+
+[[control]]
+id = "boot-refuses-missing-named-broca-config"
+guards = "A BROCA_CONFIG_PATH naming no file refuses startup instead of every broca.jsonc loader silently taking shipped defaults"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/provider_override_boot.rs"
+expect_red = ["provider_override_boot::a_missing_named_config_file_refuses_boot"]
+expect_message = "a missing named config file must refuse boot by name"
+file = "crates/broca-module-serve/src/main.rs"
+old = "    .map_err(ServeIoError)?;\n    broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;"
+new = "    .ok(); // NON-VACUITY BREAK: ignore a missing named config file.\n    broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;"
+
+[[control]]
+id = "serve-send-wal-probe-off-runtime-worker"
+guards = "The session.send WAL presence probe (live stat and archive reads) runs on the blocking pool, not on the request's runtime worker"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::the_send_path_wal_probe_does_not_block_the_runtime_worker"]
+expect_message = "the WAL presence probe must not run on the runtime worker"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                let probed = broca_diagnostics::spawn_blocking("
+new = "                let probed = probe_handler.session_written(&probe_session); // NON-VACUITY BREAK: probe on the runtime worker.\n                let _unused = broca_diagnostics::spawn_blocking("
+
+[[control]]
+id = "serve-subscribe-unit-frame-guard"
+guards = "A subscribe unit whose frame exceeds the transport limit ends the stream with a typed undeliverable error instead of an over-limit frame on the shared module connection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::an_oversized_subscribe_unit_ends_the_stream_with_a_typed_error"]
+expect_message = "an oversized unit must end the stream with a typed error"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {\n                let _ = send_undeliverable_unit("
+new = "            if frame_bytes > usize::MAX - 1 { // NON-VACUITY BREAK: no transport frame guard on stream data.\n                let _ = send_undeliverable_unit("
+
+[[control]]
+id = "fanout-attach-builds-only-delivered-units"
+guards = "A subscriber attach advances projection state through history it does not deliver instead of materializing every control unit of the session"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/fanout.rs"
+expect_red = ["fanout::tests::an_attach_builds_only_the_units_it_delivers"]
+expect_message = "a resume near the head must not build the session's whole history"
+file = "crates/broca-module/src/fanout.rs"
+old = "            advance_control_projection_state(&durable_prefix[..skipped], &mut state);\n            let projected = project_control_with_state(&durable_prefix[skipped..], &mut state);"
+new = "            let _ = skipped; // NON-VACUITY BREAK: materialize the whole prefix.\n            let projected = project_control_with_state(&durable_prefix, &mut state);"
+
+[[control]]
+id = "serve-request-panic-is-answered"
+guards = "A route request whose task panics is answered on its own correlation with a transient refusal, never left unanswered"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::a_panicking_request_does_not_end_the_connection"]
+expect_message = "the panicked request must be answered on its own correlation"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,\n                \"route request task panicked; answering it with a transient refusal\""
+new = "        Err(_) if true => Ok(()), // NON-VACUITY BREAK: leave the panicked request unanswered.\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,\n                \"route request task panicked; answering it with a transient refusal\""
+
+[[control]]
+id = "actor-checks-plan-model-against-inherited-model"
+guards = "A send that left its model to the session has its plan's model-bearing items checked by the actor against the inherited frozen model, refusing plan_model_mismatch"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
+expect_red = ["plan_admission::a_model_less_steer_checks_its_plan_against_the_inherited_model"]
+expect_message = "a plan naming another model than the inherited one is still refused"
+file = "crates/broca-module/src/actor.rs"
+old = "        if let Some(plan) = deferred_model_check {"
+new = "        if let Some(plan) = deferred_model_check.filter(|_| false) { // NON-VACUITY BREAK: never check an inherited model."
+
+[[control]]
+id = "serve-skips-plan-model-check-for-inherited-model"
+guards = "The serve layer never compares a plan's model-bearing items with the empty placeholder a model-less joining send carries"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
+expect_red = ["plan_admission::a_model_less_steer_checks_its_plan_against_the_inherited_model"]
+expect_message = "a model-less steer resending a plan that names the session's own model is accepted"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                        if model_inherited {\n                            None\n                        } else {"
+new = "                        if false && model_inherited { // NON-VACUITY BREAK: check the placeholder model.\n                            None\n                        } else {"
+
+[[control]]
+id = "serve-request-panic-after-reply-sends-nothing"
+guards = "A route request that panics after its terminal reply went out is not answered a second time, so no orphan terminal reaches a correlation the daemon may reuse"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::a_request_that_panics_after_replying_sends_one_terminal"]
+expect_message = "a request answers once: no second terminal after its reply"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        Err(_) if terminal_sent.load(Ordering::SeqCst) => {"
+new = "        Err(_) if false && terminal_sent.load(Ordering::SeqCst) => { // NON-VACUITY BREAK: answer a panic even after the reply."

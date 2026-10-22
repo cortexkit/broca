@@ -382,8 +382,10 @@ fn send_id_scope(session: &BrocaBindIdentity) -> String {
 /// The reported code deliberately matches the one the daemon uses when it refuses a bind for
 /// the same reason, so a caller that already handles it sees no change when the refusal moves
 /// from bind time to op time.
-fn execute_class_root_refusal(session: &BrocaBindIdentity) -> Option<String> {
-    if session.project_root.exists() {
+async fn execute_class_root_refusal(session: &BrocaBindIdentity) -> Option<String> {
+    // `tokio::fs` runs the stat on the blocking pool: a slow or network filesystem must not
+    // stall the runtime worker that also carries other sessions' frames and streams.
+    if tokio::fs::metadata(&session.project_root).await.is_ok() {
         return None;
     }
     Some(format!(
@@ -991,15 +993,31 @@ where
             joined = routes.bind_tasks.join_next(), if !routes.bind_tasks.is_empty() => {
                 match joined.expect("guarded by !routes.bind_tasks.is_empty()") {
                     Ok(completed) => finish_bind(completed, &writer, &mut routes).await?,
-                    Err(error) => break Err(ServeIoError(format!("bind authorization task failed: {error}"))),
+                    // A panic inside the adoption check is caught in `authorize_bind` and
+                    // answered as a transient refusal. Reaching here means the task failed
+                    // outside it; that is still this bind's failure, not the connection's. Its
+                    // pending entry is replaced by a rebind or removed by its GOODBYE.
+                    Err(error) => tracing::error!(
+                        target: "wire.ingress",
+                        "bind authorization task failed; refusing only that bind: {error}"
+                    ),
                 }
             }
             joined = request_tasks.join_next(), if !request_tasks.is_empty() => {
                 match joined.expect("guarded by !request_tasks.is_empty()") {
                     Ok(Ok(())) => {}
+                    // An egress failure inside a request task means the connection itself is
+                    // unusable, so it still ends the loop.
                     Ok(Err(e)) => break Err(e),
                     Err(e) if e.is_cancelled() => {}
-                    Err(e) => break Err(ServeIoError(format!("route request task failed: {e}"))),
+                    // A panic in a request is answered inside its task (`reply_on_panic`).
+                    // Reaching here means the task failed outside that guard. It is still
+                    // confined to its own request: ending the loop would cut every session's
+                    // streams and in-flight sends on this connection for one request's bug.
+                    Err(e) => tracing::error!(
+                        target: "wire.ingress",
+                        "route request task failed; dropping only that request: {e}"
+                    ),
                 }
             }
             (frame, reader) = &mut pending_read => {
@@ -1213,7 +1231,7 @@ where
                     .clone();
                 let read_only = crate::agent_data::request_is_read_only(&frame.body);
                 let reply_cancel = cancel.clone();
-                request_tasks.spawn(async move {
+                request_tasks.spawn(reply_on_panic(writer.clone(), (ver, channel, epoch, corr), async move {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled(), if read_only => Ok(()),
@@ -1256,7 +1274,7 @@ where
                     }
                         } => result,
                     }
-                });
+                }));
                 return Ok(true);
             }
             let req: RouteRequest = match serde_json::from_slice(&frame.body) {
@@ -1767,18 +1785,106 @@ async fn handle_control_request(
     }
 }
 
+/// Drive `task` to completion, turning a panic raised while polling it into `Err(())`. The
+/// payload is discarded: it can carry arbitrary internal state and is never reported.
+async fn catch_panic<F: std::future::Future>(task: F) -> Result<F::Output, ()> {
+    let mut task = std::pin::pin!(task);
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(_) => std::task::Poll::Ready(Err(())),
+        }
+    })
+    .await
+}
+
+tokio::task_local! {
+    /// Whether the route request running in this task has claimed its terminal: started to
+    /// write its Response or Error, or handed a subscription stream's terminal to the forward
+    /// task. Set only by [`mark_terminal_sent`]; read by [`reply_on_panic`].
+    static TERMINAL_SENT: Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Record that the current route request has claimed its terminal. Outside a request task
+/// (frame-loop control replies, health, binds) there is nothing to record.
+fn mark_terminal_sent() {
+    let _ = TERMINAL_SENT.try_with(|sent| sent.store(true, Ordering::SeqCst));
+}
+
+/// The fixed refusal message used when a route request task or a bind's adoption check panics.
+/// A panic payload can carry arbitrary internal state, so it is never reported.
+const REQUEST_PANICKED_MESSAGE: &str = "the request failed inside broca before it was answered";
+
+/// Run one route request's task, answering its correlation with a transient refusal if the
+/// task panics. Without the answer the caller waits out its whole timeout and cannot tell a
+/// crash from a slow reply. The panic stays confined to this request: the connection and every
+/// other request on it keep running.
+async fn reply_on_panic<F>(
+    writer: EgressSender<Frame>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    task: F,
+) -> Result<(), ServeIoError>
+where
+    F: std::future::Future<Output = Result<(), ServeIoError>>,
+{
+    let terminal_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = TERMINAL_SENT.scope(Arc::clone(&terminal_sent), task);
+    match catch_panic(task).await {
+        Ok(result) => result,
+        // A request answers once. Once its terminal has been claimed (written, or delegated to
+        // a stream's forward task), a second answer could become an orphan the daemon forwards
+        // anyway, possibly onto a newer request that reuses the correlation on this channel.
+        Err(_) if terminal_sent.load(Ordering::SeqCst) => {
+            tracing::error!(
+                target: "wire.ingress",
+                channel, epoch, corr,
+                "route request task panicked after its reply went out; sending nothing more"
+            );
+            Ok(())
+        }
+        Err(_) => {
+            tracing::error!(
+                target: "wire.ingress",
+                channel, epoch, corr,
+                "route request task panicked; answering it with a transient refusal"
+            );
+            send_serve_error(
+                &writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                &ServeError::Transient(REQUEST_PANICKED_MESSAGE.into()),
+            )
+            .await
+        }
+    }
+}
+
 async fn authorize_bind(
     mut completed: BindCompletion,
     registry: LineageRegistry,
 ) -> BindCompletion {
     if let broca_protocol::SendScope::Stamped(stamp) = &completed.bind.scope {
-        completed.refusal = registry
-            .bind_adoption_refusal(
-                &completed.identity,
-                completed.bind.principal.as_ref(),
-                stamp,
-            )
-            .await;
+        let check = registry.bind_adoption_refusal(
+            &completed.identity,
+            completed.bind.principal.as_ref(),
+            stamp,
+        );
+        // A panic in the check refuses this bind as transient, through the same reply as an
+        // unreadable history, instead of leaving the bind unanswered.
+        let refusal = match catch_panic(check).await {
+            Ok(refusal) => refusal,
+            Err(_) => {
+                tracing::error!(
+                    target: "wire.ingress",
+                    channel = completed.channel, epoch = completed.epoch,
+                    "bind authorization panicked; refusing the bind as transient"
+                );
+                Err(ServeError::Transient(REQUEST_PANICKED_MESSAGE.into()))
+            }
+        };
+        completed.refusal = refusal;
     }
     completed
 }
@@ -1829,6 +1935,13 @@ async fn finish_bind(
         "module route bound");
     if let Some(cancel) = routes.agent_data_cancel.remove(&completed.channel) {
         cancel.cancel();
+    }
+    // Any subscription slot on this channel belongs to the generation being replaced: a stream
+    // for the new generation can open only after this publication. The old generation's GOODBYE
+    // is ignored once the new one is published, so retiring its stream here is the only point
+    // where it ends before the replacement route itself closes.
+    if let Some(slot) = routes.subscribe_cancel.remove(&completed.channel) {
+        slot.route.cancel();
     }
     routes.by_channel.insert(
         completed.channel,
@@ -1902,7 +2015,7 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
     let request_slots = request_slots.clone();
     let writer = writer.clone();
     let conn_cancel = conn_cancel.clone();
-    request_tasks.spawn(async move {
+    request_tasks.spawn(reply_on_panic(writer.clone(), (ver, channel, epoch, corr), async move {
         let _permit = request_slots
             .acquire_owned()
             .await
@@ -1953,7 +2066,7 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
             Some((operation, session)) => log_served_request(operation, session, request).await,
             None => request.await,
         }
-    });
+    }));
     Ok(())
 }
 
@@ -1983,7 +2096,7 @@ where
     let describe =
         matches!(&prepared, PreparedRouteRequest::Request(req) if req.method == OP_ROLE_DESCRIBE);
 
-    request_tasks.spawn(async move {
+    request_tasks.spawn(reply_on_panic(writer.clone(), (ver, channel, epoch, corr), async move {
         // Authorization can read durable history, and permits can be held by slow calls.
         // Neither wait belongs on the frame reader: it must still answer PING and GOODBYE.
         let _turn = dispatch_ticket.wait().await;
@@ -2073,7 +2186,7 @@ where
             Some((operation, session)) => log_served_request(operation, session, request).await,
             None => request.await,
         }
-    });
+    }));
     Ok(())
 }
 
@@ -2419,13 +2532,30 @@ where
             let session_written = if inherit_frozen.is_empty() {
                 false
             } else {
-                match handler.session_written(&session) {
+                // The presence probe can stat the live WAL and read archive containers, so it
+                // runs on the blocking pool rather than on this request's runtime worker.
+                let probe_handler = Arc::clone(handler);
+                let probe_session = session.clone();
+                let probed = broca_diagnostics::spawn_blocking(
+                    broca_diagnostics::JobKind::WalRead,
+                    move || probe_handler.session_written(&probe_session),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    Err(ServeError::Open(
+                        format!("session presence probe failed: {error}; retry the send"),
+                        Some(broca_protocol::ErrorClass::Transient),
+                    ))
+                });
+                match probed {
                     Ok(written) => written,
                     Err(error) => {
                         return send_serve_error(writer, ver, channel, epoch, corr, &error).await
                     }
                 }
             };
+            // Captured before the placeholder below replaces the absent model.
+            let model_inherited = params.model.is_none();
             if params.model.is_none() {
                 let may_inherit = inherit_frozen
                     .contains(&broca_protocol::request::InheritedParam::Model)
@@ -2458,7 +2588,7 @@ where
             } else {
                 inherit_frozen
             };
-            if let Some(detail) = execute_class_root_refusal(&session) {
+            if let Some(detail) = execute_class_root_refusal(&session).await {
                 return send_error(
                     writer,
                     ver,
@@ -2508,7 +2638,13 @@ where
                         &req.params,
                         plan,
                         scope,
-                        params.model.as_ref().expect("model was resolved"),
+                        // An inherited model is known only to the session's actor, which checks
+                        // the plan's models against it; the placeholder must never be compared.
+                        if model_inherited {
+                            None
+                        } else {
+                            params.model.as_ref()
+                        },
                     )
                     .await
                     {
@@ -2620,7 +2756,7 @@ where
                     .await
                 }
             };
-            if let Some(detail) = execute_class_root_refusal(&session) {
+            if let Some(detail) = execute_class_root_refusal(&session).await {
                 return send_error(
                     writer,
                     ver,
@@ -3123,6 +3259,9 @@ where
     if cancel.is_cancelled() {
         return Ok(());
     }
+    // From here the forward task owns this request's terminal (its StreamEnd or stream Error),
+    // so the request task must not answer it again.
+    mark_terminal_sent();
 
     // Forward task: Delivery → StreamData (control=Interactive, display=Background lane
     // labels) until the stream ends, then StreamEnd. A session subscription is
@@ -3172,9 +3311,38 @@ where
                 return;
             }
             let (priority, body) = match encode_delivery(&delivery) {
-                Some(v) => v,
-                None => break, // a Detached marker: end the stream (client resubscribes)
+                EncodedDelivery::Data(priority, body) => (priority, body),
+                // A Detached marker: end the stream cleanly; the client resubscribes.
+                EncodedDelivery::Detached => break,
+                EncodedDelivery::Unencodable(error) => {
+                    let _ = send_undeliverable_unit(
+                        &writer,
+                        (ver, channel, epoch, corr),
+                        &delivery,
+                        "unencodable",
+                        format!("subscribe unit could not be encoded: {error}"),
+                        None,
+                    )
+                    .await;
+                    return;
+                }
             };
+            // The same transport bound unary replies honour. An oversized frame on the wire
+            // could invalidate sibling requests on this one module connection, and a clean
+            // StreamEnd here would send the client back to the same cursor forever.
+            let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);
+            if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {
+                let _ = send_undeliverable_unit(
+                    &writer,
+                    (ver, channel, epoch, corr),
+                    &delivery,
+                    "too_large",
+                    "subscribe unit exceeds the transport frame limit".into(),
+                    Some(frame_bytes),
+                )
+                .await;
+                return;
+            }
             let frame = match Frame::build_with_version(
                 ver,
                 FrameType::StreamData,
@@ -3185,7 +3353,18 @@ where
                 body,
             ) {
                 Ok(f) => f,
-                Err(_) => break,
+                Err(error) => {
+                    let _ = send_undeliverable_unit(
+                        &writer,
+                        (ver, channel, epoch, corr),
+                        &delivery,
+                        "unencodable",
+                        format!("subscribe frame could not be built: {error}"),
+                        None,
+                    )
+                    .await;
+                    return;
+                }
             };
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -3216,22 +3395,74 @@ where
     Ok(())
 }
 
-/// Encode one data Delivery to (lane priority, body bytes). Terminal deliveries have no data
-/// body; the forward task handles `Error` before calling this and treats `Detached` as a clean
-/// resubscribe boundary.
-fn encode_delivery(delivery: &Delivery) -> Option<(Priority, Vec<u8>)> {
-    match delivery {
+/// What one Delivery becomes on a subscribe stream.
+enum EncodedDelivery {
+    /// A data frame body and its lane priority.
+    Data(Priority, Vec<u8>),
+    /// The clean resubscribe boundary. Terminal deliveries (`Error`, `Expired`) are handled by
+    /// the forward task before encoding and also land here.
+    Detached,
+    /// A unit that cannot be serialized. It must end the stream with a typed error: a clean end
+    /// would send the client back to the same unit forever.
+    Unencodable(serde_json::Error),
+}
+
+fn encode_delivery(delivery: &Delivery) -> EncodedDelivery {
+    let (priority, encoded) = match delivery {
         Delivery::Control(event) => {
             let (cursor, unit) = event.as_ref();
-            encode_subscribe_control(cursor.wal_seq, cursor.sub_index, unit)
-                .ok()
-                .map(|body| (Priority::Interactive, body))
+            (
+                Priority::Interactive,
+                encode_subscribe_control(cursor.wal_seq, cursor.sub_index, unit),
+            )
         }
-        Delivery::Display(event) => encode_subscribe_display(event.as_ref())
-            .ok()
-            .map(|body| (Priority::Background, body)),
-        Delivery::Expired { .. } | Delivery::Error(_) | Delivery::Detached => None,
+        Delivery::Display(event) => (
+            Priority::Background,
+            encode_subscribe_display(event.as_ref()),
+        ),
+        Delivery::Expired { .. } | Delivery::Error(_) | Delivery::Detached => {
+            return EncodedDelivery::Detached
+        }
+    };
+    match encoded {
+        Ok(body) => EncodedDelivery::Data(priority, body),
+        Err(error) => EncodedDelivery::Unencodable(error),
     }
+}
+
+/// The stream terminal for a unit this connection cannot deliver.
+const SUBSCRIBE_UNIT_UNDELIVERABLE: &str = "subscribe_unit_undeliverable";
+
+/// End a subscribe stream with a typed error naming the unit that cannot be delivered: its
+/// control cursor (null for a display event), why, and for an oversized unit its frame size and
+/// the limit. Like the other stream terminals, no StreamEnd follows it.
+async fn send_undeliverable_unit(
+    writer: &EgressSender<Frame>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    delivery: &Delivery,
+    reason: &str,
+    message: String,
+    frame_bytes: Option<usize>,
+) -> Result<(), ServeIoError> {
+    let cursor = match delivery {
+        Delivery::Control(event) => {
+            let (cursor, _) = event.as_ref();
+            serde_json::json!({"wal_seq": cursor.wal_seq, "sub_index": cursor.sub_index})
+        }
+        _ => serde_json::Value::Null,
+    };
+    let mut detail = serde_json::json!({"reason": reason, "cursor": cursor});
+    if let Some(frame_bytes) = frame_bytes {
+        detail["frame_bytes"] = frame_bytes.into();
+        detail["limit"] = broca_wire::SUBC_MAX_FRAME_BYTES.into();
+    }
+    tracing::warn!(
+        target: "wire.egress",
+        channel, epoch, corr, reason, %detail,
+        "ending subscribe stream on an undeliverable unit: {message}"
+    );
+    let body = ErrorBody::new(SUBSCRIBE_UNIT_UNDELIVERABLE, message).with_detail(detail);
+    send_error_body(writer, ver, channel, epoch, corr, body).await
 }
 
 async fn send_hello(
@@ -3578,7 +3809,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     params: &serde_json::Value,
     plan: &serde_json::Value,
     scope: Option<&broca_protocol::SessionScope>,
-    model: &crate::wire::ModelParams,
+    model: Option<&crate::wire::ModelParams>,
 ) -> Result<broca_module::actor::SendPlan, SendPlanRefusal> {
     if let Some(params) = params.as_object() {
         broca_fetch_plan::check_send_members(params)?;
@@ -3622,18 +3853,27 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         .into());
     }
     // Even an unchanged frozen plan can carry persona text for a different model on a later send.
-    broca_fetch_plan::admit::check_plan_model(
-        &parsed,
-        &model.provider,
-        &model.model,
-        model.variant.as_deref(),
-    )?;
+    // A send that left its model to the session is checked by the session's actor instead, once
+    // the inherited model is resolved; the plan travels with the send for that.
+    let model_check = match model {
+        Some(model) => {
+            broca_fetch_plan::admit::check_plan_model(
+                &parsed,
+                &model.provider,
+                &model.model,
+                model.variant.as_deref(),
+            )?;
+            None
+        }
+        None => Some(std::sync::Arc::new(parsed.clone())),
+    };
     match handler.plan_state(session).await {
         broca_module::serve::PlanState::Admitted { frozen } => {
             broca_fetch_plan::check_later_plan(frozen.as_deref(), &parsed.identity)?;
             Ok(broca_module::actor::SendPlan {
                 identity: parsed.identity,
                 manifest: None,
+                model_check,
             })
         }
         broca_module::serve::PlanState::NotAdmitted | broca_module::serve::PlanState::Unknown => {
@@ -3647,6 +3887,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
             Ok(broca_module::actor::SendPlan {
                 identity: parsed.identity,
                 manifest: Some(std::sync::Arc::new(admitted.manifest)),
+                model_check,
             })
         }
     }
@@ -3962,6 +4203,12 @@ async fn send_error_bytes(
 
 async fn send(writer: &EgressSender<Frame>, frame: Frame) -> Result<(), ServeIoError> {
     let _phase = stall::enter(Phase::EgressSend).await;
+    // Every Response and Error a request writes passes here, so this is where the request's
+    // terminal is recorded. It is recorded before the frame is handed off: once ownership
+    // leaves this task the frame may reach the daemon.
+    if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
+        mark_terminal_sent();
+    }
     writer
         .send(frame)
         .await
@@ -4608,6 +4855,53 @@ mod tests {
         let _second_turn = tokio::time::timeout(std::time::Duration::from_secs(1), second_wait)
             .await
             .expect("the reopened route advances after the first request releases its turn");
+    }
+
+    /// A control unit whose encoded frame exceeds the transport limit is never put on the wire:
+    /// the stream ends with a typed error naming the unit's cursor, the frame size and the
+    /// limit, and no clean StreamEnd that would send the client back to the same cursor. The
+    /// served bytes are pinned by `tests/golden/subscribe_unit_undeliverable.too_large.json`.
+    #[tokio::test]
+    async fn an_oversized_subscribe_unit_ends_the_stream_with_a_typed_error() {
+        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let mut ingress = BindIngress::new(registry);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let sink = ingress.subscribe(1, 10).await;
+        // 1 MiB of control characters: JSON escapes each as six bytes.
+        let unit = broca_protocol::caller::ControlUnit::ToolResult {
+            result: broca_protocol::ToolResult {
+                tool_call_id: broca_protocol::ToolCallId("call-1".into()),
+                output: broca_protocol::ToolOutput::Text {
+                    text: "\u{1}".repeat(1 << 20),
+                },
+                is_error: false,
+            },
+        };
+        sink.send(Delivery::Control(Arc::new((
+            broca_core::Cursor {
+                wal_seq: 42,
+                sub_index: 1,
+            },
+            unit,
+        ))))
+        .await
+        .unwrap();
+        let frame = next_written(&mut ingress.written).await;
+        assert_eq!(
+            (frame.header.ty, frame.header.epoch, frame.header.corr),
+            (FrameType::Error, 1, 10),
+            "an oversized unit must end the stream with a typed error"
+        );
+        assert_eq!(
+            String::from_utf8(frame.body.to_vec()).unwrap(),
+            include_str!("../tests/golden/subscribe_unit_undeliverable.too_large.json").trim_end()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            ingress.written.try_recv().is_err(),
+            "no StreamEnd or data frame follows the typed terminal"
+        );
     }
 
     #[tokio::test]
@@ -5447,6 +5741,9 @@ mod tests {
             unimplemented!()
         }
         async fn status(&self, session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+            if session.session == "panicking-status" {
+                panic!("a request handler bug");
+            }
             if session.session == "oversized-error-response" {
                 return Err(ServeError::Transient(
                     "x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize),
@@ -5777,6 +6074,42 @@ mod tests {
         drop(release);
         ingress.complete_bind().await;
         assert_eq!(next_written(&mut ingress.written).await.header.corr, 2);
+        let sink = ingress.subscribe(2, 20).await;
+        ingress.goodbye(1).await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 2);
+        ingress.assert_delivery(&sink, 2, 20).await;
+    }
+
+    /// Publishing a replacement generation ends the stream the replaced generation opened, whose
+    /// own GOODBYE is ignored from then on, while a stream opened under the replacement lives on.
+    #[tokio::test]
+    async fn accepted_replacement_retires_the_old_generation_stream() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let old = ingress.subscribe(1, 10).await;
+        ingress.bind(2, "replacement", true).await;
+        store.entered.notified().await;
+        drop(release);
+        ingress.complete_bind().await;
+        // A cancelled stream's StreamEnd is best-effort and may precede the acknowledgement.
+        let ack = loop {
+            let frame = next_written(&mut ingress.written).await;
+            if (frame.header.ty, frame.header.epoch) != (FrameType::StreamEnd, 1) {
+                break frame;
+            }
+        };
+        assert_eq!((ack.header.ty, ack.header.corr), (FrameType::Response, 2));
+        // The forwarder drops its delivery receiver only when it ends.
+        tokio::time::timeout(std::time::Duration::from_secs(5), old.closed())
+            .await
+            .expect("the replaced generation's stream must end when the replacement is published");
+        while let Ok(frame) = ingress.written.try_recv() {
+            assert_eq!(
+                (frame.header.ty, frame.header.epoch, frame.header.corr),
+                (FrameType::StreamEnd, 1, 10)
+            );
+        }
         let sink = ingress.subscribe(2, 20).await;
         ingress.goodbye(1).await;
         assert_eq!(ingress.routes.by_channel[&7].0, 2);
@@ -6580,6 +6913,378 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(serve.await.unwrap().unwrap(), ServeEnd::Goodbye);
+    }
+
+    /// A handler whose WAL presence probe blocks its thread until the test releases it, and
+    /// records whether the release arrived in time.
+    struct BlockingProbeHandler {
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        released: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ServeHandler for BlockingProbeHandler {
+        fn session_written(&self, _session: &BrocaBindIdentity) -> Result<bool, ServeError> {
+            self.entered.notify_one();
+            let release = self.release.lock().unwrap().take().unwrap();
+            let released = release
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            self.released.store(released, Ordering::SeqCst);
+            Ok(false)
+        }
+        async fn send(&self, _req: SendRequest) -> Result<SendResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn retract(
+            &self,
+            _session: &BrocaBindIdentity,
+            _submission_id: broca_protocol::SubmissionId,
+        ) -> Result<RetractResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn subscribe(
+            &self,
+            _session: &BrocaBindIdentity,
+            _from: SubscribeFrom,
+            _sink: mpsc::Sender<Delivery>,
+        ) -> Result<(), ServeError> {
+            unimplemented!()
+        }
+        async fn read(&self, _req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn cancel(
+            &self,
+            _session: &BrocaBindIdentity,
+            _run_id: broca_protocol::RunId,
+        ) -> Result<CancelResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn status(&self, _session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn run_status(
+            &self,
+            _session: &BrocaBindIdentity,
+            _run_id: broca_protocol::RunId,
+        ) -> Result<RunStatusResponse, ServeError> {
+            unimplemented!()
+        }
+    }
+
+    /// Start a frame loop serving `handler`, complete its handshake, and bind route channel 7
+    /// to `session`. Returns the daemon end of the socket, the loop's egress, and the loop.
+    async fn bound_frame_loop<H: ServeHandler + 'static>(
+        handler: Arc<H>,
+        session: &str,
+    ) -> (
+        tokio::io::DuplexStream,
+        EgressReceiver<Frame>,
+        tokio::task::JoinHandle<Result<ServeEnd, ServeIoError>>,
+    ) {
+        let (mut daemon, mut module_read) = tokio::io::duplex(64 * 1024);
+        let (writer, mut written) =
+            broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
+        let serve = tokio::spawn(async move {
+            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            run_frame_loop(
+                &mut module_read,
+                writer,
+                "broca",
+                handler,
+                &registry,
+                &VaultGauge::not_in_use(),
+                None,
+                CancellationToken::new(),
+                crate::wal_archive::WalArchiveConfig::default(),
+                &crate::consumer_routes::ConsumerRoutes::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        let hello = next_written(&mut written).await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                hello.header.corr,
+                serde_json::to_vec(&ModuleHelloAckBody {
+                    negotiated_ver: PROTOCOL_VERSION,
+                    subc_ops: vec![],
+                    subc_capabilities: vec![],
+                    storage: None,
+                    machine_id: None,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new("/tmp", "runner", session),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                2,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_written(&mut written).await.header.ty,
+            FrameType::Response
+        );
+        (daemon, written, serve)
+    }
+
+    /// The WAL presence probe on the send path runs off the runtime worker. On this
+    /// single-threaded runtime a probe run inline would block the only worker, so the task that
+    /// releases it could never run.
+    #[tokio::test]
+    async fn the_send_path_wal_probe_does_not_block_the_runtime_worker() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handler = Arc::new(BlockingProbeHandler {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            released: std::sync::atomic::AtomicBool::new(false),
+        });
+        let releaser = handler.clone();
+        tokio::spawn(async move {
+            releaser.entered.notified().await;
+            let _ = release_tx.send(());
+        });
+        let (mut daemon, mut written, serve) = bound_frame_loop(handler.clone(), "probe").await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                7,
+                1,
+                3,
+                serde_json::to_vec(&RouteRequest {
+                    method: OP_SEND.into(),
+                    params: serde_json::json!({"prompt": "steer me", "delivery": "steer"}),
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        // The session was never written, so the model-less steer is refused for its model.
+        let reply = next_written(&mut written).await;
+        assert_eq!((reply.header.ty, reply.header.corr), (FrameType::Error, 3));
+        assert!(
+            handler.released.load(Ordering::SeqCst),
+            "the WAL presence probe must not run on the runtime worker"
+        );
+        serve.abort();
+    }
+
+    /// A request that has already sent its reply and then panics is not answered again: the
+    /// daemon sees exactly one terminal frame for the correlation, never an orphan Error that
+    /// could land on a newer request reusing it.
+    #[tokio::test]
+    async fn a_request_that_panics_after_replying_sends_one_terminal() {
+        let (writer, mut written) =
+            broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
+        let task_writer = writer.clone();
+        let result = reply_on_panic(writer, (PROTOCOL_VERSION, 7, 1, 3), async move {
+            send_json_response(
+                &task_writer,
+                PROTOCOL_VERSION,
+                7,
+                1,
+                3,
+                &serde_json::json!({"ok": true}),
+            )
+            .await?;
+            if true {
+                panic!("a bug after the reply");
+            }
+            Ok(())
+        })
+        .await;
+        assert!(result.is_ok());
+        let reply = next_written(&mut written).await;
+        assert_eq!(
+            (reply.header.ty, reply.header.corr),
+            (FrameType::Response, 3)
+        );
+        assert!(
+            written.try_recv().is_err(),
+            "a request answers once: no second terminal after its reply"
+        );
+    }
+
+    /// A panic inside one request's task is confined to that request: the request is answered
+    /// on its own correlation with a transient refusal carrying a fixed message, and the
+    /// connection keeps answering frames and ends normally on GOODBYE.
+    #[tokio::test]
+    async fn a_panicking_request_does_not_end_the_connection() {
+        let (mut daemon, mut module_read) = tokio::io::duplex(64 * 1024);
+        let (writer, mut written) =
+            broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
+        let handler = Arc::new(GatedStatusHandler {
+            gate_auth: false,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let serve = tokio::spawn(async move {
+            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            run_frame_loop(
+                &mut module_read,
+                writer,
+                "broca",
+                handler,
+                &registry,
+                &VaultGauge::not_in_use(),
+                None,
+                CancellationToken::new(),
+                crate::wal_archive::WalArchiveConfig::default(),
+                &crate::consumer_routes::ConsumerRoutes::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        let hello = next_written(&mut written).await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                hello.header.corr,
+                serde_json::to_vec(&ModuleHelloAckBody {
+                    negotiated_ver: PROTOCOL_VERSION,
+                    subc_ops: vec![],
+                    subc_capabilities: vec![],
+                    storage: None,
+                    machine_id: None,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new("/tmp/project-a", "runner", "panicking-status"),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                2,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_written(&mut written).await.header.ty,
+            FrameType::Response
+        );
+        test_request(&mut daemon, OP_STATUS, 3).await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Ping, control_flags(), 0, 0, 4, vec![]).unwrap(),
+        )
+        .await
+        .unwrap();
+        // The refusal and the PONG may arrive in either order: collect both and tell them
+        // apart by correlation.
+        let mut frames = Vec::new();
+        while frames.len() < 2 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), written.recv()).await {
+                Ok(Some(frame)) => frames.push(frame),
+                _ => break,
+            }
+        }
+        let refusal = frames
+            .iter()
+            .find(|frame| frame.header.corr == 3)
+            .expect("the panicked request must be answered on its own correlation");
+        assert_eq!(
+            (refusal.header.ty, refusal.header.channel),
+            (FrameType::Error, 7)
+        );
+        let pong = frames
+            .iter()
+            .find(|frame| frame.header.corr == 4)
+            .expect("the connection still answers PING");
+        let body: ErrorBody = serde_json::from_slice(&refusal.body).unwrap();
+        assert_eq!(body.code, "transient");
+        assert_eq!(
+            body.message,
+            ServeError::Transient(REQUEST_PANICKED_MESSAGE.into()).to_string()
+        );
+        assert!(
+            !body.message.contains("a request handler bug"),
+            "the panic payload must not reach the caller"
+        );
+        assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 4));
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 5, vec![]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), serve)
+            .await
+            .expect("the serve loop did not end on GOODBYE")
+            .unwrap();
+        assert_eq!(
+            result.expect("a panicking request must not end the connection with an error"),
+            ServeEnd::Goodbye
+        );
     }
 
     /// The tool plane's `scope.describe` goes out on this registered module connection, only

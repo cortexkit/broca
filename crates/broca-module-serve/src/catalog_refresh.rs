@@ -343,31 +343,58 @@ fn counts_at_the_loop(error: &PollError) -> bool {
     }
 }
 
-/// Start the 30-minute refresh loop. The first poll runs in the detached task, after startup has
+/// The first retry after a failed poll. Each further consecutive failure doubles the wait.
+const CATALOG_RETRY_FIRST: Duration = Duration::from_secs(5);
+/// The longest wait between retries of a failing poll.
+const CATALOG_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// How long to wait before the next poll, given how many polls in a row have just failed.
+///
+/// A failure waits a short, doubling delay rather than the full refresh interval. At boot
+/// fusiform is often not yet reachable when the first poll runs, and a short fusiform outage
+/// is ordinary; waiting the full interval after either kept the catalog on its last-known-good
+/// copy for half an hour per failed poll. A success returns to the normal cadence.
+fn next_poll_delay(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return CATALOG_POLL_INTERVAL;
+    }
+    let doublings = (consecutive_failures - 1).min(16);
+    CATALOG_RETRY_FIRST
+        .saturating_mul(1 << doublings)
+        .min(CATALOG_RETRY_MAX)
+}
+
+/// Start the refresh loop: every 30 minutes after a successful poll, sooner after a failed one
+/// (see [`next_poll_delay`]). The first poll runs in the detached task, after startup has
 /// finished wiring the cache; no fusiform route is opened by this function itself.
 pub fn spawn_catalog_poll(poller: Arc<CatalogPoller>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Make startup observably side-effect free toward fusiform. The task's first timer tick is
-        // the first poll; constructing the poller and spawning this loop never opens the route.
-        let first_poll = tokio::time::Instant::now() + Duration::from_millis(1);
-        let mut interval = tokio::time::interval_at(first_poll, CATALOG_POLL_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Make startup observably side-effect free toward fusiform. The first poll runs after
+        // this first sleep; constructing the poller and spawning this loop never opens the route.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let mut consecutive_failures: u32 = 0;
         loop {
-            interval.tick().await;
-            if let Err(error) = poller.poll().await {
-                // Count it where the health probe can see it. A transport failure never
-                // reaches `cache.refresh`, so without this the probe reads ZERO refusals
-                // through a total refresh outage -- which is what happened on 09-14. Which
-                // failures count here, and why a Cache error must not, is the rule at
-                // `counts_at_the_loop`.
-                if counts_at_the_loop(&error) {
-                    poller.cache.note_poll_failure(error.to_string());
+            match poller.poll().await {
+                Ok(()) => consecutive_failures = 0,
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    // Count it where the health probe can see it. A transport failure never
+                    // reaches `cache.refresh`, so without this the probe would read ZERO
+                    // refusals through a total refresh outage. Which
+                    // failures count here, and why a Cache error must not, is the rule at
+                    // `counts_at_the_loop`.
+                    if counts_at_the_loop(&error) {
+                        poller.cache.note_poll_failure(error.to_string());
+                    }
+                    tracing::warn!(
+                        target: "catalog",
+                        "fusiform catalog refresh failed; retaining last-known-good memory, \
+                         retrying in {}s: {error}",
+                        next_poll_delay(consecutive_failures).as_secs()
+                    );
                 }
-                tracing::warn!(
-                    target: "catalog",
-                    "fusiform catalog refresh failed; retaining last-known-good memory: {error}"
-                );
             }
+            tokio::time::sleep(next_poll_delay(consecutive_failures)).await;
         }
     })
 }
@@ -604,6 +631,40 @@ mod tests {
         );
         assert_eq!(object.get("paged"), Some(&serde_json::json!(true)));
         assert!(!object.contains_key("page_token"));
+    }
+
+    /// A failed poll retries after a short, doubling, capped delay; a success restores the
+    /// normal interval.
+    #[test]
+    fn a_failed_poll_retries_on_a_capped_backoff() {
+        assert_eq!(next_poll_delay(0), CATALOG_POLL_INTERVAL);
+        assert_eq!(next_poll_delay(1), Duration::from_secs(5));
+        assert_eq!(next_poll_delay(2), Duration::from_secs(10));
+        assert_eq!(next_poll_delay(3), Duration::from_secs(20));
+        assert_eq!(next_poll_delay(8), CATALOG_RETRY_MAX);
+        assert_eq!(next_poll_delay(u32::MAX), CATALOG_RETRY_MAX);
+    }
+
+    /// The refresh loop polls again within a minute when fusiform is unreachable at boot,
+    /// instead of serving the last-known-good catalog for the full refresh interval.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreachable_fusiform_at_boot_is_polled_again_promptly() {
+        let route = Arc::new(FakeRoute::default());
+        let poller = Arc::new(CatalogPoller::with_route(
+            route.clone(),
+            identity(),
+            Arc::new(CatalogCache::empty()),
+        ));
+        let task = spawn_catalog_poll(poller);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        task.abort();
+        // Each failed poll calls once and retries once on a reopened route.
+        let polls = route.arguments.lock().unwrap().len() / 2;
+        assert!(
+            polls >= 3,
+            "a failing poll must be retried within a minute, not after the refresh interval \
+             ({polls} polls in 60s)"
+        );
     }
 
     fn identity() -> BindIdentity {

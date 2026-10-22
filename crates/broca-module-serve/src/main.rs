@@ -130,6 +130,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // The startup crash-orphan pass treats a WAL last written before this instant as a crashed
     // process's leftover; anything written later belongs to a live writer.
     let process_started = std::time::SystemTime::now();
+    // Before any broca.jsonc loader: each of them reads a missing file as "no overrides".
+    broca_module_serve::config_home::require_explicit_file(
+        broca_module_serve::cache_routing::CONFIG_PATH_ENV,
+        "broca.jsonc",
+    )
+    .map_err(ServeIoError)?;
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;
@@ -3717,7 +3723,11 @@ mod executor {
                             prior_snapshot.head_seq,
                         )
                         .await;
-                    let prompt_ordinal = self
+                    // Like every other failure before the loop, this one is reported through
+                    // the admission ack. Returning without it would drop the ack unsent, and
+                    // the actor would then see only "run ended before admission" instead of
+                    // this permanent Config cause.
+                    let prompt_ordinal = match self
                         .session_prompt_ordinal(
                             &job.req,
                             prior_snapshot
@@ -3727,7 +3737,16 @@ mod executor {
                                 .map(|episode| &episode.config.frozen_render_config),
                             prior_snapshot.head_seq,
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(ordinal) => ordinal,
+                        Err(error) => {
+                            if let Some(ack) = job.on_admitted {
+                                let _ = ack.send(Err(error.clone()));
+                            }
+                            return Err(error);
+                        }
+                    };
                     match broca_module_serve::claude_code_identity::fresh_persona(
                         install_id,
                         resolution.account_id.as_deref(),
