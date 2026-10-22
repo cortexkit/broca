@@ -63,6 +63,11 @@ fn every_open_failed_site_chooses_a_class() {
         ("send: erased cause", "None"),
         ("send: typed admission", "Some(class)"),
         ("send_status: durable send has no carrying run", "None"),
+        // A stamped bind whose history no source could read is refused, and may succeed on retry.
+        (
+            "bind_adoption_refusal: history unreadable",
+            "Some(broca_protocol::ErrorClass::Transient)",
+        ),
         ("retract: erased cause", "None"),
         ("subscribe: erased cause", "None"),
         (

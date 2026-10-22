@@ -362,20 +362,358 @@ async fn owner_authorization_on_15mb_wal() {
     assert_eq!(registry.slot_counts().open, 0);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn bind_and_owner_checks_reuse_large_wal_ownership_without_prefix_reads() {
+    let fixture = Fixture::new();
+    let mut records = vec![started(
+        &fixture.session,
+        Some(reserved("basal")),
+        Some(scope("core")),
+    )];
+    for step in 1..=256 {
+        records.push(WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(step),
+        });
+        let mut record = super::tests::assistant_record();
+        if let WalRecord::ModelStepFinished {
+            step_id,
+            assistant_message,
+            ..
+        } = &mut record
+        {
+            *step_id = broca_protocol::StepId(step);
+            *assistant_message = Arc::new(broca_protocol::AssistantMessage {
+                message_id: broca_protocol::MessageId(format!("m{step}")),
+                content: vec![broca_protocol::ContentBlock::Text {
+                    text: "x".repeat(61_000),
+                }],
+            });
+        }
+        records.push(record);
+    }
+    fixture.append(&records);
+    let stored = snapshot(&fixture);
+    fixture.append(&[finished()]);
+    let current = snapshot(&fixture);
+    let expected = current
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .ownership
+        .as_ref()
+        .unwrap();
+    let bytes = std::fs::metadata(fixture.wal.wal_path(&fixture.session))
+        .unwrap()
+        .len();
+    assert!(
+        (15_000_000..17_000_000).contains(&bytes),
+        "WAL bytes: {bytes}"
+    );
+
+    for source in ["live_cold", "closed_cold", "store", "live_cached"] {
+        let (registry, wal, _) =
+            registry(&fixture, Ok((source == "store").then(|| stored.clone())));
+        if source.starts_with("live") {
+            install_live(
+                &registry,
+                &fixture.session,
+                current.checkpoint.as_ref().unwrap(),
+            );
+            if source == "live_cold" {
+                registry
+                    .inner
+                    .live_ownership
+                    .lock()
+                    .unwrap()
+                    .remove(&fixture.session);
+            } else {
+                let slots = registry.inner.slots.lock().unwrap();
+                if let Some(Entry::Open { handle, .. }) = slots.get(&fixture.session) {
+                    handle
+                        .first_episode
+                        .set(expected.first_episode.clone().unwrap())
+                        .unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            registry.owner_ownership(&fixture.session).await.unwrap(),
+            expected.for_owner_access(),
+            "{source}"
+        );
+        // Without a live actor, the lookup decodes the WAL, flushes the WAL to make the
+        // observed head durable, then rereads exactly that prefix. A live actor supplies
+        // an already-durable head, so the lookup needs only one decode.
+        let cold_full_reads = wal
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(after, through)| {
+                *after == 0 && through.is_none_or(|seq| seq == current.watermark_seq)
+            })
+            .count();
+        assert_eq!(
+            cold_full_reads,
+            match source {
+                "live_cold" => 1,
+                "closed_cold" => 2,
+                _ => 0,
+            },
+            "{source}"
+        );
+
+        for _ in 0..3 {
+            wal.requests.lock().unwrap().clear();
+            wal.decoded_seqs.lock().unwrap().clear();
+            assert_eq!(
+                registry
+                    .session_ownership_for_bind(&fixture.session)
+                    .await
+                    .as_ref(),
+                Some(expected),
+                "{source}"
+            );
+            assert_eq!(
+                registry.owner_ownership(&fixture.session).await.unwrap(),
+                expected.for_owner_access(),
+                "{source}"
+            );
+            let requests = wal.requests.lock().unwrap();
+            assert!(requests.iter().all(|(after, through)| {
+                *after >= current.watermark_seq - 1 || (*after == 0 && *through == Some(1))
+            }), "only the final-frame suffix or the bounded first episode may be read: {source}: {requests:?}");
+            let decoded = wal.decoded_seqs.lock().unwrap();
+            assert!(
+                decoded
+                    .iter()
+                    .all(|seq| *seq == 1 || *seq >= current.watermark_seq),
+                "decoded an unchanged prefix: {source}: {decoded:?}"
+            );
+            if source == "live_cached" {
+                assert!(requests.is_empty(), "live cache must need no WAL reads");
+            }
+        }
+    }
+}
+
+fn plan_manifest(identity: &str, transforms: bool) -> Box<broca_wal::PlanManifest> {
+    Box::new(broca_wal::PlanManifest {
+        plan: broca_wal::OpaqueJson::from_json_text(if transforms {
+            serde_json::json!({"step_transform_items": [{
+                "provider": "p",
+                "subscriptions": [{"hook": "pre_tool", "phase": "approve", "ops": [],
+                    "on_unavailable": "refuse", "budget_ms": 1000}]
+            }]})
+            .to_string()
+        } else {
+            "{}".into()
+        })
+        .unwrap(),
+        plan_identity: identity.into(),
+        composition_digest: String::new(),
+        fetches: vec![],
+        tools: Arc::new(vec![]),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+        role_versions: Default::default(),
+        declarations: vec![],
+    })
+}
+
+fn plan_start(fixture: &Fixture, identity: &str, transforms: bool) -> WalRecord {
+    let mut start = started(
+        &fixture.session,
+        Some(reserved("core")),
+        Some(scope("core")),
+    );
+    if let WalRecord::RunStarted { manifest, .. } = &mut start {
+        *manifest = Some(plan_manifest(identity, transforms));
+    }
+    start
+}
+
+#[tokio::test]
+async fn bind_sources_preserve_frozen_plan_hooks_and_approval_answers() {
+    let fixture = Fixture::new();
+    fixture.append(&[plan_start(&fixture, "owner-test-plan", true)]);
+    let stored = snapshot(&fixture);
+    fixture.append(&[finished()]);
+    let current = snapshot(&fixture);
+    for source in ["live", "store", "anchored_frame"] {
+        let (registry, _, _) = registry(&fixture, Ok((source == "store").then(|| stored.clone())));
+        if source == "live" {
+            install_live(
+                &registry,
+                &fixture.session,
+                current.checkpoint.as_ref().unwrap(),
+            );
+            let slots = registry.inner.slots.lock().unwrap();
+            if let Some(Entry::Open { handle, .. }) = slots.get(&fixture.session) {
+                handle
+                    .first_episode
+                    .set(
+                        current
+                            .checkpoint
+                            .as_ref()
+                            .unwrap()
+                            .ownership
+                            .as_ref()
+                            .unwrap()
+                            .first_episode
+                            .clone()
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+        } else if source == "anchored_frame" {
+            registry.owner_ownership(&fixture.session).await.unwrap();
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                registry.plan_state(&fixture.session).await,
+                crate::serve::PlanState::Admitted {
+                    frozen: Some("owner-test-plan".into())
+                },
+                "{source}"
+            );
+            assert!(
+                registry.frozen_plan_requires_hooks(&fixture.session).await,
+                "{source}"
+            );
+            assert!(
+                registry
+                    .frozen_plan_requires_approval(&fixture.session)
+                    .await,
+                "{source}"
+            );
+            assert_eq!(
+                registry
+                    .session_ownership_for_bind(&fixture.session)
+                    .await
+                    .as_ref(),
+                current.checkpoint.as_ref().unwrap().ownership.as_ref(),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stale_first_episode_positions_revalidate_recreated_or_truncated_wals() {
+    for replacement in ["recreated", "truncated"] {
+        let fixture = Fixture::new();
+        fixture.append(&[plan_start(&fixture, "old-plan", false), finished()]);
+        let (registry, wal, _) = registry(&fixture, Ok(None));
+        registry.owner_ownership(&fixture.session).await.unwrap();
+        let path = fixture.wal.wal_path(&fixture.session);
+        if replacement == "recreated" {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            // Keep the inode and lineage header, but replace every record after it.
+            // A saved byte position is not proof that the replacement frame is the original,
+            // even though both frames have the same sequence number.
+            let bytes = std::fs::read(&path).unwrap();
+            let header_end =
+                broca_wal::HEADER_LEN + u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(header_end as u64)
+                .unwrap();
+        }
+        fixture.append(&[
+            plan_start(
+                &fixture,
+                "replacement-plan-with-a-different-frame-length",
+                true,
+            ),
+            finished(),
+        ]);
+        wal.requests.lock().unwrap().clear();
+        assert_eq!(
+            registry.plan_state(&fixture.session).await,
+            crate::serve::PlanState::Admitted {
+                frozen: Some("replacement-plan-with-a-different-frame-length".into())
+            },
+            "{replacement}"
+        );
+        assert!(wal.requests.lock().unwrap().contains(&(0, None)),
+            "a stale first-frame anchor or lineage must fall back to full revalidation: {replacement}");
+        assert!(registry.frozen_plan_requires_hooks(&fixture.session).await);
+        assert!(
+            registry
+                .frozen_plan_requires_approval(&fixture.session)
+                .await
+        );
+    }
+}
+
+#[tokio::test]
+async fn bind_unknown_history_is_not_reported_as_unowned() {
+    let fixture = Fixture::new();
+    fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
+    let projected = snapshot(&fixture);
+    let whole_log = projected.checkpoint.as_ref().unwrap().ownership.clone();
+    let (registry, wal, _) = registry(&fixture, Ok(Some(projected)));
+    wal.fault.store(2, Ordering::Relaxed);
+    // Every range read is unproven here, but the store's plain record read still works: the
+    // bind answer is the whole log's, not an unowned session and not unknown.
+    assert_eq!(
+        registry.session_ownership_for_bind(&fixture.session).await,
+        whole_log
+    );
+    assert!(wal.requests.lock().unwrap().contains(&(0, None)));
+
+    let (registry, _, _) = self::registry(&fixture, Err("store unavailable".into()));
+    let path = fixture.wal.wal_path(&fixture.session);
+    std::fs::write(&path, []).unwrap();
+    assert!(registry
+        .session_ownership_for_bind(&fixture.session)
+        .await
+        .is_none());
+    let registry = LineageRegistry::new(Arc::new(NeverOpener));
+    assert!(registry
+        .session_ownership_for_bind(&fixture.session)
+        .await
+        .is_none());
+}
+
 struct CountingWal {
     inner: Arc<FileWalStore>,
     reads: Mutex<Vec<u64>>,
+    decoded_seqs: Mutex<Vec<u64>>,
+    requests: Mutex<Vec<(u64, Option<u64>)>>,
     fault: AtomicU64,
 }
 
 impl WalStore for CountingWal {
+    fn check_move(&self, session: &LineageKey, write: bool) -> Result<(), broca_wal::WalError> {
+        self.inner.check_move(session, write)
+    }
+
     fn open(&self, _: &LineageKey) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
         panic!("authorization never opens a WAL writer")
     }
 
     fn read_records(&self, session: &LineageKey) -> Result<Vec<FramedRecord>, broca_wal::WalError> {
         self.reads.lock().unwrap().push(0);
-        self.inner.read_records(session)
+        self.requests.lock().unwrap().push((0, None));
+        if self.fault.load(Ordering::Relaxed) == 10 {
+            return Err(broca_wal::WalError::Io(std::io::Error::other(
+                "injected whole-log read failure",
+            )));
+        }
+        let records = self.inner.read_records(session)?;
+        self.decoded_seqs
+            .lock()
+            .unwrap()
+            .extend(records.iter().map(|frame| frame.seq));
+        Ok(records)
     }
 
     fn read_records_range(
@@ -386,7 +724,27 @@ impl WalStore for CountingWal {
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
         self.reads.lock().unwrap().push(after);
-        if self.fault.load(Ordering::Relaxed) == 2 {
+        self.requests.lock().unwrap().push((after, through));
+        let fault = self.fault.load(Ordering::Relaxed);
+        let suffix_fault = after > 0 && matches!(fault, 6 | 8);
+        let first_fault = after == 0 && through == Some(1) && matches!(fault, 7 | 9);
+        if (suffix_fault || first_fault)
+            && self
+                .fault
+                .compare_exchange(fault, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            // Fail only this read. A retry from another snapshot would succeed and would
+            // hide the failed read, which the refusal tests below must detect.
+            return if fault >= 8 {
+                Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()))
+            } else {
+                Err(broca_wal::WalError::Io(std::io::Error::other(
+                    "injected one-shot ownership read failure",
+                )))
+            };
+        }
+        if matches!(self.fault.load(Ordering::Relaxed), 2 | 10) {
             return Ok(broca_wal::WalRangeRead::without_anchors(Vec::new()));
         }
         if self.fault.load(Ordering::Relaxed) == 5 && through.is_some() {
@@ -394,8 +752,16 @@ impl WalStore for CountingWal {
                 .inner
                 .read_records_range(session, after, Some(after), anchor);
         }
-        self.inner
-            .read_records_range(session, after, through, anchor)
+        let range = self
+            .inner
+            .read_records_range(session, after, through, anchor)?;
+        if let broca_wal::WalRangeRecords::Complete(records) = range.records() {
+            self.decoded_seqs
+                .lock()
+                .unwrap()
+                .extend(records.iter().map(|frame| frame.seq));
+        }
+        Ok(range)
     }
 
     fn flush_for_read(&self, session: &LineageKey) -> Result<Option<u64>, broca_wal::WalError> {
@@ -463,6 +829,8 @@ fn registry(
     let wal = Arc::new(CountingWal {
         inner: fixture.wal.clone(),
         reads: Mutex::new(Vec::new()),
+        decoded_seqs: Mutex::new(Vec::new()),
+        requests: Mutex::new(Vec::new()),
         fault: AtomicU64::new(0),
     });
     let store = Arc::new(SnapshotStore {
@@ -665,6 +1033,8 @@ async fn ownership_tail_freezes_scope_after_the_store_watermark() {
     let wal = Arc::new(CountingWal {
         inner: fixture.wal.clone(),
         reads: Mutex::new(Vec::new()),
+        decoded_seqs: Mutex::new(Vec::new()),
+        requests: Mutex::new(Vec::new()),
         fault: AtomicU64::new(0),
     });
     let registry =
@@ -1090,6 +1460,7 @@ async fn owner_caches_do_not_retain_first_episode_content() {
             anchor: projected.anchor,
             lineage_id: projected.lineage_id.clone(),
             ownership: ownership.clone(),
+            first_episode_position: None,
         },
     );
     drop(projected);
@@ -1365,4 +1736,204 @@ async fn cold_flow_sender_refuses_degraded_read_but_warm_sender_remains_authorit
         .authorize_session(&fresh, Some(&reserved("basal")))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn ownership_suffix_read_failure_never_tries_another_snapshot() {
+    for fault in [6, 8] {
+        for bind in [false, true] {
+            let fixture = Fixture::new();
+            fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
+            let projected = snapshot(&fixture);
+            let whole_log = projected.checkpoint.as_ref().unwrap().ownership.clone();
+            let (registry, wal, store) = registry(&fixture, Ok(None));
+            registry.owner_ownership(&fixture.session).await.unwrap();
+            *store.snapshot.lock().unwrap() = Ok(Some(projected));
+            store.reads.store(0, Ordering::Relaxed);
+            wal.requests.lock().unwrap().clear();
+            wal.fault.store(fault, Ordering::Relaxed);
+            let ownership = if bind {
+                registry.session_ownership_for_bind(&fixture.session).await
+            } else {
+                registry.owner_ownership(&fixture.session).await.ok()
+            };
+            assert_eq!(
+                store.reads.load(Ordering::Relaxed),
+                0,
+                "a failed suffix cannot fall through to a different snapshot: fault {fault}"
+            );
+            let requests = wal.requests.lock().unwrap().clone();
+            if bind && fault == 8 {
+                // A suffix whose coverage cannot be proven is not a failed read. Bind decodes
+                // the whole live log with the store's plain read (the `(0, None)` request),
+                // never the stored projection.
+                assert_eq!(
+                    ownership, whole_log,
+                    "an unproven suffix falls back to the whole log, not a different snapshot"
+                );
+                assert_eq!(requests.len(), 2, "{requests:?}");
+                assert_eq!(requests[1], (0, None), "{requests:?}");
+            } else {
+                assert!(
+                    ownership.is_none(),
+                    "a failed suffix cannot fall through to a different snapshot: fault {fault}"
+                );
+                assert_eq!(requests.len(), 1, "{requests:?}");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ownership_first_episode_read_failure_never_tries_another_snapshot() {
+    for fault in [7, 9] {
+        let fixture = Fixture::new();
+        fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
+        let projected = snapshot(&fixture);
+        let whole_log = projected.checkpoint.as_ref().unwrap().ownership.clone();
+        let (registry, wal, store) = registry(&fixture, Ok(None));
+        registry.owner_ownership(&fixture.session).await.unwrap();
+        *store.snapshot.lock().unwrap() = Ok(Some(projected));
+        store.reads.store(0, Ordering::Relaxed);
+        wal.requests.lock().unwrap().clear();
+        wal.fault.store(fault, Ordering::Relaxed);
+        let ownership = registry.session_ownership_for_bind(&fixture.session).await;
+        assert_eq!(store.reads.load(Ordering::Relaxed), 0,
+            "a failed first-episode read cannot fall through to a different snapshot: fault {fault}");
+        let requests = wal.requests.lock().unwrap().clone();
+        if fault == 9 {
+            // An unproven first-episode frame is not a failed read: bind decodes the whole
+            // live log (the trailing `(0, None)` request), never the stored projection.
+            assert_eq!(
+                ownership, whole_log,
+                "an unproven first episode falls back to the whole log, not a different snapshot"
+            );
+            assert_eq!(requests.len(), 3, "{requests:?}");
+            assert_eq!(requests[2], (0, None), "{requests:?}");
+        } else {
+            assert!(ownership.is_none(),
+                "a failed first-episode read cannot fall through to a different snapshot: fault {fault}");
+            assert_eq!(requests.len(), 2, "{requests:?}");
+        }
+    }
+}
+
+/// A stamped bind into a session recorded without a principal must be refused, whichever
+/// source answers. When no source can read the history, the bind is refused as a transient
+/// failure: "unknown" must never read as "nothing refuses the stamp".
+#[tokio::test]
+async fn bind_adoption_refuses_when_ownership_is_unknown() {
+    let stamp = broca_protocol::BindScope {
+        scope: SessionScope {
+            flow_id: None,
+            sender: None,
+            ..scope("core")
+        },
+        owner_authorized: true,
+    };
+    // 0: every read proven; 8: the suffix is unproven, so the whole log is decoded;
+    // 6: the suffix read fails; 10: every range is unproven and the whole-log read fails.
+    for fault in [0, 8, 6, 10] {
+        let fixture = Fixture::new();
+        fixture.append(&[started(&fixture.session, None, None), finished()]);
+        let (registry, wal, _) = registry(&fixture, Ok(None));
+        registry.owner_ownership(&fixture.session).await.unwrap();
+        wal.fault.store(fault, Ordering::Relaxed);
+        let decided = registry
+            .bind_adoption_refusal(&fixture.session, Some(&reserved("core")), &stamp)
+            .await;
+        match fault {
+            0 | 8 => assert_eq!(
+                decided.unwrap(),
+                Some(broca_core::AdoptionRefusal::NoRecordedPrincipal),
+                "fault {fault}"
+            ),
+            _ => assert!(
+                matches!(
+                    decided,
+                    Err(crate::serve::ServeError::Open(
+                        _,
+                        Some(broca_protocol::ErrorClass::Transient)
+                    ))
+                ),
+                "unreadable ownership must refuse the bind, not accept it: fault {fault}: {decided:?}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn move_fenced_ownership_never_reuses_a_corrupt_cached_prefix() {
+    for fence in ["moving", "moved"] {
+        for source in ["memory", "store", "live"] {
+            let fixture = Fixture::new();
+            fixture.append(&[plan_start(&fixture, "plan", true), finished()]);
+            let projected = snapshot(&fixture);
+            let (registry, wal, _) =
+                registry(&fixture, Ok((source == "store").then(|| projected.clone())));
+            if source == "live" {
+                install_live(
+                    &registry,
+                    &fixture.session,
+                    projected.checkpoint.as_ref().unwrap(),
+                );
+            } else if source == "memory" {
+                registry
+                    .session_ownership_for_bind(&fixture.session)
+                    .await
+                    .unwrap();
+            }
+            let path = fixture.wal.wal_path(&fixture.session);
+            if fence == "moving" {
+                broca_wal::migration::atomic_json(
+                    &fixture.root,
+                    &path.with_extension("moving"),
+                    &broca_wal::migration::Freeze {
+                        cut_id: "cut-a".into(),
+                        end_offset: 0,
+                        lineage_id: "lineage".into(),
+                    },
+                )
+                .unwrap();
+            } else {
+                broca_wal::migration::atomic_json(
+                    &fixture.root,
+                    &path.with_extension("moved"),
+                    &broca_wal::migration::Moved {
+                        cut_id: "cut-a".into(),
+                        holder: "remote".into(),
+                        lineage_id: "lineage".into(),
+                    },
+                )
+                .unwrap();
+            }
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[0] ^= 0xff;
+            std::fs::write(&path, &bytes).unwrap();
+            wal.requests.lock().unwrap().clear();
+            assert!(
+                registry.owner_ownership(&fixture.session).await.is_err(),
+                "{source}"
+            );
+            assert!(
+                registry
+                    .session_ownership_for_bind(&fixture.session)
+                    .await
+                    .is_none(),
+                "{source}"
+            );
+            assert!(wal
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(after, _)| *after == 0));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "readers cannot repair corruption"
+            );
+        }
+    }
 }

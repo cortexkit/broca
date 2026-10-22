@@ -685,6 +685,135 @@ struct OwnershipSnapshot {
     watermark_seq: u64,
     anchor: Option<broca_wal::WalByteAnchor>,
     lineage_id: Option<String>,
+    first_episode_position: Option<FirstEpisodePosition>,
+}
+
+#[derive(Clone)]
+struct FirstEpisodePosition {
+    seq: u64,
+    before: Option<broca_wal::WalByteAnchor>,
+    at: Option<broca_wal::WalByteAnchor>,
+}
+
+enum OwnershipPurpose {
+    Owner,
+    Bind(Option<broca_core::FirstEpisodeV1>),
+}
+
+fn first_episode_from_frame(
+    frame: &broca_wal::FramedRecord,
+) -> Result<broca_core::FirstEpisodeV1, OpenError> {
+    broca_core::AdmissionCheckpointV1::from_frames(std::slice::from_ref(frame))
+        .map_err(|error| OpenError::Open(error.to_string()))?
+        .ownership
+        .and_then(|ownership| ownership.first_episode)
+        .ok_or_else(|| OpenError::Open("first episode frame is not RunStarted".into()))
+}
+
+/// Bind ownership decoded from the session's whole log through the store's plain record
+/// read, for when the validated reader cannot prove its coverage. Stores without range proofs
+/// (every store except the file store) always end up here. Like the validated reader, an empty
+/// or missing log counts as no history only when nothing in the store contradicts that. The
+/// answer is not cached: it carries no byte anchor a later read could validate.
+async fn whole_log_bind_ownership(
+    sources: ReadSources,
+    key: LineageKey,
+) -> Result<broca_core::SessionOwnershipV1, String> {
+    spawn_blocking(JobKind::WalRead, move || {
+        let stored_history = || {
+            sources
+                .store
+                .as_ref()
+                .map(|store| store.read_admission_snapshot(&key))
+                .transpose()
+                .map(Option::flatten)
+        };
+        let records = match sources.wal_store.read_records(&key) {
+            Ok(records) => records,
+            Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let meta = stored_history()?;
+                if sources
+                    .wal_store
+                    .lineage_exists(&key, meta.as_ref())
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err("session ownership history is missing".into());
+                }
+                return Ok(broca_core::SessionOwnershipV1::default());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if records.is_empty()
+            && stored_history()?.is_some_and(|meta| {
+                meta.watermark_seq > 0
+                    || meta.checkpoint.as_ref().is_some_and(|checkpoint| {
+                        checkpoint.last_episode.is_some()
+                            || checkpoint
+                                .ownership
+                                .as_ref()
+                                .is_some_and(|ownership| ownership.episodes > 0)
+                    })
+            })
+        {
+            return Err("empty session WAL contradicts materialized history".into());
+        }
+        broca_core::AdmissionCheckpointV1::from_frames(&records)
+            .map_err(|error| error.to_string())?
+            .ownership
+            .ok_or_else(|| "whole-log fold produced no ownership summary".into())
+    })
+    .await
+    .map_err(|error| format!("whole-log ownership task failed: {error}"))?
+}
+
+/// Why a validated ownership read gave no answer. Cancel and retract treat both kinds the
+/// same, as a transient refusal. The bind-time checks tell them apart: a range whose coverage
+/// cannot be proven is not a failed read, so bind decodes the whole log instead.
+enum OwnershipReadError {
+    /// The read failed, or the history it found contradicts the session's stored metadata.
+    Read(OpenError),
+    /// The read returned frames but cannot prove they are the whole requested history: the
+    /// store reports no completeness, a durability barrier failed, or the range has gaps.
+    CoverageUnproven(OpenError),
+}
+
+impl From<OpenError> for OwnershipReadError {
+    fn from(error: OpenError) -> Self {
+        Self::Read(error)
+    }
+}
+
+impl OwnershipReadError {
+    fn coverage_unproven(context: &str, reason: String) -> Self {
+        Self::CoverageUnproven(OpenError::Classified {
+            reason: format!("{context}: {reason}"),
+            class: broca_protocol::ErrorClass::Transient,
+        })
+    }
+
+    fn into_open(self) -> OpenError {
+        match self {
+            Self::Read(error) | Self::CoverageUnproven(error) => error,
+        }
+    }
+}
+
+/// What the `route.bind` checks know about a session's ownership.
+// Built once per bind check and consumed at once, so the size gap between variants costs
+// nothing worth a heap allocation.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindOwnership {
+    /// Read from the session's history, or authoritatively empty: no history at all, or the
+    /// session expired.
+    Known(broca_core::SessionOwnershipV1),
+    /// This registry has no read-only history source, so it has nothing to check a bind
+    /// against (the same answer a handler without history gives).
+    NoHistorySource,
+    /// Ownership could not be established: the validated read failed, or its coverage was
+    /// unproven and decoding the whole log failed too. Callers must not treat this as a
+    /// session without an owner.
+    Unreadable(String),
 }
 
 impl OwnershipSnapshot {
@@ -698,6 +827,7 @@ impl OwnershipSnapshot {
             watermark_seq: snapshot.watermark_seq,
             anchor: snapshot.anchor,
             lineage_id: snapshot.lineage_id,
+            first_episode_position: None,
         })
     }
 }
@@ -1212,19 +1342,51 @@ impl LineageRegistry {
         key: &LineageKey,
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
         self.check_authorization_expired(key).await?;
-        let live = {
+        self.durable_session_ownership(key, false)
+            .await
+            .map_err(OwnershipReadError::into_open)
+    }
+
+    async fn durable_session_ownership(
+        &self,
+        key: &LineageKey,
+        for_bind: bool,
+    ) -> Result<broca_core::SessionOwnershipV1, OwnershipReadError> {
+        match self.check_move(key, true) {
+            // Moving and moved sessions must fail closed if any of the log is unreadable.
+            // A cached prefix or a suffix read from a WAL byte anchor covers only part of
+            // the history, so revalidate the whole log before deciding ownership here.
+            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => {
+                let reader = self.inner.reader.as_ref().ok_or_else(|| {
+                    OpenError::Open("owner authorization reader is not configured".into())
+                })?;
+                return self.read_owner_fallback(reader, key, None, for_bind).await;
+            }
+            Err(error) => return Err(error.into()),
+            Ok(()) => {}
+        }
+        let (live, live_first) = {
             let slots = self.inner.slots.lock().unwrap();
             match slots.get(key) {
-                Some(Entry::Open { handle, .. }) => {
-                    Some((handle.gen, handle.durable_head.load(Ordering::Acquire)))
-                }
-                _ => None,
+                Some(Entry::Open { handle, .. }) => (
+                    Some((handle.gen, handle.durable_head.load(Ordering::Acquire))),
+                    handle.first_episode.get().cloned(),
+                ),
+                _ => (None, None),
             }
         };
         if let Some((generation, head)) = live {
             if let Some(cached) = self.inner.live_ownership.lock().unwrap().get(key) {
                 if cached.generation == generation && cached.head == head {
-                    return Ok(cached.ownership.clone());
+                    let mut ownership = cached.ownership.clone();
+                    if !for_bind {
+                        return Ok(ownership);
+                    }
+                    ownership.first_episode = live_first;
+                    if ownership.episodes == 0 || ownership.first_episode.is_some() {
+                        ownership.plan_manifest_folded = true;
+                        return Ok(ownership);
+                    }
                 }
             }
         }
@@ -1233,33 +1395,76 @@ impl LineageRegistry {
         })?;
         let live_head = live.map(|(_, head)| head);
         let cached = self.inner.owner_snapshots.lock().unwrap().get(key).cloned();
-        if let Some(snapshot) = cached {
+        if let Some(mut snapshot) = cached {
             if let Some((current, head)) = self
-                .owner_snapshot_at_head(reader, key, &snapshot, live_head)
+                .owner_snapshot_at_head(
+                    reader,
+                    key,
+                    &mut snapshot,
+                    live_head,
+                    if for_bind {
+                        OwnershipPurpose::Bind(None)
+                    } else {
+                        OwnershipPurpose::Owner
+                    },
+                )
                 .await?
             {
-                return Ok(self.remember_owner_snapshot(key, snapshot, &current, head, live));
+                self.remember_owner_snapshot(key, snapshot, &current, head, live);
+                return Ok(current);
             }
         }
         if let Some(store) = reader.store.clone() {
             let read_key = key.clone();
+            // A failed projection lookup supplies no ownership. Only a subsequent WAL
+            // read may establish it; WAL errors below must not retry another projection.
             let snapshot = spawn_blocking(JobKind::StoreRead, move || {
                 store.read_admission_snapshot(&read_key)
             })
             .await
             .ok()
             .and_then(Result::ok)
-            .flatten()
-            .and_then(OwnershipSnapshot::from_store);
-            if let Some(snapshot) = snapshot {
+            .flatten();
+            if let Some(stored) = snapshot {
+                let first_episode = stored
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.ownership.as_ref())
+                    .filter(|ownership| ownership.plan_manifest_folded)
+                    .and_then(|ownership| ownership.first_episode.clone());
+                let Some(mut snapshot) = OwnershipSnapshot::from_store(stored) else {
+                    return self.read_owner_fallback(reader, key, live, for_bind).await;
+                };
                 if let Some((current, head)) = self
-                    .owner_snapshot_at_head(reader, key, &snapshot, live_head)
+                    .owner_snapshot_at_head(
+                        reader,
+                        key,
+                        &mut snapshot,
+                        live_head,
+                        if for_bind {
+                            OwnershipPurpose::Bind(first_episode)
+                        } else {
+                            OwnershipPurpose::Owner
+                        },
+                    )
                     .await?
                 {
-                    return Ok(self.remember_owner_snapshot(key, snapshot, &current, head, live));
+                    self.remember_owner_snapshot(key, snapshot, &current, head, live);
+                    return Ok(current);
                 }
             }
         }
+        self.read_owner_fallback(reader, key, live, for_bind).await
+    }
+
+    async fn read_owner_fallback(
+        &self,
+        reader: &ReadSources,
+        key: &LineageKey,
+        live: Option<(u64, u64)>,
+        for_bind: bool,
+    ) -> Result<broca_core::SessionOwnershipV1, OwnershipReadError> {
+        let live_head = live.map(|(_, head)| head);
         // Admission checkpoints contain prompts and queued requests as well as ownership.
         // Finite-retention sessions must not copy that content into the persistent store,
         // so their owner lookup reads the WAL. A failed store read needs the same fallback,
@@ -1279,12 +1484,55 @@ impl LineageRegistry {
             .await?;
         let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
             .records()
-            .map_err(|reason| OpenError::Classified {
-                reason: format!("owner authorization: {reason}"),
-                class: broca_protocol::ErrorClass::Transient,
+            .map_err(|reason| {
+                OwnershipReadError::coverage_unproven("owner authorization", reason)
             })?;
+        if for_bind && records.is_empty() {
+            // An empty or missing WAL cannot erase ownership recorded in the materialized
+            // history. Fail the ownership read if metadata contradicts an empty WAL or its
+            // provenance cannot be checked, rather than infer that the session has no owner.
+            let sources = reader.clone();
+            let key = key.clone();
+            let absent = matches!(range.records(), broca_wal::WalRangeRecords::Absent);
+            spawn_blocking(JobKind::StoreRead, move || {
+                let meta = sources
+                    .store
+                    .as_ref()
+                    .map(|store| store.read_admission_snapshot(&key))
+                    .transpose()?
+                    .flatten();
+                if meta.as_ref().is_some_and(|meta| {
+                    meta.watermark_seq > 0
+                        || meta.checkpoint.as_ref().is_some_and(|checkpoint| {
+                            checkpoint.last_episode.is_some()
+                                || checkpoint
+                                    .ownership
+                                    .as_ref()
+                                    .is_some_and(|ownership| ownership.episodes > 0)
+                        })
+                }) || (absent
+                    && sources
+                        .wal_store
+                        .lineage_exists(&key, meta.as_ref())
+                        .map_err(|e| e.to_string())?)
+                {
+                    return Err("empty session WAL contradicts materialized history".into());
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| OpenError::Open(format!("ownership provenance task failed: {error}")))?
+            .map_err(OpenError::Open)?;
+        }
         let mut ownership = broca_core::SessionOwnershipV1::default();
         ownership.fold_owner_records(records);
+        let first = records
+            .iter()
+            .find(|frame| matches!(frame.record, broca_wal::WalRecord::RunStarted { .. }));
+        if for_bind {
+            ownership.first_episode = first.map(first_episode_from_frame).transpose()?;
+            ownership.plan_manifest_folded = true;
+        }
         let head = records.last().map_or(0, |record| record.seq);
         // An anchor at EOF cannot validate a following frame and makes the range reader
         // scan from zero. Retain a checkpoint before the last frame so repeated checks have
@@ -1298,21 +1546,28 @@ impl LineageRegistry {
             lineage_id: range.lineage_id.map(|id| id.to_string()),
             anchor: range.anchor_at(watermark_seq),
             ownership: base,
+            first_episode_position: first.map(|frame| FirstEpisodePosition {
+                seq: frame.seq,
+                before: range.anchor_at(frame.seq - 1),
+                at: range.anchor_at(frame.seq),
+            }),
         };
-        Ok(self.remember_owner_snapshot(key, snapshot, &ownership, head, live))
+        self.remember_owner_snapshot(key, snapshot, &ownership, head, live);
+        Ok(ownership)
     }
 
     async fn owner_snapshot_at_head(
         &self,
         reader: &ReadSources,
         key: &LineageKey,
-        snapshot: &OwnershipSnapshot,
+        snapshot: &mut OwnershipSnapshot,
         live_head: Option<u64>,
-    ) -> Result<Option<(broca_core::SessionOwnershipV1, u64)>, OpenError> {
+        purpose: OwnershipPurpose,
+    ) -> Result<Option<(broca_core::SessionOwnershipV1, u64)>, OwnershipReadError> {
         if live_head.is_some_and(|head| snapshot.watermark_seq > head) {
             return Ok(None);
         }
-        let range = match self
+        let range = self
             .read_durable_range_for(
                 reader,
                 key,
@@ -1324,22 +1579,18 @@ impl LineageRegistry {
                     purpose: ReadPurpose::Authorization,
                 },
             )
-            .await
-        {
-            Ok(range) => range,
-            Err(_) => return Ok(None),
-        };
+            .await?;
+        let records =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)
+                .records()
+                .map_err(|reason| {
+                    OwnershipReadError::coverage_unproven("owner authorization suffix", reason)
+                })?;
         if snapshot.lineage_id.as_deref() != range.lineage_id.map(|id| id.to_string()).as_deref()
             || snapshot.lineage_id.is_none()
         {
             return Ok(None);
         }
-        let Ok(records) =
-            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)
-                .records()
-        else {
-            return Ok(None);
-        };
         let head = records
             .last()
             .map_or(snapshot.watermark_seq, |record| record.seq);
@@ -1348,7 +1599,89 @@ impl LineageRegistry {
         }
         let mut ownership = snapshot.ownership.clone();
         ownership.fold_owner_records(records);
+        let first = (snapshot.ownership.episodes == 0)
+            .then(|| {
+                records
+                    .iter()
+                    .find(|frame| matches!(frame.record, broca_wal::WalRecord::RunStarted { .. }))
+            })
+            .flatten();
+        if let Some(frame) = first {
+            snapshot.first_episode_position = Some(FirstEpisodePosition {
+                seq: frame.seq,
+                before: range.anchor_at(frame.seq - 1),
+                at: range.anchor_at(frame.seq),
+            });
+        }
+        if let OwnershipPurpose::Bind(stored_first) = purpose {
+            ownership.first_episode = match (stored_first, first, ownership.episodes) {
+                (Some(first), _, _) => Some(first),
+                (_, Some(frame), _) => Some(first_episode_from_frame(frame)?),
+                (_, _, 0) => None,
+                _ => {
+                    let Some(position) = &snapshot.first_episode_position else {
+                        return Ok(None);
+                    };
+                    let Some(first) = self
+                        .read_first_episode(reader, key, snapshot, position, head)
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    Some(first)
+                }
+            };
+            ownership.plan_manifest_folded = true;
+        }
         Ok(Some((ownership, head)))
+    }
+
+    async fn read_first_episode(
+        &self,
+        reader: &ReadSources,
+        key: &LineageKey,
+        snapshot: &OwnershipSnapshot,
+        position: &FirstEpisodePosition,
+        head: u64,
+    ) -> Result<Option<broca_core::FirstEpisodeV1>, OwnershipReadError> {
+        // Keep only frame positions in the ownership cache, not tool or provider text.
+        // Bind pays one bounded RunStarted-frame read when no live/store summary supplies it.
+        let range = self
+            .read_durable_range_for(
+                reader,
+                key,
+                ReadRangeRequest {
+                    after_seq: position.seq - 1,
+                    anchor: position.before,
+                    live_head: Some(head),
+                    through_seq: Some(position.seq),
+                    purpose: ReadPurpose::Authorization,
+                },
+            )
+            .await?;
+        let records = crate::durable_read::DurableRead::classify(
+            &range,
+            position.seq - 1,
+            Some(position.seq),
+        )
+        .records()
+        .map_err(|reason| {
+            OwnershipReadError::coverage_unproven("owner authorization first episode", reason)
+        })?;
+        if position.seq > head
+            || position.at.is_none()
+            || range.anchor_at(position.seq) != position.at
+            || snapshot.lineage_id.as_deref()
+                != range.lineage_id.map(|id| id.to_string()).as_deref()
+        {
+            return Ok(None);
+        }
+        match records {
+            [frame] if matches!(frame.record, broca_wal::WalRecord::RunStarted { .. }) => {
+                Ok(Some(first_episode_from_frame(frame)?))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn remember_owner_snapshot(
@@ -1377,84 +1710,54 @@ impl LineageRegistry {
     }
 
     /// The ownership summary of a session's durable history, read without opening its actor,
-    /// for the adoption check at `route.bind`. `None` when this registry has no read-only source
-    /// or the history cannot be read: the bind then goes ahead, and the same check runs
-    /// authoritatively on the first send.
+    /// for the prechecks that run before a session's actor sees a send or a bind. `None` when
+    /// this registry has no read-only source or the history cannot be read. Each caller treats
+    /// `None` as unknown: the session's actor makes the same decision authoritatively. The
+    /// stamped-bind adoption check must not skip on unknown and uses [`Self::bind_ownership`].
     pub async fn session_ownership_for_bind(
         &self,
         key: &LineageKey,
     ) -> Option<broca_core::SessionOwnershipV1> {
+        match self.bind_ownership(key).await {
+            BindOwnership::Known(ownership) => Some(ownership),
+            BindOwnership::NoHistorySource => None,
+            BindOwnership::Unreadable(error) => {
+                tracing::warn!(
+                    target: "scope",
+                    "route.bind ownership unknown, history unreadable: {error}"
+                );
+                None
+            }
+        }
+    }
+
+    /// The ownership a `route.bind` is checked against. The validated reader answers first,
+    /// from the live session, a cached or stored checkpoint plus its WAL suffix, or the whole
+    /// WAL. When that reader cannot prove it covered the whole history, the whole log is
+    /// decoded instead, as stores without range proofs serve it. A validated-read error, or a
+    /// failed whole-log fallback, is [`BindOwnership::Unreadable`]; a validated-read error is
+    /// never retried against any other source.
+    pub async fn bind_ownership(&self, key: &LineageKey) -> BindOwnership {
         if matches!(
             self.check_expired(key, None).await,
             Err(OpenError::Expired { .. })
         ) {
-            return Some(broca_core::SessionOwnershipV1::default());
+            return BindOwnership::Known(broca_core::SessionOwnershipV1::default());
         }
-        let sources = self.inner.reader.clone()?;
-        let key = key.clone();
-        let folded = spawn_blocking(JobKind::WalRead, move || {
-            let records = match sources.wal_store.read_records(&key) {
-                Ok(records) => records,
-                Err(broca_wal::WalError::Io(error))
-                    if error.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    let meta = sources
-                        .store
-                        .as_ref()
-                        .map(|store| store.read_admission_snapshot(&key))
-                        .transpose()?
-                        .flatten();
-                    if !sources
-                        .wal_store
-                        .lineage_exists(&key, meta.as_ref())
-                        .map_err(|e| e.to_string())?
-                    {
-                        let mut empty = broca_core::AdmissionCheckpointV1::from_frames(&[])
-                            .map_err(|e| e.to_string())?;
-                        empty.ownership = Some(broca_core::SessionOwnershipV1::default());
-                        return Ok(empty);
-                    }
-                    return Err("session ownership history is missing".into());
-                }
-                Err(error) => return Err(error.to_string()),
-            };
-            if records.is_empty() {
-                let meta = sources
-                    .store
-                    .as_ref()
-                    .map(|store| store.read_admission_snapshot(&key))
-                    .transpose()?
-                    .flatten();
-                if meta.as_ref().is_some_and(|meta| {
-                    meta.watermark_seq > 0
-                        || meta.checkpoint.as_ref().is_some_and(|checkpoint| {
-                            checkpoint.last_episode.is_some()
-                                || checkpoint
-                                    .ownership
-                                    .as_ref()
-                                    .is_some_and(|ownership| ownership.episodes > 0)
-                        })
-                }) {
-                    return Err("empty session WAL contradicts materialized history".into());
+        let Some(reader) = self.inner.reader.clone() else {
+            return BindOwnership::NoHistorySource;
+        };
+        match self.durable_session_ownership(key, true).await {
+            Ok(ownership) => BindOwnership::Known(ownership),
+            Err(OwnershipReadError::CoverageUnproven(unproven)) => {
+                match whole_log_bind_ownership(reader, key.clone()).await {
+                    Ok(ownership) => BindOwnership::Known(ownership),
+                    Err(error) => BindOwnership::Unreadable(format!(
+                        "{unproven}; whole-log read failed: {error}"
+                    )),
                 }
             }
-            broca_core::AdmissionCheckpointV1::from_frames(&records)
-                .map_err(|error| error.to_string())
-        })
-        .await;
-        match folded {
-            Ok(Ok(checkpoint)) => checkpoint.ownership,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    target: "scope",
-                    "route.bind adoption check skipped, history unreadable: {error}"
-                );
-                None
-            }
-            Err(error) => {
-                tracing::warn!(target: "scope", "route.bind adoption check task failed: {error}");
-                None
-            }
+            Err(OwnershipReadError::Read(error)) => BindOwnership::Unreadable(error.to_string()),
         }
     }
 

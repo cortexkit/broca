@@ -343,7 +343,8 @@ async fn the_migration_adopts_only_a_session_whose_every_episode_recorded_the_ow
                         owner_authorized: true,
                     },
                 )
-                .await;
+                .await
+                .unwrap_or_else(|error| panic!("{label}: the bind read its history: {error}"));
             assert_eq!(bind, expected, "{label}: the bind");
             let sent = registry.send(owner_send()).await;
             match &expected {

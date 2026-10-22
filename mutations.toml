@@ -2789,6 +2789,184 @@ file = "crates/broca-module-serve/src/main.rs"
 old = "            let prior_snapshot = &job.prior_snapshot;"
 new = "            let _ = self.wal_store.read_records(&job.req.session); // NON-VACUITY BREAK\n            let prior_snapshot = &job.prior_snapshot;"
 
+[[control]]
+id = "module-bind-reuses-owner-snapshot"
+guards = "repeated bind ownership and frozen-plan probes reuse validated ownership instead of decoding the whole WAL"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::bind_and_owner_checks_reuse_large_wal_ownership_without_prefix_reads"]
+expect_message = "only the final-frame suffix or the bounded first episode may be read"
+file = "crates/broca-module/src/registry.rs"
+old = "        match self.durable_session_ownership(key, true).await {"
+new = "        // NON-VACUITY BREAK: bypass cached ownership and decode the complete WAL on every bind.\n        match self.read_owner_fallback(&reader, key, None, true).await {"
+
+[[control]]
+id = "module-bind-validates-first-episode-anchor"
+guards = "a cached first-episode frame position must be revalidated before supplying a frozen plan"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::stale_first_episode_positions_revalidate_recreated_or_truncated_wals"]
+expect_message = "a stale first-frame anchor or lineage must fall back to full revalidation"
+file = "crates/broca-module/src/registry.rs"
+old = "            || range.anchor_at(position.seq) != position.at"
+new = "            || false // NON-VACUITY BREAK: trust a cached position after the frame was replaced."
+
+[[control]]
+id = "module-moved-ownership-revalidates-full-history"
+guards = "move-fenced ownership refuses unreadable history instead of disclosing an owner from a cached prefix"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::unreadable_moved_ownership_fails_closed_without_repair"]
+expect_message = 'left: "scope_owner_mismatch"'
+file = "crates/broca-module/src/registry.rs"
+old = "                return self.read_owner_fallback(reader, key, None, for_bind).await;"
+new = "                let _ = reader; // NON-VACUITY BREAK: allow moved ownership to reuse a cached prefix."
+
+[[control]]
+id = "module-owner-suffix-read-error-is-not-a-cache-miss"
+guards = "an actual ownership suffix read error cannot retry a cached or materialized owner"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::ownership_suffix_read_failure_never_tries_another_snapshot"]
+expect_message = "a failed suffix cannot fall through to a different snapshot"
+file = "crates/broca-module/src/registry.rs"
+old = '''            .await?;
+        let records =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)'''
+new = '''            .await;
+        let range = match range {
+            Ok(range) => range,
+            Err(_) => return Ok(None), // NON-VACUITY BREAK: hide an actual suffix read error.
+        };
+        let records =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)'''
+
+[[control]]
+id = "module-owner-first-episode-read-error-is-not-a-cache-miss"
+guards = "an actual first-episode read error cannot retry a cached or materialized owner"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::ownership_first_episode_read_failure_never_tries_another_snapshot"]
+expect_message = "a failed first-episode read cannot fall through to a different snapshot"
+file = "crates/broca-module/src/registry.rs"
+old = '''            .await?;
+        let records = crate::durable_read::DurableRead::classify(
+            &range,
+            position.seq - 1,'''
+new = '''            .await;
+        let range = match range {
+            Ok(range) => range,
+            Err(_) => return Ok(None), // NON-VACUITY BREAK: hide an actual first-episode read error.
+        };
+        let records = crate::durable_read::DurableRead::classify(
+            &range,
+            position.seq - 1,'''
+
+[[control]]
+id = "module-owner-unproven-suffix-is-not-a-cache-miss"
+guards = "unproven suffix coverage cannot retry a different ownership snapshot"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::ownership_suffix_read_failure_never_tries_another_snapshot"]
+expect_message = "a failed suffix cannot fall through to a different snapshot"
+file = "crates/broca-module/src/registry.rs"
+old = '''        let records =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head)
+                .records()
+                .map_err(|reason| {
+                    OwnershipReadError::coverage_unproven("owner authorization suffix", reason)
+                })?;'''
+new = '''        let Ok(records) =
+            crate::durable_read::DurableRead::classify(&range, snapshot.watermark_seq, live_head).records()
+        else { return Ok(None); }; // NON-VACUITY BREAK: unproven coverage becomes a cache miss.'''
+
+[[control]]
+id = "module-owner-unproven-first-episode-is-not-a-cache-miss"
+guards = "unproven first-episode coverage cannot retry a different ownership snapshot"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+platforms = ["linux", "macos"]
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::ownership_first_episode_read_failure_never_tries_another_snapshot"]
+expect_message = "a failed first-episode read cannot fall through to a different snapshot"
+file = "crates/broca-module/src/registry.rs"
+old = '''        let records = crate::durable_read::DurableRead::classify(
+            &range,
+            position.seq - 1,
+            Some(position.seq),
+        )
+        .records()
+        .map_err(|reason| {
+            OwnershipReadError::coverage_unproven("owner authorization first episode", reason)
+        })?;'''
+new = '''        let Ok(records) = crate::durable_read::DurableRead::classify(
+            &range, position.seq - 1, Some(position.seq),
+        ).records() else { return Ok(None); }; // NON-VACUITY BREAK: unproven first episode becomes a cache miss.'''
+
+[[control]]
+id = "module-bind-unproven-ownership-is-not-accepted"
+guards = "a stamped bind whose ownership the validated reader cannot prove decodes the whole log and is refused by its history, never accepted as if nothing refused the stamp"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::refused_replacement_goodbye_preserves_published_route_and_stream", "serve::tests::stamped_bind_with_unreadable_history_is_refused_not_published"]
+expect_message = "right: (Error, "
+file = "crates/broca-module/src/registry.rs"
+old = '''            Err(OwnershipReadError::CoverageUnproven(unproven)) => {
+                match whole_log_bind_ownership(reader, key.clone()).await {
+                    Ok(ownership) => BindOwnership::Known(ownership),
+                    Err(error) => BindOwnership::Unreadable(format!(
+                        "{unproven}; whole-log read failed: {error}"
+                    )),
+                }
+            }
+            Err(OwnershipReadError::Read(error)) => BindOwnership::Unreadable(error.to_string()),'''
+new = '''            Err(_) => {
+                // NON-VACUITY BREAK: unproven or unreadable ownership skips the adoption check.
+                let _ = reader;
+                BindOwnership::NoHistorySource
+            }'''
+
+[[control]]
+id = "module-bind-unreadable-ownership-refuses"
+guards = "a stamped bind whose history no source can read is refused as a transient failure, not accepted"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::bind_adoption_refuses_when_ownership_is_unknown"]
+expect_message = "unreadable ownership must refuse the bind, not accept it"
+file = "crates/broca-module/src/serve.rs"
+old = '''            crate::registry::BindOwnership::Unreadable(reason) => {
+                return Err(ServeError::Open('''
+new = '''            crate::registry::BindOwnership::Unreadable(reason) => {
+                return Ok(None); // NON-VACUITY BREAK: unreadable history accepts the bind.
+                return Err(ServeError::Open('''
+
 # This proof checks the following behavior: RunStarted hook output requires step-transforms/v1, even
 # without a manifest.
 # Windows runs only the test or tests named in this row, skipping all other tests in the broca-wal --lib
@@ -9035,8 +9213,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::fresh_bind_is_known_empty_without_a_warning"]
 file = "crates/broca-module/src/registry.rs"
-old = "empty.ownership = Some(broca_core::SessionOwnershipV1::default());"
-new = "empty.ownership = None; // NON-VACUITY BREAK: confuse authoritative absence with unknown history"
+old = "        match self.durable_session_ownership(key, true).await {\n            Ok(ownership) => BindOwnership::Known(ownership),"
+new = "        match self.durable_session_ownership(key, true).await {\n            Ok(ownership) if ownership.episodes == 0 => BindOwnership::NoHistorySource, // NON-VACUITY BREAK: confuse authoritative absence with unknown history\n            Ok(ownership) => BindOwnership::Known(ownership),"
 
 [[control]]
 id = "retention-audit-lost-history-stays-unknown"
@@ -9049,12 +9227,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::missing_materialized_history_is_not_known_empty_ownership"]
 file = "crates/broca-module/src/registry.rs"
-old = '''                    if !sources
-                        .wal_store
-                        .lineage_exists(&key, meta.as_ref())'''
-new = '''                    if true || !sources // NON-VACUITY BREAK: treat real history loss as empty
-                        .wal_store
-                        .lineage_exists(&key, meta.as_ref())'''
+old = "                if sources\n                    .wal_store\n                    .lineage_exists(&key, meta.as_ref())"
+new = "                if false && sources // NON-VACUITY BREAK: treat missing history as empty\n                    .wal_store\n                    .lineage_exists(&key, meta.as_ref())"
 
 [[control]]
 id = "retention-audit-group-explicit-refusal"
@@ -9151,8 +9325,8 @@ select = "expected"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::zero_record_wal_does_not_hide_materialized_ownership_history"]
 file = "crates/broca-module/src/registry.rs"
-old = "            if records.is_empty() {\n                let meta = sources"
-new = "            if false && records.is_empty() { // NON-VACUITY BREAK: treat lost WAL as fresh\n                let meta = sources"
+old = "        if for_bind && records.is_empty() {"
+new = "        if for_bind && records.is_empty() && matches!(range.records(), broca_wal::WalRangeRecords::Absent) { // NON-VACUITY BREAK: treat zero-record WAL as fresh"
 
 [[control]]
 id = "retention-followup-bounded-first-episode"
@@ -12210,13 +12384,12 @@ runner = "cargo"
 package = "broca-module"
 target = "--lib"
 test_file = "crates/broca-module/src/registry_owner_tests.rs"
-expect_red = ["registry::owner_tests::owner_barrier_failure_refuses_cancel_and_retract_without_writes", "registry::owner_tests::advanced_owner_head_refuses_failed_suffix_and_full_revalidation"]
+expect_red = ["registry::owner_tests::owner_barrier_failure_refuses_cancel_and_retract_without_writes"]
 file = "crates/broca-module/src/registry.rs"
 old = '''        let records = crate::durable_read::DurableRead::classify(&range, 0, live_head)
             .records()
-            .map_err(|reason| OpenError::Classified {
-                reason: format!("owner authorization: {reason}"),
-                class: broca_protocol::ErrorClass::Transient,
+            .map_err(|reason| {
+                OwnershipReadError::coverage_unproven("owner authorization", reason)
             })?;'''
 new = '''        // NON-VACUITY BREAK: treat unproven owner history as authoritative.
         let records = match range.records() {
