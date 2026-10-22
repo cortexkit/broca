@@ -624,8 +624,9 @@ variants select the corresponding native tier ids. Argon tiers use uppercase `th
 
 broca also serves the `classifier/v1` role (`cortexkit-role-classifier`, with the
 batch rules of `cortexkit-model-batch`) from the same management surface, for the
-decision models it routes: TypeSafe's `typesafe/jev-1.13.0` in this build. The
-manifest lists `classifier/v1` in `capabilities.provides`.
+decision models it routes: TypeSafe's `typesafe/jev-1.13.0`, and Cloudflare Workers
+AI's `cloudflare-workers-ai/@cf/cloudflare/clef` and `.../clef-flash` in this build.
+The manifest lists `classifier/v1` in `capabilities.provides`.
 
 - **One route, one role.** A `route.open` declaring `role_versions
   {"classifier": "v1"}` is a classifier route. On it `role.describe` answers the
@@ -646,6 +647,16 @@ manifest lists `classifier/v1` in `capabilities.provides`.
 - **Catalog.** A row whose `model.kind` is `decision` is a classifier; another
   stated kind, or no kind, is refused `model_not_classifier`; a model the catalog
   does not list is `model_unknown`.
+- **Providers.** Jev is called at `POST https://api.typesafe.ai/v1/systemone` with
+  the vault credential `apikey:typesafe`. Clef and Clef-flash are called at `POST
+  https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/cloudflare/{model}`
+  with `apikey:cloudflare-workers-ai`, whose vault record carries the account id
+  beside the token; their answers are read from the `result` member of Cloudflare's
+  reply envelope. `providers.<id>.base_url` (`typesafe`, `cloudflare-workers-ai`)
+  replaces either base. Workers AI errors map by their `errors[].code` first: a
+  daily allocation used up (3036) or an account not entitled (5035, 5016, 3023)
+  ends the whole batch, is never recorded for an item, and is refused at admission
+  when the call's first provider call meets it.
 
 ## 5. Reliability model (the egress reality)
 

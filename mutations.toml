@@ -23563,3 +23563,80 @@ expect_red = ["system_one::tests::the_catalog_row_decides_the_kind_refusals"]
 file = "crates/broca-module-serve/src/system_one/classify.rs"
 old = "            None => CatalogRow::Kindless,"
 new = "            None => CatalogRow::Kind(CLASSIFIER_KIND), // NON-VACUITY BREAK: read a kindless row as a classifier."
+
+[[control]]
+id = "system-one-workers-ai-account-url"
+guards = "A Clef or Clef-flash item is sent to Cloudflare's documented run endpoint for the credential's account, accounts/{account_id}/ai/run/@cf/cloudflare/{model}"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/workers_ai_tests.rs"
+expect_red = [
+    "system_one::workers_ai_tests::clef_requests_and_replies_take_cloudflares_documented_shapes",
+    "system_one::workers_ai_tests::clef_flash_takes_its_own_endpoint_and_images_are_forwarded_as_written",
+]
+file = "crates/broca-module-serve/src/system_one/workers_ai.rs"
+old = """            .extend(["accounts", account_id, "ai", "run"])"""
+new = """            .extend(["accounts", account_id, "run"]) // NON-VACUITY BREAK: drop the ai segment of the run path."""
+
+[[control]]
+id = "system-one-workers-ai-codes-decide"
+guards = "A Workers AI error maps by its errors[].code before its status, so a daily allocation 429 is account_limit_exhausted and a 403 for a paid plan is account_not_entitled, never stored per item"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/workers_ai_tests.rs"
+expect_red = [
+    "system_one::workers_ai_tests::workers_ai_errors_map_as_the_roles_code_table_states",
+    "system_one::workers_ai_tests::an_account_level_error_ends_the_whole_batch_and_records_no_unsent_item",
+    "system_one::workers_ai_tests::an_account_level_error_on_the_first_call_is_a_refusal_that_writes_nothing",
+]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "            let item_code = workers_ai_item_code(status, code).unwrap_or(errors::PROVIDER_ERROR);"
+new = "            let item_code = item_code_for_status(status).unwrap_or(errors::PROVIDER_ERROR); // NON-VACUITY BREAK: map by status alone."
+
+[[control]]
+id = "system-one-daily-allocation-not-retried"
+guards = "A Workers AI daily-allocation 429 (code 3036) ends the whole batch at once: it is never sat out and retried as a rate limit, even with a short Retry-After"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/workers_ai_tests.rs"
+expect_red = ["system_one::workers_ai_tests::an_account_level_error_ends_the_whole_batch_and_records_no_unsent_item"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "            Some(errors::RATE_LIMITED | errors::PROVIDER_ERROR)"
+new = "            Some(errors::RATE_LIMITED | errors::PROVIDER_ERROR | errors::ACCOUNT_LIMIT_EXHAUSTED) // NON-VACUITY BREAK: retry a daily-allocation 429."
+
+[[control]]
+id = "system-one-workers-ai-result-envelope"
+guards = "The classifier conformance suite, run through broca's Workers AI client against a stand-in answering in Cloudflare's envelope, fails when the client stops reading the answer from the envelope's result member"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test classifier_conformance"
+test_file = "crates/broca-module-serve/tests/classifier_conformance.rs"
+expect_red = [
+    "classifier_conformance_suite_passes_through_workers_ai",
+    "a_batch_in_flight_when_broca_is_killed_is_released_and_resumed",
+]
+platforms = ["macos", "linux"]
+file = "crates/broca-module-serve/src/system_one/workers_ai.rs"
+old = "                return ProviderReply::Answered(result.get().as_bytes().to_vec());"
+new = "                let _ = result; return ProviderReply::Answered(body.to_vec()); // NON-VACUITY BREAK: answer with the whole envelope."
+
+[[control]]
+id = "system-one-killed-batch-released-at-start"
+guards = "A batch left running by a killed ck-broca is released when broca starts again, before it serves, so a re-send is admitted and calls only the unanswered items"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test classifier_conformance"
+test_file = "crates/broca-module-serve/tests/classifier_conformance.rs"
+expect_red = ["a_batch_in_flight_when_broca_is_killed_is_released_and_resumed"]
+platforms = ["macos", "linux"]
+file = "crates/broca-module-serve/src/main.rs"
+old = """        let released = service
+            .release_abandoned()
+            .map_err(|e| ServeIoError(format!("release System One batches left running: {e}")))?;"""
+new = """        let released = 0; // NON-VACUITY BREAK: leave a dead process's batches running."""

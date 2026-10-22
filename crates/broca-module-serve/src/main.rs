@@ -140,8 +140,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_overrides =
         broca_module_serve::provider_overrides::ProviderOverrides::load_default_path()
             .map_err(ServeIoError)?;
-    // System One's TypeSafe endpoint honours the same boot override a chat provider does.
+    // System One's TypeSafe and Workers AI endpoints honour the same boot override a chat
+    // provider does.
     let typesafe_base_url = provider_overrides.base_url("typesafe").map(str::to_owned);
+    let workers_ai_base_url = provider_overrides
+        .base_url(broca_module_serve::system_one::workers_ai::PROVIDER_ID)
+        .map(str::to_owned);
     let stop_signal = shutdown_signal()?;
     // Where the WAL, leases and run index live. Resolved before any connection is made so a
     // machine that cannot place its durable state refuses to start by name instead of first
@@ -426,11 +430,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
-    // System One's provider credential. Without a vault (the mock provider path) its requests
-    // carry none, as every run's do there.
+    // System One's provider credentials. Without a vault (the mock provider path) their
+    // requests carry none, as every run's do there.
     let mut system_one_credential: Arc<
-        dyn broca_module_serve::system_one::typesafe::CredentialSource,
-    > = Arc::new(broca_module_serve::system_one::typesafe::NoCredential);
+        dyn broca_module_serve::system_one::credential::CredentialSource,
+    > = Arc::new(broca_module_serve::system_one::credential::NoCredential);
+    let mut workers_ai_credential: Arc<
+        dyn broca_module_serve::system_one::credential::CredentialSource,
+    > = Arc::new(broca_module_serve::system_one::credential::NoCredential);
     // Open the vault only when a real provider call will actually be made. A mock base_url
     // path authenticates with AuthMode::None for every run (see `decide_auth`), so the vault
     // is unused there — skip it. The default is now the vault, but the mock path never needs
@@ -529,25 +536,32 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             account_selection,
         ));
         broca_module_serve::account_routing::publish_counters(routing.counters());
-        // System One reads its provider key by grant like a run does, on a vault route of its
-        // own so its credential reads never queue behind a session's.
-        system_one_credential =
-            Arc::new(broca_module_serve::system_one::typesafe::VaultCredential {
-                client: Arc::new(broca_subc::VaultClient::new(
-                    Arc::clone(&vault_conn),
-                    &vault_module,
-                    &vault_bind,
-                    VAULT_READY_TIMEOUT,
-                )),
-                vault_id: addressing
-                    .vault_id_for(
-                        &broca_module_serve::CredentialId::parse(
-                            broca_module_serve::system_one::typesafe::CREDENTIAL_ID,
+        // System One reads its provider keys by grant like a run does, on a vault route of its
+        // own so its credential reads never queue behind a session's. Both providers share it.
+        let system_one_vault = Arc::new(broca_subc::VaultClient::new(
+            Arc::clone(&vault_conn),
+            &vault_module,
+            &vault_bind,
+            VAULT_READY_TIMEOUT,
+        ));
+        let system_one_vault_credential = |credential_id: &str| {
+            Arc::new(
+                broca_module_serve::system_one::credential::VaultCredential {
+                    client: Arc::clone(&system_one_vault),
+                    credential_id: credential_id.to_owned(),
+                    vault_id: addressing
+                        .vault_id_for(
+                            &broca_module_serve::CredentialId::parse(credential_id)
+                                .expect("a System One credential id parses"),
                         )
-                        .expect("the TypeSafe credential id parses"),
-                    )
-                    .into_owned(),
-            });
+                        .into_owned(),
+                },
+            )
+        };
+        system_one_credential =
+            system_one_vault_credential(broca_module_serve::system_one::typesafe::CREDENTIAL_ID);
+        workers_ai_credential =
+            system_one_vault_credential(broca_module_serve::system_one::workers_ai::CREDENTIAL_ID);
         let client = broca_subc::VaultClient::new(
             vault_conn,
             &vault_module,
@@ -632,13 +646,28 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             config.attempt_timeout,
         )
         .map_err(ServeIoError)?;
+        let workers_ai = |model_path: &'static str| {
+            broca_module_serve::system_one::workers_ai::WorkersAi::new(
+                workers_ai_base_url.as_deref(),
+                model_path,
+                Arc::clone(&workers_ai_credential),
+                config.attempt_timeout,
+            )
+            .map(Arc::new)
+            .map_err(ServeIoError)
+        };
+        let clef = workers_ai(broca_module_serve::system_one::workers_ai::CLEF_MODEL_PATH)?;
+        let clef_flash =
+            workers_ai(broca_module_serve::system_one::workers_ai::CLEF_FLASH_MODEL_PATH)?;
         let service = Arc::new(broca_module_serve::system_one::SystemOne::new(
             store,
             broca_module_serve::serve::process_launch_id(),
             Arc::new(broca_module_serve::system_one::LiveCatalog),
-            vec![broca_module_serve::system_one::ModelPin::jev(Arc::new(
-                typesafe,
-            ))],
+            vec![
+                broca_module_serve::system_one::ModelPin::jev(Arc::new(typesafe)),
+                broca_module_serve::system_one::ModelPin::clef(clef),
+                broca_module_serve::system_one::ModelPin::clef_flash(clef_flash),
+            ],
             config,
             registry.batches_in_flight_gauge(),
         ));

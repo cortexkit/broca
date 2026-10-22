@@ -11,63 +11,15 @@ use async_trait::async_trait;
 
 use super::{ClassifierProvider, ProviderReply};
 
+// The credential types lived here before a second provider shared them.
+pub use super::credential::{CredentialSource, NoCredential, ProviderSecret, VaultCredential};
+
 /// TypeSafe's API base; the endpoint is this plus `/systemone`. A `providers.typesafe.base_url`
 /// in broca's config replaces it, as it does for a chat provider.
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai/v1";
 
 /// The credential TypeSafe calls present.
 pub const CREDENTIAL_ID: &str = "apikey:typesafe";
-
-/// Where a provider's bearer token comes from.
-#[async_trait]
-pub trait CredentialSource: Send + Sync {
-    /// The credential's id (never its secret), for `auth_failed`'s detail.
-    fn credential_id(&self) -> Option<String>;
-    /// The bearer token, `None` to send no `authorization` header.
-    async fn bearer(&self) -> Result<Option<String>, String>;
-}
-
-/// No credential: the requests carry no `authorization` header. Only for a rig whose stand-in
-/// provider takes none (broca's mock provider path, where no vault is opened).
-pub struct NoCredential;
-
-#[async_trait]
-impl CredentialSource for NoCredential {
-    fn credential_id(&self) -> Option<String> {
-        None
-    }
-
-    async fn bearer(&self) -> Result<Option<String>, String> {
-        Ok(None)
-    }
-}
-
-/// A credential read from the vault by grant, the way a session's run reads its own.
-pub struct VaultCredential {
-    pub client: Arc<broca_subc::VaultClient>,
-    /// The vault's id for the credential: [`CREDENTIAL_ID`], or its configured alias.
-    pub vault_id: String,
-}
-
-/// The shortest life a token may have left when it is handed out, so one provider attempt
-/// never starts with a token about to expire.
-const VAULT_MIN_TTL_MS: i64 = 60_000;
-
-#[async_trait]
-impl CredentialSource for VaultCredential {
-    fn credential_id(&self) -> Option<String> {
-        Some(CREDENTIAL_ID.to_owned())
-    }
-
-    async fn bearer(&self) -> Result<Option<String>, String> {
-        self.client
-            .get_scoped(&self.vault_id, Some(VAULT_MIN_TTL_MS))
-            .await
-            .result
-            .map(|token| Some(token.token))
-            .map_err(|error| error.to_string())
-    }
-}
 
 /// The TypeSafe client.
 pub struct TypeSafe {
@@ -107,7 +59,7 @@ impl TypeSafe {
 
 /// `Retry-After` in whole seconds, as milliseconds. An HTTP-date form is not read: the
 /// provider documents none, and an unread wait leaves the error to the caller.
-fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+pub(crate) fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let seconds: u64 = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()

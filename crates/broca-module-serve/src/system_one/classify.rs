@@ -20,7 +20,7 @@ use cortexkit_model_batch::{
 use cortexkit_role_classifier::{
     errors::{self, ItemError, Refusal},
     identity::BatchIdentity,
-    provider::item_code_for_status,
+    provider::{item_code_for_status, workers_ai_item_code},
     reply::Usage,
     request::{
         check_catalog_row, check_request, check_request_bytes, parse_request, CatalogRow,
@@ -92,6 +92,10 @@ struct RawParams<'a> {
 struct RawItem<'a> {
     #[serde(borrow)]
     state: &'a RawValue,
+    /// Forwarded as written to a provider that takes images; validation already bounded them
+    /// by the model's `images.max`, which is absent for a text-only model.
+    #[serde(borrow, default)]
+    images: Option<&'a RawValue>,
 }
 
 /// The provider's reply, with its answers kept as the exact text it sent (RULES §12).
@@ -299,6 +303,24 @@ fn map_reply(reply: ProviderReply) -> Result<(String, Option<Usage>), ItemError>
             }
             Err(error)
         }
+        ProviderReply::WorkersAiError {
+            status,
+            code,
+            retry_after_ms,
+        } => {
+            let item_code = workers_ai_item_code(status, code).unwrap_or(errors::PROVIDER_ERROR);
+            // The code goes into the message whether or not the table lists it, so a caller can
+            // read a code the table does not map.
+            let message = match code {
+                Some(code) => format!("Workers AI answered HTTP {status} with error code {code}"),
+                None => format!("Workers AI answered HTTP {status}"),
+            };
+            let mut error = ItemError::for_code(item_code, message);
+            if let (errors::RATE_LIMITED, Some(wait)) = (item_code, retry_after_ms) {
+                error = error.with_retry_after_ms(wait);
+            }
+            Err(error)
+        }
         ProviderReply::Transport(message) => Err(ItemError::for_code(
             errors::PROVIDER_ERROR,
             format!("the provider could not be reached: {message}"),
@@ -311,16 +333,30 @@ fn map_reply(reply: ProviderReply) -> Result<(String, Option<Usage>), ItemError>
 }
 
 /// Whether an attempt's refusal is one the provider marked retryable: an overload or rate
-/// status that names a wait short enough to sit out inside the call.
+/// status that names a wait short enough to sit out inside the call. A Workers AI refusal is
+/// retried only when its code maps to a rate limit or a provider error: a 429 for the daily
+/// allocation (3036) names the account, and waiting cannot clear it.
 fn retry_wait(reply: &ProviderReply, service: &SystemOne) -> Option<std::time::Duration> {
-    match reply {
+    let wait = match reply {
         ProviderReply::Status {
             status: 429 | 503 | 529,
             retry_after_ms: Some(wait),
-        } => Some(std::time::Duration::from_millis(*wait))
-            .filter(|wait| *wait <= service.config.max_retry_wait),
-        _ => None,
-    }
+        } => *wait,
+        ProviderReply::WorkersAiError {
+            status: status @ (429 | 503),
+            code,
+            retry_after_ms: Some(wait),
+        } if matches!(
+            workers_ai_item_code(*status, *code),
+            Some(errors::RATE_LIMITED | errors::PROVIDER_ERROR)
+        ) =>
+        {
+            *wait
+        }
+        _ => return None,
+    };
+    Some(std::time::Duration::from_millis(wait))
+        .filter(|wait| *wait <= service.config.max_retry_wait)
 }
 
 /// One item's provider call, retried only where the provider marked its refusal retryable.
@@ -542,8 +578,14 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
                 continue;
             }
         }
+        let images = raw.items[index]
+            .images
+            .filter(|images| images.get().trim() != "null")
+            .map_or(String::new(), |images| {
+                format!(",\"images\":{}", images.get())
+            });
         let body = format!(
-            "{{\"model\":{},\"state\":{},\"questions\":{questions}}}",
+            "{{\"model\":{},\"state\":{},\"questions\":{questions}{images}}}",
             serde_json::to_string(&pin.provider_model).expect("a string encodes"),
             raw.items[index].state.get(),
         );
