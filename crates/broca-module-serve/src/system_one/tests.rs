@@ -175,7 +175,7 @@ fn rig() -> Rig {
 
 fn noul(value: &str, usage: Option<&str>) -> String {
     let usage = usage.map_or(String::new(), |usage| format!(",\"usage\":{usage}"));
-    format!(r#"{{"model":"jev-latest","answers":{{"q":{{"type":"noul","noul":{value}}}}}{usage}}}"#)
+    format!(r#"{{"model":"jev-1.13.0","answers":{{"q":{{"type":"noul","noul":{value}}}}}{usage}}}"#)
 }
 
 fn params(batch: &str, model: &str, states: &[&str], max_cost_usd: Option<f64>) -> String {
@@ -236,7 +236,7 @@ async fn answers_keep_the_providers_number_spelling_and_request_order() {
     rig.stand_in.script(
         "a",
         vec![Script::Answer(format!(
-            r#"{{"model":"jev-latest","answers":{spelled}}}"#
+            r#"{{"model":"jev-1.13.0","answers":{spelled}}}"#
         ))],
     );
     rig.stand_in
@@ -257,8 +257,36 @@ async fn answers_keep_the_providers_number_spelling_and_request_order() {
     assert_eq!(rig.stand_in.calls("a"), 1);
     let sent: Value = serde_json::from_str(&rig.stand_in.bodies.lock().unwrap()[0]).unwrap();
     assert_eq!(
-        sent["model"], "jev-latest",
-        "the catalog id maps to TypeSafe's model value"
+        sent["model"], "jev-1.13.0",
+        "the pinned row sends TypeSafe's versioned id, never the moving jev-latest alias"
+    );
+}
+
+/// A reply naming another model is still answered and stored; only the difference is
+/// reported, so the row's pin, not the provider's alias resolution, decides what is billed.
+#[tokio::test]
+async fn a_reply_from_another_model_is_answered_and_reported() {
+    use super::classify::answered_by_another_model;
+    assert_eq!(
+        answered_by_another_model("jev-1.13.0", Some("jev-1.14.0")),
+        Some("jev-1.14.0")
+    );
+    assert_eq!(
+        answered_by_another_model("jev-1.13.0", Some("jev-1.13.0")),
+        None
+    );
+    assert_eq!(answered_by_another_model("jev-1.13.0", None), None);
+    let rig = rig();
+    rig.stand_in.script(
+        "a",
+        vec![Script::Answer(
+            r#"{"model":"jev-1.14.0","answers":{"q":{"type":"noul","noul":0.3}}}"#.to_owned(),
+        )],
+    );
+    let reply = admitted(&rig, params("other-model", JEV, &["a"], None)).await;
+    assert_eq!(
+        answers_text(&reply, 0),
+        r#"{"q":{"type":"noul","noul":0.3}}"#
     );
 }
 

@@ -157,13 +157,18 @@ pub struct ModelPin {
     pub provider: Arc<dyn ClassifierProvider>,
 }
 
+/// The `model` value broca sends for the `typesafe/jev-1.13.0` row. TypeSafe accepts versioned
+/// ids in that field (https://docs.typesafe.ai/models); its `jev-latest` alias moves to newer
+/// versions, so sending the alias would let a newer model answer, and be billed, as 1.13.0.
+const JEV_1_13_0_WIRE: &str = "jev-1.13.0";
+
 impl ModelPin {
-    /// TypeSafe's Jev 1.13.0, which takes `jev-latest`, text only. Its question limit is the
-    /// role's own question-id space at the clef bound, since TypeSafe states none.
+    /// TypeSafe's Jev 1.13.0, text only. Its question limit is the role's own question-id
+    /// space at the clef bound, since TypeSafe states none.
     pub fn jev(provider: Arc<dyn ClassifierProvider>) -> Self {
         Self {
             catalog_id: JEV_1_13_0.to_owned(),
-            provider_model: cortexkit_role_classifier::provider::models::JEV_LATEST.to_owned(),
+            provider_model: JEV_1_13_0_WIRE.to_owned(),
             max_questions: cortexkit_role_classifier::provider::clef_limits::MAX_QUESTIONS as u64,
             images_max: None,
             provider,

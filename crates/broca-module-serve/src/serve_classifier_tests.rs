@@ -121,7 +121,7 @@ impl ClassifierProvider for HeldProvider {
         self.entered.notify_waiters();
         let _permit = self.gate.acquire().await.unwrap();
         ProviderReply::Answered(
-            br#"{"model":"jev-latest","answers":{"q":{"type":"noul","noul":0.5}}}"#.to_vec(),
+            br#"{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":0.5}}}"#.to_vec(),
         )
     }
 }

@@ -60,9 +60,13 @@ struct Args {
     /// Per-request timeout, in seconds.
     #[arg(long, default_value_t = 60)]
     request_timeout_secs: u64,
+    /// The `model` value to send. broca sends the versioned id; pass `jev-latest` to see what
+    /// the alias resolves to.
+    #[arg(long, default_value = "jev-1.13.0")]
+    model: String,
 }
 
-fn plan() -> Vec<(&'static str, String)> {
+fn plan(model: &str) -> Vec<(&'static str, String)> {
     let noul =
         json!({"flagged": {"type": "noul", "instructions": "Does the message ask for a refund?"}});
     let choice = json!({"topic": {"type": "choice", "instructions": "What is the message about?",
@@ -73,7 +77,7 @@ fn plan() -> Vec<(&'static str, String)> {
     all.extend(choice.as_object().unwrap().clone());
     all.extend(score.as_object().unwrap().clone());
     let body = |state: serde_json::Value, questions: &serde_json::Value| {
-        json!({"model": "jev-latest", "state": state, "questions": questions}).to_string()
+        json!({"model": model, "state": state, "questions": questions}).to_string()
     };
     vec![
         (
@@ -175,6 +179,8 @@ struct AnswerView<'a> {
     answers: &'a serde_json::value::RawValue,
     #[serde(default)]
     usage: Option<UsageView>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn show(count: Option<u64>) -> String {
@@ -187,7 +193,7 @@ async fn main() -> Result<(), String> {
     if args.count == 0 || args.count > MAX_REQUESTS {
         return Err(format!("--count is 1 to {MAX_REQUESTS}"));
     }
-    let plan: Vec<_> = plan().into_iter().take(args.count).collect();
+    let plan: Vec<_> = plan(&args.model).into_iter().take(args.count).collect();
     let credential =
         CredentialId::parse(CREDENTIAL_ID).ok_or("the fixed credential id does not parse")?;
     // Both modes look the handle up first, so a dry run also proves a live run will find it.
@@ -237,7 +243,9 @@ async fn main() -> Result<(), String> {
                         )
                     });
                     format!(
-                        "{name}: HTTP 200 in {elapsed} ms; answered; input_tokens {}, output_tokens {}, charge {} USD; answers {}",
+                        "{name}: HTTP 200 in {elapsed} ms; answered by {} (sent {}); input_tokens {}, output_tokens {}, charge {} USD; answers {}",
+                        answer.model.as_deref().unwrap_or("(no model named)"),
+                        args.model,
                         show(usage.input_tokens),
                         show(usage.output_tokens),
                         charge.unwrap_or_else(|| "absent".into()),

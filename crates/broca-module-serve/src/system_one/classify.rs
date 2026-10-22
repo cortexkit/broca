@@ -101,6 +101,19 @@ struct ProviderAnswer<'a> {
     answers: &'a RawValue,
     #[serde(default)]
     usage: Option<Usage>,
+    /// The version that answered, which the provider may name even when it differs from the
+    /// one sent.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// The model a reply names when it differs from the one broca sent. Such a reply is still
+/// answered and stored: the row stays pinned, and the difference is only logged.
+pub(super) fn answered_by_another_model<'a>(
+    sent: &str,
+    answered: Option<&'a str>,
+) -> Option<&'a str> {
+    answered.filter(|answered| *answered != sent)
 }
 
 /// One item of the reply.
@@ -269,7 +282,7 @@ fn first_call_refusal(error: &ItemError, model: &str, pin: &ModelPin) -> Refusal
 
 /// Map one attempt's reply to the item's answer text and usage, or its error (RULES §15,
 /// TypeSafe's errors by status).
-fn map_reply(reply: ProviderReply) -> Result<(String, Option<Usage>), ItemError> {
+fn map_reply(reply: ProviderReply, pin: &ModelPin) -> Result<(String, Option<Usage>), ItemError> {
     match reply {
         ProviderReply::Answered(body) => {
             let decoded: ProviderAnswer<'_> = serde_json::from_slice(&body).map_err(|e| {
@@ -278,6 +291,13 @@ fn map_reply(reply: ProviderReply) -> Result<(String, Option<Usage>), ItemError>
                     format!("the provider's reply did not decode: {e}"),
                 )
             })?;
+            if let Some(answered) =
+                answered_by_another_model(&pin.provider_model, decoded.model.as_deref())
+            {
+                tracing::warn!(target: "system_one", catalog_id = %pin.catalog_id,
+                    sent = %pin.provider_model, answered = %answered,
+                    "the provider answered with a different model than the one sent");
+            }
             if !decoded.answers.get().trim_start().starts_with('{') {
                 return Err(ItemError::for_code(
                     errors::PROVIDER_ERROR,
@@ -343,7 +363,7 @@ async fn call_provider(
             Some(wait) if attempt < service.config.max_attempts => {
                 tokio::time::sleep(wait).await;
             }
-            _ => return map_reply(reply),
+            _ => return map_reply(reply, pin),
         }
     }
 }
