@@ -32,7 +32,9 @@ def api(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("names", nargs="+")
-    parser.add_argument("--timeout", type=float, default=1200)
+    # No default: the caller states a budget that covers its producers' own job budgets. A
+    # built-in 20 minutes once gave up on producers that CI allowed 45.
+    parser.add_argument("--timeout", type=float, required=True)
     parser.add_argument("--poll-seconds", type=float, default=5)
     args = parser.parse_args()
     if args.timeout <= 0 or args.poll_seconds < 0:

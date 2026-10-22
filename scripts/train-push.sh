@@ -257,7 +257,7 @@ if [ "$1" = "--status" ]; then
   # name nothing creates, so the "live lock" arm passed against a fixture I had
   # built rather than against the mechanism -- the verifier checking what the test
   # wrote. The real claim is `held/owner` carrying "<pid> <train-name>".
-  lock_dir="$(git rev-parse --git-dir 2>/dev/null)/train-push-locks"
+  lock_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/train-push-locks"
   held="$lock_dir/held"
   # `|| true` because this runs under `set -e` and awk exits non-zero on a missing
   # file -- which is the COMMON case here, no lock at all. Without it the clean arm
@@ -330,7 +330,11 @@ fi
 # LIMIT, stated because it bounds the claim: the lock is LOCAL and the refs are REMOTE, so this
 # sees trains on this machine only. Single operator, single box here; a second machine driving
 # the same remote is invisible to it, which is why leftover refs are still LISTED below.
-train_lock_dir="$(git rev-parse --git-dir 2>/dev/null)/train-push-locks"
+#
+# The lock lives in the COMMON git directory, which every linked worktree of this clone shares.
+# `--git-dir` names a per-worktree directory, so two worktrees each took their own lock and
+# both trains were admitted.
+train_lock_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/train-push-locks"
 mkdir -p "$train_lock_dir" 2>/dev/null || true
 train_lock_held="$train_lock_dir/held"
 

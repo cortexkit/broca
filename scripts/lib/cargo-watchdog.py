@@ -8,6 +8,13 @@ defaults to 900 seconds; no output for this long is an idle timeout (exit 124).
 Both values may be fractional seconds for tests. An optional
 --deadline-seconds keeps callers' existing hard wall-clock limits (also exit
 124). Ordinary Cargo exit statuses pass through unchanged.
+
+Cargo's exit is watched directly, not inferred from its output pipes closing. A
+descendant that outlives Cargo (a leaked test daemon, say) keeps those pipes
+open, and waiting for them would turn a finished step into an idle timeout.
+After Cargo exits, output is drained for BROCA_CARGO_EXIT_DRAIN_SECONDS
+(default 5); a pipe still open then is reported, the leftover processes in
+Cargo's private group are stopped, and Cargo's own status is returned.
 """
 
 import argparse
@@ -18,6 +25,7 @@ import selectors
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -100,6 +108,7 @@ def main() -> int:
     try:
         lock_timeout = positive_seconds("BROCA_CARGO_LOCK_TIMEOUT_SECONDS", "300")
         idle_timeout = positive_seconds("BROCA_CARGO_IDLE_TIMEOUT_SECONDS", "900")
+        exit_drain = positive_seconds("BROCA_CARGO_EXIT_DRAIN_SECONDS", "5")
     except ValueError as error:
         parser.error(str(error))
 
@@ -127,6 +136,25 @@ def main() -> int:
         selector.register(stream, selectors.EVENT_READ, (stream, output))
         pending_lines[stream] = b""
 
+    # A thread reaps Cargo and wakes the selector through this pipe, so its exit is seen as soon
+    # as it happens rather than at the next timeout. The thread owns the write end and closes it
+    # itself, so a late write can never land on a descriptor this process has reused.
+    exit_read, exit_write = os.pipe()
+
+    def report_exit():
+        try:
+            process.wait()
+            os.write(exit_write, b"x")
+        except OSError:
+            pass
+        finally:
+            os.close(exit_write)
+
+    selector.register(exit_read, selectors.EVENT_READ, None)
+    threading.Thread(target=report_exit, daemon=True).start()
+    output_streams = {stdout, stderr}
+    exited_at = None
+
     started = time.monotonic()
     last_output = started
     lock_name = None
@@ -141,12 +169,24 @@ def main() -> int:
         previous_handlers[signum] = signal.signal(signum, remember_signal)
 
     try:
-        while selector.get_map():
+        while output_streams:
             now = time.monotonic()
             if interrupted:
                 signum = interrupted[0]
                 terminate_group(process)
                 return 128 + signum
+
+            if exited_at is not None and now - exited_at >= exit_drain:
+                status = shell_status(process.returncode)
+                print(
+                    f"cargo watchdog: step '{args.step}' exited with status {status}, but a "
+                    f"process it started still holds its output open {exit_drain:g}s later; "
+                    "stopping what is left of Cargo's process group",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                terminate_group(process)
+                return status
 
             if lock_name is not None and lock_started is not None and now - lock_started >= lock_timeout:
                 print(
@@ -182,6 +222,8 @@ def main() -> int:
                 return 124
 
             remaining = [idle_timeout - idle]
+            if exited_at is not None:
+                remaining.append(exit_drain - (now - exited_at))
             if lock_name is not None and lock_started is not None:
                 remaining.append(lock_timeout - (now - lock_started))
             if args.deadline_seconds is not None:
@@ -191,10 +233,15 @@ def main() -> int:
                 continue
 
             for key, _ in events:
+                if key.data is None:
+                    selector.unregister(exit_read)
+                    exited_at = time.monotonic()
+                    continue
                 stream, output = key.data
                 data = os.read(stream.fileno(), 65536)
                 if not data:
                     selector.unregister(stream)
+                    output_streams.discard(stream)
                     stream.close()
                     continue
 
@@ -223,6 +270,7 @@ def main() -> int:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
         selector.close()
+        os.close(exit_read)
         for stream in (stdout, stderr):
             if not stream.closed:
                 stream.close()

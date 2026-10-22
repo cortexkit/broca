@@ -32,7 +32,11 @@ PLACE = ROOT / "scripts" / "place-release.sh"
 class RestartTests(unittest.TestCase):
     def setUp(self) -> None:
         if shutil.which("codesign") is None or os.uname().sysname != "Darwin":
-            self.skipTest("place-release.sh places Mach-O binaries; these arms need macOS")
+            reason = "place-release.sh places Mach-O binaries; these arms need macOS"
+            # script-suites.sh sets this on a Mac, where a skip would hide a broken tool setup.
+            if os.environ.get("BROCA_REQUIRE_NATIVE_MACOS") == "1":
+                self.fail(f"BROCA_REQUIRE_NATIVE_MACOS=1 but {reason}")
+            self.skipTest(reason)
         self.tmp = Path(tempfile.mkdtemp(prefix="place-release-restart-"))
         # Two real, single-architecture Mach-O binaries with different bytes, built here so the
         # script's file-kind comparison and signing run for real. (System binaries are
@@ -47,7 +51,13 @@ class RestartTests(unittest.TestCase):
                 'if (argc > 1 && strcmp(argv[1], "--version") == 0) puts("ck-broca 0.0.1");'
                 f'return sizeof("{word}") == 0;}}\n'
             )
-            subprocess.run(["cc", "-o", str(out), str(src)], check=True)
+            subprocess.run(["cc", "-g", "-o", str(out), str(src)], check=True)
+            # Placement on macOS refuses a binary without an adjacent dSYM whose UUID matches,
+            # so each fixture gets a real one rather than a stand-in directory.
+            subprocess.run(
+                ["dsymutil", str(out), "-o", f"{out}.dSYM"],
+                check=True, capture_output=True,
+            )
         self.old_inode = self.dest.stat().st_ino
         self.rollback = self.tmp / "rollback"
         self.ck_log = self.tmp / "ck.log"

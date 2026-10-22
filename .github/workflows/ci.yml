@@ -20,8 +20,12 @@ on:
     - cron: "0 6 * * *"
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # The event is part of the group, so a master push and the nightly run on master never
+  # cancel each other. Only pull requests and train branches cancel a superseded run: every
+  # master commit keeps its own result, because release tagging reads the CI result of the
+  # exact commit it tags.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/train/') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -174,7 +178,11 @@ jobs:
     # Prepare consumers alongside producers; each shard waits only for its own
     # platform's artifacts, not the other platform's matrix jobs or cache saves.
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # The artifact wait below may last as long as the slowest producer's own budget (45
+    # minutes, integration-build), and the replay needs its own time after that. A smaller job
+    # budget lets GitHub cancel a shard whose producer is still inside its allowance.
+    # scripts/test-ci-pipeline.py checks these three numbers against each other.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -216,7 +224,7 @@ jobs:
       - name: Wait for this platform's fixtures and test archive
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -B scripts/wait-ci-artifacts.py "fixtures-${{ runner.os }}" "integration-${{ matrix.os }}"
+        run: python3 -B scripts/wait-ci-artifacts.py --timeout 2700 "fixtures-${{ runner.os }}" "integration-${{ matrix.os }}"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: fixtures-${{ runner.os }}

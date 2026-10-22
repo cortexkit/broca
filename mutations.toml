@@ -11293,12 +11293,29 @@ runner = "command"
 command = ["python3", "-B", "scripts/test-train-push.py", "{test}"]
 test_count_pattern = "Ran {count} test"
 test_file = "scripts/test-train-push.py"
-expect_red = ["ConcurrencyGuardArms.test_two_trains_started_together_cannot_both_be_admitted"]
+expect_red = [
+    "ConcurrencyGuardArms.test_two_trains_started_together_cannot_both_be_admitted",
+    "ConcurrencyGuardArms.test_a_live_lock_from_another_worktree_refuses",
+]
 file = "scripts/train-push.sh"
 old = '''  if owner_is_live "$owner_pid" "$owner_start"; then
     printf 'train-push: train %s is RUNNING as pid %s\n' "${owner_name:-?}" "$owner_pid" >&2'''
 new = '''  if false; then # NON-VACUITY BREAK: ignore the live owner
     printf 'train-push: train %s is RUNNING as pid %s\n' "${owner_name:-?}" "$owner_pid" >&2'''
+
+[[control]]
+id = "train-push-lock-shared-across-worktrees"
+# Train fixtures depend on POSIX process/lock semantics and executable shell shims.
+platforms = ["linux", "macos"]
+guards = "a train started in one linked worktree is refused while another worktree's train holds the lock"
+runner = "command"
+command = ["python3", "-B", "scripts/test-train-push.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-train-push.py"
+expect_red = ["ConcurrencyGuardArms.test_a_live_lock_from_another_worktree_refuses"]
+file = "scripts/train-push.sh"
+old = 'train_lock_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/train-push-locks"'
+new = 'train_lock_dir="$(git rev-parse --git-dir 2>/dev/null)/train-push-locks" # NON-VACUITY BREAK: per-worktree lock'
 
 [[control]]
 id = "script-wal-moving-sidecar"
@@ -22964,3 +22981,91 @@ expect_red = [
 file = "crates/broca-catalog/src/runtime.rs"
 old = "            CapabilityFlag::Absent => CapabilityFlag::Unknown,"
 new = "            CapabilityFlag::Absent => CapabilityFlag::Absent, // NON-VACUITY BREAK: absent reasoning admits as false again."
+
+[[control]]
+id = "script-suites-account-for-every-suite-file"
+guards = "a suite file under scripts/ that no script-suites.sh list runs is reported, not left to rot"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-script-suites.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-script-suites.py"
+expect_red = [
+    "InventoryTests.test_every_suite_file_is_listed",
+    "InventoryTests.test_the_restart_suite_runs_in_required_mode",
+]
+file = "scripts/script-suites.sh"
+old = """    # second live-run check.
+    scripts/test-place-release-restart.py"""
+new = """    # second live-run check.
+    # NON-VACUITY BREAK: the restart suite is no longer run"""
+
+[[control]]
+id = "script-suites-native-macos-skip-is-a-failure"
+guards = "the macOS-only restart suite fails instead of skipping when its run requires native macOS"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-script-suites.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-script-suites.py"
+expect_red = ["RequiredModeTests.test_required_mode_turns_the_skip_into_a_failure"]
+file = "scripts/test-place-release-restart.py"
+old = """            if os.environ.get("BROCA_REQUIRE_NATIVE_MACOS") == "1":"""
+new = """            if False:  # NON-VACUITY BREAK: required mode skips like an ordinary run"""
+
+[[control]]
+id = "cargo-watchdog-sees-cargo-exit-past-a-leaked-pipe"
+guards = "a finished Cargo step returns Cargo's status even while a descendant still holds its output pipe"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-cargo-watchdog.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-cargo-watchdog.py"
+expect_red = ["CargoWatchdogTests.test_an_exited_cargo_is_not_held_open_by_a_descendant"]
+file = "scripts/lib/cargo-watchdog.py"
+old = """                    exited_at = time.monotonic()
+                    continue"""
+new = """                    exited_at = None  # NON-VACUITY BREAK: wait for the pipes, not for Cargo
+                    continue"""
+
+[[control]]
+id = "ci-concurrency-keeps-master-and-nightly-runs"
+guards = "a master push and the nightly CI run neither share a concurrency group nor cancel master runs"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_master_and_nightly_runs_are_never_cancelled_by_each_other"]
+file = ".github/workflows/ci.yml"
+old = "  group: ci-${{ github.event_name }}-${{ github.ref }}"
+new = "  group: ci-${{ github.ref }} # NON-VACUITY BREAK: push and schedule share a group"
+
+[[control]]
+id = "ci-shard-wait-covers-producer-budget"
+guards = "integration shards wait for their artifacts at least as long as the slowest producer may run"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_shard_budget_covers_the_slowest_producer_then_the_replay"]
+file = ".github/workflows/ci.yml"
+old = '''        run: python3 -B scripts/wait-ci-artifacts.py --timeout 2700 "fixtures-${{ runner.os }}" "integration-${{ matrix.os }}"'''
+new = '''        run: python3 -B scripts/wait-ci-artifacts.py --timeout 1200 "fixtures-${{ runner.os }}" "integration-${{ matrix.os }}" # NON-VACUITY BREAK: the old 20-minute wait'''
+
+[[control]]
+id = "release-judges-only-push-ci-runs"
+guards = "a failed, cancelled or running nightly CI run on the release commit does not block tagging, and cannot replace a push run"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-release.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-release.py"
+expect_red = [
+    "Release.test_a_scheduled_ci_run_never_holds_a_release",
+    "Release.test_a_scheduled_success_cannot_stand_in_for_a_push_run",
+]
+file = "scripts/ci-status.sh"
+old = '    runs = [r for r in runs if r.get("event") == event]'
+new = '    pass  # NON-VACUITY BREAK: judge every event'
