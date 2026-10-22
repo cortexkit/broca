@@ -2491,7 +2491,8 @@ mod tests {
 
     /// Fusiform's curated rows next to ordinary chat rows, the page shape that refused every
     /// refresh on 2026-10-21. The refresh succeeds through the real refresh path, the chat rows
-    /// are unchanged, and no curated row is excluded: their unstated facts read as unknown.
+    /// are unchanged, and no curated row is excluded: an omitted reasoning flag reads as Unknown,
+    /// an omitted tool-call or attachment flag as Absent, and an omitted window as `None`.
     #[test]
     fn curated_decision_rows_beside_chat_rows_refresh_without_refusing() {
         let cache = CatalogCache::empty();
