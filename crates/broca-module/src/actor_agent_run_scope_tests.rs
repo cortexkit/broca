@@ -138,6 +138,7 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
             Some(SendPlan {
                 identity: "test-plan".into(),
                 manifest: Some(Arc::new(manifest)),
+                model_check: None,
             })
         } else {
             None

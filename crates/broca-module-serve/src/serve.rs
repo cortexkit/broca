@@ -2528,6 +2528,8 @@ where
                     }
                 }
             };
+            // Captured before the placeholder below replaces the absent model.
+            let model_inherited = params.model.is_none();
             if params.model.is_none() {
                 let may_inherit = inherit_frozen
                     .contains(&broca_protocol::request::InheritedParam::Model)
@@ -2610,7 +2612,13 @@ where
                         &req.params,
                         plan,
                         scope,
-                        params.model.as_ref().expect("model was resolved"),
+                        // An inherited model is known only to the session's actor, which checks
+                        // the plan's models against it; the placeholder must never be compared.
+                        if model_inherited {
+                            None
+                        } else {
+                            params.model.as_ref()
+                        },
                     )
                     .await
                     {
@@ -3772,7 +3780,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     params: &serde_json::Value,
     plan: &serde_json::Value,
     scope: Option<&broca_protocol::SessionScope>,
-    model: &crate::wire::ModelParams,
+    model: Option<&crate::wire::ModelParams>,
 ) -> Result<broca_module::actor::SendPlan, SendPlanRefusal> {
     if let Some(params) = params.as_object() {
         broca_fetch_plan::check_send_members(params)?;
@@ -3816,18 +3824,27 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         .into());
     }
     // Even an unchanged frozen plan can carry persona text for a different model on a later send.
-    broca_fetch_plan::admit::check_plan_model(
-        &parsed,
-        &model.provider,
-        &model.model,
-        model.variant.as_deref(),
-    )?;
+    // A send that left its model to the session is checked by the session's actor instead, once
+    // the inherited model is resolved; the plan travels with the send for that.
+    let model_check = match model {
+        Some(model) => {
+            broca_fetch_plan::admit::check_plan_model(
+                &parsed,
+                &model.provider,
+                &model.model,
+                model.variant.as_deref(),
+            )?;
+            None
+        }
+        None => Some(std::sync::Arc::new(parsed.clone())),
+    };
     match handler.plan_state(session).await {
         broca_module::serve::PlanState::Admitted { frozen } => {
             broca_fetch_plan::check_later_plan(frozen.as_deref(), &parsed.identity)?;
             Ok(broca_module::actor::SendPlan {
                 identity: parsed.identity,
                 manifest: None,
+                model_check,
             })
         }
         broca_module::serve::PlanState::NotAdmitted | broca_module::serve::PlanState::Unknown => {
@@ -3841,6 +3858,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
             Ok(broca_module::actor::SendPlan {
                 identity: parsed.identity,
                 manifest: Some(std::sync::Arc::new(admitted.manifest)),
+                model_check,
             })
         }
     }

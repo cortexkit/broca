@@ -23663,3 +23663,31 @@ expect_message = "the panicked request must be answered on its own correlation"
 file = "crates/broca-module-serve/src/serve.rs"
 old = "        Ok(result) => result,\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
 new = "        Ok(result) => result,\n        Err(_) if true => Ok(()), // NON-VACUITY BREAK: leave the panicked request unanswered.\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
+
+[[control]]
+id = "actor-checks-plan-model-against-inherited-model"
+guards = "A send that left its model to the session has its plan's model-bearing items checked by the actor against the inherited frozen model, refusing plan_model_mismatch"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
+expect_red = ["plan_admission::a_model_less_steer_checks_its_plan_against_the_inherited_model"]
+expect_message = "a plan naming another model than the inherited one is still refused"
+file = "crates/broca-module/src/actor.rs"
+old = "        if let Some(plan) = deferred_model_check {"
+new = "        if let Some(plan) = deferred_model_check.filter(|_| false) { // NON-VACUITY BREAK: never check an inherited model."
+
+[[control]]
+id = "serve-skips-plan-model-check-for-inherited-model"
+guards = "The serve layer never compares a plan's model-bearing items with the empty placeholder a model-less joining send carries"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
+expect_red = ["plan_admission::a_model_less_steer_checks_its_plan_against_the_inherited_model"]
+expect_message = "a model-less steer resending a plan that names the session's own model is accepted"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                        if model_inherited {\n                            None\n                        } else {"
+new = "                        if false && model_inherited { // NON-VACUITY BREAK: check the placeholder model.\n                            None\n                        } else {"

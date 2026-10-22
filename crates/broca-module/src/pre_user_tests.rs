@@ -285,6 +285,7 @@ impl Fixture {
                 first.then(|| SendPlan {
                     identity: "plan".into(),
                     manifest: Some(self.manifest.clone()),
+                    model_check: None,
                 }),
             ),
         )

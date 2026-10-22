@@ -2537,3 +2537,91 @@ async fn later_plan_tools_are_refused_in_every_delivery_without_writes() {
     assert_eq!(rig.wal_bytes(), before);
     rig.finish().await;
 }
+
+/// A steer that omits `model` takes the session's frozen model, and a resent plan's
+/// model-bearing items are checked against that model, not against an empty placeholder: the
+/// frozen plan naming the session's own model is accepted, and once a later episode moved the
+/// session to another variant, the same plan is refused `plan_model_mismatch` naming the
+/// inherited model, with nothing written.
+#[tokio::test]
+async fn a_model_less_steer_checks_its_plan_against_the_inherited_model() {
+    let (mut rig, _admitter) = worker_plan_rig("plan-model-inherited").await;
+    let plan_model = json!({"provider": "fake", "id": "fake", "variant": "high"});
+    let plan = model_plan(plan_model.clone());
+    rig.script.push(&[
+        Step::Text("first"),
+        Step::Text("steered"),
+        Step::Text("second"),
+        Step::Text("spare"),
+    ]);
+    rig.script.hold_model(true);
+    let first = send_plan(
+        &mut rig,
+        7,
+        "turn-1",
+        "hi",
+        Some(&plan),
+        json!({"model": {"provider": "fake", "model": "fake", "variant": "high"}}),
+    )
+    .await;
+    let first_id = result(&first)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_entered().await;
+    let steered = send_plan(
+        &mut rig,
+        7,
+        "turn-2",
+        "and this",
+        Some(&plan),
+        json!({"model": null, "delivery": "steer"}),
+    )
+    .await;
+    assert_eq!(
+        steered.header.ty,
+        FrameType::Response,
+        "a model-less steer resending a plan that names the session's own model is accepted: {}",
+        String::from_utf8_lossy(&steered.body)
+    );
+    assert_eq!(result(&steered)["run_id"], first_id);
+    rig.script.hold_model(false);
+    rig.wait_for_finished(1).await;
+
+    // A later plan-less episode moves the session to another variant.
+    result(
+        &send_plan(
+            &mut rig,
+            7,
+            "turn-3",
+            "next",
+            None,
+            json!({"model": {"provider": "fake", "model": "fake", "variant": "low"}}),
+        )
+        .await,
+    );
+    rig.wait_for_finished(2).await;
+
+    let before = rig.wal_bytes();
+    let refused = send_plan(
+        &mut rig,
+        7,
+        "turn-4",
+        "again",
+        Some(&plan),
+        json!({"model": null, "delivery": "steer"}),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert!(
+        refused.header.ty == FrameType::Error && body["code"] == "plan_model_mismatch",
+        "a plan naming another model than the inherited one is still refused: {body}"
+    );
+    assert_eq!(
+        body["detail"],
+        json!({
+            "provider": "prefrontal-core",
+            "plan_model": plan_model,
+            "send_model": {"provider": "fake", "id": "fake", "variant": "low"},
+        })
+    );
+    assert_eq!(rig.wal_bytes(), before, "refusal must preserve WAL bytes");
+    rig.finish().await;
+}

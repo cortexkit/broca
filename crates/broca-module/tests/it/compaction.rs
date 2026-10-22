@@ -288,6 +288,7 @@ impl Rig {
                 manifest.map(|manifest| SendPlan {
                     identity: "plan".into(),
                     manifest: Some(manifest),
+                    model_check: None,
                 }),
             )
             .await
