@@ -1640,7 +1640,7 @@ impl SubcConnection {
             preset: preset.map(str::to_owned),
         })
         .map_err(|e| ConnError::Transport(e.to_string()))?;
-        self.send_tool_call_body(route, deadline, body).await
+        self.send_tool_call_body(route, deadline, name, body).await
     }
 
     /// Preserve the exact argument bytes rather than parsing and reserializing them.
@@ -1664,7 +1664,7 @@ impl SubcConnection {
             call_key,
             approval_digest,
         )?;
-        self.send_tool_call_body(route, deadline, body).await
+        self.send_tool_call_body(route, deadline, name, body).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1704,6 +1704,7 @@ impl SubcConnection {
             )
             .map_err(|error| ConnError::Transport(error.to_string()))?;
             self.enqueue_approved(&runtime, frame, signals).await?;
+            log_tool_dispatch(route.channel, corr, name);
             Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr))
         };
         let (runtime, _registration, mut rx, corr) =
@@ -1756,6 +1757,7 @@ impl SubcConnection {
         &self,
         route: &RouteHandle,
         deadline: Duration,
+        operation: &str,
         body: Vec<u8>,
     ) -> ConnResult<serde_json::Value> {
         let corr = self.next_corr();
@@ -1771,6 +1773,7 @@ impl SubcConnection {
         )
         .map_err(|error| ConnError::Transport(error.to_string()))?;
         self.send(&runtime, frame).await?;
+        log_tool_dispatch(route.channel, corr, operation);
         self.receive_tool_call(runtime, route, corr, &mut rx, deadline)
             .await
     }
@@ -2792,6 +2795,18 @@ async fn writer_task<W: AsyncWrite + Unpin>(
             break;
         }
     }
+}
+
+// Put request identity on the opt-in wire target; tool arguments are deliberately not logged.
+fn log_tool_dispatch(route_channel: u16, correlation_id: u64, operation: &str) {
+    tracing::debug!(
+        target: "subc.wire",
+        stage = "tool_dispatch",
+        route_channel,
+        correlation_id,
+        operation,
+        "tool call dispatched"
+    );
 }
 
 /// Channel-0 control-plane flags: PASSIVE priority, non-binary (JSON body) —
@@ -4251,6 +4266,56 @@ mod tests {
                 .unwrap();
             task.await.unwrap().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn tool_dispatch_log_identifies_route_request_and_operation_without_arguments() {
+        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+        let capture = broca_test_support::LogCapture::new();
+        let signals = broca_core::tool_plane::DispatchSignals::default();
+        let dispatch = capture.scope_future(conn.tool_call_raw_guarded(
+            &route,
+            "lookup",
+            r#"{"secret":"argument content"}"#,
+            Some("provider-call"),
+            Duration::from_secs(1),
+            None,
+            None,
+            None,
+            &signals,
+        ));
+        let receive = async {
+            let request = module.next_request().await;
+            assert!(module.reply(&request, br#"{"content":[]}"#.to_vec()));
+            request
+        };
+        let (result, request) = tokio::join!(dispatch, receive);
+        assert!(result.is_ok(), "{result:?}");
+
+        let logs: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.target == "subc.wire"
+                    && event
+                        .fields
+                        .get("stage")
+                        .is_some_and(|stage| stage == "tool_dispatch")
+            })
+            .collect();
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        let event = &logs[0];
+        assert_eq!(event.level, tracing::Level::DEBUG);
+        assert_eq!(event.fields["stage"], "tool_dispatch");
+        assert_eq!(event.fields["route_channel"], "5");
+        assert_eq!(
+            event.fields["correlation_id"],
+            request.header.corr.to_string()
+        );
+        assert_eq!(event.fields["operation"], "lookup");
+        let fields = format!("{:?}", event.fields);
+        assert!(!fields.contains("secret"));
+        assert!(!fields.contains("argument content"));
     }
 
     #[tokio::test]
