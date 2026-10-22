@@ -22826,3 +22826,29 @@ expect_red = ["compaction::view::tests::a_view_with_an_apply_mark_broca_did_not_
 file = "crates/broca-core/src/compaction/view.rs"
 old = "    if view.apply.is_some() {"
 new = "    if view.apply.is_some() && false { // NON-VACUITY BREAK: honour any apply mark."
+
+[[control]]
+id = "read-refused-while-tags-await-setup"
+guards = "While a tag-rendering run waits for its compaction Setup answer, session.read and session.resolve refuse transient, so no number shown is later renumbered by a Setup checkpoint"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/compaction.rs"
+expect_red = ["compaction::reads_wait_out_the_setup_answer_and_never_show_a_number_that_changes"]
+file = "crates/broca-module/src/serve.rs"
+old = "        if page.tags_await_setup {"
+new = "        if page.tags_await_setup && false { // NON-VACUITY BREAK: serve numbers a Setup checkpoint may change."
+
+[[control]]
+id = "replay-flags-a-run-awaiting-its-setup-answer"
+guards = "Replay marks a running tag-rendering run on a compaction session with no recorded Setup answer, which the read path refuses"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/compaction.rs"
+expect_red = ["compaction::reads_wait_out_the_setup_answer_and_never_show_a_number_that_changes"]
+file = "crates/broca-core/src/replay.rs"
+old = "        && compaction.state().is_none()"
+new = "        && compaction.state().is_some() // NON-VACUITY BREAK: never flag the Setup window."

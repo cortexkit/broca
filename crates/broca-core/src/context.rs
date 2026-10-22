@@ -756,6 +756,9 @@ pub struct SessionReadPage {
     pub deferred_calls: Option<crate::DeferredCallProjection>,
     pub late_approvals: Vec<crate::LateApprovalView>,
     pub withdrawals_owed: bool,
+    /// The running episode's tag numbers wait for its compaction Setup answer, which may
+    /// anchor them at a checkpoint; a read refuses rather than show numbers that could change.
+    pub tags_await_setup: bool,
 }
 
 /// Assemble one transcript page from atomically selected store rows plus the bounded WAL tail.
@@ -979,6 +982,7 @@ fn read_session_page_from_rows(
             deferred_calls: deferred_calls.filter(|view| !view.calls.is_empty()),
             late_approvals,
             withdrawals_owed,
+            tags_await_setup: tail_state.tags_await_setup,
         },
         dispatches,
     ))
@@ -1193,6 +1197,7 @@ fn read_session_page_full(
             .map_or_else(Vec::new, |view| view.late_approvals()),
         withdrawals_owed: crate::replay::project_deferred_calls(None, framed, None, None)
             .is_some_and(|view| !view.obligations().withdrawals.is_empty()),
+        tags_await_setup: replay.tags_await_setup,
     })
 }
 
@@ -1357,6 +1362,7 @@ pub fn resume_state_from_store(
         )
     };
     Ok(crate::ReplayState {
+        tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,
         cancel_at: tail_state.cancel_at,
         // This prefix supplies model input rather than transcript reads, so it carries no run metadata.

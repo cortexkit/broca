@@ -3422,7 +3422,7 @@ async fn send_serve_error(
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::SendIdReuse { .. } => "send_id_reuse",
-        ServeError::Transient(_) => "transient",
+        ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient",
         ServeError::BaselineRequired => "baseline_required",
         ServeError::CapUnavailable(_) => "cap_unavailable",
         ServeError::BudgetDenied { .. } => "budget_denied",

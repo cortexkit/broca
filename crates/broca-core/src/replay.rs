@@ -100,6 +100,11 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    /// The last episode renders tags under the computed rules on a compaction-managed session,
+    /// is still running, and no Setup answer is recorded yet: the answer may carry a tag
+    /// checkpoint that renumbers the run's parts from its cut (llm-runner §9.6), so no read
+    /// may expose those numbers until it is durable.
+    pub tags_await_setup: bool,
     pub input_budget: crate::input_budget::InputTokenBudget,
     pub cancel_at: Option<broca_wal::record::RunCancelAt>,
     /// Run metadata beside the prompt, never part of model input or WAL message bytes.
@@ -2184,7 +2189,15 @@ fn replay_seeded_with_compaction<'a>(
     }
     // A torn import's repair truncates the prompt; a turn past the end no longer exists.
     committed_tool_turns.retain(|(prompt_index, _)| *prompt_index < prompt.len());
+    let tags_await_setup = saw_run_started
+        && !run_finished_durable
+        && compaction_session
+        && compaction.state().is_none()
+        && run_config
+            .as_ref()
+            .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
     Ok(ReplayState {
+        tags_await_setup,
         input_budget,
         cancel_at,
         message_runs,

@@ -1417,6 +1417,10 @@ pub enum ServeError {
     },
     /// Admission failed before durable start because a dependency is temporarily unavailable.
     Transient(String),
+    /// A read arrived while the session's running run waits for its compaction Setup answer,
+    /// which may anchor the run's tag numbers at a checkpoint. Refused `transient`, writing
+    /// nothing, so no reader sees a number that changes once the answer is durable.
+    TagsAwaitSetup,
     /// A durable cap receiver needs a fresh baseline before it can continue.
     BaselineRequired,
     /// The daemon's cap table was not configured.
@@ -1538,6 +1542,9 @@ impl std::fmt::Display for ServeError {
                 "send_id was already used with different {differing}; retries must be byte-identical"
             ),
             ServeError::Transient(s) => write!(f, "transient admission failure: {s}"),
+            ServeError::TagsAwaitSetup => f.write_str(
+                "the running run's tag numbers wait for its compaction Setup answer; retry shortly",
+            ),
             ServeError::BaselineRequired => f.write_str("baseline_required"),
             ServeError::CapUnavailable(s) => write!(f, "cap table unavailable: {s}"),
             ServeError::BudgetDenied { cap_id, reason } => {
@@ -2724,6 +2731,12 @@ impl ServeHandler for crate::LineageRegistry {
                     requested: requested.clone(),
                 });
             }
+        }
+        // A Setup answer may still anchor the running run's numbers at a checkpoint and change
+        // every number from its cut (llm-runner §9.6): until it is durable, refuse rather than
+        // show numbers a later read would contradict. The window lasts one Setup call.
+        if page.tags_await_setup {
+            return Err(ServeError::TagsAwaitSetup);
         }
         if let (Some(after), Some(mid)) = (after, &req.after_mid) {
             if !after.is_some_and(|ordinal| ordinal < page.prompt_len) {
