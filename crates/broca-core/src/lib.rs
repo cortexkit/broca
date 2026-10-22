@@ -27,6 +27,7 @@ pub mod hooks;
 pub mod import;
 pub mod input_budget;
 pub mod lease;
+pub mod placement;
 pub mod projection;
 mod projection_health;
 pub mod projection_plan;
