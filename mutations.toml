@@ -167,6 +167,20 @@ old = "        let retention_wal = self.wal_store.clone();"
 new = "        let _ = self.read_wal_framed_records().await?; // NON-VACUITY BREAK: decode the full retention history.\n        let retention_wal = self.wal_store.clone();"
 
 [[control]]
+id = "actor-admission-stamps-retained-run-lineage"
+guards = "A run admitted into a long retained session gets its lineage on its run-index row even when the bounded retention sync projects no run rows"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::later_retained_run_in_a_long_session_records_its_lineage_at_admission"]
+expect_message = "later retained run lost its lineage"
+file = "crates/broca-module/src/actor.rs"
+old = "        self.stamp_retained_run(&admitted_run_id).await;"
+new = "        let _ = &admitted_run_id; // NON-VACUITY BREAK: skip the admission lineage stamp."
+
+[[control]]
 id = "actor-refused-queue-and-retract-have-no-effect"
 guards = "Refused Queued and Retracted appends preserve actor caches and live inbox state even when a reserved terminal lets a later sync succeed"
 runner = "cargo"

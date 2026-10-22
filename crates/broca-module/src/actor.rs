@@ -4490,6 +4490,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
         }
         let _ = self.sync_retention_index().await;
+        self.stamp_retained_run(&admitted_run_id).await;
         Ok(admitted_run_id)
     }
 
@@ -11313,6 +11314,44 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         self.retention_deadline = result?;
         Ok(())
+    }
+
+    /// Give the run just admitted its retained lineage on its run-index row.
+    ///
+    /// `sync_retention_index` keeps the hot path bounded: it reuses a lineage summary that
+    /// already matches the WAL, or projects run rows only when a 256 KiB tail reaches the
+    /// lineage's first record. A later run in a long retained session therefore often gets
+    /// no projection here, and a session read can refresh the summary without run rows,
+    /// after which enrollment repair sees a current summary and never projects the run.
+    /// Without a lineage the row is missed by withdrawal discovery and by expiry accounting
+    /// that reads runs by lineage. This point update costs no WAL read. The store changes
+    /// the row only when a live retained lineage with this id exists for this session, so
+    /// a forever session is never stamped.
+    async fn stamp_retained_run(&mut self, run_id: &RunId) {
+        let Some(service) = self.registry.retention_service() else {
+            return;
+        };
+        let Some(writer) = self.writer.as_ref() else {
+            return;
+        };
+        if writer.is_retention_lineage() == Some(false) {
+            return;
+        }
+        let Some(id) = writer.lineage_id() else {
+            return;
+        };
+        let key = self.key.clone();
+        let run = run_id.0.clone();
+        let stamped = tokio::task::spawn_blocking(move || {
+            service.index.stamp_run_lineage(&run, &key, &id.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|result| result);
+        if stamped.is_err() {
+            self.registry.repair_retention(&self.key);
+            tracing::warn!(target: "retention", "run lineage stamp failed; repair enrolled");
+        }
     }
 
     async fn expire_actor(&mut self, now_ms: u64) -> bool {

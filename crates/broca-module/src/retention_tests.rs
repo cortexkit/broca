@@ -958,6 +958,72 @@ async fn first_retained_send_records_policy_and_never_indexes_the_title() {
     assert!(registry.stop_and_seal().await);
 }
 
+/// A later run in a retained session must carry the lineage on its run-index row even when
+/// admission takes the bounded retention sync, which projects no run rows once the WAL is
+/// longer than the 256 KiB tail it may read. A run row without a lineage is invisible to
+/// withdrawal discovery and to expiry accounting that reads runs by lineage.
+#[tokio::test]
+async fn later_retained_run_in_a_long_session_records_its_lineage_at_admission() {
+    let rig = Rig::new();
+    let send = |registry: &crate::registry::LineageRegistry,
+                run: &'static str,
+                kind: crate::executor::RunKind| {
+        let registry = registry.clone();
+        let key = rig.key.clone();
+        async move {
+            assert!(matches!(
+                registry
+                    .route_send(&key, request(&key, run), kind)
+                    .await
+                    .unwrap(),
+                crate::actor::SendOutcome::Active { .. }
+            ));
+            wait_idle(&registry, &key).await;
+        }
+    };
+    // A short first run, as in production, so its admission projects the lineage summary.
+    let short = rig.registry(None);
+    send(&short, "first-run", crate::executor::RunKind::FreshOrResume).await;
+    assert!(short.stop_and_seal().await);
+    // Long replies push the WAL past the bounded tail, as long sidekick sessions do.
+    let long = rig.registry_with_reply(None, "x".repeat(400 * 1024));
+    send(&long, "growth-run", crate::executor::RunKind::AppendEpisode).await;
+    assert!(
+        fs::metadata(rig.service.wal.ephemeral_wal_path(&rig.key))
+            .unwrap()
+            .len()
+            > 256 * 1024,
+        "the session must outgrow the bounded retention tail"
+    );
+    send(&long, "later-run", crate::executor::RunKind::AppendEpisode).await;
+    let lineage = rig
+        .store
+        .lookup_live_retention_lineage(&rig.key)
+        .unwrap()
+        .unwrap()
+        .lineage_id;
+    for run in ["first-run", "growth-run", "later-run"] {
+        let retention = rig.store.lookup_run_retention(run).unwrap().unwrap();
+        assert_eq!(
+            retention.lineage_id.as_deref(),
+            Some(lineage.as_str()),
+            "later retained run lost its lineage: {run}"
+        );
+        let row = rig.store.lookup_run(run).unwrap().unwrap();
+        assert_eq!(row.state, RunIndexState::Completed);
+        assert_eq!(row.title, None, "retained run rows never store a title");
+    }
+    let indexed: Vec<_> = rig
+        .store
+        .retention_run_rows(&lineage)
+        .unwrap()
+        .into_iter()
+        .map(|run| run.run.run_id)
+        .collect();
+    assert_eq!(indexed, ["first-run", "growth-run", "later-run"]);
+    assert!(long.stop_and_seal().await);
+}
+
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn expiry_timer_ends_subscriptions_releases_lease_and_fresh_send_completes_deletion() {
