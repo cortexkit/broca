@@ -231,6 +231,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         }
     }
 

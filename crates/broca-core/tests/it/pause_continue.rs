@@ -112,6 +112,7 @@ fn edit_tool() -> Tool {
         input_schema: json!({"type": "object"}),
         module: None,
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     }
 }
 

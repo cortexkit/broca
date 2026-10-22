@@ -64,6 +64,74 @@ pub struct Tool {
     pub module: Option<String>,
     #[serde(default)]
     pub execution_mode: ExecutionMode,
+    /// The longest the tool may take to answer one call, declared by the caller that declared
+    /// the tool. Broca waits for the call's terminal reply this long or its default wait,
+    /// whichever is longer, so a tool that legitimately holds a call for minutes is not cut off
+    /// and its run ended interrupted. Frozen with the rest of the tool at run start. It is dispatch metadata only:
+    /// no provider request ever renders it. Absent costs no bytes.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_tool_reply"
+    )]
+    pub reply: Option<ToolReply>,
+}
+
+/// The largest `reply.max_ms` a declared tool may carry: one day. The same bound the tool
+/// provider role puts on a catalog tool's `reply.max_ms`
+/// (`cortexkit_role_tool_provider::catalog::check_reply`), so a deadline means the same thing
+/// whether a catalog or a `session.send` declared it.
+pub const TOOL_REPLY_MAX_MS: u64 = 86_400_000;
+
+/// A declared tool's reply deadline: exactly `{max_ms}`. The shape of a catalog tool's `reply`
+/// without its `hold_argument`, which a caller-declared tool has no catalog schema pin to
+/// support. Strict: an unknown member, a missing `max_ms`, or a `max_ms` outside
+/// 1..=[`TOOL_REPLY_MAX_MS`] is refused, never read as no deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolReply {
+    #[serde(deserialize_with = "deserialize_tool_reply_max_ms")]
+    pub max_ms: u64,
+}
+
+impl ToolReply {
+    /// Why `max_ms` is not a deadline a declared tool may carry, if it is not.
+    pub fn check_max_ms(max_ms: u64) -> Result<(), &'static str> {
+        if (1..=TOOL_REPLY_MAX_MS).contains(&max_ms) {
+            Ok(())
+        } else {
+            Err("must be an integer from 1 to 86,400,000")
+        }
+    }
+}
+
+/// A present `reply` must be a deadline object: `null` is refused like any other wrong type
+/// rather than read as no deadline, so a caller that meant to declare one learns it did not.
+fn deserialize_tool_reply<'de, D>(deserializer: D) -> Result<Option<ToolReply>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Decode through a JSON value so only the object form is accepted: serde's derived struct
+    // decoding would also take a one-element array (`[1800000]`) as `{max_ms: 1800000}`.
+    let value = Value::deserialize(deserializer)?;
+    if !value.is_object() {
+        return Err(serde::de::Error::custom(format!(
+            "reply must be an object holding max_ms; got {value}"
+        )));
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_tool_reply_max_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let max_ms = u64::deserialize(deserializer)?;
+    ToolReply::check_max_ms(max_ms)
+        .map(|()| max_ms)
+        .map_err(|reason| serde::de::Error::custom(format!("reply.max_ms {reason}")))
 }
 
 /// What the model is allowed/forced to do with tools this step.
@@ -748,6 +816,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 module: Some("aft".into()),
                 execution_mode: ExecutionMode::Parallel,
+                reply: None,
             }]),
             policy_allowed: ["edit".to_string()].into_iter().collect(),
             tool_choice: ToolChoice::Auto,
@@ -882,6 +951,79 @@ mod declared_marker_tests {
         assert_eq!(
             options.with_prompt(vec![]).declared_markers,
             options.declared_markers
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_reply_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_with(reply: Value) -> Value {
+        json!({"name": "research", "description": "", "input_schema": {"type": "object"}, "reply": reply})
+    }
+
+    #[test]
+    fn a_declared_reply_decodes_and_encodes_after_the_other_members() {
+        let tool: Tool = serde_json::from_value(tool_with(json!({"max_ms": 1_800_000}))).unwrap();
+        assert_eq!(tool.reply, Some(ToolReply { max_ms: 1_800_000 }));
+        assert_eq!(
+            serde_json::to_string(&tool).unwrap(),
+            r#"{"name":"research","description":"","input_schema":{"type":"object"},"execution_mode":"parallel","reply":{"max_ms":1800000}}"#
+        );
+        for bound in [1, TOOL_REPLY_MAX_MS] {
+            let tool: Tool = serde_json::from_value(tool_with(json!({"max_ms": bound}))).unwrap();
+            assert_eq!(tool.reply, Some(ToolReply { max_ms: bound }));
+        }
+    }
+
+    #[test]
+    fn an_absent_reply_costs_no_bytes() {
+        let tool: Tool = serde_json::from_value(
+            json!({"name": "research", "description": "", "input_schema": {"type": "object"}}),
+        )
+        .unwrap();
+        assert_eq!(tool.reply, None);
+        assert!(!serde_json::to_string(&tool).unwrap().contains("reply"));
+    }
+
+    /// Every malformed deadline is refused rather than read as "no deadline": a caller that
+    /// meant to declare one must learn it did not, before its long call is cut at the default.
+    #[test]
+    fn a_malformed_reply_is_refused_not_dropped() {
+        for reply in [
+            json!(null),
+            json!({}),
+            json!({"max_ms": 0}),
+            json!({"max_ms": TOOL_REPLY_MAX_MS + 1}),
+            json!({"max_ms": -5}),
+            json!({"max_ms": 1.5}),
+            json!({"max_ms": "1800000"}),
+            json!({"max_ms": 1000, "hold_argument": {"name": "t", "default_ms": 1, "grace_ms": 1}}),
+            json!({"max_ms": 1000, "extra": true}),
+            json!(1_800_000),
+            json!([1_800_000]),
+        ] {
+            assert!(
+                serde_json::from_value::<Tool>(tool_with(reply.clone())).is_err(),
+                "{reply} must be refused"
+            );
+        }
+    }
+
+    /// Unknown members of a tool other than `reply` stay tolerated and dropped, as before.
+    #[test]
+    fn other_unknown_tool_members_are_still_tolerated() {
+        let tool: Tool = serde_json::from_value(json!({
+            "name": "research", "description": "", "input_schema": {"type": "object"},
+            "timeout_ms": 5, "strict": true
+        }))
+        .unwrap();
+        assert_eq!(tool.reply, None);
+        assert_eq!(
+            serde_json::to_string(&tool).unwrap(),
+            r#"{"name":"research","description":"","input_schema":{"type":"object"},"execution_mode":"parallel"}"#
         );
     }
 }

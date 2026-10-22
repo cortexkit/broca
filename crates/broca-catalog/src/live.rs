@@ -3174,7 +3174,7 @@ mod responses_tool_admission_tests {
             description: name.into(),
             input_schema: json!({"type":"object","properties":{"filePath":{"type":"string"},"limit":{"type":"integer"}},"required":["filePath"]}),
             module: None,
-            execution_mode: Default::default(),
+            execution_mode: Default::default(), reply: None,
         }).collect::<Vec<_>>().into();
         opts
     }

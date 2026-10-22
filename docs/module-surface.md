@@ -406,6 +406,22 @@ tools is refused before it can freeze that list, even if it queues or steers; it
 retrofit a plan (the existing `plan_drift` rule still applies). Omitting tools does not
 revalidate or replace an older run's frozen tool list.
 
+`role.describe.capabilities` includes `send_tool_reply_bound` (a broca extension). A tool
+declared directly in `session.send.tools` may carry `reply: {"max_ms": N}`, the longest one of
+its calls may take to answer, with N from 1 to 86,400,000 (the bound a tool provider's catalog
+`reply.max_ms` has). Broca then waits for each call of that tool by the same rule as a catalog
+tool's `reply`: `max_ms`, never less than its default 120-second wait. Without `reply` the tool
+keeps the default wait, after which a call with no answer is indeterminate and the run ends
+`interrupted`. A frozen fetch plan's own `reply` for the tool takes precedence. The deadline is
+frozen with the tool in the run's `RunStarted` (a resume keeps it, and a later send or catalog
+cannot change it); a send that omits `tools` inherits it with the rest of the tool. It is never
+rendered into a provider request and never sent to the tool. `reply` is strict: a non-object,
+a missing, zero, too large or non-integer `max_ms`, or any other member inside `reply` is
+refused `invalid_params` naming the member (`tools[0].reply.max_ms`, `tools[0].reply.grace_ms`,
+...) before anything is written. Other unknown members of a tool stay tolerated and ignored, as
+before. Records whose tools carry a `reply` require the must-understand WAL feature
+`tool-reply/v1`; tools without one keep their old bytes.
+
 `role.describe.capabilities` includes `fetch-plan-optional-tools/v1`. A caller may mark
 a plan's tool item `optional: true`; literal `false`, optional compaction/transform items,
 and optional persona text remain invalid. Optional tool fetches have a five-second budget

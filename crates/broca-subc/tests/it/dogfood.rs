@@ -121,6 +121,7 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
         input_schema: json!({"type": "object"}),
         module: None,
         execution_mode: mode,
+        reply: None,
     }
 }
 

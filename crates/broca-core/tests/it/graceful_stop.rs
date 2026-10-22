@@ -222,6 +222,7 @@ fn request(name: &str, mode: ExecutionMode) -> RunRequest {
         input_schema: json!({"type": "object"}),
         module: None,
         execution_mode: mode,
+        reply: None,
     }];
     let policy_allowed: HashSet<String> = ["edit".to_string()].into_iter().collect();
     RunRequest {

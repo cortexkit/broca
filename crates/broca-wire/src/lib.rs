@@ -355,6 +355,50 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Check every `tools[i].reply` of a `session.send` before anything else reads the send, so a
+/// malformed deadline is refused `invalid_params` naming its exact member
+/// (`tools[0].reply.max_ms`, `tools[1].reply.timeout`, ...) rather than the whole `tools` field,
+/// and before admission writes anything. The rules are [`broca_protocol::ToolReply`]'s: an
+/// object holding exactly a `max_ms` integer from 1 to
+/// [`broca_protocol::request::TOOL_REPLY_MAX_MS`]. Other unknown members of a tool are left as
+/// they always were: tolerated and dropped.
+pub fn check_tool_replies(params: &serde_json::Value) -> Result<(), (String, String)> {
+    let Some(tools) = params.get("tools").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    for (index, tool) in tools.iter().enumerate() {
+        let Some(reply) = tool.get("reply") else {
+            continue;
+        };
+        let field = format!("tools[{index}].reply");
+        let Some(members) = reply.as_object() else {
+            return Err((
+                field.clone(),
+                format!("{field} must be an object holding max_ms; got {reply}"),
+            ));
+        };
+        if let Some(unknown) = members.keys().find(|key| key.as_str() != "max_ms") {
+            let field = format!("{field}.{unknown}");
+            return Err((
+                field.clone(),
+                format!("{field} is not a reply member; a declared tool's reply holds only max_ms"),
+            ));
+        }
+        let field = format!("{field}.max_ms");
+        let checked = match members.get("max_ms") {
+            None => Err("is required"),
+            Some(value) => value
+                .as_u64()
+                .ok_or("must be an integer from 1 to 86,400,000")
+                .and_then(broca_protocol::ToolReply::check_max_ms),
+        };
+        if let Err(reason) = checked {
+            return Err((field.clone(), format!("{field} {reason}")));
+        }
+    }
+    Ok(())
+}
+
 fn deserialize_directives<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>, D::Error> {
@@ -4027,6 +4071,84 @@ mod send_tool_shape_tests {
         assert_eq!(serde_json::to_string(&params.tools).unwrap(), tools);
         let decoded: Vec<Tool> = serde_json::from_str(tools).unwrap();
         assert_eq!(serde_json::to_string(&decoded).unwrap(), tools);
+    }
+
+    /// The `session.send` params Core sends for a lead session's long-running `research` tool:
+    /// a send-declared tool with `reply: {max_ms: 1800000}`.
+    #[test]
+    fn send_params_tool_reply_matches_golden() {
+        let params: SendParams = serde_json::from_value(serde_json::json!({
+            "prompt": "Research how a resumed run keeps its frozen tools.",
+            "tools": [{
+                "name": "research",
+                "description": "Ask sidekick a question.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"request": {"type": "string"}},
+                    "required": ["request"]
+                },
+                "module": "prefrontal-core",
+                "reply": {"max_ms": 1_800_000}
+            }]
+        }))
+        .unwrap();
+        assert!(check_tool_replies(&serde_json::to_value(&params).unwrap()).is_ok());
+        assert_eq!(
+            params.tools.as_ref().unwrap()[0].reply,
+            Some(broca_protocol::ToolReply { max_ms: 1_800_000 })
+        );
+        scope_refusal_golden::assert_golden(
+            params,
+            "send_params.tool_reply.json",
+            SEND_PARAMS_TOOL_REPLY_SHA256,
+        );
+    }
+
+    const SEND_PARAMS_TOOL_REPLY_SHA256: &str =
+        "501fb9c1284bb31577d149b884d2828771a0b5f76f319f5b3bab944612886338";
+
+    /// Each malformed `tools[i].reply` is refused naming its exact member, and serde's own decode
+    /// of the send refuses it too, so no path reads it as "no deadline".
+    #[test]
+    fn malformed_tool_replies_are_refused_naming_the_member() {
+        let ok = serde_json::json!({"name": "ok", "description": "", "input_schema": {}});
+        for (reply, field) in [
+            (serde_json::json!({}), "tools[1].reply.max_ms"),
+            (serde_json::json!({"max_ms": 0}), "tools[1].reply.max_ms"),
+            (
+                serde_json::json!({"max_ms": 86_400_001u64}),
+                "tools[1].reply.max_ms",
+            ),
+            (
+                serde_json::json!({"max_ms": "600000"}),
+                "tools[1].reply.max_ms",
+            ),
+            (serde_json::json!({"max_ms": 1.5}), "tools[1].reply.max_ms"),
+            (serde_json::json!({"max_ms": -1}), "tools[1].reply.max_ms"),
+            (
+                serde_json::json!({"max_ms": 600_000, "grace_ms": 5}),
+                "tools[1].reply.grace_ms",
+            ),
+            (serde_json::json!(600_000), "tools[1].reply"),
+            (serde_json::json!(null), "tools[1].reply"),
+            (serde_json::json!([]), "tools[1].reply"),
+        ] {
+            let mut tool = ok.clone();
+            tool["reply"] = reply.clone();
+            let params = serde_json::json!({"prompt": "hi", "tools": [ok.clone(), tool]});
+            let (refused, message) = check_tool_replies(&params).unwrap_err();
+            assert_eq!(refused, field, "{reply}");
+            assert!(message.starts_with(field), "{reply}: {message}");
+            assert!(
+                serde_json::from_value::<SendParams>(params).is_err(),
+                "{reply} must not decode as a send"
+            );
+        }
+        let declared = serde_json::json!({"prompt": "hi", "tools": [ok.clone(), {
+            "name": "held", "description": "", "input_schema": {}, "reply": {"max_ms": 1}
+        }]});
+        assert!(check_tool_replies(&declared).is_ok());
+        assert!(check_tool_replies(&serde_json::json!({"prompt": "hi"})).is_ok());
     }
 }
 

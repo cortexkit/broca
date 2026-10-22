@@ -190,6 +190,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STEP_TRANSFORMS_FEATURE,
     STRUCTURED_OUTPUT_FEATURE,
     STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
+    TOOL_REPLY_FEATURE,
 ];
 
 /// Google RPC quota details on a stored provider error must not be silently discarded on read.
@@ -270,6 +271,12 @@ pub const STRUCTURED_OUTPUT_FEATURE: &str = "structured-output/v1";
 /// A schema compilation refusal changes every subsequent request. Older readers must not
 /// skip the downgrade and resume sending the strict grammar the provider already refused.
 pub const STRUCTURED_OUTPUT_DOWNGRADE_FEATURE: &str = "structured-output-downgrade/v1";
+
+/// A tool declared on `session.send` that carries its own reply deadline (`Tool::reply`), frozen
+/// in a `RunStarted`'s tools or held in a `Queued` request's. A reader without it must refuse
+/// such a WAL: decoding the tool would silently drop the deadline, and the resumed or drained
+/// run would cut that tool's long calls at the default wait and end the run interrupted.
+pub const TOOL_REPLY_FEATURE: &str = "tool-reply/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -942,8 +949,10 @@ mod tests {
                 STEP_TRANSFORMS_FEATURE,
                 STRUCTURED_OUTPUT_FEATURE,
                 STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
+                TOOL_REPLY_FEATURE,
             ]
         );
+        assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
         assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
         assert_eq!(COMPACTION_FEATURE, "compaction/v1");
@@ -1162,6 +1171,42 @@ mod tests {
             assert!(
                 matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [RUNNER_TAGS_FEATURE]),
                 "an older reader refuses {value} by name"
+            );
+        }
+    }
+
+    /// A run start or queued send whose tools declare a reply deadline is a gated frame
+    /// requiring `tool-reply/v1`: a build that predates the feature refuses it by that name
+    /// instead of decoding the tool without its deadline and cutting its long calls. The same
+    /// records whose tools declare none keep their ungated bytes.
+    #[test]
+    fn tool_reply_is_must_understand_and_older_readers_refuse_it_by_name() {
+        let tool = serde_json::json!({"name":"research","description":"","input_schema":{"type":"object"},"module":"prefrontal-core","execution_mode":"parallel"});
+        let run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/tmp/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[tool.clone(), tool.clone()],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"}});
+        let queued = serde_json::json!({"type":"queued","submission_id":"sub","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[],"tools":[tool.clone()],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}});
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != TOOL_REPLY_FEATURE)
+            .collect();
+        for (plain, path) in [(run, "/config/tools/1"), (queued, "/request/tools/0")] {
+            let record: WalRecord = serde_json::from_value(plain.clone()).unwrap();
+            assert!(record.required_features().is_empty(), "{plain}");
+            assert_eq!(encode(1, 1, &record).unwrap()[4], FRAMING_VERSION);
+            let mut declared = plain;
+            declared.pointer_mut(path).unwrap()["reply"] = serde_json::json!({"max_ms": 1_800_000});
+            let record: WalRecord = serde_json::from_value(declared.clone()).unwrap();
+            assert_eq!(record.required_features(), &[TOOL_REPLY_FEATURE]);
+            let bytes = encode(1, 1, &record).unwrap();
+            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+            let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
+                panic!("a reply-reading build decodes {declared}");
+            };
+            assert_eq!(framed.record, record);
+            assert_eq!(serde_json::to_value(&framed.record).unwrap(), declared);
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [TOOL_REPLY_FEATURE]),
+                "an older reader refuses {declared} by name"
             );
         }
     }

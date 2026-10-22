@@ -61,6 +61,7 @@ fn request_options() -> CallOptions {
         input_schema: json!({"type": "object", "properties": {}}),
         module: None,
         execution_mode: Default::default(),
+        reply: None,
     }]
     .into();
     opts.tool_choice = ToolChoice::Auto.into();

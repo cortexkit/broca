@@ -134,6 +134,19 @@ impl ToolManifest {
         self.provider_replies.get(provider)?.get(tool)
     }
 
+    /// The reply deadline the caller declared on the tool itself (`Tool::reply` on a
+    /// `session.send` tool), read from the tools frozen at run start. Returned as the role's
+    /// type so dispatch computes its deadline with the same arithmetic as a catalog tool's.
+    pub fn declared_reply(
+        &self,
+        tool: &str,
+    ) -> Option<cortexkit_role_tool_provider::catalog::Reply> {
+        let reply = self.get(tool)?.reply?;
+        Some(cortexkit_role_tool_provider::catalog::Reply::new(
+            reply.max_ms,
+        ))
+    }
+
     /// Return one declaration per name in the name-index HashMap's iteration order.
     pub fn tools(&self) -> Vec<Tool> {
         self.name_to_index
@@ -276,5 +289,54 @@ mod tests {
         );
         assert!(loaded.provider_reply("other", "read").is_none());
         assert!(loaded.provider_reply("selected", "unselected").is_none());
+    }
+
+    #[test]
+    fn a_send_declared_reply_is_read_from_the_frozen_tool() {
+        let tools: Vec<Tool> = serde_json::from_value(json!([
+            {"name":"research", "description":"", "input_schema":{}, "module":"prefrontal-core", "reply":{"max_ms":1800000}},
+            {"name":"note", "description":"", "input_schema":{}}
+        ]))
+        .unwrap();
+        let manifest = ToolManifest::from_tools(tools);
+        assert_eq!(
+            manifest.declared_reply("research"),
+            Some(cortexkit_role_tool_provider::catalog::Reply::new(1_800_000))
+        );
+        assert_eq!(manifest.declared_reply("note"), None);
+        assert_eq!(manifest.declared_reply("absent"), None);
+        // A send-declared deadline is not a plan provider's declaration.
+        assert!(manifest
+            .provider_reply("prefrontal-core", "research")
+            .is_none());
+    }
+
+    /// A send-declared tool's `reply.max_ms` accepts exactly the values the tool provider role
+    /// accepts for a catalog tool's, so the same deadline is valid from either source.
+    #[test]
+    fn send_declared_reply_bounds_match_the_catalog_rule() {
+        use cortexkit_role_tool_provider::catalog::{check_reply, CatalogTool, Reply};
+        for max_ms in [
+            0,
+            1,
+            2,
+            120_000,
+            1_800_000,
+            86_399_999,
+            86_400_000,
+            86_400_001,
+            u64::MAX,
+        ] {
+            let catalog = check_reply(
+                &CatalogTool::new("t", "0".repeat(64), 1, json!({"type":"object"}))
+                    .with_reply(Reply::new(max_ms)),
+            )
+            .is_ok();
+            assert_eq!(
+                broca_protocol::ToolReply::check_max_ms(max_ms).is_ok(),
+                catalog,
+                "max_ms {max_ms}"
+            );
+        }
     }
 }

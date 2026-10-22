@@ -146,6 +146,7 @@ pub(super) fn tool() -> Tool {
         input_schema: json!({"type":"object","properties":{"f":{"type":"string"}},"required":["f"]}),
         module: Some("aft".into()),
         execution_mode: ExecutionMode::Sequential,
+        reply: None,
     }
 }
 pub(super) fn call(id: &str) -> ToolCall {

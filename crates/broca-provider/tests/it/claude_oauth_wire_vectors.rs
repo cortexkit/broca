@@ -263,6 +263,7 @@ fn broca_request(case: &Value) -> CallOptions {
                 input_schema: tool["input_schema"].clone(),
                 module: None,
                 execution_mode: Default::default(),
+                reply: None,
             })
             .collect::<Vec<_>>()
             .into();

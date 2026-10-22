@@ -1315,10 +1315,26 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_tool_reply() {
+            with_feature(base, crate::framing::TOOL_REPLY_FEATURE)
+        } else {
+            base
+        };
         if self.carries_google_rpc_error_details() {
             with_feature(base, crate::framing::GOOGLE_RPC_ERROR_DETAILS_FEATURE)
         } else {
             base
+        }
+    }
+
+    /// Whether a tool this record freezes or queues declares its own reply deadline, which an
+    /// older reader would drop while decoding the tool.
+    fn carries_tool_reply(&self) -> bool {
+        let declares = |tools: &[Tool]| tools.iter().any(|tool| tool.reply.is_some());
+        match self {
+            WalRecord::RunStarted { config, .. } => declares(&config.tools),
+            WalRecord::Queued { request, .. } => request.tools.as_deref().is_some_and(declares),
+            _ => false,
         }
     }
 
@@ -2601,6 +2617,7 @@ mod schema_tests {
                 input_schema: json!({"type": "object"}),
                 module: Some("aft".into()),
                 execution_mode: broca_protocol::request::ExecutionMode::Parallel,
+                reply: None,
             }]),
             tool_choice: ToolChoice::Auto,
             generation: GenerationConfig::default(),
@@ -4076,6 +4093,7 @@ mod schema_tests {
             input_schema: json!({"type": "object"}),
             module: Some("aft".into()),
             execution_mode: broca_protocol::request::ExecutionMode::Parallel,
+            reply: None,
         }]);
 
         let encoded = serde_json::to_value(&config).unwrap();

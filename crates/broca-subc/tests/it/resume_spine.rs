@@ -158,6 +158,7 @@ fn request(project_root: &Path) -> RunRequest {
         input_schema: json!({"type": "object"}),
         module: None,
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     }];
     let policy_allowed = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {

@@ -124,6 +124,7 @@ async fn live_model_reads_a_real_file_through_real_aft() {
         }),
         module: None,
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     };
     let req = RunRequest {
         directives: None,
@@ -262,6 +263,7 @@ async fn live_model_drives_a_real_subc_tool_call() {
         }),
         module: None,
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     };
     let req = RunRequest { directives: None, session_class: None, retention: None, title: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, project_id: None, principal: None, run_id: RunId("live-demo".into()),
     scope: None,
@@ -392,6 +394,7 @@ async fn live_interleaved_thinking_echo_back_survives_multiturn() {
         }),
         module: None,
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     };
     let req = RunRequest {
         directives: None,

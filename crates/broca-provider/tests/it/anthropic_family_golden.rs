@@ -108,6 +108,7 @@ fn fixed_request() -> CallOptions {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         },
         Tool {
             name: "get_weather".into(),
@@ -118,6 +119,7 @@ fn fixed_request() -> CallOptions {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         },
     ]
     .into();
@@ -138,5 +140,35 @@ fn anthropic_family_matches_pre_refactor_golden() {
         GOLDEN.trim_end_matches('\n'),
         "The AnthropicMessages family render diverged from the pre-refactor golden — \
          the refactor changed the rendered bytes (a cache + resume bust)."
+    );
+}
+
+/// A tool's `reply` deadline is dispatch metadata that never reaches a provider: the golden
+/// request with a deadline declared on every tool renders exactly the golden bytes.
+#[test]
+fn a_tool_reply_deadline_never_reaches_the_anthropic_request() {
+    let frozen = anthropic_frozen_config("claude-opus-4-8");
+    let mut with_reply = fixed_request();
+    with_reply.tools = std::sync::Arc::new(
+        with_reply
+            .tools
+            .iter()
+            .cloned()
+            .map(|tool| Tool {
+                reply: Some(broca_protocol::ToolReply { max_ms: 1_800_000 }),
+                ..tool
+            })
+            .collect(),
+    );
+    assert!(with_reply.tools.iter().all(|tool| tool.reply.is_some()));
+    let rendered = AnthropicMessages.render(&frozen, &with_reply);
+    assert_eq!(
+        rendered,
+        AnthropicMessages.render(&frozen, &fixed_request()),
+        "a declared reply deadline changed the rendered Anthropic request"
+    );
+    assert_eq!(
+        String::from_utf8(rendered).unwrap(),
+        GOLDEN.trim_end_matches('\n')
     );
 }

@@ -596,6 +596,7 @@ fn session_tool(provider: &str, tool: &cortexkit_role_tool_provider::catalog::Ca
         input_schema: tool.input_schema.clone(),
         module: Some(provider.to_owned()),
         execution_mode: ExecutionMode::default(),
+        reply: None,
     }
 }
 

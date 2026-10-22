@@ -233,6 +233,7 @@ impl Fixture {
             input_schema: serde_json::json!({"type": "object"}),
             module: None,
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         }];
         req.policy_allowed = ["edit".to_string()].into_iter().collect();
         req

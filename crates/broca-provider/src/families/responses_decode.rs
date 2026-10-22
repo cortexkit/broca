@@ -690,6 +690,7 @@ fn decode_tools(value: Option<&Value>) -> Vec<Tool> {
             input_schema: tool.get("parameters").cloned().unwrap_or(Value::Null),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         })
         .collect()
 }

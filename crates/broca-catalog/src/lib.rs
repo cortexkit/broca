@@ -1857,6 +1857,7 @@ mod tests {
                 }),
                 module: None,
                 execution_mode: Default::default(),
+                reply: None,
             }]
             .into();
             opts.tool_choice = ToolChoice::Auto.into();

@@ -81,6 +81,7 @@ fn fixed_request() -> CallOptions {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         },
         Tool {
             name: "get_weather".into(),
@@ -91,6 +92,7 @@ fn fixed_request() -> CallOptions {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         },
     ]
     .into();

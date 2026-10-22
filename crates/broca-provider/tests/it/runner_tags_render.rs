@@ -122,6 +122,7 @@ fn options(prompt: Vec<Message>) -> CallOptions {
         input_schema: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
         module: None,
         execution_mode: Default::default(),
+        reply: None,
     }]);
     options
 }

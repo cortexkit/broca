@@ -75,6 +75,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         },
         Tool {
             name: "get_weather".into(),
@@ -85,6 +86,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         },
     ]
     .into();
@@ -247,4 +249,31 @@ fn openai_responses_24h_retention_renders_verbatim() {
         "the golden must carry a retention to swap"
     );
     assert_eq!(rendered, expected.trim_end_matches('\n'));
+}
+
+/// A tool's `reply` deadline is dispatch metadata that never reaches a provider: the golden
+/// request with a deadline declared on every tool renders exactly the golden bytes.
+#[test]
+fn a_tool_reply_deadline_never_reaches_the_openai_responses_request() {
+    let frozen = golden_frozen();
+    let mut with_reply = fixed_request();
+    with_reply.tools = std::sync::Arc::new(
+        with_reply
+            .tools
+            .iter()
+            .cloned()
+            .map(|tool| Tool {
+                reply: Some(broca_protocol::ToolReply { max_ms: 1_800_000 }),
+                ..tool
+            })
+            .collect(),
+    );
+    assert!(with_reply.tools.iter().all(|tool| tool.reply.is_some()));
+    let rendered = OpenAiResponses.render(&frozen, &with_reply);
+    assert_eq!(
+        rendered,
+        OpenAiResponses.render(&frozen, &fixed_request()),
+        "a declared reply deadline changed the rendered OpenAI Responses request"
+    );
+    assert_eq!(String::from_utf8(rendered).unwrap(), GOLDEN);
 }

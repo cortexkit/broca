@@ -61,6 +61,7 @@ impl Rig {
                 input_schema: serde_json::json!({"type":"object"}),
                 module: None,
                 execution_mode: Default::default(),
+                reply: None,
             }],
             policy_allowed: ["edit".into()].into_iter().collect(),
             tool_choice: ToolChoice::Auto,

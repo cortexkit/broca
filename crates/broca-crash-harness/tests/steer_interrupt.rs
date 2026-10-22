@@ -316,6 +316,7 @@ impl Session {
                 input_schema: serde_json::json!({"type": "object"}),
                 module: None,
                 execution_mode: ExecutionMode::Parallel,
+                reply: None,
             }],
             policy_allowed: ["work".to_string()].into_iter().collect(),
             tool_choice: ToolChoice::Auto,

@@ -211,6 +211,7 @@ impl RunSpec {
             input_schema: serde_json::json!({"type": "object"}),
             module: None,
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         });
         self.tool_results
             .push((name.to_string(), result.to_string()));

@@ -884,11 +884,13 @@ fn interrupt_reason_and_directives_require_named_reader_features_only_when_prese
 /// builds wrote them before a declared tool could carry its own reply deadline. They must keep
 /// these bytes and stay ungated: a session whose tools declare no deadline must remain readable
 /// by every build that read it before.
+const PRE_TOOL_REPLY_RUN_STARTED: &str = r#"{"type":"run_started","run_id":"run-9","session":{"project_root":"/tmp/project","harness":"runner","session":"lead"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"research","description":"Ask sidekick a question.","input_schema":{"properties":{"request":{"type":"string"}},"required":["request"],"type":"object"},"module":"prefrontal-core","execution_mode":"parallel"},{"name":"note","description":"Record a note.","input_schema":{"type":"object"},"execution_mode":"sequential"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#;
+
 #[test]
 fn pre_tool_reply_send_declared_tools_keep_their_bytes_and_frame_requirements() {
     use crate::framing::{encode, FRAMING_VERSION, HEADER_LEN};
     for pinned in [
-        r#"{"type":"run_started","run_id":"run-9","session":{"project_root":"/tmp/project","harness":"runner","session":"lead"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[{"name":"research","description":"Ask sidekick a question.","input_schema":{"properties":{"request":{"type":"string"}},"required":["request"],"type":"object"},"module":"prefrontal-core","execution_mode":"parallel"},{"name":"note","description":"Record a note.","input_schema":{"type":"object"},"execution_mode":"sequential"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+        PRE_TOOL_REPLY_RUN_STARTED,
         r#"{"type":"queued","submission_id":"sub-run-10","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"queued"}]}],"tools":[{"name":"research","description":"Ask sidekick a question.","input_schema":{"type":"object"},"module":"prefrontal-core","execution_mode":"parallel"}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}}"#,
     ] {
         let record: WalRecord = serde_json::from_str(pinned).unwrap();
@@ -905,4 +907,37 @@ fn pre_tool_reply_send_declared_tools_keep_their_bytes_and_frame_requirements() 
         assert_eq!(frame[4], FRAMING_VERSION);
         assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
     }
+}
+
+/// The same run start once its `research` tool declares `reply: {max_ms: 1800000}`: the
+/// deadline is the tool's last member, nothing else changes, and the frame requires
+/// `tool-reply/v1`. The golden's tool entry is also checked against the bytes the real serve
+/// path freezes for the `send_params.tool_reply.json` send.
+#[test]
+fn tool_reply_run_started_matches_golden() {
+    let golden = include_str!("../../tests/golden/run_started.tool_reply.json");
+    let mut record: WalRecord = serde_json::from_str(PRE_TOOL_REPLY_RUN_STARTED).unwrap();
+    let WalRecord::RunStarted { config, .. } = &mut record else {
+        panic!("expected a run start");
+    };
+    let mut tools = config.tools.as_ref().clone();
+    tools[0].reply = Some(broca_protocol::ToolReply { max_ms: 1_800_000 });
+    config.tools = std::sync::Arc::new(tools);
+    assert_eq!(
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+        golden
+    );
+    assert_eq!(serde_json::from_str::<WalRecord>(golden).unwrap(), record);
+    assert_eq!(
+        record.required_features(),
+        &[crate::framing::TOOL_REPLY_FEATURE]
+    );
+    assert_eq!(
+        golden.trim_end(),
+        PRE_TOOL_REPLY_RUN_STARTED.replacen(
+            r#""execution_mode":"parallel"}"#,
+            r#""execution_mode":"parallel","reply":{"max_ms":1800000}}"#,
+            1
+        )
+    );
 }

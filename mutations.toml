@@ -4571,6 +4571,39 @@ file = "crates/broca-subc/src/subc_plane.rs"
 old = "        if let Some(reply) = reply {"
 new = "        if let Some(reply) = reply.filter(|_| false) { // NON-VACUITY BREAK: ignore frozen reply"
 
+# A tool declared directly on session.send carries its own reply deadline, frozen with the run's
+# tools. Losing it at dispatch cuts a long call at the default wait and ends the run interrupted.
+
+[[control]]
+id = "send-declared-reply-used-at-dispatch"
+guards = "a tool declared on session.send waits its frozen reply.max_ms at dispatch instead of the default"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::send_declared_reply_reaches_dispatch_deadline"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "                    .or_else(|| manifest.declared_reply(&call.tool_name))"
+new = "                    .or_else(|| manifest.declared_reply(&call.tool_name).filter(|_| false)) // NON-VACUITY BREAK: drop the frozen send-declared reply"
+
+# A declared reply deadline is dispatch metadata: rendering it would change the provider request
+# bytes (a cache bust) and send the provider a member it does not define.
+# Only the render-invariance test runs; other `it` tests are skipped, so failures unique to
+# those tests will not fail this mutation proof.
+
+[[control]]
+id = "tool-reply-never-rendered"
+guards = "a tool's declared reply deadline never reaches the rendered provider request"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/anthropic_family_golden.rs"
+expect_red = ["anthropic_family_golden::a_tool_reply_deadline_never_reaches_the_anthropic_request"]
+file = "crates/broca-provider/src/families/anthropic_messages.rs"
+old = "    json!({ \"name\": name_map.wire_name(&t.name), \"description\": t.description, \"input_schema\": t.input_schema })"
+new = "    { let mut tool = json!({ \"name\": name_map.wire_name(&t.name), \"description\": t.description, \"input_schema\": t.input_schema }); if let Some(reply) = t.reply { tool[\"reply\"] = json!({ \"max_ms\": reply.max_ms }); } tool } // NON-VACUITY BREAK: render the declared reply deadline"
+
 
 # Retention rows completing the guard list: the dual-live-WAL error, the per-path content
 # gates, the fold's directory, and address resolution's tombstone precedence. The real-daemon

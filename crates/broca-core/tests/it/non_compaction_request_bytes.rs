@@ -124,6 +124,7 @@ fn request(run: &str, dir: &std::path::Path, text: &str) -> RunRequest {
             input_schema: json!({"type": "object"}),
             module: None,
             execution_mode: ExecutionMode::Sequential,
+            reply: None,
         }],
         policy_allowed: ["read".to_string()].into_iter().collect(),
         tool_choice: ToolChoice::Auto,

@@ -343,6 +343,7 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
         input_schema: json!({"type": "object"}),
         module: None,
         execution_mode: mode,
+        reply: None,
     }
 }
 
@@ -1604,6 +1605,7 @@ async fn multi_step_tool_batches_borrow_one_large_manifest() {
             }),
             module: Some(format!("module-{index}")),
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         })
         .collect();
     let provider = StubProvider::new(vec![

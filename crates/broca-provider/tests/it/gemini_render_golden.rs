@@ -76,6 +76,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         },
         Tool {
             name: "get_weather".into(),
@@ -86,6 +87,7 @@ pub(crate) fn fixed_request() -> CallOptions {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         },
     ]
     .into();

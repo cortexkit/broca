@@ -115,6 +115,7 @@ async fn loop_drives_aimock_through_real_aft() {
         // Batch-scheduling class only; read is side-effect-free, so AFT won't gate it
         // and AllowAll passes it. (This is NOT AFT's execution/safety class.)
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     };
 
     let mut frozen = openai_chat_frozen_config(&model);

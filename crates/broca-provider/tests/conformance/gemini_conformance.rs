@@ -56,7 +56,7 @@ fn rich_request() -> CallOptions {
         },
     ]);
     opts.tools = (0..12)
-        .map(|i| Tool { name: format!("tool_{i:02}"), description: format!("tool number {i}"), input_schema: json!({"type": "object", "properties": {format!("p{i}"): {"type": "string"}}}), module: None, execution_mode: Default::default() })
+        .map(|i| Tool { name: format!("tool_{i:02}"), description: format!("tool number {i}"), input_schema: json!({"type": "object", "properties": {format!("p{i}"): {"type": "string"}}}), module: None, execution_mode: Default::default(), reply: None, })
         .collect::<Vec<_>>()
         .into();
     opts.tool_choice = ToolChoice::Auto.into();

@@ -290,6 +290,7 @@ data: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"a
             input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         }
     }
 

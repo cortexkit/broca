@@ -109,6 +109,7 @@ fn tool_loop() -> CallOptions {
         }),
         module: None,
         execution_mode: Default::default(),
+        reply: None,
     }]
     .into();
     opts.tool_choice = ToolChoice::Auto.into();
