@@ -40,8 +40,12 @@ impl SubcCompactionPlane {
         }
     }
 
-    /// Setup configuration and composition pass through unchanged. Request identity must match
-    /// the caller's durable session key, not the module route's synthetic `runner` harness.
+    /// Setup configuration and composition pass through unchanged. Setup's `harness` and
+    /// `session` must equal the caller's own bind identity, which is also the identity the
+    /// compaction route is opened with (compaction routes do not present the tool-module
+    /// `runner` harness). The provider therefore sees one identity for the session, and calls
+    /// it makes back about the conversation reach the session itself. A Setup naming another
+    /// harness or session is never sent.
     pub async fn setup_with_deadline(
         &self,
         provider: &str,

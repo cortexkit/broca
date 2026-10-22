@@ -220,7 +220,17 @@ async fn setup_uses_the_unscoped_role_route_and_frozen_vectors() {
     );
     {
         let binds = serving.script.binds.lock().unwrap();
-        assert_eq!(binds[0]["identity"]["harness"], "runner");
+        // The route carries the session's real identity, the one Setup reports, not the
+        // tool-module `runner` harness: a provider calls back about the conversation under it.
+        assert_eq!(
+            binds[0]["identity"]["harness"], serving.bind.harness,
+            "a compaction route must not present the tool-module harness"
+        );
+        assert_eq!(binds[0]["identity"]["session"], serving.bind.session);
+        assert_eq!(
+            binds[0]["identity"]["project_root"],
+            json!(serving.bind.project_root)
+        );
         assert_eq!(
             binds[0]["role_versions"],
             json!({"compaction-provider": "v1"})
@@ -278,6 +288,54 @@ async fn setup_refuses_mismatched_caller_identity_before_opening_a_route() {
     }
     assert_eq!(bind_count(&serving), 0);
     assert!(serving.script.bodies.lock().unwrap().is_empty());
+}
+
+/// A compaction route is bound to one session, the caller's own, and names the same session
+/// and harness Setup reports. A Setup naming a different session (or harness) is refused before
+/// it reaches the provider even while that session's route is open and cached, so the provider
+/// never sees a single-session route carrying a Setup for another session.
+#[tokio::test]
+async fn an_open_session_route_never_carries_a_setup_for_another_session() {
+    let serving = start(
+        "compaction-route-session",
+        vec![Reply::Json(ready())],
+        describe(),
+        false,
+    )
+    .await;
+    let accepted = serde_json::to_value(setup(&serving.bind)).unwrap();
+    assert!(serving
+        .plane
+        .setup("compaction-test", &serving.bind, setup(&serving.bind))
+        .await
+        .is_ok());
+    {
+        let binds = serving.script.binds.lock().unwrap();
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0]["identity"]["session"], accepted["session"]);
+        assert_eq!(binds[0]["identity"]["harness"], accepted["harness"]);
+    }
+    let sent = serving.script.bodies.lock().unwrap().len();
+    for mismatch in ["session", "harness"] {
+        let mut request = serde_json::to_value(setup(&serving.bind)).unwrap();
+        request[mismatch] = json!("another");
+        assert!(serving
+            .plane
+            .setup(
+                "compaction-test",
+                &serving.bind,
+                serde_json::from_value(request).unwrap()
+            )
+            .await
+            .is_err());
+    }
+    assert_eq!(bind_count(&serving), 1, "no route opened for the mismatch");
+    assert_eq!(
+        serving.script.bodies.lock().unwrap().len(),
+        sent,
+        "a Setup for another session reached the provider"
+    );
+    serving.plane.close_session_routes(&serving.bind).await;
 }
 
 /// `view.get` and `compaction.ride` go out on the same role route as Setup, as

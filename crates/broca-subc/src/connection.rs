@@ -1226,7 +1226,7 @@ impl SubcConnection {
         role_versions: Option<std::collections::BTreeMap<String, String>>,
     ) -> ConnResult<RouteHandle> {
         let req = ClientControlRequest::RouteOpen {
-            identity: to_subc_bind(identity, &target),
+            identity: to_subc_bind(identity, &target, role_versions.as_ref()),
             target,
             consumer_identity: self.shared.consumer_identity.clone(),
             // Reverse-request capabilities (MCP elicitation/sampling/roots). The runner's
@@ -3085,10 +3085,11 @@ pub fn supervised_consumer_identity() -> Option<subc_control::ConsumerIdentity> 
     })
 }
 
-/// The harness name broca presents on every tool-provider route.
+/// The harness name broca presents on tool-provider routes.
 ///
 /// Tool modules accept only a fixed set of harness values at bind (opencode, pi, runner, mcp:*,
-/// fed:*) and reject anything else, so every `RouteTarget::ToolProvider` bind presents `runner`.
+/// fed:*) and reject anything else, so every `RouteTarget::ToolProvider` bind that does not
+/// declare the compaction-provider role presents `runner`.
 ///
 /// Broca's own `BindIdentity.harness` cannot simply be that value: it is an opaque key component,
 /// joined into WAL, lease, store and idempotency keys, so it partitions durable state and broca
@@ -3098,14 +3099,43 @@ pub fn supervised_consumer_identity() -> Option<subc_control::ConsumerIdentity> 
 /// Management and internal routes carry the caller's own harness instead (see `to_subc_bind`):
 /// the daemon does not constrain the field there, claustrum discards the bind identity, and
 /// magic-context keys nothing on it for `ck-import`'s management route.
+///
+/// Compaction-provider routes carry the caller's own harness too (see
+/// [`declares_compaction_provider`]).
 const TOOL_MODULE_HARNESS: &str = "runner";
 
-fn to_subc_bind(identity: &BindIdentity, target: &RouteTarget) -> SubcBindIdentity {
+/// Whether a route declares the compaction-provider role. Such a route carries the caller's own
+/// bind identity (`project_root`, `harness` and `session`) rather than the tool-module `runner`
+/// harness; its Setup body names the same harness and session.
+///
+/// A compaction provider calls back about the conversation (`session.read`, sends, reminders)
+/// with the conversation's identity. When the route said `runner` while Setup said the real
+/// harness, one session showed two identities on the wire, and a provider that took the route's
+/// harness read a lineage nobody had ever written: an empty page with no lineage id. The daemon
+/// treats the bind harness as a free string, and compaction providers recognise the runner by
+/// its daemon-attested principal rather than the harness, so nothing requires the translation
+/// on these routes.
+fn declares_compaction_provider(
+    role_versions: Option<&std::collections::BTreeMap<String, String>>,
+) -> bool {
+    role_versions.is_some_and(|roles| roles.contains_key(broca_core::compaction_provider::ROLE))
+}
+
+fn to_subc_bind(
+    identity: &BindIdentity,
+    target: &RouteTarget,
+    role_versions: Option<&std::collections::BTreeMap<String, String>>,
+) -> SubcBindIdentity {
     // EXHAUSTIVE ON PURPOSE. A new RouteTarget variant must be a compile error here rather
     // than defaulting either way: defaulting to translate silently widens a tool-module
     // workaround onto a surface that never asked for it (which is the defect this fixes), and
     // defaulting to pass-through silently hands a closed enum a value it rejects at bind.
     let harness = match target {
+        // A compaction provider keys the conversation on the session's real identity, and its
+        // Setup body reports that identity, so the route presents it unchanged.
+        RouteTarget::ToolProvider { .. } if declares_compaction_provider(role_versions) => {
+            identity.harness.as_str()
+        }
         // Tool modules run a closed enum and reject anything else at bind.
         RouteTarget::ToolProvider { .. } => TOOL_MODULE_HARNESS,
         // Management and internal surfaces do not constrain the field -- subc-protocol carries
@@ -3585,6 +3615,7 @@ mod tests {
                 &RouteTarget::ToolProvider {
                     module_id: "aft".to_string(),
                 },
+                None,
             );
 
             assert_eq!(
@@ -3624,7 +3655,7 @@ mod tests {
                     service_id: "s".to_string(),
                 },
             ] {
-                let outbound = to_subc_bind(&identity, &target);
+                let outbound = to_subc_bind(&identity, &target, None);
                 assert_eq!(
                     outbound.harness, caller_harness,
                     "a management/internal bind must carry {caller_harness:?}, not the tool constant"
@@ -3645,17 +3676,58 @@ mod tests {
             &RouteTarget::ToolProvider {
                 module_id: "aft".to_string(),
             },
+            None,
         );
         let mgmt = to_subc_bind(
             &identity,
             &RouteTarget::ManagementSurface {
                 module_id: "broca".to_string(),
             },
+            None,
         );
         assert_ne!(
             tool.harness, mgmt.harness,
             "the whole point of the scoping is that these two disagree"
         );
+    }
+
+    /// A route that declares the compaction-provider role binds the session's real identity,
+    /// the one its Setup body reports. A provider calls back about the conversation under that
+    /// identity, and a `runner` bind beside a Setup naming the real harness gave one session
+    /// two identities on the wire: the provider's read-back found an empty, never-written
+    /// lineage. Other role routes (step-transform hooks) and plain tool routes keep `runner`,
+    /// because tool modules key per-session state on it.
+    #[test]
+    fn a_compaction_provider_route_binds_the_sessions_real_identity() {
+        use std::collections::BTreeMap;
+        let role = |name: &str| BTreeMap::from([(name.to_owned(), "v1".to_owned())]);
+        let target = RouteTarget::ToolProvider {
+            module_id: "magic-context".to_string(),
+        };
+        for caller_harness in ["broca", "conformance", "anything-a-caller-picks"] {
+            let identity = BindIdentity {
+                project_root: std::path::PathBuf::from("/tmp/p"),
+                harness: caller_harness.to_string(),
+                session: "s1".to_string(),
+            };
+            let compaction = role(broca_core::compaction_provider::ROLE);
+            let outbound = to_subc_bind(&identity, &target, Some(&compaction));
+            assert_eq!(outbound.harness, caller_harness);
+            assert_eq!(outbound.session, identity.session);
+            assert_eq!(outbound.project_root, identity.project_root);
+
+            for other in [
+                Some(role("step-transform-provider")),
+                Some(role("tool-provider")),
+                None,
+            ] {
+                assert_eq!(
+                    to_subc_bind(&identity, &target, other.as_ref()).harness,
+                    TOOL_MODULE_HARNESS,
+                    "{other:?} must keep the tool-module harness"
+                );
+            }
+        }
     }
 
     fn frame(ty: FrameType, channel: u16, epoch: u32, corr: u64) -> Frame {

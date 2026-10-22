@@ -45,6 +45,13 @@ pub(super) struct CompactionCall {
     pub request_id: String,
     pub issued_at_ms: u64,
     pub deadline_ms: u64,
+    /// The bind identity of the route that delivered this call, as the daemon bound it at this
+    /// provider's ingress. It is recorded separately from the call's body so a test can compare
+    /// what the route said about the session with what Setup said.
+    pub route_identity: Option<broca_protocol::BindIdentity>,
+    /// The `harness` and `session` the Setup body reported.
+    pub setup_harness: String,
+    pub setup_session: String,
 }
 pub(super) const MODULE: &str = "conformance-compaction";
 pub(super) const MODEL_PREFIX: &str = "conformance-model-";
@@ -66,6 +73,9 @@ pub(super) struct Session {
 
 pub(super) struct Provider {
     pub shared: Arc<Shared>,
+    /// Each route's bind identity, keyed by its channel and epoch, recorded when the daemon
+    /// binds the route to this provider.
+    pub binds: Mutex<HashMap<(u16, u32), broca_protocol::BindIdentity>>,
 }
 
 impl Session {
@@ -90,9 +100,24 @@ impl Session {
 }
 #[async_trait]
 impl subc_client_rs::ModuleHandler for Provider {
+    async fn on_bind(
+        &self,
+        request: &subc_client_rs::RouteBindRequest,
+    ) -> subc_client_rs::BindDecision {
+        let identity = &request.identity;
+        self.binds.lock().unwrap().insert(
+            (request.handle.channel, request.handle.epoch),
+            broca_protocol::BindIdentity::new(
+                identity.project_root.clone(),
+                identity.harness.as_str(),
+                identity.session.as_str(),
+            ),
+        );
+        subc_client_rs::BindDecision::accept()
+    }
     async fn handle(
         &self,
-        _: subc_client_rs::RequestCtx,
+        ctx: subc_client_rs::RequestCtx,
         body: Vec<u8>,
     ) -> subc_client_rs::HandlerOutcome {
         let request: Value = serde_json::from_slice(&body).expect("SDK request JSON");
@@ -136,6 +161,13 @@ impl subc_client_rs::ModuleHandler for Provider {
             .expect("provider request id")
             .to_owned();
         let now = params["now"].as_u64().expect("actual runner clock");
+        let route = ctx.route_handle();
+        let route_identity = self
+            .binds
+            .lock()
+            .unwrap()
+            .get(&(route.channel, route.epoch))
+            .cloned();
         let answer = {
             let mut sessions = self.shared.compaction.lock().unwrap();
             let state = sessions
@@ -146,6 +178,9 @@ impl subc_client_rs::ModuleHandler for Provider {
                 request_id: request_id.clone(),
                 issued_at_ms: now - state.start_ms,
                 deadline_ms: now - state.start_ms + state.script.call_timeout_ms,
+                route_identity,
+                setup_harness: params["harness"].as_str().unwrap_or_default().to_owned(),
+                setup_session: session.to_owned(),
             });
             match state.script.setup.clone() {
                 CompactionSetup::Unavailable => {
@@ -943,4 +978,170 @@ impl BrocaSubject {
         }).await;
         Ok(())
     }
+}
+
+/// One `session.read` from ordinal 0 on a fresh management route opened over `identity`.
+async fn read_over(
+    subject: &BrocaSubject,
+    connection: &SubcConnection,
+    identity: &broca_protocol::BindIdentity,
+) -> Value {
+    let route = subject.open(connection, identity).await.unwrap();
+    let bytes = connection
+        .route_request_raw(
+            &route,
+            serde_json::to_vec(&json!({"method":"session.read",
+                "params":{"from_ordinal":0,"max_bytes":1048576}}))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let _ = connection.route_close(&route).await;
+    let reply: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(reply.get("error").is_none(), "session.read: {reply}");
+    reply["result"].clone()
+}
+
+/// A compaction provider calls back about the conversation under the identity its route was
+/// bound with, so that identity must be the session's real one: a read-back over it returns the
+/// session's messages and lineage. A route bound with the tool-module `runner` harness while
+/// Setup named the real harness gave one session two identities on the wire, and the
+/// provider's read-back landed on a lineage nobody had written: no messages and no lineage id.
+///
+/// The read-back travels as the reserved `magic-context` principal, the module a real
+/// compaction provider reads as, over the identity the stand-in provider recorded when the
+/// daemon bound the Setup route to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compaction_provider_reads_the_session_back_over_the_identity_its_route_was_bound_with() {
+    require_compaction_test_clock();
+    if !super::session_class::rigs_present() {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let scratch = super::session_class::scratch("compaction-read-back");
+        let mut subject = BrocaSubject::new(&scratch).await;
+        subject.reserved_reader = true;
+        let session = "read-back";
+        subject
+            .install_script(
+                session,
+                Script {
+                    turns: vec![cortexkit_role_llm_runner_conformance::ScriptedTurn::new(
+                        vec![ScriptedPart::Text("read-back answer".into())],
+                    )],
+                },
+            )
+            .await
+            .unwrap();
+        subject.install_setup(
+            session,
+            CompactionSetup::Ready(CompactionMessage {
+                compaction_id: "read-back-head".into(),
+                version: 1,
+                from: 0,
+                to: 0,
+                replacement: vec![],
+            }),
+        );
+        let live = subject.start(&scratch.join("rig")).await.unwrap();
+        let owner_stamp = subject.owner_stamp();
+        let route = subject
+            .session_route(&live, session, &owner_stamp)
+            .await
+            .unwrap();
+        let mut fields = subject.send_fields(session, true);
+        fields.insert("prompt".into(), json!("read-back question"));
+        fields.insert("send_id".into(), json!("read-back-send"));
+        let sent = match route
+            .request("session.send", Value::Object(fields))
+            .await
+            .unwrap()
+        {
+            Reply::Response(sent) => sent,
+            other => panic!("send refused: {other:?}"),
+        };
+        subject.release_model_compaction(session).await.unwrap();
+        loop {
+            let Reply::Response(status) = route
+                .request("run.status", json!({"run_id": sent["run_id"]}))
+                .await
+                .unwrap()
+            else {
+                panic!("run.status refused");
+            };
+            if status["state"] != "active" && status["state"] != "pending" {
+                assert_eq!(status["state"], "completed", "{status}");
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        let (setup_count, bound, setup_harness, setup_session) = {
+            let sessions = subject.shared.compaction.lock().unwrap();
+            let calls = &sessions[session].calls;
+            (
+                calls.len(),
+                calls[0].route_identity.clone(),
+                calls[0].setup_harness.clone(),
+                calls[0].setup_session.clone(),
+            )
+        };
+        assert_eq!(setup_count, 1, "exactly one Setup");
+        let bound = bound.expect("Setup arrived on a route the stand-in provider bound");
+
+        let owner = subject.connection(&live, &owner_stamp).await.unwrap();
+        let written = read_over(&subject, &owner, &subject.bind_identity(session)).await;
+        assert!(
+            written["lineage_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+                && written["messages"]
+                    .as_array()
+                    .is_some_and(|messages| messages.len() >= 2),
+            "the session itself must hold the turn: {written}"
+        );
+        let reader = subject
+            .connection(
+                &live,
+                &RouteStamp {
+                    principal: "reserved:magic-context".into(),
+                    scope: None,
+                },
+            )
+            .await
+            .unwrap();
+        let read_back = read_over(&subject, &reader, &bound).await;
+        assert!(
+            read_back["lineage_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+                && read_back["messages"]
+                    .as_array()
+                    .is_some_and(|messages| !messages.is_empty()),
+            "a read-back over the compaction route's bind {bound:?} found no conversation: \
+             {read_back}"
+        );
+        assert_eq!(
+            read_back, written,
+            "a read-back over the compaction route's bind must see the session's own transcript"
+        );
+        assert_eq!(
+            bound,
+            subject.bind_identity(session),
+            "the compaction route must be bound with the session's own identity"
+        );
+        // The identity a provider uses for calls about the conversation is Setup's harness
+        // and session with the route's project root. The route names that same session and
+        // harness, so the session shows one identity on the wire.
+        assert_eq!(
+            (bound.harness.as_str(), bound.session.as_str()),
+            (setup_harness.as_str(), setup_session.as_str()),
+            "the Setup route's bind must name the session and harness Setup reports"
+        );
+        drop(route);
+        drop(live);
+        broca_test_support::remove_rig_dir(&scratch);
+    })
+    .await
+    .expect("compaction read-back test timed out");
 }

@@ -21865,3 +21865,19 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = "                let size = header.len() + len as usize;"
 new = '''                let size = header.len() + len as usize;
                 if size as u64 > available { return Err(WalError::TooLarge { max_bytes, file_size: offset + size as u64 }); } // NON-VACUITY BREAK: trust a torn header's declared length.'''
+
+[[control]]
+id = "subc-compaction-route-binds-session-identity"
+guards = "A compaction-provider route is bound with the session's own harness, so a provider's read-back over the route's identity reaches the session's transcript and lineage"
+platforms = ["linux", "macos"]
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance/compaction.rs"
+expect_red = ["compaction::a_compaction_provider_reads_the_session_back_over_the_identity_its_route_was_bound_with"]
+expect_message = "found no conversation"
+file = "crates/broca-subc/src/connection.rs"
+old = "        RouteTarget::ToolProvider { .. } if declares_compaction_provider(role_versions) => {\n            identity.harness.as_str()\n        }"
+new = "        RouteTarget::ToolProvider { .. } if declares_compaction_provider(role_versions) => {\n            TOOL_MODULE_HARNESS // NON-VACUITY BREAK: restore the tool-module harness on compaction routes.\n        }"
