@@ -312,6 +312,14 @@ enum Cmd {
     /// `role.describe`: write the running daemon's exact reply bytes to stdout and their count
     /// and SHA-256 to stderr, so a consumer can check what the deployed build advertises.
     Describe,
+    /// `run.event.get`: write the daemon's exact claim-check reply for one bus event to stdout and
+    /// its byte count and SHA-256 to stderr. Bind to the session that owns the event; any other
+    /// binding answers `absent`.
+    EventGet {
+        /// The event's bus message id: 64 lowercase hex characters.
+        #[arg(long)]
+        event_key: String,
+    },
     /// `run.result`: the decoded state and final-message summary for one specific run.
     Result {
         #[arg(long)]
@@ -594,7 +602,10 @@ async fn run(args: Args) -> Result<i32, String> {
     };
     let raw_output = matches!(
         &args.cmd,
-        Cmd::Status { raw: true, .. } | Cmd::Result { raw: true, .. } | Cmd::Describe
+        Cmd::Status { raw: true, .. }
+            | Cmd::Result { raw: true, .. }
+            | Cmd::Describe
+            | Cmd::EventGet { .. }
     );
     if !raw_output {
         emit(
@@ -794,6 +805,14 @@ async fn run(args: Args) -> Result<i32, String> {
                 .role_describe_raw()
                 .await
                 .map_err(|e| format!("role_describe: {e}"))?;
+            write_raw_reply(&body)?;
+            Ok(0)
+        }
+        Cmd::EventGet { event_key } => {
+            let body = client
+                .run_event_get_raw(&event_key)
+                .await
+                .map_err(|e| format!("run_event_get: {e}"))?;
             write_raw_reply(&body)?;
             Ok(0)
         }

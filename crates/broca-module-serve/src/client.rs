@@ -311,6 +311,17 @@ impl SessionClient {
         self.request_raw("run.result", &params).await
     }
 
+    /// `run.event.get{event_key}` as the daemon returned it, before JSON decoding: the exact
+    /// claim-check reply a bus consumer reads. The daemon answers `absent` unless this client is
+    /// bound to the session that owns the event.
+    pub async fn run_event_get_raw(&self, event_key: &str) -> Result<Vec<u8>, ConnError> {
+        self.request_raw(
+            "run.event.get",
+            &serde_json::json!({ "event_key": event_key }),
+        )
+        .await
+    }
+
     /// `role.describe` as the running daemon returned it, before JSON decoding: the groups and
     /// capabilities the deployed build actually advertises, which a source golden cannot show.
     pub async fn role_describe_raw(&self) -> Result<Vec<u8>, ConnError> {
