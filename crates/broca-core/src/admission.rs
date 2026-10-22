@@ -572,6 +572,11 @@ impl EffortHistoryV1 {
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
+    /// Whether any deferred call occurred in the complete prefix. Missing means an older
+    /// checkpoint cannot show whether a call before its watermark still needs an answer,
+    /// a withdrawal, or a late execution report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_deferred_calls: Option<bool>,
     /// Session input-token sum, frozen cap and missing-usage flag, independent of episode count.
     /// Checkpoints without this field must be rebuilt from the complete WAL before admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -650,6 +655,7 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
+            has_deferred_calls: Some(false),
             input_budget: Some(crate::input_budget::InputTokenBudget::default()),
             session_class: None,
             at_seq: 0,
@@ -668,6 +674,7 @@ impl AdmissionCheckpointV1 {
     pub fn from_frames(records: &[FramedRecord]) -> Result<Self, ReplayError> {
         let mut checkpoint = Self::empty();
         if !records.is_empty() && !crate::retention::starts_at_lineage_origin(records) {
+            checkpoint.has_deferred_calls = None;
             checkpoint.lineage_retention = None;
             checkpoint.tags = None;
         }
@@ -703,6 +710,9 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
+        if matches!(record, WalRecord::ToolCallDeferred { .. }) {
+            self.has_deferred_calls = Some(true);
+        }
         if let Some(budget) = &mut self.input_budget {
             budget
                 .fold(record)
@@ -2270,6 +2280,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            has_deferred_calls: None,
             tags: None,
             pending_order: None,
             input_budget: None,

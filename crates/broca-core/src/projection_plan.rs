@@ -196,7 +196,8 @@ pub fn plan_projection(
         || matches!(
             (expected_lineage_id.as_deref(), incoming_lineage_id.as_deref()),
             (Some(stored), Some(incoming)) if stored != incoming
-        );
+        )
+        || (incoming_lineage_id.is_some() && expected_lineage_id.is_none());
     // A retained lineage has no materialized prefix. The deferred-call summary
     // also contains Prepared arguments and late tool results, so it stays WAL-only.
     // Only the content-free withdrawal discovery flags may cross this fence.

@@ -205,9 +205,16 @@ pub fn batch_spend(
     step_id: broca_protocol::StepId,
     frames: &[broca_wal::FramedRecord],
 ) -> f64 {
+    batch_spend_iter(warm, step_id, frames.iter())
+}
+
+pub(crate) fn batch_spend_iter<'a>(
+    warm: Option<&WarmWait<'_>>,
+    step_id: broca_protocol::StepId,
+    frames: impl Iterator<Item = &'a broca_wal::FramedRecord>,
+) -> f64 {
     let Some(warm) = warm else { return 0.0 };
     frames
-        .iter()
         .filter_map(|frame| match &frame.record {
             broca_wal::WalRecord::CacheWarmed {
                 trigger,

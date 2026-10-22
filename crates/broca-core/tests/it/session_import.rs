@@ -296,6 +296,7 @@ async fn materialized_import_prefix_merges_with_a_following_episode_tail() {
     let mut prefix_messages = imported;
     broca_protocol::content::stamp_ordinals(&mut prefix_messages);
     let prefix = StorePrefix {
+        lineage_id: None,
         prefix: prefix_messages,
         completed_steps: 0,
         usage: Usage::default(),
@@ -509,6 +510,7 @@ fn interrupted_import_merge_matches_full_replay_at_every_watermark() {
             message.ordinal = None;
         }
         let prefix = StorePrefix {
+            lineage_id: None,
             prefix: stored,
             completed_steps: projected.completed_steps,
             usage: projected.usage,

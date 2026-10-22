@@ -49,6 +49,9 @@ pub use model_page::{
 /// counters it reflects + the WAL seq watermark + the context epoch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePrefix {
+    /// WAL identity captured in the same transaction as the messages and watermark.
+    /// Readers must compare it with the authoritative WAL before merging this prefix.
+    pub lineage_id: Option<String>,
     /// The provider-valid prompt prefix materialized so far (committed turns).
     pub prefix: Vec<Message>,
     /// Durable model steps folded into `prefix` (so resume continues StepId
@@ -76,6 +79,7 @@ impl StorePrefix {
     /// (the merge then degenerates to a full-WAL replay).
     pub fn empty() -> Self {
         Self {
+            lineage_id: None,
             prefix: Vec::new(),
             completed_steps: 0,
             usage: Usage::default(),
@@ -100,8 +104,8 @@ pub struct StorePageRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePageSnapshot {
     pub watermark_seq: u64,
-    /// WAL identity represented by the materialized rows. `None` means the row predates
-    /// lineage tracking, so callers preserve the legacy merge behavior.
+    /// WAL identity represented by the materialized rows. Without a known matching
+    /// WAL identity, readers must discard these rows and replay the complete WAL.
     pub lineage_id: Option<String>,
     /// Last control-stream unit represented by the materialized watermark state.
     pub control_head: Option<crate::Cursor>,
@@ -262,12 +266,13 @@ pub trait MaterializedStore: Send + Sync {
         }
     }
 
-    /// Atomically replace a projection only while it still represents `stale_lineage_id`.
+    /// Atomically replace a projection only while its identity equals `stale_lineage_id`.
+    /// `None` repairs a prefix whose identity was never recorded.
     /// `complete_wal` starts at sequence zero and belongs to the replacement lineage.
     fn reproject_if_lineage_mismatch(
         &self,
         _session: &BindIdentity,
-        _stale_lineage_id: &str,
+        _stale_lineage_id: Option<&str>,
         _complete_wal: &WalRangeRead,
     ) -> Result<(), String> {
         Err("materialized store does not support lineage reprojection".into())
@@ -2305,6 +2310,7 @@ mod tests {
         (
             framed,
             StorePrefix {
+                lineage_id: None,
                 prefix,
                 completed_steps: committed_state.completed_steps,
                 usage: committed_state.usage,
@@ -2584,6 +2590,7 @@ mod tests {
         let watermark = framed.len() as u64 - 1;
         let committed = replay(&wal[..watermark as usize]).expect("committed prefix replays");
         let mut prefix = StorePrefix {
+            lineage_id: None,
             prefix: committed.prompt,
             completed_steps: committed.completed_steps,
             usage: committed.usage,
@@ -2979,6 +2986,7 @@ mod episode_merge_regression {
             message.ordinal = None;
         }
         let prefix = StorePrefix {
+            lineage_id: None,
             prefix: stored_messages,
             completed_steps: projected.completed_steps,
             usage: projected.usage,

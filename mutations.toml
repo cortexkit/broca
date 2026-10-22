@@ -9,6 +9,136 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "core-admission-rejects-unidentified-checkpoint"
+guards = "An admission checkpoint with missing lineage cannot replace the authoritative full-WAL summary"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::unidentified_prefix_is_replayed_and_repaired_once_on_resume"]
+expect_message = "unidentified or mismatched admission must replay from origin"
+file = "crates/broca-core/src/run.rs"
+old = """                            (Some(stored), Some(observed)) => stored == observed,
+                            _ => false,"""
+new = """                            (Some(stored), Some(observed)) => stored == observed,
+                            _ => true, // NON-VACUITY BREAK: trust an unidentified admission checkpoint."""
+
+[[control]]
+id = "session-read-discarded-prefix-still-proves-history"
+guards = "Discarding an unidentified prefix cannot hide an unreachable WAL as an empty session"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::unidentified_prefix_does_not_hide_an_unreachable_wal"]
+expect_message = "discarded unidentified rows still prove unreachable history"
+file = "crates/broca-module/src/registry.rs"
+old = "        if store_has_history && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) {"
+new = "        if store_has_history && snapshot.watermark_seq > 0 && matches!(tail.records(), broca_wal::WalRangeRecords::Absent) { // NON-VACUITY BREAK: forget history when discarding the prefix."
+
+[[control]]
+id = "session-read-model-persists-lineage-repair"
+guards = "Model-view reads persist the replayed prefix identity rather than repeatedly replaying unidentified rows"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::session_read_model_replays_and_repairs_unidentified_prefix"]
+expect_message = "model reads must persist repaired lineage too"
+file = "crates/broca-module/src/registry.rs"
+old = """            if let Some((store, session, stale_lineage_id)) = lineage_repair {
+                repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
+            }
+            return Ok(RoutedPage::Model(page));"""
+new = """            // NON-VACUITY BREAK: return a full model page without repairing stored identity.
+            return Ok(RoutedPage::Model(page));"""
+
+[[control]]
+id = "store-unidentified-prefix-reprojection-replaces-rows"
+guards = "Reprojection replaces rather than relabels unidentified materialized history before recording WAL identity"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::unidentified_prefix_is_replayed_and_repaired_once_on_resume"]
+expect_message = "reprojection must replace unidentified rows"
+file = "crates/broca-core/src/projection_plan.rs"
+old = "        || (incoming_lineage_id.is_some() && expected_lineage_id.is_none());"
+new = "        || false; // NON-VACUITY BREAK: relabel the unidentified prefix without rebuilding its messages."
+
+[[control]]
+id = "session-read-checks-materialized-prefix-lineage"
+guards = "session.read serves only the replacement WAL after a same-watermark lineage recreation"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::session_read_rejects_equal_watermark_prefix_after_wal_recreation"]
+expect_message = "new conversation"
+file = "crates/broca-module/src/registry.rs"
+old = "            (Some(stored), Some(observed)) => stored == observed,"
+new = "            (Some(_stored), Some(_observed)) => true, // NON-VACUITY BREAK: serve stale materialized rows."
+
+[[control]]
+id = "core-resume-rejects-unidentified-prefix"
+guards = "A lineage-less prefix cannot hide a recreated WAL and successful projection repairs identity for suffix-only admission"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::unidentified_prefix_is_replayed_and_repaired_once_on_resume"]
+expect_message = "resume must render the recreated WAL"
+file = "crates/broca-core/src/run.rs"
+old = """                        && match (prefix.lineage_id.as_deref(), writer.lineage_id()) {
+                            (Some(stored), Some(observed)) => stored == observed.to_string(),
+                            _ => false,
+                        }"""
+new = """                        && match (prefix.lineage_id.as_deref(), writer.lineage_id()) {
+                            (Some(stored), Some(observed)) => stored == observed.to_string(),
+                            _ => true, // NON-VACUITY BREAK: trust an unidentified prefix.
+                        }"""
+
+[[control]]
+id = "session-read-rejects-unidentified-prefix"
+guards = "session.read rebuilds unidentified materialized rows and records the new WAL identity"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::session_read_replays_and_repairs_unidentified_prefix"]
+expect_message = "new conversation"
+file = "crates/broca-module/src/registry.rs"
+old = """        let lineage_matches = match (snapshot.lineage_id.as_deref(), observed_lineage_id) {
+            (Some(stored), Some(observed)) => stored == observed,
+            _ => false,
+        };"""
+new = """        let lineage_matches = match (snapshot.lineage_id.as_deref(), observed_lineage_id) {
+            (Some(stored), Some(observed)) => stored == observed,
+            _ => true, // NON-VACUITY BREAK: unidentified materialized rows are trusted.
+        };"""
+
+[[control]]
+id = "core-resume-checks-materialized-prefix-lineage"
+guards = "Resume rejects a stale materialized transcript even when the recreated WAL reaches the same watermark"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::recreated_wal_rejects_equal_watermark_prefix_on_resume"]
+expect_message = "resume must render the recreated WAL"
+file = "crates/broca-core/src/run.rs"
+old = "                            (Some(stored), Some(observed)) => stored == observed.to_string(),"
+new = "                            (Some(_stored), Some(_observed)) => true, // NON-VACUITY BREAK: trust the watermark across recreated WALs."
+
+[[control]]
 id = "actor-completed-warm-releases-move-fence"
 guards = "Completed manual warms release the session move fence on success, failure and caller cancellation while live warms remain busy"
 runner = "cargo"
@@ -69,6 +199,20 @@ expect_message = "past-end read must retain the written lineage"
 file = "crates/broca-module/src/registry.rs"
 old = "        page.lineage_id = lineage_id;"
 new = "        page.lineage_id = if page.messages.is_empty() { None } else { lineage_id }; // NON-VACUITY BREAK: drop the written lineage on empty pages."
+
+[[control]]
+id = "core-resume-reuses-bounded-approval-history"
+guards = "Approval-free resume decodes only the materialized prefix's WAL suffix and does not copy old WAL payloads"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::resume_decodes_and_copies_only_the_unmaterialized_suffix"]
+expect_message = "decoded"
+file = "crates/broca-core/src/run.rs"
+old = "        Some(frames) => frames,"
+new = "        Some(_frames) => Arc::new(approval_store.unwrap().read_records(&req.session)?), // NON-VACUITY BREAK: reread complete history."
 
 [[control]]
 id = "claude-code-split-message-retains-parallel-results"

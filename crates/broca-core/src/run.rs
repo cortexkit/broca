@@ -278,7 +278,7 @@ pub struct PriorWalSnapshot {
     pub base_watermark: u64,
     /// Durable writer head captured before this snapshot was loaded.
     pub head_seq: u64,
-    pub tail: Vec<broca_wal::FramedRecord>,
+    pub tail: Arc<Vec<broca_wal::FramedRecord>>,
     /// Checkpoint at `base_watermark` for a bounded snapshot. Budget resume must start from
     /// this prefix state rather than state already folded through the WAL head.
     pub checkpoint_at_base: Option<crate::AdmissionCheckpointV1>,
@@ -346,7 +346,7 @@ where
                             range.lineage_id.map(|lineage_id| lineage_id.to_string()),
                         ) {
                             (Some(stored), Some(observed)) => stored == observed,
-                            _ => true,
+                            _ => false,
                         };
                         // Preserve the existing replay policy for every source state; the
                         // safe-head and checkpoint checks below still decide seed validity.
@@ -378,7 +378,7 @@ where
                                 return Ok(PriorWalSnapshot {
                                     base_watermark: snapshot.watermark_seq,
                                     head_seq: safe_head,
-                                    tail: records,
+                                    tail: Arc::new(records),
                                     checkpoint_at_base,
                                     checkpoint_at_head: checkpoint,
                                 });
@@ -404,7 +404,7 @@ where
     Ok(PriorWalSnapshot {
         base_watermark: 0,
         head_seq: safe_head,
-        tail: records,
+        tail: Arc::new(records),
         checkpoint_at_base: None,
         checkpoint_at_head,
     })
@@ -1493,7 +1493,7 @@ type ReconstructedPrior = (
     bool,
     bool,
     Option<Vec<Message>>,
-    Option<Vec<broca_wal::FramedRecord>>,
+    Option<Arc<Vec<broca_wal::FramedRecord>>>,
 );
 
 async fn reconstruct_prior<W>(
@@ -1599,6 +1599,10 @@ where
                 Ok(prefix)
                     if (snapshot.base_watermark..=snapshot.head_seq)
                         .contains(&prefix.watermark_seq)
+                        && match (prefix.lineage_id.as_deref(), writer.lineage_id()) {
+                            (Some(stored), Some(observed)) => stored == observed.to_string(),
+                            _ => false,
+                        }
                         && (!budgeted || prefix.watermark_seq == snapshot.base_watermark) =>
                 {
                     let tail: Vec<WalRecord> = snapshot
@@ -1671,9 +1675,13 @@ where
             prior.compaction_history = state.history.clone();
         }
     }
-    // Reuse complete snapshots; a bounded suffix cannot prove that older late
-    // approvals are terminal without reading the missing prefix.
-    let approval_frames = (snapshot.base_watermark == 0).then_some(snapshot.tail);
+    // The store materializes whole committed turns, so an unfinished step's attempt
+    // is in snapshot.tail. A prefix with no deferred calls has no older approvals to
+    // recover. A missing summary or one reporting deferred calls needs complete history:
+    // even a closed call can still need a withdrawal or a late execution report.
+    let approval_frames = (snapshot.base_watermark == 0
+        || snapshot.checkpoint_at_head.has_deferred_calls == Some(false))
+    .then_some(snapshot.tail);
     Ok((
         prior,
         is_resume,
@@ -1716,7 +1724,7 @@ fn complete_snapshot<W: WalStore>(
     Ok(PriorWalSnapshot {
         base_watermark: 0,
         head_seq,
-        tail: records,
+        tail: Arc::new(records),
         checkpoint_at_base: None,
         checkpoint_at_head,
     })
@@ -2337,7 +2345,7 @@ async fn run_body_with_projector<P, T, A, W>(
     store: Option<Arc<dyn SessionStore>>,
     out: &mpsc::Sender<OutputEvent>,
     on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
-    approval_frames: Option<Vec<broca_wal::FramedRecord>>,
+    approval_frames: Option<Arc<Vec<broca_wal::FramedRecord>>>,
 ) -> Result<RunSummary, RunError>
 where
     P: Provider,
@@ -2401,7 +2409,7 @@ where
             out,
             on_admitted,
             Some(wal_store),
-            approval_frames.as_deref(),
+            approval_frames.clone(),
         )
         .await;
         return seal_size_refusal(
@@ -2442,7 +2450,7 @@ where
             out,
             on_admitted,
             Some(wal_store),
-            approval_frames.as_deref(),
+            approval_frames,
         );
         tokio::pin!(body);
         tokio::select! {
@@ -2639,7 +2647,7 @@ async fn run_body_with_approval_history<P, T, A>(
     out: &mpsc::Sender<OutputEvent>,
     on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
     approval_store: Option<&dyn WalStore>,
-    approval_frames: Option<&[broca_wal::FramedRecord]>,
+    approval_frames: Option<Arc<Vec<broca_wal::FramedRecord>>>,
 ) -> Result<RunSummary, RunError>
 where
     P: Provider,
@@ -2677,14 +2685,16 @@ where
     let input_cap_changed = input_budget.limit != frozen_input_limit;
     // Saved approvals cannot authorize work without the requester adapter. Refuse
     // before any admission, recovery or terminal record can change the episode.
-    let read_approval_frames = || -> Result<Vec<broca_wal::FramedRecord>, RunError> {
-        if let Some(frames) = approval_frames {
-            return Ok(frames.to_vec());
-        }
-        match approval_store {
-            Some(store) => Ok(store.read_records(&req.session)?),
-            None => Ok(Vec::new()),
-        }
+    // Reuse the admission frames, whether a suffix or a complete fallback. When the
+    // prefix summary is missing or reports deferred calls, read complete history once
+    // and share it among the attempt-cut check and the approval consumers below.
+    let frames_available = approval_store.is_some() || approval_frames.is_some();
+    let approval_frames = match approval_frames {
+        Some(frames) => frames,
+        None => Arc::new(match approval_store {
+            Some(store) => store.read_records(&req.session)?,
+            None => Vec::new(),
+        }),
     };
     let cut_pending_step = match &prior.resolution {
         ReplayResolution::Resume {
@@ -2693,7 +2703,7 @@ where
         | ReplayResolution::AuthRequired {
             pending: Some(pending),
             ..
-        } if is_resume => step_attempt_was_args_cut(&read_approval_frames()?, pending.step_id),
+        } if is_resume => step_attempt_was_args_cut(&approval_frames, pending.step_id),
         _ => false,
     };
     let mut approval_history = None;
@@ -2717,13 +2727,13 @@ where
             }),
             false,
         )?;
-        if approval_store.is_some() || approval_frames.is_some() {
-            let frames = read_approval_frames()?;
+        if frames_available {
+            let frames = &approval_frames;
             if frames
                 .iter()
                 .any(|frame| matches!(frame.record, WalRecord::ToolCallDeferred { .. }))
             {
-                let history = approval_gate::History::new(writer, frames)?;
+                let history = approval_gate::History::new(writer, frames.clone())?;
                 history.require_installed_plane(control)?;
                 approval_history = Some(history);
             }
@@ -2819,13 +2829,13 @@ where
             })
         });
     if approval_history.is_none() && (requires_approval || control.elicitation_plane.is_some()) {
-        let frames = read_approval_frames()?;
+        let frames = &approval_frames;
         if requires_approval
             || frames
                 .iter()
                 .any(|frame| matches!(frame.record, WalRecord::ToolCallDeferred { .. }))
         {
-            approval_history = Some(approval_gate::History::new(writer, frames)?);
+            approval_history = Some(approval_gate::History::new(writer, frames.clone())?);
         }
     }
     // Resuming or appending inherits the prior episode's cache marker order, even when absent.
@@ -9613,6 +9623,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                has_deferred_calls: None,
                 tags: Some(crate::tags::LineageTags::Off),
                 pending_order: None,
                 input_budget: Some(crate::input_budget::InputTokenBudget::default()),
@@ -10301,8 +10312,26 @@ mod approval_gate {
         Pin<Box<dyn Future<Output = Result<PolledPage, ApprovalRouteError>> + Send + 'a>>;
     type Job<'a> = Pin<Box<dyn Future<Output = (usize, Work)> + Send + 'a>>;
 
+    pub(super) struct HistoryFrames {
+        base: Arc<Vec<broca_wal::FramedRecord>>,
+        appended: Vec<broca_wal::FramedRecord>,
+    }
+    impl HistoryFrames {
+        fn iter(&self) -> impl DoubleEndedIterator<Item = &broca_wal::FramedRecord> + Clone {
+            self.base.iter().chain(self.appended.iter())
+        }
+        fn first(&self) -> Option<&broca_wal::FramedRecord> {
+            self.iter().next()
+        }
+        fn last(&self) -> Option<&broca_wal::FramedRecord> {
+            self.iter().next_back()
+        }
+        fn push(&mut self, frame: broca_wal::FramedRecord) {
+            self.appended.push(frame);
+        }
+    }
     pub(super) struct History {
-        pub frames: Vec<broca_wal::FramedRecord>,
+        pub frames: HistoryFrames,
         pub(super) projection: crate::replay::DeferredCallProjection,
         scans: HashMap<String, Arc<std::sync::Mutex<crate::consent::LookupProgress>>>,
         live_scan: Arc<std::sync::Mutex<FeedProgress>>,
@@ -10310,15 +10339,20 @@ mod approval_gate {
     impl History {
         pub fn new(
             writer: &WalHandle,
-            frames: Vec<broca_wal::FramedRecord>,
+            frames: impl Into<Arc<Vec<broca_wal::FramedRecord>>>,
         ) -> Result<Self, RunError> {
             let lineage = writer
                 .lineage_id()
                 .ok_or_else(|| RunError::Wal("approval requires WAL lineage".into()))?;
+            let frames = frames.into();
             let mut projection = crate::replay::DeferredCallProjection::new(lineage);
             projection.fold_frames(&frames);
             Ok(Self {
-                frames,
+                // New records must not force a copy of the shared admission vector.
+                frames: HistoryFrames {
+                    base: frames,
+                    appended: Vec::new(),
+                },
                 projection,
                 scans: HashMap::new(),
                 live_scan: Arc::new(std::sync::Mutex::new(FeedProgress::default())),
@@ -11211,7 +11245,8 @@ mod approval_gate {
             slots.push(slot);
         }
         writer.sync().await?;
-        let spend = crate::keep_warm_wait::batch_spend(warm.as_ref(), step, &history.frames);
+        let spend =
+            crate::keep_warm_wait::batch_spend_iter(warm.as_ref(), step, history.frames.iter());
         let result = crate::keep_warm_wait::wait_tools_with_spend(
             Box::pin(wait(
                 &mut slots, &ctx, step, plane, writer, control, hooks, history, sequential, restart,
@@ -12312,8 +12347,9 @@ mod approval_gate {
                 && history.frames.last().is_some_and(|frame| frame.seq == head)
                 && history
                     .frames
-                    .windows(2)
-                    .all(|pair| pair[0].seq.checked_add(1) == Some(pair[1].seq));
+                    .iter()
+                    .zip(history.frames.iter().skip(1))
+                    .all(|(left, right)| left.seq.checked_add(1) == Some(right.seq));
             if !complete {
                 return Err(RunError::Wal(
                     "consent_projection_incomplete: stop facts require a complete WAL fold".into(),
@@ -12322,7 +12358,8 @@ mod approval_gate {
             let mut rebuilt = crate::replay::DeferredCallProjection::new(
                 writer.lineage_id().expect("approval lineage"),
             );
-            rebuilt.fold_frames(&history.frames);
+            rebuilt.fold_frames(&history.frames.base);
+            rebuilt.fold_frames(&history.frames.appended);
             history.projection = rebuilt;
         }
         close_stopped_late(history, writer, session, control).await?;

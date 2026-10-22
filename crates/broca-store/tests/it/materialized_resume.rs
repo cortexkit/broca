@@ -35,6 +35,294 @@ use broca_wal::{DispatchOutcome, FileWal, Wal, WalRecord};
 use serde_json::json;
 use tokio::sync::{mpsc, Notify};
 
+// A historical title is never rendered. Allocations of its distinctive length expose
+// copies of old WAL payloads without charging the materialized prompt the model needs.
+const HISTORICAL_TITLE_BYTES: usize = 65_519;
+static COUNT_TITLE_COPIES: AtomicBool = AtomicBool::new(false);
+static COPIED_TITLE_BYTES: AtomicUsize = AtomicUsize::new(0);
+struct ResumeAllocator;
+unsafe impl std::alloc::GlobalAlloc for ResumeAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if COUNT_TITLE_COPIES.load(Ordering::Relaxed) && layout.size() == HISTORICAL_TITLE_BYTES {
+            COPIED_TITLE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+#[global_allocator]
+static RESUME_ALLOCATOR: ResumeAllocator = ResumeAllocator;
+
+struct InstalledConsentPlane;
+#[async_trait]
+impl broca_core::tool_plane::ElicitationPlane for InstalledConsentPlane {}
+
+/// Decode only selected frames, counting at the actual serde boundary rather than
+/// counting the length of a result that might have been filtered after a full read.
+struct DecodingWalStore {
+    inner: FileWalStore,
+    lineage_id: Option<broca_wal::WalLineageId>,
+    encoded: Vec<Vec<u8>>,
+    decoded: AtomicUsize,
+    decoded_sequences: Mutex<Vec<u64>>,
+}
+impl DecodingWalStore {
+    fn decode(&self, after: u64, through: Option<u64>) -> Vec<broca_wal::FramedRecord> {
+        self.encoded
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bytes)| {
+                let seq = index as u64 + 1;
+                if seq <= after || through.is_some_and(|head| seq > head) {
+                    return None;
+                }
+                self.decoded.fetch_add(1, Ordering::SeqCst);
+                self.decoded_sequences.lock().unwrap().push(seq);
+                let (fence, record) = serde_json::from_slice(bytes).unwrap();
+                Some(broca_wal::FramedRecord { seq, fence, record })
+            })
+            .collect()
+    }
+}
+impl WalStore for DecodingWalStore {
+    fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, broca_wal::WalError> {
+        self.inner.open(session)
+    }
+    fn read_records(
+        &self,
+        _: &BindIdentity,
+    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        Ok(self.decode(0, None))
+    }
+    fn read_records_range(
+        &self,
+        _: &BindIdentity,
+        after: u64,
+        through: Option<u64>,
+        _: Option<&broca_wal::WalByteAnchor>,
+    ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+        let mut range = broca_wal::WalRangeRead::without_anchors(self.decode(after, through));
+        range.lineage_id = self.lineage_id;
+        Ok(range)
+    }
+}
+
+fn queued_title(request: &RunRequest, index: usize, bytes: usize) -> [WalRecord; 2] {
+    let submission_id = broca_protocol::SubmissionId(format!("noise-{index}"));
+    [
+        WalRecord::Queued {
+            retention: None,
+            ts_ms: None,
+            keep_warm: None,
+            conversation_key: None,
+            submission_id: submission_id.clone(),
+            request: Box::new(request.to_submission()),
+            request_identity_digest: None,
+            principal: None,
+            send_id: None,
+            title: Some("x".repeat(bytes)),
+            delivery: None,
+            hooks: None,
+        },
+        WalRecord::Retracted {
+            submission_id,
+            failure: None,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn resume_decodes_and_copies_only_the_unmaterialized_suffix() {
+    use broca_core::{
+        load_prior_wal_snapshot, run_loop_on_writer_admitted_with_prior_snapshot, RunControl,
+        StartMode, WalHandle,
+    };
+    let dir =
+        broca_test_support::scratch_root().join(format!("resume-bounds-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let req = request(&dir);
+    let seed_store = FileWalStore::new(dir.join("seed"));
+    let (out, _events) = mpsc::channel(1000);
+    run_loop(
+        req.clone(),
+        &RecordingProvider::new(vec![
+            tool_turn("first", "t1", "a"),
+            text_turn("last", "done"),
+        ]),
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("leases")),
+        &AllowAll,
+        &seed_store,
+        &out,
+    )
+    .await
+    .unwrap();
+    let seed = seed_store.read_records(&req.session).unwrap();
+    assert!(matches!(
+        seed.last().unwrap().record,
+        WalRecord::RunFinished { .. }
+    ));
+    let mut measurements = Vec::new();
+    for history_len in [16, 256] {
+        let inner = FileWalStore::new(dir.join(format!("wal-{history_len}")));
+        let mut wal = inner.open(&req.session).unwrap();
+        for index in 0..history_len {
+            for record in queued_title(&req, index, HISTORICAL_TITLE_BYTES) {
+                wal.append(1, &record, false).unwrap();
+            }
+        }
+        let boundary = seed
+            .iter()
+            .position(|frame| matches!(frame.record, WalRecord::TurnFinished { .. }))
+            .unwrap();
+        for frame in &seed[..=boundary] {
+            wal.append(1, &frame.record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        let materialized =
+            Arc::new(SqliteStore::open(dir.join(format!("store-{history_len}.db"))).unwrap());
+        let prefix = inner
+            .read_records_range(&req.session, 0, None, None)
+            .unwrap();
+        Persister::project_range(materialized.as_ref(), &req.session, &prefix).unwrap();
+        for record in queued_title(&req, history_len, 10) {
+            wal.append(1, &record, false).unwrap();
+        }
+        wal.sync().unwrap();
+        drop(wal);
+        let frames = inner.read_records(&req.session).unwrap();
+        let encoded = frames
+            .iter()
+            .map(|frame| serde_json::to_vec(&(frame.fence, &frame.record)).unwrap())
+            .collect();
+        let store = DecodingWalStore {
+            lineage_id: prefix.lineage_id,
+            inner,
+            encoded,
+            decoded: AtomicUsize::new(0),
+            decoded_sequences: Mutex::new(Vec::new()),
+        };
+        let head = frames.last().unwrap().seq;
+        let snapshot =
+            load_prior_wal_snapshot(&store, &req.session, head, Some(materialized.as_ref()))
+                .unwrap();
+        assert_eq!(
+            snapshot.tail.len(),
+            2,
+            "admission metadata: {:?}",
+            materialized.read_admission_snapshot(&req.session).unwrap()
+        );
+        let suffix_decodes = store.decoded.load(Ordering::SeqCst);
+        assert_eq!(suffix_decodes, 2);
+
+        let complete = broca_core::PriorWalSnapshot {
+            base_watermark: 0,
+            head_seq: head,
+            tail: Arc::new(frames.clone()),
+            checkpoint_at_base: None,
+            checkpoint_at_head: broca_core::AdmissionCheckpointV1::from_frames(&frames).unwrap(),
+        };
+        COPIED_TITLE_BYTES.store(0, Ordering::SeqCst);
+        COUNT_TITLE_COPIES.store(true, Ordering::SeqCst);
+        let shared = complete.clone();
+        COUNT_TITLE_COPIES.store(false, Ordering::SeqCst);
+        assert_eq!(
+            COPIED_TITLE_BYTES.load(Ordering::SeqCst),
+            0,
+            "snapshot cloning must share historical bytes"
+        );
+        assert!(Arc::ptr_eq(&complete.tail, &shared.tail));
+
+        // The complete-WAL reconstruction is the pre-optimization resume reference.
+        // It sees the very same log and renders the same resumed StepId as the seed.
+        let reference_dir = FileWalStore::new(dir.join(format!("reference-{history_len}")));
+        let mut reference_wal = reference_dir.open(&req.session).unwrap();
+        for frame in &frames {
+            reference_wal.append(1, &frame.record, false).unwrap();
+        }
+        reference_wal.sync().unwrap();
+        drop(reference_wal);
+        let reference = RecordingProvider::new(vec![vec![], text_turn("second", "done")]);
+        run_loop(
+            req.clone(),
+            &reference,
+            &StubToolPlane::new(),
+            &FileLeaseStore::new(dir.join(format!("reference-leases-{history_len}"))),
+            &AllowAll,
+            &reference_dir,
+            &out,
+        )
+        .await
+        .unwrap();
+
+        let writer = WalHandle::spawn(store.open(&req.session).unwrap(), 1).unwrap();
+        let provider = RecordingProvider::new(vec![vec![], text_turn("second", "done")]);
+        COPIED_TITLE_BYTES.store(0, Ordering::SeqCst);
+        COUNT_TITLE_COPIES.store(true, Ordering::SeqCst);
+        let result = run_loop_on_writer_admitted_with_prior_snapshot(
+            req.clone(),
+            &writer,
+            StartMode::FreshOrResume,
+            &provider,
+            &StubToolPlane::new(),
+            &AllowAll,
+            &store,
+            Some(materialized),
+            RunControl {
+                elicitation_plane: Some(Arc::new(InstalledConsentPlane)),
+                ..Default::default()
+            },
+            &out,
+            None,
+            Some(&snapshot),
+        )
+        .await;
+        COUNT_TITLE_COPIES.store(false, Ordering::SeqCst);
+        let copies = COPIED_TITLE_BYTES.load(Ordering::SeqCst);
+        writer.shutdown().await.unwrap();
+        result.unwrap();
+        assert_eq!(
+            *provider.sent.lock().unwrap(),
+            *reference.sent.lock().unwrap(),
+            "resume must render byte-identical provider requests"
+        );
+        // Captured with run.rs from 55949716cd2425bf97fec2611e36f44a9a3b3859
+        // replaying these same records, before bounded approval-history reconstruction.
+        let legacy_bytes = include_bytes!("fixtures/resume_before_bounded_history.json");
+        assert_eq!(
+            provider.sent.lock().unwrap()[&1].as_slice(),
+            legacy_bytes.strip_suffix(b"\n").unwrap(),
+            "resume request bytes changed from the pre-optimization run loop"
+        );
+        let decoded = store.decoded.load(Ordering::SeqCst);
+        // Projection may read the two-record tail again; no reader may decode the old prefix.
+        assert!(
+            decoded <= suffix_decodes + 2,
+            "decoded {decoded} frames for history {history_len}"
+        );
+        assert!(
+            store
+                .decoded_sequences
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|seq| *seq > snapshot.base_watermark),
+            "resume decoded a frame in the materialized prefix"
+        );
+        assert_eq!(
+            copies, 0,
+            "cloned historical title bytes for history {history_len}"
+        );
+        measurements.push((decoded, copies));
+    }
+    assert_eq!(
+        measurements[0], measurements[1],
+        "resume work must not grow with session history"
+    );
+}
+
 #[derive(Clone)]
 struct RecordingProvider {
     scripts: Arc<Vec<Vec<NormalizedEvent>>>,
@@ -197,6 +485,186 @@ fn request(dir: &std::path::Path) -> RunRequest {
         inherit_frozen_cache: false,
         structured_output: None,
     }
+}
+
+#[tokio::test]
+async fn recreated_wal_rejects_equal_watermark_prefix_on_resume() {
+    recreated_prefix_resume(false).await;
+}
+
+#[tokio::test]
+async fn unidentified_prefix_is_replayed_and_repaired_once_on_resume() {
+    recreated_prefix_resume(true).await;
+}
+
+async fn recreated_prefix_resume(unidentified: bool) {
+    let dir = broca_test_support::scratch_root().join(format!(
+        "recreated-prefix-{}-{unidentified}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut old_req = request(&dir);
+    old_req.input = vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "old conversation input".into(),
+        }],
+    )];
+    let wal_store = FileWalStore::new(dir.join("wal"));
+    let store = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+    let (out, _events) = mpsc::channel(1000);
+    run_loop(
+        old_req.clone(),
+        &RecordingProvider::new(vec![text_turn("old", "old conversation reply")]),
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("old-leases")),
+        &AllowAll,
+        &wal_store,
+        &out,
+    )
+    .await
+    .unwrap();
+    let old_wal = wal_store
+        .read_records_range(&old_req.session, 0, None, None)
+        .unwrap();
+    store.project_range(&old_req.session, &old_wal).unwrap();
+    let old_prefix = store.read_prefix_with_watermark(&old_req.session).unwrap();
+    assert_eq!(
+        old_prefix.lineage_id.as_deref(),
+        Some(old_wal.lineage_id.unwrap().to_string().as_str())
+    );
+    if unidentified {
+        let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+        conn.execute("UPDATE meta SET lineage_id=NULL", []).unwrap();
+    }
+    let stale_prefix = store.read_prefix_with_watermark(&old_req.session).unwrap();
+    assert_eq!(stale_prefix.lineage_id.is_none(), unidentified);
+
+    let mut new_req = old_req.clone();
+    new_req.input = vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "new conversation input".into(),
+        }],
+    )];
+    let source = FileWalStore::new(dir.join("new-source"));
+    run_loop(
+        new_req.clone(),
+        &RecordingProvider::new(vec![text_turn("new", "new conversation reply")]),
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("new-leases")),
+        &AllowAll,
+        &source,
+        &out,
+    )
+    .await
+    .unwrap();
+    let frames = source.read_records(&new_req.session).unwrap();
+    assert!(matches!(
+        frames.last().unwrap().record,
+        WalRecord::RunFinished { .. }
+    ));
+    std::fs::remove_file(wal_store.wal_path(&new_req.session)).unwrap();
+    let mut recreated = wal_store.open(&new_req.session).unwrap();
+    for record in queued_title(&new_req, 0, 10) {
+        recreated.append(1, &record, false).unwrap();
+    }
+    recreated.append(1, &frames[0].record, false).unwrap();
+    recreated.sync().unwrap();
+    assert_eq!(
+        recreated.last_seq(),
+        old_prefix.watermark_seq,
+        "watermarks must not identify a lineage"
+    );
+    assert_ne!(
+        recreated.lineage_id().unwrap().to_string(),
+        old_prefix.lineage_id.as_ref().unwrap().as_str()
+    );
+    let new_lineage = recreated.lineage_id().unwrap();
+    let recreated_head = recreated.last_seq();
+    drop(recreated);
+    assert_eq!(
+        store.read_prefix_with_watermark(&new_req.session).unwrap(),
+        stale_prefix,
+        "the stale prefix must still be present when resume starts"
+    );
+    let admission = broca_core::load_prior_wal_snapshot(
+        &wal_store,
+        &new_req.session,
+        recreated_head,
+        Some(store.as_ref()),
+    )
+    .unwrap();
+    assert_eq!(
+        admission.base_watermark, 0,
+        "unidentified or mismatched admission must replay from origin"
+    );
+
+    let provider = RecordingProvider::new(vec![
+        text_turn("resumed", "done"),
+        text_turn("resumed", "done"),
+    ]);
+    run_loop_with_store(
+        new_req.clone(),
+        &provider,
+        &StubToolPlane::new(),
+        &FileLeaseStore::new(dir.join("resume-leases")),
+        &AllowAll,
+        &wal_store,
+        Some(store.clone()),
+        &out,
+    )
+    .await
+    .unwrap();
+    let requests = provider.sent.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let rendered = std::str::from_utf8(requests.values().next().unwrap()).unwrap();
+    assert!(
+        rendered.contains("new conversation input"),
+        "resume must render the recreated WAL: {rendered}"
+    );
+    assert!(
+        !rendered.contains("old conversation"),
+        "resume served a stale materialized prefix: {rendered}"
+    );
+    let repaired = store.read_prefix_with_watermark(&new_req.session).unwrap();
+    assert_eq!(
+        repaired.lineage_id,
+        Some(new_lineage.to_string()),
+        "projection must identify the repaired prefix"
+    );
+    let repaired_json = serde_json::to_string(&repaired.prefix).unwrap();
+    assert!(
+        repaired_json.contains("new conversation input")
+            && !repaired_json.contains("old conversation"),
+        "reprojection must replace unidentified rows, not relabel them: {repaired_json}"
+    );
+    let current = wal_store.read_records(&new_req.session).unwrap();
+    let counted = DecodingWalStore {
+        lineage_id: Some(new_lineage),
+        inner: wal_store,
+        encoded: current
+            .iter()
+            .map(|frame| serde_json::to_vec(&(frame.fence, &frame.record)).unwrap())
+            .collect(),
+        decoded: AtomicUsize::new(0),
+        decoded_sequences: Mutex::new(Vec::new()),
+    };
+    let head = current.last().unwrap().seq;
+    let snapshot =
+        broca_core::load_prior_wal_snapshot(&counted, &new_req.session, head, Some(store.as_ref()))
+            .unwrap();
+    assert_eq!(snapshot.base_watermark, repaired.watermark_seq);
+    assert!(
+        counted
+            .decoded_sequences
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|seq| *seq > repaired.watermark_seq),
+        "repair must restore suffix-only admission"
+    );
 }
 
 fn hard_stop_request(dir: &std::path::Path, stop_when: StopCondition) -> RunRequest {

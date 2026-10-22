@@ -711,7 +711,7 @@ async fn range_projection_persists_lineage_with_its_page_checkpoint() {
 }
 
 #[tokio::test]
-async fn legacy_store_snapshot_without_lineage_id_keeps_the_incremental_read() {
+async fn unidentified_store_snapshot_replays_once_then_reads_incrementally() {
     let (rig, zero_range_reads) = Rig::with_counting_zero_ranges("legacy-store-lineage-unknown");
     let key = rig.key("legacy-store");
     append_seed(
@@ -744,7 +744,7 @@ async fn legacy_store_snapshot_without_lineage_id_keeps_the_incremental_read() {
                 broca_wal::WalRangeRecords::Absent => &[],
             },
         )
-        .expect("simulate a projection written before lineage tracking");
+        .expect("simulate a projection without lineage identity");
     let legacy_snapshot = rig
         .store
         .read_page_with_watermark(&key, Some(0), 10, broca_core::context::ReadView::Raw)
@@ -770,13 +770,35 @@ async fn legacy_store_snapshot_without_lineage_id_keeps_the_incremental_read() {
         .registry
         .route_read(&key, Some(0), Some(10))
         .await
-        .expect("legacy store-backed session.read");
+        .expect("unidentified store-backed session.read");
     assert_eq!(actual, expected);
     assert_eq!(
         zero_range_reads.load(Ordering::SeqCst),
-        0,
-        "an unknown legacy store identity must not force a sequence-zero read"
+        1,
+        "an unidentified store prefix requires exactly one sequence-zero replay"
     );
+    assert_eq!(
+        rig.store
+            .read_prefix_with_watermark(&key)
+            .unwrap()
+            .lineage_id,
+        full_range.lineage_id.map(|id| id.to_string()),
+        "the replay must persist the WAL identity with its repaired prefix"
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            rig.registry
+                .route_read(&key, Some(0), Some(10))
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            zero_range_reads.load(Ordering::SeqCst),
+            1,
+            "subsequent reads must use the identified prefix and only its WAL suffix"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4007,12 +4029,12 @@ async fn session_read_renders_a_steered_message_at_its_wal_position() {
 /// Materialize every frame of `key`'s WAL into the rig's store. A read's WAL tail then starts
 /// past them, so any read from the WAL's first sequence number is a whole-WAL read.
 fn materialize_all(rig: &Rig, key: &BindIdentity) {
-    let frames = rig
+    let range = rig
         .wal_store
-        .read_records(key)
+        .read_records_range(key, 0, None, None)
         .expect("read the seeded WAL");
     rig.store
-        .project(key, &frames)
+        .project_range(key, &range)
         .expect("materialize the WAL");
 }
 

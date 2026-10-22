@@ -108,6 +108,186 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn session_read_rejects_equal_watermark_prefix_after_wal_recreation() {
+    recreated_prefix_session_read(false, false).await;
+}
+
+#[tokio::test]
+async fn unidentified_prefix_does_not_hide_an_unreachable_wal() {
+    let fixture = Fixture::new();
+    fixture.append(&[
+        started(&fixture.session, None, None),
+        super::tests::assistant_record(),
+        finished(),
+    ]);
+    let store = fixture.sqlite();
+    store
+        .project_range(
+            &fixture.session,
+            &fixture
+                .wal
+                .read_records_range(&fixture.session, 0, None, None)
+                .unwrap(),
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(fixture.root.join("store.db")).unwrap();
+    conn.execute("UPDATE meta SET lineage_id=NULL", []).unwrap();
+    assert!(
+        store
+            .read_prefix_with_watermark(&fixture.session)
+            .unwrap()
+            .watermark_seq
+            > 0
+    );
+    std::fs::remove_file(fixture.wal.wal_path(&fixture.session)).unwrap();
+    let registry =
+        LineageRegistry::new_with_reader(Arc::new(NeverOpener), fixture.wal.clone(), Some(store));
+    let raw = registry
+        .route_read_page(&fixture.session, Some(0), Some(100), true)
+        .await;
+    assert!(
+        matches!(raw, Err(OpenError::HistoryUnreachable { .. })),
+        "discarded unidentified rows still prove unreachable history"
+    );
+    let model = registry
+        .route_read_model_page(&fixture.session, &broca_core::ModelPageRequest::default())
+        .await;
+    assert!(
+        matches!(model, Err(OpenError::HistoryUnreachable { .. })),
+        "model reads must not turn unreachable history into an empty page: {model:?}"
+    );
+}
+
+#[tokio::test]
+async fn session_read_replays_and_repairs_unidentified_prefix() {
+    recreated_prefix_session_read(true, false).await;
+}
+
+#[tokio::test]
+async fn session_read_model_replays_and_repairs_unidentified_prefix() {
+    recreated_prefix_session_read(true, true).await;
+}
+
+async fn recreated_prefix_session_read(unidentified: bool, model: bool) {
+    let fixture = Fixture::new();
+    let mut old = started(&fixture.session, None, None);
+    if let WalRecord::RunStarted { input, .. } = &mut old {
+        *input = vec![broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "old conversation".into(),
+            }],
+        )]
+        .into();
+    }
+    fixture.append(&[
+        old,
+        WalRecord::StepStarted {
+            step_id: broca_protocol::StepId(1),
+        },
+        super::tests::assistant_record(),
+        finished(),
+    ]);
+    let store = fixture.sqlite();
+    store
+        .project_range(
+            &fixture.session,
+            &fixture
+                .wal
+                .read_records_range(&fixture.session, 0, None, None)
+                .unwrap(),
+        )
+        .unwrap();
+    let stale = store.read_prefix_with_watermark(&fixture.session).unwrap();
+    if unidentified {
+        let conn = rusqlite::Connection::open(fixture.root.join("store.db")).unwrap();
+        conn.execute("UPDATE meta SET lineage_id=NULL", []).unwrap();
+    }
+    let stale_prefix = store.read_prefix_with_watermark(&fixture.session).unwrap();
+    assert_eq!(stale_prefix.lineage_id.is_none(), unidentified);
+    std::fs::remove_file(fixture.wal.wal_path(&fixture.session)).unwrap();
+    let mut new = started(&fixture.session, None, None);
+    if let WalRecord::RunStarted { input, .. } = &mut new {
+        *input = vec![broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "new conversation".into(),
+            }],
+        )]
+        .into();
+    }
+    fixture.append(&[new, super::tests::assistant_record(), finished()]);
+    let replacement = fixture
+        .wal
+        .read_records_range(&fixture.session, 0, None, None)
+        .unwrap();
+    assert_eq!(stale.watermark_seq, 3);
+    assert_eq!(fixture.wal.read_records(&fixture.session).unwrap().len(), 3);
+    let lineage = replacement.lineage_id.unwrap();
+    assert_ne!(
+        stale.lineage_id.as_deref(),
+        Some(lineage.to_string().as_str())
+    );
+    assert_eq!(
+        store.read_prefix_with_watermark(&fixture.session).unwrap(),
+        stale_prefix
+    );
+
+    let registry = LineageRegistry::new_with_reader(
+        Arc::new(NeverOpener),
+        fixture.wal.clone(),
+        Some(store.clone()),
+    );
+    if model {
+        let page = registry
+            .route_read_model_page(&fixture.session, &broca_core::ModelPageRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(page.lineage_id, Some(lineage.to_string()));
+        assert_eq!(
+            page.messages[0].message.content,
+            vec![broca_protocol::ContentBlock::Text {
+                text: "new conversation".into()
+            }]
+        );
+        assert_eq!(
+            store
+                .read_prefix_with_watermark(&fixture.session)
+                .unwrap()
+                .lineage_id,
+            Some(lineage.to_string()),
+            "model reads must persist repaired lineage too"
+        );
+    }
+    let page = registry
+        .route_read_page(&fixture.session, Some(0), Some(100), true)
+        .await
+        .unwrap()
+        .page;
+    assert_eq!(page.lineage_id, Some(lineage));
+    assert_eq!(page.messages.len(), 2);
+    assert_eq!(
+        page.messages[0].message.content,
+        vec![broca_protocol::ContentBlock::Text {
+            text: "new conversation".into()
+        }]
+    );
+    assert_eq!(
+        store
+            .read_prefix_with_watermark(&fixture.session)
+            .unwrap()
+            .lineage_id,
+        Some(lineage.to_string())
+    );
+    let repeated = registry
+        .route_read_page(&fixture.session, Some(0), Some(100), true)
+        .await
+        .unwrap()
+        .page;
+    assert_eq!(repeated.messages, page.messages);
+}
+
+#[tokio::test]
 #[ignore = "manual timing probe on a 15 MB production-framed WAL"]
 async fn owner_authorization_on_15mb_wal() {
     let fixture = Fixture::new();

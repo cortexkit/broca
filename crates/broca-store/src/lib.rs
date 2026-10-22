@@ -1553,13 +1553,13 @@ impl SqliteStore {
     fn reproject_if_lineage_mismatch_inner(
         &self,
         session: &BindIdentity,
-        stale_lineage_id: &str,
+        stale_lineage_id: Option<&str>,
         complete_wal: &WalRangeRead,
     ) -> Result<(), StoreError> {
         let incoming_lineage_id = complete_wal.lineage_id.map(|id| id.to_string());
         if incoming_lineage_id
             .as_deref()
-            .is_none_or(|id| id == stale_lineage_id)
+            .is_none_or(|id| Some(id) == stale_lineage_id)
         {
             return Err(StoreError::InconsistentSnapshot(
                 "lineage repair requires a different identified WAL",
@@ -1569,7 +1569,7 @@ impl SqliteStore {
         let key = Self::key(session);
         for _ in 0..OPTIMISTIC_PROJECTION_ATTEMPTS {
             let snapshot = self.projection_snapshot(&key)?;
-            if snapshot.lineage_id.as_deref() != Some(stale_lineage_id) {
+            if snapshot.lineage_id.as_deref() != stale_lineage_id {
                 return Ok(());
             }
             let plan = Self::prepare_projection(
@@ -1591,7 +1591,7 @@ impl SqliteStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let snapshot = Self::projection_snapshot_from_tx(&tx, &key)?;
-        if snapshot.lineage_id.as_deref() != Some(stale_lineage_id) {
+        if snapshot.lineage_id.as_deref() != stale_lineage_id {
             tx.commit()?;
             return Ok(());
         }
@@ -1622,7 +1622,7 @@ impl MaterializedStore for SqliteStore {
         let meta = tx
             .query_row(
                 "SELECT watermark_seq, context_epoch, completed_steps, usage_json, \
-                  retries_used, last_step_usage_json, last_step_finish_reason_json \
+                  retries_used, last_step_usage_json, last_step_finish_reason_json, lineage_id \
                   FROM meta WHERE session=?1",
                 [&key],
                 |r| {
@@ -1634,6 +1634,7 @@ impl MaterializedStore for SqliteStore {
                         r.get::<_, Option<i64>>(4)?,
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
@@ -1656,7 +1657,9 @@ impl MaterializedStore for SqliteStore {
                 retries_used,
                 last_step_usage_json,
                 last_step_finish_reason_json,
+                lineage_id,
             )) => StorePrefix {
+                lineage_id,
                 prefix,
                 completed_steps,
                 usage: serde_json::from_str(&usage_json).map_err(|e| e.to_string())?,
@@ -1972,7 +1975,7 @@ impl MaterializedStore for SqliteStore {
     fn reproject_if_lineage_mismatch(
         &self,
         session: &BindIdentity,
-        stale_lineage_id: &str,
+        stale_lineage_id: Option<&str>,
         complete_wal: &WalRangeRead,
     ) -> Result<(), String> {
         self.reproject_if_lineage_mismatch_inner(session, stale_lineage_id, complete_wal)
