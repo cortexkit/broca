@@ -23592,3 +23592,31 @@ expect_message = "a missing named config file must refuse boot by name"
 file = "crates/broca-module-serve/src/main.rs"
 old = "    .map_err(ServeIoError)?;\n    broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;"
 new = "    .ok(); // NON-VACUITY BREAK: ignore a missing named config file.\n    broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;"
+
+[[control]]
+id = "serve-send-wal-probe-off-runtime-worker"
+guards = "The session.send WAL presence probe (live stat and archive reads) runs on the blocking pool, not on the request's runtime worker"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::the_send_path_wal_probe_does_not_block_the_runtime_worker"]
+expect_message = "the WAL presence probe must not run on the runtime worker"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                let probed = broca_diagnostics::spawn_blocking("
+new = "                let probed = probe_handler.session_written(&probe_session); // NON-VACUITY BREAK: probe on the runtime worker.\n                let _unused = broca_diagnostics::spawn_blocking("
+
+[[control]]
+id = "serve-subscribe-unit-frame-guard"
+guards = "A subscribe unit whose frame exceeds the transport limit ends the stream with a typed undeliverable error instead of an over-limit frame on the shared module connection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::an_oversized_subscribe_unit_ends_the_stream_with_a_typed_error"]
+expect_message = "an oversized unit must end the stream with a typed error"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {\n                let _ = send_undeliverable_unit("
+new = "            if frame_bytes > usize::MAX - 1 { // NON-VACUITY BREAK: no transport frame guard on stream data.\n                let _ = send_undeliverable_unit("

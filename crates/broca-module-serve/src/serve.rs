@@ -382,8 +382,10 @@ fn send_id_scope(session: &BrocaBindIdentity) -> String {
 /// The reported code deliberately matches the one the daemon uses when it refuses a bind for
 /// the same reason, so a caller that already handles it sees no change when the refusal moves
 /// from bind time to op time.
-fn execute_class_root_refusal(session: &BrocaBindIdentity) -> Option<String> {
-    if session.project_root.exists() {
+async fn execute_class_root_refusal(session: &BrocaBindIdentity) -> Option<String> {
+    // `tokio::fs` runs the stat on the blocking pool: a slow or network filesystem must not
+    // stall the runtime worker that also carries other sessions' frames and streams.
+    if tokio::fs::metadata(&session.project_root).await.is_ok() {
         return None;
     }
     Some(format!(
@@ -2443,7 +2445,22 @@ where
             let session_written = if inherit_frozen.is_empty() {
                 false
             } else {
-                match handler.session_written(&session) {
+                // The presence probe can stat the live WAL and read archive containers, so it
+                // runs on the blocking pool rather than on this request's runtime worker.
+                let probe_handler = Arc::clone(handler);
+                let probe_session = session.clone();
+                let probed = broca_diagnostics::spawn_blocking(
+                    broca_diagnostics::JobKind::WalRead,
+                    move || probe_handler.session_written(&probe_session),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    Err(ServeError::Open(
+                        format!("session presence probe failed: {error}; retry the send"),
+                        Some(broca_protocol::ErrorClass::Transient),
+                    ))
+                });
+                match probed {
                     Ok(written) => written,
                     Err(error) => {
                         return send_serve_error(writer, ver, channel, epoch, corr, &error).await
@@ -2482,7 +2499,7 @@ where
             } else {
                 inherit_frozen
             };
-            if let Some(detail) = execute_class_root_refusal(&session) {
+            if let Some(detail) = execute_class_root_refusal(&session).await {
                 return send_error(
                     writer,
                     ver,
@@ -2644,7 +2661,7 @@ where
                     .await
                 }
             };
-            if let Some(detail) = execute_class_root_refusal(&session) {
+            if let Some(detail) = execute_class_root_refusal(&session).await {
                 return send_error(
                     writer,
                     ver,
@@ -3196,9 +3213,38 @@ where
                 return;
             }
             let (priority, body) = match encode_delivery(&delivery) {
-                Some(v) => v,
-                None => break, // a Detached marker: end the stream (client resubscribes)
+                EncodedDelivery::Data(priority, body) => (priority, body),
+                // A Detached marker: end the stream cleanly; the client resubscribes.
+                EncodedDelivery::Detached => break,
+                EncodedDelivery::Unencodable(error) => {
+                    let _ = send_undeliverable_unit(
+                        &writer,
+                        (ver, channel, epoch, corr),
+                        &delivery,
+                        "unencodable",
+                        format!("subscribe unit could not be encoded: {error}"),
+                        None,
+                    )
+                    .await;
+                    return;
+                }
             };
+            // The same transport bound unary replies honour. An oversized frame on the wire
+            // could invalidate sibling requests on this one module connection, and a clean
+            // StreamEnd here would send the client back to the same cursor forever.
+            let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);
+            if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {
+                let _ = send_undeliverable_unit(
+                    &writer,
+                    (ver, channel, epoch, corr),
+                    &delivery,
+                    "too_large",
+                    "subscribe unit exceeds the transport frame limit".into(),
+                    Some(frame_bytes),
+                )
+                .await;
+                return;
+            }
             let frame = match Frame::build_with_version(
                 ver,
                 FrameType::StreamData,
@@ -3209,7 +3255,18 @@ where
                 body,
             ) {
                 Ok(f) => f,
-                Err(_) => break,
+                Err(error) => {
+                    let _ = send_undeliverable_unit(
+                        &writer,
+                        (ver, channel, epoch, corr),
+                        &delivery,
+                        "unencodable",
+                        format!("subscribe frame could not be built: {error}"),
+                        None,
+                    )
+                    .await;
+                    return;
+                }
             };
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -3240,22 +3297,74 @@ where
     Ok(())
 }
 
-/// Encode one data Delivery to (lane priority, body bytes). Terminal deliveries have no data
-/// body; the forward task handles `Error` before calling this and treats `Detached` as a clean
-/// resubscribe boundary.
-fn encode_delivery(delivery: &Delivery) -> Option<(Priority, Vec<u8>)> {
-    match delivery {
+/// What one Delivery becomes on a subscribe stream.
+enum EncodedDelivery {
+    /// A data frame body and its lane priority.
+    Data(Priority, Vec<u8>),
+    /// The clean resubscribe boundary. Terminal deliveries (`Error`, `Expired`) are handled by
+    /// the forward task before encoding and also land here.
+    Detached,
+    /// A unit that cannot be serialized. It must end the stream with a typed error: a clean end
+    /// would send the client back to the same unit forever.
+    Unencodable(serde_json::Error),
+}
+
+fn encode_delivery(delivery: &Delivery) -> EncodedDelivery {
+    let (priority, encoded) = match delivery {
         Delivery::Control(event) => {
             let (cursor, unit) = event.as_ref();
-            encode_subscribe_control(cursor.wal_seq, cursor.sub_index, unit)
-                .ok()
-                .map(|body| (Priority::Interactive, body))
+            (
+                Priority::Interactive,
+                encode_subscribe_control(cursor.wal_seq, cursor.sub_index, unit),
+            )
         }
-        Delivery::Display(event) => encode_subscribe_display(event.as_ref())
-            .ok()
-            .map(|body| (Priority::Background, body)),
-        Delivery::Expired { .. } | Delivery::Error(_) | Delivery::Detached => None,
+        Delivery::Display(event) => (
+            Priority::Background,
+            encode_subscribe_display(event.as_ref()),
+        ),
+        Delivery::Expired { .. } | Delivery::Error(_) | Delivery::Detached => {
+            return EncodedDelivery::Detached
+        }
+    };
+    match encoded {
+        Ok(body) => EncodedDelivery::Data(priority, body),
+        Err(error) => EncodedDelivery::Unencodable(error),
     }
+}
+
+/// The stream terminal for a unit this connection cannot deliver.
+const SUBSCRIBE_UNIT_UNDELIVERABLE: &str = "subscribe_unit_undeliverable";
+
+/// End a subscribe stream with a typed error naming the unit that cannot be delivered: its
+/// control cursor (null for a display event), why, and for an oversized unit its frame size and
+/// the limit. Like the other stream terminals, no StreamEnd follows it.
+async fn send_undeliverable_unit(
+    writer: &EgressSender<Frame>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    delivery: &Delivery,
+    reason: &str,
+    message: String,
+    frame_bytes: Option<usize>,
+) -> Result<(), ServeIoError> {
+    let cursor = match delivery {
+        Delivery::Control(event) => {
+            let (cursor, _) = event.as_ref();
+            serde_json::json!({"wal_seq": cursor.wal_seq, "sub_index": cursor.sub_index})
+        }
+        _ => serde_json::Value::Null,
+    };
+    let mut detail = serde_json::json!({"reason": reason, "cursor": cursor});
+    if let Some(frame_bytes) = frame_bytes {
+        detail["frame_bytes"] = frame_bytes.into();
+        detail["limit"] = broca_wire::SUBC_MAX_FRAME_BYTES.into();
+    }
+    tracing::warn!(
+        target: "wire.egress",
+        channel, epoch, corr, reason, %detail,
+        "ending subscribe stream on an undeliverable unit: {message}"
+    );
+    let body = ErrorBody::new(SUBSCRIBE_UNIT_UNDELIVERABLE, message).with_detail(detail);
+    send_error_body(writer, ver, channel, epoch, corr, body).await
 }
 
 async fn send_hello(
@@ -4632,6 +4741,53 @@ mod tests {
         let _second_turn = tokio::time::timeout(std::time::Duration::from_secs(1), second_wait)
             .await
             .expect("the reopened route advances after the first request releases its turn");
+    }
+
+    /// A control unit whose encoded frame exceeds the transport limit is never put on the wire:
+    /// the stream ends with a typed error naming the unit's cursor, the frame size and the
+    /// limit, and no clean StreamEnd that would send the client back to the same cursor. The
+    /// served bytes are pinned by `tests/golden/subscribe_unit_undeliverable.too_large.json`.
+    #[tokio::test]
+    async fn an_oversized_subscribe_unit_ends_the_stream_with_a_typed_error() {
+        let registry = Arc::new(LineageRegistry::new(Arc::new(RefusingOpener)));
+        let mut ingress = BindIngress::new(registry);
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let sink = ingress.subscribe(1, 10).await;
+        // 1 MiB of control characters: JSON escapes each as six bytes.
+        let unit = broca_protocol::caller::ControlUnit::ToolResult {
+            result: broca_protocol::ToolResult {
+                tool_call_id: broca_protocol::ToolCallId("call-1".into()),
+                output: broca_protocol::ToolOutput::Text {
+                    text: "\u{1}".repeat(1 << 20),
+                },
+                is_error: false,
+            },
+        };
+        sink.send(Delivery::Control(Arc::new((
+            broca_core::Cursor {
+                wal_seq: 42,
+                sub_index: 1,
+            },
+            unit,
+        ))))
+        .await
+        .unwrap();
+        let frame = next_written(&mut ingress.written).await;
+        assert_eq!(
+            (frame.header.ty, frame.header.epoch, frame.header.corr),
+            (FrameType::Error, 1, 10),
+            "an oversized unit must end the stream with a typed error"
+        );
+        assert_eq!(
+            String::from_utf8(frame.body.to_vec()).unwrap(),
+            include_str!("../tests/golden/subscribe_unit_undeliverable.too_large.json").trim_end()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            ingress.written.try_recv().is_err(),
+            "no StreamEnd or data frame follows the typed terminal"
+        );
     }
 
     #[tokio::test]
@@ -6643,6 +6799,200 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(serve.await.unwrap().unwrap(), ServeEnd::Goodbye);
+    }
+
+    /// A handler whose WAL presence probe blocks its thread until the test releases it, and
+    /// records whether the release arrived in time.
+    struct BlockingProbeHandler {
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        released: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ServeHandler for BlockingProbeHandler {
+        fn session_written(&self, _session: &BrocaBindIdentity) -> Result<bool, ServeError> {
+            self.entered.notify_one();
+            let release = self.release.lock().unwrap().take().unwrap();
+            let released = release
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            self.released.store(released, Ordering::SeqCst);
+            Ok(false)
+        }
+        async fn send(&self, _req: SendRequest) -> Result<SendResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn retract(
+            &self,
+            _session: &BrocaBindIdentity,
+            _submission_id: broca_protocol::SubmissionId,
+        ) -> Result<RetractResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn subscribe(
+            &self,
+            _session: &BrocaBindIdentity,
+            _from: SubscribeFrom,
+            _sink: mpsc::Sender<Delivery>,
+        ) -> Result<(), ServeError> {
+            unimplemented!()
+        }
+        async fn read(&self, _req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn cancel(
+            &self,
+            _session: &BrocaBindIdentity,
+            _run_id: broca_protocol::RunId,
+        ) -> Result<CancelResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn status(&self, _session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+            unimplemented!()
+        }
+        async fn run_status(
+            &self,
+            _session: &BrocaBindIdentity,
+            _run_id: broca_protocol::RunId,
+        ) -> Result<RunStatusResponse, ServeError> {
+            unimplemented!()
+        }
+    }
+
+    /// Start a frame loop serving `handler`, complete its handshake, and bind route channel 7
+    /// to `session`. Returns the daemon end of the socket, the loop's egress, and the loop.
+    async fn bound_frame_loop<H: ServeHandler + 'static>(
+        handler: Arc<H>,
+        session: &str,
+    ) -> (
+        tokio::io::DuplexStream,
+        EgressReceiver<Frame>,
+        tokio::task::JoinHandle<Result<ServeEnd, ServeIoError>>,
+    ) {
+        let (mut daemon, mut module_read) = tokio::io::duplex(64 * 1024);
+        let (writer, mut written) =
+            broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
+        let serve = tokio::spawn(async move {
+            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            run_frame_loop(
+                &mut module_read,
+                writer,
+                "broca",
+                handler,
+                &registry,
+                &VaultGauge::not_in_use(),
+                None,
+                CancellationToken::new(),
+                crate::wal_archive::WalArchiveConfig::default(),
+                &crate::consumer_routes::ConsumerRoutes::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        let hello = next_written(&mut written).await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                hello.header.corr,
+                serde_json::to_vec(&ModuleHelloAckBody {
+                    negotiated_ver: PROTOCOL_VERSION,
+                    subc_ops: vec![],
+                    subc_capabilities: vec![],
+                    storage: None,
+                    machine_id: None,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new("/tmp", "runner", session),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                2,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_written(&mut written).await.header.ty,
+            FrameType::Response
+        );
+        (daemon, written, serve)
+    }
+
+    /// The WAL presence probe on the send path runs off the runtime worker. On this
+    /// single-threaded runtime a probe run inline would block the only worker, so the task that
+    /// releases it could never run.
+    #[tokio::test]
+    async fn the_send_path_wal_probe_does_not_block_the_runtime_worker() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handler = Arc::new(BlockingProbeHandler {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(Some(release_rx)),
+            released: std::sync::atomic::AtomicBool::new(false),
+        });
+        let releaser = handler.clone();
+        tokio::spawn(async move {
+            releaser.entered.notified().await;
+            let _ = release_tx.send(());
+        });
+        let (mut daemon, mut written, serve) = bound_frame_loop(handler.clone(), "probe").await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                7,
+                1,
+                3,
+                serde_json::to_vec(&RouteRequest {
+                    method: OP_SEND.into(),
+                    params: serde_json::json!({"prompt": "steer me", "delivery": "steer"}),
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        // The session was never written, so the model-less steer is refused for its model.
+        let reply = next_written(&mut written).await;
+        assert_eq!((reply.header.ty, reply.header.corr), (FrameType::Error, 3));
+        assert!(
+            handler.released.load(Ordering::SeqCst),
+            "the WAL presence probe must not run on the runtime worker"
+        );
+        serve.abort();
     }
 
     /// A panic inside one request's task is confined to that request: the connection keeps
