@@ -2679,21 +2679,17 @@ fn malformed_tool_reply_message(raw: &serde_json::Value) -> String {
 }
 
 fn non_text_tool_content_placeholder(block: &serde_json::Value) -> String {
-    let content_type = block
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let mime_type = block
-        .get("mimeType")
-        .and_then(serde_json::Value::as_str)
-        .map(|value| format!(" mimeType={value}"))
-        .unwrap_or_default();
-    let data_size = block
-        .get("data")
-        .and_then(serde_json::Value::as_str)
-        .map(|value| format!(" data≈{} bytes", value.len()))
-        .unwrap_or_default();
-    format!("[non-text tool content omitted: type={content_type}{mime_type}{data_size}]")
+    broca_protocol::content::non_text_tool_content_placeholder(
+        block
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+        block.get("mimeType").and_then(serde_json::Value::as_str),
+        block
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .map(str::len),
+    )
 }
 
 #[cfg(test)]

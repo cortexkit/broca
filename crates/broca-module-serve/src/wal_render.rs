@@ -53,6 +53,10 @@ pub fn boundary_options(
             &mut prior.prompt,
             broca_protocol::tags::TagRendering::for_render_config(&config.frozen_render_config),
         );
+    } else {
+        // Model text a run under the computed rules marked for cleaning went out cleaned on
+        // every request since; a structured-output run's final text went out unchanged.
+        broca_protocol::tags::clean_computed_into(&mut prior.prompt);
     }
     let frozen: FrozenRenderConfig = serde_json::from_value(config.frozen_render_config.clone())
         .map_err(|e| format!("decode frozen_render_config: {e}"))?;

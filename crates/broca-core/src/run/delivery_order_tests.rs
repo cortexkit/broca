@@ -394,9 +394,27 @@ fn rendered(records: &[WalRecord]) -> Vec<Message> {
     prompt
 }
 
-/// With `render_tags` on, a `steer` delivery's message is a tagged part like any steer: its
-/// `SendDelivered` record carries the tag, the live request shows it, and a replay of the WAL
-/// renders the request the run sent.
+/// The number the replayed transcript shows for the first block of the first message that
+/// `holds` matches, by the computed tag rules: the WAL itself stores none.
+fn shown_number(records: &[WalRecord], holds: impl Fn(&ContentBlock) -> bool) -> u64 {
+    assert!(
+        records.iter().all(|record| record.runner_tags().is_empty()),
+        "a run under the computed rules stores no tag number"
+    );
+    crate::replay::replay(records)
+        .unwrap()
+        .prompt
+        .iter()
+        .find_map(|message| {
+            let index = message.content.iter().position(&holds)?;
+            message.part_tags()?.parts[index]
+        })
+        .expect("the part shows a number")
+}
+
+/// With `render_tags` on, a `steer` delivery's message is a numbered part like any steer: the
+/// transcript numbers it, the live request shows that number, and a replay of the WAL renders
+/// the request the run sent.
 #[tokio::test]
 async fn a_steer_delivery_is_a_tagged_part_that_renders_as_its_rebuild() {
     let Ran { model, records } = run_with(
@@ -407,15 +425,10 @@ async fn a_steer_delivery_is_a_tagged_part_that_renders_as_its_rebuild() {
         Some(rendering_manifest()),
     )
     .await;
-    let tag = records
-        .iter()
-        .find_map(|record| match record {
-            WalRecord::SendDelivered {
-                tags: Some(tags), ..
-            } => Some(tags[0].parts[0]),
-            _ => None,
-        })
-        .expect("the steer delivery is tagged");
+    let tag = shown_number(
+        &records,
+        |block| matches!(block, ContentBlock::Text { text } if text == "note"),
+    );
     let sent = model.prompt(1);
     assert_eq!(
         sent.last().unwrap().content,
@@ -431,8 +444,8 @@ async fn a_steer_delivery_is_a_tagged_part_that_renders_as_its_rebuild() {
 }
 
 /// With `render_tags` on, a `tool_result` delivery's text is part of the tool result it rides
-/// on: the result's own tag leads the result and the appended text, and the delivery has no tag
-/// of its own. A replay of the WAL renders the request the run sent.
+/// on: the result's own number leads the result and the appended text, and the delivery has no
+/// number of its own. A replay of the WAL renders the request the run sent.
 #[tokio::test]
 async fn a_tool_result_delivery_renders_inside_the_results_tagged_part() {
     let inbox = SteerInbox::new();
@@ -445,17 +458,10 @@ async fn a_tool_result_delivery_renders_inside_the_results_tagged_part() {
         Some(rendering_manifest()),
     )
     .await;
-    let carrier_tag = records
-        .iter()
-        .find_map(|record| match record {
-            WalRecord::ToolResult {
-                result,
-                tags: Some(tags),
-                ..
-            } if result.tool_call_id.0 == "two" => Some(tags.parts[0]),
-            _ => None,
-        })
-        .expect("the carrier result is tagged");
+    let carrier_tag = shown_number(
+        &records,
+        |block| matches!(block, ContentBlock::ToolResult(result) if result.tool_call_id.0 == "two"),
+    );
     assert!(records.iter().any(|record| matches!(
         record,
         WalRecord::SendDelivered {

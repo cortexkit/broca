@@ -2016,6 +2016,11 @@ impl MaterializedStore for SqliteStore {
             Some(origin) => Some(origin),
             None => trailing_origin_from_tx(&tx, &key).map_err(|e| e.to_string())?,
         };
+        let tag_seed = if end == prefix_len {
+            broca_core::tags::TagSeed::after_last(rows.last().map(|row| &row.message))
+        } else {
+            tag_seed_from_tx(&tx, &key).map_err(|e| e.to_string())?
+        };
         let deferred_calls_json: Option<String> = tx
             .query_row(
                 "SELECT deferred_calls_json FROM meta WHERE session=?1",
@@ -2069,6 +2074,7 @@ impl MaterializedStore for SqliteStore {
             last_run_id,
             last_episode_usage,
             last_title,
+            tag_seed,
         })
     }
 
@@ -2578,7 +2584,27 @@ fn projection_seed_from_complete_tx(
         trailing_origin,
         last_run_id,
         admission_checkpoint,
+        tag_seed: tag_seed_from_tx(tx, key)?,
     }))
+}
+
+/// Where tag numbering continues after the materialized rows: the last row carries the number
+/// before it and its run's computed rules, so no other row needs reading.
+fn tag_seed_from_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> Result<broca_core::tags::TagSeed, StoreError> {
+    let last = tx
+        .query_row(
+            "SELECT json, tags_json FROM message WHERE session=?1 ORDER BY ord DESC LIMIT 1",
+            [key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let last = last
+        .map(|(json, tags_json)| decode_message(json, tags_json))
+        .transpose()?;
+    Ok(broca_core::tags::TagSeed::after_last(last.as_ref()))
 }
 
 fn wal_anchor(

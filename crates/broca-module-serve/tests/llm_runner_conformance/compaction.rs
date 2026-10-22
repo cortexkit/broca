@@ -305,7 +305,37 @@ fn render_native(message: &Value) -> Result<Vec<Value>, String> {
         _ => Err(format!("unhandled native role {role}")),
     }
 }
+/// `message` as stored: a tag number the runner rendered at the start of a text (`§N§ `) is
+/// not part of the stored message the translation looks for.
+fn without_rendered_tags(message: &Value) -> Value {
+    fn strip(text: &str) -> String {
+        let Some(rest) = text.strip_prefix('§') else {
+            return text.to_owned();
+        };
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        match rest[digits..].strip_prefix("§ ") {
+            Some(after) if digits > 0 => after.to_owned(),
+            _ => text.to_owned(),
+        }
+    }
+    let mut message = message.clone();
+    match &mut message["content"] {
+        Value::String(text) => *text = strip(text),
+        Value::Array(parts) => {
+            for part in parts {
+                if let Some(Value::String(text)) = part.get_mut("text") {
+                    *text = strip(text);
+                }
+            }
+        }
+        _ => {}
+    }
+    message
+}
+
 fn translate(state: &Session, wire: &[Value]) -> Result<Vec<ModelEntry>, String> {
+    let wire: Vec<Value> = wire.iter().map(without_rendered_tags).collect();
+    let wire = wire.as_slice();
     let candidates = state
         .replacements
         .iter()
@@ -446,6 +476,7 @@ fn settlement_records() -> Vec<broca_wal::FramedRecord> {
             stop_when: vec![],
             context_management: None,
             render_tags: false,
+            computed_tags: None,
             turn_directives_v1: None,
         }),
         input: Arc::new(vec![]),

@@ -87,6 +87,7 @@ fn start(input: Vec<Message>) -> WalRecord {
         config: Box::new(RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: ModelHandle::new("anthropic", "claude-opus-5-5"),
             tools: vec![].into(),
             tool_choice: Default::default(),
@@ -135,6 +136,7 @@ fn applied(version: u64, to: u64) -> WalRecord {
         call_when: None,
         stability: None,
         ceiling: None,
+        tag_checkpoint: None,
     }
 }
 

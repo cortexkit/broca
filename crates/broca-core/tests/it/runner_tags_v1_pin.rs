@@ -441,3 +441,95 @@ async fn a_session_written_under_the_stored_ledger_keeps_its_exact_bytes() {
         "the resumed run writes nothing under the computed rules"
     );
 }
+
+/// The first run on such a session after the switch runs under the computed rules
+/// (`runner-tags/v2`) without renumbering anything a reader has seen: every stored number stays
+/// on its part, so the transcript's earlier reads hold, and the new run's counted parts are
+/// numbered from the stored ledger's high-water. Its requests show the earlier parts exactly as
+/// before and the new ones by the computed rules.
+#[tokio::test]
+async fn the_first_run_after_the_switch_counts_on_from_the_stored_high_water() {
+    let records = load_fixture_records();
+    let high_water = *wal_tags(&records).iter().max().expect("stored numbers");
+    let before = transcript(&records);
+    let store = store_with(&records, "switch");
+    let leases = broca_core::FileLeaseStore::new(scratch("switch-leases"));
+    let mut request = request();
+    request.run_id = RunId("run-after-switch".into());
+    request.input = vec![Message::new(Role::User, vec![text("next question")])];
+    let model = TurnModel {
+        turns: vec![
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![text("§2§ again, as §5§ said")],
+        ],
+        calls: Mutex::new(Vec::new()),
+    };
+    let plane = StubToolPlane::new();
+    let (tx, mut rx) = mpsc::channel(4096);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let summary = broca_core::run_loop_append_episode(
+        request.clone(),
+        &model,
+        &plane,
+        &leases,
+        &AllowAll,
+        &store,
+        None,
+        &tx,
+    )
+    .await
+    .expect("the appended run ends");
+    drop(tx);
+    drain.await.unwrap();
+    assert_eq!(summary.reason, RunFinishReason::Completed);
+    let after = store.read_records(&request.session).unwrap();
+
+    // The run froze the computed rules with the ledger's high-water as its checkpoint, and
+    // stored no number.
+    let started = after[records.len()..]
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::RunStarted { config, .. } => Some(config.computed_tags),
+            _ => None,
+        })
+        .expect("the appended run started");
+    assert_eq!(
+        started,
+        Some(broca_wal::ComputedTagRules {
+            checkpoint: high_water
+        })
+    );
+    assert!(after[records.len()..]
+        .iter()
+        .all(|frame| frame.record.runner_tags().is_empty()));
+
+    // Every earlier part keeps its stored number; the new ones count on above them.
+    let now = transcript(&after);
+    let earlier = before.as_array().unwrap();
+    for (index, entry) in earlier.iter().enumerate() {
+        assert_eq!(now[index]["tags"], entry["tags"], "message {index}");
+    }
+    let new: Vec<Value> = now.as_array().unwrap()[earlier.len()..]
+        .iter()
+        .map(|entry| entry["tags"].clone())
+        .collect();
+    assert_eq!(
+        new,
+        vec![json!([high_water + 1]), json!([high_water + 2])],
+        "the prompt and the model's answer"
+    );
+
+    // The request shows the earlier parts by the stored-ledger rules and the new prompt by the
+    // computed ones; the model's own notation in its answer is cleaned where it is shown.
+    let sent = request_text(&model.calls.lock().unwrap()[0]);
+    assert!(sent.contains("§1§ find the tags"), "{sent}");
+    assert!(sent.contains("§2§ looking"), "{sent}");
+    assert!(
+        sent.contains(&format!("§{}§ next question", high_water + 1)),
+        "{sent}"
+    );
+    let answer = &now.as_array().unwrap().last().unwrap()["message"];
+    assert_eq!(answer["content"][0]["text"], "§2§ again, as §5§ said");
+}

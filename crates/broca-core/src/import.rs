@@ -318,8 +318,9 @@ pub async fn run_import_with_store<W: WalStore>(
         return Err(ImportError::ImportIdReuse);
     }
 
-    // The import's records carry runner tags, counted on from whatever this WAL (a dangling
-    // earlier import) or a lineage retention deleted at this address already used.
+    // The lineage's tag state, counted on from whatever this WAL (a dangling earlier import) or
+    // a lineage retention deleted at this address already used: the import's run freezes it as
+    // its checkpoint.
     let floor = wal_store
         .retired_tag_floor(&request.session)
         .map_err(|error| ImportError::Wal(error.to_string()))?;
@@ -363,7 +364,16 @@ pub async fn run_import_with_store<W: WalStore>(
         ts_ms: epoch_millis(),
         run_id: request.run_id.clone(),
         session: request.session,
-        config: Box::new(import_marker_config(&request_digest)),
+        // Imported under the computed tag rules: nothing is stamped, and since an import renders
+        // no tags its parts carry keys and no numbers. Later runs count on after any number a
+        // retention-deleted predecessor at this address handed out.
+        config: Box::new(import_marker_config(
+            &request_digest,
+            writer
+                .lineage_tags()
+                .unwrap_or(crate::tags::LineageTags::unstarted())
+                .ledger_high(),
+        )),
         input: messages.into(),
         origin,
         submission_id: None,
@@ -397,10 +407,13 @@ pub async fn run_import_with_store<W: WalStore>(
     })
 }
 
-fn import_marker_config(request_digest: &str) -> RunConfig {
+fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunConfig {
     RunConfig {
         turn_directives_v1: None,
         render_tags: false,
+        computed_tags: Some(broca_wal::ComputedTagRules {
+            checkpoint: tag_checkpoint,
+        }),
         model: ModelHandle::new("import", "import"),
         tools: Vec::new().into(),
         tool_choice: ToolChoice::None,

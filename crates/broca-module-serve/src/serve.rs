@@ -5774,6 +5774,7 @@ mod tests {
             config: Box::new(broca_wal::RunConfig {
                 turn_directives_v1: None,
                 render_tags: false,
+                computed_tags: None,
                 model: broca_protocol::request::ModelHandle::new("fake", "fake"),
                 tools: vec![].into(),
                 tool_choice: Default::default(),

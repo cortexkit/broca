@@ -497,7 +497,7 @@ fn drift_run_config(
     req: &broca_core::RunRequest,
     started: &broca_catalog::live::ProviderResolution,
 ) -> broca_wal::RunConfig {
-    broca_wal::RunConfig { turn_directives_v1: None, render_tags: false,
+    broca_wal::RunConfig { turn_directives_v1: None, render_tags: false, computed_tags: None,
         model: req.model.clone(),
         tools: req.tools.clone().into(),
         tool_choice: req.tool_choice.clone(),

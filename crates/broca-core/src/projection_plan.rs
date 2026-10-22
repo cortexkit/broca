@@ -477,6 +477,8 @@ pub fn plan_projection(
         // Legacy budget firings can reconstruct their text from the frozen config. Only
         // metadata is persisted here; the ordinary body projection still validates new firings.
         false,
+        // Only run metadata of this replay is persisted, never its messages or their tags.
+        crate::tags::TagSeed::default(),
     )?;
     let final_run_json = final_state
         .run_finals

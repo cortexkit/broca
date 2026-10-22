@@ -247,6 +247,7 @@ fn seed_idle_run(store: &impl WalStore, request: &RunRequest) {
     let config = RunConfig {
         turn_directives_v1: None,
         render_tags: false,
+        computed_tags: None,
         model: request.model.clone(),
         tools: request.tools.clone().into(),
         tool_choice: request.tool_choice.clone(),
@@ -314,6 +315,7 @@ fn resumable_frozen_config(request: &RunRequest, stop_when: Vec<StopCondition>) 
     RunConfig {
         turn_directives_v1: None,
         render_tags: false,
+        computed_tags: None,
         model: request.model.clone(),
         tools: request.tools.clone().into(),
         tool_choice: request.tool_choice.clone(),

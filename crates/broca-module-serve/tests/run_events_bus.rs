@@ -70,6 +70,7 @@ fn started_at(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
         config: Box::new(RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: ModelHandle::new("fixture", "model"),
             tools: vec![].into(),
             tool_choice: Default::default(),
@@ -305,6 +306,7 @@ async fn real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox() {
                 call_when: None,
                 stability: None,
                 ceiling: Some(broca_wal::OpaqueJson::from_json_text("{}").unwrap()),
+                tag_checkpoint: None,
             },
             true,
         )

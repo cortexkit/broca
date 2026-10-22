@@ -423,6 +423,7 @@ mod tests {
             config: Box::new(RunConfig {
                 turn_directives_v1: None,
                 render_tags: false,
+                computed_tags: None,
                 model: ModelHandle::new("stub", "m"),
                 tools: vec![].into(),
                 tool_choice: ToolChoice::Auto,

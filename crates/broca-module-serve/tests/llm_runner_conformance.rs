@@ -56,6 +56,9 @@ const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 const SESSION_MARKER: &str = "conformance-session:";
 /// The harness every session the suite opens is bound under.
 const HARNESS: &str = "conformance";
+/// The member of a scripted tool result that holds the content blocks the scripted tool
+/// provider answers with as they are, instead of the result's JSON as one text block.
+const OWN_CONTENT: &str = "$broca_content";
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/bus.rs"]
 mod bus;
@@ -358,7 +361,21 @@ fn observe_model_request(
         observation =
             observation.with_submit_result_schema(submit["function"]["parameters"].clone());
     }
-    observation
+    // Every text the model received, in request order, as it received it (a rendered tag
+    // prefix included): message content strings and text parts, tool results included.
+    let mut rendered = Vec::new();
+    for message in request["messages"].as_array().into_iter().flatten() {
+        match &message["content"] {
+            Value::String(text) => rendered.push(text.clone()),
+            Value::Array(parts) => rendered.extend(
+                parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str().map(str::to_owned)),
+            ),
+            _ => {}
+        }
+    }
+    observation.with_rendered(rendered)
 }
 
 async fn serve_model_request(
@@ -683,6 +700,13 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
             }
         }
         let result = self.shared.results.lock().unwrap().get(&arguments).cloned();
+        // A scripted result naming its own content blocks (an image-only result) is answered
+        // with them as they are.
+        if let Some(content) = result.as_ref().and_then(|result| result.get(OWN_CONTENT)) {
+            return subc_client_rs::HandlerOutcome::Response(
+                serde_json::to_vec(&json!({ "content": content })).unwrap(),
+            );
+        }
         let text = result.map_or_else(
             || format!("no scripted result for arguments {arguments}"),
             |result| result.to_string(),
@@ -1710,6 +1734,8 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::TurnDirectives,
             Capability::HoldToolCalls,
             Capability::Tags,
+            Capability::TagCheckpoint,
+            Capability::RenderedModelInput,
             Capability::DeliveryOrder,
             Capability::Compaction,
             Capability::ModelView,
@@ -1811,6 +1837,15 @@ impl LlmRunnerSubject for BrocaSubject {
         first: bool,
         members: &Map<String, Value>,
     ) -> Option<Map<String, Value>> {
+        // A session with a scripted compaction provider keeps its compaction plan, the extra
+        // members beside the plan's own.
+        if compaction::known_session(&self.shared, session) {
+            let mut fields = self.compaction_fields(session, first)?;
+            if let Some(plan) = fields.get_mut("plan").and_then(Value::as_object_mut) {
+                plan.extend(members.clone());
+            }
+            return Some(fields);
+        }
         self.shared
             .plan_sessions
             .lock()
@@ -1956,6 +1991,30 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(&arguments.to_string())
             .copied()
             .unwrap_or(0)
+    }
+
+    /// An image-only tool result. Broca keeps no image bytes: its tool plane maps the image to
+    /// a placeholder naming its MIME type, which carries `marker` so the case finds the entry.
+    fn image_tool_result(&self, marker: &str) -> Option<Value> {
+        Some(json!({ OWN_CONTENT: [{
+            "type": "image",
+            "mimeType": format!("image/png; name={marker}"),
+            "data": "aGk=",
+        }]}))
+    }
+
+    /// Broca has no fork or clone operation, so no session is ever a fork the runner could
+    /// detect; the fork case names that as inapplicable.
+    async fn fork_session(
+        &self,
+        _handle: &Self::Handle,
+        _parent: &str,
+        _fork: &str,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::new(
+            "broca has no fork or clone operation: a session cannot be forked, so there is no \
+             fork of a managed session for the runner to refuse",
+        ))
     }
 
     fn not_executed_tool_result(

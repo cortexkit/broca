@@ -271,6 +271,7 @@ mod tests {
             call_when: None,
             stability: None,
             ceiling: None,
+            tag_checkpoint: None,
         }
     }
 

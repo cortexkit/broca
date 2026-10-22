@@ -141,6 +141,7 @@ pub(super) fn setup_record(ceiling: Option<&str>) -> WalRecord {
         call_when: None,
         stability: None,
         ceiling: ceiling.map(|json| OpaqueJson::from_json_text(json).unwrap()),
+        tag_checkpoint: None,
     }
 }
 
@@ -170,6 +171,7 @@ fn synchronous_records() -> Vec<WalRecord> {
                 },
             ]),
             ceiling: None,
+            tag_checkpoint: None,
         },
         WalRecord::CompactionRequest {
             provider: "provider".into(),
@@ -191,6 +193,7 @@ fn synchronous_records() -> Vec<WalRecord> {
             call_when: None,
             stability: None,
             ceiling: None,
+            tag_checkpoint: None,
         },
         WalRecord::CompactionAnswer {
             provider: "provider".into(),

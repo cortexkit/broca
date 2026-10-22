@@ -129,6 +129,7 @@ impl Fixture {
                 config: Box::new(RunConfig {
                     turn_directives_v1: None,
                     render_tags: false,
+                    computed_tags: None,
                     model: ModelHandle::new("stub", "projection-bench"),
                     tools: Vec::new().into(),
                     tool_choice: Default::default(),

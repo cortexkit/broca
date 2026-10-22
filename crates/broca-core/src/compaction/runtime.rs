@@ -646,7 +646,7 @@ impl Runtime<'_> {
         if answer.request_id() != request_id {
             return Err(unavailable());
         }
-        let (initial, ceiling) = match answer {
+        let (initial, ceiling, checkpoint) = match answer {
             SetupAnswer::Refuse {
                 code,
                 reason,
@@ -661,8 +661,11 @@ impl Runtime<'_> {
                 )))
             }
             SetupAnswer::Ready {
-                initial, ceiling, ..
-            } => (initial, ceiling),
+                initial,
+                ceiling,
+                checkpoint,
+                ..
+            } => (initial, ceiling, checkpoint),
             // The answer decodes strictly on `answer`, so no other kind reaches here.
             #[allow(unreachable_patterns)]
             _ => return Err(unavailable()),
@@ -693,6 +696,12 @@ impl Runtime<'_> {
             ceiling: ceiling.map(|policy| {
                 OpaqueJson::from_json_text(serde_json::to_string(&policy).expect("role JSON"))
                     .expect("role JSON")
+            }),
+            // Recorded with the answer, so a resume, a read and a restart anchor numbering at
+            // the same cut.
+            tag_checkpoint: checkpoint.map(|checkpoint| broca_wal::SetupTagCheckpoint {
+                tag_checkpoint: checkpoint.tag_checkpoint,
+                cut: checkpoint.cut,
             }),
         };
         let mut state = CompactionState::default();

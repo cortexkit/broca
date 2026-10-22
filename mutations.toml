@@ -22332,6 +22332,34 @@ new = "    Retracted,\n    Unknown, // NON-VACUITY BREAK: reject future queued s
 [[control]]
 id = "caller-unknown-control-event-reset-fallback"
 guards = "An unknown caller control event clears partial display state instead of failing stream decoding"
+id = "tags-switch-counts-on-from-the-ledger-high-water"
+guards = "The first run under the computed tag rules starts above every number the stored ledger handed out, so no number a reader saw is reused"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
+expect_red = ["runner_tags_v1_pin::the_first_run_after_the_switch_counts_on_from_the_stored_high_water"]
+file = "crates/broca-core/src/run.rs"
+old = "                checkpoint: ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)),"
+new = "                checkpoint: 0 * ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)), // NON-VACUITY BREAK: forget the ledger's high-water."
+
+[[control]]
+id = "tags-run-in-flight-keeps-the-stored-ledger"
+guards = "A run frozen under runner-tags/v1 resumes with its old numbering and exact old request bytes"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
+expect_red = ["runner_tags_v1_pin::a_session_written_under_the_stored_ledger_keeps_its_exact_bytes"]
+file = "crates/broca-core/src/run.rs"
+old = "            config.and_then(|config| config.computed_tags),"
+new = "            Some(broca_wal::ComputedTagRules { checkpoint: 0 }), // NON-VACUITY BREAK: resume a ledger run under the computed rules."
+
+[[control]]
+id = "tags-only-parts-rendered-with-a-number-count"
+guards = "Reasoning, tool calls, empty text and JSON tool output never take a tag number"
 runner = "cargo"
 package = "broca-protocol"
 target = "--lib"
@@ -22345,6 +22373,15 @@ new = "    /// Unknown future control events use this conservative reset fallbac
 [[control]]
 id = "display-unknown-event-reset-fallback"
 guards = "An unknown display event resets partial state instead of failing the stream frame"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::computed_numbering_counts_only_parts_rendered_with_a_number"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "                    .is_some_and(cortexkit_role_llm_runner::tags::counts);"
+new = "                    .is_some(); // NON-VACUITY BREAK: number every known part."
+
+[[control]]
+id = "tags-image-only-result-renders-its-label"
+guards = "An image-only tool result renders as its number and the [image] label"
 runner = "cargo"
 package = "broca-protocol"
 target = "--lib"
@@ -22631,3 +22668,74 @@ expect_red = ["runtime::tests::an_amountless_stated_zero_rate_is_a_known_zero_pr
 file = "crates/broca-catalog/src/runtime.rs"
 old = "        return Some(0.0);"
 new = "        return None; // NON-VACUITY BREAK: read a free side as unpriced."
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::computed_rendering_numbers_cleans_and_labels"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "                        *text = cortexkit_role_llm_runner::tags::image_label(number);"
+new = "                        *text = cortexkit_role_llm_runner::tags::render_counted_text(number, text); // NON-VACUITY BREAK: render the placeholder text."
+
+[[control]]
+id = "tags-setup-checkpoint-anchors-its-cut"
+guards = "A compaction provider's Setup checkpoint numbers the cut message and later ones after the checkpoint"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+only = false
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::a_setup_checkpoint_renumbers_from_its_cut", "tags::tests::a_crash_after_setup_replays_the_anchored_numbers"]
+file = "crates/broca-core/src/tags.rs"
+old = "            .max(anchor);"
+new = "            .max(anchor * 0); // NON-VACUITY BREAK: ignore the checkpoint's number."
+
+[[control]]
+id = "tags-marker-checkpoint-wins-over-setup"
+guards = "An in-effect marker carrying a checkpoint takes precedence over the Setup checkpoint"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::an_in_effect_marker_checkpoint_wins_over_the_setup_checkpoint"]
+file = "crates/broca-core/src/tags.rs"
+old = "            cortexkit_role_llm_runner::tags::anchor(session, markers, Some(&setup), |cut| {"
+new = "            cortexkit_role_llm_runner::tags::anchor(session, &markers[..0], Some(&setup), |cut| { // NON-VACUITY BREAK: drop the markers."
+
+[[control]]
+id = "tags-structured-final-text-is-never-cleaned"
+guards = "A final_text structured-output run's text is exposed raw, whatever its plan renders"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::only_a_tag_rendering_run_that_is_not_final_text_output_cleans"]
+file = "crates/broca-core/src/tags.rs"
+old = "        clean: render_tags && !structured_final_text(frozen_render_config),"
+new = "        clean: render_tags || structured_final_text(frozen_render_config), // NON-VACUITY BREAK: clean structured output."
+
+[[control]]
+id = "tags-setup-checkpoint-is-must-understand"
+guards = "A Setup record carrying a tag checkpoint requires runner-tags/v2, so an older reader refuses it"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::a_crash_after_setup_replays_the_anchored_numbers"]
+file = "crates/broca-wal/src/record.rs"
+old = "            WalRecord::CompactionMessage { tag_checkpoint, .. } => tag_checkpoint.is_some(),"
+new = "            WalRecord::CompactionMessage { tag_checkpoint, .. } => tag_checkpoint.is_none() && false, // NON-VACUITY BREAK: write the checkpoint ungated."
+
+[[control]]
+id = "template-part-tag-names-a-shown-part"
+guards = "A part_tag slot renders only the number the part its {mid, part} names shows"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::shown_number_tests::a_part_tag_names_the_number_its_part_shows"]
+file = "crates/broca-module/src/actor.rs"
+old = "    if key_message != part.mid {"
+new = "    if key_message != part.mid && false { // NON-VACUITY BREAK: accept a part key of another message."

@@ -184,6 +184,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
     RUNNER_TAGS_FEATURE,
+    RUNNER_TAGS_V2_FEATURE,
     RUN_CANCEL_AT_FEATURE,
     SCOPE_FEATURE,
     SESSION_CLASS_FEATURE,
@@ -257,6 +258,14 @@ pub const RETENTION_FEATURE: &str = "retention/v1";
 /// run's requests without the tags it was admitted to show. Every record of a session admitted
 /// by a tag-writing build carries them; sessions admitted earlier keep their exact bytes.
 pub const RUNNER_TAGS_FEATURE: &str = "runner-tags/v1";
+
+/// Computed runner tags (llm-runner 0.4.0 `tags::RULES_FEATURE`): a run start frozen under the
+/// rules that number parts from the transcript instead of storing a number per part
+/// (`RunConfig::computed_tags`, carrying the run's starting checkpoint), and a compaction Setup
+/// record carrying the provider's Setup checkpoint (`CompactionMessage::tag_checkpoint`). A
+/// reader that skipped either would stamp the run's parts with stored numbers, render its
+/// requests by the old rules, or number the session from the wrong anchor.
+pub const RUNNER_TAGS_V2_FEATURE: &str = "runner-tags/v2";
 
 /// Pending cancellation changes recovery's next action, so a reader may not skip it.
 pub const RUN_CANCEL_AT_FEATURE: &str = "run-cancel-at/v1";
@@ -939,6 +948,7 @@ mod tests {
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
                 RUNNER_TAGS_FEATURE,
+                RUNNER_TAGS_V2_FEATURE,
                 RUN_CANCEL_AT_FEATURE,
                 SCOPE_FEATURE,
                 SESSION_CLASS_FEATURE,
@@ -951,6 +961,7 @@ mod tests {
         );
         assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
         assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");
+        assert_eq!(RUNNER_TAGS_V2_FEATURE, "runner-tags/v2");
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
         assert_eq!(COMPACTION_FEATURE, "compaction/v1");
         assert_eq!(COMPACTION_WAIT_FEATURE, "compaction-wait/v1");

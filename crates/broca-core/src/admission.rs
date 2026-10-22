@@ -1172,6 +1172,7 @@ mod tests {
         RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: ModelHandle::new("stub", model),
             tools: Arc::new(vec![
                 Tool {

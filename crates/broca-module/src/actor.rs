@@ -7588,6 +7588,49 @@ fn shown_number(
 }
 
 #[cfg(test)]
+mod shown_number_tests {
+    use super::shown_number;
+    use cortexkit_role_llm_runner::delivery_order::PartRef;
+
+    /// A `part_tag` slot renders the number the transcript shows for the part its `{mid, part}`
+    /// names; a part that shows none, or that no message has, is gone.
+    #[test]
+    fn a_part_tag_names_the_number_its_part_shows() {
+        let mut shown = broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text { text: "hi".into() }],
+        );
+        let mut quiet = shown.clone();
+        let mut high = 41;
+        broca_protocol::tags::number_message(
+            &mut shown,
+            broca_protocol::tags::ComputedRules {
+                render: true,
+                clean: true,
+            },
+            &mut high,
+        );
+        broca_protocol::tags::number_message(
+            &mut quiet,
+            broca_protocol::tags::ComputedRules {
+                render: false,
+                clean: false,
+            },
+            &mut high,
+        );
+        let mut transcript = vec![shown, quiet];
+        broca_protocol::content::stamp_ordinals(&mut transcript);
+        assert_eq!(
+            shown_number(&transcript, &PartRef::new("m0", "m0#0")),
+            Some(42)
+        );
+        assert_eq!(shown_number(&transcript, &PartRef::new("m1", "m1#0")), None);
+        assert_eq!(shown_number(&transcript, &PartRef::new("m7", "m7#0")), None);
+        assert_eq!(shown_number(&transcript, &PartRef::new("m0", "m1#0")), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
@@ -7696,6 +7739,7 @@ mod tests {
         broca_wal::RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: broca_protocol::request::ModelHandle::new("fake", "fake"),
             tools: vec![].into(),
             tool_choice: Default::default(),

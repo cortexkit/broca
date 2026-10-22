@@ -1,14 +1,15 @@
-//! Request bytes of a run frozen with `render_tags` are the bytes a rebuild from the WAL gives,
-//! at every step. That is broca's resume rule: a resumed run renders from the WAL, so a live
-//! request that differed from the rebuild would change the prompt the provider has cached.
+//! Request bytes of a run frozen with `render_tags` under the computed tag rules are the bytes a
+//! rebuild from the WAL gives, at every step. That is broca's resume rule: a resumed run renders
+//! from the WAL, so a live request that differed from the rebuild would change the prompt the
+//! provider has cached.
 //!
-//! The live loop attaches tags to the messages it adds from what the writer assigned, and a
-//! rebuild attaches them from the records. Each case here compares the two, step by step, where
-//! the live side could drift: a steer joining the running turn, a budget nudge, a tool call id
-//! the model repeats, a budget finalize turn whose calls are dropped, a resumed pending turn,
-//! and a crash cut at every record boundary of a tool loop with a steer. The cases run for a
-//! family that keeps assistant tags as metadata and for Anthropic Messages, which shows them
-//! in assistant text, so every assistant turn's rendering is compared too.
+//! The live loop numbers the messages it adds as they join the prompt, and a rebuild numbers
+//! them as replay places them. Each case here compares the two, step by step, where the live
+//! side could drift: a steer joining the running turn, a budget nudge, a tool call id the model
+//! repeats, a budget finalize turn whose calls are dropped, a resumed pending turn, and a crash
+//! cut at every record boundary of a tool loop with a steer. The cases run with no family and
+//! with Anthropic Messages, whose renderers differ, so every assistant turn's rendering is
+//! compared on both.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -343,12 +344,31 @@ fn wal_tags(records: &[FramedRecord]) -> Vec<u64> {
         .collect()
 }
 
+/// The numbers the replayed transcript shows, in transcript order.
+fn transcript_numbers(records: &[FramedRecord]) -> Vec<u64> {
+    let records: Vec<WalRecord> = records.iter().map(|frame| frame.record.clone()).collect();
+    broca_core::replay(&records)
+        .unwrap()
+        .prompt
+        .iter()
+        .filter_map(|message| message.part_tags())
+        .flat_map(|tags| tags.parts.iter().flatten().copied().collect::<Vec<_>>())
+        .collect()
+}
+
+/// The run stores no number, and the transcript numbers its counted parts one after another
+/// from 1, in the order a request renders them.
 fn assert_tags_increase(label: &str, records: &[FramedRecord]) {
-    let tags = wal_tags(records);
-    assert!(!tags.is_empty(), "{label}: the session is tagged");
     assert!(
-        tags.windows(2).all(|pair| pair[0] < pair[1]),
-        "{label}: tags {tags:?}"
+        wal_tags(records).is_empty(),
+        "{label}: the computed rules store no number"
+    );
+    let numbers = transcript_numbers(records);
+    assert!(!numbers.is_empty(), "{label}: the session is numbered");
+    assert_eq!(
+        numbers,
+        (1..=numbers.len() as u64).collect::<Vec<_>>(),
+        "{label}: numbers in rendered order"
     );
 }
 
@@ -401,27 +421,22 @@ async fn a_steer_mid_run_renders_live_as_its_rebuild() {
                 .any(|text| text.starts_with('§') && text.ends_with("§ also check the docs")),
             "{label}: the steer is rendered with its tag: {second:?}"
         );
-        // The first assistant text's tag is the one right after the user input's.
+        // The model's text is numbered on every family: the first one right after the user
+        // input.
         let third = sent_texts(&run.calls[2]);
-        let anthropic = family.is_some();
-        assert_eq!(
+        assert!(
             third.contains(&"§2§ looking".to_owned()),
-            anthropic,
             "{label}: {third:?}"
         );
-        assert_eq!(third.contains(&"looking".to_owned()), !anthropic, "{label}");
-        // The model's own (wrong) mark is replaced by the part's tag on Anthropic, and kept
-        // as written elsewhere.
-        assert_eq!(
-            third.contains(&"§99§ checking again".to_owned()),
-            !anthropic,
+        assert!(!third.contains(&"looking".to_owned()), "{label}");
+        // The model's own (wrong) mark is cleaned, and the part shows its own number.
+        assert!(
+            !third.iter().any(|text| text.contains("§99§")),
             "{label}: {third:?}"
         );
-        if anthropic {
-            assert!(third
-                .iter()
-                .any(|text| text.ends_with("§ checking again") && !text.starts_with("§99§")));
-        }
+        assert!(third
+            .iter()
+            .any(|text| text.ends_with("§ checking again") && text.starts_with('§')));
     }
 }
 
@@ -507,20 +522,10 @@ async fn a_finalize_turn_keeps_its_kept_blocks_tags_and_renders_as_its_rebuild()
     .await;
     assert_tags_increase("finalize", &run.records);
     assert_live_matches_rebuilt("finalize", &run, 0);
-    let (at, finalize_tags) = run
+    let at = run
         .records
         .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(at, frame)| match &frame.record {
-            WalRecord::ModelStepFinished { tags, .. } => Some((
-                at,
-                tags.as_deref()
-                    .cloned()
-                    .expect("the finalize step is tagged"),
-            )),
-            _ => None,
-        })
+        .rposition(|frame| matches!(frame.record, WalRecord::ModelStepFinished { .. }))
         .expect("the finalize step");
     let mut records: Vec<WalRecord> = run.records.iter().map(|f| f.record.clone()).collect();
     let transcript_answer = |records: &[WalRecord]| {
@@ -534,35 +539,25 @@ async fn a_finalize_turn_keeps_its_kept_blocks_tags_and_renders_as_its_rebuild()
     };
     let answer = transcript_answer(&records);
     assert_eq!(answer.content, vec![text("final answer")]);
-    assert_eq!(
-        answer.part_tags().unwrap().parts,
-        vec![Some(finalize_tags.parts[0])],
-        "the kept text block keeps the tag the writer gave it"
+    let kept = answer.part_tags().unwrap().parts.clone();
+    assert!(
+        matches!(kept.as_slice(), [Some(_)]),
+        "the kept text block is numbered: {kept:?}"
     );
 
-    // A finalize record that still holds a call (one a provider emitted, tagged like every
-    // block): replay drops the call, and the text keeps its own tag, not the call's.
-    let next = wal_tags(&run.records).last().copied().unwrap() + 1;
+    // A finalize record that still holds a call (one a provider emitted): replay drops the
+    // call, and the text keeps its number, since a call never counts.
     if let WalRecord::ModelStepFinished {
-        assistant_message,
-        tags,
-        ..
+        assistant_message, ..
     } = &mut records[at]
     {
         let mut message = (**assistant_message).clone();
         message.content.insert(0, call("late"));
         *assistant_message = Arc::new(message);
-        *tags = Some(Box::new(broca_protocol::tags::MessageTags::new(vec![
-            next,
-            finalize_tags.parts[0],
-        ])));
     }
     let answer = transcript_answer(&records);
     assert_eq!(answer.content, vec![text("final answer")]);
-    assert_eq!(
-        answer.part_tags().unwrap().parts,
-        vec![Some(finalize_tags.parts[0])]
-    );
+    assert_eq!(answer.part_tags().unwrap().parts, kept);
 }
 
 /// Kill at every record boundary of a tagged tool loop with a steer, resume, and check: every

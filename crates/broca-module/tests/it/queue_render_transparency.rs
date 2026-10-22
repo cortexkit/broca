@@ -652,6 +652,7 @@ fn recovered_stop_config() -> broca_wal::RunConfig {
     broca_wal::RunConfig {
         turn_directives_v1: None,
         render_tags: false,
+        computed_tags: None,
         model: ModelHandle::new("anthropic", "claude-opus-4-8"),
         tools: vec![Tool {
             name: "edit".into(),
