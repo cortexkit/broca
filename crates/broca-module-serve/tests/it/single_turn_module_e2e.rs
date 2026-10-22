@@ -2690,9 +2690,10 @@ async fn a_provider_401_evicts_the_current_real_vault_credential_from_process_ca
     // The shipped catalog points `atomic-chat` at this loopback port, and real desktop apps
     // listen on it too. Keep it occupied for the whole test -- by this listener when it is free,
     // by whatever already holds it otherwise -- so the arm passes only when aimock boots on its
-    // own port and the provider route really reaches it. The listener never accepts, so a
-    // request that strays onto the catalog port hangs into the run timeout instead of
-    // receiving aimock's 401.
+    // own port and the provider route really reaches it. When this test binds the port, its
+    // listener never accepts, so a request that strays there hangs into the run timeout instead
+    // of receiving aimock's 401; when another process owns it, that process decides the reply,
+    // which is still not aimock's 401.
     let _catalog_port = occupy_atomic_chat_catalog_port();
     let aimock = AiMock::start("vault-provider-401", VAULT_REJECTION_FIXTURES).await;
     if aimock.is_none() && vault_required() {
