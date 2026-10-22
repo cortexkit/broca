@@ -38,6 +38,12 @@ broca-module = { path = "../broca-module" }
 broca-fetch-plan = { path = "../broca-fetch-plan" }
 cortexkit-role-step-transform-provider = { workspace = true }
 cortexkit-role-llm-runner = { workspace = true }
+# System One classification (classifier/v1) and the batch rules it implements.
+cortexkit-role-classifier = { workspace = true }
+cortexkit-model-batch = { workspace = true }
+# System One's provider calls. The same release and TLS backend broca-provider builds, so the
+# lockfile gains no crate.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 broca-provider = { path = "../broca-provider" }
 # Random bytes for the Claude Code persona's install id and per-episode prompt id. Already in
 # the lockfile (broca-wal uses the same version).
@@ -117,6 +123,8 @@ cortexkit-role-tool-provider = { workspace = true }
 # as a module from inside the test process, through the module SDK.
 cortexkit-role-llm-runner-conformance = { workspace = true }
 cortexkit-role-harness = { workspace = true }
+# The classifier/v1 conformance suite, run against the real classify.run serve path.
+cortexkit-role-classifier-conformance = { workspace = true }
 subc-client-rs = { workspace = true }
 # The native-search-probe example decodes a gzip or deflate response it records raw. Same
 # backend tungstenite already builds, so the lockfile gains no new crate.

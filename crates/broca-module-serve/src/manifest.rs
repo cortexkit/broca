@@ -200,7 +200,15 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             name: OP_ROLE_DESCRIBE.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some(
-                "Describe what this build serves of the llm-runner/v1 role: its ops, capability groups and read byte cap."
+                "Describe the role the route was opened for: on an llm-runner/v1 route its ops, capability groups and read byte cap; on a classifier/v1 route its limits and the models it serves."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: cortexkit_role_classifier::ops::CLASSIFY_RUN.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "classifier/v1 routes only: answer a batch of items against a set of questions with one hosted decision model, idempotent by batch_id; no session is involved."
                     .to_string(),
             ),
         },
@@ -374,11 +382,17 @@ pub fn manifest_configured(
         anchored_to: SignalAnchor::HealthGauges {
             // Open idle/paused actors need no drain time. Opening and closing actors can
             // still hold admission or durable teardown work, so wait for those too.
-            gauges: vec!["runs_in_flight".to_string(), "opening".to_string(), "closing".to_string()],
+            // System One batch calls hold no session but are work a restart would cut.
+            gauges: vec![
+                "runs_in_flight".to_string(),
+                "opening".to_string(),
+                "closing".to_string(),
+                "system_one_batches_in_flight".to_string(),
+            ],
         },
         cadence: None,
         domain: Some("runs".to_string()),
-        note: Some("Active runs and actors opening or closing. Restart-paused runs are idle and do not hold the drain open.".to_string()),
+        note: Some("Active runs, actors opening or closing, and System One batch calls. Restart-paused runs are idle and do not hold the drain open.".to_string()),
     }];
         // An absent retention creates no timer, so it must make no standing signal claim.
         if archive.enabled() {
@@ -413,6 +427,10 @@ pub fn manifest_configured(
         provides: vec![
             broca_wire::LLM_RUNNER_V1.to_string(),
             broca_wire::agent_data::PROVIDES.to_string(),
+            // System One's decision models, on management routes opened declaring the
+            // `classifier` role. A caller finds broca by this entry, then picks it for a model
+            // its classifier `role.describe` lists.
+            cortexkit_role_classifier::PROVIDES.to_string(),
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
         ],
@@ -521,11 +539,11 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "agent-data/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
+                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),
-            "broca declares runner and agent-data roles, flow and agent-run scope handling, and requires or denies nothing"
+            "broca declares runner, agent-data and classifier roles, flow and agent-run scope handling, and requires or denies nothing"
         );
         //
         // `consumes` has skip_serializing_if = "Vec::is_empty" since subc-protocol 0.19.0, so

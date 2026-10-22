@@ -23468,3 +23468,98 @@ expect_message = "refused_overlapping_batch=0"
 file = "crates/broca-core/examples/replay-corpus-scan.rs"
 old = "                if reason == OVERLAPPING_BATCH_REASON =>"
 new = "                if false && reason == OVERLAPPING_BATCH_REASON => // NON-VACUITY BREAK: file overlap refusals with the others."
+
+[[control]]
+id = "system-one-batch-id-reuse-refused"
+guards = "A System One batch_id re-sent with a different body is refused batch_id_reuse and never served another body's stored answers"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one_tests.rs"
+expect_red = ["system_one::tests::a_different_body_is_reuse_and_writes_nothing"]
+file = "crates/broca-store/src/system_one.rs"
+old = "        if digest != claim.body_digest {"
+new = "        if false && digest != claim.body_digest { // NON-VACUITY BREAK: treat any body as the recorded one."
+
+[[control]]
+id = "system-one-single-flight-per-batch"
+guards = "A batch another call holds is refused batch_in_progress, so no item is sent to the provider twice at once"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one_tests.rs"
+expect_red = [
+    "system_one::tests::a_running_batch_is_in_progress_and_untouched",
+    "system_one::tests::startup_releases_batches_a_crashed_process_left_running",
+]
+file = "crates/broca-store/src/system_one.rs"
+old = """        if state == "running" {"""
+new = """        if false && state == "running" { // NON-VACUITY BREAK: let a second holder in."""
+
+[[control]]
+id = "system-one-ceiling-only-tightens"
+guards = "A re-send's max_cost_usd can lower a batch's recorded ceiling and never raise it"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one_tests.rs"
+expect_red = ["system_one::tests::the_ceiling_tightens_durably_and_never_loosens"]
+file = "crates/broca-store/src/system_one.rs"
+old = "            (Some(recorded), Some(sent)) => Some(recorded.min(sent)),"
+new = "            (Some(_recorded), Some(sent)) => Some(sent), // NON-VACUITY BREAK: the re-send's ceiling replaces the recorded one."
+
+[[control]]
+id = "system-one-retention-cutoff-seven-days"
+guards = "A System One batch and its outcomes are deleted exactly seven days after first admission, not later"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one_tests.rs"
+expect_red = ["system_one::tests::retention_deletes_a_batch_exactly_seven_days_after_first_admission"]
+file = "crates/broca-store/src/system_one.rs"
+old = "        let cutoff = now_ms.saturating_sub(RETENTION_MS);"
+new = "        let cutoff = now_ms.saturating_sub(RETENTION_MS + 1); // NON-VACUITY BREAK: keep batches one millisecond past retention."
+
+[[control]]
+id = "system-one-resend-asks-only-unanswered"
+guards = "A re-send serves stored answers and calls the provider only for items still needing an outcome, including after an interrupted call"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+only = false
+test_file = "crates/broca-module-serve/src/system_one/tests.rs"
+expect_red = ["system_one::tests::a_resend_after_an_interrupted_call_asks_only_unanswered_items"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "            Outcome::Answered(_) => true,"
+new = "            Outcome::Answered(_) => false, // NON-VACUITY BREAK: re-ask stored answers."
+
+[[control]]
+id = "system-one-wrong-kind-refused"
+guards = "classify.run refuses a catalog row whose kind is not a decision model with model_not_classifier naming the kind"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/tests.rs"
+expect_red = ["system_one::tests::the_catalog_row_decides_the_kind_refusals"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "            Some(kind) => CatalogRow::Kind(kind),"
+new = "            Some(_kind) => CatalogRow::Kind(CLASSIFIER_KIND), // NON-VACUITY BREAK: read any stated kind as a classifier."
+
+[[control]]
+id = "system-one-kindless-row-refused"
+guards = "classify.run refuses a catalog row that states no kind, never inventing one"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/tests.rs"
+expect_red = ["system_one::tests::the_catalog_row_decides_the_kind_refusals"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "            None => CatalogRow::Kindless,"
+new = "            None => CatalogRow::Kind(CLASSIFIER_KIND), // NON-VACUITY BREAK: read a kindless row as a classifier."

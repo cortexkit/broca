@@ -1155,3 +1155,49 @@ async fn restart_resume_admission_refusal_seals_interrupted_with_reason() {
         .any(|record| matches!(record, WalRecord::ResumeStarted { .. })));
     assert!(registry.stop_and_seal().await);
 }
+
+/// A System One batch call holds no session, so the stop sees it only through the batch gauge.
+/// The grace waits for a batch the same as for a run, and no longer: a batch still running when
+/// the grace ends does not hold the stop open.
+#[tokio::test]
+async fn the_stop_grace_waits_for_batches_but_never_past_its_end() {
+    let f = Fixture::new(Hold::UntilReleased, vec![edit_step()]);
+    let gauge = f.registry.batches_in_flight_gauge();
+    gauge.store(1, Ordering::Relaxed);
+    assert_eq!(f.registry.slot_counts().batches_in_flight, 1);
+    let lowered = gauge.clone();
+    let lowering = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        lowered.store(0, Ordering::Relaxed);
+    });
+    let started = tokio::time::Instant::now();
+    assert!(
+        f.registry
+            .stop_and_seal_with_budget(Duration::from_secs(5), TOTAL)
+            .await
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(150),
+        "the grace ended before the batch did: {waited:?}"
+    );
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+    lowering.await.unwrap();
+
+    let f = Fixture::new(Hold::UntilReleased, vec![edit_step()]);
+    f.registry
+        .batches_in_flight_gauge()
+        .store(1, Ordering::Relaxed);
+    let started = tokio::time::Instant::now();
+    assert!(
+        f.registry
+            .stop_and_seal_with_budget(Duration::from_millis(200), TOTAL)
+            .await
+    );
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(200), "{waited:?}");
+    assert!(
+        waited < Duration::from_secs(2),
+        "a batch that outlives the grace held the stop open: {waited:?}"
+    );
+}

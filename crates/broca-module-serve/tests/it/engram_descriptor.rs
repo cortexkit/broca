@@ -27,7 +27,7 @@ fn tracked_descriptor() -> serde_json::Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("tracked descriptor is not JSON: {e}"))
 }
 
-/// The backup descriptor declares nine entries. Engram includes only `portable` entries in
+/// The backup descriptor declares ten entries. Engram includes only `portable` entries in
 /// each backup generation; `rebuild`, `device-local` and `excluded` entries are left out.
 /// Only durable sessions are backed up, in their own trees. `wal/` and
 /// `wal-archive/` hold disposable sessions whose callers relaunch rather than restore
@@ -37,7 +37,7 @@ fn tracked_descriptor() -> serde_json::Value {
 /// not depend on these trees surviving a disk loss: the billing collector ingests export
 /// facts into its own backed-up store.
 #[test]
-fn the_tracked_descriptor_declares_brocas_nine_entries_with_their_classes() {
+fn the_tracked_descriptor_declares_brocas_ten_entries_with_their_classes() {
     let d = tracked_descriptor();
     assert_eq!(d["module_id"], "broca");
 
@@ -74,6 +74,9 @@ fn the_tracked_descriptor_declares_brocas_nine_entries_with_their_classes() {
         ("broca/run-index", "rebuild", "whole-db"),
         ("broca/session-archive", "excluded", "filetree"),
         ("broca/session-wals", "excluded", "filetree"),
+        // System One's batch store keeps caller text for seven days by ruling; a backup
+        // generation would keep it longer.
+        ("broca/system-one", "excluded", "whole-db"),
     ]
     .iter()
     .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))

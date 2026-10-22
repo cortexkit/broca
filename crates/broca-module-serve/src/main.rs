@@ -140,6 +140,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_overrides =
         broca_module_serve::provider_overrides::ProviderOverrides::load_default_path()
             .map_err(ServeIoError)?;
+    // System One's TypeSafe endpoint honours the same boot override a chat provider does.
+    let typesafe_base_url = provider_overrides.base_url("typesafe").map(str::to_owned);
     let stop_signal = shutdown_signal()?;
     // Where the WAL, leases and run index live. Resolved before any connection is made so a
     // machine that cannot place its durable state refuses to start by name instead of first
@@ -424,6 +426,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
+    // System One's provider credential. Without a vault (the mock provider path) its requests
+    // carry none, as every run's do there.
+    let mut system_one_credential: Arc<
+        dyn broca_module_serve::system_one::typesafe::CredentialSource,
+    > = Arc::new(broca_module_serve::system_one::typesafe::NoCredential);
     // Open the vault only when a real provider call will actually be made. A mock base_url
     // path authenticates with AuthMode::None for every run (see `decide_auth`), so the vault
     // is unused there — skip it. The default is now the vault, but the mock path never needs
@@ -522,6 +529,25 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             account_selection,
         ));
         broca_module_serve::account_routing::publish_counters(routing.counters());
+        // System One reads its provider key by grant like a run does, on a vault route of its
+        // own so its credential reads never queue behind a session's.
+        system_one_credential =
+            Arc::new(broca_module_serve::system_one::typesafe::VaultCredential {
+                client: Arc::new(broca_subc::VaultClient::new(
+                    Arc::clone(&vault_conn),
+                    &vault_module,
+                    &vault_bind,
+                    VAULT_READY_TIMEOUT,
+                )),
+                vault_id: addressing
+                    .vault_id_for(
+                        &broca_module_serve::CredentialId::parse(
+                            broca_module_serve::system_one::typesafe::CREDENTIAL_ID,
+                        )
+                        .expect("the TypeSafe credential id parses"),
+                    )
+                    .into_owned(),
+            });
         let client = broca_subc::VaultClient::new(
             vault_conn,
             &vault_module,
@@ -592,6 +618,40 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cap_store),
     ));
     registry.set_retention_service(retention);
+    // System One: decision models served in this process with no session. Its batch record
+    // is its own file; `run-index.db` is a rebuildable projection and cannot hold an authority.
+    let system_one = {
+        let store = Arc::new(
+            broca_store::SystemOneStore::open(state_root.join("system-one.db"))
+                .map_err(|e| ServeIoError(format!("open System One batch store: {e}")))?,
+        );
+        let config = broca_module_serve::system_one::Config::default();
+        let typesafe = broca_module_serve::system_one::typesafe::TypeSafe::new(
+            typesafe_base_url.as_deref(),
+            Arc::clone(&system_one_credential),
+            config.attempt_timeout,
+        )
+        .map_err(ServeIoError)?;
+        let service = Arc::new(broca_module_serve::system_one::SystemOne::new(
+            store,
+            broca_module_serve::serve::process_launch_id(),
+            Arc::new(broca_module_serve::system_one::LiveCatalog),
+            vec![broca_module_serve::system_one::ModelPin::jev(Arc::new(
+                typesafe,
+            ))],
+            config,
+            registry.batches_in_flight_gauge(),
+        ));
+        let released = service
+            .release_abandoned()
+            .map_err(|e| ServeIoError(format!("release System One batches left running: {e}")))?;
+        if released > 0 {
+            tracing::info!(target: "system_one", released,
+                "released batches a previous process left running; their unanswered items are asked again on re-send");
+        }
+        service
+    };
+    let _system_one_sweep = system_one.spawn_sweeper(registry.stopping_signal());
     let agent_data = Arc::new(broca_module_serve::agent_data::AgentDataService::new(
         state_root.clone(),
         registry.as_ref().clone(),
@@ -786,7 +846,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let stream = connect(&conn_path).await?;
     let (read_half, write_half) = tokio::io::split(stream);
-    let serving = broca_module_serve::serve::serve_connection_with_agent_data(
+    let serving = broca_module_serve::serve::serve_connection_with_services(
         read_half,
         write_half,
         &module_id,
@@ -800,6 +860,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         daemon_capabilities,
         Some(scope_describer),
         Some(agent_data),
+        Some(system_one),
     );
     tokio::pin!(serving);
     tokio::select! {

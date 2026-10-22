@@ -289,6 +289,69 @@ struct ServingCatalog {
     providers: BTreeMap<String, ServingProvider>,
     overlay_removed_models: BTreeMap<String, BTreeSet<String>>,
     withdrawn_models: BTreeMap<String, BTreeSet<String>>,
+    /// Every present row's model-batch facts, by catalog id, whether or not broca resolves a
+    /// chat wire family for its provider. System One (decision and extraction models) is not
+    /// served through a wire family, so a row such as `typesafe/jev-1.13.0`, which the chat
+    /// serving index leaves out, still needs its kind, price and limits read from here.
+    batch_rows: BTreeMap<String, ModelBatchRow>,
+}
+
+/// The facts a model-batch role (`classifier/v1`, `extractor/v1`) reads from one catalog row.
+/// Absent is never zero: a fact the catalog does not state stays `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelBatchRow {
+    /// `model.kind` as served (`decision`, `extraction`, `chat`, ...); `None` when the row
+    /// states no kind.
+    pub kind: Option<String>,
+    /// `limit.context`, the exact context window, when stated.
+    pub context_tokens: Option<u64>,
+    /// `capability.attachment` stated true.
+    pub attachment: bool,
+    /// `rate.input` in nanodollars per million tokens: `Some(0)` for a stated zero, `None`
+    /// when the row does not price input.
+    pub input_rate_nanos: Option<i64>,
+    /// `rate.output` in nanodollars per million tokens, with the same rules as
+    /// `input_rate_nanos`.
+    pub output_rate_nanos: Option<i64>,
+}
+
+/// A fusiform rate as integer nanodollars per million tokens, for spend arithmetic that must
+/// not pass through binary floating point. A rate finer than a nanodollar rounds up, so a
+/// spend bound built on it never understates. `None` for an unpriced or unreadable rate.
+fn batch_rate_nanos(value: Option<&Value>) -> Option<i64> {
+    let rate = value?.as_object()?;
+    if rate.get("state").and_then(Value::as_str) == Some("stated_zero")
+        && !rate.contains_key("units")
+        && !rate.contains_key("exponent")
+    {
+        return Some(0);
+    }
+    if rate.get("currency")?.as_str()? != "USD"
+        || !matches!(rate.get("state")?.as_str()?, "priced" | "stated_zero")
+    {
+        return None;
+    }
+    let units = rate.get("units")?.as_u64()?;
+    let exponent = rate.get("exponent")?.as_u64()?;
+    if exponent > 18 || (rate.get("state")?.as_str()? == "stated_zero" && units != 0) {
+        return None;
+    }
+    let nanos = if exponent <= 9 {
+        u128::from(units) * 10u128.pow(9 - exponent as u32)
+    } else {
+        u128::from(units).div_ceil(10u128.pow(exponent as u32 - 9))
+    };
+    i64::try_from(nanos).ok()
+}
+
+fn batch_row_of(model: &ServingModel, facts: &BTreeMap<String, Value>) -> ModelBatchRow {
+    ModelBatchRow {
+        kind: model.kind.clone(),
+        context_tokens: model.context_limit,
+        attachment: model.attachment == CapabilityFlag::Known(true),
+        input_rate_nanos: batch_rate_nanos(facts.get("rate.input")),
+        output_rate_nanos: batch_rate_nanos(facts.get("rate.output")),
+    }
 }
 
 /// What one assembly of fusiform's model map produced.
@@ -404,6 +467,23 @@ impl CatalogSnapshot {
             .providers
             .get(provider_id)
             .is_some_and(|provider| !provider.models.is_empty())
+    }
+
+    /// The model-batch facts of the row `<provider_id>/<model_id>`, whether or not the chat
+    /// serving index serves it. `None` when the catalog lists no present, readable row for it.
+    pub fn model_batch_row(&self, catalog_id: &str) -> Option<ModelBatchRow> {
+        self.0.catalog.batch_rows.get(catalog_id).cloned()
+    }
+
+    /// Every row whose stated `model.kind` is `kind`, by catalog id in sorted order.
+    pub fn model_batch_rows_of_kind(&self, kind: &str) -> Vec<(String, ModelBatchRow)> {
+        self.0
+            .catalog
+            .batch_rows
+            .iter()
+            .filter(|(_, row)| row.kind.as_deref() == Some(kind))
+            .map(|(id, row)| (id.clone(), row.clone()))
+            .collect()
     }
 
     /// Whether a provider/model pair is in the compact serving index.
@@ -527,6 +607,7 @@ impl ServingCatalog {
         let mut withdrawn_models: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut model_identities = BTreeSet::new();
         let mut excluded_rows = Vec::new();
+        let mut batch_rows = BTreeMap::new();
 
         for (identity, facts) in models {
             let Some((provider_id, model_id)) = identity
@@ -574,6 +655,7 @@ impl ServingCatalog {
                     } else {
                         match serving_model_from_facts(identity, facts) {
                             Ok(mut model) => {
+                                batch_rows.insert(identity.clone(), batch_row_of(&model, facts));
                                 if let Some(patch) = overlay.model_patch(&provider_id, &model_id) {
                                     patch.apply(&mut model);
                                 }
@@ -698,6 +780,7 @@ impl ServingCatalog {
                 providers,
                 overlay_removed_models,
                 withdrawn_models,
+                batch_rows,
             },
             model_identities,
             excluded_rows,
@@ -745,6 +828,9 @@ impl ServingCatalog {
             providers,
             overlay_removed_models,
             withdrawn_models,
+            // The vendored models.dev snapshot states no `model.kind`, so it lists no
+            // model-batch row.
+            batch_rows: BTreeMap::new(),
         }
     }
 
@@ -3176,6 +3262,59 @@ mod tests {
         }
         assert_eq!(rows.len(), 3, "clef, clairic and jev");
         rows
+    }
+
+    /// System One reads a row's kind, price and limits whether or not broca serves its provider
+    /// as chat: Jev's `typesafe` provider has no wire family, yet its row is readable, priced in
+    /// exact nanodollars, and states no context window; a stated-zero output is a zero, not
+    /// absent.
+    #[test]
+    fn model_batch_rows_are_read_without_a_chat_wire_family() {
+        let cache = CatalogCache::empty();
+        cache
+            .refresh(curated_response(1))
+            .expect("curated rows load");
+        let snapshot = cache.snapshot().expect("installed");
+        assert!(!snapshot.contains_model("typesafe", "jev-1.13.0"));
+        let jev = snapshot
+            .model_batch_row("typesafe/jev-1.13.0")
+            .expect("jev's row is readable");
+        assert_eq!(
+            jev,
+            ModelBatchRow {
+                kind: Some("decision".into()),
+                context_tokens: None,
+                attachment: false,
+                input_rate_nanos: Some(42_000_000),
+                output_rate_nanos: Some(0),
+            }
+        );
+        let clef = snapshot
+            .model_batch_row("cloudflare-workers-ai/@cf/cloudflare/clef")
+            .expect("clef's row is readable");
+        assert_eq!(clef.context_tokens, Some(65_536));
+        assert!(clef.attachment);
+        assert_eq!(clef.input_rate_nanos, Some(240_000_000));
+        let decisions: Vec<String> = snapshot
+            .model_batch_rows_of_kind("decision")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            decisions,
+            [
+                "cloudflare-workers-ai/@cf/cloudflare/clef",
+                "typesafe/jev-1.13.0"
+            ]
+        );
+        assert_eq!(snapshot.model_batch_row("typesafe/jev-9"), None);
+        assert_eq!(
+            batch_rate_nanos(Some(&serde_json::json!(
+                {"state":"priced","currency":"USD","exponent":12,"units":1001}
+            ))),
+            Some(2),
+            "a rate finer than a nanodollar rounds up"
+        );
     }
 
     fn curated_response(catalog_version: i64) -> FusiformCatalogResponse {

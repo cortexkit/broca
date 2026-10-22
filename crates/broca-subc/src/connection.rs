@@ -1163,6 +1163,50 @@ impl SubcConnection {
         .map_err(RouteOpenError::into_conn)
     }
 
+    /// `route.open` to a module's management surface declaring the `classifier/v1` role
+    /// ([`CLASSIFIER_ROLE_VERSIONS`]), so the module answers that route as a classifier:
+    /// `role.describe` is the classifier's and `classify.run` is served, and nothing else. This
+    /// is the one place the route shape of a `classifier/v1` caller is written down; a test
+    /// rig opening a classifier route as an outside caller would goes through it too.
+    pub async fn route_open_classifier_within(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        retry: RouteOpenRetry,
+    ) -> ConnResult<RouteHandle> {
+        self.route_open_management_roles_within(
+            module_id,
+            identity,
+            classifier_role_versions(),
+            retry,
+        )
+        .await
+    }
+
+    /// `route.open` to a management surface declaring `role_versions`, retrying a temporary
+    /// refusal until `retry` runs out. A module that cannot serve the declared roles refuses
+    /// the bind, and the open fails with its refusal.
+    pub async fn route_open_management_roles_within(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        role_versions: std::collections::BTreeMap<String, String>,
+        retry: RouteOpenRetry,
+    ) -> ConnResult<RouteHandle> {
+        retry_route_open(retry, None, || {
+            self.route_open_target(
+                RouteTarget::ManagementSurface {
+                    module_id: module_id.to_string(),
+                },
+                identity,
+                None,
+                Some(role_versions.clone()),
+            )
+        })
+        .await
+        .map_err(RouteOpenError::into_conn)
+    }
+
     /// `route.open` to a management surface under a scope the daemon holds, retrying a
     /// temporary refusal until `retry` runs out. The daemon admits the open only for the scope's
     /// owner or a listed carrier, and stamps the scope on the target's `route.bind`.
@@ -1302,7 +1346,9 @@ impl SubcConnection {
             .await
     }
 
-    async fn route_request_terminal_with_deadline(
+    /// [`Self::route_request_terminal`] with the caller's own reply budget, for a request whose
+    /// provider may legitimately take longer than the default (a batch of model calls).
+    pub async fn route_request_terminal_with_deadline(
         &self,
         route: &RouteHandle,
         body: Vec<u8>,
@@ -3103,6 +3149,19 @@ pub fn supervised_consumer_identity() -> Option<subc_control::ConsumerIdentity> 
 /// Compaction-provider routes carry the caller's own harness too (see
 /// [`declares_compaction_provider`]).
 const TOOL_MODULE_HARNESS: &str = "runner";
+
+/// The `role_versions` a caller declares on `route.open` to reach a module's `classifier/v1`
+/// surface: role `classifier`, version `v1`. A module serving several roles on one management
+/// surface tells them apart by this declaration, which the daemon forwards on the bind.
+pub const CLASSIFIER_ROLE_VERSIONS: (&str, &str) = ("classifier", "v1");
+
+/// [`CLASSIFIER_ROLE_VERSIONS`] as the map `route.open` carries.
+pub fn classifier_role_versions() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([(
+        CLASSIFIER_ROLE_VERSIONS.0.to_owned(),
+        CLASSIFIER_ROLE_VERSIONS.1.to_owned(),
+    )])
+}
 
 /// Whether a route declares the compaction-provider role. Such a route carries the caller's own
 /// bind identity (`project_root`, `harness` and `session`) rather than the tool-module `runner`

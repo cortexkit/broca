@@ -1,0 +1,1 @@
+{"role":"classifier/v1","limits":{"max_items":16,"max_request_bytes":1048576},"models":[{"model":"typesafe/jev-1.13.0","max_questions":64,"max_items":16,"images":null,"price":{"input_per_mtok_usd":0.042,"output_per_mtok_usd":0},"egress_host":"127.0.0.1"}]}

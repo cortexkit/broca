@@ -14,7 +14,7 @@ use broca_diagnostics::{spawn_blocking, JobKind};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -582,6 +582,8 @@ pub struct MoveSessionGuard {
 }
 
 struct Inner {
+    /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
+    batches_in_flight: Arc<AtomicUsize>,
     cut_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Migration notices are deduplicated while the session remains in the bounded cache.
     attribution_notices: Mutex<BoundedSessionCache<()>>,
@@ -938,6 +940,10 @@ pub struct SlotCounts {
     /// whether a restart will cut somebody's turn needs the second, and reading the first instead
     /// gives a plausible number about a different question.
     pub runs_in_flight: usize,
+    /// System One batch calls (`classify.run`) running at this instant. They hold no session,
+    /// so they are counted beside `runs_in_flight` rather than in it, and the stop's grace
+    /// waits for them only as long as it waits for runs: a batch never extends the grace.
+    pub batches_in_flight: usize,
 }
 
 /// A handle the actor uses to transition ITS OWN slot during close/finalize. Cloneable,
@@ -1126,6 +1132,7 @@ impl LineageRegistry {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                batches_in_flight: Arc::new(AtomicUsize::new(0)),
                 attribution_notices: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 retention: std::sync::OnceLock::new(),
                 #[cfg(test)]
@@ -3692,7 +3699,7 @@ impl LineageRegistry {
         let deadline = started + total;
         while started.elapsed() < grace.min(total) {
             let counts = self.slot_counts();
-            if counts.runs_in_flight == 0 && counts.opening == 0 {
+            if counts.runs_in_flight == 0 && counts.opening == 0 && counts.batches_in_flight == 0 {
                 break;
             }
             tokio::time::sleep_until(
@@ -3820,6 +3827,12 @@ impl LineageRegistry {
             .collect()
     }
 
+    /// The gauge the System One batch service raises for each batch call it runs, so health
+    /// and the stop's grace see batches beside session runs.
+    pub fn batches_in_flight_gauge(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.inner.batches_in_flight)
+    }
+
     /// Cheap inspection: count how many registry slots are opening, open, or closing.
     pub fn slot_counts(&self) -> SlotCounts {
         let slots = self.inner.slots.lock().unwrap();
@@ -3828,6 +3841,7 @@ impl LineageRegistry {
             opening: 0,
             closing: 0,
             runs_in_flight: 0,
+            batches_in_flight: self.inner.batches_in_flight.load(Ordering::Relaxed),
         };
         for entry in slots.values() {
             match entry {
@@ -4965,6 +4979,7 @@ mod tests {
                 opening: 1,
                 closing: 1,
                 runs_in_flight: 0,
+                batches_in_flight: 0,
             }
         );
     }

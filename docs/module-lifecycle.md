@@ -18,11 +18,14 @@ Shutdown must therefore count actors' work, not just the daemon's forwarded RPCs
    ceiling, not broca's post-GOODBYE budget.
 3. The daemon probes `health.check`. Broca's manifest `self_signals` entry named
    `runs_in_flight` has `kind: "busy"` and
-   `anchored_to: {"health_gauges":{"gauges":["runs_in_flight","opening","closing"]}}`.
+   `anchored_to: {"health_gauges":{"gauges":["runs_in_flight","opening","closing","system_one_batches_in_flight"]}}`.
    These are existing registry counters in `metrics`, not WAL-derived estimates.
    Opening actors may still be admitting work; closing actors may still be
    syncing/joining their writers. Idle open actors and paused runs are **not**
    busy. A restart-paused actor stays open but clears `runs_in_flight`.
+   `system_one_batches_in_flight` counts running `classify.run` calls, which hold no
+   session; the post-GOODBYE grace waits for them as it waits for runs, and never
+   longer, so a batch never extends the shutdown budget.
 4. Once forwarded requests and all declared gauges are zero, or the drain ceiling
    expires, the daemon sends channel-0 GOODBYE. The serve loop returns and
    `stop_and_seal` starts its unchanged **10 s grace / 20 s total** budget. Actors

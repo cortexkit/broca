@@ -42,9 +42,11 @@ mod fold_identities;
 pub mod retention;
 pub mod retention_withdrawals;
 pub mod session_refs;
+pub mod system_one;
 pub use fold_identities::fold_identities;
 
 pub use caps::CapsStore;
+pub use system_one::SystemOneStore;
 
 /// Auditable outcome of one explicit legacy page-usage backfill.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
