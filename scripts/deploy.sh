@@ -76,9 +76,31 @@ if ! bash scripts/verify-deploy.sh --sha "$expected_sha" --marker "$MARKER" --co
   rollback_command >&2
   exit 1
 fi
+# The daemon answers `module_warming` until the restarted broca has finished starting, and a
+# one-time store upgrade can make that take minutes (0.3.246's took 100 s). That refusal is the
+# daemon saying "not yet", not a failed deploy, so retry it for up to five minutes; any other
+# failure ends the deploy at once.
+acceptance() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if bash scripts/acceptance-turn.sh "$version" >"$logdir/acceptance.log" 2>&1; then
+      cat "$logdir/acceptance.log"
+      return 0
+    fi
+    if ! grep -q 'module_warming' "$logdir/acceptance.log"; then
+      cat "$logdir/acceptance.log"
+      return 1
+    fi
+    echo "deploy: broca is still starting (module_warming), acceptance attempt $attempt of 30; retrying"
+    # Tests shorten the wait; a real deploy always waits 10 s.
+    sleep "${BROCA_DEPLOY_WARMING_RETRY_SECS:-10}"
+  done
+  cat "$logdir/acceptance.log"
+  echo "deploy: broca was still starting after five minutes" >&2
+  return 1
+}
 # stage-release builds both ck-broca and this client from the same committed HEAD.
-if [ ! -x ./target/release/broca-session ] || \
-    ! bash scripts/acceptance-turn.sh "$version" 2>&1 | tee "$logdir/acceptance.log"; then
+if [ ! -x ./target/release/broca-session ] || ! acceptance; then
   echo "deploy: LIVE ACCEPTANCE FAILED (including unavailable providers/client); not publishing." >&2
   rollback_command >&2
   exit 1

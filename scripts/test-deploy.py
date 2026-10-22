@@ -80,6 +80,13 @@ if name == "place" and "--report" in args:
         "sessions_sealed": ["session.wal"], "sessions_unconfirmed": [], "seal_error": ""}))
 if name == "publish":
     pathlib.Path(os.environ["TAG_WHEN_GREEN_LOG"]).write_text("background CI\n")
+if name == "accept" and os.environ.get("WARMING_ACCEPTS"):
+    # The daemon refuses a bind while the restarted module is still starting.
+    with open(os.environ["EVENTS"]) as events:
+        attempts = sum(1 for line in events if json.loads(line)[0] == "accept")
+    if attempts <= int(os.environ["WARMING_ACCEPTS"]):
+        print("ERROR bind management surface 'broca': subc rejected: module_warming")
+        sys.exit(1)
 sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
 ''')
         for file, step in (("stage-release.sh", "stage"), ("place-release.sh", "place"),
@@ -147,6 +154,17 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertIn("LIVE ACCEPTANCE FAILED", result.stderr)
         self.assertIn("Rollback:", result.stderr)
         self.assertEqual(self.steps(), ["stage", "place", "verify"])
+
+    def test_acceptance_waits_out_a_module_still_starting(self):
+        result = self.deploy(WARMING_ACCEPTS="2", BROCA_DEPLOY_WARMING_RETRY_SECS="0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept", "accept", "accept", "publish"])
+        self.assertIn("still starting (module_warming)", result.stdout)
+
+    def test_acceptance_failure_other_than_warming_is_not_retried(self):
+        result = self.deploy(FAIL_STEP="accept", BROCA_DEPLOY_WARMING_RETRY_SECS="0")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.steps().count("accept"), 1)
 
     def test_existing_version_tag_on_other_commit_refuses(self):
         self.git("tag", "v0.0.2")
