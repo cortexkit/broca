@@ -180,6 +180,9 @@ fn assemble_judged(
                         .cloned()
                         .collect()
                 });
+                let carried = carried
+                    .as_deref()
+                    .map(crate::compaction::CarriedMessages::new);
                 for value in &values {
                     let message = match &carried {
                         Some(carried) => native_message(value, carried),

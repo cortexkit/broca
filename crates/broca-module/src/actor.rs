@@ -8,6 +8,11 @@
 //! one-active-run-per-lineage invariant the lease enforces); a `Send` while a run is
 //! active is durably queued, a `Send` while idle starts a run.
 //!
+//! One exception to one-at-a-time: while a restart-paused episode waits for its frozen
+//! dependencies during admission, the actor keeps serving commands from inside that suspended
+//! admission so status, cancel and new sends stay responsive. A nested command's exit request
+//! or a writer poisoned under it ends that admission early (see `start_run_with_cancel`).
+//!
 //! Closing replies `Reopen` to buffered commands so callers retry through the registry,
 //! then flushes and rechecks pending submissions, abandoning close if work remains.
 //! It cancels and joins subscribers, shuts down the WAL writer, releases the lease,
@@ -1132,11 +1137,83 @@ impl std::fmt::Display for StartRunFailure {
     }
 }
 
+/// Why a budget cap denied admission. The reason string is what callers and the queued-admission
+/// tombstone see; the classification decides whether a durably queued send may be failed for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetDenial {
+    /// Recorded spend has reached the hard cap. Waiting does not lower spend.
+    HardCapExceeded,
+    /// Some spend is not yet resolved into the cap mirror.
+    UnresolvedSpend,
+    /// The cap mirror was applied against a different export source or epoch than this daemon's
+    /// export index reports, or past its high-water. Only the cap provider re-applying the cap
+    /// against this export store clears it, and nothing in broca triggers that, so it can last
+    /// indefinitely (for example after the export store is recreated).
+    ExportSourceMismatch,
+    /// The cap mirror has not yet consumed every export fact this daemon wrote.
+    TrailingWatermark,
+    /// Caps apply, but this actor has no export index to compare the mirror against. This is
+    /// fixed for the actor's lifetime, so it does not clear by waiting.
+    ExportIndexUnavailable,
+    /// The cap mirror is older than the cap allows.
+    Stale,
+}
+
+impl BudgetDenial {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::HardCapExceeded => "hard_cap_exceeded",
+            Self::UnresolvedSpend => "unresolved_spend",
+            Self::ExportSourceMismatch => "export_source_mismatch",
+            Self::TrailingWatermark => "trailing_watermark",
+            Self::ExportIndexUnavailable => "export_index_unavailable",
+            Self::Stale => "stale",
+        }
+    }
+
+    /// Whether the denial may clear after accounting or cap-mirror state is updated in the normal
+    /// course (spend resolves, or the cap provider's regular refresh brings the mirror up to
+    /// date). A queued send denied for such a reason stays queued for a later drain. Any other
+    /// denial fails the send, so the caller sees the refusal rather than a send that waits
+    /// silently on something nothing will update.
+    fn clears_by_waiting(self) -> bool {
+        match self {
+            Self::UnresolvedSpend | Self::TrailingWatermark | Self::Stale => true,
+            Self::HardCapExceeded | Self::ExportIndexUnavailable | Self::ExportSourceMismatch => {
+                false
+            }
+        }
+    }
+
+    fn from_reason(reason: &str) -> Option<Self> {
+        [
+            Self::HardCapExceeded,
+            Self::UnresolvedSpend,
+            Self::ExportSourceMismatch,
+            Self::TrailingWatermark,
+            Self::ExportIndexUnavailable,
+            Self::Stale,
+        ]
+        .into_iter()
+        .find(|denial| denial.reason() == reason)
+    }
+
+    fn into_error(self, cap_id: String) -> RunError {
+        RunError::BudgetDenied {
+            cap_id,
+            reason: self.reason().into(),
+        }
+    }
+}
+
 fn queued_admission_is_permanent(error: &RunError) -> bool {
-    !matches!(
-        error,
-        RunError::BudgetDenied { reason, .. } if reason == "trailing_watermark"
-    ) && error.admission_error_class() == ErrorClass::Permanent
+    if let RunError::BudgetDenied { reason, .. } = error {
+        // An unrecognized reason keeps the permanent class it has always had.
+        if BudgetDenial::from_reason(reason).is_some_and(BudgetDenial::clears_by_waiting) {
+            return false;
+        }
+    }
+    error.admission_error_class() == ErrorClass::Permanent
 }
 
 fn submission_from_episode(episode: &broca_core::LastEpisodeV1) -> SubmissionRequest {
@@ -1392,6 +1469,12 @@ pub struct LineageActor<W: WalStore> {
     ordered_submissions: HashMap<broca_protocol::SubmissionId, broca_protocol::DeliveryOrder>,
     restart_admitting: bool,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    /// Set while startup restart recovery drives the admission, because that branch answers
+    /// parked `restart_waiters` itself once it knows the episode's outcome.
+    restart_recovery_owns_waiters: bool,
+    /// A command dispatched inside a suspended restart admission asked this generation to
+    /// exit. The admission ends early, and the enclosing command returns the exit request.
+    nested_exit_requested: bool,
     /// Shared permit for manual and automatic cache refreshes. While held, keep the writer
     /// open so a completed response can still record its usage.
     warm_in_flight: crate::keep_warm::WarmSlot,
@@ -1598,6 +1681,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             ordered_submissions: HashMap::new(),
             restart_admitting: false,
             restart_waiters: Vec::new(),
+            restart_recovery_owns_waiters: false,
+            nested_exit_requested: false,
             warm_in_flight: Default::default(),
         };
         tokio::spawn(async move {
@@ -1606,8 +1691,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .await;
             match outcome {
                 Ok(()) => {
-                    // Normal close already tears down the writer and lease before removing its
-                    // slot. This generation-checked fallback also covers an unexpected clean exit.
+                    // Every normal exit path tears down children, writer and lease before
+                    // returning, which makes this call a no-op for them. It still gives any
+                    // other clean exit the same ordered teardown before the slot is finalized,
+                    // instead of leaving it to field drop order (which drops the lease first).
+                    actor.emergency_teardown().await;
+                    // Generation-checked: a no-op once a close has already removed the slot.
                     actor.registry.finalize_exit(&actor.key, actor.gen);
                 }
                 Err(panic) => {
@@ -1670,7 +1759,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
             if self.registry.is_stopping() {
                 break;
             }
-            match self.recover_durable_work().await {
+            let recovered = self.recover_durable_work().await;
+            if std::mem::take(&mut self.nested_exit_requested) {
+                self.emergency_teardown().await;
+                return;
+            }
+            match recovered {
                 Ok(()) => break,
                 Err(error) => {
                     let now = self
@@ -1783,45 +1877,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 _ = tick => {
                     self.fanout.reap_finished();
-                    // Before considering close, drain any commands ALREADY queued — in
-                    // particular a real RunFinished that's sitting in the channel. This
-                    // keeps the liveness backstop below from spuriously synthesizing a
-                    // Panicked terminal when the real terminal was simply queued-but-not-
-                    // yet-processed (select! can favor this tick over a ready recv).
+                    // Before considering close, handle external commands that are already
+                    // queued, so close does not overtake work that raced in.
                     while let Ok(cmd) = self.rx.try_recv() {
                         if self.handle_cmd(cmd).await {
                             self.emergency_teardown().await;
                             return;
                         }
                     }
-                    // LIVENESS BACKSTOP: the dedicated terminal lane is selected before this
-                    // tick, and a run task cannot finish until its guard has published there. If
-                    // the actor is still Active after the task ends, the terminal was genuinely
-                    // lost; synthesize one so the lineage cannot remain wedged Active.
-                    if let RunState::Active {
-                        task_run_id,
-                        attempt_id,
-                        handle,
-                        ..
-                    } = &self.state
-                    {
-                        if handle.is_finished() {
-                            // Synthesize with the TASK id and attempt (what on_run_finished
-                            // matches on).
-                            let task_run_id = task_run_id.clone();
-                            let attempt_id = *attempt_id;
-                            if self
-                                .on_run_finished(
-                                    task_run_id,
-                                    attempt_id,
-                                    Err(broca_core::RunError::Panicked),
-                                )
-                                .await
-                            {
-                                self.emergency_teardown().await;
-                                return;
-                            }
-                        }
+                    if self.idle_tick_backstop().await {
+                        self.emergency_teardown().await;
+                        return;
                     }
                     if self.writer_poisoned {
                         self.teardown_poisoned().await;
@@ -1837,6 +1903,47 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // normal exit. If that invariant changes, still stop children and the writer before the
         // spawn wrapper makes this generation's registry slot reopenable.
         self.emergency_teardown().await;
+    }
+
+    /// Liveness backstop run on the idle tick. Returns true when the actor must take its
+    /// emergency teardown.
+    ///
+    /// A run task publishes its terminal on the dedicated terminal lane before it can finish
+    /// (its `RunFinishGuard` sends either the real result or a synthetic `Panicked`). So once
+    /// the task is finished, any terminal it produced is already queued on that lane. The lane
+    /// is checked before the tick in `select!`, but only at poll time: the run can publish and
+    /// finish after that poll, or while the tick awaits an external command it drained. The
+    /// lane is therefore drained here, after observing the finished task and before deciding
+    /// the terminal was lost. Only a task that is still the active one after that drain had
+    /// its terminal genuinely lost, and gets a synthetic `Panicked` so the lineage cannot stay
+    /// wedged Active.
+    async fn idle_tick_backstop(&mut self) -> bool {
+        if !matches!(&self.state, RunState::Active { handle, .. } if handle.is_finished()) {
+            return false;
+        }
+        while let Ok(terminal) = self.terminal_rx.try_recv() {
+            if self.handle_cmd(terminal).await {
+                return true;
+            }
+        }
+        let RunState::Active {
+            task_run_id,
+            attempt_id,
+            handle,
+            ..
+        } = &self.state
+        else {
+            return false;
+        };
+        if !handle.is_finished() {
+            // A drained terminal let a queued submission start a new run.
+            return false;
+        }
+        // Synthesize with the TASK id and attempt (what on_run_finished matches on).
+        let task_run_id = task_run_id.clone();
+        let attempt_id = *attempt_id;
+        self.on_run_finished(task_run_id, attempt_id, Err(broca_core::RunError::Panicked))
+            .await
     }
 
     /// Dispatch ONE command. Shared by the live `recv` arm and the pre-close drain.
@@ -2083,7 +2190,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             self.admitting_retention = None;
         }
         self.observe_writer_poison();
-        should_exit
+        should_exit || std::mem::take(&mut self.nested_exit_requested)
     }
 
     /// Mark the actor for emergency teardown as soon as its shared writer becomes poisoned.
@@ -2267,13 +2374,32 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // - Active + completed retry: the preflight wins immediately without a materialized store;
         //   with one, it falls through to the run path so projection still catches up.
         // - Active + mismatched reuse: the preflight returns ImportIdReuse.
-        let Some(writer) = self.writer.as_deref() else {
+        let Some(writer) = self.writer.clone() else {
             return ImportOutcome::Error(broca_core::ImportError::Wal(
                 "session writer is unavailable".into(),
             ));
         };
-        if !matches!(self.state, RunState::Idle) {
-            match broca_core::check_import_retry(&request, self.wal_store.as_ref(), writer) {
+        let request = if matches!(self.state, RunState::Idle) {
+            request
+        } else {
+            // The retry preflight reads and decodes the whole WAL. Run it on the blocking pool
+            // like every other actor WAL read, so a long session does not hold a runtime worker
+            // thread that provider streams, fan-out and other actors are scheduled on.
+            let store = self.wal_store.clone();
+            let preflight_writer = writer.clone();
+            let preflight = spawn_blocking(JobKind::WalRead, move || {
+                let result =
+                    broca_core::check_import_retry(&request, store.as_ref(), &preflight_writer);
+                (request, result)
+            })
+            .await;
+            let (request, result) = match preflight {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    return ImportOutcome::Error(broca_core::ImportError::Wal(error.to_string()))
+                }
+            };
+            match result {
                 Ok(Some(outcome)) if self.materialized_store.is_none() => {
                     return ImportOutcome::Imported(outcome)
                 }
@@ -2281,10 +2407,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(error) => return ImportOutcome::Error(error),
                 Ok(None) => return ImportOutcome::Busy,
             }
-        }
+            request
+        };
         match broca_core::run_import_with_store(
             request,
-            writer,
+            &writer,
             self.wal_store.as_ref(),
             self.materialized_store.clone(),
         )
@@ -2311,8 +2438,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
     }
 
     async fn recover_durable_work(&mut self) -> Result<(), String> {
-        if self.wal_store.check_move(&self.key, true).is_err() {
-            return Ok(());
+        // A session that is moving or has moved away is not ours to recover. Any other failure
+        // to read the move fence (an I/O error) proves nothing about durable work, so it must
+        // reach the caller's back-off and recovery gate instead of reading as "nothing to do".
+        if let Err(error) = self.wal_store.check_move(&self.key, true) {
+            return match error.into_move_refusal() {
+                Ok(_) => Ok(()),
+                Err(error) => Err(format!("session move check failed: {error}")),
+            };
         }
         self.recover_durable_work_inner().await?;
         if self.registry.has_recovery_debt(&self.key) {
@@ -2410,6 +2543,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             let mut request = submission_from_config(episode_config, episode_input);
             request.keep_warm = episode_keep_warm;
             request.on_restart = episode_on_restart;
+            // This branch answers parked `ResumeRestart` waiters below, after it knows whether
+            // a refused resume was sealed.
+            self.restart_recovery_owns_waiters = true;
             let result = self
                 .start_run(
                     episode_run_id.clone(),
@@ -2425,6 +2561,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     false,
                 )
                 .await;
+            self.restart_recovery_owns_waiters = false;
             match result {
                 Ok(_) => {
                     self.finish_restart_waiters(Ok(()));
@@ -2438,6 +2575,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         "shutdown interrupted restart admission".into()
                     ));
                     return Ok(());
+                }
+                Err(error) if self.nested_exit_requested || self.writer_poisoned => {
+                    // The admission ended because this generation is exiting, not because a
+                    // dependency refused the resume. Leave the episode paused for the next
+                    // generation's recovery instead of sealing it as refused.
+                    let error = error.to_string();
+                    self.finish_restart_waiters(Err(error.clone()));
+                    return Err(error);
                 }
                 Err(error) => {
                     let refusal = ProviderError {
@@ -3808,38 +3953,32 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
             .unwrap_or(i64::MAX);
         for cap in caps {
-            let reason = if cap.spend_nanos >= cap.hard_cap_nanos {
-                Some("hard_cap_exceeded")
+            let denial = if cap.spend_nanos >= cap.hard_cap_nanos {
+                Some(BudgetDenial::HardCapExceeded)
             // Upgrade safety: persisted negative counts are impossible accounting states, not
             // proof that all spend resolved. Any nonzero value must therefore fail closed.
             } else if cap.unresolved_count != 0 {
-                Some("unresolved_spend")
+                Some(BudgetDenial::UnresolvedSpend)
             } else if let Some((source_instance_id, source_epoch, high_water)) = export_position {
                 if cap.applied_watermark.source_instance_id != source_instance_id
                     || cap.applied_watermark.source_epoch != source_epoch
                     || cap.applied_watermark.consumed_export_seq > high_water
                 {
-                    Some("export_source_mismatch")
+                    Some(BudgetDenial::ExportSourceMismatch)
                 } else if cap.applied_watermark.consumed_export_seq < high_water {
-                    Some("trailing_watermark")
+                    Some(BudgetDenial::TrailingWatermark)
                 } else {
                     None
                 }
             } else {
-                Some("export_index_unavailable")
+                Some(BudgetDenial::ExportIndexUnavailable)
             };
-            if let Some(reason) = reason {
-                return Err(RunError::BudgetDenied {
-                    cap_id: cap.cap_id,
-                    reason: reason.into(),
-                });
+            if let Some(denial) = denial {
+                return Err(denial.into_error(cap.cap_id));
             }
             let age_ms = now_ms.saturating_sub(cap.as_of_ms).max(0) as u64;
             if age_ms > cap.max_staleness_ms {
-                return Err(RunError::BudgetDenied {
-                    cap_id: cap.cap_id,
-                    reason: "stale".into(),
-                });
+                return Err(BudgetDenial::Stale.into_error(cap.cap_id));
             }
         }
         Ok(())
@@ -4388,11 +4527,40 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Err(_) => Err(StartRunFailure::Infrastructure("run ended before admission".into())),
                 },
                 Some(command) = self.rx.recv(), if restart_resuming => {
-                    Box::pin(self.handle_cmd(command)).await;
+                    // Commands are served while a restart-paused episode waits for its
+                    // dependencies, so this one runs inside the suspended admission. Its exit
+                    // request and any writer poison it observed must end this admission too:
+                    // continuing would admit work into a generation that is about to tear down.
+                    if Box::pin(self.handle_cmd(command)).await {
+                        self.nested_exit_requested = true;
+                        break Err(StartRunFailure::Infrastructure(
+                            "session actor is exiting during restart admission".into(),
+                        ));
+                    }
+                    if self.writer_poisoned {
+                        break Err(StartRunFailure::Infrastructure(
+                            "session writer was poisoned during restart admission".into(),
+                        ));
+                    }
                 }
             }
         };
         self.restart_admitting = false;
+        // `ResumeRestart` requests that arrived during this admission were parked because it
+        // was already resuming the episode. Every path into restart admission must answer them
+        // once it ends (a cancel or interrupt finalizer, a queued drain, a cancel recovery),
+        // or the boot resume loop, which awaits each reply in turn, stalls behind this session.
+        // Restart recovery answers them itself after deciding whether to seal a refused
+        // resume, so it keeps them here.
+        if restart_resuming && !self.restart_recovery_owns_waiters {
+            self.finish_restart_waiters(match &admission {
+                Ok(_) => Ok(()),
+                Err(StartRunFailure::Shutdown) => {
+                    Err("shutdown interrupted restart admission".into())
+                }
+                Err(error) => Err(error.to_string()),
+            });
+        }
         // A dropped acknowledgement means execution ended before the durable admission point.
         let admitted_run_id = match admission {
             Ok(id) => id,
@@ -6258,7 +6426,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // Claim the close: CAS Open{gen} → Closing. If the slot isn't Open{gen} (a re-open
         // already replaced us), just exit — nothing to tear down against the registry.
         let Some(close_token) = self.registry.begin_close(&self.key, self.gen) else {
-            // Our slot is gone; release the lease and exit.
+            // Our slot is gone, so there is no registry close to commit, but this generation
+            // still owns its subscribers, writer and lease. Tear them down in the same order
+            // as a committed close before exiting: a lease released while the writer thread
+            // still drains would let a replacement actor append beside it.
+            self.emergency_teardown().await;
             return true;
         };
 
@@ -6381,6 +6553,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// both an actor panic and an undurable active-run result restore child/writer/lease ordering
     /// before the generation becomes reopenable.
     async fn emergency_teardown(&mut self) {
+        // The lease is released only as the last step of an ordered close (idle close, expiry
+        // or poisoned teardown). Once it is gone this generation has already stopped its
+        // children, closed its writer and told the executor the session closed, and its
+        // registry slot may already be reopenable. Running the executor close hook again would
+        // retire routes a newer generation of the same session may have registered.
+        if self.lease.is_none() {
+            return;
+        }
         self.stop_active_run().await;
         self.teardown_subscribers().await;
         self.shutdown_writer().await;
@@ -11336,6 +11516,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return false;
         }
         let Some(close) = self.registry.begin_close(&self.key, self.gen) else {
+            // The slot is not ours to close right now. Leaving the elapsed deadline in place
+            // would wake the actor loop immediately and reread the whole WAL in a busy loop;
+            // retry after the same back-off as a failed read.
+            self.retention_deadline = Some(now_ms.saturating_add(1000));
             return false;
         };
         self.pending_fifo.clear();
@@ -11392,3 +11576,7 @@ mod wal_proof_tests;
 #[cfg(test)]
 #[path = "closed_poll_tests.rs"]
 mod closed_poll_tests;
+
+#[cfg(test)]
+#[path = "actor_lifecycle_audit_tests.rs"]
+mod lifecycle_audit_tests;

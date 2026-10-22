@@ -411,6 +411,8 @@ impl Fixture {
             delivered_submissions: Default::default(),
             restart_admitting: false,
             restart_waiters: Vec::new(),
+            restart_recovery_owns_waiters: false,
+            nested_exit_requested: false,
             warm_in_flight: Default::default(),
         };
         actor.refresh_admission_view().await.unwrap();

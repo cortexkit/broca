@@ -591,8 +591,12 @@ pub trait ExportIndex: Send + Sync {
 /// Re-derive usage facts for terminal run-index rows missed by the live export path.
 ///
 /// Callers run this off the async runtime's blocking pool. Missing rows are grouped by
-/// session so one WAL replay can heal every missed run in that lineage; `fact_id`
-/// uniqueness makes overlapping live emission and repeated catch-up harmless.
+/// session so one WAL read heals every missed run in that lineage. Sessions are handled one at
+/// a time, in the order the index first lists them, and each WAL is dropped before the next is
+/// read: after an export outage many sessions can be missing rows, and holding every one of
+/// their WALs at once at boot could exhaust memory. Within a session, runs are emitted in the
+/// index's order. `fact_id` uniqueness makes overlapping live emission and repeated catch-up
+/// harmless, including a retry after a later session's read failed.
 pub fn catch_up_usage_exports(
     index: &dyn ExportIndex,
     wal_store: &dyn WalStore,
@@ -600,28 +604,31 @@ pub fn catch_up_usage_exports(
 ) -> Result<usize, ExportError> {
     let missing = index.missing_terminal_runs()?;
     let count = missing.len();
-    let mut records_by_session = HashMap::new();
-    for run in &missing {
-        if records_by_session.contains_key(&run.session) {
-            continue;
-        }
-        let records = wal_store.read_records(&run.session).map_err(|error| {
-            ExportError::Storage(format!(
-                "read WAL for missed export run {}: {error}",
-                run.run_id.0
-            ))
-        })?;
-        records_by_session.insert(run.session.clone(), records);
+    let mut sessions: Vec<(BindIdentity, Vec<RunId>)> = Vec::new();
+    let mut position_by_session = HashMap::new();
+    for run in missing {
+        let position = *position_by_session
+            .entry(run.session.clone())
+            .or_insert_with(|| {
+                sessions.push((run.session.clone(), Vec::new()));
+                sessions.len() - 1
+            });
+        sessions[position].1.push(run.run_id);
     }
 
-    for run in missing {
-        let records = records_by_session
-            .get(&run.session)
-            .expect("every missing run's session was loaded above");
-        index.emit_run(records, &run.run_id, resolver)?;
-        // Each emit has released the store connection. Give admissions and the
-        // census a chance to acquire it before the next catch-up transaction.
-        std::thread::yield_now();
+    for (session, run_ids) in sessions {
+        let records = wal_store.read_records(&session).map_err(|error| {
+            ExportError::Storage(format!(
+                "read WAL for missed export run {}: {error}",
+                run_ids[0].0
+            ))
+        })?;
+        for run_id in &run_ids {
+            index.emit_run(&records, run_id, resolver)?;
+            // Each emit has released the store connection. Give admissions and the
+            // census a chance to acquire it before the next catch-up transaction.
+            std::thread::yield_now();
+        }
     }
     Ok(count)
 }
@@ -1600,6 +1607,15 @@ mod catch_up_tests {
         reads: Mutex<HashMap<BindIdentity, usize>>,
     }
 
+    thread_local! {
+        /// WAL reads and export emissions made on this thread, in order.
+        static EVENTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn note_event(event: String) {
+        EVENTS.with(|events| events.borrow_mut().push(event));
+    }
+
     impl WalStore for CountingWalStore {
         fn open(&self, _session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
             Err(WalError::Io(std::io::Error::other(
@@ -1608,6 +1624,7 @@ mod catch_up_tests {
         }
 
         fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
+            note_event(format!("read {}", session.project_root.display()));
             *self
                 .reads
                 .lock()
@@ -1639,6 +1656,7 @@ mod catch_up_tests {
             if self.fail_run.as_ref() == Some(run_id) {
                 return Err(ExportError::Storage("injected export failure".into()));
             }
+            note_event(format!("emit {}", run_id.0));
             self.seen_frames.lock().unwrap().push(records.len());
             self.emitted
                 .lock()
@@ -1668,8 +1686,11 @@ mod catch_up_tests {
         }
     }
 
+    /// Each session's WAL is read, its missing runs are emitted, and only then is the next
+    /// session's WAL read, so at most one session's WAL is resident at a time. Runs keep the
+    /// index's order within their session.
     #[test]
-    fn catch_up_reads_each_missing_session_once_and_preserves_run_order() {
+    fn catch_up_reads_each_missing_session_once_and_emits_it_before_reading_the_next() {
         let first = BindIdentity::new("/tmp/first", "runner", "session");
         let second = BindIdentity::new("/tmp/second", "runner", "session");
         let index = RecordingExportIndex {
@@ -1696,14 +1717,22 @@ mod catch_up_tests {
         };
         let resolver = |_: &str, _: &str| (crate::ChargeBasis::Unknown, 1);
 
+        EVENTS.with(|events| events.borrow_mut().clear());
         assert_eq!(catch_up_usage_exports(&index, &wal, &resolver), Ok(3));
         assert_eq!(
             *wal.reads.lock().expect("read counter lock"),
             HashMap::from([(first, 1), (second, 1)])
         );
         assert_eq!(
-            *index.emitted.lock().expect("emitted runs lock"),
-            vec![RunId("r1".into()), RunId("r2".into()), RunId("r3".into())]
+            EVENTS.with(|events| events.borrow().clone()),
+            [
+                "read /tmp/first",
+                "emit r1",
+                "emit r3",
+                "read /tmp/second",
+                "emit r2"
+            ],
+            "every missing run of one session is emitted before the next session's WAL is read"
         );
     }
 

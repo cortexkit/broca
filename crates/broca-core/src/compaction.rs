@@ -510,6 +510,8 @@ pub(crate) fn native_fields(value: &Value) -> bool {
         })
 }
 fn encoded(message: &Message) -> Value {
+    #[cfg(test)]
+    carried_encoding_tests::note_encoded();
     serde_json::to_value(message).expect("native JSON")
 }
 fn tool_ids(message: &Message) -> impl Iterator<Item = &str> {
@@ -530,32 +532,50 @@ fn native_replacement(
         .filter(|end| *end <= raw.len());
     let start = usize::try_from(compaction.range.from).ok();
     // Out-of-bounds is fenced later; don't mislabel it as structural just for indexing.
-    let carried = start
-        .zip(end)
-        .and_then(|(start, end)| raw.get(start..end))
-        .unwrap_or_default();
+    let carried = CarriedMessages::new(
+        start
+            .zip(end)
+            .and_then(|(start, end)| raw.get(start..end))
+            .unwrap_or_default(),
+    );
     let mut messages = Vec::with_capacity(compaction.replacement.len());
     for value in &compaction.replacement {
-        messages.push(native_message(value, carried).ok_or(bad)?);
+        messages.push(native_message(value, &carried).ok_or(bad)?);
     }
     Ok(messages)
+}
+
+/// The transcript messages a replacement stands in for, each encoded once so that judging every
+/// replacement message against them costs one encoding per message on either side rather than
+/// two per comparison.
+pub(crate) struct CarriedMessages<'a> {
+    messages: &'a [Message],
+    encoded: Vec<Value>,
+}
+
+impl<'a> CarriedMessages<'a> {
+    pub(crate) fn new(messages: &'a [Message]) -> Self {
+        Self {
+            messages,
+            encoded: messages.iter().map(encoded).collect(),
+        }
+    }
 }
 
 /// One provider-written message in broca's schema. A message that is not a byte-identical
 /// copy of one in `carried` (the transcript messages it stands in for) is authored by the
 /// provider, and may then carry no model origin, signed or encrypted reasoning, or
 /// provider-signed text: those would claim the model wrote what the provider wrote.
-pub(crate) fn native_message(value: &Value, carried: &[Message]) -> Option<Message> {
+pub(crate) fn native_message(value: &Value, carried: &CarriedMessages<'_>) -> Option<Message> {
     let message = native_schema_message(value)?;
-    let unchanged = carried
-        .iter()
-        .any(|original| encoded(original) == encoded(&message));
+    let candidate = encoded(&message);
+    let unchanged = carried.encoded.contains(&candidate);
     if !unchanged {
         if message.origin.is_some() || message.content.iter().any(is_signed) {
             return None;
         }
         // Removing an origin from otherwise unchanged content does not make it authored.
-        if carried.iter().any(|original| {
+        if carried.messages.iter().any(|original| {
             original.origin.is_some()
                 && original.role == message.role
                 && original.content == message.content
@@ -832,4 +852,78 @@ mod tests;
 
 pub(crate) fn now() -> u64 {
     crate::run::epoch_millis().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod carried_encoding_tests {
+    use super::*;
+
+    thread_local! {
+        /// Messages encoded to JSON values on this thread by `encoded`.
+        static ENCODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn note_encoded() {
+        ENCODED.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    fn text(role: Role, text: String) -> Message {
+        Message::new(role, vec![ContentBlock::Text { text }])
+    }
+
+    /// Judging a replacement against the range it replaces encodes each carried message once and
+    /// each replacement message once. Encoding both sides for every comparison made a large
+    /// replacement over a large range allocate a JSON value tree per pair while a step waited.
+    #[test]
+    fn replacement_validation_encodes_each_message_once() {
+        const CARRIED: usize = 20;
+        const REPLACEMENT: usize = 10;
+        let raw: Vec<Message> = (0..CARRIED)
+            .map(|index| {
+                let role = if index % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                text(role, format!("carried {index}"))
+            })
+            .collect();
+        // Provider-authored summaries: none is a copy of a carried message, so each one is
+        // compared against the whole range.
+        let replacement: Vec<Value> = (0..REPLACEMENT)
+            .map(|index| {
+                serde_json::to_value(text(Role::User, format!("summary {index}"))).unwrap()
+            })
+            .collect();
+        let message = CompactionMessage::new("c", 1, Range::new(0, CARRIED as u64), replacement);
+
+        ENCODED.with(|cell| cell.set(0));
+        let messages = native_replacement(&message, &raw).expect("summaries are valid");
+        let encodings = ENCODED.with(std::cell::Cell::get);
+
+        assert_eq!(messages.len(), REPLACEMENT);
+        assert_eq!(
+            encodings,
+            CARRIED + REPLACEMENT,
+            "each carried and each replacement message is encoded exactly once"
+        );
+    }
+
+    /// A replacement message identical to a carried one is recognized as carried, so it may keep
+    /// the model origin it had in the transcript.
+    #[test]
+    fn a_carried_copy_keeps_its_model_origin() {
+        let mut carried = text(Role::Assistant, "kept".into());
+        carried.origin = Some(broca_protocol::request::ModelHandle {
+            provider_module_id: "provider".into(),
+            model_id: "model".into(),
+        });
+        let raw = vec![text(Role::User, "ask".into()), carried.clone()];
+        let copy = serde_json::to_value(&carried).unwrap();
+        let message = CompactionMessage::new("c", 1, Range::new(0, 2), vec![copy]);
+
+        let messages = native_replacement(&message, &raw).expect("a carried copy is valid");
+
+        assert_eq!(messages, vec![carried]);
+    }
 }
