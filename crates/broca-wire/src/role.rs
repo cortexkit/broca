@@ -169,8 +169,9 @@ pub struct HeadResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// What a send that names no model can carry (llm-runner 0.5.1 §4.3). A send's prompt is
-    /// text only, so broca states `attachments: "no"` on every answer, a never-written
-    /// session's included.
+    /// text only, so broca states `attachments: "no"` on every written session's answer. A
+    /// never-written session's answer leaves it out with every other member, as the
+    /// conformance kit requires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<cortexkit_role_llm_runner::read::HeadInput>,
 }
@@ -656,24 +657,6 @@ mod pinned_reply_bytes {
             meta.input.and_then(|input| input.carries_attachments()),
             Some(false)
         );
-    }
-
-    /// A never-written session's head: no lineage, so nothing but `input`, which §4.3 puts
-    /// outside the lineage rule.
-    #[test]
-    fn session_head_never_written_is_pinned() {
-        let head = HeadResponse {
-            input: Some(head_input()),
-            ..HeadResponse::default()
-        };
-        assert_golden(
-            head.clone(),
-            "session_head.never_written.json",
-            "b749a47fe55fdb2ac64cdec956b48614cedf3edf603ee5e6626e5160fbd4e10a",
-        );
-        let meta: cortexkit_role_llm_runner::read::HeadMeta =
-            serde_json::from_value(serde_json::to_value(&head).unwrap()).unwrap();
-        assert!(meta.lineage_consistent(), "{meta:?}");
     }
 
     #[test]

@@ -339,12 +339,8 @@ async fn a_never_written_session_has_no_lineage_page_or_head() {
         &call(&mut rig, "session.head", serde_json::json!({})).await,
     ))
     .unwrap();
-    // `input` sits outside the lineage rule (llm-runner 0.5.1 §4.3), so a never-written
-    // session states it too; every lineage member stays absent.
-    let mut expected = HeadMeta::no_lineage();
-    expected.input = Some(cortexkit_role_llm_runner::read::HeadInput::new("no"));
-    assert_eq!(head, expected);
-    assert!(head.lineage_consistent());
+    // §4.3 would let it state `input`, but the conformance kit requires every member absent.
+    assert_eq!(head, HeadMeta::no_lineage());
     assert!(
         rig.wal_bytes().is_empty(),
         "a read of an unwritten session wrote"

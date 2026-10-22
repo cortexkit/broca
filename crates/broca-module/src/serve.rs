@@ -2839,11 +2839,11 @@ impl ServeHandler for crate::LineageRegistry {
             ..
         } = self.route_read_page(session, None, Some(1), false).await?;
         // A session never written has no lineage, and then nothing else to report either.
+        // A session never written answers every member absent, `input` included: the
+        // conformance kit (0.10.2 `never_written_session_empty_head`) requires it, although
+        // llm-runner 0.5.1 §4.3 lets such a session state `input`.
         let Some(lineage_id) = page.lineage_id else {
-            return Ok(broca_wire::HeadResponse {
-                input: Some(broca_wire::head_input()),
-                ..broca_wire::HeadResponse::default()
-            });
+            return Ok(broca_wire::HeadResponse::default());
         };
         // Retained sessions report expiry activity; maintenance must not move that clock.
         // Otherwise use the live WAL file's own write time, a stat; else
