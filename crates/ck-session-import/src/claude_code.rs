@@ -16,15 +16,19 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, BufReader, Error as IoError, ErrorKind};
+use std::io::{BufReader, Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use broca_protocol::{
     ContentBlock, Message, ModelHandle, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use crate::{finalize_import, HarnessReader, ImportedSession, SessionSummary};
+use crate::{
+    check_session_source_size, finalize_import, omit_nested_tool_images, read_bounded_jsonl_line,
+    HarnessReader, ImportedSession, SessionSummary,
+};
 
 type ReaderResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -135,7 +139,7 @@ impl HarnessReader for ClaudeCodeReader {
     fn enumerate(&self) -> ReaderResult<Vec<SessionSummary>> {
         let mut sessions = Vec::new();
         for path in self.session_files()? {
-            let rows = match load_rows(&path) {
+            let rows = match load_summary_rows(&path) {
                 Ok(rows) => rows,
                 Err(error) => {
                     eprintln!(
@@ -157,25 +161,18 @@ impl HarnessReader for ClaudeCodeReader {
             };
             let title = selected
                 .iter()
-                .filter(|index| !is_api_error_message(&rows[**index].value))
-                .find_map(|index| first_user_text(&rows[*index].value))
-                .map(|text| truncate_title(&text));
-            let cwd = selected.iter().rev().find_map(|index| {
-                rows[*index]
-                    .value
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::to_string)
-            });
+                .filter(|index| !rows[**index].is_api_error)
+                .find_map(|index| rows[*index].title.as_deref())
+                .map(str::to_string);
+            let cwd = selected
+                .iter()
+                .rev()
+                .find_map(|index| rows[*index].cwd.clone());
             let message_count = selected
                 .iter()
                 .filter(|index| {
-                    !is_api_error_message(&rows[**index].value)
-                        && matches!(
-                            rows[**index].value.get("type").and_then(Value::as_str),
-                            Some("user" | "assistant")
-                        )
+                    !rows[**index].is_api_error
+                        && matches!(rows[**index].kind.as_str(), "user" | "assistant")
                 })
                 .count();
             let latest_timestamp = selected
@@ -189,7 +186,7 @@ impl HarnessReader for ClaudeCodeReader {
                     title,
                     cwd,
                     message_count,
-                    approximate_size_bytes: fs::metadata(path)?.len(),
+                    approximate_size_bytes: Some(fs::metadata(path)?.len()),
                 },
             ));
         }
@@ -209,6 +206,7 @@ impl HarnessReader for ClaudeCodeReader {
         let mut dropped_system = 0usize;
         let mut dropped_api_errors = 0usize;
         let mut dropped_redacted = 0usize;
+        let mut omitted_images = 0usize;
         let mut skipped_blocks = BTreeSet::new();
         let mut skipped_rows = BTreeSet::new();
 
@@ -249,6 +247,7 @@ impl HarnessReader for ClaudeCodeReader {
                     row,
                     &mut messages,
                     &mut dropped_redacted,
+                    &mut omitted_images,
                     &mut skipped_blocks,
                     join_previous_assistant,
                 ),
@@ -277,6 +276,11 @@ impl HarnessReader for ClaudeCodeReader {
                 "Dropped {dropped_redacted} Claude Code redacted_thinking block(s); foreign encrypted reasoning cannot be replayed"
             ));
         }
+        if omitted_images > 0 {
+            warnings.push(format!(
+                "Omitted {omitted_images} unsupported Claude Code tool-result image block(s)"
+            ));
+        }
         if !skipped_blocks.is_empty() {
             warnings.push(format!(
                 "Skipped unsupported Claude Code content block kinds: {}",
@@ -293,6 +297,16 @@ impl HarnessReader for ClaudeCodeReader {
         let mut imported = finalize_import(messages, format!("cc:{session_id}"), warnings, "cc")?;
         imported.dropped_api_error_messages = dropped_api_errors;
         Ok(imported)
+    }
+
+    fn session_cwd(&self, session_id: &str) -> ReaderResult<Option<String>> {
+        let path = self.find_session(session_id)?;
+        let rows = load_summary_rows(&path)?;
+        let selected = select_latest_branch(&rows)?;
+        Ok(selected
+            .iter()
+            .rev()
+            .find_map(|index| rows[*index].cwd.clone()))
     }
 }
 
@@ -311,17 +325,44 @@ struct SourceRow {
     timestamp: String,
     order: usize,
     sidechain: bool,
+    message_fingerprint: [u8; 32],
+    kind: String,
+    is_api_error: bool,
+    title: Option<String>,
+    cwd: Option<String>,
 }
 
 fn load_rows(path: &Path) -> ReaderResult<Vec<SourceRow>> {
+    load_rows_with_values(path, true)
+}
+
+fn load_summary_rows(path: &Path) -> ReaderResult<Vec<SourceRow>> {
+    load_rows_with_values(path, false)
+}
+
+fn load_rows_with_values(path: &Path, retain_values: bool) -> ReaderResult<Vec<SourceRow>> {
+    check_session_source_size(path)?;
     let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut bytes_read = 0;
+    let mut line_index = 0;
     let mut rows = Vec::new();
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
+    while read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).map_err(|error| {
+        IoError::new(
+            ErrorKind::InvalidData,
+            format!(
+                "read Claude Code session {} line {}: {error}",
+                path.display(),
+                line_index + 1
+            ),
+        )
+    })? {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            line_index += 1;
             continue;
         }
-        let value: Value = serde_json::from_str(&line).map_err(|error| {
+        let value: Value = serde_json::from_slice(&line).map_err(|error| {
             IoError::new(
                 ErrorKind::InvalidData,
                 format!(
@@ -331,29 +372,61 @@ fn load_rows(path: &Path) -> ReaderResult<Vec<SourceRow>> {
                 ),
             )
         })?;
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let title = (!retain_values && kind == "user")
+            .then(|| first_user_text(&value))
+            .flatten()
+            .map(|title| truncate_title(&title));
+        let cwd = (!retain_values)
+            .then(|| value.get("cwd").and_then(Value::as_str))
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let is_api_error = value.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true);
+        let message_fingerprint = fingerprint_message(value.get("message"));
+        let uuid = value
+            .get("uuid")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let parent_uuid = value
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let sidechain = value
+            .get("isSidechain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let value = if retain_values { value } else { Value::Null };
         rows.push(SourceRow {
-            uuid: value
-                .get("uuid")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            parent_uuid: value
-                .get("parentUuid")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            timestamp: value
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            sidechain: value
-                .get("isSidechain")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
             value,
+            uuid,
+            parent_uuid,
+            timestamp,
+            sidechain,
             order: line_index,
+            message_fingerprint,
+            kind,
+            is_api_error,
+            title,
+            cwd,
         });
+        line_index += 1;
     }
     Ok(rows)
+}
+
+fn fingerprint_message(message: Option<&Value>) -> [u8; 32] {
+    let bytes = serde_json::to_vec(&message).expect("a JSON value always serializes");
+    Sha256::digest(bytes).into()
 }
 
 fn select_latest_branch(rows: &[SourceRow]) -> ReaderResult<Vec<usize>> {
@@ -362,9 +435,9 @@ fn select_latest_branch(rows: &[SourceRow]) -> ReaderResult<Vec<usize>> {
         if let Some(uuid) = row.uuid.as_deref() {
             if let Some(previous_index) = by_uuid.get(uuid).copied() {
                 let previous = &rows[previous_index];
-                // Only the complete message payload and timestamp establish rewrite identity;
+                // Only the complete message fingerprint and timestamp establish rewrite identity;
                 // row metadata such as slug and parentUuid is expected to change.
-                if previous.value.get("message") != row.value.get("message")
+                if previous.message_fingerprint != row.message_fingerprint
                     || previous.timestamp != row.timestamp
                 {
                     return Err(IoError::new(
@@ -431,6 +504,7 @@ fn convert_message_row(
     row: &Value,
     messages: &mut Vec<Message>,
     dropped_redacted: &mut usize,
+    omitted_images: &mut usize,
     skipped_blocks: &mut BTreeSet<String>,
     join_previous_assistant: bool,
 ) {
@@ -472,7 +546,9 @@ fn convert_message_row(
     let mut pending_role = None;
     let mut pending = Vec::new();
     for block in blocks {
-        let Some(converted) = convert_block(block, dropped_redacted, skipped_blocks) else {
+        let Some(converted) =
+            convert_block(block, dropped_redacted, omitted_images, skipped_blocks)
+        else {
             continue;
         };
         let role = if matches!(converted, ContentBlock::ToolResult(_)) {
@@ -512,6 +588,7 @@ fn singleton_text_block(value: &Value) -> Option<&str> {
 fn convert_block(
     block: &Value,
     dropped_redacted: &mut usize,
+    omitted_images: &mut usize,
     skipped_blocks: &mut BTreeSet<String>,
 ) -> Option<ContentBlock> {
     let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
@@ -552,7 +629,8 @@ fn convert_block(
             thought_signature: None,
         })),
         "tool_result" => {
-            let content = block.get("content").cloned().unwrap_or(Value::Null);
+            let mut content = block.get("content").cloned().unwrap_or(Value::Null);
+            *omitted_images += omit_nested_tool_images(&mut content);
             let output = match content {
                 Value::String(text) => ToolOutput::Text { text },
                 value => match singleton_text_block(&value) {
@@ -676,6 +754,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use crate::MAX_JSONL_LINE_BYTES;
     use broca_module_serve::wire::{ImportOriginKind, ImportOriginParams, ImportParams};
     use broca_protocol::{CallOptions, ContentBlock, Role, ToolOutput, ToolResult};
     use broca_provider::{
@@ -685,8 +764,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        convert_block, load_rows, select_latest_branch, ClaudeCodeReader, HarnessReader,
-        DROPPED_CONTENT_BLOCK_KINDS, OBSERVED_NON_MESSAGE_ROW_KINDS,
+        convert_block, load_rows, load_summary_rows, select_latest_branch, ClaudeCodeReader,
+        HarnessReader, DROPPED_CONTENT_BLOCK_KINDS, OBSERVED_NON_MESSAGE_ROW_KINDS,
     };
 
     const TOOL_SESSION: &str = "11111111-1111-4111-8111-111111111111";
@@ -895,10 +974,17 @@ mod tests {
             "is_error": is_error,
         });
         let mut dropped_redacted = 0;
+        let mut omitted_images = 0;
         let mut skipped_blocks = BTreeSet::new();
-        let converted = convert_block(&block, &mut dropped_redacted, &mut skipped_blocks)
-            .expect("tool result should convert");
+        let converted = convert_block(
+            &block,
+            &mut dropped_redacted,
+            &mut omitted_images,
+            &mut skipped_blocks,
+        )
+        .expect("tool result should convert");
         assert_eq!(dropped_redacted, 0);
+        assert_eq!(omitted_images, 0);
         assert!(skipped_blocks.is_empty());
         match converted {
             ContentBlock::ToolResult(result) => result,
@@ -933,6 +1019,37 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_images_are_omitted_without_losing_surrounding_text() {
+        let block = json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_image",
+            "content": [
+                {"type": "text", "text": "before image"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "PRIVATE_BASE64"}},
+                {"type": "text", "text": "after image"}
+            ]
+        });
+        let mut dropped_redacted = 0;
+        let mut omitted_images = 0;
+        let converted = convert_block(
+            &block,
+            &mut dropped_redacted,
+            &mut omitted_images,
+            &mut BTreeSet::new(),
+        )
+        .expect("tool result should remain importable");
+        let ContentBlock::ToolResult(result) = converted else {
+            panic!("expected a tool result")
+        };
+        let encoded = serde_json::to_string(&result.output).unwrap();
+        assert_eq!(omitted_images, 1);
+        assert!(encoded.contains("before image"));
+        assert!(encoded.contains("after image"));
+        assert!(encoded.contains("image omitted from imported tool output"));
+        assert!(!encoded.contains("PRIVATE_BASE64"));
+    }
+
+    #[test]
     fn string_tool_result_stays_text() {
         let result = converted_tool_result(json!("plain output"), false);
 
@@ -955,8 +1072,62 @@ mod tests {
             Some("Please inspect the synthetic fixture.")
         );
         assert_eq!(sessions[0].cwd.as_deref(), Some("/tmp/scrubbed-project"));
+        assert_eq!(
+            fixture().session_cwd(TOOL_SESSION).unwrap().as_deref(),
+            Some("/tmp/scrubbed-project")
+        );
         assert_eq!(sessions[0].message_count, 4);
-        assert!(sessions[0].approximate_size_bytes > 0);
+        assert!(sessions[0]
+            .approximate_size_bytes
+            .is_some_and(|size| size > 0));
+    }
+
+    #[test]
+    fn claude_summary_rows_discard_message_payloads_but_keep_display_metadata() {
+        let reader = fixture();
+        let path = reader.find_session(TOOL_SESSION).unwrap();
+
+        let rows = load_summary_rows(&path).unwrap();
+
+        assert!(rows.iter().all(|row| row.value.is_null()));
+        assert!(rows
+            .iter()
+            .any(|row| { row.title.as_deref() == Some("Please inspect the synthetic fixture.") }));
+        assert!(rows
+            .iter()
+            .any(|row| row.cwd.as_deref() == Some("/tmp/scrubbed-project")));
+    }
+
+    #[test]
+    fn selected_claude_session_rejects_an_oversized_jsonl_record() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("ck-claude-line-cap-{}", std::process::id()));
+        let project = root.join("project");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&project).unwrap();
+        let header = json!({
+            "type": "user",
+            "uuid": "header",
+            "parentUuid": null,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "cwd": "/tmp/project",
+            "message": {"role": "user", "content": "header"}
+        });
+        let oversized = json!({
+            "type": "user",
+            "uuid": "large",
+            "parentUuid": "header",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "message": {"role": "user", "content": "x".repeat(MAX_JSONL_LINE_BYTES)}
+        });
+        let path = project.join("oversized.jsonl");
+        fs::write(&path, format!("{}\n{}\n", header, oversized)).unwrap();
+
+        let error = ClaudeCodeReader::new(&root)
+            .convert("oversized")
+            .unwrap_err();
+        assert!(error.to_string().contains("line limit"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

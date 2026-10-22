@@ -2512,8 +2512,8 @@ target = "--lib"
 test_file = "crates/broca-wire/src/lib.rs"
 expect_red = ["send_finished_tests::finished_send_reply_pins_wire_bytes"]
 file = "crates/broca-wire/src/lib.rs"
-old = "    Finished {\n        run_id: String,\n        reason: broca_protocol::RunFinishReason,"
-new = "    #[serde(rename = \"done\")] // NON-VACUITY BREAK\n    Finished {\n        run_id: String,\n        reason: broca_protocol::RunFinishReason,"
+old = "    Finished {\n        run_id: String,\n        /// An unfamiliar reason from a newer runner reads as `Unknown`, never as `error`.\n        reason: broca_protocol::OpenRunFinishReason,"
+new = "    #[serde(rename = \"done\")] // NON-VACUITY BREAK\n    Finished {\n        run_id: String,\n        /// An unfamiliar reason from a newer runner reads as `Unknown`, never as `error`.\n        reason: broca_protocol::OpenRunFinishReason,"
 
 # This proof checks the following behavior: projection failure diagnostics increment their counter in
 # production, not just tests.
@@ -22038,3 +22038,471 @@ file = "crates/broca-wal/src/file_wal.rs"
 old = "                let size = header.len() + len as usize;"
 new = '''                let size = header.len() + len as usize;
                 if size as u64 > available { return Err(WalError::TooLarge { max_bytes, file_size: offset + size as u64 }); } // NON-VACUITY BREAK: trust a torn header's declared length.'''
+
+[[control]]
+id = "codex-compaction-replaces-old-history"
+guards = "Codex replacement history supersedes compacted transcript rows while retaining later conversation"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/codex.rs"
+expect_red = ["codex::tests::codex_compaction_replaces_older_history_and_keeps_following_turns"]
+file = "crates/ck-session-import/src/codex.rs"
+old = "                messages.clear();"
+new = "                let _ = &mut messages; // NON-VACUITY BREAK: retain superseded history."
+
+[[control]]
+id = "pi-compaction-keeps-declared-history-tail"
+guards = "Pi compaction replaces history before firstKeptEntryId but preserves the declared retained tail"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/pi.rs"
+expect_red = ["pi::tests::compaction_summary_and_first_kept_entry_replace_older_history"]
+file = "crates/ck-session-import/src/pi.rs"
+old = "                    path = retained;"
+new = "                    path = path[compaction_index + 1..].to_vec(); // NON-VACUITY BREAK: discard the retained tail."
+
+[[control]]
+id = "imported-tool-images-never-replay-base64"
+guards = "Claude, Goose and Pi imports replace nested tool-result images with bounded placeholders"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/lib.rs"
+expect_red = ["claude_code::tests::tool_result_images_are_omitted_without_losing_surrounding_text"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if matches!(kind, Some(\"image\" | \"image_url\" | \"input_image\")) || has_base64_source {"
+new = "            if false { // NON-VACUITY BREAK: replay unsupported image payloads as raw data."
+
+[[control]]
+id = "ck-import-magic-context-compartments-do-not-overlap"
+guards = "OpenCode magic-context compartment ranges are strictly separated before any lineage commit"
+runner = "cargo"
+package = "ck-import"
+target = "--bin ck-import"
+select = "expected"
+test_file = "crates/ck-import/src/mc_state.rs"
+expect_red = ["mc_state::tests::overlapping_compartments_are_rejected_before_state_import"]
+file = "crates/ck-import/src/mc_state.rs"
+old = "        if let Some(previous_end) = previous_end_message {"
+new = "        if let Some(previous_end) = None::<u64> { // NON-VACUITY BREAK: admit overlapping ranges."
+
+[[control]]
+id = "ck-import-optional-magic-context-errors-continue-lineage"
+guards = "Malformed optional magic-context rows warn and allow the lineage import path to continue"
+runner = "cargo"
+package = "ck-import"
+target = "--test it"
+select = "expected"
+test_file = "crates/ck-import/tests/it/cli.rs"
+expect_red = ["cli::malformed_mc_row_warns_and_continues_lineage_setup"]
+file = "crates/ck-import/src/main.rs"
+old = "            Err(message) => {\n                mc_status = \"unavailable\".into();\n                warn_mc_state_unavailable(output, &message, &session_id);\n            }"
+new = "            Err(message) => return Err(message), // NON-VACUITY BREAK: abort before lineage import."
+
+[[control]]
+id = "ck-import-selected-cwd-does-not-enumerate"
+guards = "An inferred project root looks up only the selected session instead of enumerating every source transcript"
+runner = "cargo"
+package = "ck-import"
+target = "--bin ck-import"
+select = "expected"
+test_file = "crates/ck-import/src/main.rs"
+expect_red = ["tests::inferred_project_root_uses_selected_cwd_without_enumerating"]
+file = "crates/ck-import/src/main.rs"
+old = "reader\n            .session_cwd(source_id)\n            .map_err(|error| format!(\"inspect selected {source_harness} session: {error}\"))?"
+new = '''reader
+            .enumerate()
+            .map_err(|error| format!("inspect {source_harness} sessions: {error}"))?
+            .into_iter()
+            .find(|session| session.id == source_id)
+            .and_then(|summary| summary.cwd)'''
+
+[[control]]
+id = "pi-list-skips-only-malformed-parent-trees"
+guards = "A malformed Pi parent tree is omitted from session listing without hiding valid sessions, while selected conversion remains strict"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/pi.rs"
+expect_red = ["pi::tests::malformed_parent_tree_is_skipped_from_enumeration_but_selected_import_fails"]
+file = "crates/ck-session-import/src/pi.rs"
+old = '''            let selected = match session.selected_path() {
+                Ok(selected) => selected,
+                Err(error) => {
+                    eprintln!(
+                        "WARNING: skipped malformed Pi parent tree for session '{}': {error}",
+                        session.id
+                    );
+                    continue;
+                }
+            };'''
+new = "            let selected = session.selected_path()?; // NON-VACUITY BREAK: let one malformed tree abort listing"
+
+[[control]]
+id = "session-import-jsonl-line-size-limit"
+guards = "Foreign JSONL records are rejected before an oversized line can grow the reader buffer"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/lib.rs"
+expect_red = ["claude_code::tests::selected_claude_session_rejects_an_oversized_jsonl_record"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {"
+new = "            if false { // NON-VACUITY BREAK: allow an oversized JSONL line to allocate."
+
+[[control]]
+id = "session-import-jsonl-total-byte-limit"
+guards = "A reader stops when appended JSONL bytes exceed the per-session source bound"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/lib.rs"
+expect_red = ["tests::jsonl_reader_refuses_bytes_after_the_source_limit"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if bytes_read.saturating_add(count as u64) > MAX_SESSION_SOURCE_BYTES {"
+new = "            if false { // NON-VACUITY BREAK: allow the source byte count to exceed its limit."
+
+[[control]]
+id = "session-import-source-file-size-limit"
+guards = "An oversized source file is refused from its metadata before the reader opens or parses its payload"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/lib.rs"
+expect_red = ["tests::session_source_size_is_rejected_before_reading_contents"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "    if size > MAX_SESSION_SOURCE_BYTES {"
+new = "    if false { // NON-VACUITY BREAK: accept source files larger than the import limit."
+
+[[control]]
+id = "claude-enumeration-retains-only-summary-metadata"
+guards = "Claude Code summary enumeration does not retain parsed message payloads after deriving branch metadata"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/claude_code.rs"
+expect_red = ["claude_code::tests::claude_summary_rows_discard_message_payloads_but_keep_display_metadata"]
+file = "crates/ck-session-import/src/claude_code.rs"
+old = "        let value = if retain_values { value } else { Value::Null };"
+new = "        let value = value; // NON-VACUITY BREAK: retain the complete payload while listing."
+
+[[control]]
+id = "claude-summary-preserves-rewrite-conflict-detection"
+guards = "Metadata-only Claude branch selection still rejects a UUID rewrite whose full message payload changed"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/claude_code.rs"
+expect_red = ["claude_code::tests::duplicate_uuid_conflicting_message_is_invalid_data"]
+file = "crates/ck-session-import/src/claude_code.rs"
+old = "if previous.message_fingerprint != row.message_fingerprint\n                    || previous.timestamp != row.timestamp"
+new = "if previous.timestamp != row.timestamp // NON-VACUITY BREAK: accept changed message payloads"
+
+[[control]]
+id = "codex-enumeration-does-not-collect-rollout-rows"
+guards = "Codex session listing derives metadata as it scans and does not collect every rollout row as a Value"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/codex.rs"
+expect_red = ["codex::tests::enumeration_streams_rollouts_without_collecting_full_rows"]
+file = "crates/ck-session-import/src/codex.rs"
+old = "fn inspect_rollout(path: &Path) -> ReaderResult<RolloutMetadata> {\n    check_session_source_size(path)?;"
+new = "fn inspect_rollout(path: &Path) -> ReaderResult<RolloutMetadata> {\n    let _ = read_rows(path)?; // NON-VACUITY BREAK: collect full rows during listing.\n    check_session_source_size(path)?;"
+
+[[control]]
+id = "wire-run-status-unknown-state-fallback"
+guards = "An unrecognized run.status state decodes to the nonterminal fallback rather than failing the typed response"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::unknown_run_status_state_decodes_to_a_nonterminal_fallback"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    /// Fallback for a newer state string; old-runner clients do not treat it as terminal.\n    #[serde(other)]\n    Unknown,"
+new = "    /// Fallback for a newer state string; old-runner clients do not treat it as terminal.\n    Unknown, // NON-VACUITY BREAK: reject future run states."
+
+[[control]]
+id = "wire-send-unknown-state-fallback"
+guards = "An unfamiliar session.send state decodes before the client applies its explicit non-actionable fallback"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::unknown_send_state_decodes_without_closing_the_wire_vocabulary"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    /// A newer runner state this client does not interpret; callers keep it non-actionable.\n    #[serde(other)]\n    Unknown,"
+new = "    /// A newer runner state this client does not interpret; callers keep it non-actionable.\n    Unknown, // NON-VACUITY BREAK: reject future send states."
+
+[[control]]
+id = "wire-queued-send-unknown-state-fallback"
+guards = "An unfamiliar queued-send status decodes to a non-actionable fallback"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::unknown_queued_send_state_decodes_to_a_non_actionable_fallback"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    Retracted,\n    #[serde(other)]\n    Unknown,"
+new = "    Retracted,\n    Unknown, // NON-VACUITY BREAK: reject future queued states."
+
+[[control]]
+id = "caller-unknown-control-event-reset-fallback"
+guards = "An unknown caller control event clears partial display state instead of failing stream decoding"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/caller.rs"
+expect_red = ["caller::tests::unknown_control_event_uses_the_display_reset_fallback"]
+file = "crates/broca-protocol/src/caller.rs"
+old = "    /// Unknown future control events use this conservative reset fallback.\n    #[serde(other)]\n    DisplayReset,"
+new = "    /// Unknown future control events use this conservative reset fallback.\n    DisplayReset, // NON-VACUITY BREAK: reject unfamiliar control events."
+
+[[control]]
+id = "display-unknown-event-reset-fallback"
+guards = "An unknown display event resets partial state instead of failing the stream frame"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/display.rs"
+expect_red = ["display::tests::unknown_display_event_uses_the_reset_fallback"]
+file = "crates/broca-protocol/src/display.rs"
+old = "    /// Unknown future display events use the same conservative reset fallback.\n    #[serde(other)]\n    DisplayReset,"
+new = "    /// Unknown future display events use the same conservative reset fallback.\n    DisplayReset, // NON-VACUITY BREAK: reject unfamiliar display events."
+
+[[control]]
+id = "subscribe-unknown-envelope-reset-fallback"
+guards = "An unfamiliar subscribe envelope is handled as a display reset instead of failing frame decoding"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::unknown_subscribe_envelopes_and_event_types_reset_display_state"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    Display {\n        event: DisplayEvent,\n    },\n    #[serde(other)]\n    Unknown,\n}"
+new = "    Display {\n        event: DisplayEvent,\n    },\n    Unknown, // NON-VACUITY BREAK: reject future subscribe lanes\n}"
+
+[[control]]
+id = "provider-finish-reason-unknown-fallback"
+guards = "A caller reading an unfamiliar step finish reason gets the generic other reason rather than a named one or a decode failure"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/content.rs"
+expect_red = ["content::tests::unknown_provider_finish_reason_uses_the_other_fallback_only_for_callers"]
+file = "crates/broca-protocol/src/content.rs"
+old = "        crate::caller::OpenState::Unknown(_) => FinishReason::Other,\n    })\n}"
+new = "        crate::caller::OpenState::Unknown(_) => FinishReason::Stop, // NON-VACUITY BREAK: label a new provider reason as stop.\n    })\n}"
+
+[[control]]
+id = "durable-finish-reason-stays-closed"
+guards = "The closed step finish reason that WAL records decode refuses an unfamiliar value instead of reading it as other"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/content.rs"
+expect_red = ["content::tests::unknown_provider_finish_reason_uses_the_other_fallback_only_for_callers"]
+file = "crates/broca-protocol/src/content.rs"
+old = "    Error,\n    Other,\n}"
+new = "    Error,\n    #[serde(other)] // NON-VACUITY BREAK: durable records accept unknown reasons.\n    Other,\n}"
+
+[[control]]
+id = "open-run-state-keeps-unknown-values"
+guards = "An unfamiliar run finish or pause reason on a caller surface decodes as an explicit Unknown carrying its spelling, not as a known reason or a decode failure"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/caller.rs"
+expect_red = ["caller::tests::unknown_finish_and_pause_reasons_decode_as_explicit_unknown_states"]
+file = "crates/broca-protocol/src/caller.rs"
+old = "            Err(_) => Self::Unknown(raw),"
+new = "            Err(error) => return Err(D::Error::custom(error)), // NON-VACUITY BREAK: close the caller vocabulary."
+
+[[control]]
+id = "durable-pause-reason-stays-closed"
+guards = "The closed pause reason that WAL records decode refuses an unfamiliar value instead of reading it as a known pause"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/caller.rs"
+expect_red = ["caller::tests::durable_reason_enums_stay_closed_to_unknown_values", "caller::tests::unknown_finish_and_pause_reasons_decode_as_explicit_unknown_states"]
+file = "crates/broca-protocol/src/caller.rs"
+old = "    /// A graceful process stop at a clean boundary; the same episode can resume after boot.\n    Restart,"
+new = "    /// A graceful process stop at a clean boundary; the same episode can resume after boot.\n    #[serde(other)] // NON-VACUITY BREAK: read an unknown pause as a restart.\n    Restart,"
+
+[[control]]
+id = "subscribe-unknown-run-reason-becomes-unrecognized-state"
+guards = "A subscribe control unit whose finish reason is newer than the client decodes as an unrecognized run state instead of failing the stream"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::subscribe_units_with_unknown_run_reasons_become_unrecognized_run_states"]
+file = "crates/broca-wire/src/lib.rs"
+old = "        } => Some(UnrecognizedRunState::Finished { run_id, reason }),"
+new = "        } => None, // NON-VACUITY BREAK: fail the stream on a newer finish reason."
+
+[[control]]
+id = "session-cli-unknown-finish-is-not-success"
+guards = "The session CLI stops on its run's unrecognized ending without reporting success, since it cannot tell whether the run succeeded"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --bin broca-session \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module-serve/src/bin/broca-session.rs"
+expect_red = ["tests::combined_turn_ends_on_an_unrecognized_finish_without_calling_it_an_error"]
+file = "crates/broca-module-serve/src/bin/broca-session.rs"
+old = "            Some(OpenState::Unknown(_)) => 1,"
+new = "            Some(OpenState::Unknown(_)) => 0, // NON-VACUITY BREAK: report an unknown ending as success."
+
+[[control]]
+id = "caller-error-class-open-string-decode"
+guards = "An unfamiliar provider error class is retained on caller reads while the inner routing fallback cannot retry"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/caller.rs"
+expect_red = ["caller::tests::unknown_caller_error_class_is_preserved_with_a_non_retrying_fallback"]
+file = "crates/broca-protocol/src/caller.rs"
+old = "let known = serde_json::from_value::<crate::ErrorClass>(serde_json::Value::String(\n            raw_class.clone(),\n        ))\n        .is_ok();"
+new = "let known = true; // NON-VACUITY BREAK: route unknown classes through the closed enum."
+
+[[control]]
+id = "shared-refusal-class-maps-provider-local-values"
+guards = "Every provider-local ErrorClass is mapped into the pinned four-class shared vocabulary before a refusal is served"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/error.rs"
+expect_red = ["error::open_error_class_tests::producer_classes_map_to_the_closed_shared_vocabulary"]
+file = "crates/broca-protocol/src/error.rs"
+old = "let wire = match class.shared_class() {"
+new = "let wire = match class { // NON-VACUITY BREAK: expose producer-local provider_unavailable."
+
+[[control]]
+id = "wire-principal-refusal-class-is-open-to-readers"
+guards = "A principal refusal's served class is constrained on write but remains open for a future caller read"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::refusal_classes_are_open_when_consumers_decode_them"]
+file = "crates/broca-wire/src/lib.rs"
+old = "pub struct FlowPrincipalRefusal {\n    pub code: String,\n    pub message: String,\n    pub class: broca_protocol::OpenErrorClass,"
+new = "pub struct FlowPrincipalRefusal {\n    pub code: String,\n    pub message: String,\n    pub class: broca_protocol::ErrorClass, // NON-VACUITY BREAK: close caller decoding."
+
+[[control]]
+id = "wire-caller-message-serialization-does-not-clone"
+guards = "A caller-facing stateful message rewrites only the stateful block in a borrowed view, not the whole message"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::stateful_caller_message_serializer_uses_borrowed_content"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    CallerMessageRef(message).serialize(serializer)\n}\n\nstruct CallerMessageRef"
+new = "    CallerMessageRef(&(*message).clone()).serialize(serializer) // NON-VACUITY BREAK: clone all message blocks\n}\n\nstruct CallerMessageRef"
+
+[[control]]
+id = "codex-legacy-compaction-summary-replaces-old-history"
+guards = "A legacy Codex compaction summary replaces all history accumulated before its row"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/codex.rs"
+expect_red = ["codex::tests::codex_legacy_compaction_summary_replaces_older_history"]
+file = "crates/ck-session-import/src/codex.rs"
+old = "                messages.clear();"
+new = "                let _ = &mut messages; // NON-VACUITY BREAK: retain history superseded by a legacy summary."
+
+[[control]]
+id = "goose-imported-tool-images-never-replay-base64"
+guards = "Goose imported tool results replace image blocks with bounded placeholders and keep nearby text"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/goose.rs"
+expect_red = ["goose::tests::tool_result_images_are_omitted_and_text_is_retained"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if matches!(kind, Some(\"image\" | \"image_url\" | \"input_image\")) || has_base64_source {"
+new = "            if false { // NON-VACUITY BREAK: keep unsupported image payloads in tool output."
+
+[[control]]
+id = "pi-imported-tool-images-never-replay-base64"
+guards = "Pi imported tool results replace image blocks with bounded placeholders and keep nearby text"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/pi.rs"
+expect_red = ["pi::tests::tool_result_images_are_omitted_with_an_actionable_warning"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if matches!(kind, Some(\"image\" | \"image_url\" | \"input_image\")) || has_base64_source {"
+new = "            if false { // NON-VACUITY BREAK: keep unsupported image payloads in tool output."
+
+[[control]]
+id = "codex-selected-rollout-line-size-limit"
+guards = "Codex import refuses an oversized JSONL record before allocating it as a parsed row"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/codex.rs"
+expect_red = ["codex::tests::selected_codex_rollout_rejects_an_oversized_jsonl_record"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {"
+new = "            if false { // NON-VACUITY BREAK: permit an oversized JSONL record."
+
+[[control]]
+id = "pi-selected-session-line-size-limit"
+guards = "Pi import refuses an oversized JSONL record before allocating it as a parsed node"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/pi.rs"
+expect_red = ["pi::tests::selected_pi_session_rejects_an_oversized_jsonl_record"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {"
+new = "            if false { // NON-VACUITY BREAK: permit an oversized JSONL record."
+
+[[control]]
+id = "session-import-line-helper-size-limit"
+guards = "The shared JSONL reader refuses a record that exceeds its fixed buffer bound"
+runner = "cargo"
+package = "ck-session-import"
+target = "--lib"
+select = "expected"
+test_file = "crates/ck-session-import/src/lib.rs"
+expect_red = ["tests::jsonl_reader_rejects_oversized_records_before_buffering_them"]
+file = "crates/ck-session-import/src/lib.rs"
+old = "            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {"
+new = "            if false { // NON-VACUITY BREAK: permit an oversized JSONL record."

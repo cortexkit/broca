@@ -59,6 +59,8 @@ tool-calls are its content blocks — no separate tool_call unit) · `step_finis
 `tool_result` · `step_finished` · `approval_request` · `display_reset` · `error`
 · `run_finished{reason}`.
 
+Readers are not closed to future tags: an unfamiliar `run.status.state` or `session.send.state` decodes to the non-actionable `unknown` fallback; the typed send client reports a protocol fallback rather than treating it as an active or terminal run. An unfamiliar control or display event becomes `display_reset`, clearing partial rendering without inventing a durable event. Caller error classes retain unfamiliar strings through the open `SharedProviderError` wrapper. An unfamiliar run finish reason or pause reason (`session.send` `reason`/`pause_reason`, `run.status` `pause_reason`, the `run_paused` refusal's `detail.reason`) decodes as an explicit `OpenState::Unknown` that keeps the spelling; it is never read as `error`, as `auth_required`, or as any other known reason, and every caller must handle it as its own case. On `session.subscribe`, a `paused` or `run_finished` unit with such a reason decodes as `SubscribeEvent::UnrecognizedRunState`: the run did pause or end, but the client cannot say why. An unfamiliar step finish reason reads as `other`. Durable WAL records keep the closed enums and still refuse unknown values. Producers still write only the pinned values above, so existing bytes do not change.
+
 **Approval back-channel** (caller → runner, control lane): `ApprovalResponse` =
 `allow` | `allow_narrowed{input}` | `deny{reason}`, correlated by `tool_call_id`
 (+ envelope `corr`). Approval may NARROW, never widen.

@@ -1218,7 +1218,8 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
         State::Paused => RunStatusResponse::Paused {
             pause_reason: state
                 .pause_reason
-                .filter(|reason| *reason == broca_protocol::PauseReason::Restart),
+                .filter(|reason| *reason == broca_protocol::PauseReason::Restart)
+                .map(Into::into),
             usage,
             retries_used,
             reason: pause_reason,
@@ -2396,7 +2397,7 @@ impl ServeHandler for crate::LineageRegistry {
             } => (
                 broca_wire::SendResult::Finished {
                     run_id: run_id.0,
-                    reason,
+                    reason: reason.into(),
                 },
                 delivered,
             ),
@@ -2411,7 +2412,7 @@ impl ServeHandler for crate::LineageRegistry {
             } => (
                 broca_wire::SendResult::Paused {
                     run_id: run_id.0,
-                    pause_reason: reason,
+                    pause_reason: reason.into(),
                 },
                 delivered,
             ),

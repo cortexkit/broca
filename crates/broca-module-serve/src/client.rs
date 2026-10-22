@@ -30,7 +30,7 @@ use crate::wire::{
 
 use broca_wire::RunResultParams;
 
-pub use broca_wire::{decode_subscribe_event, SubscribeEvent};
+pub use broca_wire::{decode_subscribe_event, SubscribeEvent, UnrecognizedRunState};
 
 /// A client for one session on a module. Short requests like send/status/cancel/retract use
 /// the shared command channel because they complete quickly, and replies are matched by
@@ -74,17 +74,21 @@ pub struct SendSpec<'a> {
 
 /// What a `send` produced: an active run, an already-finished run, or a durably-queued submission.
 #[derive(Debug, Clone, PartialEq)]
+///
+/// Pause and finish reasons are open: a reason from a newer runner arrives as
+/// [`broca_protocol::OpenState::Unknown`], which says only that the run paused or ended for a
+/// reason this client cannot interpret. It is not an error and not a re-authentication pause.
 pub enum SendOutcome {
     Paused {
         run_id: String,
-        pause_reason: broca_protocol::PauseReason,
+        pause_reason: broca_protocol::OpenPauseReason,
     },
     Active {
         run_id: String,
     },
     Finished {
         run_id: String,
-        reason: broca_protocol::RunFinishReason,
+        reason: broca_protocol::OpenRunFinishReason,
     },
     Pending {
         submission_id: String,
@@ -130,6 +134,24 @@ fn decode_result_envelope<T: serde::de::DeserializeOwned>(
             serde_json::from_value(result)
                 .map_err(|e| ConnError::Protocol(format!("{error_context}: {e}")))
         }
+    }
+}
+
+fn send_outcome(result: SendResult) -> Result<SendOutcome, ConnError> {
+    match result {
+        SendResult::Finished { run_id, reason } => Ok(SendOutcome::Finished { run_id, reason }),
+        SendResult::Paused {
+            run_id,
+            pause_reason,
+        } => Ok(SendOutcome::Paused {
+            run_id,
+            pause_reason,
+        }),
+        SendResult::Active { run_id } => Ok(SendOutcome::Active { run_id }),
+        SendResult::Pending { submission_id } => Ok(SendOutcome::Pending { submission_id }),
+        SendResult::Unknown => Err(ConnError::Protocol(
+            "session.send returned an unrecognized runner state".into(),
+        )),
     }
 }
 
@@ -195,18 +217,7 @@ impl SessionClient {
         let result: SendResult = self
             .request("session.send", &params, "decode send result")
             .await?;
-        Ok(match result {
-            SendResult::Finished { run_id, reason } => SendOutcome::Finished { run_id, reason },
-            SendResult::Paused {
-                run_id,
-                pause_reason,
-            } => SendOutcome::Paused {
-                run_id,
-                pause_reason,
-            },
-            SendResult::Active { run_id } => SendOutcome::Active { run_id },
-            SendResult::Pending { submission_id } => SendOutcome::Pending { submission_id },
-        })
+        send_outcome(result)
     }
 
     /// `session.import`: seed canonical history as one completed provider-free episode.
@@ -536,6 +547,51 @@ mod tests {
     }
 
     #[test]
+    fn typed_client_decoder_accepts_an_unknown_run_status_state() {
+        let body = br#"{"result":{"state":"future_runner_state","extra":"future field"}}"#;
+        let status: RunStatusResponse = decode_result_envelope(body, "decode run status").unwrap();
+        assert!(matches!(status, RunStatusResponse::Unknown));
+    }
+
+    #[test]
+    fn unknown_send_state_uses_an_explicit_protocol_fallback() {
+        let body = br#"{"result":{"state":"future_send_state"}}"#;
+        let result: SendResult = decode_result_envelope(body, "decode send result").unwrap();
+
+        assert!(matches!(result, SendResult::Unknown));
+        match send_outcome(result) {
+            Err(ConnError::Protocol(message)) => {
+                assert!(message.contains("unrecognized runner state"));
+            }
+            other => panic!("unknown send state must remain non-actionable: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_send_pause_and_finish_reasons_reach_the_caller_as_unknown() {
+        let body = br#"{"result":{"state":"finished","run_id":"run-1","reason":"future_finish"}}"#;
+        let result: SendResult = decode_result_envelope(body, "decode send result").unwrap();
+        assert_eq!(
+            send_outcome(result).unwrap(),
+            SendOutcome::Finished {
+                run_id: "run-1".into(),
+                reason: broca_protocol::OpenState::Unknown("future_finish".into()),
+            }
+        );
+
+        let body =
+            br#"{"result":{"state":"paused","run_id":"run-1","pause_reason":"future_pause"}}"#;
+        let result: SendResult = decode_result_envelope(body, "decode send result").unwrap();
+        assert_eq!(
+            send_outcome(result).unwrap(),
+            SendOutcome::Paused {
+                run_id: "run-1".into(),
+                pause_reason: broca_protocol::OpenState::Unknown("future_pause".into()),
+            }
+        );
+    }
+
+    #[test]
     fn typed_read_matches_legacy_double_parse() {
         let read = ReadResult {
             next_late_after: None,
@@ -583,7 +639,7 @@ mod tests {
         assert_typed_response_matches_legacy(
             &SendResult::Finished {
                 run_id: "run-1".into(),
-                reason: broca_protocol::RunFinishReason::Interrupted,
+                reason: broca_protocol::RunFinishReason::Interrupted.into(),
             },
             "decode finished send result",
         );

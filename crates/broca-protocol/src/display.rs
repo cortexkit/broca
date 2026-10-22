@@ -46,5 +46,22 @@ pub enum DisplayEvent {
     /// the step whose deltas preceded it on the display lane, not the control lane's latest
     /// step. Non-empty message ids bound that re-stream when the next id differs. Gemini
     /// uses empty ids, so the re-stream/next-step boundary is unmarked on this lossy lane.
+    /// Unknown future display events use the same conservative reset fallback.
+    #[serde(other)]
     DisplayReset,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisplayEvent;
+
+    #[test]
+    fn unknown_display_event_uses_the_reset_fallback() {
+        let event: DisplayEvent = serde_json::from_value(serde_json::json!({
+            "type": "future_display_delta",
+            "payload": "ignored by this reader"
+        }))
+        .unwrap();
+        assert_eq!(event, DisplayEvent::DisplayReset);
+    }
 }

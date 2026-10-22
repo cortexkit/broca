@@ -9,9 +9,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
+use std::path::Path;
 
 use broca_protocol::{ContentBlock, Message, Role, ToolCallId};
+use serde_json::Value;
 
 pub mod claude_code;
 pub mod codex;
@@ -21,6 +23,120 @@ pub mod pi;
 
 mod sqlite_read;
 
+pub(crate) const MAX_SESSION_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_JSONL_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SESSION_TITLE_CHARS: usize = 80;
+
+pub(crate) fn truncate_session_title(title: String) -> String {
+    if title.chars().count() <= MAX_SESSION_TITLE_CHARS {
+        return title;
+    }
+    let mut truncated = title
+        .chars()
+        .take(MAX_SESSION_TITLE_CHARS - 1)
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+/// Refuse oversized JSONL sources before retaining their parsed rows.
+pub(crate) fn check_session_source_size(path: &Path) -> io::Result<u64> {
+    let size = std::fs::metadata(path)?.len();
+    if size > MAX_SESSION_SOURCE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source session {} is {size} bytes; the import reader limit is {} bytes",
+                path.display(),
+                MAX_SESSION_SOURCE_BYTES
+            ),
+        ));
+    }
+    Ok(size)
+}
+
+/// Read one JSONL record without allowing an unbounded line or source to grow the buffer.
+pub(crate) fn read_bounded_jsonl_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    bytes_read: &mut u64,
+) -> io::Result<bool> {
+    line.clear();
+    let mut read_any = false;
+    loop {
+        let (count, ended_line) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(read_any);
+            }
+            let count = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("JSONL record exceeds the {MAX_JSONL_LINE_BYTES}-byte line limit"),
+                ));
+            }
+            if bytes_read.saturating_add(count as u64) > MAX_SESSION_SOURCE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source session exceeds the {MAX_SESSION_SOURCE_BYTES}-byte import reader limit"
+                    ),
+                ));
+            }
+            line.extend_from_slice(&available[..count]);
+            (count, available[count - 1] == b'\n')
+        };
+        reader.consume(count);
+        *bytes_read += count as u64;
+        read_any = true;
+        if ended_line {
+            break;
+        }
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    }
+    Ok(true)
+}
+
+/// Replace image blocks nested in imported tool output before it reaches a model prompt.
+///
+/// Canonical tool output has no image block, so keeping the source JSON can turn a large
+/// base64 payload into ordinary prompt text. A fixed text placeholder preserves the position
+/// of omitted media without retaining its bytes.
+pub(crate) fn omit_nested_tool_images(value: &mut Value) -> usize {
+    match value {
+        Value::Array(items) => items.iter_mut().map(omit_nested_tool_images).sum(),
+        Value::Object(object) => {
+            let kind = object.get("type").and_then(Value::as_str);
+            let has_base64_source =
+                object
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .is_some_and(|source| {
+                        source.get("type").and_then(Value::as_str) == Some("base64")
+                            && source.get("data").and_then(Value::as_str).is_some()
+                    });
+            if matches!(kind, Some("image" | "image_url" | "input_image")) || has_base64_source {
+                *value = serde_json::json!({
+                    "type": "text",
+                    "text": "[image omitted from imported tool output]"
+                });
+                return 1;
+            }
+            object.values_mut().map(omit_nested_tool_images).sum()
+        }
+        _ => 0,
+    }
+}
+
 /// Metadata cheap enough to show while choosing a source session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
@@ -28,7 +144,8 @@ pub struct SessionSummary {
     pub title: Option<String>,
     pub cwd: Option<String>,
     pub message_count: usize,
-    pub approximate_size_bytes: u64,
+    /// `None` when obtaining a size would require scanning stored session payloads.
+    pub approximate_size_bytes: Option<u64>,
 }
 
 /// One surviving imported block used to translate a source transcript coordinate.
@@ -57,28 +174,36 @@ pub struct CoordinateMap {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImportedBlockRange {
-    start: ImportedBlockCoordinate,
-    end: ImportedBlockCoordinate,
+    start: Option<ImportedBlockCoordinate>,
+    end: Option<ImportedBlockCoordinate>,
 }
 
 impl CoordinateMap {
     pub fn start_coordinate_for_ordinal(&self, ordinal: u64) -> Option<&ImportedBlockCoordinate> {
-        self.by_ordinal.get(&ordinal).map(|range| &range.start)
+        self.by_ordinal
+            .get(&ordinal)
+            .and_then(|range| range.start.as_ref())
     }
 
     pub fn start_coordinate_for_message_id(
         &self,
         message_id: &str,
     ) -> Option<&ImportedBlockCoordinate> {
-        self.by_message_id.get(message_id).map(|range| &range.start)
+        self.by_message_id
+            .get(message_id)
+            .and_then(|range| range.start.as_ref())
     }
 
     pub fn coordinate_for_ordinal(&self, ordinal: u64) -> Option<&ImportedBlockCoordinate> {
-        self.by_ordinal.get(&ordinal).map(|range| &range.end)
+        self.by_ordinal
+            .get(&ordinal)
+            .and_then(|range| range.end.as_ref())
     }
 
     pub fn coordinate_for_message_id(&self, message_id: &str) -> Option<&ImportedBlockCoordinate> {
-        self.by_message_id.get(message_id).map(|range| &range.end)
+        self.by_message_id
+            .get(message_id)
+            .and_then(|range| range.end.as_ref())
     }
 
     pub fn date_for_ordinal(&self, ordinal: u64) -> Option<&str> {
@@ -136,6 +261,16 @@ pub trait HarnessReader {
     fn harness(&self) -> &'static str;
     fn enumerate(&self) -> Result<Vec<SessionSummary>, Box<dyn Error + Send + Sync>>;
     fn convert(&self, session_id: &str) -> Result<ImportedSession, Box<dyn Error + Send + Sync>>;
+    /// Return the selected session's project directory without listing every session.
+    ///
+    /// Readers that do not store a directory may return `None`; callers then use their own
+    /// current directory. Implementations should keep this lookup scoped to `session_id`.
+    fn session_cwd(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+        Ok(None)
+    }
 }
 
 pub(crate) fn finalize_import(
@@ -212,13 +347,22 @@ pub(crate) fn build_coordinate_map(
                 };
                 direct
                     .entry(origin.ordinal)
-                    .and_modify(|range| range.end = coordinate.clone())
+                    .and_modify(|range| range.end = Some(coordinate.clone()))
                     .or_insert(ImportedBlockRange {
-                        start: coordinate.clone(),
-                        end: coordinate,
+                        start: Some(coordinate.clone()),
+                        end: Some(coordinate),
                     });
             }
         }
+    }
+
+    let mut next_ranges = vec![None; source_messages.len()];
+    let mut next = None;
+    for (index, source) in source_messages.iter().enumerate().rev() {
+        if let Some(range) = direct.get(&source.ordinal) {
+            next = Some(range.clone());
+        }
+        next_ranges[index] = next.clone();
     }
 
     let mut by_ordinal = HashMap::new();
@@ -226,18 +370,35 @@ pub(crate) fn build_coordinate_map(
     let mut dates_by_ordinal = HashMap::new();
     let mut dates_by_message_id = HashMap::new();
     let mut prior = None;
-    for source in source_messages {
+    for (index, source) in source_messages.iter().enumerate() {
         let range = if let Some(range) = direct.get(&source.ordinal) {
-            prior = Some(range.end.clone());
+            prior = range.end.clone();
             Some(range.clone())
         } else {
-            // A dropped source row inherits only the nearest prior real block. Snapping forward
-            // would claim that a compartment summarized content which occurred after its boundary.
-            // Synthetic repair blocks can shift ordinals but are deliberately never an anchor.
-            prior.clone().map(|coordinate| ImportedBlockRange {
-                start: coordinate.clone(),
-                end: coordinate,
-            })
+            // Starts move toward the next surviving block and ends toward the previous one.
+            // A fully dropped span therefore has inverted edges; the optional compartment-state
+            // import can skip it rather than treating it as history on either side.
+            match (next_ranges[index].as_ref(), prior.as_ref()) {
+                (Some(next), Some(previous)) => Some(ImportedBlockRange {
+                    start: next.start.clone(),
+                    end: Some(previous.clone()),
+                }),
+                (Some(next), None) => Some(ImportedBlockRange {
+                    start: next.start.clone(),
+                    end: None,
+                }),
+                (None, Some(previous)) => Some(ImportedBlockRange {
+                    // The sentinel is just past imported messages. A trailing dropped span has no
+                    // forward block for its start, so this start uses the sentinel and its end
+                    // remains anchored to the previous surviving block.
+                    start: Some(ImportedBlockCoordinate {
+                        message_ordinal: imported_block_counts.len() as u64,
+                        block_index: 0,
+                    }),
+                    end: Some(previous.clone()),
+                }),
+                (None, None) => None,
+            }
         };
         if let Some(range) = range {
             by_ordinal.insert(source.ordinal, range.clone());
@@ -549,15 +710,60 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::io::Cursor;
+
     use broca_protocol::{
         ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
     };
 
     use super::{
-        build_coordinate_map, estimate_from_metrics, estimate_tokens, finalize_import,
-        measure_serialized_messages, normalize_for_session_import, normalize_tool_blocks_and_ids,
-        NoImportableContentError, OriginMessageCoordinate,
+        build_coordinate_map, check_session_source_size, estimate_from_metrics, estimate_tokens,
+        finalize_import, measure_serialized_messages, normalize_for_session_import,
+        normalize_tool_blocks_and_ids, read_bounded_jsonl_line, NoImportableContentError,
+        OriginMessageCoordinate, MAX_JSONL_LINE_BYTES, MAX_SESSION_SOURCE_BYTES,
     };
+
+    #[test]
+    fn jsonl_reader_rejects_oversized_records_before_buffering_them() {
+        let bytes = vec![b'x'; MAX_JSONL_LINE_BYTES + 1];
+        let mut reader = Cursor::new(bytes);
+        let mut line = Vec::new();
+        let mut bytes_read = 0;
+
+        let error = read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).unwrap_err();
+
+        assert!(error.to_string().contains("line limit"));
+        assert!(line.len() <= MAX_JSONL_LINE_BYTES);
+        assert!(bytes_read <= MAX_JSONL_LINE_BYTES as u64);
+    }
+
+    #[test]
+    fn jsonl_reader_refuses_bytes_after_the_source_limit() {
+        let mut reader = Cursor::new(b"x".to_vec());
+        let mut line = Vec::new();
+        let mut bytes_read = MAX_SESSION_SOURCE_BYTES;
+
+        let error = read_bounded_jsonl_line(&mut reader, &mut line, &mut bytes_read).unwrap_err();
+
+        assert!(error.to_string().contains("source session exceeds"));
+        assert!(line.is_empty());
+        assert_eq!(bytes_read, MAX_SESSION_SOURCE_BYTES);
+    }
+
+    #[test]
+    fn session_source_size_is_rejected_before_reading_contents() {
+        let path = broca_test_support::scratch_root()
+            .join(format!("ck-import-source-cap-{}.jsonl", std::process::id()));
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_SOURCE_BYTES + 1).unwrap();
+        drop(file);
+
+        let error = check_session_source_size(&path).unwrap_err();
+
+        assert!(error.to_string().contains("import reader limit"));
+        let _ = std::fs::remove_file(path);
+    }
 
     fn tool_call(id: &str, name: &str) -> ContentBlock {
         ContentBlock::ToolCall(ToolCall {
@@ -923,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinate_map_snaps_dropped_rows_backward_and_counts_synthetic_results() {
+    fn coordinate_map_snaps_dropped_starts_forward_and_ends_backward() {
         let result = |id: &str| {
             ContentBlock::ToolResult(ToolResult {
                 tool_call_id: ToolCallId(id.into()),
@@ -967,13 +1173,58 @@ mod tests {
             .collect::<Vec<_>>();
         let map = build_coordinate_map(&messages, &source, &source).unwrap();
 
-        assert_eq!(map.coordinate_for_ordinal(0).unwrap().flat_id(), "m0#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(1).unwrap().flat_id(),
+            "m1#0"
+        );
         assert_eq!(map.coordinate_for_ordinal(1).unwrap().flat_id(), "m0#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(2).unwrap().flat_id(),
+            "m1#0"
+        );
         assert_eq!(map.coordinate_for_ordinal(2).unwrap().flat_id(), "m1#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(3).unwrap().flat_id(),
+            "m3#0"
+        );
         assert_eq!(map.coordinate_for_ordinal(3).unwrap().flat_id(), "m1#0");
-        assert_eq!(map.coordinate_for_ordinal(4).unwrap().flat_id(), "m3#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(4).unwrap().flat_id(),
+            "m3#0"
+        );
         assert!(map.contains_flat_id("m2#0"));
         assert!(!map.contains_flat_id("m4#0"));
+    }
+
+    #[test]
+    fn coordinate_map_marks_a_trailing_dropped_start_as_unmapped() {
+        let messages = vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "survives".into(),
+            }],
+        )];
+        let origins = vec![OriginMessageCoordinate {
+            ordinal: 0,
+            message_id: "source-0".into(),
+            date: None,
+        }];
+        let source = vec![
+            origins[0].clone(),
+            OriginMessageCoordinate {
+                ordinal: 1,
+                message_id: "source-1".into(),
+                date: None,
+            },
+        ];
+        let map = build_coordinate_map(&messages, &origins, &source).unwrap();
+
+        assert_eq!(map.coordinate_for_ordinal(1).unwrap().flat_id(), "m0#0");
+        assert_eq!(
+            map.start_coordinate_for_ordinal(1).unwrap().message_ordinal,
+            1
+        );
+        assert!(!map.contains_flat_id("m1#0"));
     }
 
     #[test]

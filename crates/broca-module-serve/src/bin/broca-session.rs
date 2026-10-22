@@ -22,11 +22,12 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use broca_module::serve::SubscribeFrom;
+use broca_module_serve::client::UnrecognizedRunState;
 use broca_module_serve::client::{decode_subscribe_event, SendOutcome, SendSpec, SubscribeEvent};
 use broca_module_serve::wire::{AuthParams, CacheParams};
 use broca_module_serve::wire::{VaultAuditResponse, VaultAuditRow};
 use broca_module_serve::SessionClient;
-use broca_protocol::caller::{ControlUnit, RunFinishReason};
+use broca_protocol::caller::{ControlUnit, OpenRunFinishReason, OpenState, RunFinishReason};
 use broca_protocol::request::{CacheRole, Tool};
 use broca_subc::SubcConnection;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -1136,7 +1137,8 @@ struct RunTurnTracker<'a> {
     /// answer entirely. Holding it and promoting it only when a terminal names this run
     /// keeps both guarantees.
     provisional_text: String,
-    finish_reason: Option<RunFinishReason>,
+    /// An unrecognized reason from a newer runner is kept as `Unknown`, never read as `error`.
+    finish_reason: Option<OpenRunFinishReason>,
 }
 
 impl<'a> RunTurnTracker<'a> {
@@ -1189,7 +1191,7 @@ impl<'a> RunTurnTracker<'a> {
                     // run after all, so promote the text held back from rendering.
                     self.final_text = std::mem::take(&mut self.provisional_text);
                 }
-                self.finish_reason = Some(*reason);
+                self.finish_reason = Some((*reason).into());
                 return RunTurnAction::Finished;
             }
             // An EARLIER run draining into this stream: the CLI subscribes before it
@@ -1233,28 +1235,58 @@ impl<'a> RunTurnTracker<'a> {
             // No run on the terminal means a producer older than that field. Fall back to
             // the start gate, which is what this client did for every terminal before it.
             ControlUnit::RunFinished { reason, .. } => {
-                self.finish_reason = Some(*reason);
+                self.finish_reason = Some((*reason).into());
                 RunTurnAction::Finished
             }
             _ => RunTurnAction::Continue,
         }
     }
 
+    /// Attribute a pause or ending whose reason this client does not know, by the same rules
+    /// [`Self::consume`] applies to a recognized `Paused` or `RunFinished`: it still ends this
+    /// client's interest in its run, but it is reported as unrecognized, never as an error.
+    fn consume_unrecognized(&mut self, state: &UnrecognizedRunState) -> RunTurnAction {
+        let names_target = state.run_id().map(|id| id.0.as_str() == self.target_run_id);
+        match (state, names_target) {
+            (UnrecognizedRunState::Paused { .. }, Some(true)) => RunTurnAction::Paused,
+            (UnrecognizedRunState::Finished { reason, .. }, Some(true)) => {
+                if !self.started {
+                    self.final_text = std::mem::take(&mut self.provisional_text);
+                }
+                self.finish_reason = Some(OpenState::Unknown(reason.clone()));
+                RunTurnAction::Finished
+            }
+            // A terminal without a run id comes from a producer older than that field; it is
+            // ours only after this run's start, as for a recognized terminal.
+            (UnrecognizedRunState::Finished { reason, .. }, None) if self.started => {
+                self.finish_reason = Some(OpenState::Unknown(reason.clone()));
+                RunTurnAction::Finished
+            }
+            _ => {
+                self.provisional_text.clear();
+                RunTurnAction::Ignore
+            }
+        }
+    }
+
     fn exit_code(&self) -> i32 {
-        match self.finish_reason {
-            Some(
+        match &self.finish_reason {
+            Some(OpenState::Known(
                 RunFinishReason::Completed
                 | RunFinishReason::MaxSteps
                 | RunFinishReason::BudgetExhausted
                 | RunFinishReason::ContextCeiling,
-            ) => 0,
-            Some(
+            )) => 0,
+            Some(OpenState::Known(
                 RunFinishReason::Interrupted
                 | RunFinishReason::Cancelled
                 | RunFinishReason::Error
                 | RunFinishReason::TransformUnavailable,
-            )
+            ))
             | None => 1,
+            // The run ended, but this client cannot tell whether it succeeded, so it does not
+            // report success. The emitted event names the reason as unrecognized.
+            Some(OpenState::Unknown(_)) => 1,
         }
     }
 }
@@ -1394,9 +1426,11 @@ async fn run_turn(
         return Ok(
             if matches!(
                 reason,
-                RunFinishReason::Completed
-                    | RunFinishReason::MaxSteps
-                    | RunFinishReason::BudgetExhausted
+                OpenState::Known(
+                    RunFinishReason::Completed
+                        | RunFinishReason::MaxSteps
+                        | RunFinishReason::BudgetExhausted
+                )
             ) {
                 0
             } else {
@@ -1426,6 +1460,17 @@ async fn run_turn(
                 match action {
                     RunTurnAction::Finished => break,
                     RunTurnAction::Paused => break, // not a clean finish (exit 1)
+                    RunTurnAction::Ignore | RunTurnAction::Continue => {}
+                }
+            }
+            Ok(SubscribeEvent::UnrecognizedRunState { wal_seq, state, .. }) => {
+                let action = tracker.consume_unrecognized(&state);
+                if action == RunTurnAction::Ignore {
+                    continue;
+                }
+                emit_unrecognized_run_state(json, wal_seq, &state);
+                match action {
+                    RunTurnAction::Finished | RunTurnAction::Paused => break,
                     RunTurnAction::Ignore | RunTurnAction::Continue => {}
                 }
             }
@@ -1491,6 +1536,20 @@ async fn observe(
                 last_cursor = Some((wal_seq, sub_index));
                 emit_control(ControlRenderMode::Subscribe, json, wal_seq, &unit);
                 if matches!(unit, ControlUnit::RunFinished { .. }) {
+                    finished += 1;
+                    if until_runs != 0 && finished >= until_runs {
+                        break;
+                    }
+                }
+            }
+            Ok(SubscribeEvent::UnrecognizedRunState {
+                wal_seq,
+                sub_index,
+                state,
+            }) => {
+                last_cursor = Some((wal_seq, sub_index));
+                emit_unrecognized_run_state(json, wal_seq, &state);
+                if matches!(state, UnrecognizedRunState::Finished { .. }) {
                     finished += 1;
                     if until_runs != 0 && finished >= until_runs {
                         break;
@@ -1811,6 +1870,44 @@ fn emit_control_to(
     }
 }
 
+fn emit_unrecognized_run_state(json: bool, wal_seq: u64, state: &UnrecognizedRunState) {
+    emit_unrecognized_run_state_to(json, wal_seq, state, &mut |line| println!("{line}"));
+}
+
+/// Report a pause or ending whose reason this client does not know. It gets its own event
+/// rather than `run_paused` or `run_finished` so that no consumer reads it as a known outcome:
+/// the run is not reported as failed, and not as waiting for re-authentication.
+fn emit_unrecognized_run_state_to(
+    json: bool,
+    wal_seq: u64,
+    state: &UnrecognizedRunState,
+    output: &mut impl FnMut(String),
+) {
+    let kind = match state {
+        UnrecognizedRunState::Paused { .. } => "paused",
+        UnrecognizedRunState::Finished { .. } => "finished",
+    };
+    let run_id = state.run_id().map(|id| id.0.as_str());
+    let reason = state.reason();
+    emit_to(
+        json,
+        &serde_json::json!({
+            "event": "run_state_unrecognized",
+            "seq": wal_seq,
+            "state": kind,
+            "run_id": run_id,
+            "reason": reason,
+        }),
+        || {
+            let run = run_id.map(|id| format!(" run_id={id}")).unwrap_or_default();
+            format!(
+                "RUN_STATE_UNRECOGNIZED seq={wal_seq} state={kind}{run} reason={reason} (this client does not know this reason)"
+            )
+        },
+        output,
+    );
+}
+
 fn emit_run_final_text(json: bool, text: &str) {
     emit_run_final_text_to(json, text, &mut |line| println!("{line}"));
 }
@@ -2126,10 +2223,14 @@ mod tests {
     }
 
     use super::{
-        content_import_id, emit_control_to, emit_run_final_text_to, parse_tools,
-        run_id_for_combined_turn, ControlRenderMode, RunTurnAction, RunTurnRefusal, RunTurnTracker,
+        content_import_id, emit_control_to, emit_run_final_text_to, emit_unrecognized_run_state_to,
+        parse_tools, run_id_for_combined_turn, ControlRenderMode, RunTurnAction, RunTurnRefusal,
+        RunTurnTracker,
     };
     use broca_module_serve::client::SendOutcome;
+    use broca_module_serve::client::{
+        decode_subscribe_event, SubscribeEvent, UnrecognizedRunState,
+    };
     use broca_protocol::caller::{ControlUnit, PauseReason, RunFinishReason};
     use broca_protocol::content::{AssistantMessage, ContentBlock};
     use broca_protocol::usage::Usage;
@@ -2612,7 +2713,10 @@ mod tests {
             tracker.final_text, "resumed answer",
             "the held text is promoted once the terminal names this run"
         );
-        assert_eq!(tracker.finish_reason, Some(RunFinishReason::Completed));
+        assert_eq!(
+            tracker.finish_reason,
+            Some(RunFinishReason::Completed.into())
+        );
     }
 
     /// And a PRIOR run's answer is never promoted, which is the guarantee the
@@ -2683,6 +2787,82 @@ mod tests {
                 error: None,
             }),
             RunTurnAction::Paused
+        );
+    }
+
+    fn unrecognized(body: &[u8]) -> UnrecognizedRunState {
+        match decode_subscribe_event(body).unwrap() {
+            SubscribeEvent::UnrecognizedRunState { state, .. } => state,
+            other => panic!("expected an unrecognized run state, got {other:?}"),
+        }
+    }
+
+    /// A newer runner's finish reason ends the run without being read as an error: the turn
+    /// stops waiting, does not claim success, and reports the reason as unrecognized.
+    #[test]
+    fn combined_turn_ends_on_an_unrecognized_finish_without_calling_it_an_error() {
+        let mut tracker = RunTurnTracker::new("ours");
+        assert_eq!(
+            tracker.consume(&run_started("ours")),
+            RunTurnAction::Continue
+        );
+        let foreign = unrecognized(
+            br#"{"kind":"control","cursor":{"wal_seq":3,"sub_index":0},"unit":{"type":"run_finished","run_id":"foreign","reason":"future_finish"}}"#,
+        );
+        assert_eq!(
+            tracker.consume_unrecognized(&foreign),
+            RunTurnAction::Ignore
+        );
+        let ours = unrecognized(
+            br#"{"kind":"control","cursor":{"wal_seq":4,"sub_index":0},"unit":{"type":"run_finished","run_id":"ours","reason":"future_finish"}}"#,
+        );
+        assert_eq!(tracker.consume_unrecognized(&ours), RunTurnAction::Finished);
+        assert_eq!(
+            tracker.finish_reason,
+            Some(broca_protocol::OpenState::Unknown("future_finish".into()))
+        );
+        assert_eq!(
+            tracker.exit_code(),
+            1,
+            "an unknown ending is not reported as success"
+        );
+
+        let mut lines = Vec::new();
+        emit_unrecognized_run_state_to(true, 4, &ours, &mut |line| lines.push(line));
+        let event: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "event": "run_state_unrecognized",
+                "seq": 4,
+                "state": "finished",
+                "run_id": "ours",
+                "reason": "future_finish",
+            })
+        );
+    }
+
+    #[test]
+    fn combined_turn_stops_on_its_own_unrecognized_pause_only() {
+        let mut tracker = RunTurnTracker::new("ours");
+        let foreign = unrecognized(
+            br#"{"kind":"control","cursor":{"wal_seq":3,"sub_index":0},"unit":{"type":"paused","run_id":"foreign","reason":"future_pause"}}"#,
+        );
+        assert_eq!(
+            tracker.consume_unrecognized(&foreign),
+            RunTurnAction::Ignore
+        );
+        let ours = unrecognized(
+            br#"{"kind":"control","cursor":{"wal_seq":4,"sub_index":0},"unit":{"type":"paused","run_id":"ours","reason":"future_pause"}}"#,
+        );
+        assert_eq!(tracker.consume_unrecognized(&ours), RunTurnAction::Paused);
+        assert_eq!(tracker.finish_reason, None);
+
+        let mut lines = Vec::new();
+        emit_unrecognized_run_state_to(false, 4, &ours, &mut |line| lines.push(line));
+        assert_eq!(
+            lines,
+            ["RUN_STATE_UNRECOGNIZED seq=4 state=paused run_id=ours reason=future_pause (this client does not know this reason)"]
         );
     }
 

@@ -20,7 +20,7 @@ state emits a warning and does not block the lineage import.
 The context warning uses a rough character-count / 4 estimate and compares it with
 `--context-limit` (default 200,000). Imports are rejected client-side above 100,000 messages or
 48 MiB of canonical JSON so a subc frame-limit error is never the first failure. Both import legs
-are idempotent; if compartment seeding fails after lineage import, re-run the same command.
+are idempotent; if compartment seeding fails after lineage import, rerun with the same `--session <target-session-id>` printed by the import. A retry without `--session` creates a new lineage and imports the transcript again, so choose a session id up front when you may need to retry.
 
 ## Live smoke test
 

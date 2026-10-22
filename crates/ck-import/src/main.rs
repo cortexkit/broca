@@ -225,7 +225,7 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
         json!({"event": "progress", "action": "converting", "source": source_id}),
         || format!("Converting {source_harness} session {source_id}..."),
     );
-    let (imported, source_summary) =
+    let (imported, source_cwd) =
         convert_source(reader.as_ref(), source_id, args.project_root.as_ref())?;
 
     let mut mc_status = if args.skip_mc_state {
@@ -233,6 +233,7 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
     } else {
         "absent".to_string()
     };
+    let session_id = args.session.unwrap_or_else(fresh_uuid);
     let mut mc_compartments = None;
     if !args.skip_mc_state && source_harness == "opencode" {
         let coordinates = imported.coordinate_map.as_ref().ok_or_else(|| {
@@ -243,22 +244,19 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
             .mc_state_db
             .clone()
             .unwrap_or_else(default_context_db_path);
-        match load_compartments(&context_db, source_id, coordinates)? {
-            CompartmentLoad::None => {}
-            CompartmentLoad::Unavailable(message) => {
+        match load_compartments(&context_db, source_id, coordinates) {
+            Ok(CompartmentLoad::None) => {}
+            Ok(CompartmentLoad::Unavailable(message)) => {
                 mc_status = "unavailable".into();
-                output.event(
-                    json!({
-                        "event": "warning",
-                        "kind": "mc_state_unavailable",
-                        "message": message,
-                    }),
-                    || format!("WARNING: Magic-context state unavailable; continuing lineage-only: {message}"),
-                );
+                warn_mc_state_unavailable(output, &message, &session_id);
             }
-            CompartmentLoad::Found(compartments) => {
+            Ok(CompartmentLoad::Found(compartments)) => {
                 mc_status = "prepared".into();
                 mc_compartments = Some(compartments);
+            }
+            Err(message) => {
+                mc_status = "unavailable".into();
+                warn_mc_state_unavailable(output, &message, &session_id);
             }
         }
     }
@@ -293,14 +291,12 @@ async fn run(args: Args, output: &Output) -> Result<(), String> {
         );
     }
 
-    let project_root = resolve_project_root(args.project_root, source_summary.as_ref());
-    let session_id = args.session.unwrap_or_else(fresh_uuid);
+    let project_root = resolve_project_root(args.project_root, source_cwd.as_deref());
     let import_id = args
         .import_id
         .unwrap_or_else(|| digest_import_id(&imported.source_ref));
-    let mc_prepared = mc_compartments
-        .map(|compartments| prepare_state_import(&session_id, compartments))
-        .transpose()?;
+    let mc_prepared =
+        prepare_optional_mc_state(&session_id, mc_compartments, output, &mut mc_status);
     let mc_compartment_count = mc_prepared
         .as_ref()
         .map_or(0, |prepared| prepared.compartment_count);
@@ -454,21 +450,56 @@ fn convert_source(
     reader: &dyn HarnessReader,
     source_id: &str,
     project_root: Option<&PathBuf>,
-) -> Result<(ImportedSession, Option<SessionSummary>), String> {
+) -> Result<(ImportedSession, Option<String>), String> {
     let source_harness = reader.harness();
-    let source_summary = if project_root.is_none() {
-        reader
-            .enumerate()
-            .map_err(|error| format!("inspect {source_harness} sessions: {error}"))?
-            .into_iter()
-            .find(|session| session.id == source_id)
-    } else {
-        None
-    };
     let imported = reader
         .convert(source_id)
         .map_err(|error| format!("convert {source_harness} session: {error}"))?;
-    Ok((imported, source_summary))
+    let source_cwd = if project_root.is_none() {
+        reader
+            .session_cwd(source_id)
+            .map_err(|error| format!("inspect selected {source_harness} session: {error}"))?
+    } else {
+        None
+    };
+    Ok((imported, source_cwd))
+}
+
+fn mc_state_unavailable_message(reason: &str, session_id: &str) -> String {
+    format!(
+        "Magic-context state unavailable; continuing with lineage-only: {reason}. To retry state seeding, rerun with --session {session_id}."
+    )
+}
+
+fn warn_mc_state_unavailable(output: &Output, reason: &str, session_id: &str) {
+    let message = mc_state_unavailable_message(reason, session_id);
+    output.event(
+        json!({
+            "event": "warning",
+            "kind": "mc_state_unavailable",
+            "message": message,
+        }),
+        || format!("WARNING: {message}"),
+    );
+}
+
+fn prepare_optional_mc_state(
+    session_id: &str,
+    compartments: Option<Vec<mc_state::WireCompartment>>,
+    output: &Output,
+    status: &mut String,
+) -> Option<mc_state::PreparedStateImport> {
+    match compartments {
+        Some(compartments) => match prepare_state_import(session_id, compartments) {
+            Ok(prepared) => Some(prepared),
+            Err(message) => {
+                *status = "unavailable".into();
+                warn_mc_state_unavailable(output, &message, session_id);
+                None
+            }
+        },
+        None => None,
+    }
 }
 
 /// Build the retry instruction shown when the lineage import committed but the
@@ -494,16 +525,10 @@ fn retry_instruction(failure: &str, session_id: &str) -> String {
     )
 }
 
-fn resolve_project_root(
-    project_root: Option<PathBuf>,
-    source_summary: Option<&SessionSummary>,
-) -> PathBuf {
-    project_root.unwrap_or_else(|| {
-        source_summary
-            .and_then(|summary| summary.cwd.as_deref())
-            .map(PathBuf::from)
-            .unwrap_or_else(current_dir_fallback)
-    })
+fn resolve_project_root(project_root: Option<PathBuf>, source_cwd: Option<&str>) -> PathBuf {
+    project_root
+        .or_else(|| source_cwd.map(PathBuf::from))
+        .unwrap_or_else(current_dir_fallback)
 }
 
 fn effective_message_count(real_count: usize, override_count: Option<usize>) -> usize {
@@ -549,7 +574,9 @@ fn format_session_table(sessions: &[SessionSummary]) -> String {
             "{}\t{}\t{}\t{}\t{}",
             session.id,
             session.message_count,
-            session.approximate_size_bytes,
+            session
+                .approximate_size_bytes
+                .map_or_else(|| "-".to_string(), |size| size.to_string()),
             session.title.as_deref().unwrap_or("-"),
             session.cwd.as_deref().unwrap_or("-")
         );
@@ -590,7 +617,9 @@ fn fresh_uuid() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::retry_instruction;
+    use super::{
+        mc_state_unavailable_message, prepare_optional_mc_state, retry_instruction, Output,
+    };
 
     /// The instruction must carry the session id, because the retry it describes is only
     /// idempotent when addressed to the SAME lineage. Asserting the id is present is the
@@ -616,6 +645,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn optional_state_preparation_failure_becomes_a_lineage_only_status() {
+        let mut status = "prepared".to_string();
+        let prepared = prepare_optional_mc_state(
+            "ses_retry",
+            Some(Vec::new()),
+            &Output { json: true },
+            &mut status,
+        );
+
+        assert!(prepared.is_none());
+        assert_eq!(status, "unavailable");
+        let message = mc_state_unavailable_message("empty bundle", "ses_retry");
+        assert!(message.contains("continuing with lineage-only"));
+        assert!(message.contains("--session ses_retry"));
+    }
+
     use std::cell::Cell;
     use std::error::Error;
     use std::path::{Path, PathBuf};
@@ -634,6 +680,7 @@ mod tests {
     #[derive(Default)]
     struct CountingReader {
         enumerate_calls: AtomicUsize,
+        session_cwd_calls: AtomicUsize,
         convert_calls: AtomicUsize,
     }
 
@@ -644,6 +691,10 @@ mod tests {
 
         fn convert_calls(&self) -> usize {
             self.convert_calls.load(Ordering::SeqCst)
+        }
+
+        fn session_cwd_calls(&self) -> usize {
+            self.session_cwd_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -659,7 +710,7 @@ mod tests {
                 title: None,
                 cwd: Some("/source/project".into()),
                 message_count: 1,
-                approximate_size_bytes: 1,
+                approximate_size_bytes: Some(1),
             }])
         }
 
@@ -681,6 +732,14 @@ mod tests {
                 coordinate_map: None,
             })
         }
+
+        fn session_cwd(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+            self.session_cwd_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some("/source/project".into()))
+        }
     }
 
     #[test]
@@ -688,25 +747,27 @@ mod tests {
         let reader = CountingReader::default();
         let configured_root = PathBuf::from("/configured/project");
 
-        let (imported, source_summary) =
+        let (imported, source_cwd) =
             convert_source(&reader, "selected", Some(&configured_root)).unwrap();
         let resolved_root =
-            resolve_project_root(Some(configured_root.clone()), source_summary.as_ref());
+            resolve_project_root(Some(configured_root.clone()), source_cwd.as_deref());
 
         assert_eq!(reader.enumerate_calls(), 0);
+        assert_eq!(reader.session_cwd_calls(), 0);
         assert_eq!(reader.convert_calls(), 1);
         assert_eq!(imported.source_ref, "counting:selected");
         assert_eq!(resolved_root, configured_root);
     }
 
     #[test]
-    fn inferred_project_root_enumerates_once_and_uses_source_cwd() {
+    fn inferred_project_root_uses_selected_cwd_without_enumerating() {
         let reader = CountingReader::default();
 
-        let (imported, source_summary) = convert_source(&reader, "selected", None).unwrap();
-        let resolved_root = resolve_project_root(None, source_summary.as_ref());
+        let (imported, source_cwd) = convert_source(&reader, "selected", None).unwrap();
+        let resolved_root = resolve_project_root(None, source_cwd.as_deref());
 
-        assert_eq!(reader.enumerate_calls(), 1);
+        assert_eq!(reader.enumerate_calls(), 0);
+        assert_eq!(reader.session_cwd_calls(), 1);
         assert_eq!(reader.convert_calls(), 1);
         assert_eq!(imported.source_ref, "counting:selected");
         assert_eq!(resolved_root, Path::new("/source/project"));

@@ -20,9 +20,9 @@ use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use crate::{
-    finalize_import,
+    finalize_import, omit_nested_tool_images,
     sqlite_read::{open_read_only_database, ReadOnlyDatabase},
-    HarnessReader, ImportedSession, SessionSummary,
+    truncate_session_title, HarnessReader, ImportedSession, SessionSummary,
 };
 
 type ReaderResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -79,8 +79,7 @@ impl HarnessReader for GooseReader {
             eprintln!("{warning}");
         }
         let mut statement = connection.prepare(
-            "SELECT s.id, s.name, s.working_dir, COUNT(m.id), \
-             COALESCE(SUM(LENGTH(CAST(m.content_json AS BLOB)) + COALESCE(LENGTH(CAST(m.metadata_json AS BLOB)), 0)), 0) \
+            "SELECT s.id, s.name, s.working_dir, COUNT(m.id) \
              FROM sessions s LEFT JOIN messages m ON m.session_id = s.id \
              GROUP BY s.id, s.name, s.working_dir, s.updated_at \
              ORDER BY s.updated_at DESC, s.id",
@@ -89,13 +88,12 @@ impl HarnessReader for GooseReader {
             let title: String = row.get(1)?;
             let directory: String = row.get(2)?;
             let count: i64 = row.get(3)?;
-            let size: i64 = row.get(4)?;
             Ok(SessionSummary {
                 id: row.get(0)?,
-                title: nonempty(title),
+                title: nonempty(title).map(truncate_session_title),
                 cwd: nonempty(directory),
                 message_count: usize::try_from(count.max(0)).unwrap_or(usize::MAX),
-                approximate_size_bytes: u64::try_from(size.max(0)).unwrap_or(u64::MAX),
+                approximate_size_bytes: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -151,6 +149,7 @@ impl HarnessReader for GooseReader {
 
         let mut messages = Vec::new();
         let mut skipped_signed = 0usize;
+        let mut omitted_images = 0usize;
         let mut skipped_unknown = Vec::new();
 
         for (row_id, role, raw_content, raw_metadata) in source_messages {
@@ -215,7 +214,7 @@ impl HarnessReader for GooseReader {
                     }
                     "toolRequest" => convert_tool_request(part)
                         .map(|call| (source_role, ContentBlock::ToolCall(call))),
-                    "toolResponse" => convert_tool_response(part)
+                    "toolResponse" => convert_tool_response(part, &mut omitted_images)
                         .map(|result| (Role::Tool, ContentBlock::ToolResult(result))),
                     other => {
                         if !skipped_unknown.iter().any(|known| known == other) {
@@ -249,6 +248,11 @@ impl HarnessReader for GooseReader {
                 STRIPPED_CONTENT_KINDS.join(", ")
             ));
         }
+        if omitted_images > 0 {
+            warnings.push(format!(
+                "Omitted {omitted_images} unsupported Goose tool-result image block(s)"
+            ));
+        }
         if !skipped_unknown.is_empty() {
             warnings.push(format!(
                 "Skipped unsupported Goose content kinds: {}",
@@ -257,6 +261,18 @@ impl HarnessReader for GooseReader {
         }
 
         finalize_import(messages, format!("goose:{session_id}"), warnings, "goose")
+    }
+
+    fn session_cwd(&self, session_id: &str) -> ReaderResult<Option<String>> {
+        let ReadOnlyDatabase { connection, .. } = self.open()?;
+        let directory = connection
+            .query_row(
+                "SELECT working_dir FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(directory.and_then(nonempty))
     }
 }
 
@@ -347,7 +363,7 @@ fn convert_tool_request(part: &Value) -> Option<ToolCall> {
     })
 }
 
-fn convert_tool_response(part: &Value) -> Option<ToolResult> {
+fn convert_tool_response(part: &Value, omitted_images: &mut usize) -> Option<ToolResult> {
     let call_id = part.get("id").and_then(Value::as_str)?;
     let result = part.get("toolResult")?;
     let status = result.get("status").and_then(Value::as_str).unwrap_or("");
@@ -357,11 +373,12 @@ fn convert_tool_response(part: &Value) -> Option<ToolResult> {
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let content = if value.is_array() {
+        let mut content = if value.is_array() {
             value.clone()
         } else {
             value.get("content").cloned().unwrap_or(Value::Null)
         };
+        *omitted_images += omit_nested_tool_images(&mut content);
         if is_error {
             (
                 ToolOutput::Error {
@@ -389,10 +406,11 @@ fn convert_tool_response(part: &Value) -> Option<ToolResult> {
             (content_output(content), false)
         }
     } else {
-        let error = result
+        let mut error = result
             .get("error")
             .cloned()
             .unwrap_or_else(|| Value::String("Goose tool execution failed".into()));
+        *omitted_images += omit_nested_tool_images(&mut error);
         (
             ToolOutput::Error {
                 message: value_text(&error),
@@ -485,8 +503,9 @@ mod tests {
 
     use broca_module_serve::wire::{ImportOriginKind, ImportOriginParams, ImportParams};
     use broca_protocol::{ContentBlock, Role, ToolOutput};
+    use serde_json::json;
 
-    use super::{GooseReader, HarnessReader, STRIPPED_CONTENT_KINDS};
+    use super::{convert_tool_response, GooseReader, HarnessReader, STRIPPED_CONTENT_KINDS};
 
     fn fixture() -> GooseReader {
         GooseReader::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/goose.db"))
@@ -499,12 +518,16 @@ mod tests {
         assert_eq!(sessions[0].id, "goose-tools");
         assert_eq!(sessions[0].title.as_deref(), Some("Tool fixture"));
         assert_eq!(sessions[0].cwd.as_deref(), Some("/tmp/scrubbed-goose"));
+        assert_eq!(
+            fixture().session_cwd("goose-tools").unwrap().as_deref(),
+            Some("/tmp/scrubbed-goose")
+        );
         assert_eq!(sessions[0].message_count, 5);
-        assert!(sessions[0].approximate_size_bytes > 0);
+        assert!(sessions[0].approximate_size_bytes.is_none());
     }
 
     #[test]
-    fn sqlite_size_estimate_counts_utf8_bytes() {
+    fn sqlite_size_estimate_is_deferred_until_import() {
         let path = broca_test_support::scratch_root()
             .join(format!("ck-goose-bytes-{}.db", std::process::id()));
         let _ = fs::remove_file(&path);
@@ -520,12 +543,35 @@ mod tests {
         drop(connection);
 
         let summary = GooseReader::new(&path).enumerate().unwrap().remove(0);
-        assert_eq!(
-            summary.approximate_size_bytes,
-            "é".len() as u64 + "🙂".len() as u64
-        );
+        assert_eq!(summary.approximate_size_bytes, None);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tool_result_images_are_omitted_and_text_is_retained() {
+        let part = json!({
+            "id": "call-image",
+            "toolResult": {
+                "status": "success",
+                "value": {"content": [
+                    {"type": "text", "text": "before image"},
+                    {"type": "image", "source": {"type": "base64", "data": "PRIVATE_BASE64"}},
+                    {"type": "text", "text": "after image"}
+                ]}
+            }
+        });
+        let mut omitted_images = 0;
+        let result = convert_tool_response(&part, &mut omitted_images).unwrap();
+        assert_eq!(omitted_images, 1);
+        assert!(matches!(
+            result.output,
+            ToolOutput::Text { ref text }
+                if text.contains("before image")
+                    && text.contains("after image")
+                    && text.contains("image omitted from imported tool output")
+                    && !text.contains("PRIVATE_BASE64")
+        ));
     }
 
     #[test]
