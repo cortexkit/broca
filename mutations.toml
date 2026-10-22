@@ -18042,8 +18042,8 @@ select = "expected"
 test_file = "crates/broca-wire/src/lib.rs"
 expect_red = ["caller_message_tests::text_with_provider_state_reaches_callers_as_plain_text"]
 file = "crates/broca-wire/src/lib.rs"
-old = '    #[serde(serialize_with = "serialize_caller_message")]'
-new = '    // NON-VACUITY BREAK: write the canonical block, provider state included.'
+old = '''                    None => serialize_caller_message(self.0, serializer),'''
+new = '''                    None => self.0.serialize(serializer), // NON-VACUITY BREAK: write the canonical block, provider state included.'''
 
 [[control]]
 id = "codeassist-session-id-stable-across-runs"
@@ -19533,13 +19533,13 @@ new = '''            (Role::Assistant, ContentBlock::Text { text } | ContentBloc
 
 [[control]]
 id = "runner-tags-live-results-render-as-their-rebuild"
-guards = "A render_tags run attaches each tool result's tag to the message it adds live, so its request equals the request rebuilt from the WAL"
+guards = "A render_tags run frozen under the stored-ledger rules (runner-tags/v1) and resumed by a later build attaches each tool result's stored tag to the message it adds live, so its request repeats the bytes the request rebuilt from the WAL gives"
 runner = "cargo"
 package = "broca-core"
 target = "--test it"
 select = "expected"
-test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
-expect_red = ["runner_tags_determinism::a_steer_mid_run_renders_live_as_its_rebuild"]
+test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
+expect_red = ["runner_tags_v1_pin::a_session_written_under_the_stored_ledger_keeps_its_exact_bytes"]
 file = "crates/broca-core/src/run.rs"
 old = '''        crate::tags::attach_parts(&mut results, result_tags);
         mutable_call_options(&mut opts).prompt.push(results);'''
@@ -19547,14 +19547,31 @@ new = '''        let _ = result_tags; // NON-VACUITY BREAK: the live tool messag
         mutable_call_options(&mut opts).prompt.push(results);'''
 
 [[control]]
-id = "runner-tags-steer-carries-its-record-tags"
-guards = "A steer joins the running turn with the tags its Steered record was given, so the live request equals its rebuild"
+id = "runner-tags-computed-live-results-numbered-as-their-rebuild"
+guards = "Under the computed tag rules (runner-tags/v2) the tool message a run adds live carries no tags when no result has one, so the step's numbering numbers its results as the rebuild from the WAL does"
 runner = "cargo"
 package = "broca-core"
 target = "--test it"
 select = "expected"
 test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
-expect_red = ["runner_tags_determinism::a_steer_mid_run_renders_live_as_its_rebuild"]
+expect_red = ["runner_tags_determinism::a_repeated_tool_call_id_renders_live_as_its_rebuild"]
+file = "crates/broca-core/src/run.rs"
+old = '''    parts
+        .iter()
+        .any(Option::is_some)
+        .then(|| broca_protocol::tags::PartTags::new(parts))'''
+new = '''    let _ = parts.iter().any(Option::is_some); // NON-VACUITY BREAK: an untagged batch still gets empty live tags
+    Some(broca_protocol::tags::PartTags::new(parts))'''
+
+[[control]]
+id = "runner-tags-steer-carries-its-record-tags"
+guards = "A steer joining a run frozen under the stored-ledger rules (runner-tags/v1) and resumed by a later build carries the tags its Steered record was stamped with, so the live request equals its rebuild"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
+expect_red = ["runner_tags_v1_pin::a_resumed_stored_ledger_run_renders_a_steer_live_as_its_rebuild"]
 file = "crates/broca-core/src/steer.rs"
 old = '''        if let Some(tags) = record() {
             for (message, tags) in messages.iter_mut().zip(&tags) {
@@ -19562,6 +19579,49 @@ old = '''        if let Some(tags) = record() {
 new = '''        if let Some(tags) = record() {
             for (message, tags) in messages.iter_mut().zip(&tags) {
                 let _ = (message, tags); // NON-VACUITY BREAK: the queued steer loses its tags'''
+
+[[control]]
+id = "runner-tags-computed-steer-numbered-at-its-step"
+guards = "Under the computed tag rules (runner-tags/v2) a steer joins the prompt before the step boundary numbers it, so the request that first carries it shows its number exactly as the rebuild from the WAL does"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
+expect_red = ["runner_tags_determinism::a_steer_mid_run_renders_live_as_its_rebuild"]
+file = "crates/broca-core/src/run.rs"
+old = '''        steer_backlog.append(&mut steered);
+        if !steer_backlog.is_empty() {
+            mutable_call_options(&mut opts)
+                .prompt
+                .append(&mut steer_backlog);
+        }
+
+        // Ordinals are positional metadata over this append-only prompt. Replay/merge and prior
+        // loop iterations already stamped the stable prefix, so touch only entries appended since
+        // the previous provider call. Assigned values remain their absolute 0-based positions.
+        broca_protocol::content::stamp_ordinals_from(
+            &mut mutable_call_options(&mut opts).prompt,
+            stamped_len,
+        );
+        stamped_len = opts.prompt.len();
+        tag_numbering
+            .number_new(&mut mutable_call_options(&mut opts).prompt)
+            .map_err(RunError::TagNumbering)?;'''
+new = '''        tag_numbering
+            .number_new(&mut mutable_call_options(&mut opts).prompt)
+            .map_err(RunError::TagNumbering)?; // NON-VACUITY BREAK: the step is numbered before its steers join
+        steer_backlog.append(&mut steered);
+        if !steer_backlog.is_empty() {
+            mutable_call_options(&mut opts)
+                .prompt
+                .append(&mut steer_backlog);
+        }
+        broca_protocol::content::stamp_ordinals_from(
+            &mut mutable_call_options(&mut opts).prompt,
+            stamped_len,
+        );
+        stamped_len = opts.prompt.len();'''
 
 [[control]]
 id = "runner-tags-unseeded-writer-refuses"
@@ -19701,16 +19761,59 @@ new = "    if let Some(reason) = indexed_finish_reason(&state.state).filter(|_| 
 
 [[control]]
 id = "runner-tags-steer-delivery-carries-its-record-tags"
-guards = "A send delivered as a steer joins the running turn with the tags its SendDelivered record was given, so the live request equals its rebuild"
+guards = "A send delivered as a steer into a run frozen under the stored-ledger rules (runner-tags/v1) and resumed by a later build carries the tags its SendDelivered record was stamped with, so the live request equals its rebuild"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
+expect_red = ["runner_tags_v1_pin::a_resumed_stored_ledger_run_renders_a_steer_delivery_live_as_its_rebuild"]
+file = "crates/broca-core/src/steer.rs"
+old = '''            if let Some(Some(tags)) = assigned.get(position) {'''
+new = '''            if let Some(Some(tags)) = assigned.get(position).filter(|_| false) { // NON-VACUITY BREAK: delivered steers lose their tags'''
+
+[[control]]
+id = "runner-tags-computed-steer-delivery-numbered-at-its-step"
+guards = "Under the computed tag rules (runner-tags/v2) a send delivered as a steer joins the prompt before the step boundary numbers it, so the request that first carries it shows its number exactly as the rebuild from the WAL does"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-core/src/run/delivery_order_tests.rs"
 expect_red = ["run::delivery_order_tests::a_steer_delivery_is_a_tagged_part_that_renders_as_its_rebuild"]
-file = "crates/broca-core/src/steer.rs"
-old = '''            if let Some(Some(tags)) = assigned.get(position) {'''
-new = '''            if let Some(Some(tags)) = assigned.get(position).filter(|_| false) { // NON-VACUITY BREAK: delivered steers lose their tags'''
+file = "crates/broca-core/src/run.rs"
+old = '''        steer_backlog.append(&mut steered);
+        if !steer_backlog.is_empty() {
+            mutable_call_options(&mut opts)
+                .prompt
+                .append(&mut steer_backlog);
+        }
+
+        // Ordinals are positional metadata over this append-only prompt. Replay/merge and prior
+        // loop iterations already stamped the stable prefix, so touch only entries appended since
+        // the previous provider call. Assigned values remain their absolute 0-based positions.
+        broca_protocol::content::stamp_ordinals_from(
+            &mut mutable_call_options(&mut opts).prompt,
+            stamped_len,
+        );
+        stamped_len = opts.prompt.len();
+        tag_numbering
+            .number_new(&mut mutable_call_options(&mut opts).prompt)
+            .map_err(RunError::TagNumbering)?;'''
+new = '''        tag_numbering
+            .number_new(&mut mutable_call_options(&mut opts).prompt)
+            .map_err(RunError::TagNumbering)?; // NON-VACUITY BREAK: the step is numbered before its delivered steers join
+        steer_backlog.append(&mut steered);
+        if !steer_backlog.is_empty() {
+            mutable_call_options(&mut opts)
+                .prompt
+                .append(&mut steer_backlog);
+        }
+        broca_protocol::content::stamp_ordinals_from(
+            &mut mutable_call_options(&mut opts).prompt,
+            stamped_len,
+        );
+        stamped_len = opts.prompt.len();'''
 
 [[control]]
 id = "responses-reasoning-summary-reaches-display-lane"
@@ -21559,7 +21662,7 @@ new = '''                    let no_tool_reason = stop_satisfied(&stop_when, com
 
 [[control]]
 id = "run-text-step-at-limit-completes-direct"
-guards = "On the direct path (control payloads on), the post-step stop check ends a no-tool limiting step completed; only a limiting step with tool calls ends max_steps"
+guards = "On the direct path (control payloads on), a no-tool limiting step whose post-step stop check fires falls through to the natural no-tool end and ends completed; only a limiting step with tool calls ends max_steps"
 runner = "cargo"
 select = "expected"
 package = "broca-core"
@@ -21568,8 +21671,8 @@ target = "--test it"
 test_file = "crates/broca-core/tests/it/run_loop.rs"
 expect_red = ["run_loop::the_step_limit_ends_max_steps_only_when_the_limiting_step_requested_tools"]
 file = "crates/broca-core/src/run.rs"
-old = '''                StopCondition::StepCount { .. } if !pending.is_empty() => RunFinishReason::MaxSteps,'''
-new = '''                StopCondition::StepCount { .. } => RunFinishReason::MaxSteps, // NON-VACUITY BREAK: any limiting step ends max_steps.'''
+old = '''            // A satisfied stop on a step without tool calls ends the run `completed`, exactly'''
+new = '''            if matches!(cond, StopCondition::StepCount { .. }) { break RunFinishReason::MaxSteps; } // NON-VACUITY BREAK: a no-tool limiting step ends max_steps.'''
 
 [[control]]
 id = "replay-text-step-at-limit-completes"
