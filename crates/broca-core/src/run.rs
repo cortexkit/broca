@@ -2618,6 +2618,26 @@ fn render_new_tags(
     *rendered_len = prompt.len();
 }
 
+fn stamp_raw_suffix(raw: &mut [Message], stamped_len: &mut usize) -> usize {
+    let stamped = broca_protocol::content::stamp_ordinals_from(raw, *stamped_len);
+    *stamped_len = raw.len();
+    stamped
+}
+
+#[test]
+fn raw_stamping_visits_only_new_messages() {
+    let mut raw = vec![Message::new(Role::User, vec![]); 1000];
+    let mut stamped_len = 0;
+    assert_eq!(stamp_raw_suffix(&mut raw, &mut stamped_len), 1000);
+    raw.extend([
+        Message::new(Role::Assistant, vec![]),
+        Message::new(Role::Tool, vec![]),
+    ]);
+    assert_eq!(stamp_raw_suffix(&mut raw, &mut stamped_len), 2);
+    assert_eq!(raw[1001].ordinal, Some(1001));
+    assert_eq!(stamp_raw_suffix(&mut raw, &mut stamped_len), 0);
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_body<P: Provider, T: ToolPlane, A: ApprovalPolicy>(
@@ -4080,6 +4100,7 @@ where
     let committed_episode_steps = completed_steps.saturating_sub(u64::from(pending_turn.is_some()));
     let episode_history_start = episode_history_start(&prompt, committed_episode_steps);
     let mut compaction_raw = compaction_runtime.as_ref().map(|_| prompt.clone());
+    let mut raw_stamped_len = stamped_len;
     // Earlier episodes' tool results were sent with the guidance their own episode produced.
     // Every later request must render them the same way, or it edits a message the provider has
     // already seen (a cache miss everywhere, and a rejected request where signed thinking is bound
@@ -4359,7 +4380,7 @@ where
             if raw.len() < opts.prompt.len() {
                 raw.extend_from_slice(&opts.prompt[raw.len()..]);
             }
-            broca_protocol::content::stamp_ordinals(raw);
+            stamp_raw_suffix(raw, &mut raw_stamped_len);
         }
         // A run frozen with `render_tags` shows each tagged user and tool-result text part
         // with its `§N§ ` prefix, and on Anthropic Messages each assistant text part's tag too.

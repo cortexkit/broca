@@ -24144,3 +24144,15 @@ expect_red = ["system_one::tests::the_catalog_row_decides_the_kind_refusals"]
 file = "crates/broca-module-serve/src/system_one/classify.rs"
 old = "            None => CatalogRow::Kindless,"
 new = "            None => CatalogRow::Kind(CLASSIFIER_KIND), // NON-VACUITY BREAK: read a kindless row as a classifier."
+
+[[control]]
+id = "compaction-raw-stamps-only-the-suffix"
+guards = "raw ordinal stamping touches only messages appended since the previous boundary"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::raw_stamping_visits_only_new_messages"]
+file = "crates/broca-core/src/run.rs"
+old = "stamp_ordinals_from(raw, *stamped_len)"
+new = "stamp_ordinals_from(raw, 0) /* NON-VACUITY BREAK: revisit the entire transcript */"

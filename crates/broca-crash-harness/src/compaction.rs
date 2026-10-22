@@ -33,6 +33,25 @@ use crate::{
 const PROVIDER: &str = "compactor";
 const APPLIED_HEAD: &str = "durable compacted head";
 
+#[tokio::test]
+async fn compaction_requests_match_the_pre_windowing_bytes() {
+    let mut requests = Vec::new();
+    for scenario in [SCENARIO, SIGNED_SCENARIO] {
+        let handle = RunnerHandle::new(scenario).await;
+        requests.push(
+            handle
+                .reference
+                .sent
+                .values()
+                .map(|bytes| String::from_utf8(bytes.clone()).expect("canonical request JSON"))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let expected: Vec<Vec<String>> =
+        serde_json::from_str(include_str!("fixtures/compaction_request_bytes.json")).unwrap();
+    assert_eq!(requests, expected);
+}
+
 fn request() -> RunRequest {
     let submission = serde_json::from_value(json!({
         "model":{"provider_module_id":"stub","model_id":"model"},
