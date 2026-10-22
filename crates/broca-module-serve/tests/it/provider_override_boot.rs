@@ -95,3 +95,35 @@ fn the_spawned_binary_writes_its_logs_under_the_pinned_data_home() {
     let _ = std::fs::remove_dir_all(&data_home);
     let _ = std::fs::remove_file(&path);
 }
+
+/// A `BROCA_CONFIG_PATH` naming no file refuses startup, naming the variable and the path.
+/// Every broca.jsonc loader reads a missing file as "no overrides", so without this refusal a
+/// typo boots green with every override silently gone.
+#[test]
+fn a_missing_named_config_file_refuses_boot() {
+    let data_home = broca_test_support::scratch_root()
+        .join(format!("broca-missing-config-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_home);
+    let missing = broca_test_support::scratch_root()
+        .join(format!("broca-missing-config-{}.jsonc", std::process::id()));
+    let _ = std::fs::remove_file(&missing);
+    let output = broca_test_support::retry_executable_file_busy(|| {
+        broca_test_support::ckdev_command(
+            env!("CARGO_BIN_EXE_ck-broca"),
+            broca_test_support::scratch_root(),
+        )
+        .args(["--subc", "unused-connection.json"])
+        .env("BROCA_CONFIG_PATH", &missing)
+        .env("XDG_DATA_HOME", &data_home)
+        .env_remove("BROCA_STATE_ROOT")
+        .output()
+    })
+    .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("BROCA_CONFIG_PATH") && error.contains(&missing.display().to_string()),
+        "a missing named config file must refuse boot by name: {error}"
+    );
+    let _ = std::fs::remove_dir_all(&data_home);
+}

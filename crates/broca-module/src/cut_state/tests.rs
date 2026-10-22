@@ -683,3 +683,66 @@ async fn mapless_cut_is_unreadable_before_any_artifact_resolution() {
     assert!(error.message.contains("sessions"));
     assert_eq!(artifacts.locks.load(Ordering::SeqCst), 0);
 }
+
+/// A damaged or foreign file under the cuts directory does not stop boot reconciliation: the
+/// valid pending cut beside it still completes, and the damaged file is left as it was, where
+/// the move fence still reads it and fails closed.
+#[tokio::test]
+async fn a_damaged_cut_file_does_not_stop_boot_reconciliation() {
+    let root = root("damaged-boot");
+    let store = CutStore::new(&root);
+    let artifacts = Artifacts::new(root.clone());
+    store
+        .execute(
+            contract::ADMITTED_CALLER,
+            Op::Prepare.method(),
+            &params(),
+            &artifacts,
+        )
+        .await
+        .unwrap();
+    store
+        .execute(
+            contract::ADMITTED_CALLER,
+            Op::Export.method(),
+            &params(),
+            &artifacts,
+        )
+        .await
+        .unwrap();
+    artifacts.applied.store(0, Ordering::SeqCst);
+    artifacts.fail_after.store(1, Ordering::SeqCst);
+    let mut release = params();
+    release["holder"] = json!("remote");
+    assert!(store
+        .execute(
+            contract::ADMITTED_CALLER,
+            Op::Release.method(),
+            &release,
+            &artifacts,
+        )
+        .await
+        .is_err());
+    assert!(store.load(CUT).unwrap().intent.is_some());
+    let cuts = store.path(CUT).parent().unwrap().to_owned();
+    std::fs::write(cuts.join("damaged.json"), b"corrupt").unwrap();
+    std::fs::write(cuts.join("not.a.cut.json"), b"{}").unwrap();
+    artifacts.fail_after.store(usize::MAX, Ordering::SeqCst);
+    store
+        .reconcile_boot(&artifacts)
+        .await
+        .expect("one damaged cut file must not fail boot reconciliation");
+    assert!(
+        store.load(CUT).unwrap().intent.is_none(),
+        "the valid cut beside the damaged file still completes"
+    );
+    assert_eq!(
+        std::fs::read(cuts.join("damaged.json")).unwrap(),
+        b"corrupt",
+        "the damaged cut is left untouched"
+    );
+    assert!(
+        broca_wal::migration::cut_fence(&root.join("wal"), "b").is_err(),
+        "the move fence still fails closed on the damaged cut"
+    );
+}

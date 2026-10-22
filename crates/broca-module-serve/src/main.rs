@@ -130,6 +130,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // The startup crash-orphan pass treats a WAL last written before this instant as a crashed
     // process's leftover; anything written later belongs to a live writer.
     let process_started = std::time::SystemTime::now();
+    // Before any broca.jsonc loader: each of them reads a missing file as "no overrides".
+    broca_module_serve::config_home::require_explicit_file(
+        broca_module_serve::cache_routing::CONFIG_PATH_ENV,
+        "broca.jsonc",
+    )
+    .map_err(ServeIoError)?;
     broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
     let archive_config = broca_module_serve::wal_archive::WalArchiveConfig::load_default_path()
         .map_err(ServeIoError)?;

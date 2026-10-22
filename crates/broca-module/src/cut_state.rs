@@ -448,6 +448,13 @@ impl CutStore {
     }
     /// Run before session opening. The service adapter resolves every cut's refs
     /// through the same locked actors used for live operations.
+    ///
+    /// A cut that cannot be reconciled (a foreign or damaged file, an unreadable state, a
+    /// failed step) is logged and left as it is, so one bad file cannot stop the service from
+    /// starting and answering every other session. Leaving it is what keeps it fenced: an
+    /// unfinished intent stays on disk and still fences its sessions, and a cut file the move
+    /// fence cannot read makes that fence fail closed. Only an unreadable cuts directory fails
+    /// the whole pass.
     pub async fn reconcile_boot(&self, artifacts: &dyn CutArtifacts) -> Result<(), ErrorBody> {
         let dir = self.root.join("agent-data/cuts");
         let entries = match std::fs::read_dir(dir) {
@@ -460,49 +467,65 @@ impl CutStore {
             if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
-            let cut_id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| unavailable("invalid cut filename"))?;
-            contract::refs::CutId::new(cut_id).map_err(unavailable)?;
-            let _cut_lock = self.lock(cut_id).await?;
-            let mut state = self.load(cut_id)?;
-            if state.intent.is_none() {
-                continue;
+            if let Err(error) = self.reconcile_boot_cut(&path, artifacts).await {
+                tracing::error!(
+                    cut = %path.display(),
+                    code = error.code.as_str(),
+                    error = ?error,
+                    "cut boot reconciliation failed; the cut is left pending and fenced"
+                );
             }
-            let _sessions = match &state.refs {
-                Some(refs) => match artifacts
-                    .lock_refs(
-                        cut_id,
-                        refs,
-                        state
-                            .intent
-                            .as_ref()
-                            .map(intent_request)
-                            .transpose()?
-                            .map_or(Op::Status, |r| r.op()),
-                    )
-                    .await
-                {
-                    Ok(guard) => Some(guard),
-                    Err(error) => {
-                        // Pending intents still fence their sessions. A missing
-                        // door or damaged staging must not prevent the service
-                        // from answering status or the driver's repeat.
-                        tracing::warn!(
-                            cut_id,
-                            code = error.code.as_str(),
-                            "cut boot reconciliation remains pending"
-                        );
-                        continue;
-                    }
-                },
-                None => None,
-            };
-            self.reconcile_locked(cut_id, &mut state, artifacts, false)
-                .await?;
         }
         Ok(())
+    }
+
+    /// Reconcile the one cut stored at `path`.
+    async fn reconcile_boot_cut(
+        &self,
+        path: &Path,
+        artifacts: &dyn CutArtifacts,
+    ) -> Result<(), ErrorBody> {
+        let cut_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| unavailable("invalid cut filename"))?;
+        contract::refs::CutId::new(cut_id).map_err(unavailable)?;
+        let _cut_lock = self.lock(cut_id).await?;
+        let mut state = self.load(cut_id)?;
+        if state.intent.is_none() {
+            return Ok(());
+        }
+        let _sessions = match &state.refs {
+            Some(refs) => match artifacts
+                .lock_refs(
+                    cut_id,
+                    refs,
+                    state
+                        .intent
+                        .as_ref()
+                        .map(intent_request)
+                        .transpose()?
+                        .map_or(Op::Status, |r| r.op()),
+                )
+                .await
+            {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    // Pending intents still fence their sessions. A missing
+                    // door or damaged staging must not prevent the service
+                    // from answering status or the driver's repeat.
+                    tracing::warn!(
+                        cut_id,
+                        code = error.code.as_str(),
+                        "cut boot reconciliation remains pending"
+                    );
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+        self.reconcile_locked(cut_id, &mut state, artifacts, false)
+            .await
     }
     pub fn state_root(&self) -> &Path {
         &self.root

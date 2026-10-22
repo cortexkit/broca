@@ -991,15 +991,32 @@ where
             joined = routes.bind_tasks.join_next(), if !routes.bind_tasks.is_empty() => {
                 match joined.expect("guarded by !routes.bind_tasks.is_empty()") {
                     Ok(completed) => finish_bind(completed, &writer, &mut routes).await?,
-                    Err(error) => break Err(ServeIoError(format!("bind authorization task failed: {error}"))),
+                    // A panic in one bind's authorization is that bind's failure, not the
+                    // connection's: every other route and stream on this connection is healthy.
+                    // The bind is never acknowledged, so its caller sees it time out, and its
+                    // pending entry is replaced by a rebind or removed by its GOODBYE.
+                    Err(error) => tracing::error!(
+                        target: "wire.ingress",
+                        "bind authorization task failed; refusing only that bind: {error}"
+                    ),
                 }
             }
             joined = request_tasks.join_next(), if !request_tasks.is_empty() => {
                 match joined.expect("guarded by !request_tasks.is_empty()") {
                     Ok(Ok(())) => {}
+                    // An egress failure inside a request task means the connection itself is
+                    // unusable, so it still ends the loop.
                     Ok(Err(e)) => break Err(e),
                     Err(e) if e.is_cancelled() => {}
-                    Err(e) => break Err(ServeIoError(format!("route request task failed: {e}"))),
+                    // A panic is confined to its own request. Ending the loop here would cut
+                    // every session's streams and in-flight sends on this connection for one
+                    // request's bug. The task's correlation is gone with it, so no reply is
+                    // fabricated: its caller sees an unanswered request, which is what an
+                    // outcome that cannot be known looks like.
+                    Err(e) => tracing::error!(
+                        target: "wire.ingress",
+                        "route request task failed; dropping only that request: {e}"
+                    ),
                 }
             }
             (frame, reader) = &mut pending_read => {
@@ -5454,6 +5471,9 @@ mod tests {
             unimplemented!()
         }
         async fn status(&self, session: &BrocaBindIdentity) -> Result<StatusResponse, ServeError> {
+            if session.session == "panicking-status" {
+                panic!("a request handler bug");
+            }
             if session.session == "oversized-error-response" {
                 return Err(ServeError::Transient(
                     "x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize),
@@ -6623,6 +6643,117 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(serve.await.unwrap().unwrap(), ServeEnd::Goodbye);
+    }
+
+    /// A panic inside one request's task is confined to that request: the connection keeps
+    /// answering frames and ends normally on GOODBYE instead of failing the whole serve loop.
+    #[tokio::test]
+    async fn a_panicking_request_does_not_end_the_connection() {
+        let (mut daemon, mut module_read) = tokio::io::duplex(64 * 1024);
+        let (writer, mut written) =
+            broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
+        let handler = Arc::new(GatedStatusHandler {
+            gate_auth: false,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let serve = tokio::spawn(async move {
+            let registry = LineageRegistry::new(Arc::new(RefusingOpener));
+            run_frame_loop(
+                &mut module_read,
+                writer,
+                "broca",
+                handler,
+                &registry,
+                &VaultGauge::not_in_use(),
+                None,
+                CancellationToken::new(),
+                crate::wal_archive::WalArchiveConfig::default(),
+                &crate::consumer_routes::ConsumerRoutes::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        let hello = next_written(&mut written).await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                hello.header.corr,
+                serde_json::to_vec(&ModuleHelloAckBody {
+                    negotiated_ver: PROTOCOL_VERSION,
+                    subc_ops: vec![],
+                    subc_capabilities: vec![],
+                    storage: None,
+                    machine_id: None,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let bind = ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "broca".into(),
+            },
+            identity: SubcBindIdentity::new("/tmp/project-a", "runner", "panicking-status"),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
+        write_frame(
+            &mut daemon,
+            &Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                2,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next_written(&mut written).await.header.ty,
+            FrameType::Response
+        );
+        test_request(&mut daemon, OP_STATUS, 3).await;
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Ping, control_flags(), 0, 0, 4, vec![]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let pong = next_written(&mut written).await;
+        assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 4));
+        write_frame(
+            &mut daemon,
+            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 5, vec![]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), serve)
+            .await
+            .expect("the serve loop did not end on GOODBYE")
+            .unwrap();
+        assert_eq!(
+            result.expect("a panicking request must not end the connection with an error"),
+            ServeEnd::Goodbye
+        );
     }
 
     /// The tool plane's `scope.describe` goes out on this registered module connection, only

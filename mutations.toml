@@ -23551,3 +23551,44 @@ expect_red = ["catalog_refresh::tests::a_failed_poll_retries_on_a_capped_backoff
 file = "crates/broca-module-serve/src/catalog_refresh.rs"
 old = "    if consecutive_failures == 0 {\n        return CATALOG_POLL_INTERVAL;\n    }"
 new = "    if consecutive_failures == 0 || true { // NON-VACUITY BREAK: wait the full interval after a failure too.\n        return CATALOG_POLL_INTERVAL;\n    }"
+
+[[control]]
+id = "serve-request-panic-stays-local"
+guards = "A panic inside one route request task is confined to that request; the module connection keeps serving and ends normally"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::a_panicking_request_does_not_end_the_connection"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                    Err(e) => tracing::error!(\n                        target: \"wire.ingress\",\n                        \"route request task failed; dropping only that request: {e}\"\n                    ),"
+new = "                    Err(e) => break Err(ServeIoError(format!(\"route request task failed: {e}\"))), // NON-VACUITY BREAK: one panic ends the connection."
+
+[[control]]
+id = "cut-boot-isolates-damaged-cut"
+guards = "One damaged or foreign cut file is logged and left fenced instead of aborting boot reconciliation and daemon start"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/cut_state/tests.rs"
+expect_red = ["cut_state::tests::a_damaged_cut_file_does_not_stop_boot_reconciliation"]
+expect_message = "one damaged cut file must not fail boot reconciliation"
+file = "crates/broca-module/src/cut_state.rs"
+old = "            if let Err(error) = self.reconcile_boot_cut(&path, artifacts).await {"
+new = "            self.reconcile_boot_cut(&path, artifacts).await?; // NON-VACUITY BREAK: one bad cut fails the pass.\n            if let Err(error) = Ok::<(), ErrorBody>(()) {"
+
+[[control]]
+id = "boot-refuses-missing-named-broca-config"
+guards = "A BROCA_CONFIG_PATH naming no file refuses startup instead of every broca.jsonc loader silently taking shipped defaults"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/provider_override_boot.rs"
+expect_red = ["provider_override_boot::a_missing_named_config_file_refuses_boot"]
+expect_message = "a missing named config file must refuse boot by name"
+file = "crates/broca-module-serve/src/main.rs"
+old = "    .map_err(ServeIoError)?;\n    broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;"
+new = "    .ok(); // NON-VACUITY BREAK: ignore a missing named config file.\n    broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;"

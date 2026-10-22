@@ -144,7 +144,8 @@ impl CacheTtlTable {
         Self::load_resolved(Self::default_path())
     }
 
-    /// Missing cache configuration keeps shipped defaults, including explicit paths.
+    /// Missing cache configuration keeps shipped defaults. The daemon refuses to boot on a
+    /// missing explicit path before this runs (`config_home::require_explicit_file`).
     pub fn load_resolved(resolved: crate::config_home::ConfigHome) -> Result<Self, String> {
         match resolved {
             crate::config_home::ConfigHome::Resolved { path, .. } => Self::load(&path),
