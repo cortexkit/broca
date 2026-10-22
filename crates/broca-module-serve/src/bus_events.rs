@@ -483,6 +483,10 @@ impl Service {
             let mut recovery_at = tokio::time::Instant::now();
             let mut retry_at = tokio::time::Instant::now();
             let mut backoff = Duration::from_secs(1);
+            // Whether the stale backlog must be replaced with skip markers before the next
+            // publish: set when a connection comes up and after a failed publish, which is
+            // how an outage shows while a publisher is held.
+            let mut skip_due = true;
             let mut progress = ProgressThrottle::default();
             let mut progress_at = tokio::time::Instant::now();
             let mut prune_at = tokio::time::Instant::now();
@@ -511,6 +515,7 @@ impl Service {
                             "run.ended",
                             "run.steer_consumed",
                             "run.progress",
+                            broca_store::bus_events::SKIPPED_EVENT,
                         ] {
                             account
                                 .event_subject("broca", name, 1)
@@ -535,6 +540,7 @@ impl Service {
                         Ok(connected) => {
                             publisher = Some(connected);
                             backoff = Duration::from_secs(1);
+                            skip_due = true;
                         }
                         Err(_) => {
                             store
@@ -696,7 +702,34 @@ impl Service {
                     prune_at = tokio::time::Instant::now() + Duration::from_secs(60);
                 }
                 if let Some(bus) = publisher.as_ref() {
-                    if tokio::time::Instant::now() >= retry_at {
+                    if skip_due && tokio::time::Instant::now() >= retry_at {
+                        let s = store.clone();
+                        match broca_diagnostics::spawn_blocking(
+                            broca_diagnostics::JobKind::StoreWrite,
+                            move || s.skip_stale_bus_events(now_ms()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(summary)) => {
+                                skip_due = false;
+                                if summary.skipped > 0 {
+                                    tracing::warn!(target: "bus", skipped = summary.skipped, sessions = summary.sessions, "queued run events older than two minutes are not published; one run.skipped marker per session stands in for them");
+                                }
+                            }
+                            failed => {
+                                // Publishing now could replay stale events, so the drain waits
+                                // until the backlog has been replaced.
+                                let error = match failed {
+                                    Ok(Err(error)) => error.to_string(),
+                                    _ => "the skip task stopped".to_string(),
+                                };
+                                tracing::warn!(target: "bus", %error, "could not replace the stale run event backlog; publishing waits");
+                                retry_at = tokio::time::Instant::now() + backoff;
+                                backoff = (backoff * 2).min(Duration::from_secs(60));
+                            }
+                        }
+                    }
+                    if !skip_due && tokio::time::Instant::now() >= retry_at {
                         // One sequential publisher preserves each run's WAL order through retries.
                         // A pass drains until the outbox is empty or its budget is spent, so a
                         // backlog clears at the broker's pace rather than a fixed count per pass.
@@ -710,6 +743,7 @@ impl Service {
                                 _ => {
                                     retry_at = tokio::time::Instant::now() + backoff;
                                     backoff = (backoff * 2).min(Duration::from_secs(60));
+                                    skip_due = true;
                                     break;
                                 }
                             }
@@ -808,7 +842,7 @@ impl ProgressThrottle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -965,7 +999,11 @@ mod tests {
         assert!(queue.is_empty());
     }
 
-    fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> broca_wal::WalRecord {
+    pub(crate) fn run_started(
+        session: &BindIdentity,
+        run_id: &str,
+        ts_ms: u64,
+    ) -> broca_wal::WalRecord {
         broca_wal::WalRecord::RunStarted {
             tags: None,
             run_id: broca_protocol::RunId(run_id.into()),
@@ -1013,7 +1051,7 @@ mod tests {
         }
     }
 
-    fn run_finished(ts_ms: u64) -> broca_wal::WalRecord {
+    pub(crate) fn run_finished(ts_ms: u64) -> broca_wal::WalRecord {
         broca_wal::WalRecord::RunFinished {
             interrupt_reason: None,
             reason: broca_protocol::RunFinishReason::Completed,

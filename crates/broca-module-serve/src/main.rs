@@ -620,9 +620,12 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bus_stop = tokio_util::sync::CancellationToken::new();
     let _bus_stop_guard = bus_stop.clone().drop_guard();
-    let bus_connector: Arc<dyn broca_module_serve::bus_events::BusConnector> = Arc::new(
-        broca_module_serve::bus_events_nats::NatsConnector::new(plan_conn.clone()),
-    );
+    let bus_connector: Arc<dyn broca_module_serve::bus_events::BusConnector> =
+        Arc::new(broca_module_serve::bus_events_nats::NatsConnector::new(
+            // The process's one ck-bus credential holder: the run event publisher and the
+            // compaction consumer below both use this connector.
+            broca_module_serve::bus_events_nats::CredentialHolder::new(plan_conn.clone()),
+        ));
     let _compaction_bus = if bus_event_config.enabled {
         let service = broca_module_serve::compaction_bus::Service::new(
             run_index.clone(),

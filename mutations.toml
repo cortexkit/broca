@@ -21302,3 +21302,42 @@ old = '''        crate::spec::WireFamilyId::OpenAiResponses => {
             meta_subscription_quota_exhausted(status, body, error)
         }'''
 new = '''        crate::spec::WireFamilyId::OpenAiResponses => error, // NON-VACUITY BREAK: drop the Meta subscription quota mapping.'''
+
+[[control]]
+id = "bus-credential-retired-key-is-reissued"
+guards = "When ck-bus refuses the connect nonce because the process's key is retired, the credential holder re-issues once, the connection authenticates on the new key and the queued run event outbox drains, instead of retrying the retired key forever"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/bus_events_nats.rs"
+expect_red = ["bus_events_nats::tests::a_retired_key_is_reissued_once_and_the_queued_outbox_drains", "bus_events_nats::tests::two_connections_finding_the_key_retired_share_one_reissue", "bus_events_nats::tests::real_broker_handshake_reissues_a_retired_key_and_the_outbox_drains"]
+file = "crates/broca-module-serve/src/bus_events_nats.rs"
+old = "        if !error.key_retired() {"
+new = "        if true || !error.key_retired() { // NON-VACUITY BREAK: never re-issue a key the handshake finds retired"
+
+[[control]]
+id = "bus-credential-reissue-is-single-flight"
+guards = "Connections that find the same key retired share one ckbus.credential re-issue; a second issue would retire the key the first connection just moved to"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/bus_events_nats.rs"
+expect_red = ["bus_events_nats::tests::two_connections_finding_the_key_retired_share_one_reissue"]
+file = "crates/broca-module-serve/src/bus_events_nats.rs"
+old = "            .filter(|c| c.credential_public != stale_public)"
+new = "            .filter(|c| false && c.credential_public != stale_public) // NON-VACUITY BREAK: issue again even when another caller already replaced the key"
+
+[[control]]
+id = "bus-events-stale-backlog-becomes-skip-markers"
+guards = "Queued run events older than two minutes when a bus connection comes up are never published; each session's are replaced in one transaction by one run.skipped marker that is published ahead of the session's younger events"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/bus_events.rs"
+expect_red = ["bus_events::tests::bus_stale_backlog_becomes_one_marker_per_session_ahead_of_its_young_events", "bus_events::tests::bus_stale_backlog_replacement_survives_a_crash_at_each_point"]
+file = "crates/broca-store/src/bus_events.rs"
+old = "            let Some(last_stale) = rows.iter().rposition(|row| row.at_ms < cutoff) else {"
+new = "            let Some(last_stale) = rows.iter().rposition(|row| false && row.at_ms < cutoff) else { // NON-VACUITY BREAK: publish the stale backlog instead of replacing it"

@@ -13,9 +13,22 @@ for this machine account. Otherwise an event could be published before its
 intended consumer exists.
 The daemon obtains its account, JWT, server URL and inbox prefix from
 `ckbus.credential` over its daemon-attested `reserved:broca` route; the private
-key stays in ck-bus. Nonces use `ckbus.nonce_sign`; JWTs renew about ten minutes
-after issue with `ckbus.credential_renew`, followed by reconnect with the new JWT.
-No bus credential file or credential environment variable is accepted.
+key stays in ck-bus. Nonces use `ckbus.nonce_sign`; JWTs renew five minutes
+before they expire with `ckbus.credential_renew`, and every connect and reconnect
+presents the current JWT. No bus credential file or credential environment
+variable is accepted.
+
+ck-bus keeps one current key per module, and each `ckbus.credential` call retires
+the previous one. So the process holds exactly **one** credential, created at boot
+and shared by every NATS connection it opens (the run event publisher and the
+compaction consumer). When `ckbus.nonce_sign` or `ckbus.credential_renew` refuses
+with `ckbus_credential_superseded` or `ckbus_credential_revoked`, the holder
+issues one replacement for every connection (concurrent callers share it), with
+exponential backoff from 1 to 60 seconds between failed issues; a connection the
+broker kicked reconnects naming the new key, and the publisher reconnects on it.
+On `ckbus_generation_not_live` it issues nothing: the process is being replaced,
+so it logs once and makes no further ck-bus calls. Every ck-bus failure keeps its
+refusal code and is logged at WARN once per distinct cause and method.
 
 Every subject is constructed and validated by bus-naming **0.2.3**. That linked
 validator is the dotted-event support contract; there is no invented server
@@ -61,6 +74,7 @@ The machine account comes from ck-bus, not the caller:
 | `ck.{acct}.event.broca.run.ended.v1` | `terminal`, optional `error_class`, `structured_output` |
 | `ck.{acct}.event.broca.run.steer_consumed.v1` | `step`, `consumed`, `send_ids`, `truncated` |
 | `ck.{acct}.event.broca.run.progress.v1` | `step`, optional `last_content_at_ms`, `max_content_gap_ms` |
+| `ck.{acct}.event.broca.run.skipped.v1` | see "Stale backlog"; its body has its own fields |
 
 All bodies contain `v:1`, `session_ref` (the shared llm-runner 32-hex handle),
 `run_id`, `seq` and `at_ms`. Lifecycle `seq` is the causing WAL record's sequence.
@@ -114,6 +128,41 @@ when the publisher first learns its machine account from ck-bus or an enabled
 period (see "What becomes an event") begins. A crash after broker ack but before the mark
 can republish the identical key/digest. Broker deduplication is finite; consumers
 must also be idempotent.
+
+### Stale backlog
+
+Within an enabled period, a queued lifecycle event leaves the outbox only by being
+published or by being covered by a `run.skipped` marker for its session, which is
+then queued and published like any event (the 24-hour retention prune and the
+discard at a new period's start, described above, are the only exceptions). When a bus connection comes up (including
+the first after boot) and after any failed publish, queued events whose own `at_ms`
+is more than **2 minutes** old (`STALE_BACKLOG_MS`) are not published. Core
+reconciles every run by polling while events are down, so such events tell it
+nothing, and replaying them does harm: each stale `run.ended` triggers a status
+poll, and a stale `run.progress` refreshes a worker's liveness clock with replay
+time. A gap shorter than 2 minutes publishes normally.
+
+Instead, one marker per affected session names what was skipped. Its JCS body is
+`session_ref`, `from_seq` and `to_seq` (the first and last skipped events in WAL
+order), `from_ms` and `to_ms` (the earliest and latest of their clocks) and
+`count`. A session's skipped range runs from its first queued event through its
+last stale one, so nothing published for the session predates its marker. The
+marker is published with headers `kind` (`run.skipped`), `session_ref`, `epoch`
+(of the last skipped event) and `seq` (`to_seq`), and no `run_id`. Its key is the
+lowercase SHA-256 of the JCS tuple `[epoch,session_ref,from_seq,to_seq,subject]`,
+and `run.event.get` serves its body like any run event. It goes out **before**
+that session's younger events, which keeps per-run order; events of other
+sessions are not reordered.
+
+The skipped rows leave the outbox in the same transaction that inserts their
+marker, so a crash leaves either the rows (the next connection replaces them) or
+the marker (published like any event; a crash after its publish and before the
+mark republishes the identical key and digest), never neither and never both.
+Publishing waits until the replacement has succeeded. Consumers should treat an
+unknown kind such as `run.skipped` as a reason to reconcile that session once.
+Like the other run events, `run.skipped` is published without a manifest event
+declaration: the daemon's HELLO validator that broca builds against refuses dotted
+event names.
 
 Acknowledged bodies remain in the database for claim-check reads. A prune pass
 removes rows older than 24 hours and counts/WARNs once per pass for unacknowledged
