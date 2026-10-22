@@ -24156,3 +24156,15 @@ expect_red = ["run::raw_stamping_visits_only_new_messages"]
 file = "crates/broca-core/src/run.rs"
 old = "stamp_ordinals_from(raw, *stamped_len)"
 new = "stamp_ordinals_from(raw, 0) /* NON-VACUITY BREAK: revisit the entire transcript */"
+
+[[control]]
+id = "compaction-view-range-is-window-sized"
+guards = "ordinal range lookup excludes the hidden transcript prefix before walking a view range"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::ordinal_ranges_bound_the_work_to_the_requested_window"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "let start = prompt.partition_point(|m| m.ordinal.is_none_or(|o| o < from));"
+new = "let start = { let _ = from; 0 }; // NON-VACUITY BREAK: walk the hidden prefix"

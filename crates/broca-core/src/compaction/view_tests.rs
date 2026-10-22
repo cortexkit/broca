@@ -81,6 +81,60 @@ fn conversation() -> Vec<Message> {
     ])
 }
 
+#[test]
+fn ordinal_ranges_bound_the_work_to_the_requested_window() {
+    let mut prompt = stamped(vec![text(Role::User, "old"); 150_000]);
+    prompt[0].role = Role::System;
+    let window = ordinal_range(&prompt, 149_800, 149_999);
+    assert_eq!(window.len(), 199);
+    assert_eq!(window[0].ordinal, Some(149_800));
+    assert!(ordinal_range(&prompt, 150_000, u64::MAX).is_empty());
+    assert_eq!(ordinal_range(&prompt, 10, 10).len(), 0);
+}
+
+#[test]
+fn indexed_render_keeps_interior_system_messages_and_episode_coordinates() {
+    let prompt = stamped(vec![
+        text(Role::User, "hidden"),
+        text(Role::System, "system"),
+        text(Role::User, "kept"),
+        text(Role::Assistant, "answer"),
+    ]);
+    let mut opts = CallOptions::new(prompt.clone());
+    opts.render_episodes = std::sync::Arc::new(broca_protocol::request::RenderHistory {
+        compaction_prefix_len: None,
+        episodes: (0..4)
+            .map(|i| broca_protocol::request::EpisodeRenderInput {
+                prompt_start: i,
+                first_user: Some(i),
+                frozen_config: json!({}),
+            })
+            .collect(),
+    });
+    let (view, _) = make_view(
+        2,
+        1,
+        vec![ViewRange::replace(
+            0,
+            2,
+            replace_bytes(&[text(Role::User, "summary")]),
+        )],
+    );
+    let mut state = after_setup();
+    state.view = Some(AppliedView {
+        view,
+        choice: broca_wal::CompactionViewChoice::Applied,
+    });
+    let rendered = crate::compaction::model_options_indexed(&opts, &state, &[1]).unwrap();
+    assert_eq!(rendered.prompt[0], prompt[1]);
+    let coords: Vec<_> = rendered
+        .render_episodes
+        .iter()
+        .map(|e| (e.prompt_start, e.first_user))
+        .collect();
+    assert_eq!(coords, vec![(2, Some(2)), (3, Some(3))]);
+}
+
 /// A view may replace several ranges and edit single parts of the messages it keeps. The
 /// history it gives is the role's reference assembly, with broca's transcript messages keeping
 /// their ordinals and the provider's messages carrying none.

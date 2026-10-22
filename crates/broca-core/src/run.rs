@@ -4101,6 +4101,10 @@ where
     let episode_history_start = episode_history_start(&prompt, committed_episode_steps);
     let mut compaction_raw = compaction_runtime.as_ref().map(|_| prompt.clone());
     let mut raw_stamped_len = stamped_len;
+    // The prompt can contain system messages anywhere, not just at its beginning.
+    // Index their positions once as the append-only prompt grows instead of rescanning history.
+    let mut system_positions = Vec::new();
+    let mut system_indexed_len = 0;
     // Earlier episodes' tool results were sent with the guidance their own episode produced.
     // Every later request must render them the same way, or it edits a message the provider has
     // already seen (a cache miss everywhere, and a rejected request where signed thinking is bound
@@ -4373,6 +4377,15 @@ where
             stamped_len,
         );
         stamped_len = opts.prompt.len();
+        system_positions.extend(
+            opts.prompt[system_indexed_len..]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, message)| {
+                    (message.role == Role::System).then_some(system_indexed_len + i)
+                }),
+        );
+        system_indexed_len = opts.prompt.len();
         tag_numbering
             .number_new(&mut mutable_call_options(&mut opts).prompt)
             .map_err(RunError::TagNumbering)?;
@@ -4533,7 +4546,7 @@ where
                 ))
                 .await?
             };
-            let view = crate::compaction::model_options(&opts, state)
+            let view = crate::compaction::model_options_indexed(&opts, state, &system_positions)
                 .map_err(|error| RunError::Wal(error.to_string()))?;
             notice_request_bytes = provider.render_request(&view).len();
             let (estimate, _) =
@@ -4567,13 +4580,14 @@ where
                 &resolved_run_id,
                 out,
                 &opts,
+                &system_positions,
                 raw,
                 provider,
                 context_limit,
             ))
             .await?;
             // A ceiling ride or a view-ready notification may have changed the durable view.
-            let view = crate::compaction::model_options(&opts, state)
+            let view = crate::compaction::model_options_indexed(&opts, state, &system_positions)
                 .map_err(|error| RunError::Wal(error.to_string()))?;
             notice_request_bytes = provider.render_request(&view).len();
             if let Some(notice) = crate::compaction::view::next_notice(
