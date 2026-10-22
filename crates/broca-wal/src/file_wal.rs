@@ -32,6 +32,7 @@ pub use human_prompt_count::{
 #[cfg(test)]
 thread_local! {
     static OPEN_STAGES: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    static OPEN_READ_CAP: Cell<u64> = const { Cell::new(DEFAULT_MAX_READ_BYTES) };
 }
 
 fn open_observed(_stage: &'static str) {
@@ -655,23 +656,27 @@ impl FileWal {
         // Recover the valid records and metadata plus the byte offset where they end (the start of
         // any torn tail, or the whole file if intact).
         open_observed("replay");
+        #[cfg(test)]
+        let max_read_bytes = OPEN_READ_CAP.with(Cell::get);
+        #[cfg(not(test))]
+        let max_read_bytes = DEFAULT_MAX_READ_BYTES;
         let recovered = match File::open(&path) {
             Ok(file) => {
                 let size = file.metadata().map_err(WalError::Io)?.len();
-                if size > DEFAULT_MAX_READ_BYTES {
+                if size > max_read_bytes {
                     return Err(WalError::TooLarge {
-                        max_bytes: DEFAULT_MAX_READ_BYTES,
+                        max_bytes: max_read_bytes,
                         file_size: size,
                     });
                 }
                 scan_prefix(
                     std::io::BufReader::new(file),
-                    DEFAULT_MAX_READ_BYTES,
+                    max_read_bytes,
                     |_| None::<()>,
                 )?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                scan_prefix(std::io::empty(), DEFAULT_MAX_READ_BYTES, |_| None::<()>)?
+                scan_prefix(std::io::empty(), max_read_bytes, |_| None::<()>)?
             }
             Err(error) => return Err(WalError::Io(error)),
         };
@@ -1140,13 +1145,11 @@ fn scan_prefix<T>(
             let len = u32::from_le_bytes(header[..4].try_into().unwrap());
             if len <= crate::framing::MAX_PAYLOAD_LEN {
                 let size = header.len() + len as usize;
-                if size as u64 > available {
-                    return Err(WalError::TooLarge {
-                        max_bytes,
-                        file_size: offset + size as u64,
-                    });
-                }
-                frame.resize(size, 0);
+                // The declared payload may be a torn tail's damaged length. Read
+                // only within budget; exceptional classification below probes one
+                // more byte to distinguish EOF from an actually oversized source.
+                let bounded_size = size.min(usize::try_from(available).unwrap_or(usize::MAX));
+                frame.resize(bounded_size, 0);
                 let n = read_up_to(&mut file, &mut frame[header.len()..])?;
                 frame.truncate(header.len() + n);
                 scan.bytes_read += n as u64;
@@ -1965,6 +1968,85 @@ mod tests {
         assert!(
             !framing.contains(concat!("fn verified_prefix_", "features(")),
             "feature checks belong to the decoder, not a second pass over verified records"
+        );
+    }
+
+    #[test]
+    fn near_cap_torn_headers_recover_before_budget_refusal() {
+        fn open_with_cap(path: &Path, cap: u64) -> Result<FileWal, WalError> {
+            struct RestoreCap(u64);
+            impl Drop for RestoreCap {
+                fn drop(&mut self) {
+                    OPEN_READ_CAP.with(|cap| cap.set(self.0));
+                }
+            }
+            let _restore = RestoreCap(OPEN_READ_CAP.with(|limit| limit.replace(cap)));
+            FileWal::open(path)
+        }
+        fn verified_prefix(tag: &str) -> (PathBuf, Vec<u8>) {
+            let path = tmp(tag);
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append(7, &WalRecord::StepStarted { step_id: StepId(1) }, true)
+                .unwrap();
+            drop(wal);
+            let prefix = std::fs::read(&path).unwrap();
+            (path, prefix)
+        }
+        let next = WalRecord::StepStarted { step_id: StepId(2) };
+        let intact_frame = encode(2, 7, &next).unwrap();
+        let mut header = intact_frame[..crate::framing::HEADER_LEN].to_vec();
+        header[..4].copy_from_slice(&4096u32.to_le_bytes());
+        for slack in [0, 7] {
+            let (path, prefix) = verified_prefix(&format!("near-cap-torn-{slack}"));
+            let mut damaged = prefix.clone();
+            damaged.extend_from_slice(&header);
+            std::fs::write(&path, &damaged).unwrap();
+            let cap = damaged.len() as u64 + slack;
+            assert_eq!(replay_file(&path, cap).unwrap().len(), 1);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                damaged,
+                "readers never trim the tail"
+            );
+            let mut recovered = open_with_cap(&path, cap)
+                .expect("EOF within the cap is a recoverable torn tail, not an oversized WAL");
+            assert_eq!(recovered.last_seq(), 1);
+            assert_eq!(std::fs::read(&path).unwrap(), prefix);
+            assert_eq!(recovered.append(7, &next, true).unwrap(), 2);
+            drop(recovered);
+            assert_eq!(FileWal::open(&path).unwrap().replay().unwrap().len(), 2);
+        }
+
+        let (path, prefix) = verified_prefix("near-cap-intact-control");
+        let mut intact = prefix.clone();
+        intact.extend_from_slice(&intact_frame);
+        std::fs::write(&path, &intact).unwrap();
+        let cap = prefix.len() as u64 + crate::framing::HEADER_LEN as u64 + 1;
+        assert!(matches!(
+            scan_prefix(std::io::Cursor::new(&intact), cap, |_| None::<()>),
+            Err(WalError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            open_with_cap(&path, cap),
+            Err(WalError::TooLarge { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), intact);
+
+        let mut non_tail = prefix;
+        non_tail.extend_from_slice(&header);
+        non_tail.extend_from_slice(&intact_frame);
+        std::fs::write(&path, &non_tail).unwrap();
+        assert!(matches!(
+            open_with_cap(&path, non_tail.len() as u64),
+            Err(WalError::Corrupt {
+                source: FrameError::NonTailIncompleteFrame,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            non_tail,
+            "intact later data forbids tail repair"
         );
     }
 

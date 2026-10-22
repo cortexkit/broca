@@ -20136,3 +20136,17 @@ expect_red = ["session_refs::tests::overlapping_census_late_unreadable_cannot_un
 file = "crates/broca-store/src/session_refs/census.rs"
 old = "INSERT OR IGNORE INTO agent_data_census_done VALUES(1)"
 new = "INSERT INTO agent_data_census_done VALUES(1) /* NON-VACUITY BREAK: reject an overlapping completion */"
+
+[[control]]
+id = "wal-near-cap-torn-tail-before-size-refusal"
+guards = "Recovery classifies EOF within the byte cap as a torn tail before trusting a damaged declared payload length"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::near_cap_torn_headers_recover_before_budget_refusal"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "                let size = header.len() + len as usize;"
+new = '''                let size = header.len() + len as usize;
+                if size as u64 > available { return Err(WalError::TooLarge { max_bytes, file_size: offset + size as u64 }); } // NON-VACUITY BREAK: trust a torn header's declared length.'''
