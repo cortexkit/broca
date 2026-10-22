@@ -3017,7 +3017,16 @@ async fn unknown_scope_principal_payload_never_reaches_retention_and_expires_uns
     use broca_store::retention_withdrawals::RetentionQuestionId;
     for unknown_owner in [true, false] {
         let rig = Rig::new();
+        // Freeze the clock: the question expires 3 s after `now`, and a slow runner can spend
+        // longer than that between seeding it and asking for withdrawals, which made the
+        // "not yet expired" step below race real time.
         let now = rig.service.clock.now_ms();
+        fs::write(
+            rig.root.join("test-clock"),
+            format!(r#"{{"now_ms":{now}}}"#),
+        )
+        .unwrap();
+        rig.service.clock.refresh().unwrap();
         let unknown = serde_json::json!({"kind":"future_principal", "payload":MARKER});
         let mut scope = serde_json::json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"head","scope_epoch":1});
         if unknown_owner {
@@ -3056,7 +3065,11 @@ async fn unknown_scope_principal_payload_never_reaches_retention_and_expires_uns
         ));
         assert!(!rig.service.withdraw_retained_questions().await.unwrap());
         assert!(questions.withdrawals.lock().unwrap().is_empty());
-        fs::write(rig.root.join("test-clock"), br#"{"offset_ms":4000}"#).unwrap();
+        fs::write(
+            rig.root.join("test-clock"),
+            format!(r#"{{"now_ms":{}}}"#, now + 4000),
+        )
+        .unwrap();
         rig.service.clock.refresh().unwrap();
         assert!(rig.service.withdraw_retained_questions().await.unwrap());
         assert!(rig.service.withdraw_retained_questions().await.unwrap());

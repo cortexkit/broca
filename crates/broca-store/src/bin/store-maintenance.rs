@@ -408,7 +408,15 @@ fn open_maintenance_store(
     liveness: WriterLiveness,
 ) -> Result<SqliteStore, ExitCode> {
     if !read_only && liveness.state != "no" {
-        eprintln!("store-maintenance: liveness {}; refusing offline mutation of {}: {}. Stop the daemon first.", liveness.state, state_root.display(), liveness.reason);
+        // This wording is the shared liveness contract (scripts/lib/liveness.py prints the same
+        // line for the Python tools, and both suites match its prefix), so the state root goes
+        // after the reason rather than inside the fixed phrase.
+        eprintln!(
+            "store-maintenance: liveness {}; refusing offline mutation: {} (state root {}). Stop the daemon first.",
+            liveness.state,
+            liveness.reason,
+            state_root.display()
+        );
         return Err(ExitCode::from(3));
     }
     let database = state_root.join("run-index.db");
