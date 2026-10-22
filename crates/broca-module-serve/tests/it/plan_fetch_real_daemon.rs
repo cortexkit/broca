@@ -57,6 +57,7 @@ struct Seen {
     binds: Vec<Option<std::collections::BTreeMap<String, String>>>,
     ops: Vec<String>,
     catalogs: Vec<Value>,
+    refuse_catalog: bool,
 }
 
 /// A provider serving the v1 catalog for module `id`, answering from the request's composition.
@@ -135,11 +136,18 @@ impl subc_client_rs::ModuleHandler for StandIn {
         self.seen.lock().unwrap().ops.push(op.clone());
         let answer = match op.as_str() {
             "tool.catalog" => {
-                self.seen
-                    .lock()
-                    .unwrap()
-                    .catalogs
-                    .push(request["arguments"].clone());
+                let refuse_catalog = {
+                    let mut seen = self.seen.lock().unwrap();
+                    seen.catalogs.push(request["arguments"].clone());
+                    seen.refuse_catalog
+                };
+                if self.id == "aft" && refuse_catalog {
+                    return subc_client_rs::HandlerOutcome::ErrorWithDetail {
+                        code: "invalid_request".into(),
+                        message: "AFT refused the system text\u{1b} preset".into(),
+                        detail: json!({"field": "system_text.\u{1b}preset"}),
+                    };
+                }
                 if self.id == "plexus" {
                     return subc_client_rs::HandlerOutcome::Error {
                         code: "catalog_refused".into(),
@@ -345,11 +353,57 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
 
     // The real daemon fetcher is installed on the session registry, so admission, WAL
     // freezing, model rendering and restart all exercise the same manifest.
-    use crate::delivery_rig::{result, Rig, Step};
+    use crate::delivery_rig::{golden_path, result, Rig, Step};
     let mut rig = Rig::start("optional-tool-real-daemon").await;
     rig.registry().set_plan_admitter(admitter);
     rig.script.push(&[Step::Text("admitted")]);
     rig.bind(7).await;
+
+    // The real module refusal carries provider text and a field through subc and the serve reply.
+    let mut refused_plan = vector("plans/broca-head-no-compaction.json");
+    refused_plan["system_text_items"][0]["params"]["model"] =
+        json!({"provider": "fake", "id": "fake"});
+    seen["aft"].lock().unwrap().refuse_catalog = true;
+    let before_refusal = rig.wal_bytes();
+    let refused = rig
+        .request(
+            7,
+            json!({"method":"session.send", "params":{
+                "send_id":"provider-refusal", "prompt":"hi",
+                "model":{"provider":"fake","model":"fake"}, "plan":refused_plan
+            }}),
+        )
+        .await;
+    assert_eq!(refused.header.ty, subc_protocol::FrameType::Error);
+    let refusal_body: Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(refusal_body["code"], "fetch_unavailable");
+    assert_eq!(
+        refusal_body["message"],
+        "provider aft refused the fetch: invalid_request"
+    );
+    assert_eq!(
+        refusal_body["detail"],
+        json!({
+            "provider": "aft",
+            "reason": "refused",
+            "provider_code": "invalid_request",
+            "op": "tool.catalog",
+            "message": "AFT refused the system text preset",
+            "field": "system_text.preset",
+            "retryable": false,
+        })
+    );
+    assert_eq!(rig.wal_bytes(), before_refusal);
+    let golden = golden_path("send_refused.fetch_unavailable_provider_detail.json");
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&golden, &refused.body).unwrap();
+    }
+    assert_eq!(
+        refused.body,
+        std::fs::read(&golden).expect("real serve refusal golden")
+    );
+    seen["aft"].lock().unwrap().refuse_catalog = false;
+
     // This rig binds an unscoped route, and a `worker` tool preset is admitted only over a
     // scoped one (a scope the real daemon must also hold live). Ask for a non-confining preset;
     // the composition, and so its digest, does not carry the tool items' presets.

@@ -2257,7 +2257,7 @@ async fn real_daemon_reports_an_unreadable_compaction_describe_as_fetch_unavaila
     error_body(&frame);
     assert_eq!(
         String::from_utf8(frame.body).unwrap(),
-        r#"{"code":"fetch_unavailable","message":"provider admission-compaction refused the fetch: invalid_answer","detail":{"provider":"admission-compaction","provider_code":"invalid_answer","reason":"refused"}}"#
+        r#"{"code":"fetch_unavailable","message":"provider admission-compaction refused the fetch: invalid_answer","detail":{"op":"role.describe","provider":"admission-compaction","provider_code":"invalid_answer","reason":"refused","retryable":false}}"#
     );
     real.assert_refused_before_writing();
     real.assert_compaction_routes_only();
@@ -2281,7 +2281,7 @@ async fn real_daemon_reports_a_transient_compaction_describe_as_fetch_unavailabl
     error_body(&frame);
     assert_eq!(
         String::from_utf8(frame.body).unwrap(),
-        r#"{"code":"fetch_unavailable","message":"provider admission-compaction refused the fetch: transient","detail":{"provider":"admission-compaction","provider_code":"transient","reason":"refused"}}"#
+        r#"{"code":"fetch_unavailable","message":"provider admission-compaction refused the fetch: transient","detail":{"message":"scripted describe refusal","op":"role.describe","provider":"admission-compaction","provider_code":"transient","reason":"refused","retryable":true}}"#
     );
     assert!(
         real.methods().len() > 1,

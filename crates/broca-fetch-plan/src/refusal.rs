@@ -104,6 +104,8 @@ pub enum Refusal {
     FetchUnavailable {
         provider: String,
         unanswered: Unanswered,
+        /// Safe provider response metadata, kept separate from the fetch reason.
+        provider_detail: Option<Value>,
     },
     /// What the providers answer no longer matches the plan; each difference is internally
     /// tagged with `kind`.
@@ -178,7 +180,17 @@ impl Refusal {
             Self::FetchUnavailable {
                 provider,
                 unanswered,
-            } => unanswered.detail(provider),
+                provider_detail,
+            } => {
+                let mut detail = unanswered.detail(provider);
+                if let (Some(detail), Some(provider_detail)) = (
+                    detail.as_object_mut(),
+                    provider_detail.as_ref().and_then(Value::as_object),
+                ) {
+                    detail.extend(provider_detail.clone());
+                }
+                detail
+            }
             Self::PlanStale { differences } => json!({"differences": differences}),
             Self::ToolNameCollision { name, providers } => {
                 serde_json::to_value(ToolNameCollisionDetail {
@@ -219,6 +231,7 @@ impl Refusal {
             Self::FetchUnavailable {
                 provider,
                 unanswered,
+                ..
             } => match unanswered.provider_code() {
                 Some(code) => format!("provider {provider} refused the fetch: {code}"),
                 None => format!(

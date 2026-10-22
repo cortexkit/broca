@@ -26,21 +26,23 @@ use tokio::time::Instant;
 use crate::plan::{sha256_hex, Item, Plan};
 use crate::refusal::{Refusal, Unanswered};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FetchMiss {
     unanswered: Unanswered,
     retryable: Option<bool>,
     detail: Option<FetchMissDetail>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum FetchMissDetail {
     InvalidAnswer {
         serde_error_kind: Option<&'static str>,
     },
     ProviderRefusal {
         message: Option<String>,
+        message_truncated: bool,
         field: Option<String>,
+        field_truncated: bool,
     },
     ItemDigestMismatch {
         item_digest: String,
@@ -59,22 +61,83 @@ impl FetchMiss {
         };
         let detail = match &error {
             FetchError::ProviderRefused {
-                message, detail, ..
-            } => Some(FetchMissDetail::ProviderRefusal {
-                message: Some(bounded_diagnostic_text(message)),
-                field: detail
-                    .as_ref()
-                    .and_then(|detail| detail.get("field"))
-                    .and_then(Value::as_str)
-                    .map(bounded_diagnostic_text),
-            }),
-            FetchError::Refused { .. } => None,
+                message,
+                message_truncated,
+                detail,
+                ..
+            } => {
+                let (field, field_truncated) = provider_field(detail.as_ref());
+                Some(FetchMissDetail::ProviderRefusal {
+                    message: Some(message.clone()),
+                    message_truncated: *message_truncated,
+                    field,
+                    field_truncated,
+                })
+            }
+            FetchError::Refused { detail, .. } => {
+                let (field, field_truncated) = provider_field(detail.as_ref());
+                field.map(|field| FetchMissDetail::ProviderRefusal {
+                    message: None,
+                    message_truncated: false,
+                    field: Some(field),
+                    field_truncated,
+                })
+            }
             FetchError::UnknownModule | FetchError::Lost(_) => None,
         };
         Self {
             unanswered: unanswered(error),
             retryable,
             detail,
+        }
+    }
+
+    fn provider_detail(&self, op: &str) -> Option<Value> {
+        // Provider detail can echo catalog requests or prompts, so copy only the bounded fields
+        // that explain the refusal rather than serializing the provider's whole detail object.
+        let mut detail = json!({"op": op, "retryable": self.retryable.unwrap_or(false)});
+        match &self.detail {
+            Some(FetchMissDetail::ProviderRefusal {
+                message,
+                message_truncated,
+                field,
+                field_truncated,
+            }) => {
+                if let Unanswered::Refused { code } = &self.unanswered {
+                    let (code, truncated) = bounded_diagnostic_text_with_truncation(code);
+                    detail["provider_code"] = json!(code);
+                    if truncated {
+                        detail["provider_code_truncated"] = json!(true);
+                    }
+                }
+                if let Some(message) = message {
+                    detail["message"] = json!(message);
+                    if *message_truncated {
+                        detail["message_truncated"] = json!(true);
+                    }
+                }
+                if let Some(field) = field {
+                    detail["field"] = json!(field);
+                    if *field_truncated {
+                        detail["field_truncated"] = json!(true);
+                    }
+                }
+                Some(detail)
+            }
+            Some(FetchMissDetail::InvalidAnswer { serde_error_kind }) => {
+                if let Unanswered::Refused { code } = &self.unanswered {
+                    let (code, truncated) = bounded_diagnostic_text_with_truncation(code);
+                    detail["provider_code"] = json!(code);
+                    if truncated {
+                        detail["provider_code_truncated"] = json!(true);
+                    }
+                }
+                if let Some(kind) = serde_error_kind {
+                    detail["serde_error_kind"] = json!(kind);
+                }
+                Some(detail)
+            }
+            _ => None,
         }
     }
 
@@ -182,7 +245,7 @@ impl FetchMiss {
             ),
             (
                 Unanswered::Refused { code },
-                Some(FetchMissDetail::ProviderRefusal { message, field }),
+                Some(FetchMissDetail::ProviderRefusal { message, field, .. }),
             ) if op == CATALOG_OP => tracing::warn!(
                 target: "admission",
                 "unanswered provider fetch session={} plan_identity={} provider={} op={} code=refused provider_code={} retryable={} refusal_message={:?} refusal_field={:?}",
@@ -219,11 +282,29 @@ impl FetchMiss {
 const MAX_PROVIDER_DIAGNOSTIC_BYTES: usize = 512;
 
 fn bounded_diagnostic_text(value: &str) -> String {
-    let mut end = value.len().min(MAX_PROVIDER_DIAGNOSTIC_BYTES);
-    while !value.is_char_boundary(end) {
-        end -= 1;
+    bounded_diagnostic_text_with_truncation(value).0
+}
+
+fn bounded_diagnostic_text_with_truncation(value: &str) -> (String, bool) {
+    let mut bounded = String::with_capacity(value.len().min(MAX_PROVIDER_DIAGNOSTIC_BYTES));
+    for character in value.chars().filter(|character| !character.is_control()) {
+        if bounded.len() + character.len_utf8() > MAX_PROVIDER_DIAGNOSTIC_BYTES {
+            return (bounded, true);
+        }
+        bounded.push(character);
     }
-    value[..end].to_owned()
+    (bounded, false)
+}
+
+fn provider_field(detail: Option<&Value>) -> (Option<String>, bool) {
+    let Some(field) = detail
+        .and_then(|detail| detail.get("field"))
+        .and_then(Value::as_str)
+    else {
+        return (None, false);
+    };
+    let (field, truncated) = bounded_diagnostic_text_with_truncation(field);
+    (Some(field), truncated)
 }
 
 #[derive(Debug)]
@@ -282,11 +363,12 @@ pub enum FetchError {
         detail: Option<Value>,
         retryable: bool,
     },
-    /// A tool provider refusal whose human-readable explanation is retained for diagnostics.
+    /// A provider refusal whose bounded human-readable explanation is retained for callers.
     ProviderRefused {
         code: String,
         detail: Option<Value>,
         message: String,
+        message_truncated: bool,
         retryable: bool,
     },
     /// The call was lost in transport; retried until the deadline.
@@ -294,17 +376,29 @@ pub enum FetchError {
 }
 
 impl FetchError {
-    /// Build a provider refusal with a diagnostic message capped at 512 UTF-8 bytes.
+    fn refused_field(&self) -> Option<&str> {
+        match self {
+            Self::Refused { code, detail, .. } | Self::ProviderRefused { code, detail, .. } => {
+                cortexkit_role_step_transform_provider::errors::refused_field(code, detail.as_ref())
+            }
+            Self::UnknownModule | Self::Lost(_) => None,
+        }
+    }
+
+    /// Build a provider refusal after removing control characters from the diagnostic text and
+    /// limiting it to 512 UTF-8 bytes.
     pub fn provider_refused(
         code: String,
         detail: Option<Value>,
         message: &str,
         retryable: bool,
     ) -> Self {
+        let (message, message_truncated) = bounded_diagnostic_text_with_truncation(message);
         Self::ProviderRefused {
             code,
             detail,
-            message: bounded_diagnostic_text(message),
+            message,
+            message_truncated,
             retryable,
         }
     }
@@ -834,22 +928,9 @@ pub async fn admit(
                         serde_error_kind(&error),
                     ))),
                 },
-                // The provider no longer knows the item's preset: the plan is stale.
-                Err(FetchError::Refused {
-                    code,
-                    detail,
-                    retryable,
-                }) if cortexkit_role_step_transform_provider::errors::refused_field(
-                    &code,
-                    detail.as_ref(),
-                ) == Some("preset") =>
-                {
-                    let miss = FetchMiss::from_error(FetchError::Refused {
-                        code,
-                        detail,
-                        retryable,
-                    });
-                    DeclarationOutcome::RefusedPreset(miss)
+                // A provider that no longer knows the item's preset makes the plan stale.
+                Err(error) if error.refused_field() == Some("preset") => {
+                    DeclarationOutcome::RefusedPreset(FetchMiss::from_error(error))
                 }
                 Err(error) => DeclarationOutcome::Unanswered(FetchMiss::from_error(error)),
             }
@@ -1044,13 +1125,13 @@ pub async fn admit(
     }
 
     // A required item that did not answer refuses admission; an optional one is absent.
-    let mut failures: BTreeMap<&str, Unanswered> = BTreeMap::new();
+    let mut failures: BTreeMap<&str, (FetchMiss, &'static str)> = BTreeMap::new();
     for fetch in &catalog_fetches {
         if let Err(missed) = &outcomes[fetch.provider] {
             if !fetch.optional() {
                 failures
                     .entry(fetch.provider)
-                    .or_insert_with(|| missed.unanswered.clone());
+                    .or_insert_with(|| (missed.clone(), CATALOG_OP));
             }
         }
     }
@@ -1058,18 +1139,19 @@ pub async fn admit(
         if let DeclarationOutcome::Unanswered(missed) = outcome {
             failures
                 .entry(&step.item.provider)
-                .or_insert_with(|| missed.unanswered.clone());
+                .or_insert_with(|| (missed.clone(), DECLARE_OP));
         }
     }
     if let (Some(provider), Some(Err(missed))) = (compaction_provider, &compaction) {
         failures
             .entry(provider)
-            .or_insert_with(|| missed.unanswered.clone());
+            .or_insert_with(|| (missed.clone(), DESCRIBE_OP));
     }
-    if let Some((provider, unanswered)) = failures.into_iter().next() {
+    if let Some((provider, (missed, op))) = failures.into_iter().next() {
         return Err(Refusal::FetchUnavailable {
             provider: provider.to_owned(),
-            unanswered,
+            unanswered: missed.unanswered.clone(),
+            provider_detail: missed.provider_detail(op),
         });
     }
 
@@ -1462,6 +1544,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declaration_provider_refusal_reaches_fetch_unavailable_detail() {
+        let plan = plan_with_declaration("magic-context");
+        let fetcher = ScriptedFetcher {
+            catalog_result: Ok(Value::Null),
+            declaration_result: Err(FetchError::provider_refused(
+                "invalid_request".into(),
+                Some(json!({"field": "step_transform_items[0].preset"})),
+                "the declaration preset is not available",
+                false,
+            )),
+        };
+        let refusal = admit(
+            &plan,
+            &fetcher,
+            &broca_protocol::BindIdentity::new("/tmp/log-test", "runner", "declare-refusal"),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("the provider refusal prevents admission");
+
+        assert_eq!(refusal.code(), "fetch_unavailable");
+        assert_eq!(
+            refusal.message(),
+            "provider magic-context refused the fetch: invalid_request"
+        );
+        assert_eq!(
+            refusal.detail(),
+            json!({
+                "provider": "magic-context",
+                "reason": "refused",
+                "provider_code": "invalid_request",
+                "op": DECLARE_OP,
+                "message": "the declaration preset is not available",
+                "field": "step_transform_items[0].preset",
+                "retryable": false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_refused_declared_preset_stays_plan_stale() {
+        let plan = plan_with_declaration("magic-context");
+        let fetcher = ScriptedFetcher {
+            catalog_result: Ok(Value::Null),
+            declaration_result: Err(FetchError::provider_refused(
+                "invalid_params".into(),
+                Some(json!({"field": "preset"})),
+                "the declaration preset is no longer available",
+                false,
+            )),
+        };
+        let refusal = admit(
+            &plan,
+            &fetcher,
+            &broca_protocol::BindIdentity::new("/tmp/log-test", "runner", "preset-stale"),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("the provider no longer knows the planned preset");
+
+        assert_eq!(refusal.code(), "plan_stale");
+        assert_eq!(
+            refusal.detail(),
+            json!({"differences":[{
+                "kind":"preset_missing",
+                "provider":"magic-context",
+                "preset":"worker"
+            }]})
+        );
+    }
+
+    #[tokio::test]
     async fn declaration_request_preserves_pre_bump_json_bytes() {
         struct Capture {
             requests: Mutex<Vec<Vec<u8>>>,
@@ -1652,6 +1806,45 @@ mod tests {
         assert!(invalid.contains("serde_error_kind=data"));
 
         assert!(lines.iter().all(|line| !line.contains(TEXT_MARKER)));
+    }
+
+    #[test]
+    fn provider_refusal_wire_detail_is_bounded_and_control_free() {
+        let message = format!("{}\u{1b}x", "é".repeat(257));
+        let field = format!("system_text.{}\u{0}", "f".repeat(600));
+        let miss = FetchMiss::from_error(FetchError::provider_refused(
+            "invalid_request".into(),
+            Some(json!({"field": field})),
+            &message,
+            false,
+        ));
+
+        assert_eq!(
+            miss.provider_detail(CATALOG_OP),
+            Some(json!({
+                "op": "tool.catalog",
+                "provider_code": "invalid_request",
+                "retryable": false,
+                "message": "é".repeat(256),
+                "message_truncated": true,
+                "field": format!("system_text.{}", "f".repeat(500)),
+                "field_truncated": true,
+            }))
+        );
+    }
+
+    #[test]
+    fn invalid_answer_diagnostic_reaches_wire_detail() {
+        let miss = FetchMiss::invalid_answer(Some("invalid_type"));
+        assert_eq!(
+            miss.provider_detail(DECLARE_OP),
+            Some(json!({
+                "op": DECLARE_OP,
+                "provider_code": INVALID_ANSWER,
+                "retryable": false,
+                "serde_error_kind": "invalid_type",
+            }))
+        );
     }
 
     #[tokio::test]

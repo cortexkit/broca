@@ -1,0 +1,1 @@
+{"code":"fetch_unavailable","message":"provider aft refused the fetch: invalid_request","detail":{"field":"system_text.preset","message":"AFT refused the system text preset","op":"tool.catalog","provider":"aft","provider_code":"invalid_request","reason":"refused","retryable":false}}

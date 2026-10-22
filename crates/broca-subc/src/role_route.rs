@@ -89,7 +89,11 @@ impl RoleRoute {
                 if retry_transient
                     && !retried
                     && matches!(
-                        &result, Err(FetchError::Refused { code, .. }) if code == "transient"
+                        &result,
+                        Err(
+                            FetchError::Refused { code, .. }
+                            | FetchError::ProviderRefused { code, .. }
+                        ) if code == "transient"
                     )
                 {
                     retried = true;
@@ -231,20 +235,20 @@ impl RoleRoute {
 }
 
 fn decode<A: DeserializeOwned>(reply: &[u8]) -> Result<A, FetchError> {
-    serde_json::from_slice(reply).map_err(|_| FetchError::Refused {
-        code: broca_fetch_plan::admit::INVALID_ANSWER.into(),
-        detail: None,
-        retryable: false,
+    serde_json::from_slice(reply).map_err(|error| {
+        FetchError::provider_refused(
+            broca_fetch_plan::admit::INVALID_ANSWER.into(),
+            None,
+            &format!("provider role reply is not valid JSON: {error}"),
+            false,
+        )
     })
 }
 
 /// A role call's refusal; only `transient` is retried.
 fn refused(refusal: subc_protocol::ErrorBody) -> FetchError {
-    FetchError::Refused {
-        retryable: refusal.code == "transient",
-        code: refusal.code,
-        detail: refusal.detail,
-    }
+    let retryable = refusal.code == "transient";
+    FetchError::provider_refused(refusal.code, refusal.detail, &refusal.message, retryable)
 }
 
 struct RouteLease {

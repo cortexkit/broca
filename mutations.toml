@@ -23800,3 +23800,15 @@ old = """    fn retired_tag_floor(&self, session: &BindIdentity) -> Result<u64, 
 """
 new = """    // NON-VACUITY BREAK: the retired-tag floor falls back to the trait default
 """
+
+[[control]]
+id = "fetch-refusal-detail-reaches-serve-reply"
+guards = "A required provider refusal's safe diagnostic fields survive admission and reach the real serve error body"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; BROCA_REQUIRE_SUBC=1 cargo test --locked -p broca-module-serve --test it \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module-serve/tests/it/plan_fetch_real_daemon.rs"
+expect_red = ["plan_fetch_real_daemon::a_plan_is_fetched_through_the_real_daemon_on_v1_routes"]
+file = "crates/broca-fetch-plan/src/refusal.rs"
+old = "detail.extend(provider_detail.clone());"
+new = "let _ = provider_detail; // NON-VACUITY BREAK: drop provider refusal details."
