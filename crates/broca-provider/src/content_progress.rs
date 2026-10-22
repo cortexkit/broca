@@ -27,6 +27,10 @@ pub(crate) struct ContentObserver {
     types: BTreeMap<String, EventTypeTally>,
     non_content_bytes_unknown: bool,
     suffix_bytes_unknown: bool,
+    /// How many payloads arrived as text and were parsed here. A caller that already holds the
+    /// parsed JSON uses `observe_value`, and tests assert it never pays for this second parse.
+    #[cfg(test)]
+    pub(crate) text_payloads_parsed: usize,
 }
 
 fn nonempty(value: Option<&Value>) -> bool {
@@ -168,6 +172,12 @@ impl ContentObserver {
         self.observe_bytes(name, payload, Some(bytes as u64));
     }
 
+    /// `observe` for a payload the caller has already parsed, so the hot path does not
+    /// serialize it back to text only for this observer to parse it again.
+    pub(crate) fn observe_value(&mut self, name: &str, payload: &Value, bytes: usize) {
+        self.record(name, payload, Some(bytes as u64), None);
+    }
+
     pub(crate) fn observe_unmeasured_keepalive(&mut self) {
         self.observe_bytes("keepalive", None, None);
     }
@@ -188,15 +198,23 @@ impl ContentObserver {
         bytes: Option<u64>,
         now_ms: Option<u64>,
     ) {
+        let parsed = match (name, payload) {
+            ("keepalive" | "empty" | "[DONE]", _) | (_, None) => Value::Null,
+            (_, Some(payload)) => {
+                #[cfg(test)]
+                {
+                    self.text_payloads_parsed += 1;
+                }
+                serde_json::from_str::<Value>(payload).unwrap_or(Value::Null)
+            }
+        };
+        self.record(name, &parsed, bytes, now_ms);
+    }
+
+    fn record(&mut self, name: &str, payload: &Value, bytes: Option<u64>, now_ms: Option<u64>) {
         let (content, known) = match name {
             "keepalive" | "empty" | "[DONE]" => (false, true),
-            _ => classify(
-                self.family,
-                name,
-                &payload
-                    .and_then(|p| serde_json::from_str::<Value>(p).ok())
-                    .unwrap_or(Value::Null),
-            ),
+            _ => classify(self.family, name, payload),
         };
         let key = if name.len() <= 128 { name } else { "unknown" };
         let tally = self

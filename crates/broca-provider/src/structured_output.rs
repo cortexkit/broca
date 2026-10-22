@@ -677,6 +677,13 @@ fn walk_references(
 
 // ───────────────────────── rendering ─────────────────────────
 
+#[cfg(test)]
+thread_local! {
+    /// How many requests `prepare` has copied on this thread. Each copy duplicates the whole
+    /// prompt, so tests use this to show one render copies the request at most once.
+    pub(crate) static PREPARED_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The instructions a `final_text` run without a provider-side schema constraint carries in
 /// its system prompt.
 fn instructions(frozen: &FrozenStructuredOutput) -> String {
@@ -702,6 +709,8 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
     match so.mode {
         Mode::SubmitTool => {
             let mut view = opts.clone();
+            #[cfg(test)]
+            PREPARED_COPIES.with(|copies| copies.set(copies.get() + 1));
             let mut tools = Vec::clone(&opts.tools);
             tools.push(Tool {
                 name: SUBMIT_RESULT_TOOL.to_owned(),
@@ -716,6 +725,8 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
         }
         Mode::FinalText if so.delivery == SchemaDelivery::Unconstrained => {
             let mut view = opts.clone();
+            #[cfg(test)]
+            PREPARED_COPIES.with(|copies| copies.set(copies.get() + 1));
             match view.prompt.iter_mut().find(|m| m.role == Role::System) {
                 Some(system) => {
                     let text = if so.instructions_paragraph_break {
