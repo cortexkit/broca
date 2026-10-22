@@ -4524,6 +4524,9 @@ where
                 &provider.render_config_blob(),
                 originals.as_mut(),
             );
+            if let Some(originals) = originals.as_mut() {
+                originals.index_origins(&opts.prompt);
+            }
             let raw = crate::compaction::StoredTranscript::new(&opts.prompt, originals.as_ref());
             let state = compaction_state.as_mut().expect("Setup is durable");
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);

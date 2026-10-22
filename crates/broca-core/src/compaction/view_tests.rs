@@ -94,14 +94,21 @@ fn ordinal_ranges_bound_the_work_to_the_requested_window() {
 
 #[test]
 fn view_validation_encodes_only_requested_entries_and_possible_signed_copies() {
-    let prompt = stamped(vec![text(Role::User, "hidden"); 10_000]);
+    let mut prompt = stamped(vec![text(Role::User, "hidden"); 10_000]);
+    prompt[1] = assistant(vec![ContentBlock::Text {
+        text: "model output".into(),
+    }]);
+    prompt[1].ordinal = Some(1);
     let (view, ready) = make_view(
         2,
         9_998,
         vec![ViewRange::replace(
             0,
             9_999,
-            replace_bytes(&[text(Role::User, "summary")]),
+            replace_bytes(&[
+                text(Role::User, "summary"),
+                text(Role::Assistant, "short answer"),
+            ]),
         )],
     );
     let (decision, encodings) = crate::compaction::carried_encoding_tests::measure(|| {
@@ -117,8 +124,8 @@ fn view_validation_encodes_only_requested_entries_and_possible_signed_copies() {
     });
     assert!(matches!(decision, Decision::Apply(_)), "{decision:?}");
     assert_eq!(
-        encodings, 2,
-        "only the coverage anchor and the replacement need encoding"
+        encodings, 3,
+        "only the coverage anchor and the replacements need encoding"
     );
 }
 
@@ -220,6 +227,77 @@ fn sparse_originals_preserve_signed_authorship_and_notice_digests() {
     let expected = next_notice(&state, &raw, facts()).unwrap();
     let actual = notice_through(&state, stored.newest().unwrap(), facts()).unwrap();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn indexed_plain_summary_does_not_walk_the_replaced_transcript() {
+    let mut prompt = stamped(vec![text(Role::User, "hidden"); 150_000]);
+    prompt[1] = assistant(vec![ContentBlock::Text {
+        text: "model output".into(),
+    }]);
+    prompt[1].ordinal = Some(1);
+    let mut originals = crate::compaction::OriginalMessages::default();
+    originals.index_origins(&prompt);
+    let stored = crate::compaction::StoredTranscript::new(&prompt, Some(&originals));
+    let (view, ready) = make_view(
+        2,
+        149_998,
+        vec![ViewRange::replace(
+            0,
+            149_999,
+            replace_bytes(&[text(Role::User, "summary")]),
+        )],
+    );
+    let (decision, visits) = crate::compaction::stored::measure_range_visits(|| {
+        decide_stored_at(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &prompt,
+            stored,
+            false,
+            false,
+        )
+    });
+    assert!(matches!(decision, Decision::Apply(_)));
+    assert_eq!(
+        visits, 0,
+        "a user summary cannot copy an origin that no user message has"
+    );
+}
+
+#[test]
+fn indexed_origins_still_refuse_a_user_copy_with_its_model_origin_removed() {
+    let mut prompt = stamped(vec![
+        text(Role::User, "model-owned input"),
+        text(Role::User, "tail"),
+    ]);
+    prompt[0].origin = Some(broca_protocol::ModelHandle::new("provider", "model"));
+    let mut originals = crate::compaction::OriginalMessages::default();
+    originals.index_origins(&prompt[..1]);
+    originals.index_origins(&prompt);
+    let stored = crate::compaction::StoredTranscript::new(&prompt, Some(&originals));
+    let mut stripped = prompt[0].clone();
+    stripped.origin = None;
+    let (view, ready) = make_view(
+        2,
+        0,
+        vec![ViewRange::replace(0, 1, replace_bytes(&[stripped]))],
+    );
+    assert_eq!(
+        decide_stored_at(
+            &view,
+            &ready,
+            &after_setup(),
+            LINEAGE,
+            &prompt,
+            stored,
+            false,
+            false
+        ),
+        Decision::Rejected(ViewProblem::ReplacementNotArray)
+    );
 }
 
 #[test]

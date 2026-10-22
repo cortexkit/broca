@@ -24214,8 +24214,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/view_tests.rs"
 expect_red = ["compaction::view::tests::view_validation_encodes_only_requested_entries_and_possible_signed_copies"]
 file = "crates/broca-core/src/compaction/view.rs"
-old = "candidates.iter().any(|candidate| {"
-new = "true || candidates.iter().any(|candidate| { // NON-VACUITY BREAK: clone all replaced messages"
+old = ".filter(|original| {\n                            candidates.iter().any(|candidate| {"
+new = ".filter(|original| {\n                            true || candidates.iter().any(|candidate| { // NON-VACUITY BREAK: clone all replaced messages"
 
 [[control]]
 id = "compaction-view-origin-removal-is-not-authorship"
@@ -24298,8 +24298,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/stored.rs"
 expect_red = ["compaction::stored::unchanged_messages_are_borrowed_and_only_changed_bytes_are_retained"]
 file = "crates/broca-core/src/compaction/stored.rs"
-old = "self.0.entry(index).or_insert(original);"
-new = "self.0.insert(index, original); // NON-VACUITY BREAK: replace raw bytes with decorated bytes"
+old = "self.messages.entry(index).or_insert(original);"
+new = "self.messages.insert(index, original); // NON-VACUITY BREAK: replace raw bytes with decorated bytes"
 
 [[control]]
 id = "compaction-sparse-originals-judge-and-digest-stored-bytes"
@@ -24310,5 +24310,29 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/view_tests.rs"
 expect_red = ["compaction::view::tests::sparse_originals_preserve_signed_authorship_and_notice_digests"]
 file = "crates/broca-core/src/compaction/stored.rs"
-old = "self.originals?.0.get"
-new = "(None::<&OriginalMessages>)?.0.get /* NON-VACUITY BREAK: ignore original bytes */"
+old = "self.originals?.messages.get"
+new = "(None::<&OriginalMessages>)?.messages.get /* NON-VACUITY BREAK: ignore original bytes */"
+
+[[control]]
+id = "compaction-plain-summary-skips-impossible-origin-copies"
+guards = "a plain summary of a role with no model origins never walks the replaced transcript to search for copies"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::indexed_plain_summary_does_not_walk_the_replaced_transcript"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "if !candidates.iter().any(|candidate| {"
+new = "if false && !candidates.iter().any(|candidate| { // NON-VACUITY BREAK: walk every replaced message"
+
+[[control]]
+id = "compaction-origin-role-index-keeps-authorship-fence"
+guards = "the constant-size origin-role index cannot turn a model-origin user message into provider-authored content by removing its origin"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::indexed_origins_still_refuse_a_user_copy_with_its_model_origin_removed"]
+file = "crates/broca-core/src/compaction/stored.rs"
+old = "Some(originals) => originals.origin_roles[role_index(role)],"
+new = "Some(originals) => { let _ = originals; false }, // NON-VACUITY BREAK: erase origins from the role index"

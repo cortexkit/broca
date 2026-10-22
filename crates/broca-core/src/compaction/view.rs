@@ -182,6 +182,13 @@ fn assemble_judged(
                     .map_err(|_| AssemblyProblem::Rejected(ViewProblem::ReplacementNotArray))?;
                 let candidates: Vec<_> = values.iter().filter_map(native_schema_message).collect();
                 let carried: Option<Vec<Message>> = stored.map(|stored| {
+                    if !candidates.iter().any(|candidate| {
+                        candidate.origin.is_some()
+                            || candidate.content.iter().any(super::is_signed)
+                            || stored.has_model_origin(candidate.role)
+                    }) {
+                        return Vec::new();
+                    }
                     stored
                         .range(*from, *to)
                         // A different role or content cannot be an unchanged signed copy, nor
