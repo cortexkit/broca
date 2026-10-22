@@ -23837,7 +23837,7 @@ old = '''        ("User-Agent".into(), user_agent()),
         ("x-opencode-client".into(), "pi".into()),
         ("x-opencode-session".into(), session_id.clone()),'''
 new = '''        ("User-Agent".into(), user_agent()),
-        ("x-opencode-client".into(), "pi".into()),'''
+        ("x-opencode-client".into(), "pi".into()), // NON-VACUITY BREAK: intentionally omit the required Go session header so the request test must fail.'''
 
 [[control]]
 id = "opencode-go-client-header"
@@ -23853,7 +23853,7 @@ file = "crates/broca-provider/src/opencode_go.rs"
 old = '''        ("User-Agent".into(), user_agent()),
         ("x-opencode-client".into(), "pi".into()),
         ("x-opencode-session".into(), session_id.clone()),'''
-new = '''        ("User-Agent".into(), user_agent()),
+new = '''        ("User-Agent".into(), user_agent()), // NON-VACUITY BREAK: omit client attribution to prove the header test catches it.
         ("x-opencode-session".into(), session_id.clone()),'''
 
 [[control]]
@@ -23866,11 +23866,14 @@ select = "expected"
 test_file = "crates/broca-catalog/src/lib.rs"
 expect_red = ["tests::opencode_go_models_use_their_pinned_pi_protocol_and_endpoint"]
 expect_message = "gpt-6-luna protocol pin"
-file = "crates/broca-catalog/data/overlay.json"
-old = '''        "gpt-6-luna": {
-          "wire_family": "openai_responses"
-        },'''
-new = '''        "gpt-6-luna": {},'''
+file = "crates/broca-catalog/src/lib.rs"
+old = '''        let model_family = model_entry
+            .get("wire_family")
+            .and_then(parse_family)
+            .unwrap_or(provider_family);
+'''
+new = '''        let model_family = provider_family; // NON-VACUITY BREAK: ignore the pinned model family so the catalog test must fail.
+'''
 
 
 [[control]]

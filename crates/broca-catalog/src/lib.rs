@@ -1370,12 +1370,47 @@ mod tests {
                 "https://opencode.ai/inference/go/v1",
             ),
             (
+                "grok-4.6",
+                WireFamilyId::OpenAiResponses,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
                 "grok-4.7",
                 WireFamilyId::OpenAiResponses,
                 "https://opencode.ai/inference/go/v1",
             ),
             (
+                "muse-spark-1.2-contributor",
+                WireFamilyId::OpenAiResponses,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
+                "muse-spark-1.3-contributor",
+                WireFamilyId::OpenAiResponses,
+                "https://opencode.ai/inference/go/v1",
+            ),
+            (
+                "minimax-m2.5",
+                WireFamilyId::AnthropicMessages,
+                "https://opencode.ai/inference/go",
+            ),
+            (
+                "minimax-m2.7",
+                WireFamilyId::AnthropicMessages,
+                "https://opencode.ai/inference/go",
+            ),
+            (
                 "minimax-m3",
+                WireFamilyId::AnthropicMessages,
+                "https://opencode.ai/inference/go",
+            ),
+            (
+                "qwen3.7-plus",
+                WireFamilyId::AnthropicMessages,
+                "https://opencode.ai/inference/go",
+            ),
+            (
+                "qwen3.8-flash",
                 WireFamilyId::AnthropicMessages,
                 "https://opencode.ai/inference/go",
             ),

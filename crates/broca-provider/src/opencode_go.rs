@@ -1,4 +1,4 @@
-use crate::wire::FrozenRenderConfig;
+use crate::wire::{CacheClass, FrozenRenderConfig};
 
 pub(crate) const PI_CLIENT_VERSION: &str = "1.4.0";
 // Update the pinned Node runtime with the Pi version; this Rust process never launches Node.
@@ -16,18 +16,35 @@ pub(crate) fn request_headers(frozen: &FrozenRenderConfig) -> Vec<(String, Strin
     ]
 }
 
-/// OpenAI Responses uses Pi's `openai-nosession` compatibility: it keeps the request id but omits
-/// `session_id` while the OpenCode session header supplies cache affinity.
+/// OpenAI Responses uses Pi's `openai-nosession` compatibility for OpenAI-backed Go models,
+/// assigned by `packages/ai/scripts/generate-models.ts:2252-2255` at upstream commit
+/// `74f46864025c68504cd10c89eeb626b7e3d64cea`. It keeps `x-client-request-id` but omits the
+/// `session_id` header; Go's required `x-opencode-session` remains.
 pub(crate) fn responses_request_headers(frozen: &FrozenRenderConfig) -> Vec<(String, String)> {
     let Some(session_id) = &frozen.opencode_go_session_id else {
         return Vec::new();
     };
-    vec![
+    // The Responses API's cache-affinity id is optional; OpenCode's routing session header is not.
+    // Pi omits `x-client-request-id` for an explicit `none` retention while still sending Go's
+    // `x-opencode-session` header.
+    let cache_class = frozen.cache.as_ref().map(|cache| &cache.class);
+    let send_cache_session_id = !matches!(cache_class, Some(CacheClass::None))
+        && !matches!(
+            cache_class,
+            Some(CacheClass::Hints {
+                retention: Some(retention),
+                ..
+            }) if retention == "none"
+        );
+    let mut headers = vec![
         ("User-Agent".into(), user_agent()),
         ("x-opencode-client".into(), "pi".into()),
-        ("x-client-request-id".into(), session_id.clone()),
-        ("x-opencode-session".into(), session_id.clone()),
-    ]
+    ];
+    if send_cache_session_id {
+        headers.push(("x-client-request-id".into(), session_id.clone()));
+    }
+    headers.push(("x-opencode-session".into(), session_id.clone()));
+    headers
 }
 
 fn user_agent() -> String {
@@ -67,7 +84,9 @@ mod tests {
             AnthropicMessages, BedrockConverse, Gemini, GoogleCodeAssist, OpenAiChat,
             OpenAiResponses, OpenAiResponsesChatgpt,
         },
-        wire::{AuthHandle, ClaudeCodePersona, FrozenRenderConfig, HttpRequest, WireFamily},
+        wire::{
+            AuthHandle, CacheClass, ClaudeCodePersona, FrozenRenderConfig, HttpRequest, WireFamily,
+        },
     };
     use broca_protocol::{
         content::{ContentBlock, Message, Role},
@@ -237,6 +256,41 @@ mod tests {
                 ("x-goog-api-key".into(), String::new()),
             ]
         );
+    }
+
+    #[test]
+    fn responses_omit_cache_affinity_for_explicit_no_cache_policies() {
+        let session_id = ClaudeCodePersona::derive_session_id(SESSION_REF);
+        let mut frozen = openai_responses_frozen_config("gpt-6-luna");
+        frozen.base_url = Some(GO_OPENAI_BASE.into());
+        frozen.opencode_go_session_id = Some(session_id.clone());
+
+        let mut no_cache = frozen.clone();
+        no_cache.cache = Some(crate::wire::CachePolicy {
+            version: 1,
+            class: CacheClass::None,
+        });
+        let no_cache_request = request(&OpenAiResponses, &no_cache);
+        assert_eq!(
+            header(&no_cache_request, "x-opencode-session"),
+            Some(session_id.as_str())
+        );
+        assert!(header(&no_cache_request, "x-client-request-id").is_none());
+
+        let mut no_retention = frozen;
+        no_retention.cache = Some(crate::wire::CachePolicy {
+            version: 1,
+            class: CacheClass::Hints {
+                cache_key: "cache-key-fixture".into(),
+                retention: Some("none".into()),
+            },
+        });
+        let no_retention_request = request(&OpenAiResponses, &no_retention);
+        assert_eq!(
+            header(&no_retention_request, "x-opencode-session"),
+            Some(session_id.as_str())
+        );
+        assert!(header(&no_retention_request, "x-client-request-id").is_none());
     }
 
     #[test]

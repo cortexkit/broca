@@ -435,7 +435,7 @@ async fn an_opencode_go_usage_limit_429_ends_the_step_without_retry() {
         ScriptResponse::Http {
             status: 200,
             headers: vec![("content-type", "text/event-stream")],
-            body: concat!("data: [DONE]\n\n").as_bytes(),
+            body: b"data: [DONE]\n\n",
         },
     ])
     .await;
