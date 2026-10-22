@@ -155,6 +155,7 @@ fn request(run: &str, dir: &Path) -> RunRequest {
             input_schema: json!({"type": "object"}),
             module: None,
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         }],
         policy_allowed: ["edit".to_string()].into_iter().collect(),
         tool_choice: ToolChoice::Auto,

@@ -178,10 +178,10 @@ fn scripts() -> StubProvider {
 /// A second open of the WAL while the append is still parked lets it land only after that open
 /// has measured the file. That is the order a writer outliving its run produces, so the second
 /// writer's first append reports a foreign write instead of passing by luck of timing.
-struct HeldAppend {
+pub(super) struct HeldAppend {
     state: std::sync::Mutex<HeldState>,
     changed: std::sync::Condvar,
-    parked: Notify,
+    pub(super) parked: Notify,
 }
 
 #[derive(Default)]
@@ -193,7 +193,7 @@ struct HeldState {
 }
 
 impl HeldAppend {
-    fn new(hold: bool) -> Arc<Self> {
+    pub(super) fn new(hold: bool) -> Arc<Self> {
         Arc::new(Self {
             state: std::sync::Mutex::new(HeldState {
                 released: !hold,
@@ -204,7 +204,7 @@ impl HeldAppend {
         })
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.state.lock().unwrap().released = true;
         self.changed.notify_all();
     }
@@ -267,9 +267,9 @@ impl broca_wal::Wal for HeldWal {
 
 /// A `FileWalStore` whose first opened writer holds its `StepStarted` append (see `HeldAppend`).
 /// Every other operation is the file store's own.
-struct HeldStore {
-    inner: FileWalStore,
-    hold: Arc<HeldAppend>,
+pub(super) struct HeldStore {
+    pub(super) inner: FileWalStore,
+    pub(super) hold: Arc<HeldAppend>,
 }
 
 impl WalStore for HeldStore {
@@ -371,7 +371,7 @@ impl WalStore for HeldStore {
     }
 }
 
-struct HeldModel(Notify);
+pub(super) struct HeldModel(pub(super) Notify);
 #[async_trait]
 impl Provider for HeldModel {
     async fn step(&self, _: StepId, _: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {

@@ -4347,6 +4347,7 @@ mod executor {
                 input_schema: serde_json::json!({"type": "object"}),
                 module: None,
                 execution_mode: broca_protocol::request::ExecutionMode::Parallel,
+                reply: None,
             }
         }
 

@@ -170,6 +170,7 @@ pub fn edit_request() -> RunRequest {
             input_schema: json!({"type": "object"}),
             module: None,
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         }],
         policy_allowed: ["edit".to_string()].into_iter().collect(),
         tool_choice: ToolChoice::Auto,
@@ -225,6 +226,7 @@ pub fn repetition_request() -> RunRequest {
         input_schema: json!({"type": "object"}),
         module: None,
         execution_mode: ExecutionMode::Sequential,
+        reply: None,
     }];
     request.policy_allowed = ["read".to_string()].into_iter().collect();
     request
@@ -393,6 +395,7 @@ pub fn planned_manifest() -> broca_wal::PlanManifest {
         input_schema: json!({"type": "object"}),
         module: Some("aft".into()),
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     }]);
     // SHA-256 of `{}` for the illustrative catalog and composition.
     let empty_object = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";

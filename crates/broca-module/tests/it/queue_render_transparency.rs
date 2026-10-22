@@ -73,6 +73,7 @@ fn full_request(run: &str, session: &BindIdentity) -> RunRequest {
             input_schema: serde_json::json!({"type": "object"}),
             module: Some("aft".into()),
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         }],
         policy_allowed: ["edit".to_string()].into_iter().collect(),
         tool_choice: ToolChoice::Required,
@@ -658,6 +659,7 @@ fn recovered_stop_config() -> broca_wal::RunConfig {
             input_schema: serde_json::json!({"type": "object"}),
             module: Some("aft".into()),
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         }]
         .into(),
         tool_choice: ToolChoice::Auto,

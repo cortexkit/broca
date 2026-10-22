@@ -55,6 +55,7 @@ fn tool(name: &str) -> Tool {
         input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
         module: None,
         execution_mode: broca_protocol::request::ExecutionMode::Parallel,
+        reply: None,
     }
 }
 

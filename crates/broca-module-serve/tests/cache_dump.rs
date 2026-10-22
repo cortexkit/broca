@@ -302,6 +302,7 @@ async fn fixture<F: WireFamily + 'static>(
             input_schema: json!({"type":"object","properties":{"path":{"type":"string"}}}),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         }]
     } else {
         vec![]

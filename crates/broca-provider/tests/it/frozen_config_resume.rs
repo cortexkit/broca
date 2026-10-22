@@ -186,6 +186,7 @@ mod gated {
             input_schema: serde_json::json!({"type": "object"}),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         });
         request.policy_allowed.insert("weather".into());
         request.tool_choice = tool_choice;

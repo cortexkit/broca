@@ -4579,6 +4579,7 @@ mod tests {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         }]);
         opts.tool_choice = Arc::new(ToolChoice::Auto);
         opts.provider_options = Arc::new(Value::Object(provider_options));

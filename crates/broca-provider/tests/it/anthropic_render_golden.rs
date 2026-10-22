@@ -145,6 +145,7 @@ mod gated {
                 }),
                 module: None,
                 execution_mode: Default::default(),
+                reply: None,
             },
             Tool {
                 name: "get_weather".into(),
@@ -155,6 +156,7 @@ mod gated {
                 }),
                 module: None,
                 execution_mode: Default::default(),
+                reply: None,
             },
         ]
         .into();
@@ -468,6 +470,7 @@ mod gated {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         }]
         .into();
         opts.tool_choice = ToolChoice::Auto.into();
@@ -808,6 +811,7 @@ mod gated {
             }),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         }]
         .into();
         opts.tool_choice = ToolChoice::Auto.into();

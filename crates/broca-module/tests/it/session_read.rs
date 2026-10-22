@@ -477,6 +477,7 @@ fn tool(name: &str) -> Tool {
         input_schema: serde_json::json!({"type":"object"}),
         module: None,
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     }
 }
 

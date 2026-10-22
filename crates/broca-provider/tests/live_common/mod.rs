@@ -270,6 +270,7 @@ impl LiveSpec {
             input_schema: schema,
             module: None,
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         });
         self.tool_results
             .push((name.to_string(), result.to_string()));

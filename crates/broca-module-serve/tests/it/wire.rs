@@ -7418,3 +7418,234 @@ async fn protected_moved_route(first: &str, pending_release: bool) -> PreparedWa
     .unwrap();
     route
 }
+
+/// A tool declared on `session.send` with `reply: {max_ms}`, over the real serve path: every
+/// malformed `reply` is refused `invalid_params` naming its member before anything is written;
+/// the golden send freezes the deadline into its `RunStarted` tool entry (byte for byte the
+/// entry pinned in `run_started.tool_reply.json`, in a frame requiring `tool-reply/v1`); and a
+/// later send that omits `tools` inherits the deadline with the rest of the tool.
+#[tokio::test]
+async fn send_declared_tool_reply_is_validated_frozen_and_inherited_over_the_serve_path() {
+    let dir = tmpdir("tool-reply");
+    let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
+    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+    let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
+    let exec = Arc::new(CoreExec {
+        wal_store: wal.clone(),
+        store: Some(store.clone()),
+        reply_text: "researched".into(),
+    });
+    let opener = Arc::new(
+        DefaultOpener::new(lease, wal.clone(), exec)
+            .with_run_index(store.clone())
+            .with_materialized_store(store.clone()),
+    );
+    let wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
+    let store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
+    let reg = Arc::new(LineageRegistry::new_with_reader(
+        opener,
+        wal_reader,
+        Some(store_reader),
+    ));
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (mut creader, mut cwriter) = tokio::io::split(client);
+    let (sreader, swriter) = tokio::io::split(server);
+    let serve = tokio::spawn(async move {
+        let _ = serve_connection(
+            sreader,
+            swriter,
+            "broca",
+            reg.clone(),
+            reg,
+            broca_module_serve::serve::VaultGauge::not_in_use(),
+        )
+        .await;
+    });
+    let hello = read_one(&mut creader).await;
+    let ack = Frame::build(
+        FrameType::HelloAck,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        hello.header.corr,
+        serde_json::to_vec(&ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: vec![],
+            subc_capabilities: vec![],
+            storage: None,
+            machine_id: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    write_frame(&mut cwriter, &ack).await.unwrap();
+    let session = BindIdentity::new(dir.join("proj"), "runner", "lead");
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 7,
+        epoch: 1,
+        target: RouteTarget::ManagementSurface {
+            module_id: "broca".into(),
+        },
+        identity: SubcBindIdentity::new(
+            session.project_root.clone(),
+            session.harness.clone(),
+            session.session.clone(),
+        ),
+        principal: None,
+        consumer_capabilities: None,
+        admission_facts: None,
+        scope: None,
+        role_versions: None,
+        call_mode: None,
+    };
+    write_req(&mut cwriter, 0, 10, serde_json::to_value(&bind).unwrap()).await;
+    let _ = read_one(&mut creader).await;
+
+    let mut golden: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../broca-wire/tests/golden/send_params.tool_reply.json"
+    ))
+    .unwrap();
+    golden["model"] = serde_json::json!({ "provider": "fake", "model": "fake" });
+
+    for (corr, reply, field) in [
+        (11, serde_json::json!({}), "tools[0].reply.max_ms"),
+        (
+            12,
+            serde_json::json!({"max_ms": 0}),
+            "tools[0].reply.max_ms",
+        ),
+        (
+            13,
+            serde_json::json!({"max_ms": "1800000"}),
+            "tools[0].reply.max_ms",
+        ),
+        (
+            14,
+            serde_json::json!({"max_ms": 1000, "grace_ms": 5}),
+            "tools[0].reply.grace_ms",
+        ),
+        (15, serde_json::json!(1_800_000), "tools[0].reply"),
+    ] {
+        let mut params = golden.clone();
+        params["tools"][0]["reply"] = reply.clone();
+        write_req(
+            &mut cwriter,
+            7,
+            corr,
+            serde_json::json!({"method": "session.send", "params": params}),
+        )
+        .await;
+        let response = read_one(&mut creader).await;
+        assert_eq!(
+            response.header.ty,
+            FrameType::Error,
+            "{reply} must be refused"
+        );
+        let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(error.code, "invalid_params", "{reply}: {error:?}");
+        assert_eq!(error.detail.as_ref().unwrap()["field"], field, "{reply}");
+        assert!(
+            error.message.starts_with(field),
+            "{reply}: {}",
+            error.message
+        );
+    }
+    assert!(
+        no_durable_records(wal.as_ref(), &session),
+        "a refused reply writes nothing durable"
+    );
+
+    write_req(
+        &mut cwriter,
+        7,
+        20,
+        serde_json::json!({"method": "session.send", "params": golden}),
+    )
+    .await;
+    let response = read_one(&mut creader).await;
+    assert_eq!(
+        response.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let first_run = first["result"]["run_id"].as_str().unwrap().to_string();
+    wait_for_completed_run(&mut creader, &mut cwriter, 7, &first_run, 100).await;
+
+    // A later send that omits `tools` inherits the frozen surface, deadline included.
+    write_req(
+        &mut cwriter,
+        7,
+        30,
+        serde_json::json!({"method": "session.send", "params": {
+            "prompt": "Continue.",
+            "model": { "provider": "fake", "model": "fake" }
+        }}),
+    )
+    .await;
+    let response = read_one(&mut creader).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    let second: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let second_run = second["result"]["run_id"].as_str().unwrap().to_string();
+    wait_for_completed_run(&mut creader, &mut cwriter, 7, &second_run, 200).await;
+
+    let pinned: WalRecord = serde_json::from_str(include_str!(
+        "../../../broca-wal/tests/golden/run_started.tool_reply.json"
+    ))
+    .unwrap();
+    let WalRecord::RunStarted { config: pinned, .. } = pinned else {
+        unreachable!()
+    };
+    let pinned_entry = serde_json::to_string(&pinned.tools[0]).unwrap();
+    let starts: Vec<_> = wal
+        .read_records(&session)
+        .unwrap()
+        .into_iter()
+        .filter(|frame| matches!(frame.record, WalRecord::RunStarted { .. }))
+        .collect();
+    assert_eq!(starts.len(), 2);
+    for frame in &starts {
+        let WalRecord::RunStarted { config, .. } = &frame.record else {
+            unreachable!()
+        };
+        assert_eq!(config.tools.len(), 1);
+        assert_eq!(
+            serde_json::to_string(&config.tools[0]).unwrap(),
+            pinned_entry
+        );
+        assert!(frame
+            .record
+            .required_features()
+            .contains(&broca_wal::TOOL_REPLY_FEATURE));
+    }
+    let raw = std::fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .flat_map(|entry| walk_files(&entry.unwrap().path()))
+        .map(|path| std::fs::read(path).unwrap())
+        .find(|bytes| {
+            bytes
+                .windows(pinned_entry.len())
+                .any(|w| w == pinned_entry.as_bytes())
+        })
+        .expect("the session WAL holds the pinned tool entry verbatim");
+    assert!(raw
+        .windows(b"tool-reply/v1".len())
+        .any(|window| window == b"tool-reply/v1"));
+
+    drop(cwriter);
+    drop(creader);
+    let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn walk_files(path: &Path) -> Vec<std::path::PathBuf> {
+    if path.is_dir() {
+        std::fs::read_dir(path)
+            .unwrap()
+            .flat_map(|entry| walk_files(&entry.unwrap().path()))
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    }
+}

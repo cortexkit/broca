@@ -436,6 +436,7 @@ fn manifest() -> ToolManifest {
         input_schema: serde_json::json!({"type": "object"}),
         module: Some(PROVIDER.into()),
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     }])
 }
 

@@ -27,6 +27,13 @@ pub const OP_RUN_TOOL_CALLS: &str = "run.tool_calls";
 pub const OP_SESSION_BASELINE: &str = "session.baseline";
 /// The capability group of a runner that tags every stored part and serves `session.resolve`.
 pub use cortexkit_role_llm_runner::capabilities::TAGS as TAGS_CAPABILITY;
+
+/// The `role.describe` capability (a broca extension; the llm-runner role has no group for it)
+/// saying a tool declared directly on `session.send` may carry `reply: {max_ms}`, and that broca
+/// then waits for each of its calls that long or its default wait, whichever is longer, with the
+/// value frozen with the run. A caller whose tool holds a call for minutes refuses to start on a runner that does
+/// not list it, since such a runner would cut those calls and end the run interrupted.
+pub const SEND_TOOL_REPLY_BOUND_CAPABILITY: &str = "send_tool_reply_bound";
 /// `session.resolve` names a tag no part of the session's transcript holds.
 pub use cortexkit_role_llm_runner::errors::UNKNOWN_TAG;
 /// Answer one runner-tagged part's stored text, or a character range of it.
@@ -310,6 +317,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::TURN_DIRECTIVES,
         "plans",
         "fetch-plan-optional-tools/v1",
+        SEND_TOOL_REPLY_BOUND_CAPABILITY,
         "session_class",
         cortexkit_role_llm_runner::capabilities::INPUT_TOKEN_CAP,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
@@ -818,6 +826,24 @@ mod pinned_reply_bytes {
     }
 
     #[test]
+    fn role_describe_advertises_send_tool_reply_bound_on_every_build() {
+        for describe in [
+            broca_role_describe("test"),
+            broca_role_describe_with_writers("test", true, true, true),
+        ] {
+            assert!(
+                describe
+                    .capabilities
+                    .iter()
+                    .any(|name| name == SEND_TOOL_REPLY_BOUND_CAPABILITY),
+                "{:?}",
+                describe.capabilities
+            );
+        }
+        assert_eq!(SEND_TOOL_REPLY_BOUND_CAPABILITY, "send_tool_reply_bound");
+    }
+
+    #[test]
     fn role_describe_bytes_are_pinned() {
         assert_golden(
             broca_role_describe_with_writers("0.0.0-writer-golden", true, true, true),
@@ -868,7 +894,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "63e6a764de7d4665f6fdea1487e22dca4acc415fbfe4ab4f0f8f48294fa4ff8e",
+            "00d584b3cedc43fac9e83f476397be70405b8d9c9f77f5fb856c188071ff9fac",
         );
     }
 
@@ -1022,7 +1048,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "5cd96691518fb5e801d9b372e90c1f58998f9b52ee6ff6fa10202a7f493d5e58";
+        "a3d317332850104102b89fbd5d4c6854ddee5154822870a9c83a691b37a2de01";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

@@ -720,13 +720,21 @@ impl SubcToolPlane {
 
     fn reply_deadline(&self, ctx: &BatchCtx, module_id: &str, call: &ToolCall) -> Duration {
         let manifests = self.batch_presets.lock().unwrap();
+        // A deadline the frozen fetch plan's provider declared wins; otherwise the one the caller
+        // declared on the tool when it sent it. Both go through the role's deadline arithmetic,
+        // which never lowers the runner's fallback and is never lowered by it.
         let reply = manifests
             .get(&Self::batch_route_key(ctx))
-            .and_then(|manifest| manifest.provider_reply(module_id, &call.tool_name));
+            .and_then(|manifest| {
+                manifest
+                    .provider_reply(module_id, &call.tool_name)
+                    .cloned()
+                    .or_else(|| manifest.declared_reply(&call.tool_name))
+            });
         if let Some(reply) = reply {
             return Duration::from_millis(
                 cortexkit_role_tool_provider::catalog::reply_deadline_ms(
-                    Some(reply),
+                    Some(&reply),
                     &call.input,
                     self.reply_fallback_ms(),
                 ),
@@ -901,6 +909,7 @@ impl SubcToolPlane {
                 input_schema: t.schema.clone(),
                 module: Some(module_id.to_owned()),
                 execution_mode: ExecutionMode::Parallel,
+                reply: None,
             })
             .collect();
         Ok(tools)
@@ -4115,6 +4124,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             module: module.map(ToOwned::to_owned),
             execution_mode: broca_protocol::request::ExecutionMode::Parallel,
+            reply: None,
         }
     }
 
@@ -5091,6 +5101,100 @@ mod tests {
             assert_eq!(
                 *conn.dispatched_arguments.lock().unwrap(),
                 [case["arguments"].clone()]
+            );
+            plane.batch_finished(&ctx).await.unwrap();
+        }
+    }
+
+    /// A tool declared on the send (no fetch plan) waits its own frozen `reply.max_ms`, through
+    /// the same deadline arithmetic as a catalog tool: never below the runner's fallback, and not
+    /// shortened by the debug-only short fallback. A plan provider's declaration still wins.
+    #[tokio::test]
+    async fn send_declared_reply_reaches_dispatch_deadline() {
+        let plan_reply = |max_ms: u64| {
+            let tool = serde_json::json!({"name":"read", "description":"probe", "input_schema":{}, "module":"aft", "execution_mode":"parallel", "reply":{"max_ms":1_800_000}});
+            let frozen: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+                "plan": r#"{"tool_items":[{"provider":"aft","preset":"worker"}]}"#,
+                "plan_identity":"", "composition_digest":"", "fetches":[{
+                    "provider":"aft", "catalog_digest":"", "tools":[tool], "reply":{"read":{"max_ms":max_ms}}
+                }], "tools":[tool], "system_text":"", "system_digest":"", "join_version":1, "role_versions":{}
+            }))
+            .unwrap();
+            ToolManifest::from_tools(frozen.tools.as_ref().clone())
+                .with_plan_manifest(&frozen)
+                .unwrap()
+        };
+        let declared = |reply: Option<u64>| {
+            let mut tool = serde_json::json!({"name":"read", "description":"probe", "input_schema":{}, "module":"aft"});
+            if let Some(max_ms) = reply {
+                tool["reply"] = serde_json::json!({"max_ms": max_ms});
+            }
+            ToolManifest::from_tools(vec![serde_json::from_value(tool).unwrap()])
+        };
+        for (name, manifest, fallback, expected_ms) in [
+            (
+                "declared outlasts the short fallback",
+                declared(Some(1_800_000)),
+                1_200,
+                1_800_000,
+            ),
+            (
+                "declared outlasts the default",
+                declared(Some(1_800_000)),
+                120_000,
+                1_800_000,
+            ),
+            (
+                "a short declared reply keeps the fallback floor",
+                declared(Some(500)),
+                1_200,
+                1_200,
+            ),
+            (
+                "a short declared reply keeps the default floor",
+                declared(Some(5_000)),
+                120_000,
+                120_000,
+            ),
+            (
+                "no declared reply waits the fallback",
+                declared(None),
+                1_200,
+                1_200,
+            ),
+            (
+                "the plan provider's reply wins",
+                plan_reply(300_000),
+                1_200,
+                300_000,
+            ),
+        ] {
+            let conn = ScriptedToolPlaneConnection::new(
+                vec![vec![]],
+                vec![Ok(serde_json::json!({"content":[], "isError":false}))],
+            );
+            let plane = SubcToolPlane::with_connection(conn.clone(), "aft")
+                .with_reply_fallback_for_test(fallback);
+            plane.windows.lock().unwrap().insert("aft".into(), 1);
+            let call = ToolCall {
+                tool_call_id: ToolCallId("declared-reply".into()),
+                tool_name: "read".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            };
+            let ctx = batch_ctx("declared-reply");
+            plane
+                .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+                .await
+                .unwrap();
+            assert!(matches!(
+                plane.dispatch(&ctx, &call).await,
+                DispatchResult::Completed(_)
+            ));
+            assert_eq!(
+                *conn.dispatched_deadlines.lock().unwrap(),
+                [Duration::from_millis(expected_ms)],
+                "{name}"
             );
             plane.batch_finished(&ctx).await.unwrap();
         }

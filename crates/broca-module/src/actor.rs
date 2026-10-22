@@ -8911,6 +8911,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             module: None,
             execution_mode: ExecutionMode::Sequential,
+            reply: None,
         });
         request.policy_allowed.insert("lookup".into());
 

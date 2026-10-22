@@ -203,6 +203,7 @@ fn manifest(hook: &str, policies: &[&str], tool_calls: usize) -> Arc<broca_wal::
                 input_schema: json!({"type":"object"}),
                 module: Some("aft".into()),
                 execution_mode: broca_protocol::request::ExecutionMode::Parallel,
+                reply: None,
             }]
         }
         .into(),

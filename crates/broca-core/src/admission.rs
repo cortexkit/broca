@@ -1180,6 +1180,7 @@ mod tests {
                     input_schema: serde_json::json!({"type": "object", "order": 2}),
                     module: Some("tools-b".into()),
                     execution_mode: ExecutionMode::Parallel,
+                    reply: None,
                 },
                 Tool {
                     name: "first".into(),
@@ -1187,6 +1188,7 @@ mod tests {
                     input_schema: serde_json::json!({"type": "object", "order": 1}),
                     module: Some("tools-a".into()),
                     execution_mode: ExecutionMode::Sequential,
+                    reply: None,
                 },
             ]),
             tool_choice: Default::default(),

@@ -8608,6 +8608,7 @@ mod tests {
             } else {
                 ExecutionMode::Sequential
             },
+            reply: None,
         };
         let mut req = RunRequest {
             directives: None,
@@ -8850,6 +8851,7 @@ mod tests {
             input_schema: serde_json::json!({"properties": {"nested": {"type": "object"}}}),
             module: None,
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         }]);
         request.provider_options = Arc::new(serde_json::json!({"large": "x".repeat(4096)}));
         let opts = Arc::new(request);
@@ -9333,6 +9335,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             module: None,
             execution_mode: ExecutionMode::Sequential,
+            reply: None,
         }]);
         let plane = crate::StubToolPlane::new().with_tool("edit", |call| {
             if call.tool_call_id.0 == "call_a" {

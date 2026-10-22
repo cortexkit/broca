@@ -508,6 +508,7 @@ fn request(session: &BindIdentity, episode: usize) -> RunRequest {
             input_schema: json!({"type": "object"}),
             module: None,
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         }],
         policy_allowed: HashSet::from(["lookup".to_owned()]),
         tool_choice: ToolChoice::Auto,

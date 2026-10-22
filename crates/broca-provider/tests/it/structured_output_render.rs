@@ -84,6 +84,7 @@ fn opts(tools: bool) -> CallOptions {
             input_schema: json!({"type": "object", "properties": {"name": {"type": "string"}}}),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         }]);
     }
     opts.step_context = Some(StepContext {

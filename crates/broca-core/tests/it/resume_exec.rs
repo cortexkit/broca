@@ -213,6 +213,7 @@ fn request(run: &str, dir: &std::path::Path) -> RunRequest {
             input_schema: json!({"type": "object"}),
             module: None,
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         }],
         policy_allowed: ["edit".to_string()].into_iter().collect(),
         tool_choice: ToolChoice::Auto,
@@ -794,6 +795,7 @@ async fn resume_ignores_divergent_req_uses_frozen_run_config() {
         input_schema: json!({"type": "object"}),
         module: None,
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     });
     divergent.policy_allowed.insert("delete".into());
     divergent.generation.temperature = Some(0.99);

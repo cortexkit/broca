@@ -707,6 +707,7 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
                 input_schema: so.schema(),
                 module: None,
                 execution_mode: Default::default(),
+                reply: None,
             });
             view.tools = Arc::new(tools);
             Cow::Owned(view)

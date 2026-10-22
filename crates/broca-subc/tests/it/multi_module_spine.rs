@@ -163,6 +163,7 @@ fn tool(name: &str, module: &str) -> Tool {
         input_schema: json!({"type": "object"}),
         module: Some(module.into()),
         execution_mode: ExecutionMode::Parallel,
+        reply: None,
     }
 }
 

@@ -4278,6 +4278,7 @@ fn tool_surface(label: &str) -> Vec<broca_protocol::request::Tool> {
         input_schema: serde_json::json!({"type": "object"}),
         module: Some("aft".into()),
         execution_mode: broca_protocol::request::ExecutionMode::Parallel,
+        reply: None,
     }]
 }
 

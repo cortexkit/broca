@@ -67,6 +67,7 @@ mod tests {
             input_schema: json!({"type": "object", "properties": {"tz": {"type": "string"}}}),
             module: None,
             execution_mode: Default::default(),
+            reply: None,
         }]);
         o
     }

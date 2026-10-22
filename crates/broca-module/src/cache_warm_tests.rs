@@ -1929,6 +1929,7 @@ impl Fixture {
             input_schema: serde_json::json!({"type":"object"}),
             module: None,
             execution_mode: broca_protocol::ExecutionMode::Parallel,
+            reply: None,
         }];
         request.policy_allowed.insert("wait".into());
         request

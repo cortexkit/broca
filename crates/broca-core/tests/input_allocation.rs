@@ -682,6 +682,7 @@ async fn tool_step_does_not_retain_a_second_assistant_message_copy() {
             input_schema: serde_json::json!({ "type": "object" }),
             module: None,
             execution_mode: ExecutionMode::Sequential,
+            reply: None,
         }],
         policy_allowed: HashSet::from(["allocation_probe".into()]),
         tool_choice: ToolChoice::Auto,
@@ -884,6 +885,7 @@ async fn admitted_turn_does_not_retain_a_second_tool_copy() {
             } else {
                 ExecutionMode::Sequential
             },
+            reply: None,
         })
         .collect::<Vec<_>>();
     let serialized_tool_bytes = serde_json::to_vec(&tools)
@@ -987,6 +989,7 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
         input_schema: serde_json::json!({ "type": "object" }),
         module: None,
         execution_mode: ExecutionMode::Sequential,
+        reply: None,
     };
     let request = RunRequest {
         directives: None,
@@ -1145,6 +1148,7 @@ async fn dispatched_tool_result_does_not_retain_a_second_payload_copy() {
             input_schema: serde_json::json!({ "type": "object" }),
             module: None,
             execution_mode: ExecutionMode::Parallel,
+            reply: None,
         }],
         policy_allowed: HashSet::from(["allocation_probe".into()]),
         tool_choice: ToolChoice::Auto,

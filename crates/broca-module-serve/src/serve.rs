@@ -2232,6 +2232,18 @@ where
                 &req.params,
                 &session.harness,
             );
+            if let Err((field, message)) = broca_wire::check_tool_replies(&req.params) {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some(field),
+                    &message,
+                )
+                .await;
+            }
             if let Err(field) = broca_wire::check_run_parameters(&req.params) {
                 return send_invalid_params(
                     writer,
