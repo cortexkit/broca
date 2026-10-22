@@ -428,6 +428,12 @@ pub fn decide_at(
         ViewDisposition::Discard => return Decision::Discard,
         ViewDisposition::Refuse(reason) => return Decision::Refuse(reason),
     }
+    // broca's Setup lists no `apply` marks (`SetupRequest::view_apply` stays empty), so a view
+    // carrying any mark is refused, as compaction-provider §7 requires of a mark the runner
+    // did not list.
+    if view.apply.is_some() {
+        return Decision::Refuse(refusal_reasons::UNSUPPORTED_APPLY);
+    }
     // Authorship is judged against the stored transcript a provider copies from. The bytes a
     // view gives are sent exactly as given (compaction-provider CONTRACT.md §6: "replaced bytes
     // are final ... the runner adds nothing inside replaced bytes"), so a verbatim copy of a
@@ -459,10 +465,10 @@ pub fn decide_at(
         .is_some_and(|open| open >= first && next[open].content.iter().any(is_prefix_bound))
     {
         // A deferral lasts no later than the first step of the session's next run
-        // (compaction-provider §7, as SUBC ruled it for 0.4.1: a steer, a delivered notice or a
-        // tool result continues the running run and does not end it). That request still
-        // carries the open turn's reasoning, so the view cannot be applied there without
-        // breaking it: it is refused, never deferred again.
+        // (compaction-provider 0.4.2 CONTRACT.md §7: a steer, a delivered notice or a tool
+        // result continues the running run, so a step that starts from one does not end it).
+        // That request still carries the open turn's reasoning, so the view cannot be applied
+        // there without breaking it: it is refused, never deferred again.
         if run_start {
             return Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT);
         }

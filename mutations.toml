@@ -22813,3 +22813,16 @@ expect_red = ["tags::tests::numbering_past_u64_max_is_refused_never_repeated"]
 file = "crates/broca-protocol/src/tags.rs"
 old = "    let numbers = cortexkit_role_llm_runner::tags::try_number_parts(base, &rendered)?;"
 new = "    #[allow(deprecated)] let numbers = cortexkit_role_llm_runner::tags::number_parts(base, &rendered); // NON-VACUITY BREAK: saturate instead of refusing."
+
+[[control]]
+id = "compaction-view-unlisted-apply-mark-refused"
+guards = "A view carrying an apply mark broca's Setup did not list is refused unsupported_apply, never applied"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::a_view_with_an_apply_mark_broca_did_not_list_is_refused"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "    if view.apply.is_some() {"
+new = "    if view.apply.is_some() && false { // NON-VACUITY BREAK: honour any apply mark."

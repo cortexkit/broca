@@ -895,6 +895,47 @@ fn a_steer_after_the_tool_results_keeps_the_turn_open() {
     );
 }
 
+/// broca's Setup lists no view `apply` marks, so a view carrying one (even `next_step`, which
+/// this crate defines) is refused `unsupported_apply` (compaction-provider §7), never applied;
+/// the same view unmarked applies.
+#[test]
+fn a_view_with_an_apply_mark_broca_did_not_list_is_refused() {
+    let summary = replace_bytes(&[text(Role::User, "summary")]);
+    let (view, _) = make_view(
+        2,
+        5,
+        vec![ViewRange::replace(0, 0, summary), ViewRange::keep(0, 6)],
+    );
+    let prompt = conversation();
+    let state = after_setup();
+    let marked = view
+        .clone()
+        .with_apply(crate::compaction_provider::view::apply_marks::NEXT_STEP);
+    let marked_ready = ViewReady::for_view(&marked);
+    let refused = decide(
+        &marked,
+        &marked_ready,
+        &state,
+        LINEAGE,
+        &prompt,
+        &prompt,
+        false,
+    );
+    assert_eq!(
+        refused,
+        Decision::Refuse(refusal_reasons::UNSUPPORTED_APPLY)
+    );
+    assert_eq!(
+        refused.event(2).unwrap().token(),
+        "view_refused:2:unsupported_apply"
+    );
+    let ready = ViewReady::for_view(&view);
+    assert_eq!(
+        decide(&view, &ready, &state, LINEAGE, &prompt, &prompt, false),
+        Decision::Apply(CompactionViewChoice::Applied)
+    );
+}
+
 /// A view deferred over the open tool turn when a run ends stays deferred at no later step: at
 /// the first step of the session's next run it is refused for the provider's constraint
 /// (compaction-provider §7), whatever the request ends with, and the same request inside a run

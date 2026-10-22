@@ -1142,6 +1142,8 @@ async fn an_applied_view_resumes_through_replay_and_the_run_loop_byte_identicall
 /// A new lineage of a session whose earlier lineage retention deleted starts its notice numbers
 /// at the number that lineage's tombstone recorded. The bus and the provider key notices on the
 /// session, so they never take the new lineage's notices for repeats of the deleted lineage's.
+/// The deleted lineage's recorded Setup answer did not survive it, so the new lineage calls
+/// Setup again before its first model call (llm-runner 0.4.3 §11.1, compaction-provider §4).
 #[tokio::test]
 async fn a_new_lineage_numbers_its_notices_past_the_deleted_lineages() {
     let root = broca_test_support::scratch_root().join(format!(
@@ -1161,6 +1163,10 @@ async fn a_new_lineage_numbers_its_notices_past_the_deleted_lineages() {
     let writer =
         crate::WalHandle::spawn(crate::WalStore::open(&store, &bind()).unwrap(), 1).unwrap();
     let model = crate::StubProvider::new(vec![model_events()]);
+    let plane = Arc::new(Scripted {
+        answer: ready(),
+        setups: AtomicUsize::new(0),
+    });
     let (out, _events) = tokio::sync::mpsc::channel(128);
     crate::run_loop_on_writer(
         request(),
@@ -1173,10 +1179,7 @@ async fn a_new_lineage_numbers_its_notices_past_the_deleted_lineages() {
         None,
         crate::RunControl {
             manifest: Some(manifest()),
-            compaction_plane: Some(Arc::new(Scripted {
-                answer: ready(),
-                setups: AtomicUsize::new(0),
-            })),
+            compaction_plane: Some(plane.clone()),
             ..Default::default()
         },
         &out,
@@ -1190,6 +1193,18 @@ async fn a_new_lineage_numbers_its_notices_past_the_deleted_lineages() {
         .map(|frame| frame.record)
         .collect();
     assert_eq!(notice_seqs(&records), vec![7, 8]);
+    assert_eq!(
+        plane.setups.load(Ordering::SeqCst),
+        1,
+        "Setup ran for the new lineage"
+    );
+    assert!(records.iter().any(|record| matches!(
+        record,
+        WalRecord::CompactionMessage {
+            kind: broca_wal::CompactionMessageKind::Setup,
+            ..
+        }
+    )));
     let _ = std::fs::remove_dir_all(&root);
 }
 
