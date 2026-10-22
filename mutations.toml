@@ -22506,3 +22506,44 @@ expect_red = ["tests::jsonl_reader_rejects_oversized_records_before_buffering_th
 file = "crates/ck-session-import/src/lib.rs"
 old = "            if line.len().saturating_add(count) > MAX_JSONL_LINE_BYTES {"
 new = "            if false { // NON-VACUITY BREAK: permit an oversized JSONL record."
+
+[[control]]
+id = "chat-send-refuses-a-stated-non-chat-model-kind"
+guards = "session.send admission refuses a catalog model whose stated model.kind is not chat, before RunStarted"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+select = "expected"
+test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
+expect_red = ["executor::tests::a_non_chat_catalog_model_is_refused_at_admission"]
+file = "crates/broca-catalog/src/live.rs"
+old = "    refuse_non_chat_model(&catalog, provider_id, model_id)?;"
+new = "    // NON-VACUITY BREAK: admit every model kind to chat sends."
+
+[[control]]
+id = "chat-send-kind-gate-refuses-every-non-chat-kind"
+guards = "the chat-send kind gate refuses every stated kind other than chat and names the model and kind"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/src/live.rs"
+expect_red = ["live::tests::a_stated_non_chat_model_kind_is_refused_for_chat_sends"]
+file = "crates/broca-catalog/src/live.rs"
+old = "        Some(kind) if kind != crate::runtime::MODEL_KIND_CHAT => Err(format!("
+new = "        Some(kind) if false && kind != crate::runtime::MODEL_KIND_CHAT => Err(format!( // NON-VACUITY BREAK: admit a stated non-chat kind."
+
+[[control]]
+id = "catalog-amountless-stated-zero-is-a-zero-price"
+guards = "a stated_zero rate with no amount fields is a known zero price for cache maintenance, not an unavailable one"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::an_amountless_stated_zero_rate_is_a_known_zero_price"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = "        return Some(0.0);"
+new = "        return None; // NON-VACUITY BREAK: read a free side as unpriced."
