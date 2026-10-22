@@ -666,6 +666,7 @@ mod tests {
                 tag_checkpoint: 500,
                 cut: "m0".into(),
             }),
+            ride_wait_ms: None,
         };
         let records = vec![
             computed_run_started(0),

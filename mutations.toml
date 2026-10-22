@@ -24235,3 +24235,136 @@ expect_red = ["llm_runner_role::client_message_id_is_part_of_the_send_identity_a
 file = "crates/broca-module/src/actor.rs"
 old = "            if existing_client_message_id != request.client_message_id {"
 new = "            if existing_client_message_id != request.client_message_id && false { // NON-VACUITY BREAK: answer a queued retry with another id as a retry."
+
+[[control]]
+id = "named-sender-interrupt-runs-under-owner"
+guards = "A plan-named sender's granted interrupt continues under the session owner's principal, never the sender's (llm-runner 0.5.2 §9.7)"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::a_named_senders_interrupt_needs_the_grant_and_runs_under_the_owner"]
+file = "crates/broca-module/src/actor.rs"
+old = """                Ok(StringSender::Interrupt(owner)) => {
+                    self.admitting_sent_by = request.principal.replace(owner);"""
+new = """                Ok(StringSender::Interrupt(owner)) => {
+                    let _ = owner; self.admitting_sent_by = request.principal.clone(); // NON-VACUITY BREAK: run the interrupt under the sender's principal."""
+
+[[control]]
+id = "named-sender-string-delivery-is-its-list"
+guards = "A plan-named sender's legacy queue or steer string is admitted as the list it stands for, not refused as an owner-only string (llm-runner 0.5.2 §9.7)"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::a_named_senders_string_delivery_is_its_list_and_runs_under_the_owner"]
+file = "crates/broca-module/src/actor.rs"
+old = "                Ok(StringSender::AsOrder(order)) => self.admitting_order = Some(order),"
+new = "                Ok(StringSender::AsOrder(order)) => drop(order), // NON-VACUITY BREAK: leave a named sender's string to the owner check."
+
+[[control]]
+id = "named-sender-interrupt-needs-grant"
+guards = "A plan-named sender may interrupt only with its interrupt grant; idle_start alone does not grant it (llm-runner 0.5.2 §9.7)"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::a_named_senders_interrupt_needs_the_grant_and_runs_under_the_owner"]
+file = "crates/broca-module/src/actor.rs"
+old = """            broca_protocol::Delivery::Interrupt => {
+                cortexkit_role_llm_runner::send::Delivery::Interrupt
+            }
+        };"""
+new = """            broca_protocol::Delivery::Interrupt => {
+                cortexkit_role_llm_runner::send::Delivery::Steer // NON-VACUITY BREAK: admit an interrupt on the idle_start grant.
+            }
+        };"""
+
+[[control]]
+id = "compaction-setup-freezes-ride-wait"
+guards = "A Setup answer's ride_wait_ms is frozen on the session's Setup record, so every later ride waits as long as the provider said (compaction-provider 0.5.1 §4)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::setup_freezes_a_ride_wait_within_the_cap_and_fails_any_other"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = """            // Frozen with the session like `ceiling`, so every later ride, a resumed run's
+            // included, waits as long as this answer said.
+            ride_wait_ms,"""
+new = """            // Frozen with the session like `ceiling`, so every later ride, a resumed run's
+            // included, waits as long as this answer said.
+            ride_wait_ms: ride_wait_ms.filter(|_| false), // NON-VACUITY BREAK: forget the provider's ride wait."""
+
+[[control]]
+id = "compaction-setup-refuses-ride-wait-above-cap"
+guards = "A Setup answer whose ride_wait_ms is 0, above broca's cap, or sent without a cap fails Setup instead of being honoured or clamped (compaction-provider 0.5.1 §4)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::setup_freezes_a_ride_wait_within_the_cap_and_fails_any_other"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "        if answer.is_ready() && answer.check_for(&asked).is_err() {"
+new = "        if answer.is_ready() && answer.check_for(&asked).is_err() && false { // NON-VACUITY BREAK: accept any ride_wait_ms."
+
+[[control]]
+id = "compaction-ride-uses-frozen-ride-wait"
+guards = "A rewrite ride's deadline is the session's frozen ride_wait_ms when Setup gave one (compaction-provider 0.5.1 §8)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_slow_ride_is_reported_as_a_compaction_wait_and_a_fast_one_is_not"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = """        let deadline_ms = match state.ride_wait_ms {
+            Some(wait) => wait,"""
+new = """        let deadline_ms = match state.ride_wait_ms {
+            Some(_) => MAX_REWRITE_RIDE_DEADLINE_MS, // NON-VACUITY BREAK: ignore the provider's ride wait."""
+
+[[control]]
+id = "compaction-slow-ride-reported-as-wait"
+guards = "A rewrite ride pending past COMPACTION_WAIT_REPORT_AFTER_MS is recorded as a runner-owned compaction_wait with its deadline (llm-runner 0.5.2 §6)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_slow_ride_is_reported_as_a_compaction_wait_and_a_fast_one_is_not"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "if !reported && report_at < ends_at => {"
+new = "if !reported && report_at < ends_at && false => { // NON-VACUITY BREAK: never report a slow ride."
+
+[[control]]
+id = "run-status-reports-ride-wait-deadline"
+guards = "run.status reports a rewrite ride's wait by deadline_ms, so watchdogs key on the deadline, not the reason (llm-runner 0.5.2 §6)"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::context_ceiling_tests::a_ride_wait_reports_compaction_wait_by_its_deadline"]
+file = "crates/broca-module/src/serve.rs"
+old = "            deadline_ms: state.ceiling_deadline_ms.or(state.ride_wait_deadline_ms),"
+new = "            deadline_ms: state.ceiling_deadline_ms, // NON-VACUITY BREAK: drop the ride wait's deadline."
+
+[[control]]
+id = "projection-ride-wait-compaction-wait-unit"
+guards = "A reported ride wait projects one durable compaction_wait control unit with its deadline (llm-runner 0.5.2 §6, §7)"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/projection.rs"
+expect_red = ["projection::a_reported_ride_wait_projects_a_compaction_wait_unit"]
+file = "crates/broca-core/src/projection.rs"
+old = """        WalRecord::CompactionRideWait { deadline_ms, .. } => {
+            if let Some(run_id) = &state.run_id {"""
+new = """        WalRecord::CompactionRideWait { deadline_ms, .. } => {
+            if let Some(run_id) = state.run_id.as_ref().filter(|_| false) { // NON-VACUITY BREAK: project no wait unit."""

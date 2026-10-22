@@ -142,6 +142,7 @@ pub(super) fn setup_record(ceiling: Option<&str>) -> WalRecord {
         stability: None,
         ceiling: ceiling.map(|json| OpaqueJson::from_json_text(json).unwrap()),
         tag_checkpoint: None,
+        ride_wait_ms: None,
     }
 }
 
@@ -172,6 +173,7 @@ fn synchronous_records() -> Vec<WalRecord> {
             ]),
             ceiling: None,
             tag_checkpoint: None,
+            ride_wait_ms: None,
         },
         WalRecord::CompactionRequest {
             provider: "provider".into(),
@@ -194,6 +196,7 @@ fn synchronous_records() -> Vec<WalRecord> {
             stability: None,
             ceiling: None,
             tag_checkpoint: None,
+            ride_wait_ms: None,
         },
         WalRecord::CompactionAnswer {
             provider: "provider".into(),
@@ -373,6 +376,16 @@ async fn run_setup(
     Result<CompactionState, Box<broca_protocol::ProviderError>>,
     Vec<WalRecord>,
 ) {
+    run_setup_for(setup_request(), answer).await
+}
+
+async fn run_setup_for(
+    request: SetupRequest,
+    answer: Value,
+) -> (
+    Result<CompactionState, Box<broca_protocol::ProviderError>>,
+    Vec<WalRecord>,
+) {
     let shared = Shared::default();
     let writer = shared.writer();
     let control = crate::RunControl::default();
@@ -388,7 +401,7 @@ async fn run_setup(
         writer: &writer,
         control: &control,
     };
-    let outcome = runtime.setup(setup_request(), &raw()).await;
+    let outcome = runtime.setup(request, &raw()).await;
     let _ = writer.shutdown().await;
     (outcome, shared.records())
 }
@@ -468,6 +481,160 @@ async fn setup_records_its_initial_message_and_ceiling() {
     assert_eq!(
         records[0].required_features(),
         &[broca_wal::framing::COMPACTION_FEATURE]
+    );
+}
+
+/// compaction-provider 0.5.1 §4: a `ready` answer's `ride_wait_ms` within the cap broca sent
+/// is frozen with the session, on the Setup record (which then needs
+/// `compaction-ride-wait/v1`) and in the folded state. One that is 0, above the cap, or sent to
+/// a request without a cap fails Setup as `compaction_unavailable` and records nothing; broca
+/// never clamps it.
+#[tokio::test]
+async fn setup_freezes_a_ride_wait_within_the_cap_and_fails_any_other() {
+    let capped = || setup_request().with_ride_wait_max_ms(runtime::RIDE_WAIT_MAX_MS);
+    let mut answer = ready();
+    answer["ride_wait_ms"] = json!(4000);
+    let (outcome, records) = run_setup_for(capped(), answer).await;
+    assert_eq!(outcome.unwrap().ride_wait_ms, Some(4000));
+    assert_eq!(records.len(), 1);
+    assert!(records[0]
+        .required_features()
+        .contains(&broca_wal::framing::COMPACTION_RIDE_WAIT_FEATURE));
+    let mut refolded = CompactionCheckpoint::None;
+    refolded.fold(&records[0]);
+    assert_eq!(refolded.state().unwrap().ride_wait_ms, Some(4000));
+    for (request, wait) in [
+        (capped(), 0),
+        (capped(), runtime::RIDE_WAIT_MAX_MS + 1),
+        (setup_request(), 4000),
+    ] {
+        let mut answer = ready();
+        answer["ride_wait_ms"] = json!(wait);
+        let (outcome, records) = run_setup_for(request, answer).await;
+        assert_eq!(
+            outcome.unwrap_err().provider_code.as_deref(),
+            Some("compaction_unavailable"),
+            "ride_wait_ms {wait}"
+        );
+        assert!(records.is_empty());
+    }
+    // Without the member the record keeps the bytes and requirements it always had.
+    let (outcome, records) = run_setup_for(capped(), ready()).await;
+    assert_eq!(outcome.unwrap().ride_wait_ms, None);
+    assert_eq!(
+        records[0].required_features(),
+        &[broca_wal::framing::COMPACTION_FEATURE]
+    );
+}
+
+/// A ride that answers after `delay`, recording each request's deadline.
+struct SlowRide {
+    delay: std::time::Duration,
+    deadlines: Mutex<Vec<u64>>,
+}
+#[async_trait::async_trait]
+impl CompactionPlane for SlowRide {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: SetupRequest,
+    ) -> Result<SetupAnswer, CompactionUnavailable> {
+        Err(CompactionUnavailable)
+    }
+    async fn ride(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: crate::compaction_provider::ride::RideRequest,
+    ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
+        self.deadlines.lock().unwrap().push(request.deadline_ms);
+        tokio::time::sleep(self.delay).await;
+        Ok(crate::compaction_provider::ride::RideAnswer::nothing())
+    }
+}
+
+/// Ride once under `state` with a provider answering after `delay`: the deadline the request
+/// carried and the records the ride wrote.
+async fn ride_after(
+    delay: std::time::Duration,
+    state: &mut CompactionState,
+) -> (Vec<u64>, Vec<WalRecord>) {
+    let shared = Shared::default();
+    let writer = shared.writer();
+    let control = crate::RunControl::default();
+    let bind = bind();
+    let slow = Arc::new(SlowRide {
+        delay,
+        deadlines: Mutex::new(Vec::new()),
+    });
+    let plane: Arc<dyn CompactionPlane> = slow.clone();
+    let runtime = runtime::Runtime {
+        provider: "provider",
+        bind: &bind,
+        plane: Some(&plane),
+        writer: &writer,
+        control: &control,
+    };
+    let view = runtime
+        .ride(
+            state,
+            broca_protocol::StepId(2),
+            "0123456789abcdef0123456789abcdef",
+            crate::compaction_provider::ride::RideCause::TtlExpired,
+        )
+        .await
+        .unwrap();
+    assert!(view.is_none());
+    let _ = writer.shutdown().await;
+    let deadlines = slow.deadlines.lock().unwrap().clone();
+    (deadlines, shared.records())
+}
+
+/// llm-runner 0.5.2 §6, compaction-provider 0.5.1 §8: a rewrite ride waits the session's
+/// frozen `ride_wait_ms`, sent as its deadline. One still unanswered after
+/// `COMPACTION_WAIT_REPORT_AFTER_MS` is recorded as a runner-owned wait with its absolute
+/// deadline, ended once the ride resolves, and the control lane reports it as
+/// `compaction_wait`. A ride answered sooner records nothing, and a session whose Setup gave no
+/// `ride_wait_ms` keeps broca's own short ride deadline.
+#[tokio::test]
+async fn a_slow_ride_is_reported_as_a_compaction_wait_and_a_fast_one_is_not() {
+    let mut state = CompactionState {
+        ride_wait_ms: Some(4000),
+        ..Default::default()
+    };
+    let before = crate::compaction::now();
+    let (deadlines, records) = ride_after(std::time::Duration::from_millis(1300), &mut state).await;
+    assert_eq!(deadlines, vec![4000]);
+    let [WalRecord::CompactionRideWait {
+        step_id,
+        deadline_ms,
+    }, WalRecord::CompactionRideWaitEnded { step_id: ended }] = records.as_slice()
+    else {
+        panic!("a wait and its end: {records:?}");
+    };
+    assert_eq!(
+        (*step_id, *ended),
+        (broca_protocol::StepId(2), broca_protocol::StepId(2))
+    );
+    assert!(
+        (before + 4000..=crate::compaction::now() + 4000).contains(deadline_ms),
+        "the deadline is the ride's absolute end: {deadline_ms}"
+    );
+    assert_eq!(state.ride_wait, None, "the wait ended with the ride");
+
+    let mut state = CompactionState::default();
+    let (deadlines, records) = ride_after(std::time::Duration::from_millis(10), &mut state).await;
+    assert!(
+        records.is_empty(),
+        "a quick answer is never reported: {records:?}"
+    );
+    assert_eq!(
+        deadlines,
+        vec![COMPACTION_CALL_BUDGET_MS.clamp(
+            1,
+            crate::compaction_provider::ride::MAX_REWRITE_RIDE_DEADLINE_MS
+        )]
     );
 }
 

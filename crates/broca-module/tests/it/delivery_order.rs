@@ -825,3 +825,144 @@ async fn a_keyed_retry_reports_the_delivered_runs_state_and_keeps_its_order() {
         other => panic!("a legacy retry of a queued ordered send is refused: {other:?}"),
     }
 }
+
+/// [`plan_naming`] with the sender's `interrupt` grant set as given (llm-runner 0.5.2 §9.7).
+fn plan_naming_with_interrupt(
+    sender: &str,
+    idle_start: bool,
+    interrupt: bool,
+) -> broca_module::actor::SendPlan {
+    let mut plan = plan_naming(sender, idle_start);
+    let manifest = std::sync::Arc::make_mut(plan.manifest.as_mut().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).unwrap();
+    value["senders"][0]["interrupt"] = serde_json::json!(interrupt);
+    manifest.plan = broca_wal::OpaqueJson::from_json_text(value.to_string()).unwrap();
+    manifest.plan_identity = format!("{}-interrupt-{interrupt}", manifest.plan_identity);
+    plan.identity = manifest.plan_identity.clone();
+    plan
+}
+
+/// The run `run_id` started: what its request carried, and the principal its `RunStarted`
+/// recorded.
+fn run_principals(
+    rig: &Rig,
+    key: &broca_protocol::BindIdentity,
+    run_id: &str,
+) -> (Option<BindPrincipal>, Option<BindPrincipal>) {
+    let seen = rig.exec.seen.lock().unwrap().clone();
+    let run = seen
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap_or_else(|| panic!("run {run_id} started: {seen:?}"));
+    let recorded = records(rig, key)
+        .into_iter()
+        .find_map(|record| match record {
+            WalRecord::RunStarted {
+                run_id: started,
+                principal,
+                ..
+            } if started.0 == run_id => Some(principal),
+            _ => None,
+        })
+        .expect("the run's RunStarted");
+    (run.principal.clone(), recorded)
+}
+
+/// A plan-named sender may send the legacy strings `queue` and `steer` (llm-runner 0.5.2 §9.7):
+/// with the `idle_start` grant they are admitted as the lists `[idle_start]` and
+/// `[steer, idle_start]` and start a run on an idle session, recorded with the sender on
+/// `DeliveryOrdered`; without it they are refused naming `delivery` and write nothing. The run
+/// keeps the session owner's principal, never the sender's.
+#[tokio::test]
+async fn a_named_senders_string_delivery_is_its_list_and_runs_under_the_owner() {
+    let rig = Rig::new("named-string", FakeExecutor::auto(), LONG_TTL);
+    for (delivery, run, modes) in [
+        (
+            broca_protocol::Delivery::Queue,
+            "mc-queue",
+            vec![DeliveryMode::IdleStart],
+        ),
+        (
+            broca_protocol::Delivery::Steer,
+            "mc-steer",
+            vec![DeliveryMode::Steer, DeliveryMode::IdleStart],
+        ),
+    ] {
+        let key = session_naming_ck_mc(&rig, run, true).await;
+        let mut mc = send(&key, run, None);
+        mc.delivery = delivery;
+        mc.request.principal = reserved("ck-mc");
+        let reply = rig.registry.send(mc).await.unwrap();
+        assert!(
+            matches!(reply, SendResponse::Active { ref run_id, .. } if run_id == run),
+            "{reply:?}"
+        );
+        wait_idle(&rig, &key).await;
+        assert_eq!(
+            run_principals(&rig, &key, run),
+            (reserved("owner"), reserved("owner")),
+            "the sender's run keeps the owner's principal"
+        );
+        let ordered = records(&rig, &key)
+            .into_iter()
+            .find_map(|record| match record {
+                WalRecord::DeliveryOrdered { order, sent_by, .. } => Some((order.modes, sent_by)),
+                _ => None,
+            })
+            .expect("admitted as its list");
+        assert_eq!(ordered, (modes, reserved("ck-mc")));
+
+        let key = session_naming_ck_mc(&rig, &format!("{run}-no-grant"), false).await;
+        let before = records(&rig, &key).len();
+        let mut refused = send(&key, &format!("{run}-refused"), None);
+        refused.delivery = delivery;
+        refused.request.principal = reserved("ck-mc");
+        match rig.registry.send(refused).await {
+            Err(ServeError::InvalidParams { field, .. }) => assert_eq!(field, "delivery"),
+            other => panic!("{delivery:?} without idle_start is refused: {other:?}"),
+        }
+        assert_eq!(records(&rig, &key).len(), before, "nothing written");
+    }
+}
+
+/// A plan-named sender may send `interrupt` only with its entry's `interrupt` grant
+/// (llm-runner 0.5.2 §9.7); without it the send is refused naming `delivery` and writes
+/// nothing, even with the `idle_start` grant. A granted interrupt's run keeps the owner's
+/// principal.
+#[tokio::test]
+async fn a_named_senders_interrupt_needs_the_grant_and_runs_under_the_owner() {
+    let rig = Rig::new("named-interrupt", FakeExecutor::auto(), LONG_TTL);
+    for granted in [false, true] {
+        let key = rig.key(&format!("interrupt-{granted}"));
+        let mut first = send(&key, &format!("owner-{granted}"), None);
+        first.request.principal = reserved("owner");
+        first.plan = Some(plan_naming_with_interrupt("ck-mc", true, granted));
+        rig.registry.send(first).await.unwrap();
+        wait_idle(&rig, &key).await;
+        let before = records(&rig, &key).len();
+        let run = format!("mc-interrupt-{granted}");
+        let mut mc = send(&key, &run, None);
+        mc.delivery = broca_protocol::Delivery::Interrupt;
+        mc.request.principal = reserved("ck-mc");
+        let reply = rig.registry.send(mc).await;
+        if !granted {
+            match reply {
+                Err(ServeError::InvalidParams { field, .. }) => assert_eq!(field, "delivery"),
+                other => panic!("an interrupt without the grant is refused: {other:?}"),
+            }
+            assert_eq!(records(&rig, &key).len(), before, "nothing written");
+            continue;
+        }
+        let reply = reply.unwrap();
+        assert!(
+            matches!(reply, SendResponse::Active { ref run_id, .. } if *run_id == run),
+            "{reply:?}"
+        );
+        wait_idle(&rig, &key).await;
+        assert_eq!(
+            run_principals(&rig, &key, &run),
+            (reserved("owner"), reserved("owner")),
+            "the granted interrupt's run keeps the owner's principal"
+        );
+    }
+}

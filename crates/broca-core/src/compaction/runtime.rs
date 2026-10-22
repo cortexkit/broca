@@ -22,6 +22,17 @@ use broca_protocol::{
     error::{ErrorClass, ProviderError, ProviderRefusal},
     BindIdentity, RunFinishReason,
 };
+use cortexkit_role_llm_runner::run::COMPACTION_WAIT_REPORT_AFTER_MS;
+
+/// The longest broca lets a compaction provider hold a step for a rewrite ride, sent as Setup's
+/// `ride_wait_max_ms` (compaction-provider 0.5.1 §4). A rewrite ride is optional: without its
+/// view the request still goes out under the current one, so the wait buys a better prefix,
+/// never correctness. Two minutes leaves room for a provider that summarizes with a model call
+/// of its own, and stays well below the 300 s a ceiling wait may last, where the request
+/// cannot go out at all. broca has no caller holding an HTTP request open across a step (the
+/// gateway's reason for 240 s), and the wait is reported as `compaction_wait` with its
+/// deadline, so a watchdog leaves it alone.
+pub const RIDE_WAIT_MAX_MS: u64 = 120_000;
 
 #[derive(Debug, Clone)]
 pub struct CompactionUnavailable;
@@ -645,6 +656,8 @@ impl Runtime<'_> {
         };
         request.now = self.now();
         let request_id = request.request_id.clone();
+        // Kept to check the answer against: `ride_wait_ms` must lie within this request's cap.
+        let asked = request.clone();
         let answer = tokio::select! {
             answer = plane.setup(self.provider, self.bind, request) => answer.ok(),
             _ = clock_deadline(self.control.clock.as_ref(), self.now().saturating_add(self.control.compaction_config.call_budget_ms)) => None,
@@ -652,6 +665,13 @@ impl Runtime<'_> {
         if answer.request_id() != request_id {
             return Err(unavailable());
         }
+        // A `ready` answer whose `ride_wait_ms` is 0, above the cap broca sent, or present
+        // without one is a failed Setup (compaction-provider 0.5.1 §4, `SetupAnswer::check_for`),
+        // never clamped. A refusal passes this check and is reported with its own code below.
+        if answer.is_ready() && answer.check_for(&asked).is_err() {
+            return Err(unavailable());
+        }
+        let ride_wait_ms = answer.ride_wait_ms();
         let (initial, ceiling, checkpoint) = match answer {
             SetupAnswer::Refuse {
                 code,
@@ -709,6 +729,9 @@ impl Runtime<'_> {
                 tag_checkpoint: checkpoint.tag_checkpoint,
                 cut: checkpoint.cut,
             }),
+            // Frozen with the session like `ceiling`, so every later ride, a resumed run's
+            // included, waits as long as this answer said.
+            ride_wait_ms,
         };
         let mut state = CompactionState::default();
         self.commit(&mut state, record)
@@ -741,25 +764,66 @@ impl Runtime<'_> {
     }
 
     /// Ride the provider for a view because the request's prefix is being rewritten anyway
-    /// (compaction-provider/v1 §8). The ride waits at most broca's own short deadline, which
-    /// it sends as `deadline_ms`. A missed deadline, a failed call or `nothing` gives `None`,
-    /// and the request goes out under the current view.
-    pub(crate) async fn ride(&self, session_ref: &str, cause: RideCause) -> Option<CompactionView> {
-        let plane = self.plane?;
-        let deadline_ms = self
-            .control
-            .compaction_config
-            .call_budget_ms
-            .clamp(1, MAX_REWRITE_RIDE_DEADLINE_MS);
-        let request = RideRequest::new(session_ref, cause, deadline_ms);
-        let answer = tokio::select! {
-            answer = plane.ride(self.provider, self.bind, request) => answer.ok(),
-            _ = clock_deadline(self.control.clock.as_ref(), self.now().saturating_add(deadline_ms)) => None,
+    /// (compaction-provider/v1 §8). The ride waits at most the session's frozen `ride_wait_ms`
+    /// when its Setup answer gave one (compaction-provider 0.5.1 §4, §8), and otherwise broca's
+    /// own short deadline; either is sent as `deadline_ms`. A missed deadline, a failed call or
+    /// `nothing` gives `None`, and the request goes out under the current view.
+    ///
+    /// A ride still unanswered after `COMPACTION_WAIT_REPORT_AFTER_MS` is a runner-owned wait
+    /// (llm-runner 0.5.2 §6): it is recorded durably as `CompactionRideWait` with the ride's
+    /// absolute deadline, so `run.status` and the control lane report `compaction_wait`, and a
+    /// `CompactionRideWaitEnded` follows once the ride resolves. A ride answered sooner records
+    /// nothing.
+    pub(crate) async fn ride(
+        &self,
+        state: &mut CompactionState,
+        step_id: broca_protocol::StepId,
+        session_ref: &str,
+        cause: RideCause,
+    ) -> Result<Option<CompactionView>, crate::RunError> {
+        let Some(plane) = self.plane else {
+            return Ok(None);
         };
-        match answer? {
-            RideAnswer::View { view, .. } => Some(*view),
-            _ => None,
+        let deadline_ms = match state.ride_wait_ms {
+            Some(wait) => wait,
+            None => self
+                .control
+                .compaction_config
+                .call_budget_ms
+                .clamp(1, MAX_REWRITE_RIDE_DEADLINE_MS),
+        };
+        let started = self.now();
+        let ends_at = started.saturating_add(deadline_ms);
+        let request = RideRequest::new(session_ref, cause, deadline_ms);
+        let ride = plane.ride(self.provider, self.bind, request);
+        tokio::pin!(ride);
+        let report_at = started.saturating_add(COMPACTION_WAIT_REPORT_AFTER_MS);
+        let mut reported = false;
+        let answer = loop {
+            tokio::select! {
+                answer = &mut ride => break answer.ok(),
+                _ = clock_deadline(self.control.clock.as_ref(), ends_at) => break None,
+                _ = clock_deadline(self.control.clock.as_ref(), report_at), if !reported && report_at < ends_at => {
+                    reported = true;
+                    self.commit(
+                        state,
+                        WalRecord::CompactionRideWait {
+                            step_id,
+                            deadline_ms: ends_at,
+                        },
+                    )
+                    .await?;
+                }
+            }
+        };
+        if reported {
+            self.commit(state, WalRecord::CompactionRideWaitEnded { step_id })
+                .await?;
         }
+        Ok(match answer {
+            Some(RideAnswer::View { view, .. }) => Some(*view),
+            _ => None,
+        })
     }
 
     /// The views of one step boundary (compaction-provider/v1 §7 and §8), before the request
@@ -782,10 +846,11 @@ impl Runtime<'_> {
         stored: &[Message],
         prefix_bound: bool,
         run_start: bool,
+        step_id: broca_protocol::StepId,
     ) -> Result<Vec<Event>, crate::RunError> {
         let mut events = Vec::new();
         if let Some(cause) = view::rewrite_ride_cause(state, model) {
-            if let Some(view) = Box::pin(self.ride(session_ref, cause)).await {
+            if let Some(view) = Box::pin(self.ride(state, step_id, session_ref, cause)).await? {
                 let ready = ViewReady::for_view(&view);
                 let applied = Box::pin(self.offer(
                     views,

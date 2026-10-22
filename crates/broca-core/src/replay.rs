@@ -2025,6 +2025,8 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::CompactionRideWait { .. }
+            | WalRecord::CompactionRideWaitEnded { .. }
             | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence: known to this build, but informational only under the
             // same contract, so replay skips it exactly as it skips `Unknown`. The step's retry
@@ -2419,6 +2421,9 @@ pub struct ReconciledRunState {
     pub budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
     pub context_ceiling: Option<broca_protocol::ContextCeilingDetail>,
     pub ceiling_deadline_ms: Option<u64>,
+    /// The absolute deadline of the rewrite ride the active run's step waits for, once that wait
+    /// is reported (`CompactionRideWait`, llm-runner 0.5.2 `compaction_wait`); `None` otherwise.
+    pub ride_wait_deadline_ms: Option<u64>,
     /// On an ended run admitted with structured output: what it produced, as `run.result` and
     /// `run.status` report it. Read from the run's durable result record when it completed;
     /// derived as `absent` from its frozen settings when it ended any other way.
@@ -2524,6 +2529,7 @@ pub fn reconcile_run_state<'a>(
                         error: None,
                         pause_reason: None,
                         auth_selection: None,
+                        ride_wait_deadline_ms: None,
                     });
                 }
             }
@@ -2532,6 +2538,18 @@ pub fn reconcile_run_state<'a>(
             {
                 if let Some(state) = &mut found {
                     state.ceiling_deadline_ms = Some(*deadline_ms);
+                }
+            }
+            WalRecord::CompactionRideWait { deadline_ms, .. }
+                if active_run.as_deref() == Some(run_id) =>
+            {
+                if let Some(state) = &mut found {
+                    state.ride_wait_deadline_ms = Some(*deadline_ms);
+                }
+            }
+            WalRecord::CompactionRideWaitEnded { .. } if active_run.as_deref() == Some(run_id) => {
+                if let Some(state) = &mut found {
+                    state.ride_wait_deadline_ms = None;
                 }
             }
             WalRecord::ContextCeilingDecided { detail, .. }
@@ -2564,6 +2582,12 @@ pub fn reconcile_run_state<'a>(
                 total_usage.accumulate(usage);
                 total_retries_used = total_retries_used.saturating_add(*retries_used);
                 last_step_finish_reason = *finish_reason;
+                // A step that finished no longer waits for its ride.
+                if active_run.as_deref() == Some(run_id) {
+                    if let Some(state) = &mut found {
+                        state.ride_wait_deadline_ms = None;
+                    }
+                }
             }
             WalRecord::ToolBatchStarted { .. } => indeterminate_tool_calls.reset_batch(),
             WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
@@ -2641,6 +2665,7 @@ pub fn reconcile_run_state<'a>(
                         error: error.clone(),
                         pause_reason: None,
                         auth_selection: None,
+                        ride_wait_deadline_ms: None,
                     });
                 }
             }
@@ -2667,6 +2692,7 @@ pub fn reconcile_run_state<'a>(
                     error: error.clone(),
                     pause_reason: Some(*reason),
                     auth_selection: auth_selection.clone(),
+                    ride_wait_deadline_ms: None,
                 });
             }
             WalRecord::Queued {
@@ -2697,6 +2723,7 @@ pub fn reconcile_run_state<'a>(
                     error: Some(failure.error.clone()),
                     pause_reason: None,
                     auth_selection: None,
+                    ride_wait_deadline_ms: None,
                 });
             }
             _ => {}
@@ -2720,6 +2747,7 @@ pub fn reconcile_run_state<'a>(
             pause_reason: None,
             auth_selection: None,
             title,
+            ride_wait_deadline_ms: None,
         });
     }
     found.map(|state| ReconciledRunState {

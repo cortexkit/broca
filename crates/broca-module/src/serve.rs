@@ -1228,11 +1228,17 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             .to_string()
     });
     match state.state {
+        // A runner-owned wait (llm-runner 0.5.2 §6) is whatever carries a deadline: the context
+        // ceiling's wait for a view, else a rewrite ride's reported wait. `reason` only names it.
         State::Active => RunStatusResponse::Active {
-            reason: state
-                .ceiling_deadline_ms
-                .map(|_| "context_ceiling_wait".into()),
-            deadline_ms: state.ceiling_deadline_ms,
+            reason: match (state.ceiling_deadline_ms, state.ride_wait_deadline_ms) {
+                (Some(_), _) => Some("context_ceiling_wait".into()),
+                (None, Some(_)) => {
+                    Some(cortexkit_role_llm_runner::run::RUN_REASON_COMPACTION_WAIT.into())
+                }
+                (None, None) => None,
+            },
+            deadline_ms: state.ceiling_deadline_ms.or(state.ride_wait_deadline_ms),
             usage,
             step: state.live_step,
             title,
@@ -3481,6 +3487,7 @@ mod paused_auth_tests {
                             decision_id: None,
                         }),
                     }),
+                    ride_wait_deadline_ms: None,
                 };
                 let value = serde_json::to_value(run_status_response(Some(state.clone()))).unwrap();
                 assert_eq!(value["auth"]["path"], wire);
@@ -3520,6 +3527,7 @@ mod context_ceiling_tests {
             state,
             context_ceiling: None,
             ceiling_deadline_ms: None,
+            ride_wait_deadline_ms: None,
             budget_detail: None,
             structured_output: None,
             live_step: None,
@@ -3564,5 +3572,20 @@ mod context_ceiling_tests {
         );
         assert!(wire.get("error").is_none());
         assert!(wire.get("deadline_ms").is_none());
+    }
+    /// A rewrite ride's reported wait is a runner-owned wait (llm-runner 0.5.2 §6): the
+    /// active run carries its `deadline_ms`, with the display reason `compaction_wait`, and the
+    /// role's `RunStatus` reads it as a wait until that deadline.
+    #[test]
+    fn a_ride_wait_reports_compaction_wait_by_its_deadline() {
+        let mut state = reconciled(broca_core::RunIndexState::Active);
+        state.ride_wait_deadline_ms = Some(234_567);
+        let wire = serde_json::to_value(run_status_response(Some(state))).unwrap();
+        assert_eq!(wire["state"], "active");
+        assert_eq!(wire["reason"], "compaction_wait");
+        assert_eq!(wire["deadline_ms"], 234_567);
+        let status: cortexkit_role_llm_runner::run::RunStatus =
+            serde_json::from_value(wire).unwrap();
+        assert_eq!(status.runner_wait_until(), Some(234_567));
     }
 }

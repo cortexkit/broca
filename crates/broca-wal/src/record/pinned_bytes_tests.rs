@@ -136,6 +136,8 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::InputTokenBudgetExhausted { .. } => "input_token_budget_exhausted",
         WalRecord::ContextCeilingWait { .. } => "context_ceiling_wait",
         WalRecord::ContextCeilingDecided { .. } => "context_ceiling_decided",
+        WalRecord::CompactionRideWait { .. } => "compaction_ride_wait",
+        WalRecord::CompactionRideWaitEnded { .. } => "compaction_ride_wait_ended",
         WalRecord::StructuredOutputResult { .. } => "structured_output_result",
         WalRecord::StructuredOutputDowngraded { .. } => "structured_output_downgraded",
         WalRecord::DeliveryOrdered { .. } => "delivery_ordered",
@@ -440,6 +442,43 @@ const COMPACTION_VIEW_PINNED: &[&str] = &[
     r#"{"type":"compaction_message","provider":"mc","kind":"setup","compaction_id":"c","version":1,"range":{"from":0,"to":0},"replacement":[],"sha256":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","ceiling":"{\"at_share\":0.8,\"wait_ms\":1000}"}"#,
 ];
 
+/// A rewrite ride's reported wait and its end (llm-runner 0.5.2 `compaction_wait`), each in a
+/// gated frame requiring `compaction-ride-wait/v1`.
+const RIDE_WAIT_PINNED: &[&str] = &[
+    r#"{"type":"compaction_ride_wait","step_id":2,"deadline_ms":1790000004000}"#,
+    r#"{"type":"compaction_ride_wait_ended","step_id":2}"#,
+];
+
+/// The ride-wait records keep their bytes and need `compaction-ride-wait/v1`; a Setup record carrying
+/// the provider's `ride_wait_ms` requires `compaction-ride-wait/v1` (beside the ceiling's
+/// `compaction-view/v1` when it carries one too), and one without it keeps its old bytes and
+/// requirements.
+#[test]
+fn ride_wait_records_and_a_frozen_ride_wait_are_gated() {
+    for pinned in RIDE_WAIT_PINNED {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
+        assert_eq!(
+            record.required_features(),
+            &[crate::framing::COMPACTION_RIDE_WAIT_FEATURE],
+            "{pinned}"
+        );
+    }
+    let without = r#"{"type":"compaction_message","provider":"mc","kind":"setup","compaction_id":"c","version":1,"range":{"from":0,"to":0},"replacement":[],"sha256":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}"#;
+    let record: WalRecord = serde_json::from_str(without).unwrap();
+    assert_eq!(serde_json::to_string(&record).unwrap(), without);
+    assert!(!record
+        .required_features()
+        .contains(&crate::framing::COMPACTION_RIDE_WAIT_FEATURE));
+    let with = r#"{"type":"compaction_message","provider":"mc","kind":"setup","compaction_id":"c","version":1,"range":{"from":0,"to":0},"replacement":[],"sha256":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","ride_wait_ms":4000}"#;
+    let record: WalRecord = serde_json::from_str(with).unwrap();
+    assert_eq!(serde_json::to_string(&record).unwrap(), with);
+    assert!(record
+        .required_features()
+        .contains(&crate::framing::COMPACTION_RIDE_WAIT_FEATURE));
+}
+
 #[test]
 fn asynchronous_compaction_records_keep_their_bytes_and_require_the_view_feature() {
     use crate::framing::{encode, GATED_FRAMING_VERSION};
@@ -472,6 +511,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(INPUT_CAP_PINNED.iter().copied())
         .chain(STRUCTURED_OUTPUT_PINNED.iter().copied())
         .chain(COMPACTION_VIEW_PINNED.iter().copied())
+        .chain(RIDE_WAIT_PINNED.iter().copied())
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
     // The tag of every arm of the exhaustive `tag_of` except `WalRecord::Unknown`, the
@@ -521,6 +561,8 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "delivery_ordered",
         "send_ended",
         "send_delivered",
+        "compaction_ride_wait",
+        "compaction_ride_wait_ended",
     ];
     assert_eq!(pinned, every_kind.into_iter().collect());
     assert_eq!(tag_of(&WalRecord::Unknown), "unknown");

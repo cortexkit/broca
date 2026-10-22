@@ -166,6 +166,15 @@ pub struct CompactionState {
     /// Magic Context: tag numbering is anchored at its cut message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag_checkpoint: Option<broca_wal::SetupTagCheckpoint>,
+    /// The Setup answer's `ride_wait_ms` (compaction-provider 0.5.1 §4), frozen with the
+    /// session: the deadline of every rewrite ride. Absent when the answer carried none, and
+    /// the runner then uses its own short ride deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ride_wait_ms: Option<u64>,
+    /// The rewrite ride the current step waits for, once its wait is reported
+    /// (`CompactionRideWait`): the step and the absolute deadline. Cleared when it resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ride_wait: Option<(broca_protocol::StepId, u64)>,
 }
 impl CompactionState {
     /// Send admission uses the last durable request estimate plus the new native messages,
@@ -231,7 +240,18 @@ impl CompactionState {
     pub fn fold(&mut self, record: &WalRecord) {
         self.history.fold(record);
         match record {
-            WalRecord::RunStarted { .. } => self.ceiling_check = None,
+            WalRecord::RunStarted { .. } => {
+                self.ceiling_check = None;
+                self.ride_wait = None;
+            }
+            WalRecord::CompactionRideWait {
+                step_id,
+                deadline_ms,
+            } => self.ride_wait = Some((*step_id, *deadline_ms)),
+            // A wait ends when its ride resolves, and never outlives its step or its run.
+            WalRecord::CompactionRideWaitEnded { .. }
+            | WalRecord::ModelStepFinished { .. }
+            | WalRecord::RunPaused { .. } => self.ride_wait = None,
             WalRecord::ContextCeilingWait {
                 step_id,
                 deadline_ms,
@@ -264,6 +284,7 @@ impl CompactionState {
                 stability,
                 ceiling,
                 tag_checkpoint,
+                ride_wait_ms,
                 ..
             } => {
                 self.provider.clone_from(provider);
@@ -272,6 +293,7 @@ impl CompactionState {
                     self.stability = stability.clone().unwrap_or_default();
                     self.ceiling.clone_from(ceiling);
                     self.tag_checkpoint.clone_from(tag_checkpoint);
+                    self.ride_wait_ms = *ride_wait_ms;
                 }
                 self.applied = Some(AppliedCompaction {
                     compaction_id: compaction_id.clone(),
@@ -342,6 +364,7 @@ impl CompactionState {
                     self.ceiling_check = None;
                 }
                 self.open_wait = None;
+                self.ride_wait = None;
             }
             _ => {}
         }

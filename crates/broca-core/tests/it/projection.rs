@@ -1138,3 +1138,33 @@ fn a_steered_record_projects_no_control_unit() {
     assert_eq!(project_control(&with), project_control(&without));
     assert_eq!(project_control(&with).len(), 2);
 }
+
+/// A rewrite ride's reported wait (llm-runner 0.5.2 §6) projects one durable `compaction_wait`
+/// unit naming the run and the wait's absolute deadline; its end projects nothing.
+#[test]
+fn a_reported_ride_wait_projects_a_compaction_wait_unit() {
+    let records = vec![
+        framed(1, started("r-wait")),
+        framed(2, WalRecord::StepStarted { step_id: StepId(1) }),
+        framed(
+            3,
+            WalRecord::CompactionRideWait {
+                step_id: StepId(1),
+                deadline_ms: 1_790_000_004_000,
+            },
+        ),
+        framed(4, WalRecord::CompactionRideWaitEnded { step_id: StepId(1) }),
+    ];
+    let units = project_control(&records);
+    let waits: Vec<_> = units
+        .iter()
+        .filter(|(_, unit)| matches!(unit, ControlUnit::CompactionWait { .. }))
+        .collect();
+    assert_eq!(waits.len(), 1, "{units:?}");
+    assert_eq!(waits[0].0, Cursor::new(3, 0));
+    assert_eq!(
+        serde_json::to_value(&waits[0].1).unwrap(),
+        serde_json::json!({"type":"compaction_wait","run_id":"r-wait","reason":"compaction_wait","deadline_ms":1_790_000_004_000_u64})
+    );
+    assert!(units.iter().all(|(cursor, _)| cursor.wal_seq != 4));
+}
