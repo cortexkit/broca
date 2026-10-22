@@ -268,6 +268,8 @@ pub async fn apply_idle_view(
                 prompt,
                 stored,
                 prefix_bound,
+                // No run owns the writer, so this is no run's first step.
+                false,
             )
             .await?
     };
@@ -508,6 +510,9 @@ impl Runtime<'_> {
                             &opts.prompt,
                             stored,
                             provider.reasoning_is_prefix_bound(),
+                            // The boundary's own offer (views_at_boundary) already ended any
+                            // deferral at a run's first step; a ceiling ride only adds views.
+                            false,
                             &mut events,
                         )
                         .await?;
@@ -585,6 +590,7 @@ impl Runtime<'_> {
                                     &opts.prompt,
                                     stored,
                                     provider.reasoning_is_prefix_bound(),
+                                    false,
                                     &mut events,
                                 )
                                 .await?;
@@ -775,6 +781,7 @@ impl Runtime<'_> {
         prompt: &[Message],
         stored: &[Message],
         prefix_bound: bool,
+        run_start: bool,
     ) -> Result<Vec<Event>, crate::RunError> {
         let mut events = Vec::new();
         if let Some(cause) = view::rewrite_ride_cause(state, model) {
@@ -789,6 +796,7 @@ impl Runtime<'_> {
                     prompt,
                     stored,
                     prefix_bound,
+                    run_start,
                     &mut events,
                 ))
                 .await?;
@@ -839,6 +847,7 @@ impl Runtime<'_> {
             prompt,
             stored,
             prefix_bound,
+            run_start,
             &mut events,
         ))
         .await?;
@@ -857,6 +866,7 @@ impl Runtime<'_> {
         prompt: &[Message],
         stored: &[Message],
         prefix_bound: bool,
+        run_start: bool,
         events: &mut Vec<Event>,
     ) -> Result<bool, crate::RunError> {
         let version = fetched.view_version;
@@ -868,6 +878,7 @@ impl Runtime<'_> {
             prompt,
             stored,
             prefix_bound,
+            run_start,
         ))
         .await?;
         match &decision {
@@ -916,6 +927,7 @@ impl Runtime<'_> {
         prompt: &[Message],
         stored: &[Message],
         prefix_bound: bool,
+        run_start: bool,
     ) -> Result<
         (
             view::Decision,
@@ -923,7 +935,7 @@ impl Runtime<'_> {
         ),
         crate::RunError,
     > {
-        let decision = view::decide(
+        let decision = view::decide_at(
             fetched,
             ready,
             state,
@@ -931,6 +943,7 @@ impl Runtime<'_> {
             prompt,
             stored,
             prefix_bound,
+            run_start,
         );
         if let view::Decision::Apply(choice) = &decision {
             self.apply_view(state, fetched, choice.clone()).await?;

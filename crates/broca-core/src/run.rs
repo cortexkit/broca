@@ -4484,6 +4484,8 @@ where
                     &opts.prompt,
                     raw,
                     provider.reasoning_is_prefix_bound(),
+                    // The run's first step, where a view deferred over an open turn ends.
+                    completed_steps == 0,
                 ))
                 .await?
             };

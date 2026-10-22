@@ -372,7 +372,7 @@ impl Decision {
 /// tool turn (the last assistant message of the history, when it makes tool calls, whatever
 /// user text follows its results); a view that would invalidate or leave out that reasoning is
 /// deferred until a later boundary where the turn is over (`view_deferred:<v>:signed_reasoning`),
-/// but never past a step that starts from a user message, where it is refused
+/// but never past the first step of the session's next run, where it is refused
 /// (`view_refused:<v>:provider_constraint`).
 /// Any other invalidated reasoning is left out of every request from now on, by applying the
 /// view with the companion strip (`view_companion:<v>:strip_signed_reasoning`) over the
@@ -387,6 +387,32 @@ pub fn decide(
     prompt: &[Message],
     stored: &[Message],
     prefix_bound: bool,
+) -> Decision {
+    decide_at(
+        view,
+        ready,
+        state,
+        lineage_id,
+        prompt,
+        stored,
+        prefix_bound,
+        false,
+    )
+}
+
+/// [`decide`] at a step boundary that is, or is not (`run_start`), the first step of a run.
+/// The first step of a run is where a deferral ends: a view that would still be deferred there
+/// is refused instead.
+#[allow(clippy::too_many_arguments)]
+pub fn decide_at(
+    view: &CompactionView,
+    ready: &ViewReady,
+    state: &CompactionState,
+    lineage_id: &str,
+    prompt: &[Message],
+    stored: &[Message],
+    prefix_bound: bool,
+    run_start: bool,
 ) -> Decision {
     let entries: BTreeMap<u64, TranscriptMessage> = transcript(prompt)
         .filter_map(transcript_message)
@@ -432,11 +458,12 @@ pub fn decide(
     if open_turn(&next)
         .is_some_and(|open| open >= first && next[open].content.iter().any(is_prefix_bound))
     {
-        // A deferral lasts no later than the next step that starts from a user message
-        // (compaction-provider §7). Such a request still carries the open turn's reasoning, so
-        // the view cannot be applied there without breaking it: it is refused, never deferred
-        // again.
-        if starts_from_user_message(prompt) {
+        // A deferral lasts no later than the first step of the session's next run
+        // (compaction-provider §7, as SUBC ruled it for 0.4.1: a steer, a delivered notice or a
+        // tool result continues the running run and does not end it). That request still
+        // carries the open turn's reasoning, so the view cannot be applied there without
+        // breaking it: it is refused, never deferred again.
+        if run_start {
             return Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT);
         }
         return Decision::Defer(defer_reasons::SIGNED_REASONING);
@@ -483,18 +510,6 @@ fn first_difference(before: &[Message], after: &[Message]) -> usize {
 /// the model provider requires its reasoning unchanged. A user message after the results (a
 /// steer delivered at the boundary) does not close the turn: the provider takes it together
 /// with the results. `None` when the last assistant message makes no call.
-/// Whether the request rendered from `prompt` starts from a user message: its last transcript
-/// message is the user's (a new run's prompt, a steer), not only tool results.
-fn starts_from_user_message(prompt: &[Message]) -> bool {
-    transcript(prompt).last().is_some_and(|message| {
-        message.role == Role::User
-            && message
-                .content
-                .iter()
-                .any(|block| !matches!(block, ContentBlock::ToolResult(_)))
-    })
-}
-
 fn open_turn(history: &[Message]) -> Option<usize> {
     let last_assistant = history.iter().rposition(|m| m.role == Role::Assistant)?;
     history[last_assistant]

@@ -221,7 +221,9 @@ async fn mismatched_views_are_never_applied() {
         };
         let mut live = state.clone();
         let (decision, event) = runtime
-            .offer_view(&mut live, &view, &ready, LINEAGE, &prompt, &prompt, true)
+            .offer_view(
+                &mut live, &view, &ready, LINEAGE, &prompt, &prompt, true, false,
+            )
             .await
             .unwrap();
         assert_eq!(decision, expected, "{label}");
@@ -322,30 +324,6 @@ fn signed_reasoning_is_stripped_or_the_view_deferred() {
         "view_deferred:2:signed_reasoning"
     );
 
-    // The same open turn at a step that starts from a user message (a new run's prompt after
-    // the results): the deferral ends there, and the view is refused for the provider's
-    // constraint instead of deferred again.
-    let mut prompted = open.clone();
-    prompted.push(text(Role::User, "next prompt"));
-    let prompted = stamped(prompted);
-    let refused = decide(
-        &head_open,
-        &head_open_ready,
-        &state,
-        LINEAGE,
-        &prompted,
-        &prompted,
-        true,
-    );
-    assert_eq!(
-        refused,
-        Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT)
-    );
-    assert_eq!(
-        refused.event(2).unwrap().token(),
-        "view_refused:2:provider_constraint"
-    );
-
     // A view whose first change comes after every signed block needs no companion edit. (Under
     // a Setup head the view's dropping that head would itself be a change before them, so the
     // session here has an empty head.)
@@ -393,7 +371,7 @@ async fn apply_over(
         control: &control,
     };
     let (decision, _) = runtime
-        .offer_view(state, view, ready, LINEAGE, prompt, stored, true)
+        .offer_view(state, view, ready, LINEAGE, prompt, stored, true, false)
         .await
         .unwrap();
     writer.shutdown().await.unwrap();
@@ -884,10 +862,9 @@ async fn a_change_only_in_rendered_bytes_still_strips_the_reasoning_after_it() {
 }
 
 /// User text after the tool results (a steer delivered at the boundary) does not close the
-/// open tool turn, so a view that would invalidate that turn's reasoning is never applied with a
-/// strip of the reasoning the continuation needs. That step starts from a user message, which a
-/// deferral may not outlast (compaction-provider §7): the view is refused for the provider's
-/// constraint.
+/// open tool turn. A view that would invalidate that turn's reasoning is deferred, not applied
+/// with a strip of the reasoning the continuation needs: a steer continues the running run, so
+/// it does not end a deferral (compaction-provider §7).
 #[test]
 fn a_steer_after_the_tool_results_keeps_the_turn_open() {
     let prompt = stamped(vec![
@@ -914,7 +891,52 @@ fn a_steer_after_the_tool_results_keeps_the_turn_open() {
             &prompt,
             true
         ),
+        Decision::Defer(defer_reasons::SIGNED_REASONING)
+    );
+}
+
+/// A view deferred over the open tool turn when a run ends stays deferred at no later step: at
+/// the first step of the session's next run it is refused for the provider's constraint
+/// (compaction-provider §7), whatever the request ends with, and the same request inside a run
+/// still defers it.
+#[test]
+fn a_deferral_pending_at_a_run_end_ends_at_the_next_runs_first_step() {
+    let summary = replace_bytes(&[text(Role::User, "summary")]);
+    let (view, ready) = make_view(
+        2,
+        5,
+        vec![ViewRange::replace(0, 0, summary), ViewRange::keep(0, 6)],
+    );
+    let state = after_setup();
+    // The run ended after the open turn's results, its view deferred.
+    let mut ended = conversation();
+    ended.truncate(4);
+    ended.push(assistant(vec![signed("answer"), call("b")]));
+    ended.push(Message::new(Role::Tool, vec![result("b")]));
+    let ended = stamped(ended);
+    assert_eq!(
+        decide_at(&view, &ready, &state, LINEAGE, &ended, &ended, true, false),
+        Decision::Defer(defer_reasons::SIGNED_REASONING)
+    );
+    // The next run's prompt joins the transcript; its first step ends the deferral.
+    let mut next_run = ended.clone();
+    next_run.push(text(Role::User, "next prompt"));
+    let next_run = stamped(next_run);
+    let refused = decide_at(
+        &view, &ready, &state, LINEAGE, &next_run, &next_run, true, true,
+    );
+    assert_eq!(
+        refused,
         Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT)
+    );
+    assert_eq!(
+        refused.event(2).unwrap().token(),
+        "view_refused:2:provider_constraint"
+    );
+    // The same request at a later step of a run (a steer, say) keeps deferring.
+    assert_eq!(
+        decide_at(&view, &ready, &state, LINEAGE, &next_run, &next_run, true, false),
+        Decision::Defer(defer_reasons::SIGNED_REASONING)
     );
 }
 

@@ -22777,19 +22777,17 @@ old = "                    self.described = Some(described);"
 new = "                    let _ = described; // NON-VACUITY BREAK: serve the inline message."
 
 [[control]]
-id = "compaction-deferral-ends-at-a-user-message-step"
-guards = "A view deferred for signed reasoning is refused, never deferred again, at a step that starts from a user message"
+id = "compaction-deferral-ends-at-the-next-runs-first-step"
+guards = "A view deferred for signed reasoning is refused, never deferred again, at the first step of the session's next run, and a step inside a run keeps deferring"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
 select = "expected"
-only = false
 test_file = "crates/broca-core/src/compaction/view_tests.rs"
-expect_red = ["compaction::view::tests::signed_reasoning_is_stripped_or_the_view_deferred", "compaction::view::tests::a_steer_after_the_tool_results_keeps_the_turn_open"]
+expect_red = ["compaction::view::tests::a_deferral_pending_at_a_run_end_ends_at_the_next_runs_first_step"]
 file = "crates/broca-core/src/compaction/view.rs"
-old = "        if starts_from_user_message(prompt) {"
-new = "        if false && starts_from_user_message(prompt) { // NON-VACUITY BREAK: keep deferring."
-
+old = "        if run_start {"
+new = "        if false && run_start { // NON-VACUITY BREAK: keep deferring past the next run's first step."
 [[control]]
 id = "template-part-tag-names-a-shown-part"
 guards = "A part_tag slot renders only the number the part its {mid, part} names shows"
