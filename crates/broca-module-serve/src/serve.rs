@@ -993,9 +993,9 @@ where
             joined = routes.bind_tasks.join_next(), if !routes.bind_tasks.is_empty() => {
                 match joined.expect("guarded by !routes.bind_tasks.is_empty()") {
                     Ok(completed) => finish_bind(completed, &writer, &mut routes).await?,
-                    // A panic in one bind's authorization is that bind's failure, not the
-                    // connection's: every other route and stream on this connection is healthy.
-                    // The bind is never acknowledged, so its caller sees it time out, and its
+                    // A panic inside the adoption check is caught in `authorize_bind` and
+                    // answered as a transient refusal. Reaching here means the task failed
+                    // outside it; that is still this bind's failure, not the connection's. Its
                     // pending entry is replaced by a rebind or removed by its GOODBYE.
                     Err(error) => tracing::error!(
                         target: "wire.ingress",
@@ -1010,11 +1010,10 @@ where
                     // unusable, so it still ends the loop.
                     Ok(Err(e)) => break Err(e),
                     Err(e) if e.is_cancelled() => {}
-                    // A panic is confined to its own request. Ending the loop here would cut
-                    // every session's streams and in-flight sends on this connection for one
-                    // request's bug. The task's correlation is gone with it, so no reply is
-                    // fabricated: its caller sees an unanswered request, which is what an
-                    // outcome that cannot be known looks like.
+                    // A panic in a request is answered inside its task (`reply_on_panic`).
+                    // Reaching here means the task failed outside that guard. It is still
+                    // confined to its own request: ending the loop would cut every session's
+                    // streams and in-flight sends on this connection for one request's bug.
                     Err(e) => tracing::error!(
                         target: "wire.ingress",
                         "route request task failed; dropping only that request: {e}"
@@ -1232,7 +1231,7 @@ where
                     .clone();
                 let read_only = crate::agent_data::request_is_read_only(&frame.body);
                 let reply_cancel = cancel.clone();
-                request_tasks.spawn(async move {
+                request_tasks.spawn(reply_on_panic(writer.clone(), (ver, channel, epoch, corr), async move {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled(), if read_only => Ok(()),
@@ -1275,7 +1274,7 @@ where
                     }
                         } => result,
                     }
-                });
+                }));
                 return Ok(true);
             }
             let req: RouteRequest = match serde_json::from_slice(&frame.body) {
@@ -1786,18 +1785,80 @@ async fn handle_control_request(
     }
 }
 
+/// Drive `task` to completion, turning a panic raised while polling it into `Err(())`. The
+/// payload is discarded: it can carry arbitrary internal state and is never reported.
+async fn catch_panic<F: std::future::Future>(task: F) -> Result<F::Output, ()> {
+    let mut task = std::pin::pin!(task);
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(_) => std::task::Poll::Ready(Err(())),
+        }
+    })
+    .await
+}
+
+/// The message of the refusal that answers a request whose task panicked. Fixed text: a panic
+/// payload can carry arbitrary internal state, so it never reaches the caller.
+const REQUEST_PANICKED_MESSAGE: &str = "the request failed inside broca before it was answered";
+
+/// Run one route request's task, answering its correlation with a transient refusal if the
+/// task panics. Without the answer the caller waits out its whole timeout and cannot tell a
+/// crash from a slow reply. The panic stays confined to this request: the connection and every
+/// other request on it keep running.
+async fn reply_on_panic<F>(
+    writer: EgressSender<Frame>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    task: F,
+) -> Result<(), ServeIoError>
+where
+    F: std::future::Future<Output = Result<(), ServeIoError>>,
+{
+    match catch_panic(task).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                target: "wire.ingress",
+                channel, epoch, corr,
+                "route request task panicked; answering it with a transient refusal"
+            );
+            send_serve_error(
+                &writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                &ServeError::Transient(REQUEST_PANICKED_MESSAGE.into()),
+            )
+            .await
+        }
+    }
+}
+
 async fn authorize_bind(
     mut completed: BindCompletion,
     registry: LineageRegistry,
 ) -> BindCompletion {
     if let broca_protocol::SendScope::Stamped(stamp) = &completed.bind.scope {
-        completed.refusal = registry
-            .bind_adoption_refusal(
-                &completed.identity,
-                completed.bind.principal.as_ref(),
-                stamp,
-            )
-            .await;
+        let check = registry.bind_adoption_refusal(
+            &completed.identity,
+            completed.bind.principal.as_ref(),
+            stamp,
+        );
+        // A panic in the check refuses this bind as transient, through the same reply as an
+        // unreadable history, instead of leaving the bind unanswered.
+        let refusal = match catch_panic(check).await {
+            Ok(refusal) => refusal,
+            Err(_) => {
+                tracing::error!(
+                    target: "wire.ingress",
+                    channel = completed.channel, epoch = completed.epoch,
+                    "bind authorization panicked; refusing the bind as transient"
+                );
+                Err(ServeError::Transient(REQUEST_PANICKED_MESSAGE.into()))
+            }
+        };
+        completed.refusal = refusal;
     }
     completed
 }
@@ -1928,7 +1989,7 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
     let request_slots = request_slots.clone();
     let writer = writer.clone();
     let conn_cancel = conn_cancel.clone();
-    request_tasks.spawn(async move {
+    request_tasks.spawn(reply_on_panic(writer.clone(), (ver, channel, epoch, corr), async move {
         let _permit = request_slots
             .acquire_owned()
             .await
@@ -1979,7 +2040,7 @@ async fn spawn_vault_audit_request<H: ServeHandler + 'static>(
             Some((operation, session)) => log_served_request(operation, session, request).await,
             None => request.await,
         }
-    });
+    }));
     Ok(())
 }
 
@@ -2009,7 +2070,7 @@ where
     let describe =
         matches!(&prepared, PreparedRouteRequest::Request(req) if req.method == OP_ROLE_DESCRIBE);
 
-    request_tasks.spawn(async move {
+    request_tasks.spawn(reply_on_panic(writer.clone(), (ver, channel, epoch, corr), async move {
         // Authorization can read durable history, and permits can be held by slow calls.
         // Neither wait belongs on the frame reader: it must still answer PING and GOODBYE.
         let _turn = dispatch_ticket.wait().await;
@@ -2099,7 +2160,7 @@ where
             Some((operation, session)) => log_served_request(operation, session, request).await,
             None => request.await,
         }
-    });
+    }));
     Ok(())
 }
 
@@ -6995,8 +7056,9 @@ mod tests {
         serve.abort();
     }
 
-    /// A panic inside one request's task is confined to that request: the connection keeps
-    /// answering frames and ends normally on GOODBYE instead of failing the whole serve loop.
+    /// A panic inside one request's task is confined to that request: the request is answered
+    /// on its own correlation with a transient refusal carrying a fixed message, and the
+    /// connection keeps answering frames and ends normally on GOODBYE.
     #[tokio::test]
     async fn a_panicking_request_does_not_end_the_connection() {
         let (mut daemon, mut module_read) = tokio::io::duplex(64 * 1024);
@@ -7088,7 +7150,36 @@ mod tests {
         )
         .await
         .unwrap();
-        let pong = next_written(&mut written).await;
+        // The refusal and the PONG race on egress; take what arrives, in correlation order.
+        let mut frames = Vec::new();
+        while frames.len() < 2 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), written.recv()).await {
+                Ok(Some(frame)) => frames.push(frame),
+                _ => break,
+            }
+        }
+        let refusal = frames
+            .iter()
+            .find(|frame| frame.header.corr == 3)
+            .expect("the panicked request must be answered on its own correlation");
+        assert_eq!(
+            (refusal.header.ty, refusal.header.channel),
+            (FrameType::Error, 7)
+        );
+        let pong = frames
+            .iter()
+            .find(|frame| frame.header.corr == 4)
+            .expect("the connection still answers PING");
+        let body: ErrorBody = serde_json::from_slice(&refusal.body).unwrap();
+        assert_eq!(body.code, "transient");
+        assert_eq!(
+            body.message,
+            ServeError::Transient(REQUEST_PANICKED_MESSAGE.into()).to_string()
+        );
+        assert!(
+            !body.message.contains("a request handler bug"),
+            "the panic payload must not reach the caller"
+        );
         assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 4));
         write_frame(
             &mut daemon,

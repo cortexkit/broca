@@ -23569,6 +23569,13 @@ target = "--lib"
 select = "expected"
 test_file = "crates/broca-module-serve/src/serve.rs"
 expect_red = ["serve::tests::a_panicking_request_does_not_end_the_connection"]
+# Two layers hold the property: the request task catches its own panic, and the serve loop
+# confines a task failure that escapes. The break removes both.
+[[control.edits]]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        Ok(result) => result,\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
+new = "        Ok(result) => result,\n        Err(()) if true => panic!(\"request task panicked\"), // NON-VACUITY BREAK: let the panic escape the task.\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
+[[control.edits]]
 file = "crates/broca-module-serve/src/serve.rs"
 old = "                    Err(e) => tracing::error!(\n                        target: \"wire.ingress\",\n                        \"route request task failed; dropping only that request: {e}\"\n                    ),"
 new = "                    Err(e) => break Err(ServeIoError(format!(\"route request task failed: {e}\"))), // NON-VACUITY BREAK: one panic ends the connection."
@@ -23642,3 +23649,17 @@ expect_message = "a resume near the head must not build the session's whole hist
 file = "crates/broca-module/src/fanout.rs"
 old = "            advance_control_projection_state(&durable_prefix[..skipped], &mut state);\n            let projected = project_control_with_state(&durable_prefix[skipped..], &mut state);"
 new = "            let _ = skipped; // NON-VACUITY BREAK: materialize the whole prefix.\n            let projected = project_control_with_state(&durable_prefix, &mut state);"
+
+[[control]]
+id = "serve-request-panic-is-answered"
+guards = "A route request whose task panics is answered on its own correlation with a transient refusal, never left unanswered"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::a_panicking_request_does_not_end_the_connection"]
+expect_message = "the panicked request must be answered on its own correlation"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        Ok(result) => result,\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
+new = "        Ok(result) => result,\n        Err(_) if true => Ok(()), // NON-VACUITY BREAK: leave the panicked request unanswered.\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
