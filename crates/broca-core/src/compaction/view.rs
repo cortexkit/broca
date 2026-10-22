@@ -371,7 +371,9 @@ impl Decision {
 /// provider copied into a replace range. The model provider requires the reasoning of the open
 /// tool turn (the last assistant message of the history, when it makes tool calls, whatever
 /// user text follows its results); a view that would invalidate or leave out that reasoning is
-/// deferred until a later boundary where the turn is over (`view_deferred:<v>:signed_reasoning`).
+/// deferred until a later boundary where the turn is over (`view_deferred:<v>:signed_reasoning`),
+/// but never past a step that starts from a user message, where it is refused
+/// (`view_refused:<v>:provider_constraint`).
 /// Any other invalidated reasoning is left out of every request from now on, by applying the
 /// view with the companion strip (`view_companion:<v>:strip_signed_reasoning`) over the
 /// ordinals from the first invalidated block to the end of the transcript. Messages written
@@ -430,6 +432,13 @@ pub fn decide(
     if open_turn(&next)
         .is_some_and(|open| open >= first && next[open].content.iter().any(is_prefix_bound))
     {
+        // A deferral lasts no later than the next step that starts from a user message
+        // (compaction-provider §7). Such a request still carries the open turn's reasoning, so
+        // the view cannot be applied there without breaking it: it is refused, never deferred
+        // again.
+        if starts_from_user_message(prompt) {
+            return Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT);
+        }
         return Decision::Defer(defer_reasons::SIGNED_REASONING);
     }
     let invalidated: Vec<u64> = next[first..]
@@ -474,6 +483,18 @@ fn first_difference(before: &[Message], after: &[Message]) -> usize {
 /// the model provider requires its reasoning unchanged. A user message after the results (a
 /// steer delivered at the boundary) does not close the turn: the provider takes it together
 /// with the results. `None` when the last assistant message makes no call.
+/// Whether the request rendered from `prompt` starts from a user message: its last transcript
+/// message is the user's (a new run's prompt, a steer), not only tool results.
+fn starts_from_user_message(prompt: &[Message]) -> bool {
+    transcript(prompt).last().is_some_and(|message| {
+        message.role == Role::User
+            && message
+                .content
+                .iter()
+                .any(|block| !matches!(block, ContentBlock::ToolResult(_)))
+    })
+}
+
 fn open_turn(history: &[Message]) -> Option<usize> {
     let last_assistant = history.iter().rposition(|m| m.role == Role::Assistant)?;
     history[last_assistant]

@@ -322,6 +322,30 @@ fn signed_reasoning_is_stripped_or_the_view_deferred() {
         "view_deferred:2:signed_reasoning"
     );
 
+    // The same open turn at a step that starts from a user message (a new run's prompt after
+    // the results): the deferral ends there, and the view is refused for the provider's
+    // constraint instead of deferred again.
+    let mut prompted = open.clone();
+    prompted.push(text(Role::User, "next prompt"));
+    let prompted = stamped(prompted);
+    let refused = decide(
+        &head_open,
+        &head_open_ready,
+        &state,
+        LINEAGE,
+        &prompted,
+        &prompted,
+        true,
+    );
+    assert_eq!(
+        refused,
+        Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT)
+    );
+    assert_eq!(
+        refused.event(2).unwrap().token(),
+        "view_refused:2:provider_constraint"
+    );
+
     // A view whose first change comes after every signed block needs no companion edit. (Under
     // a Setup head the view's dropping that head would itself be a change before them, so the
     // session here has an empty head.)
@@ -859,9 +883,11 @@ async fn a_change_only_in_rendered_bytes_still_strips_the_reasoning_after_it() {
         .all(|message| !message.content.iter().any(is_prefix_bound)));
 }
 
-/// User text after the tool results (a steer delivered at the boundary) does not
-/// close the open tool turn. A view that would invalidate that turn's reasoning is deferred,
-/// not applied with a strip of the reasoning the continuation needs.
+/// User text after the tool results (a steer delivered at the boundary) does not close the
+/// open tool turn, so a view that would invalidate that turn's reasoning is never applied with a
+/// strip of the reasoning the continuation needs. That step starts from a user message, which a
+/// deferral may not outlast (compaction-provider §7): the view is refused for the provider's
+/// constraint.
 #[test]
 fn a_steer_after_the_tool_results_keeps_the_turn_open() {
     let prompt = stamped(vec![
@@ -888,7 +914,7 @@ fn a_steer_after_the_tool_results_keeps_the_turn_open() {
             &prompt,
             true
         ),
-        Decision::Defer(defer_reasons::SIGNED_REASONING)
+        Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT)
     );
 }
 

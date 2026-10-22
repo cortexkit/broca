@@ -19839,7 +19839,7 @@ new = "message.content.retain(|_block| true); // NON-VACUITY BREAK: keep reasoni
 
 [[control]]
 id = "compaction-view-defers-over-the-open-turn"
-guards = "a view that would invalidate or leave out the signed reasoning of the open tool turn (a steer after its results included, or the turn copied into a fold) is deferred, not applied"
+guards = "a view that would invalidate or leave out the signed reasoning of the open tool turn (the turn copied into a fold included) is deferred, or refused at a step that starts from a user message such as a steer after its results, never applied"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
@@ -22728,19 +22728,6 @@ old = "            WalRecord::CompactionMessage { tag_checkpoint, .. } => tag_ch
 new = "            WalRecord::CompactionMessage { tag_checkpoint, .. } => tag_checkpoint.is_none() && false, // NON-VACUITY BREAK: write the checkpoint ungated."
 
 [[control]]
-id = "template-part-tag-names-a-shown-part"
-guards = "A part_tag slot renders only the number the part its {mid, part} names shows"
-runner = "cargo"
-package = "broca-module"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-module/src/actor.rs"
-expect_red = ["actor::shown_number_tests::a_part_tag_names_the_number_its_part_shows"]
-file = "crates/broca-module/src/actor.rs"
-old = "    if key_message != part.mid {"
-new = "    if key_message != part.mid && false { // NON-VACUITY BREAK: accept a part key of another message."
-
-[[control]]
 id = "read-cleans-model-text-where-its-run-cleans"
 guards = "session.read serves the model's text cleaned of tag notation for a tag-rendering run, stored text staying raw"
 runner = "cargo"
@@ -22778,3 +22765,30 @@ expect_red = ["caller_message_tests::a_descriptors_read_describes_large_payloads
 file = "crates/broca-wire/src/lib.rs"
 old = "                    self.described = Some(described);"
 new = "                    let _ = described; // NON-VACUITY BREAK: serve the inline message."
+
+[[control]]
+id = "compaction-deferral-ends-at-a-user-message-step"
+guards = "A view deferred for signed reasoning is refused, never deferred again, at a step that starts from a user message"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+only = false
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::signed_reasoning_is_stripped_or_the_view_deferred", "compaction::view::tests::a_steer_after_the_tool_results_keeps_the_turn_open"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "        if starts_from_user_message(prompt) {"
+new = "        if false && starts_from_user_message(prompt) { // NON-VACUITY BREAK: keep deferring."
+
+[[control]]
+id = "template-part-tag-names-a-shown-part"
+guards = "A part_tag slot renders only the number the part its {mid, part} names shows"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::shown_number_tests::a_part_tag_names_the_number_its_part_shows"]
+file = "crates/broca-module/src/actor.rs"
+old = "    if key_message != part.mid {"
+new = "    if key_message != part.mid && false { // NON-VACUITY BREAK: accept a part key of another message."
