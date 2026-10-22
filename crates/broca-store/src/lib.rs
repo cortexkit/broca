@@ -30,6 +30,8 @@ use broca_wal::{
 };
 use rusqlite::{config::DbConfig, Connection, OptionalExtension};
 
+const STORE_SCHEMA_VERSION: i64 = 1;
+
 mod busy;
 use busy::STORE_BUSY_TIMEOUT;
 
@@ -250,6 +252,40 @@ pub struct SqliteStore {
     pub(crate) export_high_water: AtomicU64,
     pub(crate) export_source_instance_id: String,
     pub(crate) export_source_epoch: u64,
+}
+
+struct SchemaUpgradeLog {
+    from_version: i64,
+    to_version: i64,
+    started_at: std::time::Instant,
+}
+
+impl SchemaUpgradeLog {
+    fn new(from_version: i64, to_version: i64) -> Self {
+        tracing::info!(
+            target: "store.schema",
+            from_version,
+            to_version,
+            "store schema upgrade started"
+        );
+        Self {
+            from_version,
+            to_version,
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for SchemaUpgradeLog {
+    fn drop(&mut self) {
+        tracing::info!(
+            target: "store.schema",
+            from_version = self.from_version,
+            to_version = self.to_version,
+            elapsed_ms = self.started_at.elapsed().as_millis(),
+            "store schema upgrade ended"
+        );
+    }
 }
 
 const OPTIMISTIC_PROJECTION_ATTEMPTS: usize = 3;
@@ -939,6 +975,17 @@ impl SqliteStore {
         let schema_tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let conn = &schema_tx;
+        let from_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let has_existing_schema: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type='table' AND name IN ('meta', 'message', 'run_index')
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        let _upgrade_log = (from_version < STORE_SCHEMA_VERSION && has_existing_schema)
+            .then(|| SchemaUpgradeLog::new(from_version, STORE_SCHEMA_VERSION));
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (
                  session TEXT PRIMARY KEY,
@@ -1151,6 +1198,11 @@ impl SqliteStore {
         compaction_receipts::init_schema(conn)?;
         compaction_facts::init_schema(conn)?;
         let source = export_index::init_schema(conn).map_err(StoreError::from)?;
+        if from_version < STORE_SCHEMA_VERSION {
+            // `user_version` provides one global checkpoint for this idempotent schema path.
+            // New databases get the marker without being reported as an upgrade.
+            conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+        }
         schema_tx.commit()?;
         Ok(source)
     }
@@ -2891,6 +2943,57 @@ mod tests {
         );
         SqliteStore::init(&conn).unwrap();
         SqliteStore::init(&conn).unwrap();
+    }
+
+    #[test]
+    fn schema_upgrade_logs_source_target_and_elapsed_time_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        SqliteStore::init(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        let capture = broca_test_support::LogCapture::new();
+
+        capture.in_scope(|| SqliteStore::init(&conn).unwrap());
+
+        let events = capture.events();
+        let started: Vec<_> = events
+            .iter()
+            .filter(|event| event.message() == "store schema upgrade started")
+            .collect();
+        let ended: Vec<_> = events
+            .iter()
+            .filter(|event| event.message() == "store schema upgrade ended")
+            .collect();
+        assert_eq!(started.len(), 1, "{events:?}");
+        assert_eq!(ended.len(), 1, "{events:?}");
+        assert_eq!(started[0].level, tracing::Level::INFO);
+        assert_eq!(started[0].fields["from_version"], "0");
+        assert_eq!(started[0].fields["to_version"], "1");
+        assert_eq!(ended[0].level, tracing::Level::INFO);
+        assert_eq!(ended[0].fields["from_version"], "0");
+        assert_eq!(ended[0].fields["to_version"], "1");
+        assert!(ended[0].fields.contains_key("elapsed_ms"));
+    }
+
+    #[test]
+    fn schema_initialization_without_an_upgrade_emits_no_upgrade_logs() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let capture = broca_test_support::LogCapture::new();
+
+        capture.in_scope(|| {
+            SqliteStore::init(&conn).unwrap();
+            SqliteStore::init(&conn).unwrap();
+        });
+
+        let events = capture.events();
+        assert!(
+            events.iter().all(|event| {
+                !matches!(
+                    event.message(),
+                    "store schema upgrade started" | "store schema upgrade ended"
+                )
+            }),
+            "{events:?}"
+        );
     }
 
     #[test]
