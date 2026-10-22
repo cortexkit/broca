@@ -175,6 +175,60 @@ impl WalStore for ZeroRangeCountingWalStore {
     }
 }
 
+/// A WAL store that reports no file identity, as `FileWalStore` does on Windows, where the
+/// standard library exposes no stable file id. The read path keys its cached flush proof on
+/// that identity, so without one an idle read that finds WAL records past the stored
+/// watermark must take a fresh flush barrier. Wrapping a real store lets a Unix run take the
+/// durability branch a Windows run takes; range reads still go to the Unix store, which can
+/// return byte anchors where Windows returns none.
+struct NoFileIdentityWalStore {
+    inner: Arc<dyn WalStore>,
+}
+
+impl WalStore for NoFileIdentityWalStore {
+    fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, broca_wal::WalError> {
+        self.inner.open(session)
+    }
+
+    fn read_records(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+        self.inner.read_records(session)
+    }
+
+    fn read_records_range(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        anchor: Option<&broca_wal::WalByteAnchor>,
+    ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+        self.inner
+            .read_records_range(session, after_seq, through_seq, anchor)
+    }
+
+    fn flush_for_read(&self, session: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        // Still flush, so the barrier's success or failure is real; only the identity is hidden.
+        self.inner.flush_for_read(session).map(|_| None)
+    }
+
+    fn file_identity(&self, _session: &BindIdentity) -> Result<Option<u64>, broca_wal::WalError> {
+        Ok(None)
+    }
+
+    fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
+        self.inner.wal_present(session)
+    }
+
+    fn live_wal_last_write(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<std::time::SystemTime>, broca_wal::WalError> {
+        self.inner.live_wal_last_write(session)
+    }
+}
+
 struct FlushCountingWalStore {
     inner: Arc<FileWalStore>,
     flushes: Arc<AtomicUsize>,
@@ -326,6 +380,20 @@ impl Rig {
         tag: &str,
         make_exec: impl FnOnce(Arc<FileWalStore>, Arc<broca_store::SqliteStore>) -> Arc<dyn RunExecutor>,
     ) -> (Self, Arc<AtomicUsize>) {
+        Self::counting_zero_ranges(tag, make_exec, false)
+    }
+
+    /// [`Self::with_counting_zero_ranges`] whose session reads see no WAL file identity, which
+    /// is how every read runs on Windows.
+    fn with_counting_zero_ranges_without_file_identity(tag: &str) -> (Self, Arc<AtomicUsize>) {
+        Self::counting_zero_ranges(tag, |_, _| Arc::new(NoopExec), true)
+    }
+
+    fn counting_zero_ranges(
+        tag: &str,
+        make_exec: impl FnOnce(Arc<FileWalStore>, Arc<broca_store::SqliteStore>) -> Arc<dyn RunExecutor>,
+        hide_file_identity: bool,
+    ) -> (Self, Arc<AtomicUsize>) {
         let dir = broca_test_support::scratch_root().join(format!(
             "broca-session-read-{}-{tag}-{}",
             std::process::id(),
@@ -349,7 +417,15 @@ impl Rig {
                 .with_run_index(store.clone())
                 .with_materialized_store(store.clone()),
         );
-        let wal_reader: Arc<dyn WalStore> = counting_wal;
+        // Only the registry's reader hides the identity: these tests read with no actor open,
+        // so the opener's store never serves a session read.
+        let wal_reader: Arc<dyn WalStore> = if hide_file_identity {
+            Arc::new(NoFileIdentityWalStore {
+                inner: counting_wal,
+            })
+        } else {
+            counting_wal
+        };
         let store_reader: Arc<dyn MaterializedStore> = store.clone();
         let registry = LineageRegistry::new_with_reader(opener, wal_reader, Some(store_reader));
         (
@@ -715,11 +791,46 @@ async fn range_projection_persists_lineage_with_its_page_checkpoint() {
 async fn unidentified_store_snapshot_replays_once_then_reads_incrementally() {
     let (rig, zero_range_reads) = Rig::with_counting_zero_ranges("legacy-store-lineage-unknown");
     let key = rig.key("legacy-store");
+    seed_legacy_store_session(&rig, &key);
+    // Unix exposes a WAL file identity and Windows does not. Byte anchors are minted only
+    // under that identity, so the two are present or absent together on every platform.
+    let file_identity = WalStore::file_identity(rig.wal_store.as_ref(), &key)
+        .expect("read WAL file identity")
+        .is_some();
+    let anchors = rig
+        .wal_store
+        .read_records_range(&key, 0, None, None)
+        .expect("read complete WAL")
+        .next_anchor
+        .is_some();
+    assert_eq!(
+        anchors, file_identity,
+        "byte anchors exist exactly when the WAL has a file identity"
+    );
+    assert_unidentified_store_snapshot_repair(&rig, &key, &zero_range_reads, file_identity).await;
+}
+
+/// The durability branch a Windows host takes, exercised on any host by hiding the WAL file
+/// identity from the registry's reader. The first read pays two sequence-zero range reads
+/// there; every later read requests only the WAL sequences after the repaired prefix's
+/// watermark.
+#[tokio::test]
+async fn unidentified_store_snapshot_without_file_identity_takes_its_own_flush_proof() {
+    let (rig, zero_range_reads) =
+        Rig::with_counting_zero_ranges_without_file_identity("legacy-store-no-file-identity");
+    let key = rig.key("legacy-store");
+    seed_legacy_store_session(&rig, &key);
+    assert_unidentified_store_snapshot_repair(&rig, &key, &zero_range_reads, false).await;
+}
+
+/// Seed a finished run and project it without recording the WAL's lineage id, as a store
+/// written before lineage ids existed would hold it.
+fn seed_legacy_store_session(rig: &Rig, key: &BindIdentity) {
     append_seed(
         &rig.wal_store,
-        &key,
+        key,
         &[
-            started(&key, "run-legacy-store", "legacy prompt"),
+            started(key, "run-legacy-store", "legacy prompt"),
             assistant_text(0, "legacy answer"),
             WalRecord::RunFinished {
                 interrupt_reason: None,
@@ -733,11 +844,11 @@ async fn unidentified_store_snapshot_replays_once_then_reads_incrementally() {
     );
     let full_range = rig
         .wal_store
-        .read_records_range(&key, 0, None, None)
+        .read_records_range(key, 0, None, None)
         .expect("read complete WAL");
     rig.store
         .project(
-            &key,
+            key,
             match full_range.records() {
                 broca_wal::WalRangeRecords::Complete(records)
                 | broca_wal::WalRangeRecords::Partial(records)
@@ -746,20 +857,54 @@ async fn unidentified_store_snapshot_replays_once_then_reads_incrementally() {
             },
         )
         .expect("simulate a projection without lineage identity");
+}
+
+/// Read a session whose store prefix carries no WAL lineage id: the first read replays the WAL
+/// from sequence zero and persists the lineage with the repaired prefix, and later reads use
+/// that prefix plus its WAL suffix only.
+///
+/// How many sequence-zero range reads the first read makes depends on whether the reader sees
+/// a WAL file identity. Reading the WAL past the store's watermark takes a flush barrier, and
+/// the proof it yields is cached under the file identity. With an identity, the from-zero
+/// replay that follows is covered by that cached proof and reads the WAL once. Without one,
+/// the proof cannot be cached, because nothing could tell a replaced WAL from the one that was
+/// flushed; the replay then takes its own barrier, which reads the WAL, flushes it, and reads
+/// it again up to the head the first read saw. That second read is deliberate: it is what
+/// keeps a read from serving frames no flush has proven durable.
+async fn assert_unidentified_store_snapshot_repair(
+    rig: &Rig,
+    key: &BindIdentity,
+    zero_range_reads: &AtomicUsize,
+    reader_has_file_identity: bool,
+) {
+    let full_range = rig
+        .wal_store
+        .read_records_range(key, 0, None, None)
+        .expect("read complete WAL");
+    let records = match full_range.records() {
+        broca_wal::WalRangeRecords::Complete(records)
+        | broca_wal::WalRangeRecords::Partial(records)
+        | broca_wal::WalRangeRecords::Unknown(records) => records,
+        broca_wal::WalRangeRecords::Absent => &[],
+    };
     let legacy_snapshot = rig
         .store
-        .read_page_with_watermark(&key, Some(0), 10, broca_core::context::ReadView::Raw)
+        .read_page_with_watermark(key, Some(0), 10, broca_core::context::ReadView::Raw)
         .expect("read legacy store snapshot");
     assert_eq!(legacy_snapshot.lineage_id, None);
+    // The cached-proof path above needs a WAL record past the store's watermark; without one
+    // the suffix read takes no barrier and both platforms would pay the same replay cost.
+    assert!(
+        records
+            .last()
+            .is_some_and(|frame| frame.seq > legacy_snapshot.watermark_seq),
+        "the WAL must extend past the legacy store watermark {}",
+        legacy_snapshot.watermark_seq
+    );
 
     let mut expected = broca_core::read_session_page(
         &broca_core::StorePageSnapshot::empty(),
-        match full_range.records() {
-            broca_wal::WalRangeRecords::Complete(records)
-            | broca_wal::WalRangeRecords::Partial(records)
-            | broca_wal::WalRangeRecords::Unknown(records) => records,
-            broca_wal::WalRangeRecords::Absent => &[],
-        },
+        records,
         Some(0),
         Some(10),
     )
@@ -769,18 +914,20 @@ async fn unidentified_store_snapshot_replays_once_then_reads_incrementally() {
 
     let actual = rig
         .registry
-        .route_read(&key, Some(0), Some(10))
+        .route_read(key, Some(0), Some(10))
         .await
         .expect("unidentified store-backed session.read");
     assert_eq!(actual, expected);
+    let first_read_zero_ranges = if reader_has_file_identity { 1 } else { 2 };
     assert_eq!(
         zero_range_reads.load(Ordering::SeqCst),
-        1,
-        "an unidentified store prefix requires exactly one sequence-zero replay"
+        first_read_zero_ranges,
+        "an unidentified store prefix requires exactly one sequence-zero replay, read once \
+         under a cached flush proof or twice under its own barrier (file identity: {reader_has_file_identity})"
     );
     assert_eq!(
         rig.store
-            .read_prefix_with_watermark(&key)
+            .read_prefix_with_watermark(key)
             .unwrap()
             .lineage_id,
         full_range.lineage_id.map(|id| id.to_string()),
@@ -789,14 +936,14 @@ async fn unidentified_store_snapshot_replays_once_then_reads_incrementally() {
     for _ in 0..3 {
         assert_eq!(
             rig.registry
-                .route_read(&key, Some(0), Some(10))
+                .route_read(key, Some(0), Some(10))
                 .await
                 .unwrap(),
             expected
         );
         assert_eq!(
             zero_range_reads.load(Ordering::SeqCst),
-            1,
+            first_read_zero_ranges,
             "subsequent reads must use the identified prefix and only its WAL suffix"
         );
     }
