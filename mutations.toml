@@ -23620,3 +23620,17 @@ expect_message = "an oversized unit must end the stream with a typed error"
 file = "crates/broca-module-serve/src/serve.rs"
 old = "            if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {\n                let _ = send_undeliverable_unit("
 new = "            if frame_bytes > usize::MAX - 1 { // NON-VACUITY BREAK: no transport frame guard on stream data.\n                let _ = send_undeliverable_unit("
+
+[[control]]
+id = "fanout-attach-builds-only-delivered-units"
+guards = "A subscriber attach advances projection state through history it does not deliver instead of materializing every control unit of the session"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/fanout.rs"
+expect_red = ["fanout::tests::an_attach_builds_only_the_units_it_delivers"]
+expect_message = "a resume near the head must not build the session's whole history"
+file = "crates/broca-module/src/fanout.rs"
+old = "            advance_control_projection_state(&durable_prefix[..skipped], &mut state);\n            let projected = project_control_with_state(&durable_prefix[skipped..], &mut state);"
+new = "            let _ = skipped; // NON-VACUITY BREAK: materialize the whole prefix.\n            let projected = project_control_with_state(&durable_prefix, &mut state);"

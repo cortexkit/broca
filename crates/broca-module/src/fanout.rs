@@ -96,6 +96,76 @@ pub(crate) enum AttachFrom {
     Live,
 }
 
+/// What an attach replays from the durable prefix through the barrier head.
+struct AttachReplay {
+    /// Projection state after the whole prefix, handed to the live projector.
+    state: ControlProjectionState,
+    /// The last sequence number in the prefix.
+    seeded_h: u64,
+    /// The resolved attach point; `Live` becomes "after the prefix's last cursor".
+    from: FromCursor,
+    /// The units past the attach point, in order.
+    units: Vec<(Cursor, ControlUnit)>,
+    /// How many control units were constructed, delivered or not. Only tests read it: it is
+    /// how they show that an attach does not build the history it skips.
+    #[cfg_attr(not(test), allow(dead_code))]
+    built: usize,
+}
+
+/// Project the durable prefix `records` through `h` for one attach.
+///
+/// Only units the attach delivers are constructed. A record wholly before the attach point
+/// only advances the projection state, so a live attach or a resume near the head of a long
+/// session does not clone every message and tool payload of its history. A unit's cursor
+/// carries its record's sequence number, so every record before the cursor's record yields
+/// only units at or before the cursor.
+fn replay_for_attach(
+    records: Vec<broca_wal::FramedRecord>,
+    h: u64,
+    from: AttachFrom,
+) -> AttachReplay {
+    let durable_prefix: Vec<broca_wal::FramedRecord> =
+        records.into_iter().filter(|f| f.seq <= h).collect();
+    let seeded_h = durable_prefix.last().map_or(0, |record| record.seq);
+    let mut state = ControlProjectionState::default();
+    match from {
+        // Live uses the existing strictly-after comparison once the barrier has projected H.
+        // An empty lineage has no cursor to resume after, but Start is equivalent because its
+        // replay is empty.
+        AttachFrom::Live => {
+            let last = advance_control_projection_state(&durable_prefix, &mut state);
+            AttachReplay {
+                state,
+                seeded_h,
+                from: last.map_or(FromCursor::Start, FromCursor::After),
+                units: Vec::new(),
+                built: 0,
+            }
+        }
+        AttachFrom::Cursor(from) => {
+            let skipped = match from {
+                FromCursor::Start => 0,
+                FromCursor::After(cursor) => {
+                    durable_prefix.partition_point(|framed| framed.seq < cursor.wal_seq)
+                }
+            };
+            advance_control_projection_state(&durable_prefix[..skipped], &mut state);
+            let projected = project_control_with_state(&durable_prefix[skipped..], &mut state);
+            let built = projected.len();
+            AttachReplay {
+                state,
+                seeded_h,
+                from,
+                units: projected
+                    .into_iter()
+                    .filter(|(cursor, _)| from.includes(*cursor))
+                    .collect(),
+                built,
+            }
+        }
+    }
+}
+
 /// The attach-barrier decision for a unit arriving on the LIVE ring (step 2 of the
 /// subscriber task): deliver it ONLY if it's past the barrier head `h` AND past the
 /// client's attach point. A unit with `cursor.wal_seq <= h` was already delivered by the
@@ -874,18 +944,32 @@ async fn subscriber_task<W: WalStore + 'static>(
                 return;
             }
         };
-        let durable_prefix: Vec<broca_wal::FramedRecord> =
-            records.into_iter().filter(|f| f.seq <= h).collect();
-        let seeded_h = durable_prefix.last().map_or(0, |record| record.seq);
-        let mut replay_state = ControlProjectionState::default();
-        let replay = project_control_with_state(&durable_prefix, &mut replay_state);
-        // Live uses the existing strictly-after comparison once the barrier has projected H. An empty
-        // lineage has no cursor to resume after, but Start is equivalent because its replay is empty.
-        let from = match from {
-            AttachFrom::Live => replay
-                .last()
-                .map_or(FromCursor::Start, |(cursor, _)| FromCursor::After(*cursor)),
-            AttachFrom::Cursor(from) => from,
+        // Projection is CPU work proportional to the whole prefix, so it runs on the blocking
+        // pool rather than on the runtime worker carrying other sessions' streams.
+        let AttachReplay {
+            state: replay_state,
+            seeded_h,
+            from,
+            units: replay,
+            ..
+        } = match spawn_blocking(JobKind::Projection, move || {
+            replay_for_attach(records, h, from)
+        })
+        .await
+        {
+            Ok(replay) => replay,
+            Err(error) => {
+                slot.as_mut()
+                    .expect("subscriber slot remains owned during replay")
+                    .report_gate_owner_failure();
+                let _ = deliver(
+                    &sink,
+                    &cancel,
+                    Delivery::Error(format!("WAL replay task failed: {error}")),
+                )
+                .await;
+                return;
+            }
         };
         // Hand the projector the exact state this replay produced. Send before awaiting the subscriber
         // sink so live projection cannot remain unseeded behind a slow replay consumer.
@@ -903,9 +987,6 @@ async fn subscriber_task<W: WalStore + 'static>(
                 .projection_seed_handed_off();
         }
         for (cursor, unit) in replay {
-            if !from.includes(cursor) {
-                continue; // before the client's attach point
-            }
             if deliver(&sink, &cancel, Delivery::Control(Arc::new((cursor, unit))))
                 .await
                 .is_break()
@@ -1272,6 +1353,72 @@ mod tests {
             fence: 1,
             record,
         }
+    }
+
+    /// An attach near the head of a long session constructs only the units it delivers, and a
+    /// live attach constructs none; both hand the projector the same state a full projection
+    /// reaches, and deliver exactly the full projection's tail past the attach point.
+    #[test]
+    fn an_attach_builds_only_the_units_it_delivers() {
+        let session = BindIdentity::new("/tmp/project-a", "runner", "long-attach");
+        let mut records = Vec::new();
+        for _ in 0..200 {
+            for record in [
+                run_started(&session),
+                tool_step(),
+                WalRecord::ToolResult {
+                    tags: None,
+                    hooks: None,
+                    batch_id: broca_protocol::BatchId("b1".into()),
+                    result: broca_protocol::content::ToolResult {
+                        tool_call_id: ToolCallId("c1".into()),
+                        output: broca_protocol::content::ToolOutput::Text {
+                            text: "done".into(),
+                        },
+                        is_error: false,
+                    }
+                    .into(),
+                    outcome: broca_wal::DispatchOutcome::Completed,
+                    reason: None,
+                    withdraw_elicitation: None,
+                    provider_held: None,
+                },
+                run_finished(),
+            ] {
+                records.push(framed(records.len() as u64 + 1, record));
+            }
+        }
+        let h = records.len() as u64;
+        let full = broca_core::project_control(&records);
+        let whole_state = state_through(&records);
+        let cursor = full[full.len() - 3].0;
+
+        let resumed = replay_for_attach(
+            records.clone(),
+            h,
+            AttachFrom::Cursor(FromCursor::After(cursor)),
+        );
+        assert_eq!(resumed.units, full[full.len() - 2..].to_vec());
+        assert_eq!(resumed.state, whole_state);
+        assert_eq!(resumed.seeded_h, h);
+        assert!(
+            resumed.built <= 8,
+            "a resume near the head must not build the session's whole history ({} of {} units)",
+            resumed.built,
+            full.len()
+        );
+
+        let live = replay_for_attach(records.clone(), h, AttachFrom::Live);
+        assert_eq!(
+            live.built, 0,
+            "a live attach delivers no replay and builds none"
+        );
+        assert!(live.units.is_empty());
+        assert_eq!(live.state, whole_state);
+        assert!(matches!(live.from, FromCursor::After(last) if last == full.last().unwrap().0));
+
+        let from_start = replay_for_attach(records, h, AttachFrom::Cursor(FromCursor::Start));
+        assert_eq!(from_start.units, full);
     }
 
     fn state_through(records: &[FramedRecord]) -> ControlProjectionState {
