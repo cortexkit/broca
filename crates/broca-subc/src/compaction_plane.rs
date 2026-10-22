@@ -93,11 +93,12 @@ impl SubcCompactionPlane {
             Err(refusal) => {
                 let may_clear = describe_refusal_may_clear(&refusal.code);
                 if may_clear || describe_refusal_is_routing(&refusal.code) {
-                    Err(FetchError::Refused {
-                        code: refusal.code,
-                        detail: refusal.detail,
-                        retryable: may_clear,
-                    })
+                    Err(FetchError::provider_refused(
+                        refusal.code,
+                        refusal.detail,
+                        &refusal.message,
+                        may_clear,
+                    ))
                 } else {
                     Ok(DescribeAnswer::Refused { code: refusal.code })
                 }

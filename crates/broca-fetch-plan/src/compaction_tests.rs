@@ -407,12 +407,12 @@ async fn a_provider_that_could_not_be_asked_is_fetch_unavailable_not_a_role_refu
         (
             Ok(json!("not a describe")),
             json!({"provider": "magic-context", "reason": "refused",
-                "provider_code": "invalid_answer"}),
+                "provider_code": "invalid_answer", "op": "role.describe", "retryable": false}),
         ),
         (
             Ok(json!({"majors": []})),
             json!({"provider": "magic-context", "reason": "refused",
-                "provider_code": "invalid_answer"}),
+                "provider_code": "invalid_answer", "op": "role.describe", "retryable": false}),
         ),
     ];
     for (describe, detail) in cases {

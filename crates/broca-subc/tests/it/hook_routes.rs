@@ -517,7 +517,12 @@ async fn declaration_vectors_and_refusals_are_preserved_for_admission() {
     assert!(
         matches!(serving.plane.declare("transform-test", &serving.bind, &request,
         Instant::now() + Duration::from_secs(2)).await,
-        Err(broca_fetch_plan::FetchError::Refused { code, retryable: true, .. }) if code == "transient")
+        Err(broca_fetch_plan::FetchError::ProviderRefused {
+            code,
+            message,
+            retryable: true,
+            ..
+        }) if code == "transient" && message == "scripted refusal")
     );
     assert_eq!(
         op_count(&serving, "transform.declare"),
