@@ -24180,3 +24180,15 @@ expect_red = ["compaction::view::tests::boundary_request_reuses_exact_bytes_unti
 file = "crates/broca-core/src/compaction.rs"
 old = "if self.options.is_some() && self.view_version == version {"
 new = "if false && self.options.is_some() && self.view_version == version { // NON-VACUITY BREAK: render on every estimate"
+
+[[control]]
+id = "compaction-resume-prompt-has-headroom"
+guards = "resuming a materialized prefix reserves headroom instead of reallocating the full transcript on the first new turn"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/context.rs"
+expect_red = ["context::tests::resume_prompt_reserves_room_for_new_turns"]
+file = "crates/broca-core/src/context.rs"
+old = "prefix.prefix.len() + tail_state.prompt.len() + 256"
+new = "prefix.prefix.len() + tail_state.prompt.len() /* NON-VACUITY BREAK: no growth headroom */"

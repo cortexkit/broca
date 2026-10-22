@@ -1300,7 +1300,10 @@ pub fn resume_state_from_store(
         !prefix.prefix.is_empty(),
         crate::tags::TagSeed::from_prefix(&prefix.prefix),
     )?;
-    let mut prompt = prefix.prefix.clone();
+    // Leave room for the resumed run's next turns. Cloning the exact-capacity prefix would
+    // otherwise copy the entire transcript again when the first new message is appended.
+    let mut prompt = Vec::with_capacity(prefix.prefix.len() + tail_state.prompt.len() + 256);
+    prompt.extend_from_slice(&prefix.prefix);
     if materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail) {
         prompt.clear();
     }
@@ -1844,6 +1847,19 @@ mod tests {
         BatchId, ErrorClass, MessageId, RunId, StepId, ToolCallId, Usage,
     };
     use broca_wal::{AuthSelection, DispatchOutcome, FramedRecord, RunConfig, WalRecord};
+
+    #[test]
+    fn resume_prompt_reserves_room_for_new_turns() {
+        let mut prefix = StorePrefix::empty();
+        prefix.prefix = vec![Message::new(Role::User, vec![]); 1000];
+        let mut state = resume_state_from_store(&prefix, &[], None, None, None).unwrap();
+        assert!(state.prompt.capacity() >= state.prompt.len() + 256);
+        let original = state.prompt.as_ptr();
+        state
+            .prompt
+            .extend(vec![Message::new(Role::Assistant, vec![]); 256]);
+        assert_eq!(state.prompt.as_ptr(), original);
+    }
 
     fn interrupted() -> WalRecord {
         WalRecord::RunFinished {
