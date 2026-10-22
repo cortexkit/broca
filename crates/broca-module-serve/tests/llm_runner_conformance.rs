@@ -1029,6 +1029,7 @@ impl BrocaSubject {
             compaction::manifest(),
             compaction::Provider {
                 shared: self.shared.clone(),
+                binds: Mutex::new(HashMap::new()),
             },
         )
         .await
