@@ -3295,7 +3295,12 @@ where
                     | ReplayResolution::AuthRequired { pending, .. } => pending.as_ref(),
                     _ => None,
                 };
-                if let Some(pending) = pending {
+                // A pending turn holding Prepared or approved calls is closed by `close_out`
+                // below instead: it withdraws each unanswered approval card and tells the consent
+                // provider an approved call never ran, neither of which the hard stop does.
+                if let Some(pending) = pending
+                    .filter(|pending| pending.deferred.is_empty() && pending.approved.is_empty())
+                {
                     let calls: Vec<_> = pending.assistant.tool_calls().cloned().collect();
                     let existing: Vec<_> = pending
                         .existing
@@ -3327,6 +3332,15 @@ where
                 }
                 for record in &close_out {
                     writer.record(record.clone());
+                }
+                if !close_out.is_empty() {
+                    // The close-out is durable before the consent provider hears that an
+                    // approved call will not run, as in every other sealing arm.
+                    writer.sync().await?;
+                    if let Some(history) = &approval_history {
+                        approval_gate::report_close_out(history, &close_out, &req.session, control)
+                            .await;
+                    }
                 }
                 let (summary, seq) = finish_run(
                     writer,
@@ -5178,7 +5192,9 @@ where
                 )
                 .await;
             }
-            break reason;
+            // A satisfied stop on a step without tool calls ends the run `completed`, exactly
+            // as an unconditioned no-tool answer does. Fall through to that branch so both keep
+            // the final text and announce the last message the same way.
         }
 
         // Dispatch tools, or finish if the step produced none.
@@ -5505,16 +5521,14 @@ pub(crate) async fn project_committed<W: WalStore>(
         .then(|| seed.as_ref().and_then(|seed| seed.anchor.as_ref()))
         .flatten();
     // This WAL read runs inline on the async task while the store write below is offloaded to a
-    // blocking thread. The asymmetry is deliberate, not an oversight: the read is an incremental
-    // tail bounded by the projection watermark, costing a few hundred microseconds per committed
-    // turn, and it runs concurrently with the model step rather than on a serialized path.
+    // blocking thread. It is an incremental tail bounded by the projection watermark only when
+    // `use_seed` holds. A retained lineage, a seed without a recorded policy, a seed whose
+    // deferred-call summary lacks its stopped-run set, or a budgeted run without a valid seed
+    // reads from sequence zero, so its cost grows with the WAL; the seeded-write retry below is
+    // also a full read.
     //
-    // Offloading it would cost more than it saves. WalStore is threaded through the run_loop entry
-    // points as a borrow, so moving this read onto a blocking thread requires the trait to be
-    // Clone -- a public API change breaking every external implementation, to reclaim less than a
-    // millisecond off a path that is already parallel to a step measured in seconds. If WalStore
-    // gains Clone for some other reason, wrapping this read and the fallback below becomes cheap
-    // and is worth doing then.
+    // Moving the read onto a blocking thread needs an owned read handle: WalStore is threaded
+    // through the run_loop entry points as a borrow, and giving it Clone is a public API change.
     let range = match wal_store.read_records_range(session, after_seq, Some(safe_h), anchor) {
         Ok(range) => range,
         Err(error) => {
@@ -6186,7 +6200,12 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         // without a dispatch intent have no possible side effect, so refuse them here.
         // A dispatch intent without a result already stops the run for review; replay
         // never sends that potentially executed call through this recovery path.
-        let rejected = calls.iter().filter(|call| !resume.existing.contains_key(&call.tool_call_id))
+        // A Prepared or approved call is not one of them: the live path gated it, which it
+        // never does for a cut call, so it keeps its approval state and stays in the gate.
+        let rejected = calls.iter()
+            .filter(|call| !resume.existing.contains_key(&call.tool_call_id)
+                && !resume.prepared.iter().any(|prepared| matches!(&*prepared.prepared,
+                    WalRecord::ToolCallDeferred { call_id, .. } if call_id == &call.tool_call_id)))
             .map(|call| error_result(call,
                 "tool_args_trailing_garbage: the cut attempt's rejection details were not committed before interruption (json_bytes=unavailable, whitespace_bytes=unavailable). Re-issue the call with valid, properly escaped arguments."
             )).collect();
@@ -6202,7 +6221,6 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
             resume.batch_already_started = recovered.batch_already_started;
             resume.existing.extend(recovered.existing);
         }
-        resume.prepared.clear();
     }
     let mut batch = dispatch_batch_controlled(
         resolved_run_id,
@@ -6801,8 +6819,8 @@ impl BatchOutcome {
 struct CallResolution {
     result: Arc<ToolResult>,
     ambiguous: bool,
-    /// The call was never sent because the module asked the run to stop; the run ends
-    /// Interrupted after this batch.
+    /// The call was never sent because the module asked the run to stop or the caller
+    /// cancelled it; the run ends after this batch.
     stopped: bool,
     outcome: Option<DispatchOutcome>,
     /// The typed reason written on the call's `tool_result` record. Set only when the route the
@@ -6857,6 +6875,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         // route is only ever opened under the scope this run was admitted under.
         scope: scope.cloned(),
     };
+    // The caller's immediate cancellation stops every call not yet sent, like a stop request.
+    // Calls already sent finish and keep their outcomes. Boundary cancellation is a separate
+    // token that lets the batch finish, so it is not consulted here.
+    let cancel = ordered.and_then(|control| control.cancel.as_ref());
     // Validate ids before making the batch durable. The first instance remains eligible for
     // dispatch; later instances are represented by synthetic error results in source order.
     let mut seen_call_ids = HashSet::new();
@@ -6895,8 +6917,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         Stopped,
     }
     // A stop requested before this point refuses the whole batch before anything is written
-    // for its calls: no dispatch intent, and no route opened by the tool plane.
-    let batch_refusal = if stop_is_requested(stop) {
+    // for its calls: no dispatch intent, and no route opened by the tool plane. An immediate
+    // cancellation that arrived after the model step refuses it the same way.
+    let cancelled_before_batch = cancel.is_some_and(CancellationToken::is_cancelled);
+    let batch_refusal = if stop_is_requested(stop) || cancelled_before_batch {
         Some(BatchRefusal::Stopped)
     } else {
         match tool_plane.batch_started(&ctx, &calls, manifest).await {
@@ -7246,7 +7270,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
 
         let mut resolutions: Vec<CallResolution> = Vec::with_capacity(plan.len());
         for p in plan {
-            resolutions.push(resolve(p, &ctx, tool_plane, None, stop).await);
+            resolutions.push(resolve(p, &ctx, tool_plane, cancel, stop).await);
         }
         debug_assert!(
             !resolutions.iter().any(|r| r.ambiguous),
@@ -7261,7 +7285,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         } else if let Some(cause) = gating_stop {
             Some(cause)
         } else if resolutions.iter().any(|r| r.stopped) {
-            Some(BatchInterruption::StopRequested)
+            Some(unsent_stop_cause(cancel))
         } else {
             None
         };
@@ -7322,7 +7346,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                         step_id,
                         &ctx,
                         tool_plane,
-                        None,
+                        cancel,
                         stop,
                         hooks,
                     )
@@ -7339,7 +7363,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 // but the concurrently-launched calls all finish — that's the source-order
                 // result set.
                 join_all(plan.into_iter().enumerate().map(|(index, p)| {
-                    resolve_hooked(p, index, step_id, &ctx, tool_plane, None, stop, hooks)
+                    resolve_hooked(p, index, step_id, &ctx, tool_plane, cancel, stop, hooks)
                 }))
                 .await
             };
@@ -7356,7 +7380,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     } else if scope_stopped {
         Some(BatchInterruption::ScopeDrained)
     } else if resolutions.iter().any(|r| r.stopped) {
-        Some(BatchInterruption::StopRequested)
+        Some(unsent_stop_cause(cancel))
     } else {
         None
     };
@@ -7562,6 +7586,17 @@ fn stopped_resolution(id: &ToolCallId) -> CallResolution {
     resolution
 }
 
+/// Why a batch whose unsent calls were kept back stops the run: the caller's immediate
+/// cancellation when it is set (the run ends `cancelled`), otherwise the module's stop request
+/// (the run ends `interrupted`).
+fn unsent_stop_cause(cancel: Option<&CancellationToken>) -> BatchInterruption {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        BatchInterruption::CallerCancel
+    } else {
+        BatchInterruption::StopRequested
+    }
+}
+
 /// Execute one planned call, classifying the dispatch outcome:
 ///  - `Completed`  → the definite result, recorded as `Completed`.
 ///  - `NotSent`    → the request never left, so it's a safe graceful `is_error`;
@@ -7587,9 +7622,8 @@ async fn resolve<T: ToolPlane>(
         CallPlan::Dispatch(call) if stop_is_requested(stop) => {
             stopped_resolution(&call.tool_call_id)
         }
-        CallPlan::Dispatch(call)
-            if call.approved.is_some() && cancel.is_some_and(CancellationToken::is_cancelled) =>
-        {
+        // The caller cancelled immediately before this call was sent: it is not sent either.
+        CallPlan::Dispatch(call) if cancel.is_some_and(CancellationToken::is_cancelled) => {
             stopped_resolution(&call.tool_call_id)
         }
         // RESUME: the call's terminal is already durable — include the
@@ -11198,8 +11232,16 @@ mod approval_gate {
                 .is_some_and(|tool| tool.execution_mode == ExecutionMode::Sequential)
         });
         let mut slots = Vec::with_capacity(calls.len());
+        // Duplicates are decided by source position before restored results or Prepared calls
+        // consume any id, as the plain dispatcher does. A first instance answered from the WAL
+        // still makes every later instance with its id a duplicate, so a resume refuses the
+        // same calls the live batch refused.
         let mut seen = HashSet::new();
-        for call in calls {
+        let duplicate_calls: Vec<bool> = calls
+            .iter()
+            .map(|call| !seen.insert(call.tool_call_id.clone()))
+            .collect();
+        for (call, is_duplicate) in calls.into_iter().zip(duplicate_calls) {
             if emit {
                 let _ = send(
                     out,
@@ -11215,7 +11257,7 @@ mod approval_gate {
                 Slot::Ready(Some(CallPlan::Already(result)))
             } else if let Some(prepared) = held.remove(&call.tool_call_id) {
                 Slot::Held(prepared)
-            } else if !seen.insert(call.tool_call_id.clone()) {
+            } else if is_duplicate {
                 Slot::Ready(Some(CallPlan::Synthetic {
                     result: Arc::new(error_result(&call, "duplicate tool_call_id from provider")),
                     reason: None,

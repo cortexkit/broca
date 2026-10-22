@@ -18837,8 +18837,14 @@ platforms = ["linux", "macos"]
 test_file = "crates/broca-store/src/session_refs/tests.rs"
 expect_red = ["session_refs::tests::census_over_read_only_state_root_never_changes_logs_or_manifest"]
 file = "crates/broca-core/src/wal_writer/projection_reader.rs"
-old = 'broca_wal::replay_file(path, DEFAULT_MAX_READ_BYTES)?'
-new = 'broca_wal::FileWal::open(path)?.replay()? /* NON-VACUITY BREAK: use writer recovery in census */'
+old = """            let range = broca_wal::file_wal::read_records_range(
+                &path,
+                DEFAULT_MAX_READ_BYTES,
+                0,
+                None,
+                None,
+            )?;"""
+new = """            let range = broca_wal::WalRangeRead::without_anchors(broca_wal::FileWal::open(&path)?.replay()?); /* NON-VACUITY BREAK: use writer recovery in census */"""
 
 [[control]]
 id = "agent-data-indexed-fence-precedes-intent"
@@ -22522,3 +22528,112 @@ expect_message = "found no conversation"
 file = "crates/broca-subc/src/connection.rs"
 old = "        RouteTarget::ToolProvider { .. } if declares_compaction_provider(role_versions) => {\n            identity.harness.as_str()\n        }"
 new = "        RouteTarget::ToolProvider { .. } if declares_compaction_provider(role_versions) => {\n            TOOL_MODULE_HARNESS // NON-VACUITY BREAK: restore the tool-module harness on compaction routes.\n        }"
+
+[[control]]
+id = "core-loop-finished-stop-keeps-final-text"
+guards = "A stop condition satisfied by a tool-free answer keeps a final_text run's structured result, as an unconditioned tool-free answer does"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/run_loop_terminal_paths.rs"
+expect_red = ["run_loop_terminal_paths::loop_finished_stop_keeps_the_final_text_structured_result"]
+expect_message = "the stopped run's final text is its result"
+file = "crates/broca-core/src/run.rs"
+old = """            // the final text and announce the last message the same way.
+        }"""
+new = """            // the final text and announce the last message the same way.
+            break reason; // NON-VACUITY BREAK: end before the tool-free branch keeps the final text.
+        }"""
+
+[[control]]
+id = "core-plain-dispatch-honours-immediate-cancel"
+guards = "The plain dispatcher sends no call after the caller's immediate cancellation; unsent calls get the not-dispatched terminal"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/run_loop_terminal_paths.rs"
+expect_red = ["run_loop_terminal_paths::immediate_cancel_stops_later_sequential_calls", "run_loop_terminal_paths::immediate_cancel_before_send_sends_no_parallel_call"]
+expect_message = "after the cancel"
+file = "crates/broca-core/src/run.rs"
+old = "        CallPlan::Dispatch(call) if cancel.is_some_and(CancellationToken::is_cancelled) => {"
+new = "        CallPlan::Dispatch(call) if false && cancel.is_some_and(CancellationToken::is_cancelled) => { // NON-VACUITY BREAK: send calls after a caller cancel."
+
+[[control]]
+id = "core-approval-batch-duplicate-ids-by-position"
+guards = "An approval batch refuses a repeated tool_call_id by source position, including after its first instance is answered from the WAL on resume"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/approval_tests/resume_close_out_tests.rs"
+expect_red = ["run::approval_tests::resume_close_out_tests::resumed_duplicate_of_a_restored_call_is_refused_not_dispatched"]
+expect_message = "the duplicate instance was dispatched on resume"
+file = "crates/broca-core/src/run.rs"
+old = "            } else if is_duplicate {"
+new = "            } else if is_duplicate && !resume.existing.contains_key(&call.tool_call_id) { // NON-VACUITY BREAK: a restored first instance hides its duplicate."
+
+[[control]]
+id = "core-budget-resume-withdraws-approval-cards"
+guards = "A resume sealed by a spent input budget closes Prepared calls with their approval-card withdrawal"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/approval_tests/resume_close_out_tests.rs"
+expect_red = ["run::approval_tests::resume_close_out_tests::budget_exhausted_resume_withdraws_the_open_approval_card"]
+expect_message = "the sealed call must withdraw its card"
+file = "crates/broca-core/src/run.rs"
+old = "                    .filter(|pending| pending.deferred.is_empty() && pending.approved.is_empty())"
+new = "                    .filter(|_| true) // NON-VACUITY BREAK: hard-stop Prepared calls without withdrawal."
+
+[[control]]
+id = "core-args-cut-resume-keeps-prepared-sibling"
+guards = "Resuming an args-cut step rejects only calls the live gate never saw; a Prepared sibling stays in the approval gate"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/approval_tests/resume_close_out_tests.rs"
+expect_red = ["run::approval_tests::resume_close_out_tests::args_cut_resume_keeps_a_prepared_sibling_in_the_approval_gate"]
+file = "crates/broca-core/src/run.rs"
+old = """                && !resume.prepared.iter().any(|prepared| matches!(&*prepared.prepared,
+                    WalRecord::ToolCallDeferred { call_id, .. } if call_id == &call.tool_call_id)))
+            .map(|call| error_result(call,
+                "tool_args_trailing_garbage: the cut attempt's rejection details were not committed before interruption (json_bytes=unavailable, whitespace_bytes=unavailable). Re-issue the call with valid, properly escaped arguments."
+            )).collect();"""
+new = """                && !resume.prepared.iter().any(|prepared| false && matches!(&*prepared.prepared,
+                    WalRecord::ToolCallDeferred { call_id, .. } if call_id == &call.tool_call_id)))
+            .map(|call| error_result(call,
+                "tool_args_trailing_garbage: the cut attempt's rejection details were not committed before interruption (json_bytes=unavailable, whitespace_bytes=unavailable). Re-issue the call with valid, properly escaped arguments."
+            )).collect();
+        resume.prepared.clear(); // NON-VACUITY BREAK: reject and drop Prepared siblings."""
+
+[[control]]
+id = "core-replay-refuses-overlapping-batch"
+guards = "Replay refuses a batch start or tool-calling step that would replace an uncommitted batch holding a dispatch intent"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay/batch_overlap_tests.rs"
+expect_red = ["replay::steer_tests::batch_overlap_tests::a_second_batch_start_over_an_unresolved_intent_is_refused", "replay::steer_tests::batch_overlap_tests::a_new_tool_step_over_an_unresolved_intent_is_refused"]
+expect_message = "replay forgot an unresolved dispatch intent"
+file = "crates/broca-core/src/replay.rs"
+old = "        !self.intents.is_empty()"
+new = "        false && !self.intents.is_empty() // NON-VACUITY BREAK: an open intent is not evidence."
+
+[[control]]
+id = "core-census-reader-vanished-live-wal"
+guards = "The census reader reports a live WAL that disappears after path resolution instead of reading it as empty"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/projection_reader.rs"
+expect_red = ["wal_writer::projection_reader::tests::live_wal_unlinked_after_resolution_is_not_an_empty_read"]
+expect_message = "a vanished live WAL must not read as empty"
+file = "crates/broca-core/src/wal_writer/projection_reader.rs"
+old = "                broca_wal::WalRangeRecords::Absent => {}"
+new = "                broca_wal::WalRangeRecords::Absent => return Ok((Vec::new(), 0)), // NON-VACUITY BREAK: certify a vanished WAL as empty."

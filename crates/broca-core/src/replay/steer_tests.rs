@@ -455,3 +455,6 @@ fn replay_reads_a_steer_as_written() {
     assert_eq!(state.prompt[3].content, user("hurry").content);
     assert_eq!(state.prompt[3].cache_prefix_blocks, None);
 }
+
+#[path = "batch_overlap_tests.rs"]
+mod batch_overlap_tests;

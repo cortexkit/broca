@@ -21,6 +21,7 @@ mod queue_crash;
 mod replay;
 mod resume_exec;
 mod run_loop;
+mod run_loop_terminal_paths;
 mod runner_tags;
 mod runner_tags_determinism;
 mod session_import;

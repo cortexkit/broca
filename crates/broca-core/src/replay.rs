@@ -750,6 +750,15 @@ impl OpenBatch {
         self.terminals.iter().all(Option::is_some)
     }
 
+    /// Whether any record after the batch start says something about one of its calls: a
+    /// dispatch intent, a Prepared call, or a terminal. Replacing such a batch would forget
+    /// that a call may have run, or already ran, and let a resume send it again.
+    fn holds_call_evidence(&self) -> bool {
+        !self.intents.is_empty()
+            || self.terminals.iter().any(Option::is_some)
+            || self.prepared.iter().any(Option::is_some)
+    }
+
     /// The reconstructed result for a planned call (from its terminal).
     fn result_for(&self, position: usize) -> Option<ToolResult> {
         let id = &self.planned[position];
@@ -1208,6 +1217,16 @@ pub fn budget_replay_seed_is_valid(seed: &ProjectionSeed) -> bool {
     max_fired_threshold.is_none_or(|threshold| state.tool_call_count >= threshold)
 }
 
+/// A tool batch or tool-calling step that would replace an open batch holding call evidence.
+fn overlapping_batch_error(run_id: Option<&RunId>) -> ReplayError {
+    ReplayError::CorruptLineage {
+        episode_run_id: run_id.cloned().unwrap_or_else(|| RunId("unknown".into())),
+        reason: "a tool batch opened over an uncommitted batch that already holds dispatch \
+                 intents, Prepared calls or results"
+            .into(),
+    }
+}
+
 fn invalid_budget_seed_error(seed: &ProjectionSeed) -> ReplayError {
     ReplayError::CorruptLineage {
         episode_run_id: seed
@@ -1516,6 +1535,18 @@ fn replay_seeded_with_compaction<'a>(
                     ep.natural_end = true;
                     ep.natural_end_extendable = false;
                 } else if assistant_message.tool_calls().next().is_some() {
+                    // Each tool turn opens and commits its own batch. A batch still open from an
+                    // earlier turn cannot belong to this one: fail closed if it holds call
+                    // evidence, and otherwise drop it so this turn is never paired with another
+                    // turn's planned calls.
+                    if ep
+                        .open_batch
+                        .as_ref()
+                        .is_some_and(OpenBatch::holds_call_evidence)
+                    {
+                        return Err(overlapping_batch_error(run_id.as_ref()));
+                    }
+                    ep.open_batch = None;
                     ep.open_assistant = Some(assistant_message.clone()); // tool turn — held
                     ep.open_assistant_tags = step_tags.cloned();
                     ep.open_step = Some(*step_id);
@@ -1564,6 +1595,16 @@ fn replay_seeded_with_compaction<'a>(
                 step_id,
                 planned_calls,
             } => {
+                // Every writer starts a batch at most once (a resume reuses the started batch).
+                // A second start over an uncommitted batch that already holds call evidence
+                // would erase it, so the lineage is refused instead of replayed.
+                if ep
+                    .open_batch
+                    .as_ref()
+                    .is_some_and(OpenBatch::holds_call_evidence)
+                {
+                    return Err(overlapping_batch_error(run_id.as_ref()));
+                }
                 ep.open_batch = Some(OpenBatch::new(*step_id, planned_calls.clone()));
                 ep.open_batch_id = Some(batch_id.clone());
             }

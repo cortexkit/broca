@@ -35,6 +35,9 @@ mod consent_fourth_audit_tests;
 mod memory_wal;
 use memory_wal::MemoryWal;
 
+#[path = "approval_tests/resume_close_out_tests.rs"]
+mod resume_close_out_tests;
+
 // These limits catch hangs, not slow storage or approval performance. Logic tests
 // use a sync-aware memory WAL; disk crash-cut tests opt in to a file-backed rig.
 const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);

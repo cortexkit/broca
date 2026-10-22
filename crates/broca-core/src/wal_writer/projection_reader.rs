@@ -4,6 +4,14 @@ use super::*;
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once after `records` resolves a live path and before it reads the file, so a test
+    /// can unlink the file in that window.
+    static AFTER_LIVE_PATH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub struct ReadOnlyWalReader {
     root: PathBuf,
 }
@@ -100,8 +108,27 @@ impl ReadOnlyWalReader {
     }
     pub fn records(&self, address: &str) -> Result<(Vec<broca_wal::FramedRecord>, u64), WalError> {
         if let Some(path) = self.live_path(address)? {
-            let len = std::fs::metadata(&path).map_err(WalError::Io)?.len();
-            return Ok((broca_wal::replay_file(path, DEFAULT_MAX_READ_BYTES)?, len));
+            #[cfg(test)]
+            if let Some(hook) = AFTER_LIVE_PATH_HOOK.with(|hook| hook.borrow_mut().take()) {
+                hook();
+            }
+            // One open handle answers both presence and content. A file unlinked after
+            // `live_path` (a fold archiving it) reads as absent, never as an empty WAL, so the
+            // lookup continues to the archives and, failing them, reports disappearance below.
+            let range = broca_wal::file_wal::read_records_range(
+                &path,
+                DEFAULT_MAX_READ_BYTES,
+                0,
+                None,
+                None,
+            )?;
+            let len = range.complete_byte_end.unwrap_or(0);
+            match range.into_records() {
+                broca_wal::WalRangeRecords::Complete(records)
+                | broca_wal::WalRangeRecords::Partial(records)
+                | broca_wal::WalRangeRecords::Unknown(records) => return Ok((records, len)),
+                broca_wal::WalRangeRecords::Absent => {}
+            }
         }
         let ordinary = broca_wal::archive::read_newest_member(
             &self.containers("wal-archive")?,
@@ -169,5 +196,57 @@ impl ReadOnlyWalReader {
             }
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WalStore;
+
+    /// A census-only reader over one live WAL holding a single record.
+    fn live_wal(name: &str) -> (PathBuf, String, PathBuf) {
+        let root = broca_test_support::scratch_root()
+            .join(format!("projection-reader-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bind = BindIdentity::new("/project", "census", name);
+        let store = FileWalStore::new(root.join("wal"));
+        let mut wal = store.open(&bind).unwrap();
+        wal.append(
+            1,
+            &WalRecord::TurnFinished {
+                step_id: broca_protocol::StepId(1),
+            },
+            true,
+        )
+        .unwrap();
+        drop(wal);
+        (root.clone(), session_addr(&bind), store.wal_path(&bind))
+    }
+
+    #[test]
+    fn live_wal_reads_its_records() {
+        let (root, address, _) = live_wal("present");
+        let (records, bytes) = ReadOnlyWalReader::new(&root).records(&address).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(bytes > 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A fold can unlink a live WAL after the census resolved its path. That read must report
+    /// the disappearance so the census retries enumeration; an empty record set would certify
+    /// the address as covered with none of its session refs.
+    #[test]
+    fn live_wal_unlinked_after_resolution_is_not_an_empty_read() {
+        let (root, address, path) = live_wal("vanished");
+        AFTER_LIVE_PATH_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || std::fs::remove_file(path).unwrap()));
+        });
+        let read = ReadOnlyWalReader::new(&root).records(&address);
+        match read {
+            Err(WalError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("a vanished live WAL must not read as empty: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }
