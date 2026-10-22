@@ -140,14 +140,10 @@ pub fn assemble(
 fn assemble_judged(
     view: &CompactionView,
     prompt: &[Message],
-    stored: Option<&[Message]>,
+    stored: Option<super::StoredTranscript<'_>>,
 ) -> Result<Vec<Message>, AssemblyProblem> {
     use crate::compaction_provider::view::ViewRange;
-    let stored_at = |ordinal: u64| {
-        stored.and_then(|stored| {
-            transcript(ordinal_range(stored, ordinal, ordinal.saturating_add(1))).next()
-        })
-    };
+    let stored_at = |ordinal: u64| stored.and_then(|stored| stored.at(ordinal));
     let in_range = |from: u64, to: u64| transcript(ordinal_range(prompt, from, to));
     let mut out = Vec::new();
     for range in &view.ranges {
@@ -186,7 +182,8 @@ fn assemble_judged(
                     .map_err(|_| AssemblyProblem::Rejected(ViewProblem::ReplacementNotArray))?;
                 let candidates: Vec<_> = values.iter().filter_map(native_schema_message).collect();
                 let carried: Option<Vec<Message>> = stored.map(|stored| {
-                    transcript(ordinal_range(stored, *from, *to))
+                    stored
+                        .range(*from, *to)
                         // A different role or content cannot be an unchanged signed copy, nor
                         // an otherwise unchanged message with its model origin removed.
                         .filter(|original| {
@@ -434,6 +431,29 @@ pub fn decide_at(
     prefix_bound: bool,
     run_start: bool,
 ) -> Decision {
+    decide_stored_at(
+        view,
+        ready,
+        state,
+        lineage_id,
+        prompt,
+        super::StoredTranscript::plain(stored),
+        prefix_bound,
+        run_start,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_stored_at(
+    view: &CompactionView,
+    ready: &ViewReady,
+    state: &CompactionState,
+    lineage_id: &str,
+    prompt: &[Message],
+    stored: super::StoredTranscript<'_>,
+    prefix_bound: bool,
+    run_start: bool,
+) -> Decision {
     let current = state.view.as_ref().map(|applied| applied.view.view_version);
     match dispose_fetched(view, ready, current, lineage_id, |ordinal| {
         transcript(ordinal_range(prompt, ordinal, ordinal.saturating_add(1)))
@@ -633,6 +653,14 @@ pub fn next_notice(
     facts: NoticeFacts<'_>,
 ) -> Option<AdvanceNotice> {
     let through = transcript(prompt).next_back()?;
+    notice_through(state, through, facts)
+}
+
+pub(crate) fn notice_through(
+    state: &CompactionState,
+    through: &Message,
+    facts: NoticeFacts<'_>,
+) -> Option<AdvanceNotice> {
     let through_ordinal = through.ordinal?;
     let through_digest = content_digest(&serde_json::to_value(through).expect("native JSON"));
     let applied = state.applied_view_version(facts.lineage_id);

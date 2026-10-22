@@ -2603,17 +2603,27 @@ fn render_new_tags(
     rendered_len: &mut usize,
     render_tags: bool,
     frozen_render_config: &serde_json::Value,
+    mut originals: Option<&mut crate::compaction::OriginalMessages>,
 ) {
     if *rendered_len >= prompt.len() {
         return;
     }
-    if render_tags {
-        broca_protocol::tags::render_tags_into(
-            &mut prompt[*rendered_len..],
-            broca_protocol::tags::TagRendering::for_render_config(frozen_render_config),
-        );
-    } else {
-        broca_protocol::tags::clean_computed_into(&mut prompt[*rendered_len..]);
+    for (index, message) in prompt.iter_mut().enumerate().skip(*rendered_len) {
+        let original = originals
+            .as_ref()
+            .filter(|_| message.part_tags().is_some())
+            .map(|_| message.clone());
+        if render_tags {
+            broca_protocol::tags::render_tags_into(
+                std::slice::from_mut(message),
+                broca_protocol::tags::TagRendering::for_render_config(frozen_render_config),
+            );
+        } else {
+            broca_protocol::tags::clean_computed_into(std::slice::from_mut(message));
+        }
+        if let (Some(originals), Some(original)) = (originals.as_deref_mut(), original) {
+            originals.retain_change(index, original, message);
+        }
     }
     *rendered_len = prompt.len();
 }
@@ -4099,8 +4109,11 @@ where
     // completed steps, then reproduce that guidance before either path renders another request.
     let committed_episode_steps = completed_steps.saturating_sub(u64::from(pending_turn.is_some()));
     let episode_history_start = episode_history_start(&prompt, committed_episode_steps);
-    let mut compaction_raw = compaction_runtime.as_ref().map(|_| prompt.clone());
-    let mut raw_stamped_len = stamped_len;
+    let mut originals = compaction_runtime
+        .as_ref()
+        .map(|_| crate::compaction::OriginalMessages::default());
+    let mut closing_tail = Vec::new();
+    let mut raw_len = prompt.len();
     // The prompt can contain system messages anywhere, not just at its beginning.
     // Index their positions once as the append-only prompt grows instead of rescanning history.
     let mut system_positions = Vec::new();
@@ -4113,9 +4126,14 @@ where
         &mut prompt,
         episode_step_spans.as_deref(),
         episode_history_start,
+        originals.as_mut(),
     );
     let mut repetition_observer = RepetitionObserver::from_prompt(&prompt[episode_history_start..]);
-    restore_repetition_guidance(&mut prompt[episode_history_start..]);
+    restore_guidance_with_originals(
+        &mut prompt[episode_history_start..],
+        episode_history_start,
+        originals.as_mut(),
+    );
 
     if let Some(history) = approval_history.as_mut() {
         Box::pin(approval_gate::admission(
@@ -4143,7 +4161,7 @@ where
             approval,
             writer,
             &mut prompt,
-            compaction_raw.as_mut(),
+            originals.as_mut(),
             // The resumed turn belongs to this (last) episode → stamp its model, matching
             // what replay stamps for the same turn (C7 byte-identity).
             cfg.model.clone(),
@@ -4165,6 +4183,7 @@ where
             approval_history.as_mut(),
         ))
         .await?;
+        raw_len = prompt.len();
         if !interrupt.1.is_empty() {
             return pause_approval(
                 writer,
@@ -4372,11 +4391,11 @@ where
         // Ordinals are positional metadata over this append-only prompt. Replay/merge and prior
         // loop iterations already stamped the stable prefix, so touch only entries appended since
         // the previous provider call. Assigned values remain their absolute 0-based positions.
-        broca_protocol::content::stamp_ordinals_from(
+        stamp_raw_suffix(
             &mut mutable_call_options(&mut opts).prompt,
-            stamped_len,
+            &mut stamped_len,
         );
-        stamped_len = opts.prompt.len();
+        raw_len = opts.prompt.len();
         system_positions.extend(
             opts.prompt[system_indexed_len..]
                 .iter()
@@ -4389,17 +4408,12 @@ where
         tag_numbering
             .number_new(&mut mutable_call_options(&mut opts).prompt)
             .map_err(RunError::TagNumbering)?;
-        if let Some(raw) = &mut compaction_raw {
-            if raw.len() < opts.prompt.len() {
-                raw.extend_from_slice(&opts.prompt[raw.len()..]);
-            }
-            stamp_raw_suffix(raw, &mut raw_stamped_len);
-        }
         // A run frozen with `render_tags` shows each tagged user and tool-result text part
         // with its `§N§ ` prefix, and on Anthropic Messages each assistant text part's tag too.
         // Each message is rendered once, the first time a request includes it, and depends only
         // on its stored text and tags, so every later request repeats the same bytes. The
-        // native copies above stay unprefixed.
+        // model prompt keeps its prefixes; compaction reads saved unprefixed originals when
+        // those tags changed a message's content.
         // Under the computed rules a compaction provider's first Setup may anchor the numbers
         // at its checkpoint, so nothing of this run renders until Setup has answered (below).
         let setup_pending =
@@ -4410,6 +4424,7 @@ where
                 &mut tags_rendered_len,
                 render_tags,
                 &provider.render_config_blob(),
+                originals.as_mut(),
             );
         }
 
@@ -4447,10 +4462,10 @@ where
                     )
                 })?
                 .to_string();
-            let raw = compaction_raw
-                .as_deref()
-                .expect("compaction keeps raw native values");
             if compaction_state.is_none() {
+                let raw =
+                    crate::compaction::StoredTranscript::new(&opts.prompt, originals.as_ref())
+                        .setup_messages();
                 let (_, preset, params, composition) =
                     compaction_item.as_ref().expect("runtime item");
                 let mut setup = crate::compaction_provider::setup::SetupRequest::new(
@@ -4477,7 +4492,7 @@ where
                     });
                 // Keep compaction sub-futures off the enclosing run frame. They still
                 // borrow its single writer and are polled by this run, not spawned.
-                match Box::pin(runtime.setup(setup, raw)).await {
+                match Box::pin(runtime.setup(setup, &raw)).await {
                     Ok(mut state) => {
                         state.history = compaction_history.clone();
                         // A moved session's Setup checkpoint anchors the numbers at its cut
@@ -4507,7 +4522,9 @@ where
                 &mut tags_rendered_len,
                 render_tags,
                 &provider.render_config_blob(),
+                originals.as_mut(),
             );
+            let raw = crate::compaction::StoredTranscript::new(&opts.prompt, originals.as_ref());
             let state = compaction_state.as_mut().expect("Setup is durable");
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
@@ -4558,20 +4575,22 @@ where
             // Tell the provider what the session wrote since its last notice. The notice is
             // durable in the WAL before the model call, and the bus publisher projects it from
             // there, so it is never published before it is durable.
-            if let Some(notice) = crate::compaction::view::next_notice(
-                state,
-                raw,
-                crate::compaction::view::NoticeFacts {
-                    session_ref: session_ref.clone(),
-                    lineage_id: &lineage_id,
-                    est_tokens: estimate,
-                    model: &cfg.model.model_id,
-                    window: context_limit,
-                    usage: compaction_history.usage(),
-                    events: view_events,
-                    seq_floor: compaction_notice_floor,
-                },
-            ) {
+            if let Some(notice) = raw.newest().and_then(|through| {
+                crate::compaction::view::notice_through(
+                    state,
+                    through,
+                    crate::compaction::view::NoticeFacts {
+                        session_ref: session_ref.clone(),
+                        lineage_id: &lineage_id,
+                        est_tokens: estimate,
+                        model: &cfg.model.model_id,
+                        window: context_limit,
+                        usage: compaction_history.usage(),
+                        events: view_events,
+                        seq_floor: compaction_notice_floor,
+                    },
+                )
+            }) {
                 runtime.record_notice(state, notice).await?;
             }
             state.history = compaction_history.clone();
@@ -4598,24 +4617,26 @@ where
                 })
                 .map_err(|error| RunError::Wal(error.to_string()))?;
             notice_request_bytes = request.bytes;
-            if let Some(notice) = crate::compaction::view::next_notice(
-                state,
-                raw,
-                crate::compaction::view::NoticeFacts {
-                    session_ref,
-                    lineage_id: &lineage_id,
-                    est_tokens: crate::compaction::request_estimate(
-                        notice_request_bytes,
-                        &compaction_history,
-                    )
-                    .0,
-                    model: &cfg.model.model_id,
-                    window: context_limit,
-                    usage: compaction_history.usage(),
-                    events: Vec::new(),
-                    seq_floor: compaction_notice_floor,
-                },
-            ) {
+            if let Some(notice) = raw.newest().and_then(|through| {
+                crate::compaction::view::notice_through(
+                    state,
+                    through,
+                    crate::compaction::view::NoticeFacts {
+                        session_ref,
+                        lineage_id: &lineage_id,
+                        est_tokens: crate::compaction::request_estimate(
+                            notice_request_bytes,
+                            &compaction_history,
+                        )
+                        .0,
+                        model: &cfg.model.model_id,
+                        window: context_limit,
+                        usage: compaction_history.usage(),
+                        events: Vec::new(),
+                        seq_floor: compaction_notice_floor,
+                    },
+                )
+            }) {
                 runtime.record_notice(state, notice).await?;
             }
             if ceiling_detail.is_some() {
@@ -4933,9 +4954,9 @@ where
                     if no_tool_reason == RunFinishReason::Completed && wants_final_text {
                         natural_final_text = Some(joined_text(&message));
                     }
-                    if let Some(raw) = &mut compaction_raw {
+                    if originals.is_some() {
                         // The run's last message, announced before the run ends.
-                        raw.push(Message::assistant_from(
+                        closing_tail.push(Message::assistant_from(
                             message.content.clone(),
                             cfg.model.clone(),
                         ));
@@ -5125,7 +5146,11 @@ where
                     None,
                     ClosingNotice::new(
                         compaction_state.as_mut(),
-                        compaction_raw.as_mut(),
+                        crate::compaction::StoredTranscript::new(
+                            &opts.prompt[..raw_len],
+                            originals.as_ref(),
+                        ),
+                        &closing_tail,
                         writer,
                         &req.session,
                         &cfg.model,
@@ -5176,7 +5201,11 @@ where
                 Some(&submit.tool_call_id),
                 ClosingNotice::new(
                     compaction_state.as_mut(),
-                    compaction_raw.as_mut(),
+                    crate::compaction::StoredTranscript::new(
+                        &opts.prompt[..raw_len],
+                        originals.as_ref(),
+                    ),
+                    &closing_tail,
                     writer,
                     &req.session,
                     &cfg.model,
@@ -5213,7 +5242,11 @@ where
                     None,
                     ClosingNotice::new(
                         compaction_state.as_mut(),
-                        compaction_raw.as_mut(),
+                        crate::compaction::StoredTranscript::new(
+                            &opts.prompt[..raw_len],
+                            originals.as_ref(),
+                        ),
+                        &closing_tail,
                         writer,
                         &req.session,
                         &cfg.model,
@@ -5305,7 +5338,11 @@ where
                     None,
                     ClosingNotice::new(
                         compaction_state.as_mut(),
-                        compaction_raw.as_mut(),
+                        crate::compaction::StoredTranscript::new(
+                            &opts.prompt[..raw_len],
+                            originals.as_ref(),
+                        ),
+                        &closing_tail,
                         writer,
                         &req.session,
                         &cfg.model,
@@ -5346,9 +5383,9 @@ where
             if wants_final_text {
                 natural_final_text = Some(joined_text(&assembled));
             }
-            if let Some(raw) = &mut compaction_raw {
+            if originals.is_some() {
                 // The run's last message, announced before the run ends.
-                raw.push(Message::assistant_from(
+                closing_tail.push(Message::assistant_from(
                     assembled.content.clone(),
                     cfg.model.clone(),
                 ));
@@ -5420,14 +5457,8 @@ where
         );
         // The WAL already contains the tool's unmodified output. Add guard guidance only to the
         // returned copies that enter the model prompt, keeping tool output and loop advice separate.
-        if let Some(raw) = &mut compaction_raw {
-            // Steers and budget messages added since the last status are native already.
-            raw.extend_from_slice(&opts.prompt[raw.len()..]);
-            raw.push(Message::assistant_from(
-                assembled.content.clone(),
-                cfg.model.clone(),
-            ));
-            raw.push(Message::new(
+        let original_results = originals.as_ref().map(|_| {
+            Message::new(
                 Role::Tool,
                 batch
                     .results
@@ -5435,8 +5466,8 @@ where
                     .cloned()
                     .map(ContentBlock::ToolResult)
                     .collect(),
-            ));
-        }
+            )
+        });
         attach_repetition_guidance(
             &mut repetition_observer,
             assembled.tool_calls(),
@@ -5469,7 +5500,11 @@ where
             tags: Default::default(),
         };
         crate::tags::attach_parts(&mut results, result_tags);
+        if let (Some(originals), Some(original)) = (originals.as_mut(), original_results) {
+            originals.retain_change(opts.prompt.len(), original, &results);
+        }
         mutable_call_options(&mut opts).prompt.push(results);
+        raw_len = opts.prompt.len();
         append_budget_firings(
             writer,
             &mut mutable_call_options(&mut opts).prompt,
@@ -5504,6 +5539,10 @@ where
         }
     };
 
+    broca_protocol::content::stamp_ordinals_from(
+        &mut mutable_call_options(&mut opts).prompt,
+        stamped_len,
+    );
     // Announce what the run wrote after its last step boundary (its final answer) now, not at
     // the next send's first boundary: the contract owes a notice after each durable write. The
     // notice follows those records in the WAL and its own barrier makes both durable before the
@@ -5512,7 +5551,8 @@ where
         &compaction_runtime,
         ClosingNotice::new(
             compaction_state.as_mut(),
-            compaction_raw.as_mut(),
+            crate::compaction::StoredTranscript::new(&opts.prompt[..raw_len], originals.as_ref()),
+            &closing_tail,
             writer,
             &req.session,
             &cfg.model,
@@ -6096,10 +6136,15 @@ fn restore_earlier_episode_guidance(
     prompt: &mut [Message],
     spans: Option<&[std::ops::Range<usize>]>,
     current_start: usize,
+    mut originals: Option<&mut crate::compaction::OriginalMessages>,
 ) {
     for span in spans.unwrap_or_default() {
         if span.end <= current_start && span.end <= prompt.len() {
-            restore_repetition_guidance(&mut prompt[span.clone()]);
+            restore_guidance_with_originals(
+                &mut prompt[span.clone()],
+                span.start,
+                originals.as_deref_mut(),
+            );
         }
     }
 }
@@ -6227,6 +6272,14 @@ fn attach_repetition_guidance<'a>(
 /// Offline renderers use this same fold so their reconstructed inputs receive exactly the
 /// decoration the run loop sends to the provider.
 pub fn restore_repetition_guidance(prompt: &mut [Message]) {
+    restore_guidance_with_originals(prompt, 0, None);
+}
+
+fn restore_guidance_with_originals(
+    prompt: &mut [Message],
+    base: usize,
+    mut originals: Option<&mut crate::compaction::OriginalMessages>,
+) {
     let mut observer = RepetitionObserver::new();
     let mut index = 0;
     while index + 1 < prompt.len() {
@@ -6244,12 +6297,16 @@ pub fn restore_repetition_guidance(prompt: &mut [Message]) {
             })
             .collect();
         let mut calls = calls.iter();
+        let original = originals.as_ref().map(|_| prompt[index + 1].clone());
         for block in &mut prompt[index + 1].content {
             if let ContentBlock::ToolResult(result) = block {
                 if let Some(call) = calls.next() {
                     attach_repetition_guidance_to_result(&mut observer, call, result);
                 }
             }
+        }
+        if let (Some(originals), Some(original)) = (originals.as_deref_mut(), original) {
+            originals.retain_change(base + index + 1, original, &prompt[index + 1]);
         }
         index += 2;
     }
@@ -6271,7 +6328,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     approval: &A,
     writer: &WalHandle,
     prompt: &mut Vec<Message>,
-    compaction_raw: Option<&mut Vec<Message>>,
+    originals: Option<&mut crate::compaction::OriginalMessages>,
     origin: ModelHandle,
     budget_firings: &[BudgetFiring],
     emit_control_payloads: bool,
@@ -6376,12 +6433,8 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
 
     // As on the uninterrupted path, dispatch persistence is complete before the model-facing copy
     // receives loop guidance. Existing results from the partial batch are folded here as well.
-    if let Some(raw) = compaction_raw {
-        raw.push(Message::assistant_from(
-            pending.assistant.content.clone(),
-            origin.clone(),
-        ));
-        raw.push(Message::new(
+    let original_results = originals.as_ref().map(|_| {
+        Message::new(
             Role::Tool,
             batch
                 .results
@@ -6389,8 +6442,8 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
                 .cloned()
                 .map(ContentBlock::ToolResult)
                 .collect(),
-        ));
-    }
+        )
+    });
     attach_repetition_guidance(
         repetition_observer,
         pending.assistant.tool_calls(),
@@ -6426,6 +6479,9 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         tags: Default::default(),
     };
     crate::tags::attach_parts(&mut results, result_tags);
+    if let (Some(originals), Some(original)) = (originals, original_results) {
+        originals.retain_change(prompt.len(), original, &results);
+    }
     prompt.push(results);
 
     Ok((BatchOutcome::finish_reason(batch.interruption), Vec::new()))
@@ -7911,7 +7967,8 @@ fn interrupted_result(id: &ToolCallId) -> ToolResult {
 /// for a session without compaction, or a WAL that has no lineage id yet.
 struct ClosingNotice<'a> {
     state: &'a mut crate::compaction::CompactionState,
-    raw: &'a mut Vec<Message>,
+    raw: crate::compaction::StoredTranscript<'a>,
+    extra: &'a [Message],
     lineage_id: String,
     session: &'a broca_protocol::BindIdentity,
     model: &'a broca_protocol::ModelHandle,
@@ -7925,7 +7982,8 @@ impl<'a> ClosingNotice<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         state: Option<&'a mut crate::compaction::CompactionState>,
-        raw: Option<&'a mut Vec<Message>>,
+        raw: crate::compaction::StoredTranscript<'a>,
+        extra: &'a [Message],
         writer: &WalHandle,
         session: &'a broca_protocol::BindIdentity,
         model: &'a broca_protocol::ModelHandle,
@@ -7936,7 +7994,8 @@ impl<'a> ClosingNotice<'a> {
     ) -> Option<Self> {
         Some(Self {
             state: state?,
-            raw: raw?,
+            raw,
+            extra,
             lineage_id: writer.lineage_id()?.to_string(),
             session,
             model,
@@ -7947,9 +8006,9 @@ impl<'a> ClosingNotice<'a> {
         })
     }
 
-    /// The notice for the transcript after `assistant` (the run's last model message, when it
-    /// is not in the transcript copy yet) and the tool `results` written after it, or `None`
-    /// when there is nothing new or the notice would be malformed.
+    /// Build the notice from untagged transcript messages not yet announced, plus the latest
+    /// assistant message when it is not in the prompt and any tool results written after it.
+    /// Return `None` if nothing new is available or the notice would be malformed.
     fn notice(
         self,
         assistant: &[ContentBlock],
@@ -7958,14 +8017,15 @@ impl<'a> ClosingNotice<'a> {
         &'a mut crate::compaction::CompactionState,
         crate::compaction_provider::notice::AdvanceNotice,
     )> {
+        let mut extra = self.extra.to_vec();
         if !assistant.is_empty() {
-            self.raw.push(Message::assistant_from(
+            extra.push(Message::assistant_from(
                 assistant.to_vec(),
                 self.model.clone(),
             ));
         }
         if !results.is_empty() {
-            self.raw.push(Message::new(
+            extra.push(Message::new(
                 Role::Tool,
                 results
                     .iter()
@@ -7974,7 +8034,9 @@ impl<'a> ClosingNotice<'a> {
                     .collect(),
             ));
         }
-        broca_protocol::content::stamp_ordinals(self.raw);
+        for (index, message) in extra.iter_mut().enumerate() {
+            message.ordinal = Some((self.raw.len() + index) as u64);
+        }
         let announced = self
             .state
             .announced
@@ -7982,7 +8044,8 @@ impl<'a> ClosingNotice<'a> {
             .and_then(|announced| announced.through_ordinal);
         let appended: usize = self
             .raw
-            .iter()
+            .messages_after(announced)
+            .chain(extra.iter())
             .filter(|m| m.ordinal.is_some_and(|o| announced.is_none_or(|a| o > a)))
             .map(|m| serde_json::to_vec(m).map_or(0, |bytes| bytes.len()))
             .sum();
@@ -7990,9 +8053,10 @@ impl<'a> ClosingNotice<'a> {
             self.request_bytes.saturating_add(appended),
             self.history,
         );
-        let notice = crate::compaction::view::next_notice(
+        let through = extra.last().or_else(|| self.raw.newest())?;
+        let notice = crate::compaction::view::notice_through(
             self.state,
-            self.raw,
+            through,
             crate::compaction::view::NoticeFacts {
                 session_ref: crate::wal_writer::agent_session_ref(self.session),
                 lineage_id: &self.lineage_id,

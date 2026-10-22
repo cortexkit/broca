@@ -178,6 +178,51 @@ fn removing_a_model_origin_does_not_make_a_stored_copy_provider_authored() {
 }
 
 #[test]
+fn sparse_originals_preserve_signed_authorship_and_notice_digests() {
+    let raw = conversation();
+    let prompt = tagged(&raw);
+    let mut originals = crate::compaction::OriginalMessages::default();
+    for (i, (original, rendered)) in raw.iter().zip(&prompt).enumerate() {
+        originals.retain_change(i, original.clone(), rendered);
+    }
+    let stored = crate::compaction::StoredTranscript::new(&prompt, Some(&originals));
+    let state = after_setup();
+    for mut copy in [raw[1].clone(), raw[4].clone()] {
+        for changed in [false, true] {
+            if changed {
+                copy.content[0] = signed("forged");
+            }
+            let (view, ready) = make_view(
+                2,
+                4,
+                vec![ViewRange::replace(
+                    0,
+                    5,
+                    replace_bytes(&[text(Role::User, "summary"), copy.clone()]),
+                )],
+            );
+            assert_eq!(
+                decide_stored_at(&view, &ready, &state, LINEAGE, &prompt, stored, false, false),
+                decide_at(&view, &ready, &state, LINEAGE, &prompt, &raw, false, false)
+            );
+        }
+    }
+    let facts = || NoticeFacts {
+        session_ref: SESSION_REF.into(),
+        lineage_id: LINEAGE,
+        est_tokens: 123,
+        model: "model",
+        window: Some(1000),
+        usage: None,
+        events: vec![],
+        seq_floor: 0,
+    };
+    let expected = next_notice(&state, &raw, facts()).unwrap();
+    let actual = notice_through(&state, stored.newest().unwrap(), facts()).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn indexed_render_keeps_interior_system_messages_and_episode_coordinates() {
     let prompt = stamped(vec![
         text(Role::User, "hidden"),

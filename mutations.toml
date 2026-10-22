@@ -7096,8 +7096,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::recorded_synchronous_compaction_still_renders_and_survives_a_checkpoint"]
 file = "crates/broca-core/src/compaction.rs"
-old = "o >= applied.range.to"
-new = "o > applied.range.to /* NON-VACUITY BREAK */"
+old = "view::ordinal_range(&opts.prompt, applied.range.to, u64::MAX)"
+new = "view::ordinal_range(&opts.prompt, applied.range.to.saturating_add(1), u64::MAX) /* NON-VACUITY BREAK */"
 
 [[control]]
 id = "compaction-model-page-refuses-after-mid"
@@ -19550,9 +19550,9 @@ test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
 expect_red = ["runner_tags_determinism::a_steer_mid_run_renders_live_as_its_rebuild"]
 file = "crates/broca-core/src/run.rs"
 old = '''        crate::tags::attach_parts(&mut results, result_tags);
-        mutable_call_options(&mut opts).prompt.push(results);'''
+        if let (Some(originals), Some(original)) = (originals.as_mut(), original_results)'''
 new = '''        let _ = result_tags; // NON-VACUITY BREAK: the live tool message carries no tags
-        mutable_call_options(&mut opts).prompt.push(results);'''
+        if let (Some(originals), Some(original)) = (originals.as_mut(), original_results)'''
 
 [[control]]
 id = "runner-tags-steer-carries-its-record-tags"
@@ -19943,12 +19943,12 @@ expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the
 only = false
 [[control.edits]]
 file = "crates/broca-core/src/run.rs"
-old = "            ) {\n                runtime.record_notice(state, notice).await?;\n            }\n            state.history = compaction_history.clone();"
-new = "            ) {\n                let _ = notice; // NON-VACUITY BREAK: no pre-wait notice\n            }\n            state.history = compaction_history.clone();"
+old = "            }) {\n                runtime.record_notice(state, notice).await?;\n            }\n            state.history = compaction_history.clone();"
+new = "            }) {\n                let _ = notice; // NON-VACUITY BREAK: no pre-wait notice\n            }\n            state.history = compaction_history.clone();"
 [[control.edits]]
 file = "crates/broca-core/src/run.rs"
-old = "            ) {\n                runtime.record_notice(state, notice).await?;\n            }\n            if ceiling_detail.is_some()"
-new = "            ) {\n                let _ = notice; // NON-VACUITY BREAK: no post-wait notice\n            }\n            if ceiling_detail.is_some()"
+old = "            }) {\n                runtime.record_notice(state, notice).await?;\n            }\n            if ceiling_detail.is_some()"
+new = "            }) {\n                let _ = notice; // NON-VACUITY BREAK: no post-wait notice\n            }\n            if ceiling_detail.is_some()"
 
 [[control]]
 id = "compaction-run-loop-decides-over-the-rendered-prompt"
@@ -19960,7 +19960,7 @@ test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::the_run_loop_decides_a_view_over_the_tagged_prompt_it_sends"]
 file = "crates/broca-core/src/run.rs"
 old = "                    &opts.prompt,\n                    raw,\n                    provider.reasoning_is_prefix_bound(),"
-new = "                    raw, // NON-VACUITY BREAK: decide over the raw copy\n                    raw,\n                    provider.reasoning_is_prefix_bound(),"
+new = "                    &raw.setup_messages(), // NON-VACUITY BREAK: decide over stored bytes\n                    raw,\n                    provider.reasoning_is_prefix_bound(),"
 
 [[control]]
 id = "compaction-notice-floor-across-lineages"
@@ -20023,7 +20023,7 @@ test_file = "crates/broca-core/src/compaction/view_tests.rs"
 expect_red = ["compaction::view::tests::a_verbatim_copy_of_a_stored_signed_message_is_accepted_and_an_edited_one_refused"]
 file = "crates/broca-core/src/compaction/view.rs"
 old = "assemble_judged(view, prompt, Some(stored))"
-new = "assemble_judged(view, prompt, Some(prompt)) /* NON-VACUITY BREAK: judge against the tagged prompt */"
+new = "assemble_judged(view, prompt, Some(super::StoredTranscript::plain(prompt))) /* NON-VACUITY BREAK: judge against the tagged prompt */"
 
 [[control]]
 id = "compaction-hard-stop-records-its-closing-notice"
@@ -20530,7 +20530,7 @@ select = "expected"
 test_file = "crates/broca-core/src/compaction/ceiling_tests.rs"
 expect_red = ["compaction::tests::ceiling_tests::a_ceiling_ride_applies_a_view_before_sending"]
 file = "crates/broca-core/src/run.rs"
-old = "notice_request_bytes = provider.render_request(&view).len();\n            if let Some(notice)"
+old = "notice_request_bytes = request.bytes;\n            if let Some(notice)"
 new = "// NON-VACUITY BREAK: keep the estimate from before the ceiling view\n            if let Some(notice)"
 
 [[control]]
@@ -24276,3 +24276,39 @@ expect_red = ["conformance::model_history::model_tool_pages_match_full_replay_wi
 file = "crates/broca-core/src/replay.rs"
 old = "            seed.open_episode_span"
 new = "            None // NON-VACUITY BREAK: reset counters at the watermark"
+
+[[control]]
+id = "compaction-stores-originals-only-for-changed-messages"
+guards = "unchanged transcript messages are borrowed instead of retained in a second transcript copy"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/stored.rs"
+expect_red = ["compaction::stored::unchanged_messages_are_borrowed_and_only_changed_bytes_are_retained"]
+file = "crates/broca-core/src/compaction/stored.rs"
+old = "if original.content != rendered.content {"
+new = "if true || original.content != rendered.content { // NON-VACUITY BREAK: retain the entire transcript"
+
+[[control]]
+id = "compaction-keeps-the-first-original-bytes"
+guards = "tag rendering after guidance never overwrites the original stored bytes with already decorated prompt text"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/stored.rs"
+expect_red = ["compaction::stored::unchanged_messages_are_borrowed_and_only_changed_bytes_are_retained"]
+file = "crates/broca-core/src/compaction/stored.rs"
+old = "self.0.entry(index).or_insert(original);"
+new = "self.0.insert(index, original); // NON-VACUITY BREAK: replace raw bytes with decorated bytes"
+
+[[control]]
+id = "compaction-sparse-originals-judge-and-digest-stored-bytes"
+guards = "sparse transcript lookup judges signed copies and digests notices against original stored bytes, never tagged prompt bytes"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::sparse_originals_preserve_signed_authorship_and_notice_digests"]
+file = "crates/broca-core/src/compaction/stored.rs"
+old = "self.originals?.0.get"
+new = "(None::<&OriginalMessages>)?.0.get /* NON-VACUITY BREAK: ignore original bytes */"

@@ -412,7 +412,7 @@ impl Runtime<'_> {
         opts: &broca_protocol::CallOptions,
         systems: &[usize],
         request: &mut super::BoundaryRequest,
-        stored: &[Message],
+        stored: super::StoredTranscript<'_>,
         provider: &dyn crate::Provider,
         window: Option<u64>,
     ) -> Result<Option<broca_protocol::ContextCeilingDetail>, crate::RunError> {
@@ -782,7 +782,7 @@ impl Runtime<'_> {
         lineage_id: &str,
         model: &str,
         prompt: &[Message],
-        stored: &[Message],
+        stored: super::StoredTranscript<'_>,
         prefix_bound: bool,
         run_start: bool,
     ) -> Result<Vec<Event>, crate::RunError> {
@@ -867,13 +867,13 @@ impl Runtime<'_> {
         ready: &ViewReady,
         lineage_id: &str,
         prompt: &[Message],
-        stored: &[Message],
+        stored: super::StoredTranscript<'_>,
         prefix_bound: bool,
         run_start: bool,
         events: &mut Vec<Event>,
     ) -> Result<bool, crate::RunError> {
         let version = fetched.view_version;
-        let (decision, event) = Box::pin(self.offer_view(
+        let (decision, event) = Box::pin(self.offer_stored_view(
             state,
             fetched,
             ready,
@@ -938,7 +938,32 @@ impl Runtime<'_> {
         ),
         crate::RunError,
     > {
-        let decision = view::decide_at(
+        self.offer_stored_view(
+            state,
+            fetched,
+            ready,
+            lineage_id,
+            prompt,
+            super::StoredTranscript::plain(stored),
+            prefix_bound,
+            run_start,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn offer_stored_view(
+        &self,
+        state: &mut CompactionState,
+        fetched: &CompactionView,
+        ready: &ViewReady,
+        lineage_id: &str,
+        prompt: &[Message],
+        stored: super::StoredTranscript<'_>,
+        prefix_bound: bool,
+        run_start: bool,
+    ) -> Result<(view::Decision, Option<Event>), crate::RunError> {
+        let decision = view::decide_stored_at(
             fetched,
             ready,
             state,
