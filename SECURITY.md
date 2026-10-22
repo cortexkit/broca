@@ -42,6 +42,23 @@ it. A leaked developer handle or control of the supervised process can expose
 credentials. Protect the daemon, vault, module binaries and user account as part
 of the same trust boundary.
 
+### Environment variables that move a boundary
+
+Three variables in the module's environment change where credentials come from, where model
+requests go, or where prompts are written. They are unset in a normal deployment. Anyone who
+can set the module's environment (the subc module configuration, or the account running it)
+can set them, so protect that configuration like the vault and the binaries.
+
+| Variable | Default when unset | Effect when set |
+|---|---|---|
+| `BROCA_AUTH_SOURCE` | `vault`: credentials come from the credential vault through the grant boundary above | `opencode` reads provider tokens from the OpenCode auth file (`~/.local/share/opencode/auth.json`) instead. That file is not covered by vault grants: any process running as the same user can read it. Any other value that is not blank after trimming refuses startup. |
+| `BROCA_PROVIDER_BASE_URL` | each run's endpoint comes from the model catalog | Every run is sent to this base URL instead, authenticated with no credential, and the vault is never opened. Meant for local mock providers; prompts and tool results go to whatever answers at that URL. |
+| `BROCA_DUMP_REQUEST_DIR` | no request dumps | Every rendered model request of a non-ephemeral session is written to this directory **unredacted**: full prompts, tool arguments and tool results. Files and the directory are created owner-only, and old dumps are swept by size and age, but the contents are as sensitive as the WAL. broca logs a warning naming the directory when the first dump is written. |
+
+The code that reads them is in
+[the module's startup](crates/broca-module-serve/src/main.rs) and
+[the provider transport](crates/broca-provider/src/transport.rs).
+
 The implementation of these boundaries is in
 [the vault client](crates/broca-subc/src/vault.rs) and
 [the handle-file configuration](crates/broca-module-serve/src/vault_config.rs).

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -149,7 +150,65 @@ class WorkflowGraph(unittest.TestCase):
         self.assertTrue(all(i > wait for i in downloads))
         self.assertEqual(self.workflow('ci.yml')['permissions']['actions'], 'read')
         self.assertEqual(set(jobs['test']['needs']),
-                         {'lint', 'scripts', 'unit', 'store-contention-macos', 'integration-build', 'fixtures', 'integration', 'linux-deploy'})
+                         {'lint', 'scripts', 'unit', 'production-features', 'store-contention-macos',
+                          'integration-build', 'fixtures', 'integration', 'linux-deploy'})
+
+    def test_master_and_nightly_runs_are_never_cancelled_by_each_other(self):
+        """A master push cancelled the nightly run on master, or a later push cancelled an
+        earlier master commit's run, and release tagging then found a cancelled CI run."""
+        concurrency = self.workflow('ci.yml')['concurrency']
+        self.assertIn('${{ github.event_name }}', concurrency['group'])
+        self.assertIn('${{ github.ref }}', concurrency['group'])
+        # A shared master group keeps one pending run and drops the older one, so master and
+        # nightly runs are grouped by commit. (`cond && '' || x` always yields x in GitHub's
+        # expressions, so the commit suffix must be the truthy arm.)
+        self.assertIn("${{ (github.event_name != 'pull_request' && "
+                      "!startsWith(github.ref, 'refs/heads/train/')) && "
+                      "format('-{0}', github.sha) || '' }}", concurrency['group'])
+        self.assertEqual(
+            concurrency['cancel-in-progress'],
+            "${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/train/') }}",
+        )
+
+    def test_shard_budget_covers_the_slowest_producer_then_the_replay(self):
+        """Shards start alongside their producers and wait for them. The wait must outlast the
+        longest producer budget, and the shard's job budget must outlast the wait plus a
+        replay, or a shard is cancelled while its producer is still inside its allowance."""
+        jobs = self.workflow('ci.yml')['jobs']
+        producers = {
+            'integration-build': int(jobs['integration-build']['timeout-minutes']),
+            'fixtures': int(self.workflow('fixtures.yml')['jobs']['fixtures']['timeout-minutes']),
+        }
+        wait_step = next(step for step in jobs['integration']['steps']
+                         if 'wait-ci-artifacts.py' in step.get('run', ''))
+        words = shlex.split(wait_step['run'])
+        self.assertIn('--timeout', words, 'the artifact wait must state its own budget')
+        wait_seconds = float(words[words.index('--timeout') + 1])
+        self.assertGreaterEqual(wait_seconds, 60 * max(producers.values()), producers)
+        replay_minutes = 10
+        self.assertGreaterEqual(int(jobs['integration']['timeout-minutes']) * 60,
+                                wait_seconds + 60 * replay_minutes)
+
+    def test_production_clock_code_is_linted_and_tested_and_msrv_checked(self):
+        """Every other lane enables test-clock, so the release clock path had no lint or test."""
+        job = self.workflow('ci.yml')['jobs']['production-features']
+        runs = [step.get('run', '') for step in job['steps']]
+        crates = '-p broca-core -p broca-module -p broca-module-serve'
+        clippy = next(run for run in runs if run.startswith('cargo clippy'))
+        tests = next(run for run in runs if run.startswith('cargo test'))
+        for command in (clippy, tests):
+            self.assertIn(crates, command)
+            self.assertNotIn('test-clock', command)
+            self.assertNotIn('cargo_feature_args', command)
+            self.assertNotIn('-F', command.split())
+        self.assertIn('--lib --bins', tests)
+        # Real-daemon tests in these crates must fail, not skip, when their binaries are missing.
+        for name in ('SUBC', 'AIMOCK', 'VAULT'):
+            self.assertEqual(job['env'][f'BROCA_REQUIRE_{name}'], '1')
+        rust_version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['rust-version']
+        msrv = next(step for step in job['steps'] if step.get('with', {}).get('toolchain'))
+        self.assertEqual(msrv['with']['toolchain'], rust_version)
+        self.assertIn(f'cargo +{rust_version} check --locked --workspace --all-targets', runs)
 
     def test_store_contention_runs_on_all_three_native_platforms(self):
         jobs = self.workflow('ci.yml')['jobs']
@@ -260,7 +319,7 @@ class WorkflowGraph(unittest.TestCase):
                  if line.startswith('bash scripts/ci-status.sh ')]
         self.assertEqual(len(calls), 1)
         required = calls[0][3:calls[0].index('||')]
-        self.assertEqual(required, ['--only', 'CI'])
+        self.assertEqual(required, ['--event', 'push', '--only', 'CI'])
         self.assertNotIn(windows, required)
         self.assertNotIn(linux, required)
 

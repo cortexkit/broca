@@ -30,9 +30,10 @@ aimock = { max-threads = 4 }
 # The real-daemon spine tests boot subc-core plus supervised modules per test.
 # Group them so multiple daemon stacks do not thrash the host at once. Apart
 # from live_e2e they share the crate's `it` binary and are selected by module
-# prefix; check a change with `cargo nextest list -E '<filter>'`, since a
-# prefix that matches nothing is not an error.
-filter = 'package(=broca-subc) and (binary(=live_e2e) or (binary(=it) and test(/^(aimock_real_aft|dogfood|resume_spine|tool_fault_spine|transform_spine)::/)))'
+# prefix. A prefix that matches nothing is not a nextest error, so
+# scripts/test-nextest-groups.py checks that every prefix names a module of the
+# binary and that every module starting a daemon rig is listed here.
+filter = 'package(=broca-subc) and (binary(=live_e2e) or (binary(=it) and test(/^(aimock_real_aft|compaction_routes|consent_ops|dogfood|hook_routes|multi_module_spine|resume_spine|scope_outbound_real_daemon|tool_call_cancel_real_daemon|tool_fault_spine)::/)))'
 test-group = 'subc_spine'
 
 [[profile.default.overrides]]
@@ -44,11 +45,21 @@ filter = '(package(=broca-module-serve) and kind(test)) or (package(=ck-import) 
 test-group = 'module_serve'
 
 [[profile.default.overrides]]
+# The mixed-family test boots five aimock processes at once, one per family, so
+# it takes every slot of the aimock group and runs while no other aimock test
+# does. nextest applies the first matching override, so this precedes the
+# family-wide one below.
+filter = 'package(=broca-provider) and binary(=it) and test(/^mixed_family_concurrency_e2e::/)'
+test-group = 'aimock'
+threads-required = 4
+
+[[profile.default.overrides]]
 # The provider-family e2e matrix boots one aimock process per test alongside
 # the real loop, so cap the whole family. The crate's integration tests share
 # one binary, so the family is selected by its modules' test-name prefixes.
 # A misspelled prefix selects nothing without an error (unlike binary(=...),
-# which nextest rejects when no binary has that name), so check a change with
-# `cargo nextest list -E '<filter>'`.
+# which nextest rejects when no binary has that name), so
+# scripts/test-nextest-groups.py checks each prefix and that every module
+# booting aimock is in this group.
 filter = 'package(=broca-provider) and binary(=it) and test(/^(all_families_smoke|anthropic_e2e|bedrock_e2e|gemini_e2e|openai_chat_e2e|openai_responses_e2e|stream_errors_e2e|tool_arg_errors_e2e|transport_errors_e2e)::/)'
 test-group = 'aimock'

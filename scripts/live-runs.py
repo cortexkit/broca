@@ -245,37 +245,117 @@ def _self_test() -> int:
     return 0
 
 
+class AmbiguousProcess(Exception):
+    """The daemon's process cannot be identified: several match, or one of this user's
+    processes hides its command line."""
+
+
+def process_table(proc_root: pathlib.Path | None = None) -> list[tuple[str, str]]:
+    """(pid, argv[0]) for every process whose command line can be read.
+
+    On Linux argv[0] comes from /proc/<pid>/cmdline, which keeps argument boundaries, so an
+    executable path containing spaces is read exactly. Elsewhere it is the first word of
+    `ps`'s command column, the same rule place-release.sh's running-image.sh uses on macOS; an
+    executable path with a space is cut there and never matches, and the gate then refuses as
+    if broca were not running. `proc_root` lets tests supply a fake /proc.
+    """
+    root = proc_root or pathlib.Path("/proc")
+    if proc_root is not None or (sys.platform.startswith("linux") and root.is_dir()):
+        rows = []
+        for entry in root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / "cmdline").read_bytes()
+            except OSError as error:
+                # A process that exited since the listing, or another user's, is not the daemon
+                # this account supervises. One of this user's that is still running but cannot
+                # be read might be, so it is unknown, as in running-image.sh.
+                try:
+                    owner = entry.stat().st_uid
+                except OSError:
+                    continue
+                if owner == os.geteuid():
+                    raise AmbiguousProcess(
+                        f"cannot read the command line of pid {entry.name}: {error}"
+                    ) from error
+                continue
+            if raw:
+                rows.append((entry.name, os.fsdecode(raw.split(b"\0", 1)[0])))
+        return sorted(rows, key=lambda row: int(row[0]))
+    listing = subprocess.run(
+        ["ps", "-A", "-ww", "-o", "pid=,command="], capture_output=True, text=True, check=False
+    ).stdout
+    rows = []
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].isdigit():
+            rows.append((fields[0], fields[1]))
+    return rows
+
+
+def matching_pids(pattern: str, proc_root: pathlib.Path | None = None) -> list[str]:
+    """PIDs of processes whose EXECUTABLE (argv[0]) matches `pattern`.
+
+    Only argv[0] is tested. Matching anywhere in the command line, as `pgrep -f` does, also
+    counted processes that merely name the daemon's path in an argument: the rollback
+    `place-release.sh ... --dest <path>/bin/ck-broca --restart` that deploy.sh prints, a
+    `tail` of a log beside the binary, or this script run with --process. That second match
+    made the restart gate refuse, so the rollback refused itself.
+    """
+    own = str(os.getpid())
+    return [
+        pid
+        for pid, argv0 in process_table(proc_root)
+        if pid != own and re.search(pattern, argv0)
+    ]
+
+
+def start_epoch(pid: str) -> int | None:
+    """Start time of one process in seconds since the epoch, or None if it cannot be read."""
+    if sys.platform.startswith("linux"):
+        # Field 22 is ticks since boot. The command in field 2 can contain spaces and ')',
+        # so split after its final delimiter rather than tokenising the entire record.
+        record = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        ticks = int(record.rsplit(")", 1)[1].split()[19])
+        boot = next(
+            int(line.split()[1])
+            for line in pathlib.Path("/proc/stat").read_text().splitlines()
+            if line.startswith("btime ")
+        )
+        return int(boot + ticks / os.sysconf("SC_CLK_TCK"))
+    started = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", pid], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    if not started:
+        return None
+    epoch = subprocess.run(
+        ["date", "-j", "-f", "%a %b %d %T %Y", started, "+%s"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    return int(epoch) if epoch.isdigit() else None
+
+
 def process_start_epoch(pattern: str) -> int | None:
-    """Start time of the running broca process, or None if it is not running."""
+    """Start time of the running broca process, or None if it is not running.
+
+    Raises AmbiguousProcess when several processes match. The boot epoch decides which unsealed
+    WALs count as live, and the epoch of any process that started after the daemon would call
+    the daemon's live runs abandoned and clear a restart that cuts them. So two candidates are
+    a refusal, never a pick.
+    """
     try:
-        pid = subprocess.run(
-            ["pgrep", "-f", pattern], capture_output=True, text=True, check=False
-        ).stdout.split()
-        if not pid:
+        pids = matching_pids(pattern)
+        if not pids:
             return None
-        if sys.platform.startswith("linux"):
-            # Field 22 is ticks since boot. The command in field 2 can contain spaces and ')',
-            # so split after its final delimiter rather than tokenising the entire record.
-            record = pathlib.Path(f"/proc/{pid[0]}/stat").read_text()
-            ticks = int(record.rsplit(")", 1)[1].split()[19])
-            boot = next(
-                int(line.split()[1])
-                for line in pathlib.Path("/proc/stat").read_text().splitlines()
-                if line.startswith("btime ")
+        if len(pids) > 1:
+            raise AmbiguousProcess(
+                f"{len(pids)} processes match {pattern!r} (pids {' '.join(pids)}); pass --process "
+                "with a pattern only the running daemon matches"
             )
-            return int(boot + ticks / os.sysconf("SC_CLK_TCK"))
-        started = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", pid[0]], capture_output=True, text=True, check=False
-        ).stdout.strip()
-        if not started:
-            return None
-        epoch = subprocess.run(
-            ["date", "-j", "-f", "%a %b %d %T %Y", started, "+%s"],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout.strip()
-        return int(epoch) if epoch.isdigit() else None
+        return start_epoch(pids[0])
     except (OSError, ValueError, IndexError, StopIteration):
         return None
 
@@ -319,7 +399,11 @@ def main() -> int:
         print(f"cannot compare: no wal directory at {wal_dir}", file=sys.stderr)
         return 2
 
-    boot = args.boot_epoch or process_start_epoch(args.process)
+    try:
+        boot = args.boot_epoch or process_start_epoch(args.process)
+    except AmbiguousProcess as ambiguous:
+        print(f"cannot compare: {ambiguous}", file=sys.stderr)
+        return 2
     if boot is None:
         print(
             "cannot compare: broca is not running, so there is no process boundary to compare "

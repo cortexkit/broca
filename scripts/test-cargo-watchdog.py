@@ -32,6 +32,12 @@ class CargoWatchdogTests(unittest.TestCase):
             "    child = (\"import pathlib,time; time.sleep(0.6); pathlib.Path(%r).touch()\" % os.environ['CHILD_MARKER'])\n"
             "    subprocess.Popen([sys.executable, '-c', child])\n"
             "    time.sleep(10)\n"
+            "elif mode == 'leak':\n"
+            "    # A descendant inherits Cargo's stdout and outlives it, as a leaked test daemon does.\n"
+            "    child = (\"import pathlib,time; time.sleep(0.6); pathlib.Path(%r).touch()\" % os.environ['CHILD_MARKER'])\n"
+            "    subprocess.Popen([sys.executable, '-c', child])\n"
+            "    print('fixture cargo finished', flush=True)\n"
+            "    raise SystemExit(3)\n"
             "elif mode == 'silent':\n"
             "    time.sleep(10)\n"
             "else:\n"
@@ -77,6 +83,23 @@ class CargoWatchdogTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
         self.assertIn("inventory list", result.stderr)
         self.assertIn("no output progress", result.stderr)
+
+    def test_an_exited_cargo_is_not_held_open_by_a_descendant(self):
+        """Cargo has exited, but a child it started still holds the output pipe. The step is
+        over: its status is Cargo's own, not an idle timeout after the descendant goes quiet."""
+        result = self.run_cargo(
+            "leak",
+            BROCA_CARGO_LOCK_TIMEOUT_SECONDS="30",
+            BROCA_CARGO_IDLE_TIMEOUT_SECONDS="30",
+            BROCA_CARGO_EXIT_DRAIN_SECONDS="0.15",
+        )
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "fixture cargo finished\n")
+        self.assertIn("exited with status 3", result.stderr)
+        self.assertIn("still holds its output open", result.stderr)
+        self.assertNotIn("no output progress", result.stderr)
+        time.sleep(0.7)
+        self.assertFalse(self.child_marker.exists(), "the descendant holding the pipe survived")
 
     def test_normal_cargo_failure_status_and_output_pass_through(self):
         result = self.run_cargo("failure")

@@ -182,8 +182,9 @@ def start_guard(work, train_name, path_prefix, extra_env):
 
 
 def lock_dir(work):
-    out = git(work, "rev-parse", "--git-dir").stdout.strip()
-    return (work / out) / "train-push-locks"
+    # Every worktree of one clone shares the lock, so the common git directory holds it.
+    out = git(work, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    return pathlib.Path(out) / "train-push-locks"
 
 
 def held(work):
@@ -462,6 +463,29 @@ class ConcurrencyGuardArms(unittest.TestCase):
         self.assertIn("no live train here", out)
         self.assertIn("git push origin --delete train/leftover", out)
         self.assertNotIn("a train is already running", out)
+
+    def test_a_live_lock_from_another_worktree_refuses(self):
+        """Two linked worktrees of one clone push to the same remote, so a train started in
+        either must see the other's lock. A per-worktree lock admitted both."""
+        linked = self.tmp / "linked"
+        added = git(self.work, "worktree", "add", "-q", "-b", "side", str(linked))
+        self.assertEqual(added.returncode, 0, added.stderr)
+        sleeper = subprocess.Popen(["sleep", "60"])
+        try:
+            plant_owner(self.work, sleeper.pid, "maintrain", start=proc_start(sleeper.pid))
+            out = run_guard(linked, "from-linked", path_prefix=str(self.work / "fixturebin"))
+            self.assertIn("maintrain is RUNNING", out)
+            self.assertIn("a train is already running", out)
+
+            status = subprocess.run(
+                ["bash", "scripts/train-push.sh", "--status"], cwd=linked,
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            self.assertIn(f"a train IS in flight (pid {sleeper.pid}, maintrain)", status.stdout,
+                          status.stdout + status.stderr)
+        finally:
+            sleeper.kill()
+            sleeper.wait()
 
     def test_the_lock_is_claimed_before_any_ref_moves(self):
         """The ordering that makes arm 2 reachable at all.

@@ -5777,61 +5777,50 @@ mod tests {
         waits
     }
 
-    /// Process-global lock for the stream-floor env vars so parallel tests cannot clobber each other.
-    static STREAM_FLOOR_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct StreamFloorEnvGuard {
-        prev_bytes: Option<String>,
-        prev_window: Option<String>,
-    }
-
-    impl StreamFloorEnvGuard {
-        fn apply(
-            bytes_per_sec: &str,
-            window_secs: &str,
-        ) -> (std::sync::MutexGuard<'static, ()>, Self) {
-            let guard = STREAM_FLOOR_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let prev_bytes = std::env::var("BROCA_MIN_STREAM_BYTES_PER_SEC").ok();
-            let prev_window = std::env::var("BROCA_MIN_STREAM_WINDOW_SECS").ok();
-            std::env::set_var("BROCA_MIN_STREAM_BYTES_PER_SEC", bytes_per_sec);
-            std::env::set_var("BROCA_MIN_STREAM_WINDOW_SECS", window_secs);
-            (
-                guard,
-                Self {
-                    prev_bytes,
-                    prev_window,
-                },
-            )
-        }
-    }
-
-    impl Drop for StreamFloorEnvGuard {
-        fn drop(&mut self) {
-            match &self.prev_bytes {
-                Some(value) => std::env::set_var("BROCA_MIN_STREAM_BYTES_PER_SEC", value),
-                None => std::env::remove_var("BROCA_MIN_STREAM_BYTES_PER_SEC"),
-            }
-            match &self.prev_window {
-                Some(value) => std::env::set_var("BROCA_MIN_STREAM_WINDOW_SECS", value),
-                None => std::env::remove_var("BROCA_MIN_STREAM_WINDOW_SECS"),
-            }
-        }
-    }
-
     /// A stream that trickles below the configured floor must fail once as `Transient` and must not
     /// reissue the same request to the same provider. Retrying would only re-bill the degraded
     /// endpoint; the router needs the health signal immediately.
     ///
+    /// The floor is read from process-global environment variables at every stream start, so
+    /// setting them here would change the floor for every other stream test running in this
+    /// binary at the same time, and a lock only this test takes cannot stop that. The test body
+    /// therefore runs in a child test process that is started with the variables already set;
+    /// nothing in this process ever writes them.
+    ///
     /// Real wall time (not `start_paused`): the client parks on socket IO while the server drips,
     /// so virtual time would never auto-advance past the drip sleeps.
     #[tokio::test]
-    // std Mutex across await is intentional: the floor env vars are process-global, so the lock
-    // must cover the whole test body. No other task on this runtime re-acquires it.
-    #[allow(clippy::await_holding_lock)]
     async fn stream_floor_breach_is_transient_and_not_reissued() {
-        let (_lock, _env) = StreamFloorEnvGuard::apply("50", "1");
+        const CHILD: &str = "BROCA_TEST_STREAM_FLOOR_CHILD";
+        const NAME: &str = "transport::tests::stream_floor_breach_is_transient_and_not_reissued";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("BROCA_MIN_STREAM_BYTES_PER_SEC", "50")
+                .env("BROCA_MIN_STREAM_WINDOW_SECS", "1")
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "stream floor child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // The child must have run the body, not matched nothing and passed.
+            assert!(
+                stdout.contains("1 passed"),
+                "stream floor child ran no test:\n{stdout}"
+            );
+            return;
+        }
+        assert_eq!(
+            super::stream_floor_from_env().map(|floor| floor.window),
+            Some(Duration::from_secs(1)),
+            "the child must see the floor its parent set"
+        );
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();

@@ -178,20 +178,102 @@ impl ObservedWalStore {
     }
 }
 
+// EVERY METHOD FileWalStore OVERRIDES IS FORWARDED HERE. A method left to the trait default
+// would make the reference run take a different path from production: the defaults refuse
+// retention, ignore the session class, and know no tombstone floors. The
+// test in tests/it/observed_wal_fidelity.rs compares these impls with FileWalStore's and
+// FileWal's, so a new production override cannot be missed here silently.
 impl WalStore for ObservedWalStore {
+    fn read_records_tail_bounded(
+        &self,
+        session: &BindIdentity,
+        tail_bytes: u64,
+    ) -> Result<Option<broca_wal::WalRangeRead>, WalError> {
+        WalStore::read_records_tail_bounded(&self.inner, session, tail_bytes)
+    }
+
+    fn backup_classes(&self) -> Vec<String> {
+        WalStore::backup_classes(&self.inner)
+    }
+
+    fn retired_tag_floor(&self, session: &BindIdentity) -> Result<u64, WalError> {
+        WalStore::retired_tag_floor(&self.inner, session)
+    }
+
+    fn retired_notice_floor(&self, session: &BindIdentity) -> Result<u64, WalError> {
+        WalStore::retired_notice_floor(&self.inner, session)
+    }
+
+    fn open_with_class(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+    ) -> Result<Box<dyn Wal + Send>, WalError> {
+        Ok(self.observe(WalStore::open_with_class(
+            &self.inner,
+            session,
+            retention,
+            session_class,
+        )?))
+    }
+
+    fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
+        WalStore::check_move(&self.inner, session, write)
+    }
+
     fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
-        Ok(Box::new(ObservedWal {
-            inner: self.inner.open(session)?,
-            synced: Arc::clone(&self.synced),
-        }))
+        Ok(self.observe(WalStore::open(&self.inner, session)?))
+    }
+
+    fn open_with_retention(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+    ) -> Result<Box<dyn Wal + Send>, WalError> {
+        Ok(self.observe(WalStore::open_with_retention(
+            &self.inner,
+            session,
+            retention,
+        )?))
+    }
+
+    fn lineage_exists(
+        &self,
+        session: &BindIdentity,
+        meta: Option<&broca_core::AdmissionStoreSnapshot>,
+    ) -> Result<bool, WalError> {
+        WalStore::lineage_exists(&self.inner, session, meta)
+    }
+
+    fn first_user_message(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<(Option<broca_protocol::Message>, u64), WalError> {
+        WalStore::first_user_message(&self.inner, session)
+    }
+
+    fn is_retention_lineage(&self, session: &BindIdentity) -> Result<bool, WalError> {
+        WalStore::is_retention_lineage(&self.inner, session)
     }
 
     fn wal_present(&self, session: &BindIdentity) -> Option<bool> {
-        self.inner.wal_present(session)
+        WalStore::wal_present(&self.inner, session)
+    }
+
+    fn live_wal_last_write(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<std::time::SystemTime>, WalError> {
+        WalStore::live_wal_last_write(&self.inner, session)
+    }
+
+    fn live_wal_bytes(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
+        WalStore::live_wal_bytes(&self.inner, session)
     }
 
     fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
-        self.inner.read_records(session)
+        WalStore::read_records(&self.inner, session)
     }
 
     fn read_records_range(
@@ -201,16 +283,67 @@ impl WalStore for ObservedWalStore {
         through_seq: Option<u64>,
         anchor: Option<&broca_wal::WalByteAnchor>,
     ) -> Result<broca_wal::WalRangeRead, WalError> {
-        self.inner
-            .read_records_range(session, after_seq, through_seq, anchor)
+        WalStore::read_records_range(&self.inner, session, after_seq, through_seq, anchor)
+    }
+
+    fn read_records_range_for_authorization(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        anchor: Option<&broca_wal::WalByteAnchor>,
+    ) -> Result<broca_wal::WalRangeRead, WalError> {
+        WalStore::read_records_range_for_authorization(
+            &self.inner,
+            session,
+            after_seq,
+            through_seq,
+            anchor,
+        )
+    }
+
+    fn read_records_range_from_valid_anchor(
+        &self,
+        session: &BindIdentity,
+        after_seq: u64,
+        through_seq: Option<u64>,
+        anchor: &broca_wal::WalByteAnchor,
+    ) -> Result<Option<broca_wal::WalRangeRead>, WalError> {
+        WalStore::read_records_range_from_valid_anchor(
+            &self.inner,
+            session,
+            after_seq,
+            through_seq,
+            anchor,
+        )
     }
 
     fn flush_for_read(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
-        self.inner.flush_for_read(session)
+        WalStore::flush_for_read(&self.inner, session)
     }
 
     fn file_identity(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
-        self.inner.file_identity(session)
+        WalStore::file_identity(&self.inner, session)
+    }
+
+    fn flush_for_authorization(&self, session: &BindIdentity) -> Result<Option<u64>, WalError> {
+        WalStore::flush_for_authorization(&self.inner, session)
+    }
+
+    fn file_identity_for_authorization(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<u64>, WalError> {
+        WalStore::file_identity_for_authorization(&self.inner, session)
+    }
+}
+
+impl ObservedWalStore {
+    fn observe(&self, inner: Box<dyn Wal + Send>) -> Box<dyn Wal + Send> {
+        Box::new(ObservedWal {
+            inner,
+            synced: Arc::clone(&self.synced),
+        })
     }
 }
 
@@ -219,6 +352,8 @@ struct ObservedWal {
     synced: Arc<Mutex<BTreeSet<u64>>>,
 }
 
+// Like the store above, every method FileWal overrides is forwarded, so the writer sees the
+// same byte budget and takes the same pre-encoded append path as in production.
 impl Wal for ObservedWal {
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let seq = self.inner.append(fence, record, sync)?;
@@ -226,6 +361,32 @@ impl Wal for ObservedWal {
             self.synced.lock().unwrap().insert(seq);
         }
         Ok(seq)
+    }
+
+    fn append_preencoded(
+        &mut self,
+        fence: u64,
+        record: &WalRecord,
+        sync: bool,
+        frame: Vec<u8>,
+    ) -> Result<u64, WalError> {
+        let seq = self.inner.append_preencoded(fence, record, sync, frame)?;
+        if sync {
+            self.synced.lock().unwrap().insert(seq);
+        }
+        Ok(seq)
+    }
+
+    fn append_budget(&self) -> Option<(u64, u64, u64)> {
+        self.inner.append_budget()
+    }
+
+    fn recovery_byte_cap(&self) -> Option<u64> {
+        self.inner.recovery_byte_cap()
+    }
+
+    fn append_budget_scope(&self) -> broca_wal::size_limit::SizeScope {
+        self.inner.append_budget_scope()
     }
 
     fn sync(&self) -> Result<(), WalError> {

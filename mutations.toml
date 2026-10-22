@@ -1909,8 +1909,8 @@ test_file = "scripts/test-place-release-gate.py"
 expect_red = ["LinuxDeployTests.test_linux_process_start_uses_proc_not_bsd_date"]
 platforms = ["linux"]
 file = "scripts/live-runs.py"
-old = '        if sys.platform.startswith("linux"):'
-new = "        if False:  # NON-VACUITY BREAK: restore BSD date on Linux"
+old = '    if sys.platform.startswith("linux"):'
+new = "    if False:  # NON-VACUITY BREAK: restore BSD date on Linux"
 
 [[control]]
 id = "linux-local-gate-rigs"
@@ -11308,7 +11308,10 @@ runner = "command"
 command = ["python3", "-B", "scripts/test-train-push.py", "{test}"]
 test_count_pattern = "Ran {count} test"
 test_file = "scripts/test-train-push.py"
-expect_red = ["ConcurrencyGuardArms.test_two_trains_started_together_cannot_both_be_admitted"]
+expect_red = [
+    "ConcurrencyGuardArms.test_two_trains_started_together_cannot_both_be_admitted",
+    "ConcurrencyGuardArms.test_a_live_lock_from_another_worktree_refuses",
+]
 file = "scripts/train-push.sh"
 old = '''  if owner_is_live "$owner_pid" "$owner_start"; then
     printf 'train-push: train %s is RUNNING as pid %s\n' "${owner_name:-?}" "$owner_pid" >&2'''
@@ -23468,3 +23471,332 @@ expect_message = "refused_overlapping_batch=0"
 file = "crates/broca-core/examples/replay-corpus-scan.rs"
 old = "                if reason == OVERLAPPING_BATCH_REASON =>"
 new = "                if false && reason == OVERLAPPING_BATCH_REASON => // NON-VACUITY BREAK: file overlap refusals with the others."
+
+[[control]]
+id = "train-push-lock-shared-across-worktrees"
+# Train fixtures depend on POSIX process/lock semantics and executable shell shims.
+platforms = ["linux", "macos"]
+guards = "a train started in one linked worktree is refused while another worktree's train holds the lock"
+runner = "command"
+command = ["python3", "-B", "scripts/test-train-push.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-train-push.py"
+expect_red = ["ConcurrencyGuardArms.test_a_live_lock_from_another_worktree_refuses"]
+file = "scripts/train-push.sh"
+old = 'train_lock_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/train-push-locks"'
+new = 'train_lock_dir="$(git rev-parse --git-dir 2>/dev/null)/train-push-locks" # NON-VACUITY BREAK: per-worktree lock'
+
+[[control]]
+id = "script-suites-account-for-every-suite-file"
+guards = "a suite file under scripts/ that no script-suites.sh list runs is reported, not left to rot"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-script-suites.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-script-suites.py"
+expect_red = [
+    "InventoryTests.test_every_suite_file_is_listed",
+    "InventoryTests.test_the_restart_suite_runs_in_required_mode",
+]
+file = "scripts/script-suites.sh"
+old = """    # second live-run check.
+    scripts/test-place-release-restart.py"""
+new = """    # second live-run check.
+    # NON-VACUITY BREAK: the restart suite is no longer run"""
+
+[[control]]
+id = "script-suites-native-macos-skip-is-a-failure"
+guards = "the macOS-only restart suite fails instead of skipping when its run requires native macOS"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-script-suites.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-script-suites.py"
+expect_red = ["RequiredModeTests.test_required_mode_turns_the_skip_into_a_failure"]
+file = "scripts/test-place-release-restart.py"
+old = """            if os.environ.get("BROCA_REQUIRE_NATIVE_MACOS") == "1":"""
+new = """            if False:  # NON-VACUITY BREAK: required mode skips like an ordinary run"""
+
+[[control]]
+id = "cargo-watchdog-sees-cargo-exit-past-a-leaked-pipe"
+guards = "a finished Cargo step returns Cargo's status even while a descendant still holds its output pipe"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-cargo-watchdog.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-cargo-watchdog.py"
+expect_red = ["CargoWatchdogTests.test_an_exited_cargo_is_not_held_open_by_a_descendant"]
+file = "scripts/lib/cargo-watchdog.py"
+old = """                    exited_at = time.monotonic()
+                    continue"""
+new = """                    exited_at = None  # NON-VACUITY BREAK: wait for the pipes, not for Cargo
+                    continue"""
+
+[[control]]
+id = "ci-concurrency-keeps-master-and-nightly-runs"
+guards = "a master push and the nightly CI run on master never share a concurrency group"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_master_and_nightly_runs_are_never_cancelled_by_each_other"]
+file = ".github/workflows/ci.yml"
+old = '''  group: ci-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/train/')) && format('-{0}', github.sha) || '' }}'''
+new = '''  group: ci-${{ github.ref }} # NON-VACUITY BREAK: push and schedule share a group'''
+
+[[control]]
+id = "ci-concurrency-groups-master-runs-by-commit"
+guards = "a master push between two others keeps its own CI run instead of being dropped as an older pending run"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_master_and_nightly_runs_are_never_cancelled_by_each_other"]
+file = ".github/workflows/ci.yml"
+old = '''  group: ci-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/heads/train/')) && format('-{0}', github.sha) || '' }}'''
+new = '''  group: ci-${{ github.event_name }}-${{ github.ref }} # NON-VACUITY BREAK: one group for every master commit'''
+
+[[control]]
+id = "ci-shard-wait-covers-producer-budget"
+guards = "integration shards wait for their artifacts at least as long as the slowest producer may run"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_shard_budget_covers_the_slowest_producer_then_the_replay"]
+file = ".github/workflows/ci.yml"
+old = '''        run: python3 -B scripts/wait-ci-artifacts.py --timeout 2700 "fixtures-${{ runner.os }}" "integration-${{ matrix.os }}"'''
+new = '''        run: python3 -B scripts/wait-ci-artifacts.py --timeout 1200 "fixtures-${{ runner.os }}" "integration-${{ matrix.os }}" # NON-VACUITY BREAK: the old 20-minute wait'''
+
+[[control]]
+id = "release-judges-only-push-ci-runs"
+guards = "a failed, cancelled or running nightly CI run on the release commit does not block tagging, and cannot replace a push run"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-release.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-release.py"
+expect_red = [
+    "Release.test_a_scheduled_ci_run_never_holds_a_release",
+    "Release.test_a_scheduled_success_cannot_stand_in_for_a_push_run",
+]
+file = "scripts/ci-status.sh"
+old = '    runs = [r for r in runs if r.get("event") == event]'
+new = '    pass  # NON-VACUITY BREAK: judge every event'
+
+[[control]]
+id = "live-runs-refuses-an-ambiguous-daemon-process"
+guards = "the restart gate refuses when several processes match the daemon, instead of taking the first one's start time"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "-c", "import importlib.util, sys, unittest; sys.path.insert(0, 'scripts'); spec = importlib.util.spec_from_file_location('test_live_runs', 'scripts/test-live-runs.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName(sys.argv[1], module)); sys.exit(0 if result.wasSuccessful() else 1)", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-live-runs.py"
+expect_red = ["LiveRunsGateTests.test_two_matching_processes_refuse_instead_of_picking_one"]
+file = "scripts/live-runs.py"
+old = "        if len(pids) > 1:"
+new = "        if False:  # NON-VACUITY BREAK: take the first match"
+
+[[control]]
+id = "live-runs-never-matches-its-own-process"
+guards = "the restart gate never reads its own process as the daemon when its command line names the pattern"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "-c", "import importlib.util, sys, unittest; sys.path.insert(0, 'scripts'); spec = importlib.util.spec_from_file_location('test_live_runs', 'scripts/test-live-runs.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName(sys.argv[1], module)); sys.exit(0 if result.wasSuccessful() else 1)", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-live-runs.py"
+expect_red = ["LiveRunsGateTests.test_the_scripts_own_process_is_never_a_match"]
+file = "scripts/live-runs.py"
+old = "        if pid != own and re.search(pattern, argv0)"
+new = "        if re.search(pattern, argv0)  # NON-VACUITY BREAK: keep this script's own pid"
+
+[[control]]
+id = "live-runs-matches-the-daemon-executable-only"
+guards = "the restart gate counts only processes whose executable is the daemon, so a rollback naming the daemon's path in its arguments does not refuse itself"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "-c", "import importlib.util, sys, unittest; sys.path.insert(0, 'scripts'); spec = importlib.util.spec_from_file_location('test_live_runs', 'scripts/test-live-runs.py'); module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName(sys.argv[1], module)); sys.exit(0 if result.wasSuccessful() else 1)", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-live-runs.py"
+expect_red = [
+    "LiveRunsGateTests.test_a_later_argument_naming_the_daemon_path_is_not_a_match",
+    "LiveRunsGateTests.test_the_rollback_command_deploy_prints_is_not_a_match",
+    "LiveRunsGateTests.test_an_executable_path_with_spaces_is_read_whole",
+]
+file = "scripts/live-runs.py"
+old = """                rows.append((entry.name, os.fsdecode(raw.split(b"\\0", 1)[0])))"""
+new = """                rows.append((entry.name, os.fsdecode(raw.replace(b"\\0", b" "))))  # NON-VACUITY BREAK: match anywhere in the command line"""
+
+[[control]]
+id = "nextest-group-prefixes-name-real-modules"
+guards = "a nextest group prefix that names no module of its test binary is reported"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-nextest-groups.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-nextest-groups.py"
+expect_red = ["NextestGroupTests.test_every_prefix_names_a_declared_module"]
+file = ".config/nextest.toml"
+old = "|tool_call_cancel_real_daemon|tool_fault_spine)::/)))'"
+new = "|tool_call_cancel_real_daemon|tool_fault_spine|transform_spine)::/)))' # NON-VACUITY BREAK: a module that does not exist"
+
+[[control]]
+id = "nextest-real-daemon-modules-are-capped"
+guards = "every broca-subc integration module that boots the real daemon is in the subc_spine cap"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-nextest-groups.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-nextest-groups.py"
+expect_red = ["NextestGroupTests.test_every_real_daemon_module_is_in_the_subc_spine_cap"]
+file = ".config/nextest.toml"
+old = "test(/^(aimock_real_aft|compaction_routes|consent_ops|dogfood|hook_routes|multi_module_spine|resume_spine|scope_outbound_real_daemon|tool_call_cancel_real_daemon|tool_fault_spine)::/)))'"
+new = "test(/^(aimock_real_aft|consent_ops|dogfood|hook_routes|multi_module_spine|resume_spine|scope_outbound_real_daemon|tool_call_cancel_real_daemon|tool_fault_spine)::/)))' # NON-VACUITY BREAK: compaction_routes leaves the cap"
+
+[[control]]
+id = "nextest-five-mock-test-takes-the-aimock-group"
+guards = "the test that boots five aimock processes holds every aimock slot while it runs"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-nextest-groups.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-nextest-groups.py"
+expect_red = ["NextestGroupTests.test_the_five_mock_test_takes_the_whole_aimock_group"]
+file = ".config/nextest.toml"
+old = "threads-required = 4"
+new = "threads-required = 1 # NON-VACUITY BREAK: five mocks in one slot"
+
+[[control]]
+id = "rig-stdio-guard-sees-inline-daemon-tests"
+guards = "an inline lib test that starts the real daemon without the owned-stdio rig helper is reported"
+runner = "cargo"
+package = "broca-test-support"
+target = "--test rig_stdio_guard"
+test_file = "crates/broca-test-support/tests/rig_stdio_guard.rs"
+expect_red = ["rig_children_use_owned_stdio_logs"]
+file = "crates/broca-module-serve/src/role_plane_tests.rs"
+old = '''        broca_test_support::tokio_rig_command(&daemon_bin, &root, "daemon")?'''
+new = '''        tokio::process::Command::new(broca_test_support::ckdev_command(&source, &root).get_program()) // NON-VACUITY BREAK: bypass the rig helper'''
+
+[[control]]
+id = "rig-stdio-guard-refuses-a-scan-without-inline-sources"
+guards = "the rig stdio guard fails when it stops reading inline test sources, instead of passing on less"
+runner = "cargo"
+package = "broca-test-support"
+target = "--test rig_stdio_guard"
+test_file = "crates/broca-test-support/tests/rig_stdio_guard.rs"
+expect_red = ["rig_children_use_owned_stdio_logs"]
+file = "crates/broca-test-support/tests/rig_stdio_guard.rs"
+old = '''        rust_files(&crate_dir.join("src"), &mut files);'''
+new = '''        rust_files(&crate_dir.join("no-such-src"), &mut files); // NON-VACUITY BREAK: inline test sources are no longer read'''
+
+[[control]]
+id = "provider-stream-floor-test-runs-its-body-in-the-child"
+guards = "the stream-floor test runs its assertions in a child process that sees the floor, so no test in the lib binary writes the floor variables"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::stream_floor_breach_is_transient_and_not_reissued"]
+file = "crates/broca-provider/src/transport.rs"
+old = '''                .env("BROCA_MIN_STREAM_BYTES_PER_SEC", "50")'''
+new = '''                .env("BROCA_MIN_STREAM_BYTES_PER_SEC_UNUSED", "50") // NON-VACUITY BREAK: the child gets no floor'''
+
+[[control]]
+id = "provider-stream-floor-child-must-run-a-test"
+guards = "a stream-floor child that matched no test fails the parent instead of passing it"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::stream_floor_breach_is_transient_and_not_reissued"]
+file = "crates/broca-provider/src/transport.rs"
+old = '''        const NAME: &str = "transport::tests::stream_floor_breach_is_transient_and_not_reissued";'''
+new = '''        const NAME: &str = "transport::tests::stream_floor_breach_is_transient_and_not_reissued_renamed"; // NON-VACUITY BREAK'''
+
+[[control]]
+id = "stall-watchdog-repeat-spacing"
+guards = "an ongoing stall is snapshotted again only after the repeat interval, judged from the records' own clock"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/stall/tests.rs"
+expect_red = ["stall::tests::repeats_are_limited_and_recovery_is_emitted_once"]
+file = "crates/broca-module-serve/src/stall.rs"
+old = "                .is_none_or(|last| now.saturating_sub(last) >= self.repeat_ms)"
+new = "                .is_none_or(|last| now.saturating_sub(last) >= self.repeat_ms / 100) // NON-VACUITY BREAK: repeat every 10 ms"
+
+[[control]]
+id = "stall-watchdog-healthy-reader-is-quiet"
+guards = "a reader waiting for its next frame is healthy and writes no stall snapshot, whatever heartbeat starvation the host adds"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/stall/tests.rs"
+expect_red = ["stall::tests::healthy_reader_and_heartbeat_write_no_snapshots"]
+file = "crates/broca-module-serve/src/stall.rs"
+old = "            !matches!(phase, Phase::AwaitFrame | Phase::Idle) && reader_age > self.stale_ms;"
+new = "            !matches!(phase, Phase::Idle) && reader_age > self.stale_ms; // NON-VACUITY BREAK: waiting for a frame counts as stalled"
+
+[[control]]
+id = "ci-production-lane-checks-the-declared-msrv"
+guards = "the production-features lane checks the workspace on the exact compiler Cargo.toml's rust-version promises"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_production_clock_code_is_linted_and_tested_and_msrv_checked"]
+file = ".github/workflows/ci.yml"
+old = "          toolchain: '1.96'"
+new = "          toolchain: '1.95' # NON-VACUITY BREAK: an older compiler than rust-version"
+
+[[control]]
+id = "ci-production-lane-runs-without-test-clock"
+guards = "the production-features lane tests broca-core, broca-module and broca-module-serve without test-clock"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-ci-pipeline.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-ci-pipeline.py"
+expect_red = ["WorkflowGraph.test_production_clock_code_is_linted_and_tested_and_msrv_checked"]
+file = ".github/workflows/ci.yml"
+old = "        run: cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast"
+new = "        run: cargo test --locked -p broca-core -p broca-module -p broca-module-serve --lib --bins --no-fail-fast -F broca-module-serve/test-clock # NON-VACUITY BREAK"
+
+[[control]]
+id = "crash-harness-observed-wal-forwards-the-byte-budget"
+guards = "the crash harness's observed WAL gives the writer production's byte budget, not the trait default of none"
+runner = "cargo"
+package = "broca-crash-harness"
+target = "--test it"
+test_file = "crates/broca-crash-harness/tests/it/observed_wal_fidelity.rs"
+expect_red = ["observed_wal_fidelity::observed_wrappers_forward_every_production_override"]
+file = "crates/broca-crash-harness/src/wal.rs"
+old = """    fn append_budget(&self) -> Option<(u64, u64, u64)> {
+        self.inner.append_budget()
+    }
+"""
+new = """    // NON-VACUITY BREAK: the byte budget falls back to the trait default
+"""
+
+[[control]]
+id = "crash-harness-observed-store-forwards-tombstone-floors"
+guards = "the crash harness's observed store reports production's retired-tag floor, not the trait default of 1"
+runner = "cargo"
+package = "broca-crash-harness"
+target = "--test it"
+test_file = "crates/broca-crash-harness/tests/it/observed_wal_fidelity.rs"
+expect_red = ["observed_wal_fidelity::observed_wrappers_forward_every_production_override"]
+file = "crates/broca-crash-harness/src/wal.rs"
+old = """    fn retired_tag_floor(&self, session: &BindIdentity) -> Result<u64, WalError> {
+        WalStore::retired_tag_floor(&self.inner, session)
+    }
+"""
+new = """    // NON-VACUITY BREAK: the retired-tag floor falls back to the trait default
+"""

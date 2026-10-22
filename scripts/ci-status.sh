@@ -20,9 +20,13 @@
 # full sha, and REFUSE with exit 2 when the result set is empty — because "no runs" and "the
 # query did not match" are the same output and only one of them is safe to act on.
 #
-# Usage: ci-status.sh [<commit-ish> [--only] [required-workflow-name ...]]  default HEAD
-# Without --only, every run on the commit must have concluded success. With --only, only runs
-# of the named workflows are judged (each must be present); other workflows' runs are ignored.
+# Usage: ci-status.sh [<commit-ish> [--event <event>] [--only] [required-workflow-name ...]]
+# The commit defaults to HEAD. Without --only, every run on the commit must have concluded
+# success. With --only, only runs of the named workflows are judged (each must be present);
+# other workflows' runs are ignored. --event judges only runs GitHub started for that event
+# (push, schedule, pull_request ...), and each required workflow must have such a run. The
+# nightly scheduled CI run builds against the newest sibling revisions rather than the pinned
+# ones, so its result describes those siblings, not this commit's pinned build.
 # Exit 0 all judged runs concluded success · 1 one failed or is still going · 2 cannot compare.
 
 set -euo pipefail
@@ -44,7 +48,7 @@ fi
 # ever attached to one. That form returns an empty set for a release that CI passed.
 
 RUN_LIMIT=100
-RUNS="$(gh run list --commit "$FULL" --limit "$RUN_LIMIT" --json conclusion,status,name,databaseId,headSha 2>/dev/null || true)"
+RUNS="$(gh run list --commit "$FULL" --limit "$RUN_LIMIT" --json conclusion,status,name,databaseId,headSha,event 2>/dev/null || true)"
 if [ -z "$RUNS" ]; then
   echo "ci-status: gh returned nothing for ${FULL:0:12} -- cannot compare" >&2
   exit 2
@@ -93,19 +97,38 @@ if not runs:
 
 print(f"    commit {full[:12]}   runs {len(runs)}")
 required = sys.argv[3:]
+event = None
+if required[:1] == ["--event"]:
+    if len(required) < 2 or not required[1]:
+        print("ci-status: --event needs an event name", file=sys.stderr)
+        raise SystemExit(2)
+    event = required[1]
+    required = required[2:]
 only = bool(required) and required[0] == "--only"
 if only:
     required = required[1:]
     if not required:
         print("ci-status: --only needs at least one workflow name", file=sys.stderr)
         raise SystemExit(2)
-# A green unrelated workflow cannot stand in for a missing required workflow.
-missing = set(required) - {r.get("name") for r in runs}
-if missing:
-    print("ci-status: missing required workflows: " + ", ".join(sorted(missing)), file=sys.stderr)
-    raise SystemExit(2)
 if any(r.get("headSha") != full for r in runs):
     print("ci-status: a returned run names a different commit -- cannot compare", file=sys.stderr)
+    raise SystemExit(2)
+if event is not None:
+    for r in runs:
+        if r.get("event") != event:
+            print(f"      ignored {r.get('event') or '-'} run: {r.get('name', '')[:38]} "
+                  f"({r.get('conclusion') or r.get('status') or '-'})")
+    runs = [r for r in runs if r.get("event") == event]
+# A green unrelated workflow cannot stand in for a missing required workflow, and a run for
+# another event cannot stand in for a missing run of the required event.
+missing = set(required) - {r.get("name") for r in runs}
+if missing:
+    suffix = f" (no {event} run)" if event is not None else ""
+    print("ci-status: missing required workflows: " + ", ".join(sorted(missing)) + suffix,
+          file=sys.stderr)
+    raise SystemExit(2)
+if not runs:
+    print(f"ci-status: no {event} runs for {full[:12]} -- cannot compare", file=sys.stderr)
     raise SystemExit(2)
 if only:
     runs = [r for r in runs if r.get("name") in set(required)]

@@ -3482,7 +3482,9 @@ mod tests {
         assert!(task.await.unwrap().is_err());
     }
 
-    #[tokio::test]
+    // Paused clock: the elapsed check measures virtual time, so it sees a retry backoff or
+    // wait exactly and never the host's scheduling delay.
+    #[tokio::test(start_paused = true)]
     async fn mid_run_module_removed_is_not_retried() {
         let conn = ScriptedToolPlaneConnection::new(Vec::new(), Vec::new());
         conn.script_route_open_sequence(
@@ -3512,7 +3514,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
-    #[tokio::test]
+    // Paused clock: the elapsed check measures virtual time, so it sees a retry backoff or
+    // wait exactly and never the host's scheduling delay.
+    #[tokio::test(start_paused = true)]
     async fn mid_run_unknown_route_open_code_is_not_retried() {
         let conn = ScriptedToolPlaneConnection::new(Vec::new(), Vec::new());
         conn.script_route_open_sequence(
@@ -3542,7 +3546,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
-    #[tokio::test]
+    // Paused clock: the elapsed check measures virtual time, so it sees a retry backoff or
+    // wait exactly and never the host's scheduling delay.
+    #[tokio::test(start_paused = true)]
     async fn mid_run_transport_route_open_error_is_not_retried() {
         let conn = ScriptedToolPlaneConnection::new(Vec::new(), Vec::new());
         conn.script_route_open_sequence("aft", vec![RouteOpenScript::transport("socket lost")]);
@@ -3569,7 +3575,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
-    #[tokio::test]
+    // Paused clock: the elapsed check measures virtual time, so it sees a retry backoff or
+    // wait exactly and never the host's scheduling delay.
+    #[tokio::test(start_paused = true)]
     async fn warm_module_removed_stops_after_one_attempt() {
         let conn = ScriptedToolPlaneConnection::new(Vec::new(), Vec::new());
         conn.script_route_open_sequence(
@@ -3594,7 +3602,9 @@ mod tests {
     /// The daemon passes a module's refusal through as a structured error body. The warmer
     /// must stop on its code at once, as it does for the legacy text form above, rather than
     /// retrying until its own timeout.
-    #[tokio::test]
+    // Paused clock: the elapsed check measures virtual time, so it sees a retry backoff or
+    // wait exactly and never the host's scheduling delay.
+    #[tokio::test(start_paused = true)]
     async fn warm_structured_module_refusal_stops_after_one_attempt() {
         let conn = ScriptedToolPlaneConnection::new(Vec::new(), Vec::new());
         let body = subc_protocol::ErrorBody::new("module_rejected", "module refused the route")

@@ -83,18 +83,50 @@ suites=(
     scripts/test-dependency-features.py
     scripts/test-cargo-watchdog.py
     scripts/tests/test_clock_safety.py
+    # Maintenance scripts refuse to write while a writer's liveness is unknown.
+    scripts/lib/test_liveness.py
+    # Every suite file in scripts/ is listed in one of the arrays in this file.
+    scripts/test-script-suites.py
+    # nextest's resource groups select modules that exist and every module they must cap.
+    scripts/test-nextest-groups.py
     # Vendored Cingulate consent contract: checksums, pins and broca's mapping.
     crates/broca-subc/tests/fixtures/consent/verify.py
 )
 
+# Suites that drive real macOS tools (cc, dsymutil, codesign) on real Mach-O files. On a Mac
+# they run with BROCA_REQUIRE_NATIVE_MACOS=1, so a missing tool fails instead of skipping. On
+# any other host they are reported as not run: a skip there is no evidence for the contract.
+native_macos_suites=(
+    # place-release.sh --restart restarts only after a successful placement and a clear
+    # second live-run check.
+    scripts/test-place-release-restart.py
+)
+
+# Suite files deliberately not run here, each with the place that does run it.
+run_elsewhere=(
+    # Its own CI step (in the archive job) and gate.sh's portable preflight phase run it, after
+    # Cargo has built the test binaries it inspects.
+    scripts/test-portable-test-selection.py
+    # Needs the network and an authenticated gh; armed by hand with WATCH_CI_LIVE_TESTS=1.
+    scripts/test-watch-ci.py
+)
+
 # A rename must not quietly shrink this to a no-op that keeps passing.
-for suite in "${suites[@]}"; do
+for suite in "${suites[@]}" "${native_macos_suites[@]}" "${run_elsewhere[@]}"; do
     [[ -f $suite ]] || { echo "missing suite: $suite" >&2; exit 2; }
 done
 echo "running ${#suites[@]} operator script suites"
 for suite in "${suites[@]}"; do
     echo "--- $suite"
     python3 "$suite"
+done
+for suite in "${native_macos_suites[@]}"; do
+    if [[ $(uname -s) == Darwin ]]; then
+        echo "--- $suite (native macOS)"
+        BROCA_REQUIRE_NATIVE_MACOS=1 python3 "$suite"
+    else
+        echo "--- NOT RUN: $suite needs native macOS; this host proves nothing for it"
+    fi
 done
 python3 scripts/check-path-deps.py
 python3 scripts/live-runs.py --self-test

@@ -237,13 +237,15 @@ async fn a_malformed_routing_reply_falls_back_as_unreachable() {
     }
 }
 
-#[tokio::test]
+// Paused clock with tokio's Instant: the budget is measured in virtual time, so the bound
+// checks the code's own waiting and not how promptly the host scheduled this test.
+#[tokio::test(start_paused = true)]
 async fn a_hung_routing_costs_at_most_the_admission_budget() {
     let routing = FakeRouting::hung();
     let client = client(&routing);
     let static_credential = CredentialId::parse("oauth:anthropic").unwrap();
     let budget = Duration::from_millis(250);
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let (choice, events) = broca_test_support::capture_logs(choose_account(
         &client,
         ChoiceInputs {
@@ -282,12 +284,14 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
     assert!(ADMISSION_BUDGET <= Duration::from_secs(2));
 }
 
-#[tokio::test]
+// Paused clock with tokio's Instant: the budget is measured in virtual time, so the bound
+// checks the code's own waiting and not how promptly the host scheduled this test.
+#[tokio::test(start_paused = true)]
 async fn a_slow_listing_shares_the_admission_budget() {
     let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
     let client = client(&routing);
     let static_credential = CredentialId::parse("oauth:anthropic").unwrap();
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let choice = choose_account(
         &client,
         ChoiceInputs {
@@ -1058,7 +1062,9 @@ async fn an_attempt_is_reported_only_once_its_record_is_durable_and_in_order() {
     );
 }
 
-#[tokio::test]
+// Paused clock with tokio's Instant: the budget is measured in virtual time, so the bound
+// checks the code's own waiting and not how promptly the host scheduled this test.
+#[tokio::test(start_paused = true)]
 async fn a_hung_routing_never_holds_the_reporting_run() {
     let routing = FakeRouting::hung();
     let client = Arc::new(client(&routing));
@@ -1070,7 +1076,7 @@ async fn a_hung_routing_never_holds_the_reporting_run() {
         Arc::new(AtomicU64::new(100)),
     );
     let lineage = lineage();
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
     broca_core::AccountReporter::attempt_recorded(
         reporter.as_ref(),

@@ -57,8 +57,15 @@ assert args[args.index('--commit') + 1] == os.environ['EXPECT_SHA'], 'must query
 assert args[args.index('--limit') + 1] == '100'
 mode = os.environ.get('CI_MODE', 'green')
 if mode == 'query-error': sys.exit(17)
-runs = [{'name': n, 'databaseId': i, 'headSha': os.environ['EXPECT_SHA'], 'status': 'completed', 'conclusion': 'success'} for i,n in enumerate(('CI', 'Mutation catalogue'), 1)]
+assert 'event' in args[args.index('--json') + 1].split(','), 'release judges runs by event'
+runs = [{'name': n, 'databaseId': i, 'headSha': os.environ['EXPECT_SHA'], 'status': 'completed', 'conclusion': 'success', 'event': 'push'} for i,n in enumerate(('CI', 'Mutation catalogue'), 1)]
+scheduled = dict(runs[0], databaseId=9, event='schedule')
 if mode == 'empty': runs = []
+elif mode == 'scheduled-failed': runs.append(dict(scheduled, conclusion='failure'))
+elif mode == 'scheduled-cancelled': runs.append(dict(scheduled, conclusion='cancelled'))
+elif mode == 'scheduled-pending': runs.append(dict(scheduled, status='in_progress', conclusion=''))
+elif mode == 'only-scheduled': runs[0]['event'] = 'schedule'
+elif mode == 'second-push-failed': runs.append(dict(runs[0], databaseId=8, conclusion='failure'))
 elif mode == 'missing-ci': runs = runs[1:]
 elif mode == 'missing-mutations': runs = runs[:1]
 elif mode == 'mutations-failed': runs[1]['conclusion'] = 'failure'
@@ -131,6 +138,26 @@ print(json.dumps(runs))
                 result = self.release(CI_MODE=mode)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.git('rev-parse', 'v0.3.198^{commit}').stdout.strip(), self.sha)
+
+    def test_a_scheduled_ci_run_never_holds_a_release(self):
+        # The nightly CI run on the same commit uses floating sibling revisions; a failed,
+        # cancelled or still-running one says nothing about the pinned push build.
+        for mode in ('scheduled-failed', 'scheduled-cancelled', 'scheduled-pending'):
+            with self.subTest(mode=mode):
+                self.git('tag', '-d', 'v0.3.198') if self.git('tag', '--list', 'v0.3.198').stdout else None
+                result = self.release(CI_MODE=mode)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('ignored schedule run: CI', result.stdout)
+                self.assertEqual(self.git('rev-parse', 'v0.3.198^{commit}').stdout.strip(), self.sha)
+
+    def test_a_scheduled_success_cannot_stand_in_for_a_push_run(self):
+        result = self.release(CI_MODE='only-scheduled')
+        self.assert_not_tagged_or_staged(result)
+        self.assertIn('missing required workflows: CI (no push run)', result.stderr)
+
+    def test_any_failed_push_run_refuses(self):
+        # A train commit carries two push runs (train ref, then master). Both must be green.
+        self.assert_not_tagged_or_staged(self.release(CI_MODE='second-push-failed'))
 
     def test_failed_ci_refuses(self):
         self.assert_not_tagged_or_staged(self.release(CI_MODE='failed'))

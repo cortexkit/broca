@@ -1,5 +1,42 @@
 use super::*;
 
+/// The stale threshold every Witness gives the watchdog, in milliseconds.
+const STALE_MS: u64 = 200;
+/// The minimum spacing of repeated snapshots for one ongoing stall, in milliseconds.
+const REPEAT_MS: u64 = 1_000;
+
+/// The records with heartbeat-starvation episodes taken out.
+///
+/// The heartbeat is a task on this test's runtime. When a loaded host does not schedule that
+/// runtime for longer than STALE_MS and nothing else is stale, the watchdog correctly writes a
+/// snapshot whose only trigger is the heartbeat, and a recovery once nothing is stale. Those
+/// episodes say nothing about the reader and egress paths these tests drive, so they are set
+/// aside here instead of being counted by exact-count assertions. Each one must show a heartbeat
+/// older than STALE_MS: a watchdog that fired on a fresh heartbeat still fails. A snapshot that
+/// also names another trigger is kept.
+fn without_starvation(records: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut kept = Vec::new();
+    let mut starving = false;
+    for record in records {
+        if record["triggers"] == serde_json::json!(["heartbeat"]) {
+            let age = record["heartbeat"]["age_ms"].as_u64().unwrap_or(0);
+            assert!(
+                age > STALE_MS,
+                "a heartbeat snapshot with a {age} ms heartbeat: {record}"
+            );
+            starving = true;
+            continue;
+        }
+        if starving && record["kind"] == "recovery" {
+            starving = false;
+            continue;
+        }
+        starving = false;
+        kept.push(record.clone());
+    }
+    kept
+}
+
 pub(crate) struct Witness {
     pub(crate) state: Arc<State>,
     pub(crate) watchdog: Watchdog,
@@ -23,8 +60,8 @@ impl Witness {
         let watchdog = launch(
             state.clone(),
             file,
-            200,
-            1_000,
+            STALE_MS,
+            REPEAT_MS,
             Duration::from_millis(5),
             Duration::from_millis(10),
         )
@@ -73,8 +110,9 @@ async fn healthy_reader_and_heartbeat_write_no_snapshots() {
     witness.state.set_reader(Phase::AwaitFrame, 0, 0);
     tokio::time::sleep(Duration::from_millis(650)).await;
     assert!(
-        witness.records().is_empty(),
-        "healthy idle connection emitted a stall"
+        without_starvation(&witness.records()).is_empty(),
+        "healthy idle connection emitted a stall: {:?}",
+        witness.records()
     );
     assert!(witness.state.heartbeat_ticks.load(Ordering::Relaxed) > 1);
 }
@@ -151,18 +189,63 @@ async fn repeats_are_limited_and_recovery_is_emitted_once() {
         .store(now_ms() << 1, Ordering::Relaxed);
     witness.snapshot().await;
     tokio::time::sleep(Duration::from_millis(350)).await;
-    assert_eq!(witness.records().len(), 1);
+    // Repeats are limited by spacing, read from the records' own clock: a late wake-up of this
+    // test may legitimately let a second snapshot through, but never two closer than REPEAT_MS.
+    let stalls = without_starvation(&witness.records());
+    assert!(!stalls.is_empty());
+    // A late heartbeat can add itself to a stall snapshot's triggers, so check egress is among them.
+    for record in &stalls {
+        assert!(
+            record["triggers"]
+                .as_array()
+                .is_some_and(|triggers| triggers.iter().any(|trigger| trigger == "egress_write")),
+            "{record}"
+        );
+    }
+    for pair in stalls.windows(2) {
+        let gap =
+            pair[1]["monotonic_ms"].as_u64().unwrap() - pair[0]["monotonic_ms"].as_u64().unwrap();
+        assert!(
+            gap >= REPEAT_MS,
+            "stall snapshots {gap} ms apart: {stalls:?}"
+        );
+    }
     witness.state.egress.operation.store(0, Ordering::Relaxed);
     // The watchdog thread notices the cleared operation on its own tick. Wait for that event with
     // the shared hang guard rather than a fixed 50 ms, which a busy CI runner overran.
+    let recovered = |records: &[serde_json::Value]| {
+        without_starvation(records)
+            .last()
+            .is_some_and(|record| record["kind"] == "recovery")
+    };
     let deadline = std::time::Instant::now() + broca_test_support::EVENT_HANG_GUARD;
-    while witness.records().len() < 2 && std::time::Instant::now() < deadline {
+    while !recovered(&witness.records()) && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let records = witness.records();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[1]["kind"], "recovery");
-    assert_eq!(witness.state.health()["last_trigger_kind"], "egress_write");
+    assert!(
+        recovered(&records),
+        "no recovery after the egress stall: {records:?}"
+    );
+    // A snapshot the late heartbeat caused (alone, or alongside the egress stall, where the
+    // heartbeat names the kind) may make heartbeat the last trigger; nothing else may.
+    let last_trigger = witness.state.health()["last_trigger_kind"].clone();
+    if last_trigger == "heartbeat" {
+        // Read after the trigger: the watchdog writes a record before it stores its trigger.
+        let records = witness.records();
+        assert!(
+            records.iter().any(|record| record["kind"] == "heartbeat"),
+            "last trigger is heartbeat with no heartbeat snapshot: {records:?}"
+        );
+    } else {
+        assert_eq!(last_trigger, "egress_write");
+    }
     tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(witness.records().len(), 2);
+    let kept = without_starvation(&witness.records());
+    let recoveries = kept
+        .iter()
+        .filter(|record| record["kind"] == "recovery")
+        .count();
+    assert_eq!(recoveries, 1, "recovery must be emitted once: {kept:?}");
+    assert_eq!(kept.last().unwrap()["kind"], "recovery", "{kept:?}");
 }

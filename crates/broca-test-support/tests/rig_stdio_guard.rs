@@ -145,10 +145,32 @@ fn command_definition(source: &str, mask: &[bool], variable: &str, before: usize
         .max()
 }
 
+/// The part of a `src/` file that holds tests: the whole of a dedicated test file, otherwise the
+/// text from its first code-level `#[cfg(test)]` on. Production code before that marker may
+/// legitimately start the same binaries, so it is not scanned.
+fn inline_test_source(path: &Path, source: &str) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let dedicated = name == "tests.rs"
+        || name.ends_with("_tests.rs")
+        || path.components().any(|part| part.as_os_str() == "tests");
+    if dedicated {
+        return Some(source.to_owned());
+    }
+    let mask = code_mask(source);
+    source
+        .match_indices("#[cfg(test)]")
+        .find(|(position, _)| mask.get(*position).copied().unwrap_or(false))
+        // Blank lines stand in for the production part, so reported line numbers stay true.
+        .map(|(position, _)| {
+            let skipped = source[..position].matches('\n').count();
+            "\n".repeat(skipped) + &source[position..]
+        })
+}
+
 #[test]
 fn rig_children_use_owned_stdio_logs() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut files = Vec::new();
+    let mut sources = Vec::new();
     for crate_name in [
         "broca-subc",
         "broca-module-serve",
@@ -156,21 +178,48 @@ fn rig_children_use_owned_stdio_logs() {
         "ck-import",
         "broca-provider",
     ] {
-        rust_files(
-            &root.join("crates").join(crate_name).join("tests"),
-            &mut files,
-        );
+        let crate_dir = root.join("crates").join(crate_name);
+        let mut files = Vec::new();
+        rust_files(&crate_dir.join("tests"), &mut files);
+        for path in files {
+            if let Ok(source) = std::fs::read_to_string(&path) {
+                sources.push((path, source));
+            }
+        }
+        // Inline lib tests can start a daemon too, and a scan of `tests/` alone never saw them.
+        let mut files = Vec::new();
+        rust_files(&crate_dir.join("src"), &mut files);
+        for path in files {
+            if let Some(source) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|source| inline_test_source(&path, &source))
+            {
+                sources.push((path, source));
+            }
+        }
     }
 
-    let violations: Vec<_> = files
-        .into_iter()
-        .filter_map(|path| {
-            let source = std::fs::read_to_string(&path).ok()?;
-            let sites = unwrapped_rig_spawns(&source);
+    // A scan that read nothing, or lost the inline sources, would pass on no evidence.
+    assert!(
+        sources.len() > 100,
+        "rig stdio guard scanned only {} test sources",
+        sources.len()
+    );
+    let inline_daemon_test = root.join("crates/broca-module-serve/src/role_plane_tests.rs");
+    assert!(
+        sources.iter().any(|(path, _)| path == &inline_daemon_test),
+        "rig stdio guard no longer scans inline test sources such as {}",
+        inline_daemon_test.display()
+    );
+
+    let violations: Vec<_> = sources
+        .iter()
+        .filter_map(|(path, source)| {
+            let sites = unwrapped_rig_spawns(source);
             (!sites.is_empty()).then(|| {
                 format!(
                     "{}:\n{}",
-                    path.strip_prefix(&root).unwrap_or(&path).display(),
+                    path.strip_prefix(&root).unwrap_or(path).display(),
                     sites.join("\n")
                 )
             })
