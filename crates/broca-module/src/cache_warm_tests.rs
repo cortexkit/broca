@@ -780,6 +780,7 @@ impl Fixture {
                 after_mid: None,
                 lineage_id: None,
                 max_bytes: None,
+                media: Default::default(),
             },
         )
         .await

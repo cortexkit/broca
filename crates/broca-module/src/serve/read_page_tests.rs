@@ -28,6 +28,9 @@ fn message(ordinal: u64, len: usize) -> SessionReadMessage {
             dispatched_to: Some("tool-provider".into()),
             indeterminate: false,
         }],
+        described: None,
+        digest: None,
+        part_digests: None,
     }
 }
 
@@ -220,4 +223,23 @@ fn resolve_answers_the_cleaned_model_text() {
         .expect("the page holds the tag")
         .expect("resolved");
     assert_eq!(reply.content, serde_json::json!("hi as  says"));
+}
+
+/// A descriptors `session.resolve` of text over the inline threshold answers a `text_ref`
+/// keyed by the part, over the exposed text; inline keeps the string.
+#[test]
+fn a_descriptors_resolve_of_large_text_answers_a_keyed_text_ref() {
+    use cortexkit_role_llm_runner::read::descriptors::PART_INLINE_MAX;
+    let text = "y".repeat(PART_INLINE_MAX + 1);
+    let page = page(vec![cleaned_answer(&format!("§7§ {text}"))]);
+    let params = broca_wire::ResolveParams::new("§1§")
+        .with_media(cortexkit_role_llm_runner::read::MediaMode::Descriptors);
+    let reply = resolve_in_page(&page, &params).unwrap().unwrap();
+    assert_eq!(reply.content["type"], "text_ref");
+    assert_eq!(reply.content["part"], "m0#0");
+    assert_eq!(reply.content["byte_size"], serde_json::json!(text.len()));
+    let inline = resolve_in_page(&page, &broca_wire::ResolveParams::new("§1§"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(inline.content, serde_json::json!(text));
 }

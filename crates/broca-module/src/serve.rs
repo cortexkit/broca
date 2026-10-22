@@ -45,6 +45,8 @@ pub struct SessionReadRequest {
     pub lineage_id: Option<String>,
     /// The page's byte cap; `None` is the default cap.
     pub max_bytes: Option<u64>,
+    /// `descriptors` serves large payloads as refs and every entry's content identities.
+    pub media: cortexkit_role_llm_runner::read::MediaMode,
 }
 
 impl SessionReadRequest {
@@ -60,6 +62,7 @@ impl SessionReadRequest {
             after_mid: None,
             lineage_id: None,
             max_bytes: None,
+            media: cortexkit_role_llm_runner::read::MediaMode::Inline,
         }
     }
 }
@@ -355,6 +358,16 @@ fn resolve_in_page(
         let stored = broca_protocol::tags::exposed_part_text(&entry.message, index)?;
         Some(match broca_wire::resolve_range(&stored, params.range) {
             Some(text) => {
+                let descriptors =
+                    params.media == Some(cortexkit_role_llm_runner::read::MediaMode::Descriptors);
+                let content = descriptors.then(|| {
+                    broca_wire::describe_resolved_part(
+                        &entry.message,
+                        entry.ordinal,
+                        index,
+                        text.clone(),
+                    )
+                });
                 let mut reply = broca_wire::ResolveResponse::new(
                     &params.tag,
                     entry.ordinal,
@@ -362,6 +375,9 @@ fn resolve_in_page(
                     &row.part,
                     text,
                 );
+                if let Some(content) = content {
+                    reply.content = content;
+                }
                 reply.range = params.range;
                 Ok(reply)
             }
@@ -406,6 +422,9 @@ fn session_read_response(
                 message: message.message,
                 run: message.run,
                 tool_calls: Vec::new(),
+                described: None,
+                digest: None,
+                part_digests: None,
             })
             .collect(),
         next_from_ordinal: page.next_from_ordinal,
@@ -2766,6 +2785,21 @@ impl ServeHandler for crate::LineageRegistry {
         }
         self.attribute_tool_calls(&req.session, &mut response, &dispatches, prompt_len)
             .await?;
+        if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
+            for entry in &mut response.messages {
+                // Only structure that is not payload can outgrow the per-message budget.
+                if let Err(ordinal) = entry.describe() {
+                    return Err(ServeError::ReplyTooLarge(ReplyTooLargeDetail::new(
+                        json_bytes(entry),
+                        cortexkit_role_llm_runner::read::descriptors::DESCRIPTOR_MESSAGE_MAX as u64,
+                        ReplyTooLargeSubject::Message {
+                            session: req.session.session.clone(),
+                            ordinal,
+                        },
+                    )));
+                }
+            }
+        }
         cap_page_bytes(
             &mut response,
             cap,

@@ -2819,6 +2819,21 @@ where
                 .await;
             }
             let model_view = params.view == Some(broca_wire::ReadView::Model);
+            // Descriptors are offered on raw transcript reads only, refused before any read
+            // work.
+            let media = params.read.media.unwrap_or_default();
+            if model_view && media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("media".into()),
+                    "descriptors are not offered on a model-view read",
+                )
+                .await;
+            }
             let params = params.read;
             if params.after_mid.is_some() {
                 // A read after a message is defined only within the lineage it came from, and
@@ -2859,6 +2874,7 @@ where
                 after_mid: params.after_mid,
                 lineage_id: params.lineage_id,
                 max_bytes: params.max_bytes,
+                media,
             };
             if model_view {
                 return match handler.read_model(read_req).await {
@@ -4445,6 +4461,9 @@ mod tests {
                     ),
                     tool_calls: Vec::new(),
                     tags: Vec::new(),
+                    described: None,
+                    digest: None,
+                    part_digests: None,
                 },
                 SessionReadMessage {
                     delivered_as: None,
@@ -4459,6 +4478,9 @@ mod tests {
                     ),
                     tool_calls: Vec::new(),
                     tags: Vec::new(),
+                    described: None,
+                    digest: None,
+                    part_digests: None,
                 },
             ],
             next_from_ordinal: Some(2),
@@ -5052,6 +5074,9 @@ mod tests {
                     message: self.messages[ordinal].clone(),
                     run: None,
                     tool_calls: Vec::new(),
+                    described: None,
+                    digest: None,
+                    part_digests: None,
                 })
                 .collect();
             Ok(SessionReadResponse {

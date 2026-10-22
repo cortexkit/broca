@@ -22765,3 +22765,16 @@ expect_red = ["serve::read_page_tests::resolve_answers_the_cleaned_model_text"]
 file = "crates/broca-module/src/serve.rs"
 old = "        let stored = broca_protocol::tags::exposed_part_text(&entry.message, index)?;"
 new = "        let stored = broca_protocol::tags::part_text(entry.message.content.get(index)?); // NON-VACUITY BREAK: answer the raw text."
+
+[[control]]
+id = "read-descriptors-replace-large-payloads"
+guards = "A descriptors read replaces a payload over the inline threshold by a ref in place"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::a_descriptors_read_describes_large_payloads_in_place_with_inline_identities"]
+file = "crates/broca-wire/src/lib.rs"
+old = "                    self.described = Some(described);"
+new = "                    let _ = described; // NON-VACUITY BREAK: serve the inline message."

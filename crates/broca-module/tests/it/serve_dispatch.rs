@@ -75,6 +75,7 @@ async fn import_then_read_returns_the_canonical_transcript() {
             after_mid: None,
             lineage_id: None,
             max_bytes: None,
+            media: Default::default(),
         })
         .await
         .expect("read import");
