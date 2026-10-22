@@ -1830,6 +1830,13 @@ async fn finish_bind(
     if let Some(cancel) = routes.agent_data_cancel.remove(&completed.channel) {
         cancel.cancel();
     }
+    // Any subscription slot on this channel belongs to the generation being replaced: a stream
+    // for the new generation can open only after this publication. The old generation's GOODBYE
+    // is ignored once the new one is published, so retiring its stream here is the only point
+    // where it ends before the replacement route itself closes.
+    if let Some(slot) = routes.subscribe_cancel.remove(&completed.channel) {
+        slot.route.cancel();
+    }
     routes.by_channel.insert(
         completed.channel,
         (completed.epoch, completed.identity, completed.bind),
@@ -5777,6 +5784,42 @@ mod tests {
         drop(release);
         ingress.complete_bind().await;
         assert_eq!(next_written(&mut ingress.written).await.header.corr, 2);
+        let sink = ingress.subscribe(2, 20).await;
+        ingress.goodbye(1).await;
+        assert_eq!(ingress.routes.by_channel[&7].0, 2);
+        ingress.assert_delivery(&sink, 2, 20).await;
+    }
+
+    /// Publishing a replacement generation ends the stream the replaced generation opened, whose
+    /// own GOODBYE is ignored from then on, while a stream opened under the replacement lives on.
+    #[tokio::test]
+    async fn accepted_replacement_retires_the_old_generation_stream() {
+        let (mut ingress, store, release) = held_bind_registry();
+        ingress.bind(1, "published", false).await;
+        next_written(&mut ingress.written).await;
+        let old = ingress.subscribe(1, 10).await;
+        ingress.bind(2, "replacement", true).await;
+        store.entered.notified().await;
+        drop(release);
+        ingress.complete_bind().await;
+        // A cancelled stream's StreamEnd is best-effort and may precede the acknowledgement.
+        let ack = loop {
+            let frame = next_written(&mut ingress.written).await;
+            if (frame.header.ty, frame.header.epoch) != (FrameType::StreamEnd, 1) {
+                break frame;
+            }
+        };
+        assert_eq!((ack.header.ty, ack.header.corr), (FrameType::Response, 2));
+        // The forwarder drops its delivery receiver only when it ends.
+        tokio::time::timeout(std::time::Duration::from_secs(5), old.closed())
+            .await
+            .expect("the replaced generation's stream must end when the replacement is published");
+        while let Ok(frame) = ingress.written.try_recv() {
+            assert_eq!(
+                (frame.header.ty, frame.header.epoch, frame.header.corr),
+                (FrameType::StreamEnd, 1, 10)
+            );
+        }
         let sink = ingress.subscribe(2, 20).await;
         ingress.goodbye(1).await;
         assert_eq!(ingress.routes.by_channel[&7].0, 2);

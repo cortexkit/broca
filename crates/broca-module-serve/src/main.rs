@@ -3717,7 +3717,11 @@ mod executor {
                             prior_snapshot.head_seq,
                         )
                         .await;
-                    let prompt_ordinal = self
+                    // Like every other failure before the loop, this one is reported through
+                    // the admission ack. Returning without it would drop the ack unsent, and
+                    // the actor would then see only "run ended before admission" instead of
+                    // this permanent Config cause.
+                    let prompt_ordinal = match self
                         .session_prompt_ordinal(
                             &job.req,
                             prior_snapshot
@@ -3727,7 +3731,16 @@ mod executor {
                                 .map(|episode| &episode.config.frozen_render_config),
                             prior_snapshot.head_seq,
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(ordinal) => ordinal,
+                        Err(error) => {
+                            if let Some(ack) = job.on_admitted {
+                                let _ = ack.send(Err(error.clone()));
+                            }
+                            return Err(error);
+                        }
+                    };
                     match broca_module_serve::claude_code_identity::fresh_persona(
                         install_id,
                         resolution.account_id.as_deref(),

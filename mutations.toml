@@ -23468,3 +23468,86 @@ expect_message = "refused_overlapping_batch=0"
 file = "crates/broca-core/examples/replay-corpus-scan.rs"
 old = "                if reason == OVERLAPPING_BATCH_REASON =>"
 new = "                if false && reason == OVERLAPPING_BATCH_REASON => // NON-VACUITY BREAK: file overlap refusals with the others."
+
+[[control]]
+id = "serve-prompt-history-failure-reaches-admission-ack"
+guards = "A fresh Claude Code episode whose prompt history cannot be read is refused through the admission ack with its Config cause, never by dropping the ack"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+select = "expected"
+test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
+expect_red = ["executor::tests::an_unreadable_prompt_history_is_refused_through_the_admission_ack"]
+expect_message = "the admission ack must carry the Config refusal"
+file = "crates/broca-module-serve/src/main.rs"
+old = "                        Ok(ordinal) => ordinal,\n                        Err(error) => {\n                            if let Some(ack) = job.on_admitted {"
+new = "                        Ok(ordinal) => ordinal,\n                        Err(error) => {\n                            if let Some(ack) = job.on_admitted.filter(|_| false) { // NON-VACUITY BREAK: drop the admission ack unsent."
+
+[[control]]
+id = "session-cli-run-finished-json-names-run"
+guards = "The broca-session --json-events run_finished event carries the terminal's durable run_id so a resumed run's terminal can be attributed"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin broca-session"
+select = "expected"
+test_file = "crates/broca-module-serve/src/bin/broca-session.rs"
+expect_red = ["tests::run_finished_json_names_its_run"]
+expect_message = "the JSON terminal must carry its durable run id"
+file = "crates/broca-module-serve/src/bin/broca-session.rs"
+old = '"run_id": run_id.as_ref().map(|id| &id.0), "reason": format!("{reason:?}")'
+new = '"run_id": run_id.as_ref().filter(|_| false).map(|id| &id.0), "reason": format!("{reason:?}") /* NON-VACUITY BREAK: drop the run id */'
+
+[[control]]
+id = "serve-replacement-bind-retires-old-stream"
+guards = "Publishing a replacement route generation cancels the stream the replaced generation opened, whose own GOODBYE is ignored afterwards"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::accepted_replacement_retires_the_old_generation_stream"]
+expect_message = "the replaced generation's stream must end when the replacement is published"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if let Some(slot) = routes.subscribe_cancel.remove(&completed.channel) {\n        slot.route.cancel();\n    }"
+new = "    if let Some(slot) = routes.subscribe_cancel.get(&completed.channel).filter(|_| false) { // NON-VACUITY BREAK: keep the old generation's stream.\n        slot.route.cancel();\n    }"
+
+[[control]]
+id = "registry-dispatch-cache-evicts-one-session"
+guards = "A full tool-turn dispatch cache evicts only its oldest session, so other sessions' committed facts are not forced back into whole-WAL replays"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry_owner_tests.rs"
+expect_red = ["registry::owner_tests::a_full_dispatch_cache_evicts_one_session_not_all"]
+expect_message = "a session still cached is answered without reading its WAL"
+file = "crates/broca-module/src/registry.rs"
+old = "            if cache\n                .get(key)\n                .is_none_or(|entry| entry.lineage_id != lineage_id)\n            {"
+new = "            if cache.get(key).is_none() && cache.entries.len() >= DISPATCH_CACHE_SESSIONS { // NON-VACUITY BREAK: start the whole cache over.\n                *cache = BoundedSessionCache::new(DISPATCH_CACHE_SESSIONS);\n            }\n            if cache\n                .get(key)\n                .is_none_or(|entry| entry.lineage_id != lineage_id)\n            {"
+
+[[control]]
+id = "wal-archive-first-pass-not-anchored-to-boot"
+guards = "A WAL tree that has never folded runs its first scheduled pass on the first poll instead of waiting an interval from process start, which a frequently restarted daemon never reaches"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/wal_archive.rs"
+expect_red = ["wal_archive::tests::a_never_folded_tree_folds_once_on_its_first_poll"]
+expect_message = "a never-folded tree must run exactly one pass, on its first poll"
+file = "crates/broca-module-serve/src/wal_archive.rs"
+old = "                    None => tracing::info!(\n                        target: \"archive\",\n                        \"WAL archive pass due: no earlier pass is recorded under this root\"\n                    ),"
+new = "                    None => continue, // NON-VACUITY BREAK: never run a first pass."
+
+[[control]]
+id = "catalog-failed-poll-retries-promptly"
+guards = "A failed fusiform catalog poll is retried on a short capped backoff rather than after the full 30-minute refresh interval"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
+expect_red = ["catalog_refresh::tests::a_failed_poll_retries_on_a_capped_backoff", "catalog_refresh::tests::an_unreachable_fusiform_at_boot_is_polled_again_promptly"]
+file = "crates/broca-module-serve/src/catalog_refresh.rs"
+old = "    if consecutive_failures == 0 {\n        return CATALOG_POLL_INTERVAL;\n    }"
+new = "    if consecutive_failures == 0 || true { // NON-VACUITY BREAK: wait the full interval after a failure too.\n        return CATALOG_POLL_INTERVAL;\n    }"

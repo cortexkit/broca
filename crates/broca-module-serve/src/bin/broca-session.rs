@@ -1801,7 +1801,7 @@ fn emit_control_to(
             retries_used,
         } => emit_to(
             json,
-            &serde_json::json!({"event": "run_finished", "seq": wal_seq, "reason": format!("{reason:?}"), "usage": usage, "final_step_finish_reason": final_step_finish_reason.map(|r| format!("{r:?}")), "indeterminate_tool_calls": indeterminate_tool_calls, "retries_used": retries_used}),
+            &serde_json::json!({"event": "run_finished", "seq": wal_seq, "run_id": run_id.as_ref().map(|id| &id.0), "reason": format!("{reason:?}"), "usage": usage, "final_step_finish_reason": final_step_finish_reason.map(|r| format!("{r:?}")), "indeterminate_tool_calls": indeterminate_tool_calls, "retries_used": retries_used}),
             || {
                 let totals = usage
                     .as_ref()
@@ -2206,6 +2206,31 @@ mod tests {
                 "json render dropped {needle}: {json_out}"
             );
         }
+    }
+
+    /// The JSON terminal names its run, as the human line does: a resumed run writes no new
+    /// `RunStarted`, so a consumer of `--json-events` can attribute its `run_finished` only by
+    /// this field. A terminal from a producer that never named its run says so with null.
+    #[test]
+    fn run_finished_json_names_its_run() {
+        let render = |unit: &ControlUnit| {
+            let mut line = String::new();
+            emit_control_to(ControlRenderMode::Subscribe, true, 7, unit, &mut |out| {
+                line.push_str(&out)
+            });
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        assert_eq!(
+            render(&run_finished_for("ours"))["run_id"],
+            serde_json::json!("ours"),
+            "the JSON terminal must carry its durable run id"
+        );
+        let unnamed = render(&run_finished());
+        assert_eq!(
+            unnamed.get("run_id"),
+            Some(&serde_json::Value::Null),
+            "an unnamed terminal reports the gap as null"
+        );
     }
 
     #[test]
@@ -2616,7 +2641,7 @@ mod tests {
             json_events,
             [
                 serde_json::json!({"event": "run_started", "seq": 0, "run_id": "ours"}),
-                serde_json::json!({"event": "run_finished", "seq": 3, "reason": "Completed", "usage": null, "final_step_finish_reason": null, "indeterminate_tool_calls": null, "retries_used": 0}),
+                serde_json::json!({"event": "run_finished", "seq": 3, "run_id": null, "reason": "Completed", "usage": null, "final_step_finish_reason": null, "indeterminate_tool_calls": null, "retries_used": 0}),
             ]
         );
         assert!(!json_events
@@ -2657,7 +2682,7 @@ mod tests {
             json_events,
             [
                 serde_json::json!({"event": "run_started", "seq": 0, "run_id": "ours"}),
-                serde_json::json!({"event": "run_finished", "seq": 2, "reason": "Completed", "usage": null, "final_step_finish_reason": null, "indeterminate_tool_calls": null, "retries_used": 0}),
+                serde_json::json!({"event": "run_finished", "seq": 2, "run_id": null, "reason": "Completed", "usage": null, "final_step_finish_reason": null, "indeterminate_tool_calls": null, "retries_used": 0}),
                 serde_json::json!({"event": "final_text", "text": "model reply"}),
             ]
         );

@@ -1937,3 +1937,53 @@ async fn move_fenced_ownership_never_reuses_a_corrupt_cached_prefix() {
         }
     }
 }
+
+/// A full dispatch cache admits a new session by evicting only the session cached longest ago.
+/// Every other session keeps its committed tool-turn facts, so reading them again needs no
+/// whole-WAL replay; this registry has no WAL reader, so a replay would fail the read.
+#[tokio::test]
+async fn a_full_dispatch_cache_evicts_one_session_not_all() {
+    let registry = LineageRegistry::new(Arc::new(NeverOpener));
+    let key = |name: String| BindIdentity::new("/p/dispatch", "runner", name);
+    let empty = std::collections::BTreeMap::new();
+    for filler in 0..DISPATCH_CACHE_SESSIONS - 1 {
+        registry
+            .tool_turn_dispatches(&key(format!("filler-{filler}")), "lineage", &empty, &[], 0)
+            .await
+            .unwrap();
+    }
+    let kept = key("kept".into());
+    let facts = vec![broca_core::ToolCallDispatch {
+        tool_call_id: "call".into(),
+        intent_seq: Some(4),
+        dispatched_to: Some("aft".into()),
+        indeterminate: false,
+    }];
+    registry.inner.dispatch_cache.lock().unwrap().insert(
+        kept.clone(),
+        DispatchCache {
+            lineage_id: "lineage".into(),
+            by_ordinal: [(3, facts.clone())].into(),
+            covered: 4,
+        },
+    );
+    registry
+        .tool_turn_dispatches(&key("newcomer".into()), "lineage", &empty, &[], 0)
+        .await
+        .unwrap();
+    let answered = registry
+        .tool_turn_dispatches(&kept, "lineage", &empty, &[3], 4)
+        .await
+        .expect("a session still cached is answered without reading its WAL");
+    assert_eq!(answered, [(3, facts)].into());
+    assert!(
+        registry
+            .inner
+            .dispatch_cache
+            .lock()
+            .unwrap()
+            .get(&key("filler-0".into()))
+            .is_none(),
+        "the session cached longest ago is the one evicted"
+    );
+}
