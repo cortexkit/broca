@@ -611,6 +611,19 @@ pub fn provider_for_recorded_config(
 /// these inputs never bypass catalog identity, family, quirks or auth resolution.
 #[derive(Clone, Copy, Default)]
 pub struct EpisodeRenderConfig<'a> {
+    /// Preserve a recorded OpenCode Go protocol when the model's current per-model pin changes.
+    /// `None` means a fresh run should use today's catalog selection.
+    pub wire_family: Option<WireFamilyId>,
+    /// OpenCode Go's session header is derived from the bind identity on every admission and
+    /// resume. It is transport metadata, so it does not enter the frozen request-body blob.
+    pub opencode_go_session_id: Option<&'a str>,
+    /// Restore the recorded body compatibility choice on resume; a fresh Go episode opts in.
+    pub opencode_go_reasoning_signature: Option<bool>,
+    /// Restore Go's model-specific Qwen and DeepSeek Chat Completions quirks on resume.
+    pub opencode_go_qwen_thinking: Option<bool>,
+    pub opencode_go_deepseek_thinking: Option<bool>,
+    /// On resume, restore whether OpenCode Go's Kimi K2.6 route rejects 24-hour prompt-cache hints.
+    pub opencode_go_long_cache_retention_unsupported: Option<bool>,
     /// Freshly derived or restored Code Assist identity. If the episode's frozen config
     /// recorded no identity, keep it absent so a resume reproduces the original bytes.
     pub codeassist_identity: Option<&'a broca_provider::wire::CodeAssistIdentity>,
@@ -728,6 +741,25 @@ pub fn default_max_output_tokens(output_limit: Option<u64>, context_limit: Optio
 
 impl EpisodeRenderConfig<'_> {
     fn apply(self, mut config: FrozenRenderConfig) -> FrozenRenderConfig {
+        if let Some(session_id) = self.opencode_go_session_id {
+            config.opencode_go_session_id = Some(session_id.to_string());
+            if config.family_id == WireFamilyId::OpenAiChat {
+                config.opencode_go_reasoning_signature =
+                    self.opencode_go_reasoning_signature.unwrap_or(true);
+            }
+        }
+        if let Some(recorded) = self.opencode_go_reasoning_signature {
+            config.opencode_go_reasoning_signature = recorded;
+        }
+        if let Some(recorded) = self.opencode_go_qwen_thinking {
+            config.opencode_go_qwen_thinking = recorded;
+        }
+        if let Some(recorded) = self.opencode_go_deepseek_thinking {
+            config.opencode_go_deepseek_thinking = recorded;
+        }
+        if let Some(recorded) = self.opencode_go_long_cache_retention_unsupported {
+            config.opencode_go_long_cache_retention_unsupported = recorded;
+        }
         if config.family_id == WireFamilyId::GoogleCodeAssist {
             config.codeassist_identity = self.codeassist_identity.cloned();
         }
@@ -948,6 +980,13 @@ fn resolve_provider_inner(
     // reporting an unsupported variant for a model whose options we cannot inspect.
     let catalog = crate::catalog().map_err(|error| error.to_string())?;
     let episode_render = EpisodeRenderConfig {
+        wire_family: episode_render.wire_family,
+        opencode_go_session_id: episode_render.opencode_go_session_id,
+        opencode_go_reasoning_signature: episode_render.opencode_go_reasoning_signature,
+        opencode_go_qwen_thinking: episode_render.opencode_go_qwen_thinking,
+        opencode_go_deepseek_thinking: episode_render.opencode_go_deepseek_thinking,
+        opencode_go_long_cache_retention_unsupported: episode_render
+            .opencode_go_long_cache_retention_unsupported,
         codeassist_identity: episode_render.codeassist_identity,
         base_url: episode_render
             .base_url
@@ -1118,8 +1157,16 @@ fn resolve_provider_inner(
             context_limit: catalog.context_limit(provider_id, model_id),
         });
     }
-    let (provider_spec, model_spec) = catalog
-        .model_for_serving(provider_id, model_id)
+    let recorded_opencode_go_family = if provider_id == "opencode-go" {
+        episode_render.wire_family
+    } else {
+        None
+    };
+    let serving_pair = match recorded_opencode_go_family {
+        Some(family) => catalog.model_for_serving_with_family(provider_id, model_id, family),
+        None => catalog.model_for_serving(provider_id, model_id),
+    };
+    let (mut provider_spec, model_spec) = serving_pair
         .ok_or_else(|| {
             if catalog.is_withdrawn(provider_id, model_id) {
                 format!(
@@ -1139,6 +1186,15 @@ fn resolve_provider_inner(
             }
         })?;
 
+    if provider_id == "opencode-go" {
+        if let Some(base_url) = episode_render.base_url {
+            provider_spec.base_url = base_url.to_string();
+        }
+        if episode_render.opencode_go_session_id.is_none() {
+            return Err("OpenCode Go needs a session identity when resolving a new run".into());
+        }
+    }
+
     let family = provider_spec.wire_family;
     let max_tokens = max_tokens_for(model_spec.limits.max_output, model_spec.limits.context);
     let mut frozen: FrozenRenderConfig = resolve_frozen(
@@ -1151,12 +1207,9 @@ fn resolve_provider_inner(
     if let Some(base_url) = catalog_base_url {
         frozen.base_url = Some(catalog_override_base_url(base_url, family));
     }
-    let (handle, auth_desc, auth_method) = resolve_auth(
-        auth,
-        &provider_spec.auth_kind,
-        provider_id,
-        opts.auth_method,
-    )?;
+    let auth_kind = provider_route_auth_kind(provider_id, family, &provider_spec.auth_kind);
+    let (handle, auth_desc, auth_method) =
+        resolve_auth(auth, &auth_kind, provider_id, opts.auth_method)?;
     apply_auth_method_quirks(provider_id, auth_method, &mut frozen);
     frozen.max_output_tokens = max_tokens;
     if family == WireFamilyId::GoogleCodeAssist {
@@ -1195,19 +1248,39 @@ fn resolve_provider_inner(
         episode_render.claude_code_persona,
         opts.claude_code_persona,
     );
+    if provider_id == "opencode-go" && family == WireFamilyId::OpenAiChat {
+        // Pi serves these Qwen ids through Chat Completions despite their Anthropic models.dev
+        // metadata and uses the Qwen thinking switch; the frozen flag preserves resumed bytes.
+        if episode_render.opencode_go_qwen_thinking.is_none()
+            && matches!(model_id, "qwen3.5-plus" | "qwen3.6-plus")
+        {
+            frozen.opencode_go_qwen_thinking = true;
+        }
+        if episode_render.opencode_go_deepseek_thinking.is_none()
+            && (model_id.starts_with("deepseek-v4") || model_id == "kimi-k2.6")
+        {
+            // Pi's OpenCode Go compat sends the DeepSeek-style `thinking` field on these models.
+            frozen.opencode_go_deepseek_thinking = true;
+        }
+        if episode_render.reasoning_echo.is_none() && model_id.starts_with("deepseek-v4") {
+            // DeepSeek V4 also requires each prior assistant turn's reasoning_content.
+            frozen.reasoning_echo = Some(broca_provider::policy::ReasoningEchoPolicy::DEEPSEEK);
+        }
+        if episode_render
+            .opencode_go_long_cache_retention_unsupported
+            .is_none()
+            && model_id == "kimi-k2.6"
+        {
+            frozen.opencode_go_long_cache_retention_unsupported = true;
+        }
+    }
     let frozen = episode_render.apply(frozen);
     let resolved_base_url = frozen
         .base_url
         .clone()
         .unwrap_or_else(|| "<family default>".to_string());
 
-    let refresher = secret_refresher_for(
-        auth,
-        opts,
-        &provider_spec.auth_kind,
-        provider_id,
-        auth_method,
-    );
+    let refresher = secret_refresher_for(auth, opts, &auth_kind, provider_id, auth_method);
     let provider = resolved_live_provider(http_client, frozen, handle, refresher, opts)?;
     Ok(ProviderResolution {
         provider,
@@ -1498,15 +1571,30 @@ fn resolve_family_auth(
             refresher,
         })
     } else {
+        let auth_kind = provider_route_auth_kind(provider_id, frozen.family_id, auth_kind);
         let (handle, auth_desc, auth_method) =
-            resolve_auth(auth, auth_kind, provider_id, opts.auth_method)?;
-        let refresher = secret_refresher_for(auth, opts, auth_kind, provider_id, auth_method);
+            resolve_auth(auth, &auth_kind, provider_id, opts.auth_method)?;
+        let refresher = secret_refresher_for(auth, opts, &auth_kind, provider_id, auth_method);
         Ok(FamilyAuth {
             handle,
             auth_desc,
             auth_method,
             refresher,
         })
+    }
+}
+
+fn provider_route_auth_kind(
+    provider_id: &str,
+    family: WireFamilyId,
+    default: &AuthKind,
+) -> AuthKind {
+    if provider_id == "opencode-go" && family == WireFamilyId::AnthropicMessages {
+        AuthKind::ApiKeyHeader {
+            header: "x-api-key".to_string(),
+        }
+    } else {
+        default.clone()
     }
 }
 
@@ -1652,7 +1740,9 @@ fn apply_auth_method_quirks(
     method: Option<AuthMethod>,
     frozen: &mut FrozenRenderConfig,
 ) {
-    if provider == "anthropic" && method == Some(AuthMethod::ApiKey) {
+    if (provider == "anthropic" && method == Some(AuthMethod::ApiKey))
+        || (provider == "opencode-go" && frozen.family_id == WireFamilyId::AnthropicMessages)
+    {
         apply_anthropic_apikey_quirks(frozen);
     }
 }
@@ -1903,6 +1993,118 @@ mod tests {
             cache.install_parsed_for_test(&catalog, 0, crate::CatalogSource::Fusiform);
             crate::install_global_catalog_cache(cache);
         });
+    }
+
+    #[test]
+    fn opencode_go_anthropic_route_uses_the_sdk_api_key_header_shape() {
+        let auth_kind = provider_route_auth_kind(
+            "opencode-go",
+            WireFamilyId::AnthropicMessages,
+            &AuthKind::Bearer,
+        );
+        assert!(matches!(
+            auth_kind,
+            AuthKind::ApiKeyHeader { header } if header == "x-api-key"
+        ));
+
+        let mut frozen = anthropic_frozen_config("minimax-m3");
+        apply_auth_method_quirks("opencode-go", None, &mut frozen);
+        assert_eq!(frozen.system_prompt, SystemPromptPolicy::TopLevelField);
+        assert_eq!(frozen.reasoning, ReasoningPolicy::None);
+    }
+
+    #[test]
+    fn opencode_go_resume_restores_recorded_family_and_base_url() {
+        seed_catalog_for_resolution();
+        let options = ResolveOptions::default();
+        let session_id = ClaudeCodePersona::derive_session_id("opaque-session-ref");
+        let fresh = resolve_catalog_episode_with_client(
+            "opencode-go/gpt-6-luna",
+            Some(2_048),
+            &AuthMode::None,
+            &options,
+            broca_provider::build_provider_http_client(),
+            EpisodeRenderConfig {
+                opencode_go_session_id: Some(&session_id),
+                ..Default::default()
+            },
+        )
+        .expect("the current model pin resolves");
+        assert_eq!(fresh.family_id, WireFamilyId::OpenAiResponses);
+        assert_eq!(fresh.base_url, "https://opencode.ai/inference/go/v1");
+
+        let qwen = resolve_catalog_episode_with_client(
+            "opencode-go/qwen3.5-plus",
+            Some(2_048),
+            &AuthMode::None,
+            &options,
+            broca_provider::build_provider_http_client(),
+            EpisodeRenderConfig {
+                opencode_go_session_id: Some(&session_id),
+                ..Default::default()
+            },
+        )
+        .expect("the Go Qwen compatibility model resolves");
+        assert_eq!(
+            qwen.provider.render_config_blob()["opencode_go_qwen_thinking"],
+            true
+        );
+
+        let deepseek = resolve_catalog_episode_with_client(
+            "opencode-go/deepseek-v4-pro",
+            Some(2_048),
+            &AuthMode::None,
+            &options,
+            broca_provider::build_provider_http_client(),
+            EpisodeRenderConfig {
+                opencode_go_session_id: Some(&session_id),
+                ..Default::default()
+            },
+        )
+        .expect("the Go DeepSeek compatibility model resolves");
+        let deepseek_config = deepseek.provider.render_config_blob();
+        assert_eq!(deepseek_config["opencode_go_deepseek_thinking"], true);
+        assert!(deepseek_config.get("reasoning_echo").is_some());
+
+        let kimi = resolve_catalog_episode_with_client(
+            "opencode-go/kimi-k2.6",
+            Some(2_048),
+            &AuthMode::None,
+            &options,
+            broca_provider::build_provider_http_client(),
+            EpisodeRenderConfig {
+                opencode_go_session_id: Some(&session_id),
+                ..Default::default()
+            },
+        )
+        .expect("the Go Kimi compatibility model resolves");
+        assert_eq!(
+            kimi.provider.render_config_blob()["opencode_go_long_cache_retention_unsupported"],
+            true
+        );
+
+        let resumed = resolve_catalog_episode_with_client(
+            "opencode-go/gpt-6-luna",
+            Some(2_048),
+            &AuthMode::None,
+            &options,
+            broca_provider::build_provider_http_client(),
+            EpisodeRenderConfig {
+                wire_family: Some(WireFamilyId::OpenAiChat),
+                opencode_go_session_id: Some(&session_id),
+                opencode_go_reasoning_signature: Some(false),
+                base_url: Some("https://opencode.ai/zen/go/v1"),
+                ..Default::default()
+            },
+        )
+        .expect("the recorded route remains resolvable");
+        assert_eq!(resumed.family_id, WireFamilyId::OpenAiChat);
+        assert_eq!(resumed.base_url, "https://opencode.ai/zen/go/v1");
+        let frozen = resumed.provider.render_config_blob();
+        assert_eq!(frozen["family_id"], "openai_chat");
+        assert_eq!(frozen["base_url"], "https://opencode.ai/zen/go/v1");
+        assert!(frozen.get("opencode_go_session_id").is_none());
+        assert!(frozen.get("opencode_go_reasoning_signature").is_none());
     }
 
     #[test]

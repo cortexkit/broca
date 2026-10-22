@@ -2353,6 +2353,42 @@ mod executor {
             .and_then(|persona| serde_json::from_value(persona.clone()).ok())
     }
 
+    fn frozen_opencode_go_qwen_thinking(config: &broca_wal::RunConfig) -> bool {
+        config
+            .frozen_render_config
+            .get("opencode_go_qwen_thinking")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn frozen_opencode_go_deepseek_thinking(config: &broca_wal::RunConfig) -> bool {
+        config
+            .frozen_render_config
+            .get("opencode_go_deepseek_thinking")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn frozen_opencode_go_long_cache_retention_unsupported(config: &broca_wal::RunConfig) -> bool {
+        config
+            .frozen_render_config
+            .get("opencode_go_long_cache_retention_unsupported")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn frozen_opencode_go_reasoning_signature(config: &broca_wal::RunConfig) -> bool {
+        config
+            .frozen_render_config
+            .get("opencode_go_reasoning_signature")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn frozen_wire_family(config: &broca_wal::RunConfig) -> Option<WireFamilyId> {
+        serde_json::from_value(config.frozen_render_config.get("family_id")?.clone()).ok()
+    }
+
     fn frozen_responses_tools_non_strict(config: &broca_wal::RunConfig) -> bool {
         config
             .frozen_render_config
@@ -3568,8 +3604,13 @@ mod executor {
         ) -> Result<broca_core::WarmSent, broca_module::WarmError> {
             use broca_module::WarmError;
             let config = &job.config;
-            let frozen = broca_module_serve::cache_warm::warmable_config(config)?;
             let provider_id = config.model.provider_module_id.as_str();
+            let mut frozen = broca_module_serve::cache_warm::warmable_config(config)?;
+            if provider_id == "opencode-go" {
+                frozen.opencode_go_session_id = Some(
+                    broca_module_serve::opencode_go_identity::for_session(&job.session),
+                );
+            }
             let selection = config.auth_selection.as_ref();
             // The credential the episode froze is read again exactly as a resume reads it: no
             // account is chosen afresh, and the frozen decision is carried unchanged.
@@ -3863,6 +3904,26 @@ mod executor {
                 .as_ref()
                 .filter(|_| !fresh_episode)
                 .and_then(|prior| frozen_claude_code_persona(&prior.config));
+            let opencode_go_session_id =
+                if job.req.model.provider_module_id.as_str() == "opencode-go" {
+                    Some(broca_module_serve::opencode_go_identity::for_session(
+                        &job.req.session,
+                    ))
+                } else {
+                    None
+                };
+            let opencode_go_reasoning_signature = prior_run
+                .as_ref()
+                .filter(|_| {
+                    !fresh_episode && job.req.model.provider_module_id.as_str() == "opencode-go"
+                })
+                .map(|prior| frozen_opencode_go_reasoning_signature(&prior.config));
+            let opencode_go_wire_family = prior_run
+                .as_ref()
+                .filter(|_| {
+                    !fresh_episode && job.req.model.provider_module_id.as_str() == "opencode-go"
+                })
+                .and_then(|prior| frozen_wire_family(&prior.config));
             let codeassist_identity = match broca_module_serve::codeassist_identity::for_episode(
                 &job.req.session,
                 prior_run
@@ -3987,6 +4048,32 @@ mod executor {
                 &resolve_options,
                 self.provider_client.clone(),
                 broca_catalog::live::EpisodeRenderConfig {
+                    wire_family: opencode_go_wire_family,
+                    opencode_go_session_id: opencode_go_session_id.as_deref(),
+                    opencode_go_reasoning_signature,
+                    opencode_go_qwen_thinking: prior_run
+                        .as_ref()
+                        .filter(|_| {
+                            !fresh_episode
+                                && job.req.model.provider_module_id.as_str() == "opencode-go"
+                        })
+                        .map(|prior| frozen_opencode_go_qwen_thinking(&prior.config)),
+                    opencode_go_deepseek_thinking: prior_run
+                        .as_ref()
+                        .filter(|_| {
+                            !fresh_episode
+                                && job.req.model.provider_module_id.as_str() == "opencode-go"
+                        })
+                        .map(|prior| frozen_opencode_go_deepseek_thinking(&prior.config)),
+                    opencode_go_long_cache_retention_unsupported: prior_run
+                        .as_ref()
+                        .filter(|_| {
+                            !fresh_episode
+                                && job.req.model.provider_module_id.as_str() == "opencode-go"
+                        })
+                        .map(|prior| {
+                            frozen_opencode_go_long_cache_retention_unsupported(&prior.config)
+                        }),
                     codeassist_identity: codeassist_identity.as_ref(),
                     chatgpt_wire: chatgpt_wire.as_ref(),
                     // Only the host and the output cap are restored. Re-resolve other catalog

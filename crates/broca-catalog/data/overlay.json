@@ -849,10 +849,69 @@
       "wire_family_source": "generated"
     },
     "opencode-go": {
-      "base_url": "https://opencode.ai/zen/go/v1",
-      "base_url_source": "generated",
+      "base_url": "https://opencode.ai/inference/go/v1",
+      "base_url_source": "authored",
       "wire_family": "openai_chat",
-      "wire_family_source": "generated"
+      "wire_family_reason": "OpenAI Chat is Pi's default for mixed Go models; the model-level pins below select the other APIs.",
+      "wire_family_source": "generated",
+      "models": {
+        "claude-haiku-5-5": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "gemini-4-argon-contributor": {
+          "base_url": "https://opencode.ai/inference/go/v1",
+          "wire_family": "gemini"
+        },
+        "gpt-5.6-luna": {
+          "wire_family": "openai_responses"
+        },
+        "gpt-6-luna": {
+          "wire_family": "openai_responses"
+        },
+        "grok-4.6": {
+          "wire_family": "openai_responses"
+        },
+        "grok-4.7": {
+          "wire_family": "openai_responses"
+        },
+        "minimax-m2.5": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "minimax-m2.7": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "minimax-m3": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "muse-spark-1.2-contributor": {
+          "wire_family": "openai_responses"
+        },
+        "muse-spark-1.3-contributor": {
+          "wire_family": "openai_responses"
+        },
+        "qwen3.5-plus": {
+          "wire_family": "openai_chat"
+        },
+        "qwen3.6-plus": {
+          "wire_family": "openai_chat"
+        },
+        "qwen3.7-plus": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "qwen3.8-flash": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "qwen3.8-max": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        }
+      }
     },
     "openreason": {
       "base_url": "https://api.openreason.app/v1",

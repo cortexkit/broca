@@ -60,6 +60,7 @@ fn resolve_runtime_override(
             reasoning_echo: frozen.map(|recorded| recorded.get("reasoning_echo").and_then(|v| serde_json::from_value(v.clone()).ok())),
             provider_text_state: None,
             structured_output: None,
+            ..Default::default()
         },
     )
     .unwrap_or_else(|error| panic!("runtime resolution: {error}"))
@@ -119,6 +120,7 @@ async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
             reasoning_echo: None,
             provider_text_state: None,
             structured_output: None,
+            ..Default::default()
         },
     )
     .ok()?;
@@ -459,6 +461,7 @@ fn resolve_drift_revision(
             reasoning_echo: None,
             provider_text_state: None,
             structured_output: None,
+            ..Default::default()
         },
     )
     .unwrap_or_else(|error| panic!("catalog resolution: {error}"))
@@ -804,6 +807,7 @@ fn resolve_tier_revision(
             reasoning_echo: None,
             provider_text_state: None,
             structured_output: None,
+            ..Default::default()
         },
     )
 }
@@ -1015,6 +1019,7 @@ fn resolve_variant_revision(
             reasoning_echo: None,
             provider_text_state: None,
             structured_output: None,
+            ..Default::default()
         },
     )
 }
@@ -1786,6 +1791,7 @@ fn restored_episode_render<'a>(
         responses_tools_non_strict: Some(frozen_responses_tools_non_strict(recorded)),
         structured_output: None,
         claude_code_persona: broca_catalog::live::EpisodePersona::Recorded(None),
+        ..Default::default()
     }
 }
 

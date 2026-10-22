@@ -25,9 +25,8 @@ const BASE_URL_SOURCE: &str = "base_url_source";
 const SOURCE_GENERATED: &str = "generated";
 const SOURCE_AUTHORED: &str = "authored";
 
-/// Endpoint overrides that existed as overlay `api` fields before endpoint pins.
-/// Freezing these values keeps generation and equality checks from recasting a
-/// hand-written override.
+/// OpenCode Go's root matches the Pi coding agent's `/inference/go/v1` route; Cerebras and xAI
+/// were already authored endpoint overrides and remain so.
 ///
 /// `kimi-for-coding` was here (authored to `https://api.kimi.com/coding`, dropping the
 /// document's `/v1` because its wire family was anthropic_messages). Upstream withdrew the
@@ -35,8 +34,9 @@ const SOURCE_AUTHORED: &str = "authored";
 /// document declares openai-compatible at `.../coding/v1` -- so the successor takes the
 /// generated pin like any other post-migration provider, and a frozen entry for an id that
 /// exists nowhere would guard nothing.
-const PRE_MIGRATION_OVERLAY_PINS: &[(&str, &str)] = &[
+const AUTHORED_ENDPOINT_PINS: &[(&str, &str)] = &[
     ("cerebras", "https://api.cerebras.ai/v1"),
+    ("opencode-go", "https://opencode.ai/inference/go/v1"),
     ("xai", "https://api.x.ai/v1"),
 ];
 
@@ -58,8 +58,8 @@ fn overlay_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/overlay.json")
 }
 
-fn pre_migration_overlay_base_url(provider_id: &str) -> Option<&'static str> {
-    PRE_MIGRATION_OVERLAY_PINS
+fn authored_endpoint_pin(provider_id: &str) -> Option<&'static str> {
+    AUTHORED_ENDPOINT_PINS
         .iter()
         .find(|(id, _)| *id == provider_id)
         .map(|(_, base_url)| *base_url)
@@ -77,7 +77,7 @@ fn document_base_url(entry: &Value) -> Option<&str> {
 fn generated_base_url_pins(providers: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
     providers
         .iter()
-        .filter(|(id, _)| pre_migration_overlay_base_url(id).is_none())
+        .filter(|(id, _)| authored_endpoint_pin(id).is_none())
         .filter_map(|(id, entry)| {
             document_base_url(entry).map(|base_url| (id.clone(), base_url.to_string()))
         })
@@ -250,7 +250,7 @@ fn every_overlay_base_url_pin_declares_its_source_and_is_nonempty() {
 }
 
 #[test]
-fn generated_base_url_pins_preserve_every_provider_base_url() {
+fn base_url_pins_preserve_document_and_authored_endpoints() {
     let providers = snapshot_providers();
     let overlay = overlay_value();
     let patch = overlay
@@ -262,13 +262,13 @@ fn generated_base_url_pins_preserve_every_provider_base_url() {
         // The authored OpenAI pin now sets the Responses base URL to https://api.openai.com/v1.
         let before = (id == "openai")
             .then_some("https://api.openai.com/v1")
-            .or_else(|| pre_migration_overlay_base_url(id))
+            .or_else(|| authored_endpoint_pin(id))
             .or_else(|| entry.get("api").and_then(Value::as_str))
             .unwrap_or("");
         let after = mapped_base_url(id, entry, patch);
         assert_eq!(
             after, before,
-            "{id}: base_url after overlay pins must equal the old merged entry.get(\"api\") answer"
+            "{id}: base_url must match its authored route or document API answer"
         );
     }
 }
@@ -304,17 +304,17 @@ fn generated_pins_are_exactly_the_document_endpoints() {
 }
 
 #[test]
-fn pre_migration_overlay_endpoints_stay_authored() {
+fn authored_overlay_endpoints_stay_authored() {
     let overlay = overlay_value();
     let patch = overlay
         .get("patch")
         .and_then(Value::as_object)
         .expect("overlay.patch is an object");
-    for (id, base_url) in PRE_MIGRATION_OVERLAY_PINS {
+    for (id, base_url) in AUTHORED_ENDPOINT_PINS {
         assert_eq!(
             pin_source(patch, id),
             Some(SOURCE_AUTHORED),
-            "{id}: an endpoint authored before generation must stay authored"
+            "{id}: the chosen endpoint root must stay authored"
         );
         assert_eq!(
             current_overlay_base_url(patch, id),

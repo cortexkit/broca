@@ -74,6 +74,7 @@ mod gated {
             reasoning_echo: None,
             provider_text_state: None,
             structured_output: None,
+            ..Default::default()
         };
         let resolved = broca_catalog::live::resolve_catalog_episode_with_client(
             MODEL,

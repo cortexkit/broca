@@ -1026,6 +1026,7 @@ async fn send_warm(
         if !status.is_success() {
             let code = status.as_u16();
             let text = String::from_utf8_lossy(&body);
+            log_opencode_go_refusal(&request.headers, code, &headers, &text);
             let error = classify_http_error_in_family(
                 code,
                 &text,
@@ -2845,6 +2846,7 @@ async fn drive_attempt(
             Some(text) => text,
             None => read_error_text(&mut resp, trace).await,
         };
+        log_opencode_go_refusal(&request.headers, code, &headers, &text);
         let error = classify_http_error_in_family(
             code,
             &text,
@@ -3792,6 +3794,21 @@ pub fn classify_account_limit_exhausted(
     if error.provider_code.as_deref() == Some(crate::service_tier::SERVICE_TIER_UNAVAILABLE) {
         return error;
     }
+    if status == 429 {
+        if let Some(limit_window) = opencode_go_usage_limit_window(body) {
+            let resets_at_ms = retry_after_deadline(now, error.retry_after_secs);
+            return ProviderError {
+                refusal: None,
+                class: ErrorClass::Transient,
+                provider_code: Some(ACCOUNT_LIMIT_EXHAUSTED.to_owned()),
+                resets_at_ms,
+                resets_at_source: resets_at_ms.map(|_| "retry_after".to_owned()),
+                limit_window: Some(limit_window),
+                account_ref: None,
+                ..error
+            };
+        }
+    }
     match family {
         crate::spec::WireFamilyId::AnthropicMessages => {
             let selected_headers = [
@@ -3837,6 +3854,136 @@ pub fn classify_account_limit_exhausted(
         }
         _ => error,
     }
+}
+
+const OPENCODE_GO_LIMIT_WINDOWS: [&str; 3] = ["5 hour", "weekly", "monthly"];
+
+/// OpenCode Go's documented-in-source 429 uses a typed body code, a named allowance window and
+/// a relative `Retry-After`. A bare rate-limit refusal does not have this complete signature.
+fn opencode_go_usage_limit_window(body: &str) -> Option<String> {
+    let body: Value = serde_json::from_str(body).ok()?;
+    if body.get("type").and_then(Value::as_str) != Some("error")
+        || body.pointer("/error/type").and_then(Value::as_str) != Some("GoUsageLimitError")
+        || body
+            .pointer("/metadata/workspace")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    let limit_window = body
+        .pointer("/metadata/limitName")
+        .and_then(Value::as_str)?;
+    OPENCODE_GO_LIMIT_WINDOWS
+        .contains(&limit_window)
+        .then(|| limit_window.to_owned())
+}
+
+fn retry_after_deadline(now: SystemTime, retry_after_secs: Option<f64>) -> Option<u64> {
+    let seconds = retry_after_secs.filter(|seconds| seconds.is_finite() && *seconds >= 0.0)?;
+    let millis = (seconds * 1_000.0).ceil();
+    let millis = if millis.is_finite() {
+        millis.min(u64::MAX as f64) as u64
+    } else {
+        u64::MAX
+    };
+    Some(system_time_millis(now).saturating_add(millis))
+}
+
+const OPENCODE_GO_ERROR_CODES: [&str; 12] = [
+    "AuthError",
+    "GoUsageLimitError",
+    "FreeUsageLimitError",
+    "BlackUsageLimitError",
+    "RateLimitError",
+    "ModelError",
+    "RegionError",
+    "DataPolicyError",
+    "CreditsError",
+    "MonthlyLimitError",
+    "UserLimitError",
+    "MissingSessionID",
+];
+
+fn opencode_go_body_error_code(body: &str) -> Option<&'static str> {
+    let body: Value = serde_json::from_str(body).ok()?;
+    let error = body.get("error")?.as_object()?;
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("type").and_then(Value::as_str))?;
+    OPENCODE_GO_ERROR_CODES
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == code)
+}
+
+fn is_opencode_go_request(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("x-opencode-client") && value == "pi")
+        && headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-opencode-session"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OpenCodeGoRefusalLogFields {
+    status: u16,
+    body_error_code: Option<&'static str>,
+    safe_headers: Vec<(String, String)>,
+}
+
+fn opencode_go_refusal_log_fields(
+    request_headers: &[(String, String)],
+    status: u16,
+    response_headers: &crate::wire::ResponseHeaders,
+    body: &str,
+) -> Option<OpenCodeGoRefusalLogFields> {
+    if !is_opencode_go_request(request_headers) {
+        return None;
+    }
+    const SAFE_HEADERS: [&str; 6] = [
+        "retry-after",
+        "content-type",
+        "x-request-id",
+        "request-id",
+        "server",
+        "cf-ray",
+    ];
+    let safe_headers = SAFE_HEADERS
+        .iter()
+        .filter_map(|name| {
+            response_headers
+                .get(name)
+                .map(|value| ((*name).to_owned(), value.to_owned()))
+        })
+        .collect();
+    Some(OpenCodeGoRefusalLogFields {
+        status,
+        body_error_code: opencode_go_body_error_code(body),
+        safe_headers,
+    })
+}
+
+fn log_opencode_go_refusal(
+    request_headers: &[(String, String)],
+    status: u16,
+    response_headers: &crate::wire::ResponseHeaders,
+    body: &str,
+) {
+    let Some(fields) =
+        opencode_go_refusal_log_fields(request_headers, status, response_headers, body)
+    else {
+        return;
+    };
+    tracing::warn!(
+        target: "provider",
+        http_status = fields.status,
+        body_error_code = fields.body_error_code.unwrap_or("unrecognized"),
+        response_headers = ?fields.safe_headers,
+        "OpenCode Go request refused"
+    );
 }
 
 /// Meta's Muse subscription quota refusal is an account wall, not a short rate limit: its HTTP

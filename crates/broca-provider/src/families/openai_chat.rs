@@ -67,10 +67,11 @@ impl WireFamily for OpenAiChat {
         auth: &AuthHandle,
         body: Vec<u8>,
     ) -> HttpRequest {
-        let mut headers = vec![
+        let mut headers = crate::opencode_go::request_headers(frozen);
+        headers.extend([
             ("content-type".to_string(), "application/json".to_string()),
             ("accept".to_string(), "application/json".to_string()),
-        ];
+        ]);
         match auth {
             AuthHandle::Bearer(token) => {
                 headers.push(("authorization".to_string(), format!("Bearer {token}")));
@@ -126,6 +127,7 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
             .reasoning_content_required
             .then_some(ReasoningEchoPolicy::DEEPSEEK)),
         frozen.tool_call_content_empty_string,
+        frozen.opencode_go_reasoning_signature,
         &name_map,
     );
 
@@ -148,6 +150,16 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
     }) = &frozen.variant
     {
         body["reasoning_effort"] = json!(effort);
+    }
+    if frozen.opencode_go_qwen_thinking {
+        // Pi's Go Qwen routes send enable_thinking even when reasoning is turned off.
+        body["enable_thinking"] = json!(frozen.variant.is_some());
+    }
+    if frozen.opencode_go_deepseek_thinking {
+        // DeepSeek Go routes require an explicit thinking mode on every turn.
+        body["thinking"] = json!({
+            "type": if frozen.variant.is_some() { "enabled" } else { "disabled" }
+        });
     }
 
     if !opts.tools.is_empty() {
@@ -196,6 +208,10 @@ fn apply_prompt_cache_hints(body: &mut Value, frozen: &FrozenRenderConfig) {
     else {
         return;
     };
+    // On OpenCode Go's Kimi K2.6 route, omit the 24-hour prompt-cache hint and its cache key.
+    if frozen.opencode_go_long_cache_retention_unsupported && retention.as_deref() == Some("24h") {
+        return;
+    }
     body["prompt_cache_key"] = Value::String(cache_key.clone());
     if let Some(retention) = retention {
         body["prompt_cache_retention"] = Value::String(
@@ -212,6 +228,7 @@ fn convert_messages(
     prompt: &[Message],
     reasoning_echo: Option<ReasoningEchoPolicy>,
     tool_call_content_empty_string: bool,
+    opencode_go: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
 ) -> Vec<Value> {
     let mut out = Vec::new();
@@ -227,6 +244,7 @@ fn convert_messages(
                 m,
                 reasoning_echo,
                 tool_call_content_empty_string,
+                opencode_go,
                 name_map,
             )),
             Role::Tool => {
@@ -276,10 +294,12 @@ fn convert_assistant(
     m: &Message,
     reasoning_echo: Option<ReasoningEchoPolicy>,
     tool_call_content_empty_string: bool,
+    opencode_go: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
 ) -> Value {
     let mut text = String::new();
     let mut reasoning = String::new();
+    let mut opencode_go_reasoning = false;
     let mut tool_calls: Vec<Value> = Vec::new();
     for b in &m.content {
         match b {
@@ -291,6 +311,12 @@ fn convert_assistant(
                     .is_some_and(|p| p.format == ReasoningEchoFormat::ReasoningContent) =>
             {
                 reasoning.push_str(text);
+            }
+            ContentBlock::Reasoning { text, signature }
+                if opencode_go && signature.as_deref() == Some("reasoning") =>
+            {
+                reasoning.push_str(text);
+                opencode_go_reasoning = true;
             }
             ContentBlock::ToolCall(tc) => tool_calls.push(json!({
                 "id": tc.tool_call_id.0,
@@ -348,6 +374,10 @@ fn convert_assistant(
                 echo_openrouter_details(m, &mut msg);
             }
         }
+    } else if opencode_go_reasoning {
+        // OpenCode Go's OpenAI-compatible endpoint expects Pi's `reasoning` signature as
+        // `reasoning_content` on the next request, rather than under the original field name.
+        msg["reasoning_content"] = Value::String(reasoning);
     }
     msg
 }

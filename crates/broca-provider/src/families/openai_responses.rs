@@ -75,10 +75,11 @@ impl WireFamily for OpenAiResponses {
     ) -> HttpRequest {
         let base = frozen.base_url.as_deref().unwrap_or(DEFAULT_BASE);
         let url = format!("{}/responses", base.trim_end_matches('/'));
-        let mut headers = vec![
+        let mut headers = crate::opencode_go::responses_request_headers(frozen);
+        headers.extend([
             ("content-type".to_string(), "application/json".to_string()),
             ("accept".to_string(), "application/json".to_string()),
-        ];
+        ]);
         match auth {
             AuthHandle::Bearer(token) => {
                 headers.push(("authorization".to_string(), format!("Bearer {token}")));

@@ -17913,8 +17913,16 @@ features = ["live"]
 test_file = "crates/broca-provider/tests/it/reasoning_content_required.rs"
 expect_red = ["reasoning_content_required::deepseek_tool_loop_echoes_reasoning_on_every_assistant_turn_golden", "reasoning_content_required::enabled_echoes_reasoning_on_every_assistant_turn", "reasoning_content_required::kimi_echoes_history_before_last_user_and_empty_text_turns_golden"]
 file = "crates/broca-provider/src/families/openai_chat.rs"
-old = '''        msg["reasoning_content"] = Value::String(reasoning);'''
-new = '''        if msg.get("tool_calls").is_some() { msg["reasoning_content"] = Value::String(reasoning); } // NON-VACUITY BREAK: tool-call turns only'''
+old = '''        match policy.format {
+            ReasoningEchoFormat::ReasoningContent => {
+                msg["reasoning_content"] = Value::String(reasoning);
+            }'''
+new = '''        match policy.format {
+            ReasoningEchoFormat::ReasoningContent => {
+                if msg.get("tool_calls").is_some() {
+                    msg["reasoning_content"] = Value::String(reasoning);
+                }
+            } // NON-VACUITY BREAK: only echo on tool-call turns.'''
 
 [[control]]
 id = "deepseek-reasoning-echo-host-detection"
@@ -24550,3 +24558,74 @@ old = """        WalRecord::CompactionRideWait { deadline_ms, .. } => {
             if let Some(run_id) = &state.run_id {"""
 new = """        WalRecord::CompactionRideWait { deadline_ms, .. } => {
             if let Some(run_id) = state.run_id.as_ref().filter(|_| false) { // NON-VACUITY BREAK: project no wait unit."""
+
+[[control]]
+id = "opencode-go-session-header"
+guards = "Every OpenCode Go wire format sends the opaque x-opencode-session identity"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/opencode_go.rs"
+expect_red = ["opencode_go::tests::requests_use_pi_urls_and_exact_identity_headers_for_each_format"]
+expect_message = "x-opencode-session"
+file = "crates/broca-provider/src/opencode_go.rs"
+old = '''        ("User-Agent".into(), user_agent()),
+        ("x-opencode-client".into(), "pi".into()),
+        ("x-opencode-session".into(), session_id.clone()),'''
+new = '''        ("User-Agent".into(), user_agent()),
+        ("x-opencode-client".into(), "pi".into()), // NON-VACUITY BREAK: intentionally omit the required Go session header so the request test must fail.'''
+
+[[control]]
+id = "opencode-go-client-header"
+guards = "Every OpenCode Go request identifies its validated pi client"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/opencode_go.rs"
+expect_red = ["opencode_go::tests::requests_use_pi_urls_and_exact_identity_headers_for_each_format"]
+expect_message = "x-opencode-client"
+file = "crates/broca-provider/src/opencode_go.rs"
+old = '''        ("User-Agent".into(), user_agent()),
+        ("x-opencode-client".into(), "pi".into()),
+        ("x-opencode-session".into(), session_id.clone()),'''
+new = '''        ("User-Agent".into(), user_agent()), // NON-VACUITY BREAK: omit client attribution to prove the header test catches it.
+        ("x-opencode-session".into(), session_id.clone()),'''
+
+[[control]]
+id = "opencode-go-model-format-pin"
+guards = "OpenCode Go models keep the API protocol Pi uses for that model"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/lib.rs"
+expect_red = ["tests::opencode_go_models_use_their_pinned_pi_protocol_and_endpoint"]
+expect_message = "gpt-6-luna protocol pin"
+file = "crates/broca-catalog/src/lib.rs"
+old = '''        let model_family = model_entry
+            .get("wire_family")
+            .and_then(parse_family)
+            .unwrap_or(provider_family);
+'''
+new = '''        let model_family = provider_family; // NON-VACUITY BREAK: ignore the pinned model family so the catalog test must fail.
+'''
+
+
+[[control]]
+id = "opencode-go-usage-limit-account-wall"
+guards = "Only the documented GoUsageLimitError window body maps a 429 to account_limit_exhausted"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-provider/src/transport_request_invalid_tests.rs"
+expect_red = ["transport::tests::request_invalid::opencode_go_usage_limit_429_is_account_limit_exhausted_and_logged_safely"]
+expect_message = "account_limit_exhausted"
+file = "crates/broca-provider/src/transport.rs"
+old = '''        || body.pointer("/error/type").and_then(Value::as_str) != Some("GoUsageLimitError")'''
+new = '''        || body.pointer("/error/type").and_then(Value::as_str) == Some("GoUsageLimitError") // NON-VACUITY BREAK: decline Go quota classification.'''
+
+

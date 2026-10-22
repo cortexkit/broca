@@ -240,6 +240,23 @@ pub struct FrozenRenderConfig {
     /// that way keeps rendering it, and blobs recorded without the field read back as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code_persona: Option<ClaudeCodePersona>,
+    /// OpenCode Go's transport-only session header. It is re-derived from the session reference
+    /// after restart and is not part of the frozen request-body identity.
+    #[serde(skip)]
+    pub opencode_go_session_id: Option<String>,
+    /// Whether OpenAI Chat replay should use OpenCode Go's reasoning signature. Older frozen
+    /// configs omit this flag and retain their prior body.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opencode_go_reasoning_signature: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opencode_go_qwen_thinking: bool,
+    /// Whether this Go model uses the DeepSeek-style `thinking` field. Older frozen configs omit
+    /// this flag and retain their prior body.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opencode_go_deepseek_thinking: bool,
+    /// Whether Go's Kimi K2.6 route rejects 24-hour OpenAI prompt-cache hints.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opencode_go_long_cache_retention_unsupported: bool,
 }
 
 /// Conversation identity and episode-local request numbering for the Antigravity envelope.

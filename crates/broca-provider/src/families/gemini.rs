@@ -69,10 +69,11 @@ impl WireFamily for Gemini {
             base.trim_end_matches('/'),
             frozen.wire_model_id
         );
-        let mut headers = vec![
+        let mut headers = crate::opencode_go::request_headers(frozen);
+        headers.extend([
             ("content-type".to_string(), "application/json".to_string()),
             ("accept".to_string(), "text/event-stream".to_string()),
-        ];
+        ]);
         match auth {
             AuthHandle::Bearer(token) => {
                 headers.push(("authorization".to_string(), format!("Bearer {token}")));

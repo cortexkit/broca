@@ -341,6 +341,9 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
                 3,
                 NotReproducible("v4 normalizes model-visible tool names at the render edge"),
             ),
+            // v5's OpenCode Go body quirks are enabled only by flags added to new frozen configs;
+            // v4 configs omit them and keep their prior bytes.
+            (4, Reproducible),
         ],
         WireFamilyId::BedrockConverse => &[
             (
@@ -611,6 +614,11 @@ pub fn resolve_frozen(
         bedrock_reasoning: provider.wire_family == WireFamilyId::BedrockConverse,
         structured_output: None,
         claude_code_persona: None,
+        opencode_go_session_id: None,
+        opencode_go_reasoning_signature: false,
+        opencode_go_qwen_thinking: false,
+        opencode_go_deepseek_thinking: false,
+        opencode_go_long_cache_retention_unsupported: false,
     })
 }
 
@@ -673,6 +681,11 @@ fn frozen_from_family_defaults(
         bedrock_reasoning: family == WireFamilyId::BedrockConverse,
         structured_output: None,
         claude_code_persona: None,
+        opencode_go_session_id: None,
+        opencode_go_reasoning_signature: false,
+        opencode_go_qwen_thinking: false,
+        opencode_go_deepseek_thinking: false,
+        opencode_go_long_cache_retention_unsupported: false,
     }
 }
 
@@ -758,8 +771,8 @@ pub fn apply_anthropic_apikey_quirks(frozen: &mut FrozenRenderConfig) {
 /// request shape — a change means a resume can't reproduce the original bytes.
 /// v2: render `CallOptions.generation` (`temperature`, `top_p`, `stop`).
 /// v3: request streaming usage with `stream_options.include_usage`.
-/// v4: normalize model-visible tool names at the render edge.
-pub const OPENAI_CHAT_RENDERER_VERSION: u32 = 4;
+/// v5: apply OpenCode Go's reasoning-signature, Qwen, DeepSeek, and Kimi K2.6 cache body quirks.
+pub const OPENAI_CHAT_RENDERER_VERSION: u32 = 5;
 
 /// Build the frozen render config for a standard OpenAI `/chat/completions` model:
 /// system as a leading message, no thinking blocks, `max_tokens` for the limit. Quirks
