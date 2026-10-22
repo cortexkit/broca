@@ -2381,6 +2381,7 @@ pub(crate) fn run_started(
             config: Box::new(RunConfig {
                 turn_directives_v1: None,
                 render_tags: false,
+                computed_tags: None,
                 model,
                 tools: vec![].into(),
                 tool_choice: Default::default(),

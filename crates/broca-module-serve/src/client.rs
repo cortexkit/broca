@@ -625,6 +625,9 @@ mod tests {
                     }],
                 ),
                 tool_calls: Vec::new(),
+                described: None,
+                digest: None,
+                part_digests: None,
             }],
             next_from_ordinal: Some(8),
             head: Some(broca_wire::CursorWire {

@@ -27,6 +27,7 @@ fn run_config(max_tokens: u32) -> RunConfig {
     RunConfig {
         turn_directives_v1: None,
         render_tags: false,
+        computed_tags: None,
         model: ModelHandle::new("stub", "m"),
         tools: vec![].into(),
         tool_choice: ToolChoice::Auto,
@@ -386,6 +387,7 @@ fn run_started_over_unfinished_episode_is_corrupt() {
                 "the corruption names the UNFINISHED prior episode"
             );
         }
+        other => panic!("expected a corrupt lineage, got {other}"),
     }
 }
 

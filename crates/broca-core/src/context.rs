@@ -128,6 +128,9 @@ pub struct StorePageSnapshot {
     /// Captured at the watermark on model-view reads only. Absent forces a complete read
     /// for a compaction session; the raw page path never decodes or consumes this state.
     pub compaction: Option<crate::compaction::CompactionCheckpoint>,
+    /// Where tag numbering continues after the materialized prefix: read from its last row,
+    /// whose stored tags carry the number before it and its run's computed rules.
+    pub tag_seed: crate::tags::TagSeed,
 }
 
 impl StorePageSnapshot {
@@ -146,6 +149,7 @@ impl StorePageSnapshot {
             last_run_id: None,
             last_episode_usage: None,
             compaction: None,
+            tag_seed: crate::tags::TagSeed::default(),
         }
     }
 }
@@ -759,6 +763,9 @@ pub struct SessionReadPage {
     pub deferred_calls: Option<crate::DeferredCallProjection>,
     pub late_approvals: Vec<crate::LateApprovalView>,
     pub withdrawals_owed: bool,
+    /// The running episode's tag numbers wait for its compaction Setup answer, which may
+    /// anchor them at a checkpoint; a read refuses rather than show numbers that could change.
+    pub tags_await_setup: bool,
 }
 
 /// Assemble one transcript page from atomically selected store rows plus the bounded WAL tail.
@@ -868,6 +875,7 @@ fn read_session_page_from_rows(
         None,
         snapshot.prefix_len,
         false,
+        snapshot.tag_seed,
     )?;
     if tail_state.run_id.is_none() {
         tail_state.run_id.clone_from(&snapshot.last_run_id);
@@ -981,6 +989,7 @@ fn read_session_page_from_rows(
             deferred_calls: deferred_calls.filter(|view| !view.calls.is_empty()),
             late_approvals,
             withdrawals_owed,
+            tags_await_setup: tail_state.tags_await_setup,
         },
         dispatches,
     ))
@@ -1093,6 +1102,7 @@ pub fn tool_call_dispatches(
         None,
         0,
         false,
+        crate::tags::TagSeed::default(),
     )?;
     Ok(dispatches_of_turns(
         framed,
@@ -1125,6 +1135,7 @@ pub fn replay_transcript(framed: &[FramedRecord]) -> Result<Vec<Message>, crate:
         None,
         0,
         false,
+        crate::tags::TagSeed::default(),
     )?
     .prompt)
 }
@@ -1193,6 +1204,7 @@ fn read_session_page_full(
             .map_or_else(Vec::new, |view| view.late_approvals()),
         withdrawals_owed: crate::replay::project_deferred_calls(None, framed, None, None)
             .is_some_and(|view| !view.obligations().withdrawals.is_empty()),
+        tags_await_setup: replay.tags_await_setup,
     })
 }
 
@@ -1228,6 +1240,7 @@ pub fn effective_context(
             None,
             prefix.prefix.len() as u64,
             false,
+            crate::tags::TagSeed::from_prefix(&prefix.prefix),
         )?
         .prompt,
     );
@@ -1285,6 +1298,7 @@ pub fn resume_state_from_store(
         budget_state,
         prefix.prefix.len() as u64,
         !prefix.prefix.is_empty(),
+        crate::tags::TagSeed::from_prefix(&prefix.prefix),
     )?;
     let mut prompt = prefix.prefix.clone();
     if materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail) {
@@ -1355,6 +1369,7 @@ pub fn resume_state_from_store(
         )
     };
     Ok(crate::ReplayState {
+        tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,
         cancel_at: tail_state.cancel_at,
         // This prefix supplies model input rather than transcript reads, so it carries no run metadata.
@@ -1890,6 +1905,7 @@ mod tests {
                 config: Box::new(RunConfig {
                     turn_directives_v1: None,
                     render_tags: false,
+                    computed_tags: None,
                     model: broca_protocol::request::ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
                     tool_choice: Default::default(),
@@ -2412,6 +2428,7 @@ mod tests {
             trailing_origin: trailing_origin(&prefix.prefix),
             last_run_id: Some(RunId("r".into())),
             last_episode_usage: None,
+            tag_seed: Default::default(),
         }
     }
 
@@ -2912,6 +2929,7 @@ mod episode_merge_regression {
         RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: ModelHandle::new("stub", model),
             tools: Vec::new().into(),
             tool_choice: Default::default(),

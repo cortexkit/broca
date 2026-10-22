@@ -33,6 +33,7 @@ pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
         config: Box::new(RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: broca_protocol::ModelHandle::new("stub", "m"),
             tools: Default::default(),
             tool_choice: Default::default(),

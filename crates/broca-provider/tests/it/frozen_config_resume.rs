@@ -274,6 +274,7 @@ mod gated {
         let config = RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: request.model.clone(),
             tools: request.tools.clone().into(),
             tool_choice: request.tool_choice.clone(),

@@ -382,6 +382,11 @@ pub enum SendOutcome {
         field: &'static str,
         message: String,
     },
+    /// A template send whose `part_tag` slot names a part the transcript does not show with a
+    /// number, refused `template_part_gone` before anything was written. `slot` names the slot.
+    TemplatePartGone {
+        slot: String,
+    },
     /// A retry of an ordered send that ended undelivered: replaced by a newer send under its
     /// dedupe key, or expired.
     SendEnded {
@@ -4934,22 +4939,38 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .find(|sender| &sender.module == module_id)
             .map(|sender| sender.templates.as_slice())
             .unwrap_or_default();
-        let mut assigned = std::collections::BTreeSet::new();
+        // A `part_tag` slot names a part by its host identity and renders the number the
+        // transcript shows for it now. Broca renders a template once, at admission, so the
+        // lookup is against the transcript as it stands when the send is admitted.
+        let mut transcript = Vec::new();
         if templates
             .iter()
             .flat_map(|template| template.slots.values())
-            .any(|slot| matches!(slot, cortexkit_role_llm_runner::delivery_order::Slot::Tag))
+            .any(|slot| {
+                matches!(
+                    slot,
+                    cortexkit_role_llm_runner::delivery_order::Slot::PartTag
+                )
+            })
         {
-            for record in self.read_wal_records().await.map_err(SendOutcome::Error)? {
-                for tags in record.runner_tags() {
-                    assigned.extend(tags.parts.iter().copied());
-                }
+            let records = self.read_wal_records().await.map_err(SendOutcome::Error)?;
+            if !records.is_empty() {
+                transcript = broca_core::replay(&records)
+                    .map_err(|e| SendOutcome::Error(e.to_string()))?
+                    .prompt;
             }
         }
-        let text = cortexkit_role_llm_runner::delivery_order::render(templates, template, |tag| {
-            assigned.contains(&tag)
-        })
-        .map_err(|problem| refused(format!("{problem:?}")))?;
+        let rendered =
+            cortexkit_role_llm_runner::delivery_order::render(templates, template, |part| {
+                shown_number(&transcript, part)
+            });
+        // A part the transcript does not show ends the send by name, not as a malformed slot.
+        if let Err(cortexkit_role_llm_runner::delivery_order::TemplateProblem::PartGone(slot)) =
+            &rendered
+        {
+            return Err(SendOutcome::TemplatePartGone { slot: slot.clone() });
+        }
+        let text = rendered.map_err(|problem| refused(format!("{problem:?}")))?;
         request.input = vec![broca_protocol::Message::new(
             broca_protocol::Role::User,
             vec![broca_protocol::ContentBlock::Text { text }],
@@ -7728,6 +7749,70 @@ impl<W: WalStore + 'static> LineageActor<W> {
     }
 }
 
+/// The number `transcript` shows for the part `part` names, by its message id (`m<ordinal>`)
+/// and part key (`m<ordinal>#<index>`) as `session.read` spells them. `None` when no message
+/// or part answers to the identity, or the part shows no number.
+fn shown_number(
+    transcript: &[broca_protocol::Message],
+    part: &cortexkit_role_llm_runner::delivery_order::PartRef,
+) -> Option<u64> {
+    let ordinal: u64 = part.mid.strip_prefix('m')?.parse().ok()?;
+    let (key_message, index) = part.part.split_once('#')?;
+    if key_message != part.mid {
+        return None;
+    }
+    let index: usize = index.parse().ok()?;
+    let message = transcript
+        .iter()
+        .find(|message| message.ordinal == Some(ordinal))?;
+    message.part_tags()?.parts.get(index).copied().flatten()
+}
+
+#[cfg(test)]
+mod shown_number_tests {
+    use super::shown_number;
+    use cortexkit_role_llm_runner::delivery_order::PartRef;
+
+    /// A `part_tag` slot renders the number the transcript shows for the part its `{mid, part}`
+    /// names; a part that shows none, or that no message has, is gone.
+    #[test]
+    fn a_part_tag_names_the_number_its_part_shows() {
+        let mut shown = broca_protocol::Message::new(
+            broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text { text: "hi".into() }],
+        );
+        let mut quiet = shown.clone();
+        let mut high = 41;
+        broca_protocol::tags::number_message(
+            &mut shown,
+            broca_protocol::tags::ComputedRules {
+                render: true,
+                clean: true,
+            },
+            &mut high,
+        )
+        .unwrap();
+        broca_protocol::tags::number_message(
+            &mut quiet,
+            broca_protocol::tags::ComputedRules {
+                render: false,
+                clean: false,
+            },
+            &mut high,
+        )
+        .unwrap();
+        let mut transcript = vec![shown, quiet];
+        broca_protocol::content::stamp_ordinals(&mut transcript);
+        assert_eq!(
+            shown_number(&transcript, &PartRef::new("m0", "m0#0")),
+            Some(42)
+        );
+        assert_eq!(shown_number(&transcript, &PartRef::new("m1", "m1#0")), None);
+        assert_eq!(shown_number(&transcript, &PartRef::new("m7", "m7#0")), None);
+        assert_eq!(shown_number(&transcript, &PartRef::new("m0", "m1#0")), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -7837,6 +7922,7 @@ mod tests {
         broca_wal::RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: broca_protocol::request::ModelHandle::new("fake", "fake"),
             tools: vec![].into(),
             tool_choice: Default::default(),

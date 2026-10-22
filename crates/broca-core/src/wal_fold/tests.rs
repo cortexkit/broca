@@ -154,6 +154,7 @@ impl Fixture {
                 config: Box::new(RunConfig {
                     turn_directives_v1: None,
                     render_tags: false,
+                    computed_tags: None,
                     model: broca_protocol::ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
                     tool_choice: broca_protocol::ToolChoice::Auto,

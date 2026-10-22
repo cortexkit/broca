@@ -268,6 +268,8 @@ pub async fn apply_idle_view(
                 prompt,
                 stored,
                 prefix_bound,
+                // No run owns the writer, so this is no run's first step.
+                false,
             )
             .await?
     };
@@ -508,6 +510,9 @@ impl Runtime<'_> {
                             &opts.prompt,
                             stored,
                             provider.reasoning_is_prefix_bound(),
+                            // The boundary's own offer (views_at_boundary) already ended any
+                            // deferral at a run's first step; a ceiling ride only adds views.
+                            false,
                             &mut events,
                         )
                         .await?;
@@ -585,6 +590,7 @@ impl Runtime<'_> {
                                     &opts.prompt,
                                     stored,
                                     provider.reasoning_is_prefix_bound(),
+                                    false,
                                     &mut events,
                                 )
                                 .await?;
@@ -646,7 +652,7 @@ impl Runtime<'_> {
         if answer.request_id() != request_id {
             return Err(unavailable());
         }
-        let (initial, ceiling) = match answer {
+        let (initial, ceiling, checkpoint) = match answer {
             SetupAnswer::Refuse {
                 code,
                 reason,
@@ -661,8 +667,11 @@ impl Runtime<'_> {
                 )))
             }
             SetupAnswer::Ready {
-                initial, ceiling, ..
-            } => (initial, ceiling),
+                initial,
+                ceiling,
+                checkpoint,
+                ..
+            } => (initial, ceiling, checkpoint),
             // The answer decodes strictly on `answer`, so no other kind reaches here.
             #[allow(unreachable_patterns)]
             _ => return Err(unavailable()),
@@ -693,6 +702,12 @@ impl Runtime<'_> {
             ceiling: ceiling.map(|policy| {
                 OpaqueJson::from_json_text(serde_json::to_string(&policy).expect("role JSON"))
                     .expect("role JSON")
+            }),
+            // Recorded with the answer, so a resume, a read and a restart anchor numbering at
+            // the same cut.
+            tag_checkpoint: checkpoint.map(|checkpoint| broca_wal::SetupTagCheckpoint {
+                tag_checkpoint: checkpoint.tag_checkpoint,
+                cut: checkpoint.cut,
             }),
         };
         let mut state = CompactionState::default();
@@ -766,6 +781,7 @@ impl Runtime<'_> {
         prompt: &[Message],
         stored: &[Message],
         prefix_bound: bool,
+        run_start: bool,
     ) -> Result<Vec<Event>, crate::RunError> {
         let mut events = Vec::new();
         if let Some(cause) = view::rewrite_ride_cause(state, model) {
@@ -780,6 +796,7 @@ impl Runtime<'_> {
                     prompt,
                     stored,
                     prefix_bound,
+                    run_start,
                     &mut events,
                 ))
                 .await?;
@@ -830,6 +847,7 @@ impl Runtime<'_> {
             prompt,
             stored,
             prefix_bound,
+            run_start,
             &mut events,
         ))
         .await?;
@@ -848,6 +866,7 @@ impl Runtime<'_> {
         prompt: &[Message],
         stored: &[Message],
         prefix_bound: bool,
+        run_start: bool,
         events: &mut Vec<Event>,
     ) -> Result<bool, crate::RunError> {
         let version = fetched.view_version;
@@ -859,6 +878,7 @@ impl Runtime<'_> {
             prompt,
             stored,
             prefix_bound,
+            run_start,
         ))
         .await?;
         match &decision {
@@ -907,6 +927,7 @@ impl Runtime<'_> {
         prompt: &[Message],
         stored: &[Message],
         prefix_bound: bool,
+        run_start: bool,
     ) -> Result<
         (
             view::Decision,
@@ -914,7 +935,7 @@ impl Runtime<'_> {
         ),
         crate::RunError,
     > {
-        let decision = view::decide(
+        let decision = view::decide_at(
             fetched,
             ready,
             state,
@@ -922,6 +943,7 @@ impl Runtime<'_> {
             prompt,
             stored,
             prefix_bound,
+            run_start,
         );
         if let view::Decision::Apply(choice) = &decision {
             self.apply_view(state, fetched, choice.clone()).await?;

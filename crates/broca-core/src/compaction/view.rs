@@ -374,7 +374,9 @@ impl Decision {
 /// provider copied into a replace range. The model provider requires the reasoning of the open
 /// tool turn (the last assistant message of the history, when it makes tool calls, whatever
 /// user text follows its results); a view that would invalidate or leave out that reasoning is
-/// deferred until a later boundary where the turn is over (`view_deferred:<v>:signed_reasoning`).
+/// deferred until a later boundary where the turn is over (`view_deferred:<v>:signed_reasoning`),
+/// but never past the first step of the session's next run, where it is refused
+/// (`view_refused:<v>:provider_constraint`).
 /// Any other invalidated reasoning is left out of every request from now on, by applying the
 /// view with the companion strip (`view_companion:<v>:strip_signed_reasoning`) over the
 /// ordinals from the first invalidated block to the end of the transcript. Messages written
@@ -389,6 +391,32 @@ pub fn decide(
     stored: &[Message],
     prefix_bound: bool,
 ) -> Decision {
+    decide_at(
+        view,
+        ready,
+        state,
+        lineage_id,
+        prompt,
+        stored,
+        prefix_bound,
+        false,
+    )
+}
+
+/// [`decide`] at a step boundary that is, or is not (`run_start`), the first step of a run.
+/// The first step of a run is where a deferral ends: a view that would still be deferred there
+/// is refused instead.
+#[allow(clippy::too_many_arguments)]
+pub fn decide_at(
+    view: &CompactionView,
+    ready: &ViewReady,
+    state: &CompactionState,
+    lineage_id: &str,
+    prompt: &[Message],
+    stored: &[Message],
+    prefix_bound: bool,
+    run_start: bool,
+) -> Decision {
     let entries: BTreeMap<u64, TranscriptMessage> = transcript(prompt)
         .filter_map(transcript_message)
         .map(|entry| (entry.ordinal, entry))
@@ -402,6 +430,12 @@ pub fn decide(
         ViewDisposition::Rejected(problem) => return Decision::Rejected(problem),
         ViewDisposition::Discard => return Decision::Discard,
         ViewDisposition::Refuse(reason) => return Decision::Refuse(reason),
+    }
+    // broca's Setup lists no `apply` marks (`SetupRequest::view_apply` stays empty), so a view
+    // carrying any mark is refused, as compaction-provider §7 requires of a mark the runner
+    // did not list.
+    if view.apply.is_some() {
+        return Decision::Refuse(refusal_reasons::UNSUPPORTED_APPLY);
     }
     // Authorship is judged against the stored transcript a provider copies from. The bytes a
     // view gives are sent exactly as given (compaction-provider CONTRACT.md §6: "replaced bytes
@@ -433,6 +467,14 @@ pub fn decide(
     if open_turn(&next)
         .is_some_and(|open| open >= first && next[open].content.iter().any(is_prefix_bound))
     {
+        // A deferral lasts no later than the first step of the session's next run
+        // (compaction-provider 0.4.2 CONTRACT.md §7: a steer, a delivered notice or a tool
+        // result continues the running run, so a step that starts from one does not end it).
+        // That request still carries the open turn's reasoning, so the view cannot be applied
+        // there without breaking it: it is refused, never deferred again.
+        if run_start {
+            return Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT);
+        }
         return Decision::Defer(defer_reasons::SIGNED_REASONING);
     }
     let invalidated: Vec<u64> = next[first..]

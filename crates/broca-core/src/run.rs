@@ -748,6 +748,9 @@ pub enum RunError {
     /// The routing module refused to choose a provider account for this send. Refused before
     /// anything durable is written; the refusal says whether a later retry may be admitted.
     AccountSelectionRefused(AccountSelectionRefusal),
+    /// Numbering the transcript's tags would pass `u64::MAX` (llm-runner
+    /// `tags::try_number_parts`): the run is refused rather than show two parts one number.
+    TagNumbering(broca_protocol::tags::NumberingOverflow),
 }
 
 /// Routing's refusal to choose an account, copied verbatim, with broca's classification.
@@ -778,7 +781,8 @@ impl RunError {
             | Self::ContextManagementUnavailable { .. }
             | Self::RetainedSessionTooLarge { .. }
             | Self::SessionTooLarge { .. }
-            | Self::NewerWriter { .. } => ErrorClass::Permanent,
+            | Self::NewerWriter { .. }
+            | Self::TagNumbering(_) => ErrorClass::Permanent,
             Self::LeaseHeld(_)
             | Self::Lease(_)
             | Self::Wal(_)
@@ -805,6 +809,7 @@ impl std::fmt::Display for RunError {
                 missing.join(", ")
             ),
             RunError::Panicked => write!(f, "run task panicked before producing a terminal"),
+            RunError::TagNumbering(overflow) => write!(f, "{overflow}"),
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
             RunError::Transient(s) => write!(f, "run admission temporarily unavailable: {s}"),
@@ -2588,6 +2593,31 @@ async fn seal_size_refusal<W: WalStore>(
     result
 }
 
+/// Render the tags of the messages appended to `prompt` since `rendered_len`: a run that
+/// renders tags shows numbers (by the rules each message was written under); any run shows
+/// the model's text cleaned where an earlier tag-rendering run under the computed rules wrote
+/// it. Each message is rendered once, from its stored text, so every later request repeats the
+/// same bytes.
+fn render_new_tags(
+    prompt: &mut [Message],
+    rendered_len: &mut usize,
+    render_tags: bool,
+    frozen_render_config: &serde_json::Value,
+) {
+    if *rendered_len >= prompt.len() {
+        return;
+    }
+    if render_tags {
+        broca_protocol::tags::render_tags_into(
+            &mut prompt[*rendered_len..],
+            broca_protocol::tags::TagRendering::for_render_config(frozen_render_config),
+        );
+    } else {
+        broca_protocol::tags::clean_computed_into(&mut prompt[*rendered_len..]);
+    }
+    *rendered_len = prompt.len();
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_body<P: Provider, T: ToolPlane, A: ApprovalPolicy>(
@@ -2913,24 +2943,35 @@ where
             return Err(error);
         }
     };
-    // Whether this run shows runner tags to the model: frozen in the run's own config on a
-    // resume, read from the session's frozen plan when a new episode is admitted. A lineage
-    // admitted before tags existed has none to show, so it never renders them and its records
-    // keep their exact bytes.
-    let render_tags = if is_resume && !append_episode {
-        prior
-            .run_config
-            .as_ref()
-            .is_some_and(|config| config.render_tags)
+    // Whether this run shows runner tags to the model, and under which rules: both frozen in
+    // the run's own config on a resume, so a run started under the stored-ledger rules
+    // (`runner-tags/v1`) finishes under them with its exact bytes. A new episode is admitted
+    // under the computed rules (`runner-tags/v2`), rendering when the session's frozen plan
+    // asks. Its checkpoint is the highest number the session has shown or the stored ledger
+    // handed out, so the switch renumbers nothing a reader has seen.
+    let (render_tags, computed_tags) = if is_resume && !append_episode {
+        let config = prior.run_config.as_ref();
+        (
+            config.is_some_and(|config| config.render_tags),
+            config.and_then(|config| config.computed_tags),
+        )
     } else {
-        writer.lineage_tags() != Some(crate::tags::LineageTags::Off)
-            && control
+        let ledger_high = writer
+            .lineage_tags()
+            .unwrap_or(crate::tags::LineageTags::unstarted())
+            .ledger_high();
+        (
+            control
                 .manifest
                 .as_deref()
                 .or(prior.manifest.as_deref())
-                .is_some_and(crate::tags::plan_renders_tags)
+                .is_some_and(crate::tags::plan_renders_tags),
+            Some(broca_wal::ComputedTagRules {
+                checkpoint: ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)),
+            }),
+        )
     };
-    writer.retain_live_tags(render_tags);
+    writer.retain_live_tags(render_tags && computed_tags.is_none());
     let context_limit = if is_resume && !append_episode {
         prior
             .run_config
@@ -3102,6 +3143,10 @@ where
     // accordingly; the prefix that carries across an append is the prior lineage's
     // committed conversation.
     let mut prompt: Vec<Message>;
+    // Where this run's own messages begin in `prompt`: the ones tag numbering still has to
+    // number. Earlier ones already carry their numbers: stored ones from their records, computed
+    // ones from the replay that rebuilt them.
+    let own_messages_start: usize;
     // Number of leading messages whose append-only positions are already stamped. Replay and
     // store reconstruction stamp their complete result; fresh/appended input begins after this
     // boundary and is stamped once before its first provider call.
@@ -3683,6 +3728,7 @@ where
                     writer.sync().await?;
                 }
                 prompt = prior.prompt;
+                own_messages_start = prompt.len();
                 stamped_len = prompt.len();
                 total_usage = prior.usage;
                 total_retries_used = prior.retries_used;
@@ -3795,6 +3841,7 @@ where
                 // Seed from the reconstructed state; do NOT re-write the run-start
                 // record — it's already durable and authoritative.
                 prompt = prior.prompt;
+                own_messages_start = prompt.len();
                 stamped_len = prompt.len();
                 total_usage = prior.usage;
                 total_retries_used = prior.retries_used;
@@ -3853,6 +3900,7 @@ where
                 RunConfig {
                     turn_directives_v1: req.directives.clone(),
                     render_tags,
+                    computed_tags,
                     model: cfg.model.clone(),
                     tools: Arc::clone(&tools),
                     tool_choice: cfg.tool_choice.clone(),
@@ -3940,6 +3988,7 @@ where
             Vec::new()
         };
         let input_start = prompt.len();
+        own_messages_start = input_start;
         prompt.extend(Arc::unwrap_or_clone(episode_input));
         // The writer tagged the input as it appended the RunStarted; the prompt's copies carry
         // the same tags, as replay attaches them.
@@ -4133,6 +4182,14 @@ where
     // in-flight render can force a copy of the durable prompt.
     // How much of the prompt has had its runner tags rendered (see `render_tags`).
     let mut tags_rendered_len = 0;
+    // Number this run's messages as they join the prompt, by the run's frozen rules, exactly
+    // as a replay of the WAL numbers them.
+    let own_messages_start = own_messages_start.min(prompt.len());
+    let mut tag_numbering = crate::tags::TagNumbering::for_run(
+        &prompt[..own_messages_start],
+        crate::tags::rules_for(computed_tags, render_tags, &provider.render_config_blob()),
+        computed_tags,
+    );
     let mut opts = Arc::new(CallOptions {
         ephemeral_session: retention_lineage()?,
         render_episodes: Arc::new(render_episodes.into()),
@@ -4281,6 +4338,9 @@ where
             stamped_len,
         );
         stamped_len = opts.prompt.len();
+        tag_numbering
+            .number_new(&mut mutable_call_options(&mut opts).prompt)
+            .map_err(RunError::TagNumbering)?;
         if let Some(raw) = &mut compaction_raw {
             if raw.len() < opts.prompt.len() {
                 raw.extend_from_slice(&opts.prompt[raw.len()..]);
@@ -4292,14 +4352,17 @@ where
         // Each message is rendered once, the first time a request includes it, and depends only
         // on its stored text and tags, so every later request repeats the same bytes. The
         // native copies above stay unprefixed.
-        if render_tags && tags_rendered_len < opts.prompt.len() {
-            broca_protocol::tags::render_tags_into(
-                &mut mutable_call_options(&mut opts).prompt[tags_rendered_len..],
-                broca_protocol::tags::TagRendering::for_render_config(
-                    &provider.render_config_blob(),
-                ),
+        // Under the computed rules a compaction provider's first Setup may anchor the numbers
+        // at its checkpoint, so nothing of this run renders until Setup has answered (below).
+        let setup_pending =
+            computed_tags.is_some() && compaction_runtime.is_some() && compaction_state.is_none();
+        if !setup_pending {
+            render_new_tags(
+                &mut mutable_call_options(&mut opts).prompt,
+                &mut tags_rendered_len,
+                render_tags,
+                &provider.render_config_blob(),
             );
-            tags_rendered_len = opts.prompt.len();
         }
 
         // The finalize turn keeps the declared toolset BYTE-IDENTICAL and disables calls via
@@ -4369,6 +4432,20 @@ where
                 match Box::pin(runtime.setup(setup, raw)).await {
                     Ok(mut state) => {
                         state.history = compaction_history.clone();
+                        // A moved session's Setup checkpoint anchors the numbers at its cut
+                        // before anything of this run is rendered with a number.
+                        if let (Some(_), Some(checkpoint)) = (computed_tags, &state.tag_checkpoint)
+                        {
+                            tag_numbering
+                                .anchor_setup(
+                                    &mut mutable_call_options(&mut opts).prompt,
+                                    0,
+                                    &[],
+                                    "",
+                                    checkpoint,
+                                )
+                                .map_err(RunError::TagNumbering)?;
+                        }
                         compaction_state = Some(state);
                     }
                     Err(error) => {
@@ -4377,6 +4454,12 @@ where
                     }
                 }
             }
+            render_new_tags(
+                &mut mutable_call_options(&mut opts).prompt,
+                &mut tags_rendered_len,
+                render_tags,
+                &provider.render_config_blob(),
+            );
             let state = compaction_state.as_mut().expect("Setup is durable");
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
@@ -4410,6 +4493,8 @@ where
                     &opts.prompt,
                     raw,
                     provider.reasoning_is_prefix_bound(),
+                    // The run's first step, where a view deferred over an open turn ends.
+                    completed_steps == 0,
                 ))
                 .await?
             };
@@ -8487,6 +8572,7 @@ mod tests {
         prior.run_config = Some(RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: broca_protocol::request::ModelHandle::new("chatgpt", "gpt-6.1-sol"),
             tools: vec![].into(),
             tool_choice: Default::default(),
@@ -9588,6 +9674,7 @@ mod tests {
         let config = RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: ModelHandle::new("stub", "m"),
             tools: Vec::new().into(),
             tool_choice: ToolChoice::Auto,
@@ -9663,6 +9750,7 @@ mod tests {
                 }),
                 pending_fifo: Arc::new(Vec::new()),
             },
+            tag_seed: Default::default(),
         };
         let wal_store = BudgetTailWalStore {
             observed_after: std::sync::Mutex::new(Vec::new()),

@@ -540,6 +540,7 @@ fn complete_import_records_for_test(
     let config = broca_wal::RunConfig {
         turn_directives_v1: None,
         render_tags: false,
+        computed_tags: None,
         model: broca_protocol::request::ModelHandle::new("import", "import"),
         tools: Vec::new().into(),
         tool_choice: Default::default(),

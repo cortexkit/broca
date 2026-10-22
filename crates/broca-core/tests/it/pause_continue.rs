@@ -188,6 +188,7 @@ fn seed_resume_without_terminal(
             config: Box::new(RunConfig {
                 turn_directives_v1: None,
                 render_tags: false,
+                computed_tags: None,
                 model: ModelHandle::new("stub", "m"),
                 tools: vec![edit_tool()].into(),
                 tool_choice: ToolChoice::Auto,

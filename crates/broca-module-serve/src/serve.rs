@@ -2827,6 +2827,21 @@ where
                 .await;
             }
             let model_view = params.view == Some(broca_wire::ReadView::Model);
+            // Descriptors are offered on raw transcript reads only, refused before any read
+            // work.
+            let media = params.read.media.unwrap_or_default();
+            if model_view && media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("media".into()),
+                    "descriptors are not offered on a model-view read",
+                )
+                .await;
+            }
             let params = params.read;
             if params.after_mid.is_some() {
                 // A read after a message is defined only within the lineage it came from, and
@@ -2867,6 +2882,7 @@ where
                 after_mid: params.after_mid,
                 lineage_id: params.lineage_id,
                 max_bytes: params.max_bytes,
+                media,
             };
             if model_view {
                 return match handler.read_model(read_req).await {
@@ -3405,8 +3421,16 @@ async fn send_serve_error(
                 .with_detail(serde_json::json!({"field": "delivery"}));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
+        ServeError::TemplatePartGone { slot } => {
+            let body = ErrorBody::new(
+                cortexkit_role_llm_runner::errors::TEMPLATE_PART_GONE,
+                err.to_string(),
+            )
+            .with_detail(serde_json::json!({ "slot": slot }));
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::SendIdReuse { .. } => "send_id_reuse",
-        ServeError::Transient(_) => "transient",
+        ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient",
         ServeError::BaselineRequired => "baseline_required",
         ServeError::CapUnavailable(_) => "cap_unavailable",
         ServeError::BudgetDenied { .. } => "budget_denied",
@@ -4445,6 +4469,9 @@ mod tests {
                     ),
                     tool_calls: Vec::new(),
                     tags: Vec::new(),
+                    described: None,
+                    digest: None,
+                    part_digests: None,
                 },
                 SessionReadMessage {
                     delivered_as: None,
@@ -4459,6 +4486,9 @@ mod tests {
                     ),
                     tool_calls: Vec::new(),
                     tags: Vec::new(),
+                    described: None,
+                    digest: None,
+                    part_digests: None,
                 },
             ],
             next_from_ordinal: Some(2),
@@ -5052,6 +5082,9 @@ mod tests {
                     message: self.messages[ordinal].clone(),
                     run: None,
                     tool_calls: Vec::new(),
+                    described: None,
+                    digest: None,
+                    part_digests: None,
                 })
                 .collect();
             Ok(SessionReadResponse {
@@ -5774,6 +5807,7 @@ mod tests {
             config: Box::new(broca_wal::RunConfig {
                 turn_directives_v1: None,
                 render_tags: false,
+                computed_tags: None,
                 model: broca_protocol::request::ModelHandle::new("fake", "fake"),
                 tools: vec![].into(),
                 tool_choice: Default::default(),

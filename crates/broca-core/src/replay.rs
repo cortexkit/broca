@@ -73,6 +73,10 @@ pub enum ReplayError {
         episode_run_id: RunId,
         reason: String,
     },
+    /// Numbering the transcript's tags would pass `u64::MAX` (llm-runner
+    /// `tags::try_number_parts`): the session is refused rather than shown two parts with one
+    /// number.
+    TagNumbering(broca_protocol::tags::NumberingOverflow),
 }
 
 impl std::fmt::Display for ReplayError {
@@ -86,6 +90,7 @@ impl std::fmt::Display for ReplayError {
                 "corrupt lineage WAL at episode '{}': {reason}",
                 episode_run_id.0
             ),
+            ReplayError::TagNumbering(overflow) => write!(f, "{overflow}"),
         }
     }
 }
@@ -95,6 +100,11 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    /// The last episode renders tags under the computed rules on a compaction-managed session,
+    /// is still running, and no Setup answer is recorded yet: the answer may carry a tag
+    /// checkpoint that renumbers the run's parts from its cut (llm-runner §9.6), so no read
+    /// may expose those numbers until it is durable.
+    pub tags_await_setup: bool,
     pub input_budget: crate::input_budget::InputTokenBudget,
     pub cancel_at: Option<broca_wal::record::RunCancelAt>,
     /// Run metadata beside the prompt, never part of model input or WAL message bytes.
@@ -994,7 +1004,16 @@ impl Episode {
 /// the last episode is a resume/continue target. Fails with [`ReplayError`] on a
 /// corrupt lineage (a new episode opened over an unfinished prior one).
 pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
-    let mut state = replay_seeded(records, None, None, None, None, 0, false)?;
+    let mut state = replay_seeded(
+        records,
+        None,
+        None,
+        None,
+        None,
+        0,
+        false,
+        crate::tags::TagSeed::default(),
+    )?;
     // Stamp the fully-assembled prompt with each message's durable lineage position. Done at
     // this top-level finalization point (not inside `replay_seeded`, which produces sub-lists
     // like a store-merge tail) so the position is over the WHOLE prompt. The store-merge fast
@@ -1020,6 +1039,8 @@ pub struct ProjectionSeed {
     pub admission_checkpoint: crate::AdmissionCheckpointV1,
     /// Approval metadata for the materialized prefix, including answered calls and late work.
     pub deferred_calls: Option<DeferredCallProjection>,
+    /// Where tag numbering continues after the materialized prefix.
+    pub tag_seed: crate::tags::TagSeed,
 }
 
 impl ProjectionSeed {
@@ -1037,6 +1058,7 @@ impl ProjectionSeed {
             last_run_id: None,
             admission_checkpoint: crate::AdmissionCheckpointV1::empty(),
             deferred_calls: None,
+            tag_seed: crate::tags::TagSeed::default(),
         }
     }
 }
@@ -1086,6 +1108,7 @@ pub fn replay_projection_tail(
         seeded_budget_state,
         (seed.prefix_len, seed.prefix_len > 0),
         seed.admission_checkpoint.compaction.as_ref(),
+        seed.tag_seed,
     )?;
     let mut starts_new_episode = false;
     let mut tail_updates_last_step_usage = false;
@@ -1256,6 +1279,7 @@ pub(crate) fn first_session_record_is_interrupted<'a>(
 /// (the prefix's trailing assistant origin) so those turns are stamped identically to a
 /// full replay; a `RunStarted` appearing later in the tail overrides it for its episode.
 /// Passing `None` is the full-replay case (the first `RunStarted` sets the origin).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn replay_seeded<'a>(
     records: impl IntoIterator<Item = &'a WalRecord>,
     seed_origin: Option<broca_protocol::request::ModelHandle>,
@@ -1264,6 +1288,7 @@ pub(crate) fn replay_seeded<'a>(
     seed_budget_state: Option<crate::BudgetReplayStateV1>,
     ordinal_base: u64,
     require_caller_text: bool,
+    tag_seed: crate::tags::TagSeed,
 ) -> Result<ReplayState, ReplayError> {
     replay_seeded_with_compaction(
         records,
@@ -1273,9 +1298,11 @@ pub(crate) fn replay_seeded<'a>(
         seed_budget_state,
         (ordinal_base, require_caller_text),
         None,
+        tag_seed,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay_seeded_with_compaction<'a>(
     records: impl IntoIterator<Item = &'a WalRecord>,
     seed_origin: Option<broca_protocol::request::ModelHandle>,
@@ -1284,8 +1311,12 @@ fn replay_seeded_with_compaction<'a>(
     seed_budget_state: Option<crate::BudgetReplayStateV1>,
     position: (u64, bool),
     seed_compaction: Option<&crate::compaction::CompactionCheckpoint>,
+    tag_seed: crate::tags::TagSeed,
 ) -> Result<ReplayState, ReplayError> {
     let (ordinal_base, require_caller_text) = position;
+    // Tag numbers under the computed rules, given in the order the transcript renders: each
+    // message as it is placed in the prompt, a run's rules from its `RunStarted` on.
+    let mut numbering = crate::tags::TagNumbering::new(tag_seed, 0);
     // Lineage-cumulative: the conversation prefix across ALL episodes. The ONLY state
     // that survives an episode boundary.
     let mut prompt: Vec<Message> = Vec::new();
@@ -1342,6 +1373,12 @@ fn replay_seeded_with_compaction<'a>(
         } = rec
         {
             compaction_session |= crate::compaction::has_compaction(manifest);
+        }
+        if let WalRecord::RunStarted { config, .. } = rec {
+            numbering
+                .number_new(&mut prompt)
+                .map_err(ReplayError::TagNumbering)?;
+            numbering.start_run(config);
         }
         compaction.fold_at(rec, ordinal_base.saturating_add(prompt.len() as u64));
         if compaction_session || compaction.state().is_some() {
@@ -2008,7 +2045,23 @@ fn replay_seeded_with_compaction<'a>(
                 }
             }
         }
+        numbering
+            .number_new(&mut prompt)
+            .map_err(ReplayError::TagNumbering)?;
+        if let WalRecord::CompactionMessage {
+            kind: broca_wal::CompactionMessageKind::Setup,
+            tag_checkpoint: Some(checkpoint),
+            ..
+        } = rec
+        {
+            numbering
+                .anchor_setup(&mut prompt, ordinal_base, &[], "", checkpoint)
+                .map_err(ReplayError::TagNumbering)?;
+        }
     }
+    numbering
+        .number_new(&mut prompt)
+        .map_err(ReplayError::TagNumbering)?;
 
     // Fold any still-open batch's indeterminate calls (intent∧¬terminal) into the
     // list, then classify the LAST episode's trailing state.
@@ -2136,7 +2189,15 @@ fn replay_seeded_with_compaction<'a>(
     }
     // A torn import's repair truncates the prompt; a turn past the end no longer exists.
     committed_tool_turns.retain(|(prompt_index, _)| *prompt_index < prompt.len());
+    let tags_await_setup = saw_run_started
+        && !run_finished_durable
+        && compaction_session
+        && compaction.state().is_none()
+        && run_config
+            .as_ref()
+            .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
     Ok(ReplayState {
+        tags_await_setup,
         input_budget,
         cancel_at,
         message_runs,
@@ -2912,6 +2973,7 @@ pub(crate) mod projection_boundary_tests {
                 config: Box::new(RunConfig {
                     turn_directives_v1: None,
                     render_tags: false,
+                    computed_tags: None,
                     model: ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
                     tool_choice: Default::default(),
@@ -3011,6 +3073,7 @@ pub(crate) mod projection_boundary_tests {
                 }),
                 pending_fifo: std::sync::Arc::new(Vec::new()),
             },
+            tag_seed: Default::default(),
         }
     }
 

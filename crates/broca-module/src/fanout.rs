@@ -1205,6 +1205,7 @@ mod tests {
             config: Box::new(RunConfig {
                 turn_directives_v1: None,
                 render_tags: false,
+                computed_tags: None,
                 model: broca_protocol::request::ModelHandle::new("fake", "fake"),
                 tools: vec![].into(),
                 tool_choice: Default::default(),
@@ -1377,6 +1378,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: broca_core::AdmissionCheckpointV1::empty(),
+            tag_seed: Default::default(),
         }
     }
 
@@ -2647,6 +2649,7 @@ mod tests {
                     config: Box::new(RunConfig {
                         turn_directives_v1: None,
                         render_tags: false,
+                        computed_tags: None,
                         model: broca_protocol::request::ModelHandle::new("fake", "fake"),
                         tools: vec![].into(),
                         tool_choice: Default::default(),

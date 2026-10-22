@@ -399,8 +399,77 @@ where
     }))
 }
 
+/// The start of the text a tool result shows in place of a content block broca does not carry
+/// (an image, audio, a resource), so the model still learns that the tool answered with it.
+const NON_TEXT_PLACEHOLDER_OPEN: &str = "[non-text tool content omitted: type=";
+
+/// The text a tool result shows in place of a non-text content block of `content_type`, naming
+/// its MIME type and the length of its encoded data when the block had them. Tool providers'
+/// replies are mapped through this one spelling, which [`is_image_only_placeholder`] recognises.
+pub fn non_text_tool_content_placeholder(
+    content_type: &str,
+    mime_type: Option<&str>,
+    data_len: Option<usize>,
+) -> String {
+    let mime_type = mime_type
+        .map(|value| format!(" mimeType={value}"))
+        .unwrap_or_default();
+    let data_size = data_len
+        .map(|len| format!(" data≈{len} bytes"))
+        .unwrap_or_default();
+    format!("{NON_TEXT_PLACEHOLDER_OPEN}{content_type}{mime_type}{data_size}]")
+}
+
+/// Whether a tool result's text is nothing but placeholders for images: a tool result that
+/// held only images, which the tag rules number and render as an image label.
+pub fn is_image_only_placeholder(text: &str) -> bool {
+    let image = format!("{NON_TEXT_PLACEHOLDER_OPEN}image");
+    let mut rest = text;
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(after) = rest.strip_prefix(&image) else {
+            return false;
+        };
+        // The type is exactly `image`, then the optional members, then the closing bracket.
+        if !(after.starts_with(' ') || after.starts_with(']')) {
+            return false;
+        }
+        let Some(close) = after.find(']') else {
+            return false;
+        };
+        rest = &after[close + 1..];
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_only_placeholders_are_recognised_and_mixed_content_is_not() {
+        use super::{is_image_only_placeholder, non_text_tool_content_placeholder};
+        let image = non_text_tool_content_placeholder("image", Some("image/png"), Some(8));
+        assert_eq!(
+            image,
+            "[non-text tool content omitted: type=image mimeType=image/png data≈8 bytes]"
+        );
+        assert!(is_image_only_placeholder(&image));
+        assert!(is_image_only_placeholder(&format!("{image}{image}")));
+        assert!(is_image_only_placeholder(
+            &non_text_tool_content_placeholder("image", None, None)
+        ));
+        assert!(!is_image_only_placeholder(&format!("before{image}")));
+        assert!(!is_image_only_placeholder(&format!("{image} after")));
+        assert!(!is_image_only_placeholder(
+            &non_text_tool_content_placeholder("audio", Some("audio/wav"), Some(4))
+        ));
+        assert!(!is_image_only_placeholder(
+            &non_text_tool_content_placeholder("images", None, None)
+        ));
+        assert!(!is_image_only_placeholder(""));
+    }
+
     use super::*;
 
     #[test]

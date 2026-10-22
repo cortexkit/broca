@@ -56,6 +56,9 @@ const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 const SESSION_MARKER: &str = "conformance-session:";
 /// The harness every session the suite opens is bound under.
 const HARNESS: &str = "conformance";
+/// The member of a scripted tool result that holds the content blocks the scripted tool
+/// provider answers with as they are, instead of the result's JSON as one text block.
+const OWN_CONTENT: &str = "$broca_content";
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/bus.rs"]
 mod bus;
@@ -161,6 +164,9 @@ struct Armed {
 struct Shared {
     #[cfg(feature = "test-clock")]
     mc_historian: std::sync::atomic::AtomicBool,
+    /// The `mid` of every message a `session.read` answered, keyed by the message's JSON: broca
+    /// keys a part `<mid>#<index>`, so naming a message's parts needs the message's `mid`.
+    read_mids: Mutex<HashMap<String, String>>,
     plan_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
@@ -358,7 +364,21 @@ fn observe_model_request(
         observation =
             observation.with_submit_result_schema(submit["function"]["parameters"].clone());
     }
-    observation
+    // Every text the model received, in request order, as it received it (a rendered tag
+    // prefix included): message content strings and text parts, tool results included.
+    let mut rendered = Vec::new();
+    for message in request["messages"].as_array().into_iter().flatten() {
+        match &message["content"] {
+            Value::String(text) => rendered.push(text.clone()),
+            Value::Array(parts) => rendered.extend(
+                parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str().map(str::to_owned)),
+            ),
+            _ => {}
+        }
+    }
+    observation.with_rendered(rendered)
 }
 
 async fn serve_model_request(
@@ -683,6 +703,13 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
             }
         }
         let result = self.shared.results.lock().unwrap().get(&arguments).cloned();
+        // A scripted result naming its own content blocks (an image-only result) is answered
+        // with them as they are.
+        if let Some(content) = result.as_ref().and_then(|result| result.get(OWN_CONTENT)) {
+            return subc_client_rs::HandlerOutcome::Response(
+                serde_json::to_vec(&json!({ "content": content })).unwrap(),
+            );
+        }
         let text = result.map_or_else(
             || format!("no scripted result for arguments {arguments}"),
             |result| result.to_string(),
@@ -1594,6 +1621,14 @@ impl RunnerRoute for BrocaRoute {
                 if let Some(run_id) = &polled_run {
                     self.observe_run_result(run_id, &value["result"]).await;
                 }
+                if method == "session.read" {
+                    let mut mids = self.subject.shared.read_mids.lock().unwrap();
+                    for entry in value["result"]["messages"].as_array().into_iter().flatten() {
+                        if let Some(mid) = entry["mid"].as_str() {
+                            mids.insert(entry["message"].to_string(), mid.to_owned());
+                        }
+                    }
+                }
                 Ok(Reply::Response(value["result"].clone()))
             }
             Err(error) => Ok(Reply::Error(error_body(&error))),
@@ -1710,6 +1745,8 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::TurnDirectives,
             Capability::HoldToolCalls,
             Capability::Tags,
+            Capability::TagCheckpoint,
+            Capability::RenderedModelInput,
             Capability::DeliveryOrder,
             Capability::Compaction,
             Capability::ModelView,
@@ -1811,6 +1848,15 @@ impl LlmRunnerSubject for BrocaSubject {
         first: bool,
         members: &Map<String, Value>,
     ) -> Option<Map<String, Value>> {
+        // A session with a scripted compaction provider keeps its compaction plan, the extra
+        // members beside the plan's own.
+        if compaction::known_session(&self.shared, session) {
+            let mut fields = self.compaction_fields(session, first)?;
+            if let Some(plan) = fields.get_mut("plan").and_then(Value::as_object_mut) {
+                plan.extend(members.clone());
+            }
+            return Some(fields);
+        }
         self.shared
             .plan_sessions
             .lock()
@@ -1859,22 +1905,43 @@ impl LlmRunnerSubject for BrocaSubject {
         tools: &[&str],
     ) -> Option<Map<String, Value>> {
         let mut fields = self.send_fields(session, first);
-        fields.insert(
-            "tools".into(),
-            Value::Array(
-                tools
-                    .iter()
-                    .map(|name| {
-                        json!({
-                            "name": name,
-                            "description": "Answers each call with its scripted result.",
-                            "input_schema": {"type": "object"},
-                            "module": TOOL_MODULE,
+        if first && tools.is_empty() && !compaction::known_session(&self.shared, session) {
+            // A tool-free session runs under a real plan that offers no tools. The plan
+            // replaces `system`, so its system-text item carries the session marker the
+            // scripted model identifies the session by.
+            let composition = json!({"providers":[{"provider":TOOL_MODULE,"tools":[]}],
+                "step_transform_items":[]});
+            fields.insert("tools".into(), Value::Null);
+            fields.insert("system".into(), Value::Null);
+            fields.insert(
+                "plan".into(),
+                json!({
+                    "tool_items":[],
+                    "system_text_items":[{"provider":TOOL_MODULE,"preset":"conformance",
+                        "params":{"session":session}}],
+                    "step_transform_items":[],
+                    "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+                    "composition":composition,
+                }),
+            );
+        } else {
+            fields.insert(
+                "tools".into(),
+                Value::Array(
+                    tools
+                        .iter()
+                        .map(|name| {
+                            json!({
+                                "name": name,
+                                "description": "Answers each call with its scripted result.",
+                                "input_schema": {"type": "object"},
+                                "module": TOOL_MODULE,
+                            })
                         })
-                    })
-                    .collect(),
-            ),
-        );
+                        .collect(),
+                ),
+            );
+        }
         // The session's route support picks the catalog row its model resolves against: the
         // rows `seed_structured_output_catalog` writes under the `xai` provider, using explicit
         // per-model Chat pins because Chat is the protocol the scripted model speaks.
@@ -1956,6 +2023,50 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(&arguments.to_string())
             .copied()
             .unwrap_or(0)
+    }
+
+    /// A read message's top-level parts, keyed as broca keys them: `<mid>#<index>`, the `mid`
+    /// being the one the read that served the message gave it.
+    fn read_parts(&self, message: &Value) -> Vec<(String, Value)> {
+        let mid = self
+            .shared
+            .read_mids
+            .lock()
+            .unwrap()
+            .get(&message.to_string())
+            .cloned()
+            .unwrap_or_else(|| "unread".into());
+        message["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, part)| (format!("{mid}#{index}"), part.clone()))
+            .collect()
+    }
+
+    /// An image-only tool result. Broca keeps no image bytes: its tool plane maps the image to
+    /// a placeholder naming its MIME type, which carries `marker` so the case finds the entry.
+    fn image_tool_result(&self, marker: &str) -> Option<Value> {
+        Some(json!({ OWN_CONTENT: [{
+            "type": "image",
+            "mimeType": format!("image/png; name={marker}"),
+            "data": "aGk=",
+        }]}))
+    }
+
+    /// Broca has no fork or clone operation, so no session is ever a fork the runner could
+    /// detect; the fork case names that as inapplicable.
+    async fn fork_session(
+        &self,
+        _handle: &Self::Handle,
+        _parent: &str,
+        _fork: &str,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::new(
+            "broca has no fork or clone operation: a session cannot be forked, so there is no \
+             fork of a managed session for the runner to refuse",
+        ))
     }
 
     fn not_executed_tool_result(

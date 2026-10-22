@@ -954,6 +954,11 @@ pub struct ReadParams {
     /// so no message carries any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_originals: bool,
+    /// `inline` (the default) or `descriptors`, which serves large payloads as refs in place
+    /// and every entry's content identities (llm-runner §4.1). Any other value is refused
+    /// naming `media`; a model-view read refuses `descriptors`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<cortexkit_role_llm_runner::read::MediaMode>,
 }
 
 /// Wire spelling for a subscribe attach point.
@@ -1013,12 +1018,17 @@ pub enum SendResult {
 }
 
 /// Serialize `message` as callers read it: every `text_with_state` block becomes a plain `text`
-/// block with the same text, and every other block is written unchanged.
+/// block with the same text, the model's text is cleaned where its writing run cleans it, and
+/// every other block is written unchanged.
 fn serialize_caller_message<S: serde::Serializer>(
     message: &broca_protocol::Message,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use broca_protocol::ContentBlock;
+    // The model's text as every exposure shows it: cleaned of tag notation where the run that
+    // wrote it cleans (llm-runner §9.6). The stored message keeps the raw text.
+    let exposed = broca_protocol::tags::exposed_message(message);
+    let message: &broca_protocol::Message = &exposed;
     if !message
         .content
         .iter()
@@ -1094,7 +1104,7 @@ impl serde::Serialize for CallerBlockRef<'_> {
 }
 
 /// One message in a `session.read` page.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
     pub ordinal: u64,
     /// Message-coordinate spelling used by consumers for stable message badges.
@@ -1122,6 +1132,234 @@ pub struct SessionReadMessage {
     pub tags: Vec<SessionReadTag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_as: Option<cortexkit_role_llm_runner::delivery_order::EntryDelivery>,
+    /// The content identity of the whole message exactly as an inline read serves it
+    /// (`content_digest`, JCS SHA-256). Served on every entry of a descriptors read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// The content identity of each top-level part, in message order, keyed as the tag rows
+    /// key them. Served beside `digest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_digests: Option<Vec<cortexkit_role_llm_runner::read::descriptors::PartDigest>>,
+    /// The message as a descriptors read serves it, large payloads replaced by refs in place.
+    /// When present it is what `message` serializes as; never decoded.
+    #[serde(skip)]
+    pub described: Option<serde_json::Value>,
+}
+
+impl Serialize for SessionReadMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        /// The message member: the described form when a descriptors read made one, else the
+        /// message as callers read it.
+        struct Body<'a>(&'a broca_protocol::Message, Option<&'a serde_json::Value>);
+        impl Serialize for Body<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                match self.1 {
+                    Some(described) => described.serialize(serializer),
+                    None => serialize_caller_message(self.0, serializer),
+                }
+            }
+        }
+        // The member order and omissions are the ones the derived form always wrote, so an
+        // inline read keeps its exact bytes.
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            ordinal: u64,
+            mid: &'a str,
+            message: Body<'a>,
+            #[serde(
+                skip_serializing_if = "Option::is_none",
+                serialize_with = "serialize_run_attribution"
+            )]
+            run: &'a Option<broca_core::RunAttribution>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            tool_calls: &'a [SessionReadToolCall],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            tags: &'a [SessionReadTag],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            delivered_as: &'a Option<cortexkit_role_llm_runner::delivery_order::EntryDelivery>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            digest: &'a Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            part_digests: &'a Option<Vec<cortexkit_role_llm_runner::read::descriptors::PartDigest>>,
+        }
+        Wire {
+            ordinal: self.ordinal,
+            mid: &self.mid,
+            message: Body(&self.message, self.described.as_ref()),
+            run: &self.run,
+            tool_calls: &self.tool_calls,
+            tags: &self.tags,
+            delivered_as: &self.delivered_as,
+            digest: &self.digest,
+            part_digests: &self.part_digests,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl SessionReadMessage {
+    /// Serve this entry as a descriptors read does (llm-runner §4.2): its content identities
+    /// over the full inline message, and large payloads replaced by refs in place, largest first
+    /// past the fixed per-message budget. Selection depends only on this message, so every
+    /// read of it on one lineage gives the same bytes. `Err` when the message's structure alone
+    /// exceeds the budget, which a descriptors read refuses `reply_too_large`.
+    pub fn describe(&mut self) -> Result<(), u64> {
+        use cortexkit_role_llm_runner::read::descriptors::{
+            describe, PartDigest, Payload, Reference, DESCRIPTOR_MESSAGE_MAX,
+        };
+        self.described = None;
+        let inline = serde_json::to_value(CallerMessage(&self.message))
+            .expect("a stored message serializes");
+        self.digest = Some(cortexkit_role_llm_runner::content_digest::content_digest(
+            &inline,
+        ));
+        let parts = inline
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        self.part_digests = Some(
+            parts
+                .iter()
+                .enumerate()
+                .map(|(index, part)| {
+                    PartDigest::new(broca_protocol::tags::part_key(self.ordinal, index), part)
+                })
+                .collect(),
+        );
+        let mut payloads = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let at = |field: &str| format!("/content/{index}/{field}");
+            let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
+            match part.get("type").and_then(serde_json::Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = text(&part["text"]) {
+                        payloads.push((at("text"), Reference::text(None, &text)));
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(text) = text(&part["text"]) {
+                        payloads.push((at("text"), Reference::reasoning(None, text.as_bytes())));
+                    }
+                }
+                Some("redacted_reasoning") => {
+                    if let Some(data) = text(&part["data"]) {
+                        payloads.push((at("data"), Reference::reasoning(None, data.as_bytes())));
+                    }
+                }
+                Some("tool_call") => {
+                    let name = part["tool_name"].as_str().unwrap_or_default();
+                    let bytes = serde_json::to_vec(&part["input"]).expect("JSON");
+                    payloads.push((at("input"), Reference::arguments(None, name, &bytes)));
+                }
+                Some("tool_result") => {
+                    let output = &part["output"];
+                    for field in ["text", "message", "reason"] {
+                        if let Some(text) = text(&output[field]) {
+                            payloads.push((
+                                at(&format!("output/{field}")),
+                                Reference::text(None, &text),
+                            ));
+                        }
+                    }
+                    if let Some(value) = output.get("value") {
+                        let encoded = serde_json::to_string(value).expect("JSON");
+                        payloads.push((at("output/value"), Reference::text(None, &encoded)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let payloads: Vec<Payload> = payloads
+            .into_iter()
+            .map(|(pointer, reference)| Payload {
+                pointer,
+                reference,
+                required: false,
+            })
+            .collect();
+        // The budget is the fixed per-message bound less this entry's envelope, measured with
+        // the message itself left out.
+        let envelope = serialized_json_len(&*self)
+            .saturating_sub(serde_json::to_vec(&inline).expect("JSON").len());
+        let budget = DESCRIPTOR_MESSAGE_MAX.saturating_sub(envelope);
+        match describe(&inline, &payloads, budget) {
+            Ok(described) => {
+                if described != inline {
+                    self.described = Some(described);
+                }
+                Ok(())
+            }
+            Err(_) => Err(self.ordinal),
+        }
+    }
+}
+
+/// A message as callers read it, for serializing outside a read entry.
+struct CallerMessage<'a>(&'a broca_protocol::Message);
+
+impl Serialize for CallerMessage<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_caller_message(self.0, serializer)
+    }
+}
+
+/// The exposed content of part `index` of `message` as a descriptors `session.resolve` serves
+/// it, `range` already applied to `text` (a text part's exposed text): text over the inline
+/// threshold becomes a `text_ref` keyed by the part; any other part is served as its stored
+/// structure with large payloads replaced by refs.
+pub fn describe_resolved_part(
+    message: &broca_protocol::Message,
+    ordinal: u64,
+    index: usize,
+    text: String,
+) -> serde_json::Value {
+    use cortexkit_role_llm_runner::read::descriptors::{Reference, PART_INLINE_MAX};
+    let part = broca_protocol::tags::part_key(ordinal, index);
+    let is_text = matches!(
+        message.content.get(index),
+        Some(
+            broca_protocol::ContentBlock::Text { .. }
+                | broca_protocol::ContentBlock::TextWithState { .. }
+        )
+    );
+    if is_text {
+        return if text.len() > PART_INLINE_MAX {
+            serde_json::to_value(Reference::text(Some(part), &text)).expect("JSON")
+        } else {
+            serde_json::Value::String(text)
+        };
+    }
+    // A single-part message holding only this part, described as a read describes it, then
+    // its one part taken back out.
+    let single = broca_protocol::Message::new(
+        message.role,
+        message.content.get(index).cloned().into_iter().collect(),
+    );
+    let mut entry = SessionReadMessage {
+        ordinal,
+        mid: format!("m{ordinal}"),
+        message: single,
+        run: None,
+        tool_calls: Vec::new(),
+        tags: Vec::new(),
+        delivered_as: None,
+        digest: None,
+        part_digests: None,
+        described: None,
+    };
+    let _ = entry.describe();
+    let body = entry
+        .described
+        .unwrap_or_else(|| serde_json::to_value(CallerMessage(&entry.message)).expect("JSON"));
+    body.get("content")
+        .and_then(|content| content.get(0))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn serialized_json_len(value: &impl Serialize) -> usize {
+    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
 }
 
 fn serialize_run_attribution<S: serde::Serializer>(
@@ -5178,7 +5416,205 @@ mod caller_message_tests {
             message: broca_protocol::Message::new(Role::Assistant, content),
             run: None,
             tool_calls: Vec::new(),
+            described: None,
+            digest: None,
+            part_digests: None,
         }
+    }
+
+    /// The member names of a JSON object, sorted.
+    fn members(value: &serde_json::Value) -> Vec<String> {
+        let mut names: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// A consumer that re-encodes read messages byte-exactly decodes them strictly, so the
+    /// default (inline) read adds no member to an entry, its message or any block, whatever
+    /// the computed tag rules attach to the stored message. Only an opt-in descriptors read adds
+    /// `digest` and `part_digests`. The member sets below are the ones served before the
+    /// computed rules.
+    #[test]
+    fn the_default_read_shape_has_exactly_the_members_it_always_had() {
+        use broca_protocol::content::{EncryptedReasoningFormat, ToolCall, ToolOutput, ToolResult};
+        let result = |id: &str, output: ToolOutput| {
+            ContentBlock::ToolResult(ToolResult {
+                tool_call_id: broca_protocol::ToolCallId(id.into()),
+                output,
+                is_error: false,
+            })
+        };
+        let content = vec![
+            ContentBlock::Text {
+                text: "§3§ plain".into(),
+            },
+            ContentBlock::TextWithState {
+                text: "stateful".into(),
+                provider_state: TextProviderState {
+                    format: TextProviderFormat::OpenAiResponses,
+                    data: "{}".into(),
+                },
+            },
+            ContentBlock::Reasoning {
+                text: "thought".into(),
+                signature: Some("sig".into()),
+            },
+            ContentBlock::RedactedReasoning {
+                data: "opaque".into(),
+                provider_format: Some(EncryptedReasoningFormat::OpenAiResponses),
+            },
+            ContentBlock::ToolCall(ToolCall {
+                tool_call_id: broca_protocol::ToolCallId("c".into()),
+                tool_name: "t".into(),
+                input: json!({"a": 1}),
+                thought_signature: Some("ts".into()),
+            }),
+            result("c", ToolOutput::Text { text: "out".into() }),
+            result("d", ToolOutput::Json { value: json!({}) }),
+            result(
+                "e",
+                ToolOutput::Error {
+                    message: "no".into(),
+                },
+            ),
+            result(
+                "f",
+                ToolOutput::Denied {
+                    reason: "no".into(),
+                },
+            ),
+        ];
+        let mut entry = computed(read_message(content.clone()), true);
+        entry.message.origin = Some(broca_protocol::ModelHandle::new("p", "m"));
+        let body = serde_json::to_value(&entry).unwrap();
+        assert_eq!(members(&body), ["message", "mid", "ordinal", "tags"]);
+        assert_eq!(members(&body["message"]), ["content", "origin", "role"]);
+        let blocks: Vec<Vec<String>> = body["message"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(members)
+            .collect();
+        let expected: Vec<Vec<&str>> = vec![
+            vec!["text", "type"],
+            vec!["text", "type"],
+            vec!["signature", "text", "type"],
+            vec!["data", "provider_format", "type"],
+            vec![
+                "input",
+                "thought_signature",
+                "tool_call_id",
+                "tool_name",
+                "type",
+            ],
+            vec!["is_error", "output", "tool_call_id", "type"],
+            vec!["is_error", "output", "tool_call_id", "type"],
+            vec!["is_error", "output", "tool_call_id", "type"],
+            vec!["is_error", "output", "tool_call_id", "type"],
+        ];
+        assert_eq!(blocks, expected);
+        let outputs: Vec<Vec<String>> = body["message"]["content"].as_array().unwrap()[5..]
+            .iter()
+            .map(|block| members(&block["output"]))
+            .collect();
+        assert_eq!(
+            outputs,
+            [
+                vec!["kind", "text"],
+                vec!["kind", "value"],
+                vec!["kind", "message"],
+                vec!["kind", "reason"]
+            ]
+        );
+        // The same message without the computed rules serializes to the same members.
+        let plain = serde_json::to_value(read_message(content)).unwrap();
+        assert_eq!(
+            members(&plain["message"]["content"][0]),
+            members(&body["message"]["content"][0])
+        );
+        // The rows carry only the key and, on a counted part, the number.
+        for row in body["tags"].as_array().unwrap() {
+            let names = members(row);
+            assert!(names == ["part"] || names == ["part", "tag"], "{names:?}");
+        }
+    }
+
+    /// Number `entry`'s message under the computed rules of a tag-rendering run, cleaning the
+    /// model's text (`clean`) or not.
+    fn computed(mut entry: SessionReadMessage, clean: bool) -> SessionReadMessage {
+        let mut high = 0;
+        broca_protocol::tags::number_message(
+            &mut entry.message,
+            broca_protocol::tags::ComputedRules {
+                render: true,
+                clean,
+            },
+            &mut high,
+        )
+        .unwrap();
+        entry.tags = tag_rows(entry.ordinal, &entry.message);
+        entry
+    }
+
+    /// A read shows the model's text cleaned of tag notation when the run that wrote it cleans,
+    /// as written otherwise (an untagged run, a structured-output run's final text); the stored
+    /// message keeps the raw text either way.
+    #[test]
+    fn a_read_cleans_the_model_text_only_where_its_run_cleans() {
+        let raw = "§3§ hi as §1§ says";
+        let content = vec![ContentBlock::Text { text: raw.into() }];
+        let cleaned = computed(read_message(content.clone()), true);
+        let body = serde_json::to_value(&cleaned).unwrap();
+        assert_eq!(body["message"]["content"][0]["text"], "hi as  says");
+        assert_eq!(body["tags"], json!([{"part": "m3#0", "tag": "§1§"}]));
+        assert_eq!(cleaned.message.content, content, "stored text stays raw");
+        let raw_kept = computed(read_message(content.clone()), false);
+        let body = serde_json::to_value(&raw_kept).unwrap();
+        assert_eq!(body["message"]["content"][0]["text"], raw);
+    }
+
+    /// A descriptors read serves the full inline message's content identities and replaces a
+    /// payload over the inline threshold in place by a ref; small payloads and the message's
+    /// structure stay as an inline read serves them.
+    #[test]
+    fn a_descriptors_read_describes_large_payloads_in_place_with_inline_identities() {
+        use cortexkit_role_llm_runner::read::descriptors::PART_INLINE_MAX;
+        let large = "x".repeat(PART_INLINE_MAX + 1);
+        let mut entry = read_message(vec![
+            ContentBlock::Text {
+                text: "small".into(),
+            },
+            ContentBlock::Text {
+                text: large.clone(),
+            },
+        ]);
+        let inline = serde_json::to_value(&entry).unwrap();
+        entry.describe().unwrap();
+        let body = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            body["digest"],
+            json!(cortexkit_role_llm_runner::content_digest::content_digest(
+                &inline["message"]
+            ))
+        );
+        assert_eq!(
+            body["part_digests"][1]["digest"],
+            json!(cortexkit_role_llm_runner::content_digest::content_digest(
+                &inline["message"]["content"][1]
+            ))
+        );
+        assert_eq!(body["part_digests"][0]["part"], "m3#0");
+        assert_eq!(body["message"]["content"][0]["text"], "small");
+        let reference = &body["message"]["content"][1]["text"];
+        assert_eq!(reference["type"], "text_ref");
+        assert_eq!(reference["byte_size"], json!(large.len()));
+        assert!(reference.get("part").is_none(), "a nested ref has no key");
+        cortexkit_role_llm_runner::read::descriptors::validate_references(&body["message"])
+            .unwrap();
+        // An inline read of the same entry is unchanged.
+        let mut again = read_message(entry.message.content.clone());
+        again.ordinal = entry.ordinal;
+        assert_eq!(serde_json::to_value(&again).unwrap(), inline);
     }
 
     /// A read entry carries one tag row per tagged part, after `tool_calls`; the message
@@ -5264,6 +5700,9 @@ mod caller_message_tests {
             message,
             run: None,
             tool_calls: Vec::new(),
+            described: None,
+            digest: None,
+            part_digests: None,
         };
 
         let wire = serde_json::to_value(&response).unwrap();

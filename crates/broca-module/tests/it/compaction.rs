@@ -107,10 +107,39 @@ impl Provider for Model {
     }
 }
 
+/// A compaction provider whose Setup waits until the test releases it, then answers with a
+/// head and a tag checkpoint of 500 cut at the newest message, as a provider does for a
+/// session it moved from standalone Magic Context.
+struct HeldCompactor {
+    arrived: Semaphore,
+    release: Semaphore,
+}
+
+#[async_trait]
+impl CompactionPlane for HeldCompactor {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: SetupRequest,
+    ) -> Result<SetupAnswer, CompactionUnavailable> {
+        self.arrived.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        let cut = request.newest.as_ref().map(|newest| newest.mid.clone());
+        Ok(serde_json::from_value(
+            json!({"answer":"ready","request_id":request.request_id,"initial":{
+                "compaction_id":"c1","version":1,"range":{"from":0,"to":0},
+                "replacement":[text(Role::User, "head")]
+            },"checkpoint":{"tag_checkpoint":500,"cut":cut}}),
+        )
+        .unwrap())
+    }
+}
+
 struct Exec {
     wal: Arc<FileWalStore>,
     store: Arc<broca_store::SqliteStore>,
-    compactor: Arc<Compactor>,
+    compactor: Arc<dyn CompactionPlane>,
     model: Arc<Model>,
 }
 
@@ -161,10 +190,16 @@ struct Rig {
 }
 
 fn manifest() -> Arc<PlanManifest> {
+    manifest_rendering(false)
+}
+
+/// The plan's manifest, rendering tags when `render_tags`.
+fn manifest_rendering(render_tags: bool) -> Arc<PlanManifest> {
     Arc::new(PlanManifest {
         plan: OpaqueJson::from_json_text(
             json!({"compaction_item":{
-            "provider":"provider","preset":"head","params":{}},"composition":{}})
+            "provider":"provider","preset":"head","params":{}},"composition":{},
+            "render_tags":render_tags})
             .to_string(),
         )
         .unwrap(),
@@ -182,6 +217,10 @@ fn manifest() -> Arc<PlanManifest> {
 
 impl Rig {
     fn new(tool_steps: u64) -> Self {
+        Self::with_compactor(tool_steps, Arc::new(Compactor))
+    }
+
+    fn with_compactor(tool_steps: u64, compactor: Arc<dyn CompactionPlane>) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // broca's owned scratch root: on Windows it is owner-only, which the store now requires.
         let dir = broca_test_support::scratch_root().join(format!(
@@ -193,7 +232,6 @@ impl Rig {
         let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
-        let compactor = Arc::new(Compactor);
         let model = Arc::new(Model {
             tool_steps,
             prompts: prompt_tx,
@@ -228,6 +266,10 @@ impl Rig {
     }
 
     async fn send(&self, plan: bool) {
+        self.send_manifest(plan.then(manifest)).await
+    }
+
+    async fn send_manifest(&self, manifest: Option<Arc<PlanManifest>>) {
         let request = serde_json::from_value(json!({
             "model":{"provider_module_id":"stub","model_id":"model"},
             "input":[text(Role::User, "user")], "context_limit":100000
@@ -243,9 +285,9 @@ impl Rig {
                 SendKey::RunId,
                 false,
                 broca_protocol::Delivery::Queue,
-                plan.then(|| SendPlan {
+                manifest.map(|manifest| SendPlan {
                     identity: "plan".into(),
-                    manifest: Some(manifest()),
+                    manifest: Some(manifest),
                 }),
             )
             .await
@@ -310,6 +352,58 @@ async fn setup_head_renders_and_the_notice_is_durable_before_the_model_call() {
         "no view applies before the first one arrives"
     );
     assert!(!headers.contains_key("descends_from"));
+    rig.close().await;
+}
+
+/// While a run that renders tags waits for its first Setup answer, which may anchor its numbers
+/// at a checkpoint, `session.read` and `session.resolve` refuse `transient` and write nothing.
+/// Once the answer is durable they answer, with the checkpoint's numbers: no read ever shows a
+/// number a later read changes.
+#[tokio::test]
+async fn reads_wait_out_the_setup_answer_and_never_show_a_number_that_changes() {
+    let held = Arc::new(HeldCompactor {
+        arrived: Semaphore::new(0),
+        release: Semaphore::new(0),
+    });
+    let rig = Rig::with_compactor(0, held.clone());
+    rig.send_manifest(Some(manifest_rendering(true))).await;
+    broca_test_support::event_timeout("setup call", held.arrived.acquire(), || {
+        format!("session={:?}", rig.key)
+    })
+    .await
+    .expect("Setup is called")
+    .unwrap()
+    .forget();
+    let read = || {
+        rig.registry
+            .read(SessionReadRequest::new(rig.key.clone(), Some(0), Some(100)))
+    };
+    let before = read().await;
+    assert!(
+        matches!(before, Err(broca_module::ServeError::TagsAwaitSetup)),
+        "a read inside the Setup window is refused: {before:?}"
+    );
+    let resolve = rig
+        .registry
+        .resolve(&rig.key, &broca_wire::ResolveParams::new("§1§"))
+        .await;
+    assert!(
+        matches!(resolve, Err(broca_module::ServeError::TagsAwaitSetup)),
+        "a resolve inside the Setup window is refused: {resolve:?}"
+    );
+    held.release.add_permits(1);
+    rig.prompt().await;
+    let after = read().await.expect("the Setup answer is durable");
+    let shown: Vec<_> = after
+        .messages
+        .iter()
+        .flat_map(|entry| entry.tags.iter().filter_map(|row| row.tag.clone()))
+        .collect();
+    assert_eq!(
+        shown,
+        vec!["§501§".to_owned()],
+        "the prompt shows the checkpoint's number"
+    );
     rig.close().await;
 }
 

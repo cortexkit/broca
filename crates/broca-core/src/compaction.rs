@@ -162,6 +162,10 @@ pub struct CompactionState {
     /// still reports the companion edit.
     #[serde(default)]
     pub unannounced: Vec<String>,
+    /// The Setup answer's tag checkpoint, for a session the provider moved from standalone
+    /// Magic Context: tag numbering is anchored at its cut message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_checkpoint: Option<broca_wal::SetupTagCheckpoint>,
 }
 impl CompactionState {
     /// Send admission uses the last durable request estimate plus the new native messages,
@@ -259,6 +263,7 @@ impl CompactionState {
                 call_when,
                 stability,
                 ceiling,
+                tag_checkpoint,
                 ..
             } => {
                 self.provider.clone_from(provider);
@@ -266,6 +271,7 @@ impl CompactionState {
                     self.call_when.clone_from(call_when);
                     self.stability = stability.clone().unwrap_or_default();
                     self.ceiling.clone_from(ceiling);
+                    self.tag_checkpoint.clone_from(tag_checkpoint);
                 }
                 self.applied = Some(AppliedCompaction {
                     compaction_id: compaction_id.clone(),

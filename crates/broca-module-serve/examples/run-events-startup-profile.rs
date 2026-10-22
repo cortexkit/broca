@@ -199,6 +199,7 @@ fn run_started(session: &BindIdentity, run_id: &str, ts_ms: u64) -> WalRecord {
         config: Box::new(broca_wal::RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: broca_protocol::request::ModelHandle::new("profile", "model"),
             tools: vec![].into(),
             tool_choice: Default::default(),

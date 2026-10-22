@@ -666,6 +666,7 @@ mod tests {
         RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: ModelHandle::new("xai", "grok-4"),
             tools: Vec::new().into(),
             tool_choice: ToolChoice::Auto,

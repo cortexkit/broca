@@ -76,19 +76,19 @@ subc-os = "=0.1.14"
 cortexkit-lease = "=0.1.2"
 cortexkit-log = "=0.3.5"
 cortexkit-role-harness = "=0.1.0"
-cortexkit-role-tool-provider = "=0.8.1"
-cortexkit-role-tool-provider-conformance = "=0.8.0"
-cortexkit-role-llm-runner = "=0.3.8"
+cortexkit-role-tool-provider = "=0.10.1"
+cortexkit-role-tool-provider-conformance = "=0.10.0"
+cortexkit-role-llm-runner = "=0.4.3"
 cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-trait = "=0.3.0"
 cortexkit-bus-nats = "=0.3.0"
-cortexkit-role-llm-runner-conformance = "=0.8.6"
+cortexkit-role-llm-runner-conformance = "=0.9.2"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
 jsonschema = { version = "=0.58.6", default-features = false }
-cortexkit-role-agent-data = "=0.2.1"
-cortexkit-role-step-transform-provider = "=0.3.0"
-cortexkit-role-compaction-provider = "=0.3.1"
+cortexkit-role-agent-data = "=0.2.2"
+cortexkit-role-step-transform-provider = "=0.3.1"
+cortexkit-role-compaction-provider = "=0.4.2"
 
 # The logging facade every crate here emits through. The records are formatted and
 # written by cortexkit-log, which the daemon binary installs as the process-global

@@ -479,16 +479,24 @@ pub fn last_recorded_request(
     }
     let mut prompt = prior.prompt;
     // Steers written before the step opened are rendered by that step; replay of the records
-    // before `step_started` holds them back as pending.
+    // before `step_started` holds them back as pending. The step numbered them as it placed
+    // them, so the rebuild numbers them the same way.
+    let placed = prompt.len();
     prompt.extend(prior.pending_steers);
+    crate::tags::TagNumbering::number_appended(&mut prompt, placed, &config).map_err(|error| {
+        RecordedRequestError::Unavailable(format!("number the held-back steers: {error}"))
+    })?;
     broca_protocol::content::stamp_ordinals_from(&mut prompt, 0);
     // A run frozen with `render_tags` sent its tagged user and tool-result text with the tag
-    // prefix, after the guidance above; the rebuilt request must carry the same bytes.
+    // prefix, after the guidance above; the rebuilt request must carry the same bytes. Any run
+    // sent the model's text cleaned where an earlier run under the computed rules cleans it.
     if config.render_tags {
         broca_protocol::tags::render_tags_into(
             &mut prompt,
             broca_protocol::tags::TagRendering::for_render_config(&config.frozen_render_config),
         );
+    } else {
+        broca_protocol::tags::clean_computed_into(&mut prompt);
     }
     // The one turn a budget allows after its finalize message renders with tool calls disabled.
     let tool_choice = if prior.budget_finalize_pending {

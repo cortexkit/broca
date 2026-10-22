@@ -344,6 +344,7 @@ fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() 
             config: Box::new(RunConfig {
                 turn_directives_v1: None,
                 render_tags: false,
+                computed_tags: None,
                 model: ModelHandle::new("import", "import"),
                 tools: Vec::new().into(),
                 tool_choice: ToolChoice::None,

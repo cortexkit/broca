@@ -521,6 +521,7 @@ mod tests {
         broca_wal::RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: broca_protocol::request::ModelHandle::new("p", "m"),
             tools: Default::default(),
             tool_choice: Default::default(),
@@ -591,6 +592,7 @@ mod tests {
         let mut config = broca_wal::RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: broca_protocol::request::ModelHandle::new("import", "import"),
             tools: Default::default(),
             tool_choice: Default::default(),

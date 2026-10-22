@@ -200,6 +200,26 @@ impl subc_client_rs::ModuleHandler for Provider {
                     remember_replacement(state, &initial);
                     json!({"answer":"ready","request_id":request_id,"initial":initial})
                 }
+                // A moved session's checkpoint, cut at the message the request names as its
+                // newest: the session's first message, its prompt.
+                CompactionSetup::ReadyWithCheckpoint {
+                    initial: message,
+                    tag_checkpoint,
+                } => {
+                    let initial = native_compaction(&message);
+                    remember_replacement(state, &initial);
+                    json!({"answer":"ready","request_id":request_id,"initial":initial,
+                        "checkpoint":{"tag_checkpoint":tag_checkpoint,"cut":params["newest"]["mid"]}})
+                }
+                // An answer kind this adapter does not know fails the call, as an unavailable
+                // provider does.
+                _ => {
+                    return subc_client_rs::HandlerOutcome::Error {
+                        code: "scripted_unknown_setup".into(),
+                        message: "the scripted Setup answer has a kind this adapter cannot send"
+                            .into(),
+                    }
+                }
             }
         };
         response(answer)
@@ -285,7 +305,37 @@ fn render_native(message: &Value) -> Result<Vec<Value>, String> {
         _ => Err(format!("unhandled native role {role}")),
     }
 }
+/// `message` as stored: a tag number the runner rendered at the start of a text (`§N§ `) is
+/// not part of the stored message the translation looks for.
+fn without_rendered_tags(message: &Value) -> Value {
+    fn strip(text: &str) -> String {
+        let Some(rest) = text.strip_prefix('§') else {
+            return text.to_owned();
+        };
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        match rest[digits..].strip_prefix("§ ") {
+            Some(after) if digits > 0 => after.to_owned(),
+            _ => text.to_owned(),
+        }
+    }
+    let mut message = message.clone();
+    match &mut message["content"] {
+        Value::String(text) => *text = strip(text),
+        Value::Array(parts) => {
+            for part in parts {
+                if let Some(Value::String(text)) = part.get_mut("text") {
+                    *text = strip(text);
+                }
+            }
+        }
+        _ => {}
+    }
+    message
+}
+
 fn translate(state: &Session, wire: &[Value]) -> Result<Vec<ModelEntry>, String> {
+    let wire: Vec<Value> = wire.iter().map(without_rendered_tags).collect();
+    let wire = wire.as_slice();
     let candidates = state
         .replacements
         .iter()
@@ -426,6 +476,7 @@ fn settlement_records() -> Vec<broca_wal::FramedRecord> {
             stop_when: vec![],
             context_management: None,
             render_tags: false,
+            computed_tags: None,
             turn_directives_v1: None,
         }),
         input: Arc::new(vec![]),
@@ -634,10 +685,33 @@ impl BrocaSubject {
                     .map(
                         |call| cortexkit_role_llm_runner_conformance::CompactionCall {
                             request_id: call.request_id.clone(),
+                            setup_identity:
+                                cortexkit_role_llm_runner_conformance::CompactionSetupIdentity {
+                                    harness: call.setup_harness.clone(),
+                                    session: call.setup_session.clone(),
+                                },
+                            // A Setup that arrived on a route this provider never saw bound
+                            // reports an empty identity, which the kit refuses as a mismatch.
+                            route_identity: call.route_identity.as_ref().map_or(
+                                cortexkit_role_llm_runner_conformance::CompactionRouteIdentity {
+                                    harness: String::new(),
+                                    session: String::new(),
+                                    project_root: String::new(),
+                                },
+                                |bound| {
+                                    cortexkit_role_llm_runner_conformance::CompactionRouteIdentity {
+                                        harness: bound.harness.clone(),
+                                        session: bound.session.clone(),
+                                        project_root: bound.project_root.display().to_string(),
+                                    }
+                                },
+                            ),
                         },
                     )
                     .collect(),
                 model_inputs: state.inputs.clone(),
+                // Broca's host has no standalone Magic Context to hand a session to.
+                standalone_handoffs: 0,
             },
         )
     }
@@ -807,9 +881,35 @@ pub(super) fn catalog(request: &Value) -> Value {
     let composition = &args["composition"];
     let digest = cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap();
     let schema = json!({"type":"object"});
-    json!({"generation":"1","catalog_digest":"conformance","composition_digest":digest,
-        "tools":[{"name":SCRIPTED_TOOL,"schema_digest":cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
-            "semantics":1,"capabilities":[],"description":"Answers each call with its scripted result.","input_schema":schema}]})
+    // The scripted tool, unless the composition gives this provider no tools (a tool-free
+    // plan, which asks only for the system text below).
+    let tool_free = composition["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["provider"] == super::TOOL_MODULE)
+        .is_some_and(|entry| entry["tools"].as_array().is_some_and(Vec::is_empty));
+    let tools = if tool_free {
+        json!([])
+    } else {
+        json!([{"name":SCRIPTED_TOOL,"schema_digest":cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
+            "semantics":1,"capabilities":[],"description":"Answers each call with its scripted result.","input_schema":schema}])
+    };
+    let mut answer = json!({"generation":"1","catalog_digest":"conformance",
+        "composition_digest":digest,"tools":tools});
+    // A plan's system-text item names its session, so the system prompt carries the session
+    // marker the scripted model identifies the session by when the plan replaces `system`.
+    if let Some(session) = args["system_text"]["params"]["session"].as_str() {
+        let text = format!("{}{session}", super::SESSION_MARKER);
+        answer["system_text"] = json!({
+            "text": text,
+            "item_digest": cortexkit_role_tool_provider::catalog::system_text_digest(&text),
+            "preflight_digest": "conformance",
+            "composition_digest": digest,
+            "tool_names": if tool_free { json!([]) } else { json!([SCRIPTED_TOOL]) },
+        });
+    }
+    answer
 }
 
 #[test]

@@ -45,6 +45,8 @@ pub struct SessionReadRequest {
     pub lineage_id: Option<String>,
     /// The page's byte cap; `None` is the default cap.
     pub max_bytes: Option<u64>,
+    /// `descriptors` serves large payloads as refs and every entry's content identities.
+    pub media: cortexkit_role_llm_runner::read::MediaMode,
 }
 
 impl SessionReadRequest {
@@ -60,6 +62,7 @@ impl SessionReadRequest {
             after_mid: None,
             lineage_id: None,
             max_bytes: None,
+            media: cortexkit_role_llm_runner::read::MediaMode::Inline,
         }
     }
 }
@@ -350,10 +353,21 @@ fn resolve_in_page(
             .part_tags()?
             .tagged()
             .find(|(_, tag)| *tag == number)?;
-        let block = entry.message.content.get(index)?;
-        let stored = broca_protocol::tags::part_text(block);
+        // The part as every exposure shows it: the model's text cleaned where the run that
+        // wrote it cleans, any other part in its complete stored encoding.
+        let stored = broca_protocol::tags::exposed_part_text(&entry.message, index)?;
         Some(match broca_wire::resolve_range(&stored, params.range) {
             Some(text) => {
+                let descriptors =
+                    params.media == Some(cortexkit_role_llm_runner::read::MediaMode::Descriptors);
+                let content = descriptors.then(|| {
+                    broca_wire::describe_resolved_part(
+                        &entry.message,
+                        entry.ordinal,
+                        index,
+                        text.clone(),
+                    )
+                });
                 let mut reply = broca_wire::ResolveResponse::new(
                     &params.tag,
                     entry.ordinal,
@@ -361,6 +375,9 @@ fn resolve_in_page(
                     &row.part,
                     text,
                 );
+                if let Some(content) = content {
+                    reply.content = content;
+                }
                 reply.range = params.range;
                 Ok(reply)
             }
@@ -405,6 +422,9 @@ fn session_read_response(
                 message: message.message,
                 run: message.run,
                 tool_calls: Vec::new(),
+                described: None,
+                digest: None,
+                part_digests: None,
             })
             .collect(),
         next_from_ordinal: page.next_from_ordinal,
@@ -573,6 +593,9 @@ fn final_message_of(
             )
         })?;
     let ordinal = message.ordinal.unwrap_or(ordinal as u64);
+    // The text as every exposure shows it: cleaned when a tag-rendering run under the computed
+    // rules wrote it, raw for any other run and for a structured-output run's final text.
+    let message = broca_protocol::tags::exposed_message(message);
     let text: String = message
         .content
         .iter()
@@ -1383,12 +1406,21 @@ pub enum ServeError {
         code: &'static str,
         message: String,
     },
+    /// A template send whose `part_tag` slot names a part the transcript does not show, refused
+    /// `template_part_gone` with the slot named in its detail.
+    TemplatePartGone {
+        slot: String,
+    },
     /// A deterministic send identity was reused with a different frozen request field.
     SendIdReuse {
         differing: String,
     },
     /// Admission failed before durable start because a dependency is temporarily unavailable.
     Transient(String),
+    /// A read arrived while the session's running run waits for its compaction Setup answer,
+    /// which may anchor the run's tag numbers at a checkpoint. Refused `transient`, writing
+    /// nothing, so no reader sees a number that changes once the answer is durable.
+    TagsAwaitSetup,
     /// A durable cap receiver needs a fresh baseline before it can continue.
     BaselineRequired,
     /// The daemon's cap table was not configured.
@@ -1501,11 +1533,18 @@ impl std::fmt::Display for ServeError {
                 outcome,
             } => write!(f, "submission '{submission_id}' ended {outcome}"),
             ServeError::DeliveryRefused { message, .. } => f.write_str(message),
+            ServeError::TemplatePartGone { slot } => write!(
+                f,
+                "the template's {slot} slot names a part the transcript does not show"
+            ),
             ServeError::SendIdReuse { differing } => write!(
                 f,
                 "send_id was already used with different {differing}; retries must be byte-identical"
             ),
             ServeError::Transient(s) => write!(f, "transient admission failure: {s}"),
+            ServeError::TagsAwaitSetup => f.write_str(
+                "the running run's tag numbers wait for its compaction Setup answer; retry shortly",
+            ),
             ServeError::BaselineRequired => f.write_str("baseline_required"),
             ServeError::CapUnavailable(s) => write!(f, "cap table unavailable: {s}"),
             ServeError::BudgetDenied { cap_id, reason } => {
@@ -2294,6 +2333,7 @@ impl ServeHandler for crate::LineageRegistry {
             SendOutcome::DeliveryRefused { code, message, .. } => {
                 Err(ServeError::DeliveryRefused { code, message })
             }
+            SendOutcome::TemplatePartGone { slot } => Err(ServeError::TemplatePartGone { slot }),
             SendOutcome::SendIdReuse { differing } => Err(ServeError::SendIdReuse {
                 differing: differing.to_owned(),
             }),
@@ -2692,6 +2732,12 @@ impl ServeHandler for crate::LineageRegistry {
                 });
             }
         }
+        // A Setup answer may still anchor the running run's numbers at a checkpoint and change
+        // every number from its cut (llm-runner §9.6): until it is durable, refuse rather than
+        // show numbers a later read would contradict. The window lasts one Setup call.
+        if page.tags_await_setup {
+            return Err(ServeError::TagsAwaitSetup);
+        }
         if let (Some(after), Some(mid)) = (after, &req.after_mid) {
             if !after.is_some_and(|ordinal| ordinal < page.prompt_len) {
                 return Err(ServeError::UnknownMid(mid.clone()));
@@ -2752,6 +2798,21 @@ impl ServeHandler for crate::LineageRegistry {
         }
         self.attribute_tool_calls(&req.session, &mut response, &dispatches, prompt_len)
             .await?;
+        if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
+            for entry in &mut response.messages {
+                // Only structure that is not payload can outgrow the per-message budget.
+                if let Err(ordinal) = entry.describe() {
+                    return Err(ServeError::ReplyTooLarge(ReplyTooLargeDetail::new(
+                        json_bytes(entry),
+                        cortexkit_role_llm_runner::read::descriptors::DESCRIPTOR_MESSAGE_MAX as u64,
+                        ReplyTooLargeSubject::Message {
+                            session: req.session.session.clone(),
+                            ordinal,
+                        },
+                    )));
+                }
+            }
+        }
         cap_page_bytes(
             &mut response,
             cap,

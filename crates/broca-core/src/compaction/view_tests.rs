@@ -221,7 +221,9 @@ async fn mismatched_views_are_never_applied() {
         };
         let mut live = state.clone();
         let (decision, event) = runtime
-            .offer_view(&mut live, &view, &ready, LINEAGE, &prompt, &prompt, true)
+            .offer_view(
+                &mut live, &view, &ready, LINEAGE, &prompt, &prompt, true, false,
+            )
             .await
             .unwrap();
         assert_eq!(decision, expected, "{label}");
@@ -369,7 +371,7 @@ async fn apply_over(
         control: &control,
     };
     let (decision, _) = runtime
-        .offer_view(state, view, ready, LINEAGE, prompt, stored, true)
+        .offer_view(state, view, ready, LINEAGE, prompt, stored, true, false)
         .await
         .unwrap();
     writer.shutdown().await.unwrap();
@@ -859,9 +861,10 @@ async fn a_change_only_in_rendered_bytes_still_strips_the_reasoning_after_it() {
         .all(|message| !message.content.iter().any(is_prefix_bound)));
 }
 
-/// User text after the tool results (a steer delivered at the boundary) does not
-/// close the open tool turn. A view that would invalidate that turn's reasoning is deferred,
-/// not applied with a strip of the reasoning the continuation needs.
+/// User text after the tool results (a steer delivered at the boundary) does not close the
+/// open tool turn. A view that would invalidate that turn's reasoning is deferred, not applied
+/// with a strip of the reasoning the continuation needs: a steer continues the running run, so
+/// it does not end a deferral (compaction-provider §7).
 #[test]
 fn a_steer_after_the_tool_results_keeps_the_turn_open() {
     let prompt = stamped(vec![
@@ -888,6 +891,92 @@ fn a_steer_after_the_tool_results_keeps_the_turn_open() {
             &prompt,
             true
         ),
+        Decision::Defer(defer_reasons::SIGNED_REASONING)
+    );
+}
+
+/// broca's Setup lists no view `apply` marks, so a view carrying one (even `next_step`, which
+/// this crate defines) is refused `unsupported_apply` (compaction-provider §7), never applied;
+/// the same view unmarked applies.
+#[test]
+fn a_view_with_an_apply_mark_broca_did_not_list_is_refused() {
+    let summary = replace_bytes(&[text(Role::User, "summary")]);
+    let (view, _) = make_view(
+        2,
+        5,
+        vec![ViewRange::replace(0, 0, summary), ViewRange::keep(0, 6)],
+    );
+    let prompt = conversation();
+    let state = after_setup();
+    let marked = view
+        .clone()
+        .with_apply(crate::compaction_provider::view::apply_marks::NEXT_STEP);
+    let marked_ready = ViewReady::for_view(&marked);
+    let refused = decide(
+        &marked,
+        &marked_ready,
+        &state,
+        LINEAGE,
+        &prompt,
+        &prompt,
+        false,
+    );
+    assert_eq!(
+        refused,
+        Decision::Refuse(refusal_reasons::UNSUPPORTED_APPLY)
+    );
+    assert_eq!(
+        refused.event(2).unwrap().token(),
+        "view_refused:2:unsupported_apply"
+    );
+    let ready = ViewReady::for_view(&view);
+    assert_eq!(
+        decide(&view, &ready, &state, LINEAGE, &prompt, &prompt, false),
+        Decision::Apply(CompactionViewChoice::Applied)
+    );
+}
+
+/// A view deferred over the open tool turn when a run ends stays deferred at no later step: at
+/// the first step of the session's next run it is refused for the provider's constraint
+/// (compaction-provider §7), whatever the request ends with, and the same request inside a run
+/// still defers it.
+#[test]
+fn a_deferral_pending_at_a_run_end_ends_at_the_next_runs_first_step() {
+    let summary = replace_bytes(&[text(Role::User, "summary")]);
+    let (view, ready) = make_view(
+        2,
+        5,
+        vec![ViewRange::replace(0, 0, summary), ViewRange::keep(0, 6)],
+    );
+    let state = after_setup();
+    // The run ended after the open turn's results, its view deferred.
+    let mut ended = conversation();
+    ended.truncate(4);
+    ended.push(assistant(vec![signed("answer"), call("b")]));
+    ended.push(Message::new(Role::Tool, vec![result("b")]));
+    let ended = stamped(ended);
+    assert_eq!(
+        decide_at(&view, &ready, &state, LINEAGE, &ended, &ended, true, false),
+        Decision::Defer(defer_reasons::SIGNED_REASONING)
+    );
+    // The next run's prompt joins the transcript; its first step ends the deferral.
+    let mut next_run = ended.clone();
+    next_run.push(text(Role::User, "next prompt"));
+    let next_run = stamped(next_run);
+    let refused = decide_at(
+        &view, &ready, &state, LINEAGE, &next_run, &next_run, true, true,
+    );
+    assert_eq!(
+        refused,
+        Decision::Refuse(refusal_reasons::PROVIDER_CONSTRAINT)
+    );
+    assert_eq!(
+        refused.event(2).unwrap().token(),
+        "view_refused:2:provider_constraint"
+    );
+    // The same request at a later step of a run (a steer, say) keeps deferring.
+    assert_eq!(
+        decide_at(&view, &ready, &state, LINEAGE, &next_run, &next_run, true, false),
         Decision::Defer(defer_reasons::SIGNED_REASONING)
     );
 }

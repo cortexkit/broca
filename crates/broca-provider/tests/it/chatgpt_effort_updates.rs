@@ -48,6 +48,7 @@ fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRe
         config: Box::new(RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: ModelHandle::new("chatgpt", model),
             tools: vec![].into(),
             tool_choice: Default::default(),

@@ -54,6 +54,7 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
                 config: Box::new(RunConfig {
                     turn_directives_v1: None,
                     render_tags: false,
+                    computed_tags: None,
                     model: ModelHandle::new("import", "import"),
                     tools: Vec::new().into(),
                     tool_choice: Default::default(),

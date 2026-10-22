@@ -1660,6 +1660,7 @@ fn min_config() -> RunConfig {
     RunConfig {
         turn_directives_v1: None,
         render_tags: false,
+        computed_tags: None,
         model: ModelHandle::new("stub", "stub-model"),
         tools: vec![tool("lookup")].into(),
         tool_choice: ToolChoice::Auto,
@@ -1748,6 +1749,7 @@ fn read_request(
         after_mid: None,
         lineage_id: None,
         max_bytes: None,
+        media: Default::default(),
     }
 }
 

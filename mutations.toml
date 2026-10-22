@@ -5865,6 +5865,7 @@ new = "!= Some(false) // NON-VACUITY BREAK\n                }),"
 # An ordered send keeps its title on its pending queue entry, and the run that entry starts
 # records it on its `run_started` and on its run-index row. The break drops the title from the
 # ordered entry only; plain queued and direct sends keep theirs.
+
 [[control]]
 id = "ordered-send-run-index-title"
 guards = "a run an ordered idle_start send starts indexes the title its run_started records"
@@ -22978,3 +22979,238 @@ expect_red = [
 file = "crates/broca-catalog/src/runtime.rs"
 old = "            CapabilityFlag::Absent => CapabilityFlag::Unknown,"
 new = "            CapabilityFlag::Absent => CapabilityFlag::Absent, // NON-VACUITY BREAK: absent reasoning admits as false again."
+
+[[control]]
+id = "tags-switch-counts-on-from-the-ledger-high-water"
+guards = "The first run under the computed tag rules starts above every number the stored ledger handed out, so no number a reader saw is reused"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
+expect_red = ["runner_tags_v1_pin::the_first_run_after_the_switch_counts_on_from_the_stored_high_water"]
+file = "crates/broca-core/src/run.rs"
+old = "                checkpoint: ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)),"
+new = "                checkpoint: 0 * ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)), // NON-VACUITY BREAK: forget the ledger's high-water."
+
+[[control]]
+id = "tags-run-in-flight-keeps-the-stored-ledger"
+guards = "A run frozen under runner-tags/v1 resumes with its old numbering and exact old request bytes"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
+expect_red = ["runner_tags_v1_pin::a_session_written_under_the_stored_ledger_keeps_its_exact_bytes"]
+file = "crates/broca-core/src/run.rs"
+old = "            config.and_then(|config| config.computed_tags),"
+new = "            Some(broca_wal::ComputedTagRules { checkpoint: 0 }), // NON-VACUITY BREAK: resume a ledger run under the computed rules."
+
+[[control]]
+id = "tags-only-parts-rendered-with-a-number-count"
+guards = "Reasoning, tool calls, empty text and JSON tool output never take a tag number"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::computed_numbering_counts_only_parts_rendered_with_a_number"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "        ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => {\n            PartKind::Reasoning"
+new = "        ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => {\n            PartKind::AssistantText // NON-VACUITY BREAK: count reasoning as the model's text."
+
+[[control]]
+id = "tags-image-only-result-renders-its-label"
+guards = "An image-only tool result renders as its number and the [image] label"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::computed_rendering_numbers_cleans_and_labels"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "                        *text = cortexkit_role_llm_runner::tags::image_label(number);"
+new = "                        *text = cortexkit_role_llm_runner::tags::render_counted_text(number, text); // NON-VACUITY BREAK: render the placeholder text."
+
+[[control]]
+id = "tags-setup-checkpoint-anchors-its-cut"
+guards = "A compaction provider's Setup checkpoint numbers the cut message and later ones after the checkpoint"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+only = false
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::a_setup_checkpoint_renumbers_from_its_cut", "tags::tests::a_crash_after_setup_replays_the_anchored_numbers"]
+file = "crates/broca-core/src/tags.rs"
+old = "            .max(anchor);"
+new = "            .max(anchor * 0); // NON-VACUITY BREAK: ignore the checkpoint's number."
+
+[[control]]
+id = "tags-marker-checkpoint-wins-over-setup"
+guards = "An in-effect marker carrying a checkpoint takes precedence over the Setup checkpoint"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::an_in_effect_marker_checkpoint_wins_over_the_setup_checkpoint"]
+file = "crates/broca-core/src/tags.rs"
+old = "            cortexkit_role_llm_runner::tags::anchor(session, markers, Some(&setup), |cut| {"
+new = "            cortexkit_role_llm_runner::tags::anchor(session, &markers[..0], Some(&setup), |cut| { // NON-VACUITY BREAK: drop the markers."
+
+[[control]]
+id = "tags-structured-final-text-is-never-cleaned"
+guards = "A final_text structured-output run's text is exposed raw, whatever its plan renders"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::only_a_tag_rendering_run_that_is_not_final_text_output_cleans"]
+file = "crates/broca-core/src/tags.rs"
+old = "        clean: render_tags && !structured_final_text(frozen_render_config),"
+new = "        clean: render_tags || structured_final_text(frozen_render_config), // NON-VACUITY BREAK: clean structured output."
+
+[[control]]
+id = "tags-setup-checkpoint-is-must-understand"
+guards = "A Setup record carrying a tag checkpoint requires runner-tags/v2, so an older reader refuses it"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/tags.rs"
+expect_red = ["tags::tests::a_crash_after_setup_replays_the_anchored_numbers"]
+file = "crates/broca-wal/src/record.rs"
+old = "            WalRecord::CompactionMessage { tag_checkpoint, .. } => tag_checkpoint.is_some(),"
+new = "            WalRecord::CompactionMessage { tag_checkpoint, .. } => tag_checkpoint.is_none() && false, // NON-VACUITY BREAK: write the checkpoint ungated."
+
+[[control]]
+id = "read-cleans-model-text-where-its-run-cleans"
+guards = "session.read serves the model's text cleaned of tag notation for a tag-rendering run, stored text staying raw"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::a_read_cleans_the_model_text_only_where_its_run_cleans"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    let exposed = broca_protocol::tags::exposed_message(message);"
+new = "    let exposed = std::borrow::Cow::Borrowed(message); // NON-VACUITY BREAK: serve raw model text."
+
+[[control]]
+id = "resolve-answers-the-cleaned-model-text"
+guards = "session.resolve answers the model's text as exposed, cleaned where its run cleans"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve/read_page_tests.rs"
+expect_red = ["serve::read_page_tests::resolve_answers_the_cleaned_model_text"]
+file = "crates/broca-module/src/serve.rs"
+old = "        let stored = broca_protocol::tags::exposed_part_text(&entry.message, index)?;"
+new = "        let stored = broca_protocol::tags::part_text(entry.message.content.get(index)?); // NON-VACUITY BREAK: answer the raw text."
+
+[[control]]
+id = "read-descriptors-replace-large-payloads"
+guards = "A descriptors read replaces a payload over the inline threshold by a ref in place"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::a_descriptors_read_describes_large_payloads_in_place_with_inline_identities"]
+file = "crates/broca-wire/src/lib.rs"
+old = "                    self.described = Some(described);"
+new = "                    let _ = described; // NON-VACUITY BREAK: serve the inline message."
+
+[[control]]
+id = "compaction-deferral-ends-at-the-next-runs-first-step"
+guards = "A view deferred for signed reasoning is refused, never deferred again, at the first step of the session's next run, and a step inside a run keeps deferring"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::a_deferral_pending_at_a_run_end_ends_at_the_next_runs_first_step"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "        if run_start {"
+new = "        if false && run_start { // NON-VACUITY BREAK: keep deferring past the next run's first step."
+
+[[control]]
+id = "template-part-tag-names-a-shown-part"
+guards = "A part_tag slot renders only the number the part its {mid, part} names shows"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::shown_number_tests::a_part_tag_names_the_number_its_part_shows"]
+file = "crates/broca-module/src/actor.rs"
+old = "    if key_message != part.mid {"
+new = "    if key_message != part.mid && false { // NON-VACUITY BREAK: accept a part key of another message."
+
+[[control]]
+id = "tags-numbering-past-u64-max-is-refused"
+guards = "Tag numbering that would pass u64::MAX is refused with NumberingOverflow, never saturated into a repeated number"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::numbering_past_u64_max_is_refused_never_repeated"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "    let numbers = cortexkit_role_llm_runner::tags::try_number_parts(base, &rendered)?;"
+new = "    #[allow(deprecated)] let numbers = cortexkit_role_llm_runner::tags::number_parts(base, &rendered); // NON-VACUITY BREAK: saturate instead of refusing."
+
+[[control]]
+id = "compaction-view-unlisted-apply-mark-refused"
+guards = "A view carrying an apply mark broca's Setup did not list is refused unsupported_apply, never applied"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::a_view_with_an_apply_mark_broca_did_not_list_is_refused"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "    if view.apply.is_some() {"
+new = "    if view.apply.is_some() && false { // NON-VACUITY BREAK: honour any apply mark."
+
+[[control]]
+id = "read-refused-while-tags-await-setup"
+guards = "While a tag-rendering run waits for its compaction Setup answer, session.read and session.resolve refuse transient, so no number shown is later renumbered by a Setup checkpoint"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/compaction.rs"
+expect_red = ["compaction::reads_wait_out_the_setup_answer_and_never_show_a_number_that_changes"]
+file = "crates/broca-module/src/serve.rs"
+old = "        if page.tags_await_setup {"
+new = "        if page.tags_await_setup && false { // NON-VACUITY BREAK: serve numbers a Setup checkpoint may change."
+
+[[control]]
+id = "replay-flags-a-run-awaiting-its-setup-answer"
+guards = "Replay marks a running tag-rendering run on a compaction session with no recorded Setup answer, which the read path refuses"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/compaction.rs"
+expect_red = ["compaction::reads_wait_out_the_setup_answer_and_never_show_a_number_that_changes"]
+file = "crates/broca-core/src/replay.rs"
+old = "        && compaction.state().is_none()"
+new = "        && compaction.state().is_some() // NON-VACUITY BREAK: never flag the Setup window."
+
+[[control]]
+id = "read-default-shape-adds-no-member"
+guards = "A default inline session.read adds no member to an entry, its message or a block; digests appear only on an opt-in descriptors read"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::the_default_read_shape_has_exactly_the_members_it_always_had"]
+file = "crates/broca-wire/src/lib.rs"
+old = "            #[serde(skip_serializing_if = \"Option::is_none\")]\n            digest: &'a Option<String>,"
+new = "            digest: &'a Option<String>, // NON-VACUITY BREAK: always serve a digest member."

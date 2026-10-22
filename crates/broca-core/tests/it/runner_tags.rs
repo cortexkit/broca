@@ -1,7 +1,7 @@
-//! Runner tags through a real run. The writer tags every part as it appends the record, and a
-//! run frozen with `render_tags` shows the tags of user and tool-result text to the model.
-//! Replaying the WAL rebuilds each request the run sent, with the same rendered tags, byte for
-//! byte.
+//! Runner tags through a real run under the computed rules (`runner-tags/v2`). No record stores
+//! a number: the transcript's counted parts are numbered in the order a request renders them,
+//! and only a run frozen with `render_tags` numbers and shows them. Replaying the WAL rebuilds
+//! each request the run sent, with the same rendered numbers, byte for byte.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -211,35 +211,68 @@ fn replayed_prompt(records: &[FramedRecord], nth: usize) -> Vec<Message> {
     prompt
 }
 
+/// The numbers the replayed transcript shows, part by part, in transcript order.
+fn transcript_numbers(records: &[FramedRecord]) -> Vec<Vec<Option<u64>>> {
+    let records: Vec<WalRecord> = records.iter().map(|frame| frame.record.clone()).collect();
+    replay(&records)
+        .unwrap()
+        .prompt
+        .iter()
+        .map(|message| {
+            message
+                .part_tags()
+                .expect("every part of a run under the computed rules has a row")
+                .parts
+                .clone()
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn a_tag_rendering_run_shows_user_and_tool_tags_and_replay_rebuilds_the_same_request() {
+async fn a_tag_rendering_run_numbers_counted_parts_in_rendered_order_and_replay_rebuilds_the_same_request(
+) {
     let run = run("render-on", true).await;
-    let tags = wal_tags(&run.records);
-    assert_eq!(tags, (1..=tags.len() as u64).collect::<Vec<_>>());
+    // Nothing is stored: the numbers are computed from the transcript.
+    assert!(wal_tags(&run.records).is_empty());
     assert!(run.records.iter().any(|frame| matches!(
         &frame.record,
-        WalRecord::RunStarted { config, .. } if config.render_tags
+        WalRecord::RunStarted { config, .. }
+            if config.render_tags && config.computed_tags.is_some()
     )));
+    assert!(run.records.iter().any(|frame| frame
+        .record
+        .required_features()
+        .contains(&broca_wal::framing::RUNNER_TAGS_V2_FEATURE)));
+    // The prompt, the model's text (its call not counted), the result, the final answer.
+    assert_eq!(
+        transcript_numbers(&run.records),
+        vec![
+            vec![Some(1)],
+            vec![Some(2), None],
+            vec![Some(3)],
+            vec![Some(4)],
+        ]
+    );
 
     assert_eq!(run.calls.len(), 2);
     assert_eq!(
         texts(&run.calls[0].prompt),
         vec![(Role::User, vec!["§1§ find the tags".to_owned()])]
     );
-    // The assistant's text and call (tags 2 and 3) are never rendered; the result (4) is.
+    // The model's own text shows its number on every family; the call never does.
     assert_eq!(
         texts(&run.calls[1].prompt),
         vec![
             (Role::User, vec!["§1§ find the tags".to_owned()]),
             (
                 Role::Assistant,
-                vec!["looking".to_owned(), "{\"q\":\"tags\"}".to_owned()]
+                vec!["§2§ looking".to_owned(), "{\"q\":\"tags\"}".to_owned()]
             ),
-            (Role::Tool, vec!["§4§ two hits".to_owned()]),
+            (Role::Tool, vec!["§3§ two hits".to_owned()]),
         ]
     );
 
-    // A resume renders from the WAL: the same tags, rendered the same way, give the same
+    // A resume renders from the WAL: the same numbers, rendered the same way, give the same
     // request the live run sent, so the provider's cached prefix still matches.
     for (nth, sent) in run.calls.iter().enumerate() {
         let mut rebuilt = replayed_prompt(&run.records, nth);
@@ -256,15 +289,18 @@ async fn a_tag_rendering_run_shows_user_and_tool_tags_and_replay_rebuilds_the_sa
 }
 
 #[tokio::test]
-async fn a_run_without_render_tags_still_tags_every_part_but_sends_the_text_unchanged() {
+async fn a_run_without_render_tags_numbers_nothing_and_sends_the_text_unchanged() {
     let run = run("render-off", false).await;
-    let tags = wal_tags(&run.records);
-    assert_eq!(tags, (1..=tags.len() as u64).collect::<Vec<_>>());
-    assert!(!tags.is_empty());
+    assert!(wal_tags(&run.records).is_empty());
     assert!(run.records.iter().all(|frame| !matches!(
         &frame.record,
         WalRecord::RunStarted { config, .. } if config.render_tags
     )));
+    // Every part keeps a row and a key, and none shows a number.
+    assert_eq!(
+        transcript_numbers(&run.records),
+        vec![vec![None], vec![None, None], vec![None], vec![None]]
+    );
     assert_eq!(
         texts(&run.calls[1].prompt),
         vec![

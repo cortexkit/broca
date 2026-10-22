@@ -440,6 +440,7 @@ mod tests {
                     config: Box::new(RunConfig {
                         turn_directives_v1: None,
                         render_tags: false,
+                        computed_tags: None,
                         model: broca_protocol::ModelHandle::new("stub", "m"),
                         tools: vec![].into(),
                         tool_choice: broca_protocol::ToolChoice::Auto,
@@ -779,6 +780,7 @@ mod identity_tests {
                 config: Box::new(broca_wal::RunConfig {
                     turn_directives_v1: None,
                     render_tags: false,
+                    computed_tags: None,
                     model: broca_protocol::ModelHandle::new("stub", "m"),
                     tools: vec![].into(),
                     tool_choice: broca_protocol::ToolChoice::Auto,

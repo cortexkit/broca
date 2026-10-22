@@ -173,6 +173,7 @@ pub fn read_session_model_page(
         None,
         snapshot.prefix_len,
         false,
+        snapshot.tag_seed,
     )?;
     raw.extend(tail_state.prompt);
     let has_compaction_plan = tail.iter().any(|frame| match &frame.record {

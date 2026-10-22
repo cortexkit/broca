@@ -886,6 +886,11 @@ pub enum WalRecord {
         /// dropped it would let the session run past its ceiling.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ceiling: Option<OpaqueJson>,
+        /// The Setup answer's tag checkpoint, on a Setup record of a session the provider moved
+        /// from standalone Magic Context. Must-understand (feature `runner-tags/v2`): a reader
+        /// that dropped it would number the session from the wrong anchor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag_checkpoint: Option<SetupTagCheckpoint>,
     },
     /// Every other step outcome and the cursor it moves, in one durable frame. A wait
     /// answer is itself the wait entry, with the reason and bound in the same record.
@@ -1326,6 +1331,16 @@ impl WalRecord {
         };
         let base = if self.carries_runner_tags() {
             with_feature(base, crate::framing::RUNNER_TAGS_FEATURE)
+        } else {
+            base
+        };
+        let computed_tags = match self {
+            WalRecord::RunStarted { config, .. } => config.computed_tags.is_some(),
+            WalRecord::CompactionMessage { tag_checkpoint, .. } => tag_checkpoint.is_some(),
+            _ => false,
+        };
+        let base = if computed_tags {
+            with_feature(base, crate::framing::RUNNER_TAGS_V2_FEATURE)
         } else {
             base
         };
@@ -2223,6 +2238,32 @@ pub struct RunConfig {
     /// `runner-tags/v1`): a reader that ignored it would render different request bytes.
     #[serde(default, skip_serializing_if = "is_false")]
     pub render_tags: bool,
+    /// Present when the run was frozen under the computed tag rules (feature `runner-tags/v2`):
+    /// no record of the run stores a tag number; numbers are computed from the transcript, and
+    /// only when `render_tags` is on. Absent on a run frozen under the stored-ledger rules
+    /// (`runner-tags/v1`), whose records keep stamping a number per part for the rest of the
+    /// run. Must-understand when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computed_tags: Option<ComputedTagRules>,
+}
+
+/// A run's frozen computed tag rules (`runner-tags/v2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputedTagRules {
+    /// The highest number the session had shown, or handed out under the stored ledger, when
+    /// the run was admitted: the run's first counted part is numbered after it. On the first
+    /// run under these rules this is the stored ledger's high-water, so no number a reader
+    /// has seen is reused or changed.
+    pub checkpoint: u64,
+}
+
+/// A compaction provider's Setup checkpoint (llm-runner `tags::SetupCheckpoint`), recorded with
+/// the Setup answer it came on: the message `cut` (`m<ordinal>`) and every later one are
+/// numbered after `tag_checkpoint`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupTagCheckpoint {
+    pub tag_checkpoint: u64,
+    pub cut: String,
 }
 
 /// The credential a run resolved at start, frozen for resume. A struct (not a bare string)
@@ -2624,6 +2665,7 @@ mod schema_tests {
         let config = RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: ModelHandle::new("p", "m"),
             tools: Arc::new(vec![Tool {
                 name: "edit".into(),
@@ -2734,6 +2776,7 @@ mod schema_tests {
         Box::new(RunConfig {
             turn_directives_v1: None,
             render_tags: false,
+            computed_tags: None,
             model: ModelHandle::new("p", "m"),
             tools: vec![].into(),
             tool_choice: ToolChoice::Auto,

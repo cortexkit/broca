@@ -334,6 +334,9 @@ pub fn broca_role_describe_with_writers(
     .to_vec();
     if compaction_writer {
         capabilities.extend(["compaction".into(), "model_view".into()]);
+        // A compaction provider's Setup checkpoint for a session moved from standalone Magic
+        // Context (as `ck-import` moves OpenCode sessions) anchors the session's tag numbers.
+        capabilities.push(cortexkit_role_llm_runner::capabilities::TAG_CHECKPOINT.into());
     }
     if hook_writer {
         capabilities.push(cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES.into());
@@ -1048,7 +1051,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "a3d317332850104102b89fbd5d4c6854ddee5154822870a9c83a691b37a2de01";
+        "0e948a898888a1e57d8419e13b6eab4ac49186749c7087c18cef5ab2eb4c7cfd";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =
