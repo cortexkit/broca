@@ -23573,8 +23573,8 @@ expect_red = ["serve::tests::a_panicking_request_does_not_end_the_connection"]
 # confines a task failure that escapes. The break removes both.
 [[control.edits]]
 file = "crates/broca-module-serve/src/serve.rs"
-old = "        Ok(result) => result,\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
-new = "        Ok(result) => result,\n        Err(()) if true => panic!(\"request task panicked\"), // NON-VACUITY BREAK: let the panic escape the task.\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
+old = "        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,\n                \"route request task panicked; answering it with a transient refusal\""
+new = "        Err(()) if true => panic!(\"request task panicked\"), // NON-VACUITY BREAK: let the panic escape the task.\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,\n                \"route request task panicked; answering it with a transient refusal\""
 [[control.edits]]
 file = "crates/broca-module-serve/src/serve.rs"
 old = "                    Err(e) => tracing::error!(\n                        target: \"wire.ingress\",\n                        \"route request task failed; dropping only that request: {e}\"\n                    ),"
@@ -23661,8 +23661,8 @@ test_file = "crates/broca-module-serve/src/serve.rs"
 expect_red = ["serve::tests::a_panicking_request_does_not_end_the_connection"]
 expect_message = "the panicked request must be answered on its own correlation"
 file = "crates/broca-module-serve/src/serve.rs"
-old = "        Ok(result) => result,\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
-new = "        Ok(result) => result,\n        Err(_) if true => Ok(()), // NON-VACUITY BREAK: leave the panicked request unanswered.\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,"
+old = "        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,\n                \"route request task panicked; answering it with a transient refusal\""
+new = "        Err(_) if true => Ok(()), // NON-VACUITY BREAK: leave the panicked request unanswered.\n        Err(_) => {\n            tracing::error!(\n                target: \"wire.ingress\",\n                channel, epoch, corr,\n                \"route request task panicked; answering it with a transient refusal\""
 
 [[control]]
 id = "actor-checks-plan-model-against-inherited-model"
@@ -23691,3 +23691,17 @@ expect_message = "a model-less steer resending a plan that names the session's o
 file = "crates/broca-module-serve/src/serve.rs"
 old = "                        if model_inherited {\n                            None\n                        } else {"
 new = "                        if false && model_inherited { // NON-VACUITY BREAK: check the placeholder model.\n                            None\n                        } else {"
+
+[[control]]
+id = "serve-request-panic-after-reply-sends-nothing"
+guards = "A route request that panics after its terminal reply went out is not answered a second time, so no orphan terminal reaches a correlation the daemon may reuse"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::a_request_that_panics_after_replying_sends_one_terminal"]
+expect_message = "a request answers once: no second terminal after its reply"
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        Err(_) if terminal_sent.load(Ordering::SeqCst) => {"
+new = "        Err(_) if false && terminal_sent.load(Ordering::SeqCst) => { // NON-VACUITY BREAK: answer a panic even after the reply."

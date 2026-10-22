@@ -1798,6 +1798,19 @@ async fn catch_panic<F: std::future::Future>(task: F) -> Result<F::Output, ()> {
     .await
 }
 
+tokio::task_local! {
+    /// Whether the route request running in this task has claimed its terminal: started to
+    /// write its Response or Error, or handed a subscription stream's terminal to the forward
+    /// task. Set only by [`mark_terminal_sent`]; read by [`reply_on_panic`].
+    static TERMINAL_SENT: Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Record that the current route request has claimed its terminal. Outside a request task
+/// (frame-loop control replies, health, binds) there is nothing to record.
+fn mark_terminal_sent() {
+    let _ = TERMINAL_SENT.try_with(|sent| sent.store(true, Ordering::SeqCst));
+}
+
 /// The fixed refusal message used when a route request task or a bind's adoption check panics.
 /// A panic payload can carry arbitrary internal state, so it is never reported.
 const REQUEST_PANICKED_MESSAGE: &str = "the request failed inside broca before it was answered";
@@ -1814,8 +1827,21 @@ async fn reply_on_panic<F>(
 where
     F: std::future::Future<Output = Result<(), ServeIoError>>,
 {
+    let terminal_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = TERMINAL_SENT.scope(Arc::clone(&terminal_sent), task);
     match catch_panic(task).await {
         Ok(result) => result,
+        // A request answers once. Once its terminal has been claimed (written, or delegated to
+        // a stream's forward task), a second answer could become an orphan the daemon forwards
+        // anyway, possibly onto a newer request that reuses the correlation on this channel.
+        Err(_) if terminal_sent.load(Ordering::SeqCst) => {
+            tracing::error!(
+                target: "wire.ingress",
+                channel, epoch, corr,
+                "route request task panicked after its reply went out; sending nothing more"
+            );
+            Ok(())
+        }
         Err(_) => {
             tracing::error!(
                 target: "wire.ingress",
@@ -3233,6 +3259,9 @@ where
     if cancel.is_cancelled() {
         return Ok(());
     }
+    // From here the forward task owns this request's terminal (its StreamEnd or stream Error),
+    // so the request task must not answer it again.
+    mark_terminal_sent();
 
     // Forward task: Delivery → StreamData (control=Interactive, display=Background lane
     // labels) until the stream ends, then StreamEnd. A session subscription is
@@ -4174,6 +4203,12 @@ async fn send_error_bytes(
 
 async fn send(writer: &EgressSender<Frame>, frame: Frame) -> Result<(), ServeIoError> {
     let _phase = stall::enter(Phase::EgressSend).await;
+    // Every Response and Error a request writes passes here, so this is where the request's
+    // terminal is recorded. It is recorded before the frame is handed off: once ownership
+    // leaves this task the frame may reach the daemon.
+    if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
+        mark_terminal_sent();
+    }
     writer
         .send(frame)
         .await
@@ -7072,6 +7107,42 @@ mod tests {
             "the WAL presence probe must not run on the runtime worker"
         );
         serve.abort();
+    }
+
+    /// A request that has already sent its reply and then panics is not answered again: the
+    /// daemon sees exactly one terminal frame for the correlation, never an orphan Error that
+    /// could land on a newer request reusing it.
+    #[tokio::test]
+    async fn a_request_that_panics_after_replying_sends_one_terminal() {
+        let (writer, mut written) =
+            broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
+        let task_writer = writer.clone();
+        let result = reply_on_panic(writer, (PROTOCOL_VERSION, 7, 1, 3), async move {
+            send_json_response(
+                &task_writer,
+                PROTOCOL_VERSION,
+                7,
+                1,
+                3,
+                &serde_json::json!({"ok": true}),
+            )
+            .await?;
+            if true {
+                panic!("a bug after the reply");
+            }
+            Ok(())
+        })
+        .await;
+        assert!(result.is_ok());
+        let reply = next_written(&mut written).await;
+        assert_eq!(
+            (reply.header.ty, reply.header.corr),
+            (FrameType::Response, 3)
+        );
+        assert!(
+            written.try_recv().is_err(),
+            "a request answers once: no second terminal after its reply"
+        );
     }
 
     /// A panic inside one request's task is confined to that request: the request is answered
