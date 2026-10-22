@@ -29,6 +29,7 @@ fn assert_refused(records: &[WalRecord]) {
             "replay forgot an unresolved dispatch intent: {:?}",
             state.resolution
         ),
+        Err(other) => panic!("refused for the wrong reason: {other}"),
     }
 }
 

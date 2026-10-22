@@ -62,6 +62,14 @@ fn scan(state_root: &Path) -> Result<Report, WalError> {
                     .or_default()
                     .push(address);
             }
+            // Tag numbering that would overflow is also a refusal, grouped under its own reason.
+            Err(error @ ReplayError::TagNumbering(_)) => {
+                report
+                    .other_refusals
+                    .entry(error.to_string())
+                    .or_default()
+                    .push(address);
+            }
         }
     }
     Ok(report)
@@ -168,6 +176,7 @@ mod tests {
             config: Box::new(RunConfig {
                 turn_directives_v1: None,
                 render_tags: false,
+                computed_tags: None,
                 model: ModelHandle::new("stub", "m"),
                 tools: vec![].into(),
                 tool_choice: Default::default(),
