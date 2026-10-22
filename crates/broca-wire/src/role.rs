@@ -139,6 +139,20 @@ pub struct HeadResponse {
     /// The ordinal of the newest message; absent on an empty transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_ordinal: Option<u64>,
+    /// The current lineage's first ordinal (llm-runner 0.5.0 §4.3, §4.5). Present whenever
+    /// `lineage_id` is. broca never applies a compaction view that carries a cut (it refuses
+    /// such a view `cut_unsupported`), so its lineage always starts at ordinal 0 and the answer
+    /// never carries a `cut`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_ordinal: Option<u64>,
+    /// The version of the session's visible history (llm-runner 0.5.0 §4.3). Present whenever
+    /// `lineage_id` is. Always 0: within one WAL broca has no revert and no recovery that
+    /// rewrites a written message, so nothing it has served is ever taken back or changed (an
+    /// append does not move the version). A session
+    /// whose WAL was deleted and later written again is the one case this misstates; see
+    /// `.cortexkit/internal-docs/designs/lineage-and-history-0.5.md`, "history_version floor".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_version: Option<u64>,
     /// The last durable control unit, the same cursor a `session.read` page carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<CursorWire>,
@@ -154,6 +168,21 @@ pub struct HeadResponse {
     /// steer, whichever the WAL holds last). Absent, never empty, when no send carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// What a send that names no model can carry (llm-runner 0.5.1 §4.3). A send's prompt is
+    /// text only, so broca states `attachments: "no"` on every answer, a never-written
+    /// session's included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<cortexkit_role_llm_runner::read::HeadInput>,
+}
+
+/// `session.head.input` as broca states it: a send's prompt is text (`prompt` or text
+/// `prompt_blocks`) and broca's message schema has no image, document or file block, so no send
+/// can carry an attachment. That is a known fact, so it is `no`, not `unknown` (llm-runner 0.5.1
+/// §4.3). Modalities and MIME types are left out: with no attachments they say nothing more.
+pub fn head_input() -> cortexkit_role_llm_runner::read::HeadInput {
+    cortexkit_role_llm_runner::read::HeadInput::new(
+        cortexkit_role_llm_runner::read::attachments::NO,
+    )
 }
 
 /// `run.result` params. Strict: the run is the question.
@@ -329,6 +358,10 @@ pub fn broca_role_describe_with_writers(
         // Ordered sends can land beside tool results, at a running step boundary, or when an
         // idle session starts. `turn_system` has no renderer and is deliberately not advertised.
         DELIVERY_ORDER_GROUP,
+        // A send's `client_message_id` is validated, kept in its identity and stored durably
+        // (WAL feature `client-message-id/v1`). It shows on a display row once broca serves
+        // `history_display`, which it does not declare yet; no other surface carries it.
+        cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
     ]
     .map(String::from)
     .to_vec();
@@ -534,6 +567,8 @@ mod pinned_reply_bytes {
                 title: None,
                 lineage_id: Some("lin-1".into()),
                 last_ordinal: Some(3),
+                first_ordinal: None,
+                history_version: None,
                 head: Some(CursorWire {
                     wal_seq: 12,
                     sub_index: 0,
@@ -545,6 +580,7 @@ mod pinned_reply_bytes {
                 }),
                 updated_at: Some(1_790_000_000_000),
                 cache: None,
+                input: None,
             },
             "session_head.json",
             SESSION_HEAD_SHA256,
@@ -560,6 +596,8 @@ mod pinned_reply_bytes {
                 title: Some("Fix the login bug".into()),
                 lineage_id: Some("lin-1".into()),
                 last_ordinal: Some(3),
+                first_ordinal: None,
+                history_version: None,
                 head: Some(CursorWire {
                     wal_seq: 12,
                     sub_index: 0,
@@ -571,10 +609,71 @@ mod pinned_reply_bytes {
                 }),
                 updated_at: Some(1_790_000_000_000),
                 cache: None,
+                input: None,
             },
             "session_head.title.json",
             SESSION_HEAD_TITLE_SHA256,
         );
+    }
+
+    /// `session.head` as this build serves a written session (llm-runner 0.5.1 §4.3): the
+    /// lineage starts at ordinal 0 with no cut, `history_version` is 0 (see the field's comment
+    /// for the one case it misstates), and `input` says no send can carry an attachment. The
+    /// answer is `HeadMeta::lineage_consistent`, and decodes as the role's `HeadMeta`.
+    #[test]
+    fn session_head_lineage_members_are_pinned() {
+        let head = HeadResponse {
+            title: None,
+            lineage_id: Some("lin-1".into()),
+            last_ordinal: Some(3),
+            first_ordinal: Some(0),
+            history_version: Some(0),
+            head: Some(CursorWire {
+                wal_seq: 12,
+                sub_index: 0,
+            }),
+            last_run_state: Some(LastRunState {
+                run_id: "run-1".into(),
+                state: "completed".into(),
+                reason: None,
+            }),
+            updated_at: Some(1_790_000_000_000),
+            cache: None,
+            input: Some(head_input()),
+        };
+        assert_golden(
+            head.clone(),
+            "session_head.lineage.json",
+            "ee91bd7075fde2a4871ddc490585fd1d9975838ba8f2dae9759f445a12233b45",
+        );
+        let meta: cortexkit_role_llm_runner::read::HeadMeta =
+            serde_json::from_value(serde_json::to_value(&head).unwrap()).unwrap();
+        assert!(meta.lineage_consistent(), "{meta:?}");
+        assert_eq!(meta.first_ordinal, Some(0));
+        assert_eq!(meta.cut, None);
+        assert_eq!(meta.history_version, Some(0));
+        assert_eq!(
+            meta.input.and_then(|input| input.carries_attachments()),
+            Some(false)
+        );
+    }
+
+    /// A never-written session's head: no lineage, so nothing but `input`, which §4.3 puts
+    /// outside the lineage rule.
+    #[test]
+    fn session_head_never_written_is_pinned() {
+        let head = HeadResponse {
+            input: Some(head_input()),
+            ..HeadResponse::default()
+        };
+        assert_golden(
+            head.clone(),
+            "session_head.never_written.json",
+            "b749a47fe55fdb2ac64cdec956b48614cedf3edf603ee5e6626e5160fbd4e10a",
+        );
+        let meta: cortexkit_role_llm_runner::read::HeadMeta =
+            serde_json::from_value(serde_json::to_value(&head).unwrap()).unwrap();
+        assert!(meta.lineage_consistent(), "{meta:?}");
     }
 
     #[test]
@@ -897,7 +996,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "00d584b3cedc43fac9e83f476397be70405b8d9c9f77f5fb856c188071ff9fac",
+            "245a861126f8c6fecc7dfce4567d106d3537ff1088257b5af8bca7ec43b3707c",
         );
     }
 
@@ -996,6 +1095,8 @@ mod pinned_reply_bytes {
                 title: None,
                 lineage_id: Some("lin-1".into()),
                 last_ordinal: Some(3),
+                first_ordinal: None,
+                history_version: None,
                 head: Some(CursorWire {
                     wal_seq: 12,
                     sub_index: 0,
@@ -1013,6 +1114,7 @@ mod pinned_reply_bytes {
                     prefix_tokens: None,
                     expiry_basis: crate::EXPIRY_BASIS_ESTIMATED.into(),
                 }),
+                input: None,
             },
             "session_head.cache.json",
             SESSION_HEAD_CACHE_SHA256,
@@ -1051,7 +1153,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "0e948a898888a1e57d8419e13b6eab4ac49186749c7087c18cef5ab2eb4c7cfd";
+        "72cd44fef6005652813490465cda57da1f777100143e802da5a8687c0e8f7ffc";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

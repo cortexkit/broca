@@ -438,6 +438,7 @@ fn send_params(spec: SendSpec<'_>) -> SendParams {
         directives: None,
         session_class: None,
         title: None,
+        client_message_id: None,
         on_restart: None,
         keep_warm: None,
         retention: None,
@@ -814,6 +815,7 @@ mod tests {
             template: None,
             append_episode: false,
             context_management: None,
+            client_message_id: None,
         };
         assert_request_preserves_legacy_shape("session.send", &send);
 

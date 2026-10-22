@@ -24144,3 +24144,94 @@ expect_red = ["system_one::tests::the_catalog_row_decides_the_kind_refusals"]
 file = "crates/broca-module-serve/src/system_one/classify.rs"
 old = "            None => CatalogRow::Kindless,"
 new = "            None => CatalogRow::Kind(CLASSIFIER_KIND), // NON-VACUITY BREAK: read a kindless row as a classifier."
+
+[[control]]
+id = "compaction-view-with-cut-refused"
+guards = "A compaction view carrying a cut is refused cut_unsupported, so broca never claims a lineage starting at ordinal 0 after a cut (llm-runner 0.5.0 §4.5)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::a_view_with_a_cut_is_refused_and_the_same_view_without_it_applies"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "    if view.cut.is_some() {"
+new = "    if view.cut.is_some() && false { // NON-VACUITY BREAK: apply a view with a cut as if it had none."
+
+[[control]]
+id = "session-head-states-first-ordinal"
+guards = "session.head on a written session states first_ordinal 0, which HeadMeta::lineage_consistent requires (llm-runner 0.5.0 §4.3)"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::head_reports_the_session_without_bodies"]
+file = "crates/broca-module/src/serve.rs"
+old = "            first_ordinal: Some(0),"
+new = "            first_ordinal: None, // NON-VACUITY BREAK: leave the lineage's first ordinal off the head."
+
+[[control]]
+id = "session-head-states-no-attachments"
+guards = "session.head states input.attachments no, a known fact for a text-only send, never leaving it unknown (llm-runner 0.5.1 §4.3)"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/role.rs"
+expect_red = ["role::pinned_reply_bytes::session_head_lineage_members_are_pinned", "role::pinned_reply_bytes::session_head_never_written_is_pinned"]
+file = "crates/broca-wire/src/role.rs"
+old = "        cortexkit_role_llm_runner::read::attachments::NO,"
+new = "        cortexkit_role_llm_runner::read::attachments::UNKNOWN, // NON-VACUITY BREAK: report a known fact as unknown."
+
+[[control]]
+id = "client-message-id-in-send-identity"
+guards = "A send's client_message_id is part of its identity digest, so a re-send with another id is refused naming client_message_id (llm-runner 0.5.1 §9.11)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/admission.rs"
+expect_red = ["admission::tests::client_message_id_is_part_of_send_identity_and_kept_in_the_digest"]
+file = "crates/broca-core/src/admission.rs"
+old = "        client_message_id: client_message_id.clone(),"
+new = "        client_message_id: client_message_id.clone().filter(|_| false), // NON-VACUITY BREAK: drop the id from the identity."
+
+[[control]]
+id = "client-message-id-requires-wal-feature"
+guards = "A record whose identity digest carries a client_message_id is must-understand (client-message-id/v1), so an older build cannot answer a re-send differently"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/record/pinned_bytes_tests.rs"
+expect_red = ["record::pinned_bytes_tests::a_client_message_id_in_the_identity_digest_requires_its_reader_feature"]
+file = "crates/broca-wal/src/record.rs"
+old = "    serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.client_message_id.is_some())"
+new = "    serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.client_message_id.is_some() && false) // NON-VACUITY BREAK: write the id ungated."
+
+[[control]]
+id = "client-message-id-grammar-enforced"
+guards = "session.send refuses a client_message_id outside [A-Za-z0-9_-]{1,64} naming the field (llm-runner 0.5.1 §9.11)"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["client_message_id_wire_tests::invalid_client_message_ids_are_refused_naming_the_field"]
+file = "crates/broca-wire/src/lib.rs"
+old = "        .filter(|id| cortexkit_role_llm_runner::display::client_message_id_valid(id))"
+new = "        .filter(|id| !id.is_empty() || cortexkit_role_llm_runner::display::client_message_id_valid(id)) // NON-VACUITY BREAK: accept any non-empty id."
+
+[[control]]
+id = "client-message-id-queued-retry-compared"
+guards = "A retry of a still-queued send with another client_message_id is refused naming it, read from the Queued record's identity digest"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::client_message_id_is_part_of_the_send_identity_and_never_read"]
+file = "crates/broca-module/src/actor.rs"
+old = "            if existing_client_message_id != request.client_message_id {"
+new = "            if existing_client_message_id != request.client_message_id && false { // NON-VACUITY BREAK: answer a queued retry with another id as a retry."

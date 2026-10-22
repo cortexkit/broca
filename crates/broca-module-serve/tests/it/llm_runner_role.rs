@@ -339,7 +339,12 @@ async fn a_never_written_session_has_no_lineage_page_or_head() {
         &call(&mut rig, "session.head", serde_json::json!({})).await,
     ))
     .unwrap();
-    assert_eq!(head, HeadMeta::no_lineage());
+    // `input` sits outside the lineage rule (llm-runner 0.5.1 §4.3), so a never-written
+    // session states it too; every lineage member stays absent.
+    let mut expected = HeadMeta::no_lineage();
+    expected.input = Some(cortexkit_role_llm_runner::read::HeadInput::new("no"));
+    assert_eq!(head, expected);
+    assert!(head.lineage_consistent());
     assert!(
         rig.wal_bytes().is_empty(),
         "a read of an unwritten session wrote"
@@ -640,6 +645,22 @@ async fn head_reports_the_session_without_bodies() {
     assert_eq!(last.state, "completed");
     assert!(head.updated_at.is_some_and(|at| at > 1_700_000_000_000));
     assert!(raw.get("messages").is_none() && !raw.to_string().contains("prompt 0"));
+    // llm-runner 0.5.0 §4.3, §4.5: broca applies no view with a cut, so its one lineage
+    // starts at ordinal 0 and the head names no cut.
+    assert_eq!(head.first_ordinal, Some(0));
+    assert_eq!(head.cut, None);
+    // Always 0 within one WAL: broca has no revert and no recovery that rewrites a written
+    // message. The one case it misstates (a session whose WAL was deleted and later written
+    // again) is the "history_version floor" section of
+    // .cortexkit/internal-docs/designs/lineage-and-history-0.5.md.
+    assert_eq!(head.history_version, Some(0));
+    // A send's prompt is text only, a known fact, so `no` rather than `unknown`.
+    assert_eq!(
+        head.input
+            .as_ref()
+            .and_then(|input| input.carries_attachments()),
+        Some(false)
+    );
     rig.finish().await;
 }
 
@@ -1425,4 +1446,140 @@ async fn a_pending_interrupt_without_a_model_records_the_frozen_model() {
         "the interrupt ran on the frozen model"
     );
     rig.finish().await;
+}
+
+// ---- client_message_id ----------------------------------------------------------------------
+
+/// A send's `client_message_id` (llm-runner 0.5.1 §9.11) through the real serve path. It is
+/// stored only in the identity digest of the `RunStarted` record the send wrote, which then
+/// requires `client-message-id/v1`; it is never in `session.read`. A retry with the same id is
+/// answered as a retry; one with another id, or without the id, is refused `send_id_reuse`
+/// naming `client_message_id` and writes nothing. A malformed id, and an id on a send without
+/// a `send_id`, are refused `invalid_params` naming it and write nothing.
+#[tokio::test]
+async fn client_message_id_is_part_of_the_send_identity_and_never_read() {
+    let mut rig = Rig::start("client-message-id").await;
+    rig.script.push(&[Step::Text("answer")]);
+    let with_id = serde_json::json!({"client_message_id": "msg-1"});
+    let first = rig.send_with("turn-1", "hi", None, with_id.clone()).await;
+    let run_id = result(&first)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+
+    let records = rig.records();
+    let digest = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::RunStarted {
+                request_identity_digest,
+                ..
+            } => request_identity_digest.clone(),
+            _ => None,
+        })
+        .expect("the keyed send recorded its identity");
+    assert_eq!(
+        broca_core::digest_client_message_id(&digest).as_deref(),
+        Some("msg-1")
+    );
+    let started = records
+        .iter()
+        .find(|record| matches!(record, broca_wal::WalRecord::RunStarted { .. }))
+        .unwrap();
+    assert!(started
+        .required_features()
+        .contains(&broca_wal::framing::CLIENT_MESSAGE_ID_FEATURE));
+
+    let read = call(&mut rig, "session.read", serde_json::json!({})).await;
+    assert!(
+        !String::from_utf8_lossy(&read.body).contains("msg-1"),
+        "session.read carries the client_message_id: {}",
+        String::from_utf8_lossy(&read.body)
+    );
+
+    let retry = rig.send_with("turn-1", "hi", None, with_id.clone()).await;
+    assert_eq!(result(&retry)["run_id"], run_id.as_str());
+
+    for (extra, code) in [
+        (
+            serde_json::json!({"client_message_id": "msg-2"}),
+            "send_id_reuse",
+        ),
+        (serde_json::json!({}), "send_id_reuse"),
+        (
+            serde_json::json!({"client_message_id": "bad id"}),
+            "invalid_params",
+        ),
+        (
+            serde_json::json!({"client_message_id": "msg-1", "send_id": null}),
+            "invalid_params",
+        ),
+    ] {
+        let body =
+            refused_writing_nothing(&mut rig, "session.send", keyed("turn-1", extra.clone())).await;
+        assert_eq!(body["code"], code, "{extra}: {body}");
+        assert_eq!(
+            body["detail"]["field"], "client_message_id",
+            "{extra}: {body}"
+        );
+    }
+
+    // A send queued behind a running turn keeps its id in the `Queued` record's identity, and
+    // a retry of the still-pending send is compared against it.
+    rig.script.push(&[Step::Text("busy")]);
+    rig.script.push(&[Step::Text("later")]);
+    rig.script.hold_model(true);
+    rig.send("turn-2", "busy", None).await;
+    rig.wait_entered().await;
+    let queued_with = serde_json::json!({"client_message_id": "msg-3"});
+    let queued = call(
+        &mut rig,
+        "session.send",
+        keyed("turn-3", queued_with.clone()),
+    )
+    .await;
+    assert_eq!(result(&queued)["state"], "pending", "{}", result(&queued));
+    let queued_record = rig
+        .records()
+        .into_iter()
+        .find(|record| matches!(record, broca_wal::WalRecord::Queued { .. }))
+        .expect("the send was queued");
+    assert!(queued_record
+        .required_features()
+        .contains(&broca_wal::framing::CLIENT_MESSAGE_ID_FEATURE));
+    let again = call(&mut rig, "session.send", keyed("turn-3", queued_with)).await;
+    assert_eq!(result(&again)["state"], "pending", "{}", result(&again));
+    for extra in [
+        serde_json::json!({"client_message_id": "msg-4"}),
+        serde_json::json!({}),
+    ] {
+        let body =
+            refused_writing_nothing(&mut rig, "session.send", keyed("turn-3", extra.clone())).await;
+        assert_eq!(body["code"], "send_id_reuse", "{extra}: {body}");
+        assert_eq!(
+            body["detail"]["field"], "client_message_id",
+            "{extra}: {body}"
+        );
+    }
+    rig.script.hold_model(false);
+    rig.wait_for_finished(3).await;
+    rig.finish().await;
+}
+
+/// `session.send` params for the rig's `work` tool session under `send_id`, with `extra` merged
+/// in; a `null` in `extra` removes that member.
+fn keyed(send_id: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "prompt": "hi",
+        "send_id": send_id,
+        "model": {"provider": "fake", "model": "fake"},
+        "tools": [{"name": "work", "description": "does work", "input_schema": {"type": "object"}}]
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        if value.is_null() {
+            params.as_object_mut().unwrap().remove(key);
+        } else {
+            params[key] = value.clone();
+        }
+    }
+    params
 }

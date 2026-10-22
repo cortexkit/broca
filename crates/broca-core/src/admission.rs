@@ -46,6 +46,9 @@ pub fn submission_difference(
         context_management: existing_context_management,
         inherit_frozen: existing_inherit_frozen,
         structured_output: existing_structured_output,
+        // Compared from the stored identity digest instead (`digest_client_message_id`): a
+        // request rebuilt from a durable `Queued` record never carries it.
+        client_message_id: _,
     } = existing;
     let SubmissionRequest {
         directives: requested_directives,
@@ -71,6 +74,7 @@ pub fn submission_difference(
         context_management: requested_context_management,
         inherit_frozen: requested_inherit_frozen,
         structured_output: requested_structured_output,
+        client_message_id: _,
     } = requested;
 
     [
@@ -181,6 +185,24 @@ struct SubmissionIdentityDigestV1 {
     /// field existed, and every send without one, is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     structured_output: Option<String>,
+    /// The send's `client_message_id` (llm-runner 0.5.1 §9.11), the value itself rather than
+    /// a digest of it: this is the one durable place broca keeps it. A queued send's retry is
+    /// compared against it here, and a display row (once broca serves `history_display`) will
+    /// read it back from here. Absent when the send carried
+    /// none, so every digest stored before the member existed, and every send without one, is
+    /// unchanged. A record holding a digest with it requires the WAL feature
+    /// `client-message-id/v1` (`WalRecord::required_features`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_message_id: Option<String>,
+}
+
+/// The `client_message_id` a stored identity digest carries, or `None` when it carries none
+/// or does not parse. This is how a retry of a queued send is compared, since a request rebuilt
+/// from a durable `Queued` record never carries the id itself.
+pub fn digest_client_message_id(stored: &str) -> Option<String> {
+    serde_json::from_str::<SubmissionIdentityDigestV1>(stored)
+        .ok()
+        .and_then(|digest| digest.client_message_id)
 }
 
 fn digest_json(value: serde_json::Value) -> String {
@@ -243,6 +265,7 @@ fn identity_digest_v1(
         context_management,
         inherit_frozen,
         structured_output,
+        client_message_id,
     } = request;
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
@@ -282,6 +305,7 @@ fn identity_digest_v1(
         structured_output: structured_output
             .as_ref()
             .map(|value| digest_json(serde_json::json!(value))),
+        client_message_id: client_message_id.clone(),
     }
 }
 
@@ -319,6 +343,10 @@ pub fn send_identity_difference_with_conversation_key(
     }
     let requested = identity_digest_v1(requested, delivery, conversation_key);
     [
+        (
+            stored.client_message_id != requested.client_message_id,
+            "client_message_id",
+        ),
         (stored.directives != requested.directives, "directives"),
         (stored.keep_warm != requested.keep_warm, "keep_warm"),
         (stored.delivery != requested.delivery, "delivery"),
@@ -1296,6 +1324,40 @@ mod tests {
         );
     }
 
+    /// A send's client_message_id is part of its identity (llm-runner 0.5.1 §9.11): a re-send
+    /// with another id, without the id the first send carried, or with one where the first
+    /// carried none, differs naming `client_message_id`, even with the same prompt. The digest
+    /// keeps the value itself, which is where broca stores it, and a send without one keeps
+    /// exactly the digest it had before the member existed.
+    #[test]
+    fn client_message_id_is_part_of_send_identity_and_kept_in_the_digest() {
+        let plain = request("hello");
+        let mut with_a = plain.clone();
+        with_a.client_message_id = Some("msg-a".into());
+        let mut with_b = plain.clone();
+        with_b.client_message_id = Some("msg-b".into());
+        let digest_a = submission_identity_digest(&with_a);
+        assert_eq!(
+            digest_client_message_id(&digest_a).as_deref(),
+            Some("msg-a")
+        );
+        assert_eq!(
+            digest_client_message_id(&submission_identity_digest(&plain)),
+            None
+        );
+        assert!(!submission_identity_digest(&plain).contains("client_message_id"));
+        assert_eq!(submission_identity_difference(&digest_a, &with_a), None);
+        for (stored, requested) in [(&with_a, &with_b), (&with_a, &plain), (&plain, &with_a)] {
+            assert_eq!(
+                submission_identity_difference(&submission_identity_digest(stored), requested),
+                Some("client_message_id")
+            );
+        }
+        // The request comparison used for a queued retry leaves the id to the digest, since a
+        // request decoded from a `Queued` record never carries it.
+        assert_eq!(submission_difference(&plain, &with_a), None);
+    }
+
     #[test]
     fn keep_warm_identity_is_per_send_and_off_matches_omission() {
         use broca_protocol::request::KeepWarm;
@@ -1346,6 +1408,7 @@ mod tests {
             context_management: None,
             inherit_frozen: Default::default(),
             structured_output: None,
+            client_message_id: None,
         }
     }
 

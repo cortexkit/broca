@@ -959,6 +959,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
         service_tier: None,
         inherit_frozen: Default::default(),
         structured_output: None,
+        client_message_id: None,
     };
     let records = vec![
         started("r-all"),

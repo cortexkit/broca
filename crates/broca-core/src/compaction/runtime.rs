@@ -186,7 +186,7 @@ impl CompactionViews for ViewReadyInbox {
 /// The outcome of fetching an announced view with `view.get`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Fetch {
-    View(CompactionView),
+    View(Box<CompactionView>),
     /// The provider refused with this code: it does not hold that version or that session,
     /// or gave a code broca does not know, which counts the same. The run keeps its current
     /// view and waits for the next `view_ready` (compaction-provider/v1 §6).
@@ -256,7 +256,7 @@ pub async fn apply_idle_view(
         (view::Decision::Stale, None)
     } else {
         let fetched = match runtime.view_get(ready).await {
-            Fetch::View(view) => view,
+            Fetch::View(view) => *view,
             Fetch::Unavailable | Fetch::Refused(_) => return Ok(false),
         };
         runtime
@@ -499,7 +499,7 @@ impl Runtime<'_> {
                     // still wins even when select polls the response first.
                     let answer = answer.filter(|_| self.now() < deadline_ms);
                     unavailable = Some(answer.is_none());
-                    if let Some(RideAnswer::View { view }) = answer {
+                    if let Some(RideAnswer::View { view, .. }) = answer {
                         let ready = ViewReady::for_view(&view);
                         self.offer(
                             views,
@@ -732,7 +732,7 @@ impl Runtime<'_> {
             _ = clock_deadline(self.control.clock.as_ref(), self.now().saturating_add(self.control.compaction_config.call_budget_ms)) => None,
         };
         match answer {
-            Some(ViewGetAnswer::View { view }) => Fetch::View(view),
+            Some(ViewGetAnswer::View { view }) => Fetch::View(Box::new(view)),
             Some(ViewGetAnswer::Refuse { code, .. }) => Fetch::Refused(code),
             // The answer decodes strictly on `answer`, so no other kind reaches here.
             #[allow(unreachable_patterns)]
@@ -757,7 +757,7 @@ impl Runtime<'_> {
             _ = clock_deadline(self.control.clock.as_ref(), self.now().saturating_add(deadline_ms)) => None,
         };
         match answer? {
-            RideAnswer::View { view } => Some(view),
+            RideAnswer::View { view, .. } => Some(*view),
             _ => None,
         }
     }
@@ -820,8 +820,8 @@ impl Runtime<'_> {
             _ if self.now() < views.unavailable_until => return Ok(events),
             _ => match Box::pin(self.view_get(&ready)).await {
                 Fetch::View(view) => {
-                    views.held = Some((ready.clone(), view.clone()));
-                    view
+                    views.held = Some((ready.clone(), (*view).clone()));
+                    *view
                 }
                 Fetch::Refused(code) => {
                     tracing::info!(

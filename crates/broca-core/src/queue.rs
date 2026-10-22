@@ -348,6 +348,7 @@ mod tests {
                 service_tier: None,
                 inherit_frozen: Default::default(),
                 structured_output: None,
+                client_message_id: None,
             }),
             request_identity_digest: None,
             principal: None,

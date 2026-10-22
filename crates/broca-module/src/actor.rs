@@ -1262,6 +1262,7 @@ fn submission_from_config(
         context_management: config.context_management,
         inherit_frozen: Default::default(),
         structured_output: None,
+        client_message_id: None,
     }
 }
 
@@ -4762,6 +4763,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
             if existing.delivery != delivery {
                 return SendOutcome::SendIdReuse {
                     differing: "delivery",
+                };
+            }
+            // A retry carries the same client_message_id as the queued send, or none when it
+            // carried none (llm-runner §9.11). The queued request does not keep the id, so it is
+            // read from the identity digest the queued record stored.
+            let existing_client_message_id = existing
+                .request_identity_digest
+                .as_deref()
+                .and_then(broca_core::digest_client_message_id);
+            if existing_client_message_id != request.client_message_id {
+                return SendOutcome::SendIdReuse {
+                    differing: "client_message_id",
                 };
             }
             // The title is deliberately not compared: it labels the send without being part of

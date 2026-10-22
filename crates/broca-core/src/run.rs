@@ -215,6 +215,8 @@ impl RunRequest {
                 Default::default()
             },
             structured_output: self.structured_output.clone(),
+            // The run keeps a send's client_message_id only inside `request_identity_digest`.
+            client_message_id: None,
         }
     }
 

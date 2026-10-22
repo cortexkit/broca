@@ -150,6 +150,10 @@ const LINEAGE_PAYLOAD_LEN: u32 = 16;
 pub const GATED_FRAMING_VERSION: u8 = 3;
 pub const INTERRUPT_REASON_FEATURE: &str = "interrupt-reason/v1";
 pub const TURN_DIRECTIVES_FEATURE: &str = "turn-directives/v1";
+/// A `RunStarted`, `Queued` or `Steered` record whose `request_identity_digest` carries the
+/// send's `client_message_id` (llm-runner 0.5.1 §9.11). Part of the send's identity: a build
+/// without it would answer a re-send under the same `send_id` with another id as a retry.
+pub const CLIENT_MESSAGE_ID_FEATURE: &str = "client-message-id/v1";
 
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
@@ -168,6 +172,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     AGENT_RUN_SCOPE_FEATURE,
     ARCHIVE_INDEX_V2_FEATURE,
     CHATGPT_CODEX_WIRE_FEATURE,
+    CLIENT_MESSAGE_ID_FEATURE,
     COMPACTION_VIEW_FEATURE,
     COMPACTION_WAIT_FEATURE,
     COMPACTION_FEATURE,
@@ -940,6 +945,7 @@ mod tests {
                 AGENT_RUN_SCOPE_FEATURE,
                 ARCHIVE_INDEX_V2_FEATURE,
                 CHATGPT_CODEX_WIRE_FEATURE,
+                CLIENT_MESSAGE_ID_FEATURE,
                 COMPACTION_VIEW_FEATURE,
                 COMPACTION_WAIT_FEATURE,
                 COMPACTION_FEATURE,

@@ -201,6 +201,17 @@ pub struct SendParams {
         deserialize_with = "deserialize_title"
     )]
     pub title: Option<String>,
+    /// The caller's own id for the user message this send creates (llm-runner 0.5.1 §9.11,
+    /// the `client_message_id` group): 1 to 64 characters of `[A-Za-z0-9_-]`, refused naming
+    /// the field otherwise. Part of the send's identity, so a retry under the same `send_id`
+    /// must carry the same id, or none when the first send carried none. Never rendered, never
+    /// in the stored message body and never in `session.read`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_client_message_id"
+    )]
+    pub client_message_id: Option<String>,
     /// Required on a send that starts or queues a turn. A `steer` or `interrupt` into a session
     /// that already has an episode may omit it and takes the session's frozen model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -542,6 +553,22 @@ where
             )
         })?;
     Ok(Some(title.to_owned()))
+}
+
+fn deserialize_client_message_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let id = value
+        .as_str()
+        .filter(|id| cortexkit_role_llm_runner::display::client_message_id_valid(id))
+        .ok_or_else(|| {
+            serde::de::Error::custom(
+                "client_message_id must be a string of 1-64 characters from [A-Za-z0-9_-]",
+            )
+        })?;
+    Ok(Some(id.to_owned()))
 }
 
 /// Decode `SendParams.context_management`, naming the field and the accepted spellings on a
@@ -3774,6 +3801,7 @@ mod tests {
                 "send_id",
                 "conversation_key",
                 "title",
+                "client_message_id",
                 "model",
                 "tools",
                 "tool_choice",
@@ -4958,6 +4986,56 @@ mod restart_wire_tests {
             broca_protocol::request::OnRestart::Interrupt
         );
         assert!(send_params_keys().contains(&"on_restart"));
+    }
+}
+
+#[cfg(test)]
+mod client_message_id_wire_tests {
+    use super::*;
+
+    /// Every value outside 1 to 64 characters of `[A-Za-z0-9_-]` (llm-runner 0.5.1 §9.11) is
+    /// refused naming `client_message_id`: empty, one over the limit, a space, a dot, a
+    /// non-ASCII letter, and values that are not strings.
+    #[test]
+    fn invalid_client_message_ids_are_refused_naming_the_field() {
+        for id in [
+            serde_json::json!(""),
+            serde_json::json!("a".repeat(65)),
+            serde_json::json!("has space"),
+            serde_json::json!("dot.ted"),
+            serde_json::json!("caf\u{e9}"),
+            serde_json::Value::Null,
+            serde_json::json!(7),
+        ] {
+            let params = serde_json::json!({"prompt": "hi", "client_message_id": id});
+            let error = serde_json::from_value::<SendParams>(params.clone())
+                .expect_err("an invalid client_message_id must be refused");
+            assert_eq!(
+                failing_field::<SendParams>(&params, &error).as_deref(),
+                Some("client_message_id"),
+                "{id:?}"
+            );
+        }
+    }
+
+    /// The grammar's edges are accepted verbatim, and an absent id stays absent and costs a
+    /// serialized send no bytes.
+    #[test]
+    fn valid_client_message_ids_are_kept_and_an_absent_one_writes_nothing() {
+        for id in ["a".to_owned(), "a".repeat(64), "Az09_-".to_owned()] {
+            let parsed: SendParams = serde_json::from_value(
+                serde_json::json!({"prompt": "hi", "client_message_id": id}),
+            )
+            .unwrap();
+            assert_eq!(parsed.client_message_id.as_deref(), Some(id.as_str()));
+        }
+        let absent: SendParams =
+            serde_json::from_value(serde_json::json!({"prompt": "hi"})).unwrap();
+        assert_eq!(absent.client_message_id, None);
+        assert!(serde_json::to_value(absent)
+            .unwrap()
+            .get("client_message_id")
+            .is_none());
     }
 }
 

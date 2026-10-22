@@ -741,6 +741,7 @@ async fn over_cap_admission_is_typed_and_leaves_no_wal_or_run_index_row() {
         context_management: None,
         inherit_frozen: Default::default(),
         structured_output: None,
+        client_message_id: None,
     };
     let error = registry
         .send(broca_module::serve::SendRequest {
@@ -848,6 +849,7 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
             context_management: None,
             inherit_frozen: Default::default(),
             structured_output: None,
+            client_message_id: None,
         }),
         skip_materialization: false,
         kind: RunKind::FreshOrResume,
@@ -896,6 +898,7 @@ fn budget_send(session: BindIdentity, run_id: &str) -> SendRequest {
             context_management: None,
             inherit_frozen: Default::default(),
             structured_output: None,
+            client_message_id: None,
         }),
         skip_materialization: false,
         kind: RunKind::FreshOrResume,

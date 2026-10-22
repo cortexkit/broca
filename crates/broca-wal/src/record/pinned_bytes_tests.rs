@@ -843,6 +843,41 @@ fn structured_output_records_are_must_understand_and_round_trip() {
     }
 }
 
+/// A send's client_message_id lives in its identity digest, and a `RunStarted`, `Queued` or
+/// `Steered` record whose digest carries it needs `client-message-id/v1`: a build without the
+/// name would answer a re-send with another id as a plain retry. A digest without the member, a
+/// record without a digest, and a digest that is not JSON leave the record ungated.
+#[test]
+fn a_client_message_id_in_the_identity_digest_requires_its_reader_feature() {
+    use crate::framing::{decode_next, encode, DecodeStep, GATED_FRAMING_VERSION};
+    const FEATURE: &str = "client-message-id/v1";
+    let with_id = r#"{"version":1,"model":"m","input":"i","tools":"t","policy_allowed":"p","tool_choice":"c","generation":"g","cache":"k","budget":"b","stop_when":"s","client_message_id":"msg-1"}"#;
+    let without_id = r#"{"version":1,"model":"m","input":"i","tools":"t","policy_allowed":"p","tool_choice":"c","generation":"g","cache":"k","budget":"b","stop_when":"s"}"#;
+    let old = include_str!("../../tests/golden/pre_step_transforms/run_started.json").trim_end();
+    let steered = serde_json::json!({"type":"steered","input":[{"role":"user","content":[{"type":"text","text":"more"}]}]});
+    let queued = serde_json::json!({"type":"queued", "submission_id":"sub", "request": {
+        "model":{"provider_module_id":"p","model_id":"m"}, "input":[]}});
+    for base in [serde_json::from_str(old).unwrap(), steered, queued] {
+        let plain: WalRecord = serde_json::from_value(base.clone()).unwrap();
+        assert!(!plain.required_features().contains(&FEATURE), "{base}");
+        for (digest, gated) in [(with_id, true), (without_id, false), ("not json", false)] {
+            let mut raw = base.clone();
+            raw["request_identity_digest"] = serde_json::json!(digest);
+            let record: WalRecord = serde_json::from_value(raw).unwrap();
+            assert_eq!(
+                record.required_features().contains(&FEATURE),
+                gated,
+                "{digest} on {base}"
+            );
+            if gated {
+                let frame = encode(1, 1, &record).unwrap();
+                assert_eq!(frame[4], GATED_FRAMING_VERSION);
+                assert!(matches!(decode_next(&frame), DecodeStep::Record { .. }));
+            }
+        }
+    }
+}
+
 #[test]
 fn interrupt_reason_and_directives_require_named_reader_features_only_when_present() {
     use crate::framing::{decode_next, encode, DecodeStep, GATED_FRAMING_VERSION};

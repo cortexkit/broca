@@ -936,6 +936,37 @@ fn a_view_with_an_apply_mark_broca_did_not_list_is_refused() {
     );
 }
 
+/// A view with a `cut` would start a new lineage once it applied (compaction-provider 0.5.0 §7,
+/// llm-runner 0.5.0 §4.5), which broca does not serve: it refuses the view `cut_unsupported`
+/// and keeps its one lineage starting at ordinal 0. The same view without the cut applies.
+#[test]
+fn a_view_with_a_cut_is_refused_and_the_same_view_without_it_applies() {
+    let summary = replace_bytes(&[text(Role::User, "summary")]);
+    let (view, _) = make_view(
+        2,
+        5,
+        vec![ViewRange::replace(0, 1, summary), ViewRange::keep(1, 6)],
+    );
+    let prompt = conversation();
+    let state = after_setup();
+    let ready = ViewReady::for_view(&view);
+    assert_eq!(
+        decide(&view, &ready, &state, LINEAGE, &prompt, &prompt, false),
+        Decision::Apply(CompactionViewChoice::Applied)
+    );
+    let cut = view
+        .clone()
+        .with_cut(crate::compaction_provider::view::ViewCut::new("cut-1", 0));
+    assert_eq!(cut.check(), Ok(()), "the cut itself is well formed");
+    let cut_ready = ViewReady::for_view(&cut);
+    let refused = decide(&cut, &cut_ready, &state, LINEAGE, &prompt, &prompt, false);
+    assert_eq!(refused, Decision::Refuse(CUT_UNSUPPORTED));
+    assert_eq!(
+        refused.event(2).unwrap().token(),
+        "view_refused:2:cut_unsupported"
+    );
+}
+
 /// A view deferred over the open tool turn when a run ends stays deferred at no later step: at
 /// the first step of the session's next run it is refused for the provider's constraint
 /// (compaction-provider §7), whatever the request ends with, and the same request inside a run

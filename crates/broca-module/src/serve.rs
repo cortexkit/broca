@@ -2834,7 +2834,10 @@ impl ServeHandler for crate::LineageRegistry {
         } = self.route_read_page(session, None, Some(1), false).await?;
         // A session never written has no lineage, and then nothing else to report either.
         let Some(lineage_id) = page.lineage_id else {
-            return Ok(broca_wire::HeadResponse::default());
+            return Ok(broca_wire::HeadResponse {
+                input: Some(broca_wire::head_input()),
+                ..broca_wire::HeadResponse::default()
+            });
         };
         // Retained sessions report expiry activity; maintenance must not move that clock.
         // Otherwise use the live WAL file's own write time, a stat; else
@@ -2866,6 +2869,8 @@ impl ServeHandler for crate::LineageRegistry {
         Ok(broca_wire::HeadResponse {
             lineage_id: Some(lineage_id.to_string()),
             last_ordinal: page.prompt_len.checked_sub(1),
+            first_ordinal: Some(0),
+            history_version: Some(0),
             head: page.head.map(|cursor| CursorWire {
                 wal_seq: cursor.wal_seq,
                 sub_index: cursor.sub_index,
@@ -2894,6 +2899,7 @@ impl ServeHandler for crate::LineageRegistry {
                     expiry_basis: broca_wire::EXPIRY_BASIS_ESTIMATED.into(),
                 }),
             title: last_title,
+            input: Some(broca_wire::head_input()),
         })
     }
 

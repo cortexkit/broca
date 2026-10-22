@@ -1240,6 +1240,30 @@ impl WalRecord {
         } else {
             base
         };
+        // A send's client_message_id lives in its identity digest (see
+        // `SubmissionRequest::client_message_id`). An older build would read the digest without
+        // it and answer a re-send under the same `send_id` with another id as a plain retry,
+        // where this build refuses it `send_id_reuse`, so the record is must-understand.
+        let identity_digest = match self {
+            WalRecord::RunStarted {
+                request_identity_digest,
+                ..
+            }
+            | WalRecord::Queued {
+                request_identity_digest,
+                ..
+            }
+            | WalRecord::Steered {
+                request_identity_digest,
+                ..
+            } => request_identity_digest.as_deref(),
+            _ => None,
+        };
+        let base = if identity_digest.is_some_and(digest_carries_client_message_id) {
+            with_feature(base, crate::framing::CLIENT_MESSAGE_ID_FEATURE)
+        } else {
+            base
+        };
         let scope = match self {
             WalRecord::RunStarted { scope, .. } => scope.as_ref(),
             WalRecord::ToolCallDeferred { scope, .. } => Some(scope),
@@ -1957,6 +1981,19 @@ fn input_cap_features(base: &[&str]) -> &'static [&'static str] {
 /// `base` with `feature` added in sorted position. The feature sets a record can require are a
 /// small fixed family, so each distinct union is built once and kept for the process lifetime;
 /// the cache is keyed by the address of `base`, which is always a static slice.
+/// Whether a stored request identity digest (a JSON object of per-field digests written by
+/// broca-core) carries the send's `client_message_id`. A digest that does not parse carries
+/// none: it is compared as an opaque string, and this build never writes such a digest with
+/// the member.
+fn digest_carries_client_message_id(digest: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        client_message_id: Option<serde::de::IgnoredAny>,
+    }
+    serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.client_message_id.is_some())
+}
+
 fn with_feature(base: &'static [&'static str], feature: &'static str) -> &'static [&'static str] {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -3668,6 +3705,7 @@ mod schema_tests {
                     context_management: None,
                     inherit_frozen: Default::default(),
                     structured_output: None,
+                    client_message_id: None,
                 }),
                 request_identity_digest: None,
                 principal: None,
