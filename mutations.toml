@@ -22739,3 +22739,29 @@ expect_red = ["actor::shown_number_tests::a_part_tag_names_the_number_its_part_s
 file = "crates/broca-module/src/actor.rs"
 old = "    if key_message != part.mid {"
 new = "    if key_message != part.mid && false { // NON-VACUITY BREAK: accept a part key of another message."
+
+[[control]]
+id = "read-cleans-model-text-where-its-run-cleans"
+guards = "session.read serves the model's text cleaned of tag notation for a tag-rendering run, stored text staying raw"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::a_read_cleans_the_model_text_only_where_its_run_cleans"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    let message = broca_protocol::tags::exposed_message(message);"
+new = "    let message = std::borrow::Cow::Borrowed(message); // NON-VACUITY BREAK: serve raw model text."
+
+[[control]]
+id = "resolve-answers-the-cleaned-model-text"
+guards = "session.resolve answers the model's text as exposed, cleaned where its run cleans"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve/read_page_tests.rs"
+expect_red = ["serve::read_page_tests::resolve_answers_the_cleaned_model_text"]
+file = "crates/broca-module/src/serve.rs"
+old = "        let stored = broca_protocol::tags::exposed_part_text(&entry.message, index)?;"
+new = "        let stored = broca_protocol::tags::part_text(entry.message.content.get(index)?); // NON-VACUITY BREAK: answer the raw text."

@@ -350,8 +350,9 @@ fn resolve_in_page(
             .part_tags()?
             .tagged()
             .find(|(_, tag)| *tag == number)?;
-        let block = entry.message.content.get(index)?;
-        let stored = broca_protocol::tags::part_text(block);
+        // The part as every exposure shows it: the model's text cleaned where the run that
+        // wrote it cleans, any other part in its complete stored encoding.
+        let stored = broca_protocol::tags::exposed_part_text(&entry.message, index)?;
         Some(match broca_wire::resolve_range(&stored, params.range) {
             Some(text) => {
                 let mut reply = broca_wire::ResolveResponse::new(
@@ -573,6 +574,9 @@ fn final_message_of(
             )
         })?;
     let ordinal = message.ordinal.unwrap_or(ordinal as u64);
+    // The text as every exposure shows it: cleaned when a tag-rendering run under the computed
+    // rules wrote it, raw for any other run and for a structured-output run's final text.
+    let message = broca_protocol::tags::exposed_message(message);
     let text: String = message
         .content
         .iter()

@@ -189,3 +189,35 @@ fn model_reply_too_large_subject_preserves_the_entry_source() {
     .unwrap();
     assert_eq!(model_group_reply_too_large_subject(&empty), None);
 }
+
+/// An assistant entry written by a tag-rendering run under the computed rules: its text
+/// numbered `§1§` and cleaned on exposure.
+fn cleaned_answer(text: &str) -> SessionReadMessage {
+    let mut entry = message(0, 0);
+    entry.message = Message::new(
+        Role::Assistant,
+        vec![ContentBlock::Text { text: text.into() }],
+    );
+    let mut high = 0;
+    broca_protocol::tags::number_message(
+        &mut entry.message,
+        broca_protocol::tags::ComputedRules {
+            render: true,
+            clean: true,
+        },
+        &mut high,
+    );
+    entry.tags = broca_wire::tag_rows(0, &entry.message);
+    entry
+}
+
+/// `session.resolve` answers the part's exposed content: the model's text cleaned where its
+/// run cleans it, the stored text staying raw.
+#[test]
+fn resolve_answers_the_cleaned_model_text() {
+    let page = page(vec![cleaned_answer("§3§ hi as §1§ says")]);
+    let reply = resolve_in_page(&page, &broca_wire::ResolveParams::new("§1§"))
+        .expect("the page holds the tag")
+        .expect("resolved");
+    assert_eq!(reply.content, serde_json::json!("hi as  says"));
+}

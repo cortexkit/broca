@@ -1013,12 +1013,16 @@ pub enum SendResult {
 }
 
 /// Serialize `message` as callers read it: every `text_with_state` block becomes a plain `text`
-/// block with the same text, and every other block is written unchanged.
+/// block with the same text, the model's text is cleaned where its writing run cleans it, and
+/// every other block is written unchanged.
 fn serialize_caller_message<S: serde::Serializer>(
     message: &broca_protocol::Message,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use broca_protocol::ContentBlock;
+    // The model's text as every exposure shows it: cleaned of tag notation where the run that
+    // wrote it cleans (llm-runner §9.6). The stored message keeps the raw text.
+    let message = broca_protocol::tags::exposed_message(message);
     if !message
         .content
         .iter()
@@ -1026,7 +1030,7 @@ fn serialize_caller_message<S: serde::Serializer>(
     {
         return message.serialize(serializer);
     }
-    CallerMessageRef(message).serialize(serializer)
+    CallerMessageRef(&message).serialize(serializer)
 }
 
 struct CallerMessageRef<'a>(&'a broca_protocol::Message);
@@ -5179,6 +5183,39 @@ mod caller_message_tests {
             run: None,
             tool_calls: Vec::new(),
         }
+    }
+
+    /// Number `entry`'s message under the computed rules of a tag-rendering run, cleaning the
+    /// model's text (`clean`) or not.
+    fn computed(mut entry: SessionReadMessage, clean: bool) -> SessionReadMessage {
+        let mut high = 0;
+        broca_protocol::tags::number_message(
+            &mut entry.message,
+            broca_protocol::tags::ComputedRules {
+                render: true,
+                clean,
+            },
+            &mut high,
+        );
+        entry.tags = tag_rows(entry.ordinal, &entry.message);
+        entry
+    }
+
+    /// A read shows the model's text cleaned of tag notation when the run that wrote it cleans,
+    /// as written otherwise (an untagged run, a structured-output run's final text); the stored
+    /// message keeps the raw text either way.
+    #[test]
+    fn a_read_cleans_the_model_text_only_where_its_run_cleans() {
+        let raw = "§3§ hi as §1§ says";
+        let content = vec![ContentBlock::Text { text: raw.into() }];
+        let cleaned = computed(read_message(content.clone()), true);
+        let body = serde_json::to_value(&cleaned).unwrap();
+        assert_eq!(body["message"]["content"][0]["text"], "hi as  says");
+        assert_eq!(body["tags"], json!([{"part": "m3#0", "tag": "§1§"}]));
+        assert_eq!(cleaned.message.content, content, "stored text stays raw");
+        let raw_kept = computed(read_message(content.clone()), false);
+        let body = serde_json::to_value(&raw_kept).unwrap();
+        assert_eq!(body["message"]["content"][0]["text"], raw);
     }
 
     /// A read entry carries one tag row per tagged part, after `tool_calls`; the message
