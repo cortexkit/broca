@@ -23,6 +23,7 @@ mod resume_exec;
 mod run_loop;
 mod runner_tags;
 mod runner_tags_determinism;
+mod runner_tags_v1_pin;
 mod session_import;
 mod terminal_reason_crash_cut;
 mod terminal_reason_stop_conditions;

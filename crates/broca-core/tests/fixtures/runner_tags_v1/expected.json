@@ -1,0 +1,173 @@
+{
+  "resumed_sent": [
+    "{\"generation\":{},\"prompt\":[{\"content\":[{\"text\":\"§1§ find the tags\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"§2§ looking\",\"type\":\"text\"},{\"input\":{\"q\":\"tags\"},\"tool_call_id\":\"call-1\",\"tool_name\":\"lookup\",\"type\":\"tool_call\"}],\"origin\":{\"model_id\":\"m\",\"provider_module_id\":\"stub\"},\"role\":\"assistant\"},{\"content\":[{\"is_error\":false,\"output\":{\"kind\":\"text\",\"text\":\"§5§ two hits\"},\"tool_call_id\":\"call-1\",\"type\":\"tool_result\"}],\"role\":\"tool\"},{\"content\":[{\"text\":\"§4§ also check the docs\",\"type\":\"text\"}],\"role\":\"user\"}],\"response_format\":{\"type\":\"text\"},\"tool_choice\":{\"type\":\"auto\"},\"tools\":[{\"description\":\"look something up\",\"execution_mode\":\"parallel\",\"input_schema\":{\"type\":\"object\"},\"name\":\"lookup\"}]}",
+    "{\"generation\":{},\"prompt\":[{\"content\":[{\"text\":\"§1§ find the tags\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"§2§ looking\",\"type\":\"text\"},{\"input\":{\"q\":\"tags\"},\"tool_call_id\":\"call-1\",\"tool_name\":\"lookup\",\"type\":\"tool_call\"}],\"origin\":{\"model_id\":\"m\",\"provider_module_id\":\"stub\"},\"role\":\"assistant\"},{\"content\":[{\"is_error\":false,\"output\":{\"kind\":\"text\",\"text\":\"§5§ two hits\"},\"tool_call_id\":\"call-1\",\"type\":\"tool_result\"}],\"role\":\"tool\"},{\"content\":[{\"text\":\"§4§ also check the docs\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"§6§ checking again\",\"type\":\"text\"},{\"input\":{\"q\":\"tags\"},\"tool_call_id\":\"call-2\",\"tool_name\":\"lookup\",\"type\":\"tool_call\"}],\"origin\":{\"model_id\":\"m\",\"provider_module_id\":\"stub\"},\"role\":\"assistant\"},{\"content\":[{\"is_error\":false,\"output\":{\"kind\":\"text\",\"text\":\"§8§ two hits\"},\"tool_call_id\":\"call-2\",\"type\":\"tool_result\"}],\"role\":\"tool\"}],\"response_format\":{\"type\":\"text\"},\"tool_choice\":{\"type\":\"auto\"},\"tools\":[{\"description\":\"look something up\",\"execution_mode\":\"parallel\",\"input_schema\":{\"type\":\"object\"},\"name\":\"lookup\"}]}"
+  ],
+  "resumed_wal_tags": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "sent": [
+    "{\"generation\":{},\"prompt\":[{\"content\":[{\"text\":\"§1§ find the tags\",\"type\":\"text\"}],\"role\":\"user\"}],\"response_format\":{\"type\":\"text\"},\"tool_choice\":{\"type\":\"auto\"},\"tools\":[{\"description\":\"look something up\",\"execution_mode\":\"parallel\",\"input_schema\":{\"type\":\"object\"},\"name\":\"lookup\"}]}",
+    "{\"generation\":{},\"prompt\":[{\"content\":[{\"text\":\"§1§ find the tags\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"§2§ looking\",\"type\":\"text\"},{\"input\":{\"q\":\"tags\"},\"tool_call_id\":\"call-1\",\"tool_name\":\"lookup\",\"type\":\"tool_call\"}],\"origin\":{\"model_id\":\"m\",\"provider_module_id\":\"stub\"},\"role\":\"assistant\"},{\"content\":[{\"is_error\":false,\"output\":{\"kind\":\"text\",\"text\":\"§5§ two hits\"},\"tool_call_id\":\"call-1\",\"type\":\"tool_result\"}],\"role\":\"tool\"},{\"content\":[{\"text\":\"§4§ also check the docs\",\"type\":\"text\"}],\"role\":\"user\"}],\"response_format\":{\"type\":\"text\"},\"tool_choice\":{\"type\":\"auto\"},\"tools\":[{\"description\":\"look something up\",\"execution_mode\":\"parallel\",\"input_schema\":{\"type\":\"object\"},\"name\":\"lookup\"}]}",
+    "{\"generation\":{},\"prompt\":[{\"content\":[{\"text\":\"§1§ find the tags\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"§2§ looking\",\"type\":\"text\"},{\"input\":{\"q\":\"tags\"},\"tool_call_id\":\"call-1\",\"tool_name\":\"lookup\",\"type\":\"tool_call\"}],\"origin\":{\"model_id\":\"m\",\"provider_module_id\":\"stub\"},\"role\":\"assistant\"},{\"content\":[{\"is_error\":false,\"output\":{\"kind\":\"text\",\"text\":\"§5§ two hits\"},\"tool_call_id\":\"call-1\",\"type\":\"tool_result\"}],\"role\":\"tool\"},{\"content\":[{\"text\":\"§4§ also check the docs\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"§6§ checking again\",\"type\":\"text\"},{\"input\":{\"q\":\"tags\"},\"tool_call_id\":\"call-2\",\"tool_name\":\"lookup\",\"type\":\"tool_call\"}],\"origin\":{\"model_id\":\"m\",\"provider_module_id\":\"stub\"},\"role\":\"assistant\"},{\"content\":[{\"is_error\":false,\"output\":{\"kind\":\"text\",\"text\":\"§8§ two hits\"},\"tool_call_id\":\"call-2\",\"type\":\"tool_result\"}],\"role\":\"tool\"}],\"response_format\":{\"type\":\"text\"},\"tool_choice\":{\"type\":\"auto\"},\"tools\":[{\"description\":\"look something up\",\"execution_mode\":\"parallel\",\"input_schema\":{\"type\":\"object\"},\"name\":\"lookup\"}]}"
+  ],
+  "transcript": [
+    {
+      "message": {
+        "content": [
+          {
+            "text": "find the tags",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      "tags": [
+        1
+      ]
+    },
+    {
+      "message": {
+        "content": [
+          {
+            "text": "looking",
+            "type": "text"
+          },
+          {
+            "input": {
+              "q": "tags"
+            },
+            "tool_call_id": "call-1",
+            "tool_name": "lookup",
+            "type": "tool_call"
+          }
+        ],
+        "origin": {
+          "model_id": "m",
+          "provider_module_id": "stub"
+        },
+        "role": "assistant"
+      },
+      "tags": [
+        2,
+        3
+      ]
+    },
+    {
+      "message": {
+        "content": [
+          {
+            "is_error": false,
+            "output": {
+              "kind": "text",
+              "text": "two hits"
+            },
+            "tool_call_id": "call-1",
+            "type": "tool_result"
+          }
+        ],
+        "role": "tool"
+      },
+      "tags": [
+        5
+      ]
+    },
+    {
+      "message": {
+        "content": [
+          {
+            "text": "also check the docs",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      "tags": [
+        4
+      ]
+    },
+    {
+      "message": {
+        "content": [
+          {
+            "text": "§99§ checking again",
+            "type": "text"
+          },
+          {
+            "input": {
+              "q": "tags"
+            },
+            "tool_call_id": "call-2",
+            "tool_name": "lookup",
+            "type": "tool_call"
+          }
+        ],
+        "origin": {
+          "model_id": "m",
+          "provider_module_id": "stub"
+        },
+        "role": "assistant"
+      },
+      "tags": [
+        6,
+        7
+      ]
+    },
+    {
+      "message": {
+        "content": [
+          {
+            "is_error": false,
+            "output": {
+              "kind": "text",
+              "text": "two hits"
+            },
+            "tool_call_id": "call-2",
+            "type": "tool_result"
+          }
+        ],
+        "role": "tool"
+      },
+      "tags": [
+        8
+      ]
+    },
+    {
+      "message": {
+        "content": [
+          {
+            "text": "done",
+            "type": "text"
+          }
+        ],
+        "origin": {
+          "model_id": "m",
+          "provider_module_id": "stub"
+        },
+        "role": "assistant"
+      },
+      "tags": [
+        9
+      ]
+    }
+  ],
+  "wal_tags": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ]
+}
