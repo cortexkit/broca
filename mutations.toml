@@ -22852,3 +22852,16 @@ expect_red = ["compaction::reads_wait_out_the_setup_answer_and_never_show_a_numb
 file = "crates/broca-core/src/replay.rs"
 old = "        && compaction.state().is_none()"
 new = "        && compaction.state().is_some() // NON-VACUITY BREAK: never flag the Setup window."
+
+[[control]]
+id = "read-default-shape-adds-no-member"
+guards = "A default inline session.read adds no member to an entry, its message or a block; digests appear only on an opt-in descriptors read"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::the_default_read_shape_has_exactly_the_members_it_always_had"]
+file = "crates/broca-wire/src/lib.rs"
+old = "            #[serde(skip_serializing_if = \"Option::is_none\")]\n            digest: &'a Option<String>,"
+new = "            digest: &'a Option<String>, // NON-VACUITY BREAK: always serve a digest member."

@@ -5422,6 +5422,123 @@ mod caller_message_tests {
         }
     }
 
+    /// The member names of a JSON object, sorted.
+    fn members(value: &serde_json::Value) -> Vec<String> {
+        let mut names: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// A consumer that re-encodes read messages byte-exactly decodes them strictly, so the
+    /// default (inline) read adds no member to an entry, its message or any block, whatever
+    /// the computed tag rules attach to the stored message. Only an opt-in descriptors read adds
+    /// `digest` and `part_digests`. The member sets below are the ones served before the
+    /// computed rules.
+    #[test]
+    fn the_default_read_shape_has_exactly_the_members_it_always_had() {
+        use broca_protocol::content::{EncryptedReasoningFormat, ToolCall, ToolOutput, ToolResult};
+        let result = |id: &str, output: ToolOutput| {
+            ContentBlock::ToolResult(ToolResult {
+                tool_call_id: broca_protocol::ToolCallId(id.into()),
+                output,
+                is_error: false,
+            })
+        };
+        let content = vec![
+            ContentBlock::Text {
+                text: "§3§ plain".into(),
+            },
+            ContentBlock::TextWithState {
+                text: "stateful".into(),
+                provider_state: TextProviderState {
+                    format: TextProviderFormat::OpenAiResponses,
+                    data: "{}".into(),
+                },
+            },
+            ContentBlock::Reasoning {
+                text: "thought".into(),
+                signature: Some("sig".into()),
+            },
+            ContentBlock::RedactedReasoning {
+                data: "opaque".into(),
+                provider_format: Some(EncryptedReasoningFormat::OpenAiResponses),
+            },
+            ContentBlock::ToolCall(ToolCall {
+                tool_call_id: broca_protocol::ToolCallId("c".into()),
+                tool_name: "t".into(),
+                input: json!({"a": 1}),
+                thought_signature: Some("ts".into()),
+            }),
+            result("c", ToolOutput::Text { text: "out".into() }),
+            result("d", ToolOutput::Json { value: json!({}) }),
+            result(
+                "e",
+                ToolOutput::Error {
+                    message: "no".into(),
+                },
+            ),
+            result(
+                "f",
+                ToolOutput::Denied {
+                    reason: "no".into(),
+                },
+            ),
+        ];
+        let mut entry = computed(read_message(content.clone()), true);
+        entry.message.origin = Some(broca_protocol::ModelHandle::new("p", "m"));
+        let body = serde_json::to_value(&entry).unwrap();
+        assert_eq!(members(&body), ["message", "mid", "ordinal", "tags"]);
+        assert_eq!(members(&body["message"]), ["content", "origin", "role"]);
+        let blocks: Vec<Vec<String>> = body["message"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(members)
+            .collect();
+        let expected: Vec<Vec<&str>> = vec![
+            vec!["text", "type"],
+            vec!["text", "type"],
+            vec!["signature", "text", "type"],
+            vec!["data", "provider_format", "type"],
+            vec![
+                "input",
+                "thought_signature",
+                "tool_call_id",
+                "tool_name",
+                "type",
+            ],
+            vec!["is_error", "output", "tool_call_id", "type"],
+            vec!["is_error", "output", "tool_call_id", "type"],
+            vec!["is_error", "output", "tool_call_id", "type"],
+            vec!["is_error", "output", "tool_call_id", "type"],
+        ];
+        assert_eq!(blocks, expected);
+        let outputs: Vec<Vec<String>> = body["message"]["content"].as_array().unwrap()[5..]
+            .iter()
+            .map(|block| members(&block["output"]))
+            .collect();
+        assert_eq!(
+            outputs,
+            [
+                vec!["kind", "text"],
+                vec!["kind", "value"],
+                vec!["kind", "message"],
+                vec!["kind", "reason"]
+            ]
+        );
+        // The same message without the computed rules serializes to the same members.
+        let plain = serde_json::to_value(read_message(content)).unwrap();
+        assert_eq!(
+            members(&plain["message"]["content"][0]),
+            members(&body["message"]["content"][0])
+        );
+        // The rows carry only the key and, on a counted part, the number.
+        for row in body["tags"].as_array().unwrap() {
+            let names = members(row);
+            assert!(names == ["part"] || names == ["part", "tag"], "{names:?}");
+        }
+    }
+
     /// Number `entry`'s message under the computed rules of a tag-rendering run, cleaning the
     /// model's text (`clean`) or not.
     fn computed(mut entry: SessionReadMessage, clean: bool) -> SessionReadMessage {
