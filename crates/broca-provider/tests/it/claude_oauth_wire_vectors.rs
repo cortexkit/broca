@@ -343,6 +343,7 @@ fn broca_frozen(case: &Value, vectors: &Value) -> FrozenRenderConfig {
             reason: None,
             profile: None,
             delivery: SchemaDelivery::Strict,
+            instructions_paragraph_break: true,
         });
     }
     frozen

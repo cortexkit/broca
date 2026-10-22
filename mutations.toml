@@ -22964,3 +22964,45 @@ expect_red = [
 file = "crates/broca-catalog/src/runtime.rs"
 old = "            CapabilityFlag::Absent => CapabilityFlag::Unknown,"
 new = "            CapabilityFlag::Absent => CapabilityFlag::Absent, // NON-VACUITY BREAK: absent reasoning admits as false again."
+
+[[control]]
+id = "anthropic-oauth-default-thinking-budget-below-output-cap"
+guards = "A fresh Anthropic OAuth run whose output cap does not exceed the default thinking budget is refused at admission instead of sending a request Anthropic rejects"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/frozen_config_resume.rs"
+expect_red = ["frozen_config_resume::gated::anthropic_oauth_default_thinking_budget_refuses_an_output_cap_at_or_below_it"]
+file = "crates/broca-provider/src/families/mod.rs"
+old = "        if !variant_replaces_thinking && frozen.max_output_tokens <= budget_tokens {"
+new = "        if !variant_replaces_thinking && frozen.max_output_tokens < budget_tokens { // NON-VACUITY BREAK: admit an output cap equal to the thinking budget."
+
+[[control]]
+id = "structured-output-instructions-paragraph-break-rendered"
+guards = "Schema instructions joining an existing system message start a new paragraph on runs that froze the break, so OpenAI Chat and Responses do not glue them to the caller's text"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/structured_output_render.rs"
+expect_red = ["structured_output_render::openai_instructions_start_a_new_paragraph_only_for_newly_decided_runs"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "                    let text = if so.instructions_paragraph_break {"
+new = "                    let text = if false && so.instructions_paragraph_break { // NON-VACUITY BREAK: glue the instructions to the system text."
+
+[[control]]
+id = "structured-output-instructions-paragraph-break-frozen-for-new-runs"
+guards = "A newly decided structured-output run freezes the instructions paragraph break"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/structured_output_render.rs"
+expect_red = ["structured_output_render::openai_instructions_start_a_new_paragraph_only_for_newly_decided_runs"]
+file = "crates/broca-provider/src/structured_output.rs"
+old = "        instructions_paragraph_break: true,"
+new = "        instructions_paragraph_break: false, // NON-VACUITY BREAK: new runs keep the legacy glued instructions."

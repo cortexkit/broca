@@ -222,7 +222,7 @@ pub(crate) fn apply_generation_controls(
 
 /// Explain request conflicts introduced by Anthropic OAuth's resolved manual-thinking policy.
 /// API-key resolution replaces this policy with `ReasoningPolicy::None`, so the OAuth-only
-/// temperature and forced-tool conflicts do not reject API-key requests.
+/// temperature, output-cap and forced-tool conflicts do not reject API-key requests.
 pub fn fresh_admission_config_error(
     frozen: &FrozenRenderConfig,
     generation: &GenerationConfig,
@@ -245,6 +245,27 @@ pub fn fresh_admission_config_error(
              while the resolved Anthropic OAuth auth method enabled thinking; Anthropic requires \
              generation.temperature=1 when thinking is enabled"
         ));
+    }
+
+    // The policy's default budget is sent unless a reasoning variant replaces the `thinking`
+    // object; `freeze_variant` already checks a variant's own budget against the cap.
+    if let ReasoningPolicy::AnthropicInterleaved { budget_tokens, .. } = frozen.reasoning {
+        let variant_replaces_thinking = matches!(
+            &frozen.variant,
+            Some(crate::variant::FrozenVariant {
+                request: crate::variant::VariantRequest::Anthropic { .. },
+                ..
+            })
+        );
+        if !variant_replaces_thinking && frozen.max_output_tokens <= budget_tokens {
+            return Some(format!(
+                "max_output_tokens={} conflicts with reasoning.mode='anthropic_interleaved': \
+                 the resolved Anthropic OAuth auth method enabled thinking with a budget of \
+                 {budget_tokens} tokens, and Anthropic requires the output cap to exceed the \
+                 thinking budget; raise generation.max_output_tokens above {budget_tokens}",
+                frozen.max_output_tokens
+            ));
+        }
     }
 
     let forced_choice = match tool_choice {

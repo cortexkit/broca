@@ -441,6 +441,144 @@ mod gated {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An Anthropic OAuth frozen config whose output cap is `cap`, keeping the policy's default
+    /// 1024-token thinking budget.
+    fn anthropic_oauth_with_output_cap(cap: u32) -> FrozenRenderConfig {
+        let mut frozen = anthropic_frozen_config("claude-opus-4-8");
+        assert!(matches!(
+            frozen.reasoning,
+            ReasoningPolicy::AnthropicInterleaved {
+                budget_tokens: 1024,
+                ..
+            }
+        ));
+        frozen.max_output_tokens = cap;
+        frozen.caller_max_output_tokens = Some(cap);
+        frozen
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_oauth_default_thinking_budget_refuses_an_output_cap_at_or_below_it() {
+        for cap in [512, 1024] {
+            let dir = broca_test_support::scratch_root().join(format!(
+                "broca-anthropic-cap-below-budget-{cap}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut request = request(&dir);
+            request.generation.max_output_tokens = Some(u64::from(cap));
+            let session = request.session.clone();
+            let provider = FrozenProvider::new(anthropic_oauth_with_output_cap(cap));
+
+            let error = drive_request(&dir, &provider, request)
+                .await
+                .expect_err("an output cap at or below the thinking budget must fail admission");
+
+            match error {
+                RunError::Config(message) => assert_eq!(
+                    message,
+                    format!(
+                        "max_output_tokens={cap} conflicts with \
+                         reasoning.mode='anthropic_interleaved': the resolved Anthropic OAuth \
+                         auth method enabled thinking with a budget of 1024 tokens, and \
+                         Anthropic requires the output cap to exceed the thinking budget; raise \
+                         generation.max_output_tokens above 1024"
+                    )
+                ),
+                other => panic!("expected typed Config error, got {other:?}"),
+            }
+            assert!(
+                provider.sent.lock().unwrap().is_empty(),
+                "a refused admission must not reach the provider"
+            );
+            assert!(
+                FileWalStore::new(dir.join("wal"))
+                    .read_records(&session)
+                    .expect("read refused run WAL")
+                    .is_empty(),
+                "a refused fresh admission must not write RunStarted"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_oauth_default_thinking_budget_accepts_an_output_cap_above_it() {
+        let dir = broca_test_support::scratch_root().join(format!(
+            "broca-anthropic-cap-above-budget-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut request = request(&dir);
+        request.generation.max_output_tokens = Some(1025);
+        let provider = FrozenProvider::new(anthropic_oauth_with_output_cap(1025));
+
+        let summary = drive_request(&dir, &provider, request)
+            .await
+            .expect("an output cap above the thinking budget is valid");
+
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        let sent = provider.sent.lock().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(sent.get(&0).expect("the admitted request rendered"))
+                .expect("rendered body is JSON");
+        assert_eq!(body["max_tokens"], 1025);
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        drop(sent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_api_key_small_output_cap_remains_admissible() {
+        let dir = broca_test_support::scratch_root().join(format!(
+            "broca-anthropic-apikey-small-cap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut request = request(&dir);
+        request.generation.max_output_tokens = Some(512);
+        let mut frozen = anthropic_apikey_frozen_config("claude-opus-4-8");
+        frozen.max_output_tokens = 512;
+        let provider = FrozenProvider::new(frozen);
+
+        let summary = drive_request(&dir, &provider, request)
+            .await
+            .expect("API-key resolution sends no thinking budget");
+
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_anthropic_output_cap_below_thinking_budget_remains_resumable() {
+        let dir = broca_test_support::scratch_root().join(format!(
+            "broca-anthropic-cap-legacy-resume-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut request = request(&dir);
+        request.generation.max_output_tokens = Some(512);
+        let frozen = anthropic_oauth_with_output_cap(512);
+        seed_resumable_request(&dir, &request, &frozen);
+        let provider = FrozenProvider::new(frozen);
+
+        let summary = drive_request(&dir, &provider, request)
+            .await
+            .expect("a previously admitted run is not re-checked on resume");
+
+        assert_eq!(summary.reason, RunFinishReason::Completed);
+        let sent = provider.sent.lock().unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            sent.get(&0)
+                .expect("resume reached its previously admitted provider"),
+        )
+        .expect("rendered body is JSON");
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        drop(sent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn anthropic_oauth_interleaved_thinking_refuses_forced_tool_choices_at_fresh_admission() {
         let cases = [

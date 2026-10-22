@@ -209,6 +209,7 @@ pub fn decide(
         reason: reason.map(str::to_owned),
         profile: route.profile.map(|profile| profile.name().to_owned()),
         delivery,
+        instructions_paragraph_break: true,
     })
 }
 
@@ -690,9 +691,10 @@ fn instructions(frozen: &FrozenStructuredOutput) -> String {
 /// appended to the run's tools, or for an unconstrained `final_text` run, the schema
 /// instructions appended to the system prompt. Borrowed, unchanged, for a run without.
 ///
-/// The instructions join the first system message as a final text block. A prompt with no
-/// system message gets one at the front, and every renderer-only position into the prompt
-/// (declared cache markers, episode starts) moves with it.
+/// The instructions join the first system message as a final text block, after a blank line
+/// when the run froze `instructions_paragraph_break`. A prompt with no system message gets one
+/// at the front, and every renderer-only position into the prompt (declared cache markers,
+/// episode starts) moves with it.
 pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a, CallOptions> {
     let Some(so) = &frozen.structured_output else {
         return Cow::Borrowed(opts);
@@ -714,12 +716,19 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
         }
         Mode::FinalText if so.delivery == SchemaDelivery::Unconstrained => {
             let mut view = opts.clone();
-            let block = ContentBlock::Text {
-                text: instructions(so),
-            };
             match view.prompt.iter_mut().find(|m| m.role == Role::System) {
-                Some(system) => system.content.push(block),
+                Some(system) => {
+                    let text = if so.instructions_paragraph_break {
+                        format!("\n\n{}", instructions(so))
+                    } else {
+                        instructions(so)
+                    };
+                    system.content.push(ContentBlock::Text { text });
+                }
                 None => {
+                    let block = ContentBlock::Text {
+                        text: instructions(so),
+                    };
                     view.prompt
                         .insert(0, Message::new(Role::System, vec![block]));
                     for marker in &mut view.declared_markers {
