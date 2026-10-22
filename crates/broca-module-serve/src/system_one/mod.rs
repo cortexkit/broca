@@ -24,7 +24,9 @@
 //!   existing grace, and never longer.
 
 mod classify;
+pub mod credential;
 pub mod typesafe;
+pub mod workers_ai;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,8 +50,12 @@ pub(crate) const STORE_ROLE: &str = "classifier";
 pub const OP_ROLE_DESCRIBE: &str = cortexkit_role_classifier::ops::ROLE_DESCRIBE;
 pub const OP_CLASSIFY_RUN: &str = cortexkit_role_classifier::ops::CLASSIFY_RUN;
 
-/// The catalog id of TypeSafe's Jev 1.13.0, the only model this build routes.
+/// The catalog id of TypeSafe's Jev 1.13.0.
 pub const JEV_1_13_0: &str = cortexkit_role_classifier::provider::catalog_ids::JEV_1_13_0;
+/// The catalog id of Cloudflare Workers AI's Clef.
+pub const CLEF: &str = cortexkit_role_classifier::provider::catalog_ids::CLEF;
+/// The catalog id of Cloudflare Workers AI's Clef-flash.
+pub const CLEF_FLASH: &str = cortexkit_role_classifier::provider::catalog_ids::CLEF_FLASH;
 
 /// The code a call is answered with when serving it failed inside broca (a panic, or the
 /// batch store refusing a write). Transient: the caller re-sends, and the stored outcomes
@@ -124,6 +130,14 @@ pub enum ProviderReply {
         status: u16,
         retry_after_ms: Option<u64>,
     },
+    /// A Cloudflare Workers AI reply that carried no answer: its HTTP status, the first
+    /// `errors[].code` of its body when it named one, and the wait it asked for. Mapped by
+    /// that code first, then by the status (the classifier role's Workers AI table).
+    WorkersAiError {
+        status: u16,
+        code: Option<u64>,
+        retry_after_ms: Option<u64>,
+    },
     /// No reply: the connection failed or the attempt ran out of time.
     Transport(String),
     /// The credential could not be read, so nothing was sent.
@@ -138,7 +152,8 @@ pub trait ClassifierProvider: Send + Sync {
     /// The id of the credential this provider presents, for `auth_failed`'s detail. Never a
     /// token.
     fn credential_id(&self) -> Option<String>;
-    /// Send one provider request body (`{model, state, questions}`) and return what came back.
+    /// Send one provider request body (`{model, state, questions, images?}`) and return what
+    /// came back.
     async fn call(&self, body: String) -> ProviderReply;
 }
 
@@ -171,6 +186,40 @@ impl ModelPin {
             provider_model: JEV_1_13_0_WIRE.to_owned(),
             max_questions: cortexkit_role_classifier::provider::clef_limits::MAX_QUESTIONS as u64,
             images_max: None,
+            provider,
+        }
+    }
+
+    /// Cloudflare Workers AI's Clef, which takes `clef`: up to 64 questions and 4 images per
+    /// item (Cloudflare's limits), images only where the catalog row allows attachments.
+    pub fn clef(provider: Arc<dyn ClassifierProvider>) -> Self {
+        Self::workers_ai(
+            CLEF,
+            cortexkit_role_classifier::provider::models::CLEF,
+            provider,
+        )
+    }
+
+    /// Cloudflare Workers AI's Clef-flash, which takes `clef-flash`, with Clef's limits.
+    pub fn clef_flash(provider: Arc<dyn ClassifierProvider>) -> Self {
+        Self::workers_ai(
+            CLEF_FLASH,
+            cortexkit_role_classifier::provider::models::CLEF_FLASH,
+            provider,
+        )
+    }
+
+    fn workers_ai(
+        catalog_id: &str,
+        provider_model: &str,
+        provider: Arc<dyn ClassifierProvider>,
+    ) -> Self {
+        use cortexkit_role_classifier::provider::clef_limits;
+        Self {
+            catalog_id: catalog_id.to_owned(),
+            provider_model: provider_model.to_owned(),
+            max_questions: clef_limits::MAX_QUESTIONS as u64,
+            images_max: Some(clef_limits::MAX_IMAGES as u64),
             provider,
         }
     }
@@ -427,3 +476,7 @@ fn error_body(code: &str, message: &str) -> Vec<u8> {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "workers_ai_tests.rs"]
+mod workers_ai_tests;

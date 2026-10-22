@@ -269,6 +269,10 @@ async fn main() -> Result<(), String> {
             ProviderReply::Transport(message) => format!(
                 "{name}: no reply in {elapsed} ms ({message}), so broca would record provider_error"
             ),
+            // Only the Workers AI client answers this; the TypeSafe client never does.
+            ProviderReply::WorkersAiError { status, .. } => format!(
+                "{name}: HTTP {status} in {elapsed} ms read as a Workers AI error, which this client never returns"
+            ),
             ProviderReply::Credential(message) => {
                 format!("{name}: credential unavailable ({message}); nothing sent")
             }
