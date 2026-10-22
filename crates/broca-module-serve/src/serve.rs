@@ -2527,7 +2527,13 @@ where
                             run_id,
                             reason,
                             delivered,
-                        } => (SendResult::Finished { run_id, reason }, delivered),
+                        } => (
+                            SendResult::Finished {
+                                run_id,
+                                reason: reason.into(),
+                            },
+                            delivered,
+                        ),
                         broca_module::SendResponse::Paused {
                             run_id,
                             pause_reason,
@@ -2535,7 +2541,7 @@ where
                         } => (
                             SendResult::Paused {
                                 run_id,
-                                pause_reason,
+                                pause_reason: pause_reason.into(),
                             },
                             delivered,
                         ),

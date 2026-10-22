@@ -357,7 +357,7 @@ impl AssistantMessage {
 }
 
 /// Unified finish reason, normalized from the provider's raw reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -368,22 +368,35 @@ pub enum FinishReason {
     Other,
 }
 
-impl<'de> Deserialize<'de> for FinishReason {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        Ok(match raw.as_str() {
-            "stop" => Self::Stop,
-            "length" => Self::Length,
-            "tool_calls" => Self::ToolCalls,
-            "content_filter" => Self::ContentFilter,
-            "error" => Self::Error,
-            "other" => Self::Other,
-            _ => Self::Other,
-        })
-    }
+/// Decode a step finish reason on a caller-facing surface, where a newer runner may send a
+/// reason this build does not know.
+///
+/// An unfamiliar reason reads as [`FinishReason::Other`], the bucket this vocabulary already
+/// keeps for a provider reason that matches none of the named ones, so no named reason is
+/// claimed for it. Durable WAL records and provider events keep the derived, closed decoding.
+pub fn deserialize_caller_finish_reason<'de, D>(deserializer: D) -> Result<FinishReason, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = crate::caller::OpenState::<FinishReason>::deserialize(deserializer)?;
+    Ok(match raw {
+        crate::caller::OpenState::Known(reason) => reason,
+        crate::caller::OpenState::Unknown(_) => FinishReason::Other,
+    })
+}
+
+/// The optional form of [`deserialize_caller_finish_reason`].
+pub fn deserialize_optional_caller_finish_reason<'de, D>(
+    deserializer: D,
+) -> Result<Option<FinishReason>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<crate::caller::OpenState<FinishReason>>::deserialize(deserializer)?;
+    Ok(raw.map(|raw| match raw {
+        crate::caller::OpenState::Known(reason) => reason,
+        crate::caller::OpenState::Unknown(_) => FinishReason::Other,
+    }))
 }
 
 #[cfg(test)]
@@ -391,13 +404,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_provider_finish_reason_uses_the_other_fallback() {
-        let reason: FinishReason = serde_json::from_str("\"future_reason\"").unwrap();
-        assert_eq!(reason, FinishReason::Other);
+    fn unknown_provider_finish_reason_uses_the_other_fallback_only_for_callers() {
+        #[derive(Deserialize)]
+        struct CallerRead {
+            #[serde(deserialize_with = "deserialize_caller_finish_reason")]
+            finish_reason: FinishReason,
+            #[serde(
+                default,
+                deserialize_with = "deserialize_optional_caller_finish_reason"
+            )]
+            final_step_finish_reason: Option<FinishReason>,
+        }
+        let read: CallerRead = serde_json::from_str(
+            r#"{"finish_reason":"future_reason","final_step_finish_reason":"future_reason"}"#,
+        )
+        .unwrap();
+        assert_eq!(read.finish_reason, FinishReason::Other);
+        assert_eq!(read.final_step_finish_reason, Some(FinishReason::Other));
+        let known: CallerRead = serde_json::from_str(r#"{"finish_reason":"tool_calls"}"#).unwrap();
+        assert_eq!(known.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(known.final_step_finish_reason, None);
         assert_eq!(
             serde_json::to_string(&FinishReason::Other).unwrap(),
             "\"other\""
         );
+
+        // The closed enum, which durable records use, still refuses a value it does not know.
+        assert!(serde_json::from_str::<FinishReason>("\"future_reason\"").is_err());
     }
 
     fn text_message(role: Role, text: &str) -> Message {

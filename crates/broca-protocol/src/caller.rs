@@ -67,6 +67,7 @@ pub enum ControlUnit {
     StepFinished {
         step_id: StepId,
         usage: Usage,
+        #[serde(deserialize_with = "crate::content::deserialize_caller_finish_reason")]
         finish_reason: FinishReason,
     },
     /// Approval round-trip request; the caller replies on the control back-channel.
@@ -83,7 +84,6 @@ pub enum ControlUnit {
     /// the run is RESUMABLE under the same run_id once the cause clears.
     Paused {
         run_id: RunId,
-        #[serde(deserialize_with = "deserialize_caller_pause_reason")]
         reason: PauseReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<SharedProviderError>,
@@ -109,7 +109,11 @@ pub enum ControlUnit {
         usage: Option<Usage>,
         /// The provider finish reason recorded on the last model step in this run.
         /// Absent when the run produced no model step or the WAL predates this metadata.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "crate::content::deserialize_optional_caller_finish_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         final_step_finish_reason: Option<FinishReason>,
         /// Tool calls whose side effects may have happened without a durable definite result.
         /// Present only for interrupted terminals; an empty vector proves no call was dispatched.
@@ -265,7 +269,7 @@ impl Serialize for SharedProviderError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunFinishReason {
     /// `stop_when` satisfied / no more tool calls.
@@ -318,23 +322,19 @@ pub enum RunFinishReason {
     TransformUnavailable,
 }
 
-impl<'de> Deserialize<'de> for RunFinishReason {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        Ok(match raw.as_str() {
-            "completed" => Self::Completed,
-            "max_steps" => Self::MaxSteps,
-            "budget_exhausted" => Self::BudgetExhausted,
-            "context_ceiling" => Self::ContextCeiling,
-            "cancelled" => Self::Cancelled,
-            "interrupted" => Self::Interrupted,
-            "error" => Self::Error,
-            "transform_unavailable" => Self::TransformUnavailable,
-            _ => Self::Error,
-        })
+impl RunFinishReason {
+    /// The spelling the WAL and every caller-facing surface use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::MaxSteps => "max_steps",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::ContextCeiling => "context_ceiling",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::Error => "error",
+            Self::TransformUnavailable => "transform_unavailable",
+        }
     }
 }
 
@@ -362,32 +362,97 @@ impl PauseReason {
     }
 }
 
-/// Decode a caller-facing pause reason without making durable WAL reasons extensible. Unknown
-/// caller tags keep the run paused for human review rather than claiming a graceful restart.
-pub fn deserialize_caller_pause_reason<'de, D>(deserializer: D) -> Result<PauseReason, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = String::deserialize(deserializer)?;
-    Ok(caller_pause_reason_from_wire(&raw))
+/// A run state value as a caller reads it, where a newer runner may send a value this build
+/// does not know.
+///
+/// Runner state vocabularies, such as why a run finished or why it paused, grow over time. A
+/// client that decoded them as closed enums would fail to read any reply that carries a new
+/// value, so caller-facing replies decode into this type instead. A value this build knows
+/// becomes [`OpenState::Known`]; any other string is kept verbatim as [`OpenState::Unknown`].
+///
+/// An unknown value is never mapped onto the nearest known one. It does not mean the run
+/// failed, and it does not mean the run needs re-authentication: the caller only knows that the
+/// run reached a state this build cannot interpret, and it must handle that as its own case.
+///
+/// A known value is written exactly as the closed enum writes it, and an unknown one as its
+/// received string, so for the run finish and pause reasons both are bare strings. Durable WAL records keep the closed enums and still refuse a value
+/// they do not know.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OpenState<T> {
+    /// A value from this build's vocabulary.
+    Known(T),
+    /// A value from a newer vocabulary, exactly as the producer spelled it.
+    Unknown(String),
 }
 
-/// The optional caller-surface form of [`deserialize_caller_pause_reason`].
-pub fn deserialize_optional_caller_pause_reason<'de, D>(
-    deserializer: D,
-) -> Result<Option<PauseReason>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(raw.as_deref().map(caller_pause_reason_from_wire))
+/// Why a run finished, as a caller reads it: see [`OpenState`].
+pub type OpenRunFinishReason = OpenState<RunFinishReason>;
+
+/// Why a run paused, as a caller reads it: see [`OpenState`].
+pub type OpenPauseReason = OpenState<PauseReason>;
+
+impl<T> OpenState<T> {
+    /// The value when this build knows it.
+    pub fn known(&self) -> Option<&T> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Unknown(_) => None,
+        }
+    }
 }
 
-fn caller_pause_reason_from_wire(raw: &str) -> PauseReason {
-    match raw {
-        "auth_required" => PauseReason::AuthRequired,
-        "restart" => PauseReason::Restart,
-        _ => PauseReason::AuthRequired,
+impl<T> From<T> for OpenState<T> {
+    fn from(value: T) -> Self {
+        Self::Known(value)
+    }
+}
+
+impl OpenState<RunFinishReason> {
+    /// The wire spelling, including an unknown value as it was received.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Known(reason) => reason.as_str(),
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl OpenState<PauseReason> {
+    /// The wire spelling, including an unknown value as it was received.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Known(reason) => reason.as_str(),
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for OpenState<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Known(value) => value.serialize(serializer),
+            Self::Unknown(raw) => serializer.serialize_str(raw),
+        }
+    }
+}
+
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for OpenState<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Only an unfamiliar string is open. A value of the wrong JSON type is still refused,
+        // since that is a malformed reply rather than a newer vocabulary.
+        let raw = String::deserialize(deserializer)?;
+        let known =
+            T::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&raw));
+        Ok(match known {
+            Ok(value) => Self::Known(value),
+            Err(_) => Self::Unknown(raw),
+        })
     }
 }
 
@@ -671,23 +736,69 @@ mod tests {
     }
 
     #[test]
-    fn unknown_finish_and_pause_reasons_use_caller_fallbacks() {
-        let finish: RunFinishReason = serde_json::from_str("\"future_finish\"").unwrap();
-        assert_eq!(finish, RunFinishReason::Error);
+    fn unknown_finish_and_pause_reasons_decode_as_explicit_unknown_states() {
+        let finish: OpenRunFinishReason = serde_json::from_str("\"future_finish\"").unwrap();
+        assert_eq!(finish, OpenState::Unknown("future_finish".into()));
+        assert_eq!(finish.as_str(), "future_finish");
+        assert_eq!(finish.known(), None);
+        assert_eq!(serde_json::to_string(&finish).unwrap(), "\"future_finish\"");
 
-        let paused: ControlUnit = serde_json::from_value(serde_json::json!({
+        let pause: OpenPauseReason = serde_json::from_str("\"future_pause\"").unwrap();
+        assert_eq!(pause, OpenState::Unknown("future_pause".into()));
+        assert_eq!(pause.as_str(), "future_pause");
+        assert_eq!(serde_json::to_string(&pause).unwrap(), "\"future_pause\"");
+
+        // A malformed value is not a newer vocabulary, so it is still refused.
+        assert!(serde_json::from_str::<OpenPauseReason>("7").is_err());
+    }
+
+    #[test]
+    fn known_open_states_keep_the_closed_wire_spelling() {
+        for reason in [
+            RunFinishReason::Completed,
+            RunFinishReason::MaxSteps,
+            RunFinishReason::BudgetExhausted,
+            RunFinishReason::ContextCeiling,
+            RunFinishReason::Cancelled,
+            RunFinishReason::Interrupted,
+            RunFinishReason::Error,
+            RunFinishReason::TransformUnavailable,
+        ] {
+            let closed = serde_json::to_string(&reason).unwrap();
+            assert_eq!(closed, format!("\"{}\"", reason.as_str()));
+            let open = OpenRunFinishReason::from(reason);
+            assert_eq!(serde_json::to_string(&open).unwrap(), closed);
+            assert_eq!(
+                serde_json::from_str::<OpenRunFinishReason>(&closed).unwrap(),
+                OpenState::Known(reason)
+            );
+        }
+        for reason in [PauseReason::AuthRequired, PauseReason::Restart] {
+            let closed = serde_json::to_string(&reason).unwrap();
+            assert_eq!(closed, format!("\"{}\"", reason.as_str()));
+            let open = OpenPauseReason::from(reason);
+            assert_eq!(serde_json::to_string(&open).unwrap(), closed);
+            assert_eq!(
+                serde_json::from_str::<OpenPauseReason>(&closed).unwrap(),
+                OpenState::Known(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn durable_reason_enums_stay_closed_to_unknown_values() {
+        // WAL records decode these enums directly. A record a newer runner wrote with a reason
+        // this build does not know must be refused, not read as some other recorded outcome.
+        assert!(serde_json::from_str::<RunFinishReason>("\"future_finish\"").is_err());
+        assert!(serde_json::from_str::<PauseReason>("\"future_pause\"").is_err());
+        let paused = serde_json::from_value::<ControlUnit>(serde_json::json!({
             "type": "paused",
             "run_id": "run-1",
             "reason": "future_pause"
-        }))
-        .unwrap();
-        assert_eq!(
-            paused,
-            ControlUnit::Paused {
-                run_id: RunId("run-1".into()),
-                reason: PauseReason::AuthRequired,
-                error: None,
-            }
+        }));
+        assert!(
+            paused.is_err(),
+            "a paused unit has no unknown reason to carry; the subscribe reader handles it"
         );
     }
 }

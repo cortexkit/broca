@@ -30,7 +30,7 @@ use crate::wire::{
 
 use broca_wire::RunResultParams;
 
-pub use broca_wire::{decode_subscribe_event, SubscribeEvent};
+pub use broca_wire::{decode_subscribe_event, SubscribeEvent, UnrecognizedRunState};
 
 /// A client for one session on a module. Short requests like send/status/cancel/retract use
 /// the shared command channel because they complete quickly, and replies are matched by
@@ -74,17 +74,21 @@ pub struct SendSpec<'a> {
 
 /// What a `send` produced: an active run, an already-finished run, or a durably-queued submission.
 #[derive(Debug, Clone, PartialEq)]
+///
+/// Pause and finish reasons are open: a reason from a newer runner arrives as
+/// [`broca_protocol::OpenState::Unknown`], which says only that the run paused or ended for a
+/// reason this client cannot interpret. It is not an error and not a re-authentication pause.
 pub enum SendOutcome {
     Paused {
         run_id: String,
-        pause_reason: broca_protocol::PauseReason,
+        pause_reason: broca_protocol::OpenPauseReason,
     },
     Active {
         run_id: String,
     },
     Finished {
         run_id: String,
-        reason: broca_protocol::RunFinishReason,
+        reason: broca_protocol::OpenRunFinishReason,
     },
     Pending {
         submission_id: String,
@@ -564,6 +568,30 @@ mod tests {
     }
 
     #[test]
+    fn unknown_send_pause_and_finish_reasons_reach_the_caller_as_unknown() {
+        let body = br#"{"result":{"state":"finished","run_id":"run-1","reason":"future_finish"}}"#;
+        let result: SendResult = decode_result_envelope(body, "decode send result").unwrap();
+        assert_eq!(
+            send_outcome(result).unwrap(),
+            SendOutcome::Finished {
+                run_id: "run-1".into(),
+                reason: broca_protocol::OpenState::Unknown("future_finish".into()),
+            }
+        );
+
+        let body =
+            br#"{"result":{"state":"paused","run_id":"run-1","pause_reason":"future_pause"}}"#;
+        let result: SendResult = decode_result_envelope(body, "decode send result").unwrap();
+        assert_eq!(
+            send_outcome(result).unwrap(),
+            SendOutcome::Paused {
+                run_id: "run-1".into(),
+                pause_reason: broca_protocol::OpenState::Unknown("future_pause".into()),
+            }
+        );
+    }
+
+    #[test]
     fn typed_read_matches_legacy_double_parse() {
         let read = ReadResult {
             next_late_after: None,
@@ -611,7 +639,7 @@ mod tests {
         assert_typed_response_matches_legacy(
             &SendResult::Finished {
                 run_id: "run-1".into(),
-                reason: broca_protocol::RunFinishReason::Interrupted,
+                reason: broca_protocol::RunFinishReason::Interrupted.into(),
             },
             "decode finished send result",
         );

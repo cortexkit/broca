@@ -2512,8 +2512,8 @@ target = "--lib"
 test_file = "crates/broca-wire/src/lib.rs"
 expect_red = ["send_finished_tests::finished_send_reply_pins_wire_bytes"]
 file = "crates/broca-wire/src/lib.rs"
-old = "    Finished {\n        run_id: String,\n        reason: broca_protocol::RunFinishReason,"
-new = "    #[serde(rename = \"done\")] // NON-VACUITY BREAK\n    Finished {\n        run_id: String,\n        reason: broca_protocol::RunFinishReason,"
+old = "    Finished {\n        run_id: String,\n        /// An unfamiliar reason from a newer runner reads as `Unknown`, never as `error`.\n        reason: broca_protocol::OpenRunFinishReason,"
+new = "    #[serde(rename = \"done\")] // NON-VACUITY BREAK\n    Finished {\n        run_id: String,\n        /// An unfamiliar reason from a newer runner reads as `Unknown`, never as `error`.\n        reason: broca_protocol::OpenRunFinishReason,"
 
 # This proof checks the following behavior: projection failure diagnostics increment their counter in
 # production, not just tests.
@@ -21638,48 +21638,86 @@ select = "expected"
 test_file = "crates/broca-wire/src/lib.rs"
 expect_red = ["open_state_tests::unknown_subscribe_envelopes_and_event_types_reset_display_state"]
 file = "crates/broca-wire/src/lib.rs"
-old = "enum SubscribeEventOwned {\n    Control {\n        cursor: CursorWire,\n        unit: broca_protocol::caller::ControlUnit,\n    },\n    Display {\n        event: DisplayEvent,\n    },\n    #[serde(other)]\n    Unknown,"
-new = "enum SubscribeEventOwned {\n    Control {\n        cursor: CursorWire,\n        unit: broca_protocol::caller::ControlUnit,\n    },\n    Display {\n        event: DisplayEvent,\n    },\n    Unknown, // NON-VACUITY BREAK: reject future subscribe lanes"
+old = "    Display {\n        event: DisplayEvent,\n    },\n    #[serde(other)]\n    Unknown,\n}"
+new = "    Display {\n        event: DisplayEvent,\n    },\n    Unknown, // NON-VACUITY BREAK: reject future subscribe lanes\n}"
 
 
 [[control]]
 id = "provider-finish-reason-unknown-fallback"
-guards = "An unfamiliar provider finish reason is retained as the generic other reason rather than failing event decoding"
+guards = "A caller reading an unfamiliar step finish reason gets the generic other reason rather than a named one or a decode failure"
 runner = "cargo"
 package = "broca-protocol"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-protocol/src/content.rs"
-expect_red = ["content::tests::unknown_provider_finish_reason_uses_the_other_fallback"]
+expect_red = ["content::tests::unknown_provider_finish_reason_uses_the_other_fallback_only_for_callers"]
 file = "crates/broca-protocol/src/content.rs"
-old = "            _ => Self::Other,"
-new = "            _ => Self::Stop, // NON-VACUITY BREAK: label a new provider reason as stop."
+old = "        crate::caller::OpenState::Unknown(_) => FinishReason::Other,\n    })\n}"
+new = "        crate::caller::OpenState::Unknown(_) => FinishReason::Stop, // NON-VACUITY BREAK: label a new provider reason as stop.\n    })\n}"
 
 [[control]]
-id = "run-finish-reason-unknown-fallback"
-guards = "An unfamiliar run finish reason degrades to error rather than failing caller event decoding"
+id = "durable-finish-reason-stays-closed"
+guards = "The closed step finish reason that WAL records decode refuses an unfamiliar value instead of reading it as other"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/content.rs"
+expect_red = ["content::tests::unknown_provider_finish_reason_uses_the_other_fallback_only_for_callers"]
+file = "crates/broca-protocol/src/content.rs"
+old = "    Error,\n    Other,\n}"
+new = "    Error,\n    #[serde(other)] // NON-VACUITY BREAK: durable records accept unknown reasons.\n    Other,\n}"
+
+[[control]]
+id = "open-run-state-keeps-unknown-values"
+guards = "An unfamiliar run finish or pause reason on a caller surface decodes as an explicit Unknown carrying its spelling, not as a known reason or a decode failure"
 runner = "cargo"
 package = "broca-protocol"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-protocol/src/caller.rs"
-expect_red = ["caller::tests::unknown_finish_and_pause_reasons_use_caller_fallbacks"]
+expect_red = ["caller::tests::unknown_finish_and_pause_reasons_decode_as_explicit_unknown_states"]
 file = "crates/broca-protocol/src/caller.rs"
-old = "            \"transform_unavailable\" => Self::TransformUnavailable,\n            _ => Self::Error,"
-new = "            \"transform_unavailable\" => Self::TransformUnavailable,\n            _ => Self::Completed, // NON-VACUITY BREAK: report an unknown failure as completed."
+old = "            Err(_) => Self::Unknown(raw),"
+new = "            Err(error) => return Err(D::Error::custom(error)), // NON-VACUITY BREAK: close the caller vocabulary."
 
 [[control]]
-id = "caller-pause-reason-unknown-fallback"
-guards = "An unfamiliar caller pause reason remains paused for human review instead of being treated as a restart"
+id = "durable-pause-reason-stays-closed"
+guards = "The closed pause reason that WAL records decode refuses an unfamiliar value instead of reading it as a known pause"
 runner = "cargo"
 package = "broca-protocol"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-protocol/src/caller.rs"
-expect_red = ["caller::tests::unknown_finish_and_pause_reasons_use_caller_fallbacks"]
+expect_red = ["caller::tests::durable_reason_enums_stay_closed_to_unknown_values", "caller::tests::unknown_finish_and_pause_reasons_decode_as_explicit_unknown_states"]
 file = "crates/broca-protocol/src/caller.rs"
-old = "        \"restart\" => PauseReason::Restart,\n        _ => PauseReason::AuthRequired,"
-new = "        \"restart\" => PauseReason::Restart,\n        _ => PauseReason::Restart, // NON-VACUITY BREAK: resume without human auth."
+old = "    /// A graceful process stop at a clean boundary; the same episode can resume after boot.\n    Restart,"
+new = "    /// A graceful process stop at a clean boundary; the same episode can resume after boot.\n    #[serde(other)] // NON-VACUITY BREAK: read an unknown pause as a restart.\n    Restart,"
+
+[[control]]
+id = "subscribe-unknown-run-reason-becomes-unrecognized-state"
+guards = "A subscribe control unit whose finish reason is newer than the client decodes as an unrecognized run state instead of failing the stream"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["open_state_tests::subscribe_units_with_unknown_run_reasons_become_unrecognized_run_states"]
+file = "crates/broca-wire/src/lib.rs"
+old = "        } => Some(UnrecognizedRunState::Finished { run_id, reason }),"
+new = "        } => None, // NON-VACUITY BREAK: fail the stream on a newer finish reason."
+
+[[control]]
+id = "session-cli-unknown-finish-is-not-success"
+guards = "The session CLI stops on its run's unrecognized ending without reporting success, since it cannot tell whether the run succeeded"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module-serve --bin broca-session \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module-serve/src/bin/broca-session.rs"
+expect_red = ["tests::combined_turn_ends_on_an_unrecognized_finish_without_calling_it_an_error"]
+file = "crates/broca-module-serve/src/bin/broca-session.rs"
+old = "            Some(OpenState::Unknown(_)) => 1,"
+new = "            Some(OpenState::Unknown(_)) => 0, // NON-VACUITY BREAK: report an unknown ending as success."
 
 [[control]]
 id = "caller-error-class-open-string-decode"

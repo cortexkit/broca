@@ -38,24 +38,6 @@ pub fn serialized_result_frame_bytes(result: &impl Serialize) -> u64 {
         .saturating_add(SUBC_FRAME_HEADER_BYTES)
 }
 
-fn deserialize_caller_pause_reason<'de, D>(
-    deserializer: D,
-) -> Result<broca_protocol::PauseReason, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    broca_protocol::caller::deserialize_caller_pause_reason(deserializer)
-}
-
-fn deserialize_optional_caller_pause_reason<'de, D>(
-    deserializer: D,
-) -> Result<Option<broca_protocol::PauseReason>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    broca_protocol::caller::deserialize_optional_caller_pause_reason(deserializer)
-}
-
 /// A route request: the method name plus its operation-specific params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteRequest {
@@ -1011,15 +993,16 @@ pub enum FromWire {
 pub enum SendResult {
     Paused {
         run_id: String,
-        #[serde(deserialize_with = "deserialize_caller_pause_reason")]
-        pause_reason: broca_protocol::PauseReason,
+        /// An unfamiliar reason from a newer runner reads as `Unknown`, never as a known one.
+        pause_reason: broca_protocol::OpenPauseReason,
     },
     Active {
         run_id: String,
     },
     Finished {
         run_id: String,
-        reason: broca_protocol::RunFinishReason,
+        /// An unfamiliar reason from a newer runner reads as `Unknown`, never as `error`.
+        reason: broca_protocol::OpenRunFinishReason,
     },
     Pending {
         submission_id: String,
@@ -1618,12 +1601,8 @@ pub enum RunStatusResponse {
     },
     Paused {
         /// Explicit restart-pause discriminator; authentication-pause replies omit this field to preserve their existing wire shape.
-        #[serde(
-            default,
-            deserialize_with = "deserialize_optional_caller_pause_reason",
-            skip_serializing_if = "Option::is_none"
-        )]
-        pause_reason: Option<broca_protocol::PauseReason>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pause_reason: Option<broca_protocol::OpenPauseReason>,
         #[serde(
             default,
             deserialize_with = "crate::role::deserialize_optional_run_usage",
@@ -1654,7 +1633,11 @@ pub enum RunStatusResponse {
         /// does not change the run's interrupted state into an error state.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<SharedProviderError>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         final_step_finish_reason: Option<FinishReason>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
@@ -1683,7 +1666,11 @@ pub enum RunStatusResponse {
     Completed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         directives: Option<Vec<cortexkit_role_llm_runner::directives::Directive>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         final_step_finish_reason: Option<FinishReason>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
@@ -1708,7 +1695,11 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     MaxSteps {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         final_step_finish_reason: Option<FinishReason>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
@@ -1734,7 +1725,11 @@ pub enum RunStatusResponse {
     },
     BudgetExhausted {
         detail: broca_protocol::BudgetExhaustedDetail,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         final_step_finish_reason: Option<FinishReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
@@ -1755,7 +1750,11 @@ pub enum RunStatusResponse {
     },
     ContextCeiling {
         context_ceiling: broca_protocol::ContextCeilingDetail,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         final_step_finish_reason: Option<FinishReason>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
@@ -1773,7 +1772,11 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Cancelled {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         final_step_finish_reason: Option<FinishReason>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
@@ -1798,7 +1801,11 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Error {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         final_step_finish_reason: Option<FinishReason>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
@@ -1827,7 +1834,11 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     TransformUnavailable {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
+            skip_serializing_if = "Option::is_none"
+        )]
         final_step_finish_reason: Option<FinishReason>,
         /// Steer send ids durable in this episode whose input was not included in a model
         /// step, in WAL order. A present empty list means WAL replay found none;
@@ -1859,9 +1870,11 @@ pub enum RunStatusResponse {
 #[cfg(test)]
 mod open_state_tests {
     use super::{
-        AccountSelectionRefusedDetail, DisplayEvent, FlowPrincipalRefusal, QueuedSendState,
-        RunStatusResponse, SendResult, SubscribeEvent,
+        decode_subscribe_event, AccountSelectionRefusedDetail, DisplayEvent, FlowPrincipalRefusal,
+        QueuedSendState, RunPaused, RunPausedDetail, RunStatusResponse, SendResult, SubscribeEvent,
+        UnrecognizedRunState,
     };
+    use broca_protocol::{ControlUnit, OpenState, PauseReason, RunFinishReason, RunId};
 
     #[test]
     fn unknown_run_status_state_decodes_to_a_nonterminal_fallback() {
@@ -1885,16 +1898,145 @@ mod open_state_tests {
     }
 
     #[test]
-    fn unknown_pause_reason_keeps_the_status_paused_for_human_review() {
+    fn unknown_pause_and_finish_reasons_decode_as_explicit_unknown_states() {
         let status: RunStatusResponse =
             serde_json::from_str(r#"{"state":"paused","pause_reason":"future_pause"}"#).unwrap();
+        let RunStatusResponse::Paused { pause_reason, .. } = &status else {
+            panic!("expected a paused status, got {status:?}");
+        };
+        assert_eq!(
+            pause_reason,
+            &Some(OpenState::Unknown("future_pause".into()))
+        );
+
+        let paused: SendResult = serde_json::from_str(
+            r#"{"state":"paused","run_id":"run-1","pause_reason":"future_pause"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            paused,
+            SendResult::Paused {
+                run_id: "run-1".into(),
+                pause_reason: OpenState::Unknown("future_pause".into()),
+            }
+        );
+
+        let finished: SendResult = serde_json::from_str(
+            r#"{"state":"finished","run_id":"run-1","reason":"future_finish"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            finished,
+            SendResult::Finished {
+                run_id: "run-1".into(),
+                reason: OpenState::Unknown("future_finish".into()),
+            }
+        );
+
+        let refusal: RunPaused = serde_json::from_value(serde_json::json!({
+            "code": "run_paused",
+            "message": "paused",
+            "detail": {"kind": "run_paused", "run_id": "run-1", "reason": "future_pause"}
+        }))
+        .unwrap();
+        assert_eq!(
+            refusal.detail,
+            RunPausedDetail::RunPaused {
+                run_id: "run-1".into(),
+                reason: OpenState::Unknown("future_pause".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn known_pause_and_finish_reasons_keep_their_wire_bytes() {
+        let paused = SendResult::Paused {
+            run_id: "run-1".into(),
+            pause_reason: PauseReason::AuthRequired.into(),
+        };
+        let bytes = r#"{"state":"paused","run_id":"run-1","pause_reason":"auth_required"}"#;
+        assert_eq!(serde_json::to_string(&paused).unwrap(), bytes);
+        assert_eq!(serde_json::from_str::<SendResult>(bytes).unwrap(), paused);
+
+        let finished = SendResult::Finished {
+            run_id: "run-1".into(),
+            reason: RunFinishReason::Completed.into(),
+        };
+        let bytes = r#"{"state":"finished","run_id":"run-1","reason":"completed"}"#;
+        assert_eq!(serde_json::to_string(&finished).unwrap(), bytes);
+        assert_eq!(serde_json::from_str::<SendResult>(bytes).unwrap(), finished);
+
+        let refusal = RunPaused::new("run-1".into(), PauseReason::Restart);
+        let value = serde_json::to_value(&refusal).unwrap();
+        assert_eq!(
+            value["detail"],
+            serde_json::json!({"kind": "run_paused", "run_id": "run-1", "reason": "restart"})
+        );
+    }
+
+    #[test]
+    fn subscribe_units_with_unknown_run_reasons_become_unrecognized_run_states() {
+        let paused: SubscribeEvent = serde_json::from_value(serde_json::json!({
+            "kind": "control",
+            "cursor": {"wal_seq": 7, "sub_index": 1},
+            "unit": {"type": "paused", "run_id": "run-1", "reason": "future_pause"}
+        }))
+        .unwrap();
+        assert_eq!(
+            paused,
+            SubscribeEvent::UnrecognizedRunState {
+                wal_seq: 7,
+                sub_index: 1,
+                state: UnrecognizedRunState::Paused {
+                    run_id: RunId("run-1".into()),
+                    reason: "future_pause".into(),
+                },
+            }
+        );
+
+        let body = br#"{"kind":"control","cursor":{"wal_seq":8,"sub_index":0},"unit":{"type":"run_finished","run_id":"run-1","reason":"future_finish","retries_used":0}}"#;
+        let finished = decode_subscribe_event(body).unwrap();
+        let SubscribeEvent::UnrecognizedRunState { state, .. } = &finished else {
+            panic!("expected an unrecognized run state, got {finished:?}");
+        };
+        assert_eq!(state.run_id(), Some(&RunId("run-1".into())));
+        assert_eq!(state.reason(), "future_finish");
+        assert!(matches!(state, UnrecognizedRunState::Finished { .. }));
+        assert_eq!(
+            serde_json::to_value(&finished).unwrap(),
+            serde_json::json!({
+                "kind": "control",
+                "cursor": {"wal_seq": 8, "sub_index": 0},
+                "unit": {"type": "run_finished", "run_id": "run-1", "reason": "future_finish"}
+            })
+        );
+
+        // A known reason still decodes as the ordinary control unit.
+        let known = decode_subscribe_event(
+            br#"{"kind":"control","cursor":{"wal_seq":9,"sub_index":0},"unit":{"type":"run_finished","run_id":"run-1","reason":"completed"}}"#,
+        )
+        .unwrap();
         assert!(matches!(
-            status,
-            RunStatusResponse::Paused {
-                pause_reason: Some(broca_protocol::PauseReason::AuthRequired),
+            known,
+            SubscribeEvent::Control {
+                unit: ControlUnit::RunFinished {
+                    reason: RunFinishReason::Completed,
+                    ..
+                },
                 ..
             }
         ));
+
+        // A pause without the run id it must carry is refused even with an unknown reason, and
+        // a unit with a known reason that fails to decode for another cause is still refused.
+        let malformed = decode_subscribe_event(
+            br#"{"kind":"control","cursor":{"wal_seq":10,"sub_index":0},"unit":{"type":"paused","reason":"future_pause"}}"#,
+        );
+        assert!(malformed.is_err(), "{malformed:?}");
+        let malformed_known = decode_subscribe_event(
+            br#"{"kind":"control","cursor":{"wal_seq":11,"sub_index":0},"unit":{"type":"run_finished","reason":"completed","retries_used":"x"}}"#,
+        );
+        assert!(malformed_known.is_err(), "{malformed_known:?}");
     }
 
     #[test]
@@ -2079,6 +2221,125 @@ pub enum SubscribeEvent {
         unit: broca_protocol::caller::ControlUnit,
     },
     Display(DisplayEvent),
+    /// A `paused` or `run_finished` control unit whose reason is newer than this client.
+    ///
+    /// The run did pause or end, so a caller waiting on it must stop waiting, but this client
+    /// cannot say why. It is neither a failed run nor a re-authentication pause, and a caller
+    /// must not report it as either.
+    UnrecognizedRunState {
+        wal_seq: u64,
+        sub_index: u32,
+        state: UnrecognizedRunState,
+    },
+}
+
+/// A run pause or ending whose reason this client does not know, as the subscribe stream
+/// carried it. See [`SubscribeEvent::UnrecognizedRunState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnrecognizedRunState {
+    /// The run paused, so it may still resume under the same run id.
+    Paused {
+        run_id: broca_protocol::RunId,
+        reason: String,
+    },
+    /// The run ended. `run_id` is absent only when the producer predates run ids on
+    /// terminals, exactly as on [`broca_protocol::ControlUnit::RunFinished`].
+    Finished {
+        run_id: Option<broca_protocol::RunId>,
+        reason: String,
+    },
+}
+
+impl UnrecognizedRunState {
+    /// The run this pause or ending names, when the producer recorded one.
+    pub fn run_id(&self) -> Option<&broca_protocol::RunId> {
+        match self {
+            Self::Paused { run_id, .. } => Some(run_id),
+            Self::Finished { run_id, .. } => run_id.as_ref(),
+        }
+    }
+
+    /// The reason exactly as the producer spelled it.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Paused { reason, .. } | Self::Finished { reason, .. } => reason,
+        }
+    }
+}
+
+/// The control unit an [`UnrecognizedRunState`] was read from, written back with only the
+/// fields this client understood.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum UnrecognizedRunStateRef<'a> {
+    Paused {
+        run_id: &'a broca_protocol::RunId,
+        reason: &'a str,
+    },
+    RunFinished {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<&'a broca_protocol::RunId>,
+        reason: &'a str,
+    },
+}
+
+impl<'a> From<&'a UnrecognizedRunState> for UnrecognizedRunStateRef<'a> {
+    fn from(state: &'a UnrecognizedRunState) -> Self {
+        match state {
+            UnrecognizedRunState::Paused { run_id, reason } => Self::Paused { run_id, reason },
+            UnrecognizedRunState::Finished { run_id, reason } => Self::RunFinished {
+                run_id: run_id.as_ref(),
+                reason,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum UnrecognizedSubscribeEventRef<'a> {
+    Control {
+        cursor: CursorWire,
+        unit: UnrecognizedRunStateRef<'a>,
+    },
+}
+
+/// The run id and reason of a `paused` or `run_finished` unit, read to find an unfamiliar
+/// reason. Other fields are not checked: a newer runner that adds a reason may also change
+/// them, and the caller only needs to know which run paused or ended.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RunStateProbe {
+    Paused {
+        run_id: broca_protocol::RunId,
+        reason: broca_protocol::OpenPauseReason,
+    },
+    RunFinished {
+        #[serde(default)]
+        run_id: Option<broca_protocol::RunId>,
+        reason: broca_protocol::OpenRunFinishReason,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// The unrecognized run state a pause or finish unit carries, or `None` when the unit is not a
+/// pause or finish, lacks the fields the probe needs, or carries a known reason. In the last
+/// case the closed control unit's own decoding error is the one to report.
+fn unrecognized_run_state(unit: &serde_json::Value) -> Option<UnrecognizedRunState> {
+    match RunStateProbe::deserialize(unit).ok()? {
+        RunStateProbe::Paused {
+            run_id,
+            reason: broca_protocol::OpenState::Unknown(reason),
+        } => Some(UnrecognizedRunState::Paused { run_id, reason }),
+        RunStateProbe::RunFinished {
+            run_id,
+            reason: broca_protocol::OpenState::Unknown(reason),
+        } => Some(UnrecognizedRunState::Finished { run_id, reason }),
+        RunStateProbe::Paused { .. } | RunStateProbe::RunFinished { .. } | RunStateProbe::Other => {
+            None
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -2123,7 +2384,9 @@ pub fn encode_subscribe_display(event: &DisplayEvent) -> serde_json::Result<Vec<
 enum SubscribeEventOwned {
     Control {
         cursor: CursorWire,
-        unit: broca_protocol::caller::ControlUnit,
+        // Kept as a JSON value so a unit with a newer pause or finish reason can be read again
+        // as an unrecognized run state after the closed control unit refuses it.
+        unit: serde_json::Value,
     },
     Display {
         event: DisplayEvent,
@@ -2151,6 +2414,18 @@ impl Serialize for SubscribeEvent {
             }
             .serialize(serializer),
             Self::Display(event) => SubscribeEventRef::Display { event }.serialize(serializer),
+            Self::UnrecognizedRunState {
+                wal_seq,
+                sub_index,
+                state,
+            } => UnrecognizedSubscribeEventRef::Control {
+                cursor: CursorWire {
+                    wal_seq: *wal_seq,
+                    sub_index: *sub_index,
+                },
+                unit: state.into(),
+            }
+            .serialize(serializer),
         }
     }
 }
@@ -2161,11 +2436,23 @@ impl<'de> Deserialize<'de> for SubscribeEvent {
         D: serde::Deserializer<'de>,
     {
         match SubscribeEventOwned::deserialize(deserializer)? {
-            SubscribeEventOwned::Control { cursor, unit } => Ok(Self::Control {
-                wal_seq: cursor.wal_seq,
-                sub_index: cursor.sub_index,
-                unit,
-            }),
+            SubscribeEventOwned::Control { cursor, unit } => {
+                match broca_protocol::caller::ControlUnit::deserialize(&unit) {
+                    Ok(control) => Ok(Self::Control {
+                        wal_seq: cursor.wal_seq,
+                        sub_index: cursor.sub_index,
+                        unit: control,
+                    }),
+                    Err(error) => match unrecognized_run_state(&unit) {
+                        Some(state) => Ok(Self::UnrecognizedRunState {
+                            wal_seq: cursor.wal_seq,
+                            sub_index: cursor.sub_index,
+                            state,
+                        }),
+                        None => Err(serde::de::Error::custom(error)),
+                    },
+                }
+            }
             SubscribeEventOwned::Display { event } => Ok(Self::Display(event)),
             SubscribeEventOwned::Unknown => Ok(Self::Display(DisplayEvent::DisplayReset)),
         }
@@ -2632,8 +2919,7 @@ pub struct RunPaused {
 pub enum RunPausedDetail {
     RunPaused {
         run_id: String,
-        #[serde(deserialize_with = "deserialize_caller_pause_reason")]
-        reason: broca_protocol::PauseReason,
+        reason: broca_protocol::OpenPauseReason,
     },
 }
 
@@ -2647,7 +2933,10 @@ impl RunPaused {
                  delivery \"interrupt\" to end it and start this message",
                 reason.as_str()
             ),
-            detail: RunPausedDetail::RunPaused { run_id, reason },
+            detail: RunPausedDetail::RunPaused {
+                run_id,
+                reason: reason.into(),
+            },
         }
     }
 }
@@ -4034,7 +4323,7 @@ mod send_finished_tests {
     fn finished_send_reply_pins_wire_bytes() {
         let result = SendResult::Finished {
             run_id: "run-1".into(),
-            reason: broca_protocol::RunFinishReason::Interrupted,
+            reason: broca_protocol::RunFinishReason::Interrupted.into(),
         };
         let bytes = br#"{"state":"finished","run_id":"run-1","reason":"interrupted"}"#;
         assert_eq!(serde_json::to_vec(&result).unwrap(), bytes);
@@ -4391,7 +4680,7 @@ mod restart_wire_tests {
         scope_refusal_golden::assert_golden(
             RunStatusResponse::Paused {
                 title: None,
-                pause_reason: Some(broca_protocol::PauseReason::Restart),
+                pause_reason: Some(broca_protocol::PauseReason::Restart.into()),
                 usage: None,
                 retries_used: 0,
                 reason: Some("restart".into()),

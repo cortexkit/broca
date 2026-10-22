@@ -638,7 +638,7 @@ mod pinned_reply_bytes {
             (
                 crate::SendResult::Finished {
                     run_id: "run-1".into(),
-                    reason: broca_protocol::RunFinishReason::Completed,
+                    reason: broca_protocol::RunFinishReason::Completed.into(),
                 },
                 "send_reply.unreceipted.finished.json",
                 SEND_REPLY_FINISHED_SHA256,
@@ -681,7 +681,7 @@ mod pinned_reply_bytes {
         let turn = SendReplyWire {
             result: crate::SendResult::Finished {
                 run_id: "run-1".into(),
-                reason: broca_protocol::RunFinishReason::Cancelled,
+                reason: broca_protocol::RunFinishReason::Cancelled.into(),
             },
             baseline: None,
             delivered: Some(Delivered::new(delivered_as::TURN).with_ref("run-2")),

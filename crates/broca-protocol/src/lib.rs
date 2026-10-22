@@ -55,7 +55,9 @@ pub mod usage;
 
 // Convenience re-exports for the common wire surface.
 pub use approval::{ApprovalRequest, ApprovalResponse};
-pub use caller::{ControlUnit, PauseReason, RunFinishReason};
+pub use caller::{
+    ControlUnit, OpenPauseReason, OpenRunFinishReason, OpenState, PauseReason, RunFinishReason,
+};
 pub use canonical::canonical_json_bytes;
 pub use content::{
     AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, Message, Role,
