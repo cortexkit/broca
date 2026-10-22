@@ -1027,7 +1027,8 @@ fn serialize_caller_message<S: serde::Serializer>(
     use broca_protocol::ContentBlock;
     // The model's text as every exposure shows it: cleaned of tag notation where the run that
     // wrote it cleans (llm-runner §9.6). The stored message keeps the raw text.
-    let message = broca_protocol::tags::exposed_message(message);
+    let exposed = broca_protocol::tags::exposed_message(message);
+    let message: &broca_protocol::Message = &exposed;
     if !message
         .content
         .iter()
@@ -1035,7 +1036,7 @@ fn serialize_caller_message<S: serde::Serializer>(
     {
         return message.serialize(serializer);
     }
-    CallerMessageRef(&message).serialize(serializer)
+    CallerMessageRef(message).serialize(serializer)
 }
 
 struct CallerMessageRef<'a>(&'a broca_protocol::Message);
@@ -5581,6 +5582,9 @@ mod caller_message_tests {
             message,
             run: None,
             tool_calls: Vec::new(),
+            described: None,
+            digest: None,
+            part_digests: None,
         };
 
         let wire = serde_json::to_value(&response).unwrap();

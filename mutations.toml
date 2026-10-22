@@ -19839,7 +19839,7 @@ new = "message.content.retain(|_block| true); // NON-VACUITY BREAK: keep reasoni
 
 [[control]]
 id = "compaction-view-defers-over-the-open-turn"
-guards = "a view that would invalidate or leave out the signed reasoning of the open tool turn (the turn copied into a fold included) is deferred, or refused at a step that starts from a user message such as a steer after its results, never applied"
+guards = "a view that would invalidate or leave out the signed reasoning of the open tool turn (a steer after its results included, or the turn copied into a fold) is deferred, not applied"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
@@ -22332,34 +22332,6 @@ new = "    Retracted,\n    Unknown, // NON-VACUITY BREAK: reject future queued s
 [[control]]
 id = "caller-unknown-control-event-reset-fallback"
 guards = "An unknown caller control event clears partial display state instead of failing stream decoding"
-id = "tags-switch-counts-on-from-the-ledger-high-water"
-guards = "The first run under the computed tag rules starts above every number the stored ledger handed out, so no number a reader saw is reused"
-runner = "cargo"
-package = "broca-core"
-target = "--test it"
-select = "expected"
-test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
-expect_red = ["runner_tags_v1_pin::the_first_run_after_the_switch_counts_on_from_the_stored_high_water"]
-file = "crates/broca-core/src/run.rs"
-old = "                checkpoint: ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)),"
-new = "                checkpoint: 0 * ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)), // NON-VACUITY BREAK: forget the ledger's high-water."
-
-[[control]]
-id = "tags-run-in-flight-keeps-the-stored-ledger"
-guards = "A run frozen under runner-tags/v1 resumes with its old numbering and exact old request bytes"
-runner = "cargo"
-package = "broca-core"
-target = "--test it"
-select = "expected"
-test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
-expect_red = ["runner_tags_v1_pin::a_session_written_under_the_stored_ledger_keeps_its_exact_bytes"]
-file = "crates/broca-core/src/run.rs"
-old = "            config.and_then(|config| config.computed_tags),"
-new = "            Some(broca_wal::ComputedTagRules { checkpoint: 0 }), // NON-VACUITY BREAK: resume a ledger run under the computed rules."
-
-[[control]]
-id = "tags-only-parts-rendered-with-a-number-count"
-guards = "Reasoning, tool calls, empty text and JSON tool output never take a tag number"
 runner = "cargo"
 package = "broca-protocol"
 target = "--lib"
@@ -22373,15 +22345,6 @@ new = "    /// Unknown future control events use this conservative reset fallbac
 [[control]]
 id = "display-unknown-event-reset-fallback"
 guards = "An unknown display event resets partial state instead of failing the stream frame"
-test_file = "crates/broca-protocol/src/tags.rs"
-expect_red = ["tags::tests::computed_numbering_counts_only_parts_rendered_with_a_number"]
-file = "crates/broca-protocol/src/tags.rs"
-old = "                    .is_some_and(cortexkit_role_llm_runner::tags::counts);"
-new = "                    .is_some(); // NON-VACUITY BREAK: number every known part."
-
-[[control]]
-id = "tags-image-only-result-renders-its-label"
-guards = "An image-only tool result renders as its number and the [image] label"
 runner = "cargo"
 package = "broca-protocol"
 target = "--lib"
@@ -22668,6 +22631,53 @@ expect_red = ["runtime::tests::an_amountless_stated_zero_rate_is_a_known_zero_pr
 file = "crates/broca-catalog/src/runtime.rs"
 old = "        return Some(0.0);"
 new = "        return None; // NON-VACUITY BREAK: read a free side as unpriced."
+
+[[control]]
+id = "tags-switch-counts-on-from-the-ledger-high-water"
+guards = "The first run under the computed tag rules starts above every number the stored ledger handed out, so no number a reader saw is reused"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
+expect_red = ["runner_tags_v1_pin::the_first_run_after_the_switch_counts_on_from_the_stored_high_water"]
+file = "crates/broca-core/src/run.rs"
+old = "                checkpoint: ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)),"
+new = "                checkpoint: 0 * ledger_high.max(broca_protocol::tags::high_after(&prior.prompt)), // NON-VACUITY BREAK: forget the ledger's high-water."
+
+[[control]]
+id = "tags-run-in-flight-keeps-the-stored-ledger"
+guards = "A run frozen under runner-tags/v1 resumes with its old numbering and exact old request bytes"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/runner_tags_v1_pin.rs"
+expect_red = ["runner_tags_v1_pin::a_session_written_under_the_stored_ledger_keeps_its_exact_bytes"]
+file = "crates/broca-core/src/run.rs"
+old = "            config.and_then(|config| config.computed_tags),"
+new = "            Some(broca_wal::ComputedTagRules { checkpoint: 0 }), // NON-VACUITY BREAK: resume a ledger run under the computed rules."
+
+[[control]]
+id = "tags-only-parts-rendered-with-a-number-count"
+guards = "Reasoning, tool calls, empty text and JSON tool output never take a tag number"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::computed_numbering_counts_only_parts_rendered_with_a_number"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "                    .is_some_and(cortexkit_role_llm_runner::tags::counts);"
+new = "                    .is_some(); // NON-VACUITY BREAK: number every known part."
+
+[[control]]
+id = "tags-image-only-result-renders-its-label"
+guards = "An image-only tool result renders as its number and the [image] label"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
 test_file = "crates/broca-protocol/src/tags.rs"
 expect_red = ["tags::tests::computed_rendering_numbers_cleans_and_labels"]
 file = "crates/broca-protocol/src/tags.rs"
@@ -22737,8 +22747,8 @@ select = "expected"
 test_file = "crates/broca-wire/src/lib.rs"
 expect_red = ["caller_message_tests::a_read_cleans_the_model_text_only_where_its_run_cleans"]
 file = "crates/broca-wire/src/lib.rs"
-old = "    let message = broca_protocol::tags::exposed_message(message);"
-new = "    let message = std::borrow::Cow::Borrowed(message); // NON-VACUITY BREAK: serve raw model text."
+old = "    let exposed = broca_protocol::tags::exposed_message(message);"
+new = "    let exposed = std::borrow::Cow::Borrowed(message); // NON-VACUITY BREAK: serve raw model text."
 
 [[control]]
 id = "resolve-answers-the-cleaned-model-text"
