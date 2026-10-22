@@ -2817,12 +2817,23 @@ file = "crates/broca-module/src/registry.rs"
 old = "            || range.anchor_at(position.seq) != position.at"
 new = "            || false // NON-VACUITY BREAK: trust a cached position after the frame was replaced."
 
+# Linux and macOS only. Windows files carry no stable identity, so the WAL range reader never
+# serves a suffix from a cached byte anchor there (broca_wal read_records_range ignores an
+# anchor when metadata_file_id is None) and every ownership read rereads the whole log.
+# With this break planted, the cached snapshot path still rereads the corrupted first frame
+# on Windows and fails closed, so the guarded branch changes nothing that platform can
+# observe. On Windows the fail-closed outcome is still checked by the same test, run
+# unmutated in the native Windows integration lane; there is no cached prefix to disclose an owner
+# from on that platform, because the range reader records no byte anchors without a file
+# identity (broca_wal select_range).
+
 [[control]]
 id = "module-moved-ownership-revalidates-full-history"
 guards = "move-fenced ownership refuses unreadable history instead of disclosing an owner from a cached prefix"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test it"
+platforms = ["linux", "macos"]
 select = "expected"
 test_file = "crates/broca-module-serve/tests/it/wire.rs"
 expect_red = ["wire::unreadable_moved_ownership_fails_closed_without_repair"]
@@ -12046,17 +12057,58 @@ file = "crates/broca-module/src/move_install.rs"
 old = 'if !known_version || !known_features {'
 new = 'if false && (!known_version || !known_features) { // NON-VACUITY BREAK'
 
+# Two layers refuse a write open while a move intent is pending: the store's check at the
+# top of FileWalStore::open_with_class and FileWal's own open guard, which checks the same
+# session reference. Either one alone keeps the installed-WAL scenario fenced, so each
+# layer has a row whose test reaches it with the other out of the way, and the
+# installed-WAL scenario has a row that removes both.
+# The store-level check is the only one that runs before an archived copy is restored
+# into the live tree; the core row proves that.
+# Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
+# --lib target because running the full target exceeds the 10-minute replay limit.
+
 [[control]]
 id = "move-core-opener-fence"
+guards = "a write open refused by a pending move intent never restores the archived WAL into the live tree first"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_fold/tests.rs"
+expect_red = ["wal_fold::tests::pending_move_intent_refuses_open_before_restoring_archived_copy"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = 'self.check_move(session, true)?;'
+new = '// NON-VACUITY BREAK: open without the ref-scoped intent fence'
+
+[[control]]
+id = "move-writer-open-intent-fence"
+guards = "the WAL writer itself refuses to open a session named by a pending move intent"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::writer_open_refuses_a_pending_move_intent_naming_its_reference"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "        crate::migration::guard(&path, &session_ref, true)?;"
+new = "        // NON-VACUITY BREAK: open without the writer's own move guard."
+
+[[control]]
+id = "move-installed-wal-open-fence-layers"
 guards = "first-time installed WALs cannot reopen while activation remains pending"
 runner = "cargo"
 package = "broca-module"
 target = "--lib"
 test_file = "crates/broca-module/src/move_files/tests.rs"
 expect_red = ["move_files::tests::installed_wal_without_recorded_activation_stays_fenced_on_reader_release"]
+[[control.edits]]
 file = "crates/broca-core/src/wal_writer.rs"
 old = 'self.check_move(session, true)?;'
 new = '// NON-VACUITY BREAK: open without the ref-scoped intent fence'
+[[control.edits]]
+file = "crates/broca-wal/src/file_wal.rs"
+old = "        crate::migration::guard(&path, &session_ref, true)?;"
+new = "        // NON-VACUITY BREAK: open without the writer's own move guard."
 
 # This proof checks the following behavior: a tombstone hides archived bytes without restoring the
 # archived WAL.
