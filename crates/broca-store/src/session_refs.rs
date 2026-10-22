@@ -52,6 +52,7 @@ fn init_schema_measured(
         "CREATE TABLE IF NOT EXISTS agent_data_census (address TEXT PRIMARY KEY, covered INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS agent_data_census_pending ON agent_data_census(address) WHERE covered=0",
         "CREATE TABLE IF NOT EXISTS agent_data_census_inflight (address TEXT PRIMARY KEY) WITHOUT ROWID",
+        "CREATE TABLE IF NOT EXISTS agent_data_census_unreadable (address TEXT PRIMARY KEY, reason TEXT NOT NULL) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS agent_data_census_done (id INTEGER PRIMARY KEY CHECK(id=1))",
         "CREATE TABLE IF NOT EXISTS agent_data_pending_session (session TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS agent_data_writer (id INTEGER PRIMARY KEY CHECK(id=1))",
@@ -67,6 +68,14 @@ fn init_schema_measured(
             DELETE FROM agent_data_census_done;
          END",
     ];
+    if !conn.is_autocommit() {
+        // Store initialization already owns the schema transaction. Standalone
+        // migration calls below retain their paced, short writer transactions.
+        for sql in schema {
+            conn.execute_batch(sql)?;
+        }
+        return Ok(());
+    }
     let mut used = 0;
     while used < schema.len() {
         used += batches::write_batch(
@@ -119,7 +128,10 @@ impl SqliteStore {
         let complete: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_data_projection WHERE id=1 AND backfilled=1)
              AND EXISTS(SELECT 1 FROM agent_data_census_done WHERE id=1)
-             AND NOT EXISTS(SELECT 1 FROM agent_data_pending_session)",
+             AND NOT EXISTS(SELECT 1 FROM agent_data_pending_session)
+             AND NOT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)
+             AND NOT EXISTS(SELECT 1 FROM agent_data_census_unreadable u
+                 JOIN agent_data_census c ON c.address=u.address WHERE c.covered=0)",
             [],
             |row| row.get(0),
         )?;

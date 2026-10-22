@@ -351,6 +351,14 @@ impl Fence {
         }
     }
 
+    fn evict_session(&mut self, session: &SessionKey) {
+        self.results.retain(|(owner, _), _| owner != session);
+        self.by_batch.retain(|_, keys| {
+            keys.retain(|(owner, _)| owner != session);
+            !keys.is_empty()
+        });
+    }
+
     /// Total live fence entries (for the eviction test).
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -394,6 +402,25 @@ trait ToolPlaneConnection: Send + Sync {
         ))
     }
 
+    async fn tool_call_staged(
+        &self,
+        route: &RouteHandle,
+        call: &ToolCall,
+        deadline: Duration,
+        preset: Option<&str>,
+    ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+        self.tool_call(
+            route,
+            &call.tool_name,
+            &call.input,
+            Some(&call.tool_call_id.0),
+            deadline,
+            preset,
+        )
+        .await
+        .map_err(crate::connection::ApprovedCallError::AfterPush)
+    }
+
     /// The capability names the daemon advertises (`server.describe`).
     async fn server_capabilities(&self) -> Result<Vec<String>, ConnError>;
 
@@ -403,6 +430,32 @@ trait ToolPlaneConnection: Send + Sync {
 
 #[async_trait]
 impl ToolPlaneConnection for SubcConnection {
+    async fn tool_call_staged(
+        &self,
+        route: &RouteHandle,
+        call: &ToolCall,
+        deadline: Duration,
+        preset: Option<&str>,
+    ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+        let args = serde_json::to_string(&call.input).map_err(|error| {
+            crate::connection::ApprovedCallError::BeforePush(
+                ConnError::Protocol(error.to_string()).into(),
+            )
+        })?;
+        self.tool_call_raw_guarded(
+            route,
+            &call.tool_name,
+            &args,
+            Some(&call.tool_call_id.0),
+            deadline,
+            preset,
+            None,
+            None,
+            &broca_core::tool_plane::DispatchSignals::default(),
+        )
+        .await
+    }
+
     async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
         SubcConnection::catalog_list(self).await
     }
@@ -601,16 +654,9 @@ impl SubcToolPlane {
                     .await,
             )
         } else {
-            SendAttempt::Reply(
+            SendAttempt::approved_reply(
                 self.conn
-                    .tool_call(
-                        route,
-                        &call.tool_name,
-                        &call.input,
-                        Some(&call.tool_call_id.0),
-                        deadline,
-                        preset.as_deref(),
-                    )
+                    .tool_call_staged(route, call, deadline, preset.as_deref())
                     .await,
             )
         }
@@ -1192,6 +1238,7 @@ impl SubcToolPlane {
             .as_ref()
             .is_some_and(|current| may_resend_under(&composed_under, current))
         {
+            self.forget_route(ctx, module_id, fresh);
             return drained(SCOPE_AGENT_CHANGED);
         }
         let _permit = match sem.acquire_owned().await {
@@ -1804,6 +1851,7 @@ impl SubcToolPlane {
         if let Some(token) = self.session_cancel.lock().unwrap().remove(&session) {
             token.cancel();
         }
+        self.fence.lock().unwrap().evict_session(&session);
         self.approved_args
             .lock()
             .unwrap()
@@ -2055,6 +2103,24 @@ impl ToolPlane for SubcToolPlane {
                 reason: "cached route changed before send".into(),
             };
         }
+        if scope.is_some() {
+            let current = self.cached_stamp(&ctx.bind, scope, &module_id, route_handle);
+            let compatible = composed_under
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(original, actual)| may_resend_under(original, actual));
+            if !compatible {
+                self.forget_route(ctx, &module_id, route_handle);
+                return DispatchResult::ScopeDrained {
+                    reason: if composed_under.is_some() && current.is_some() {
+                        SCOPE_AGENT_CHANGED.into()
+                    } else {
+                        SCOPE_UNVERIFIABLE.into()
+                    },
+                    sent: false,
+                };
+            }
+        }
 
         // A signal before writer enqueue returns typed NotSent below. Once the
         // guarded push succeeds, reply failures are handled as sent calls:
@@ -2269,28 +2335,31 @@ impl ToolPlane for SubcToolPlane {
             .map(str::to_owned)
             .or_else(|| self.dispatch_target(ctx, &call.tool_call_id))
             .ok_or_else(|| ToolPlaneError::Unavailable("approval_target_unavailable".into()))?;
-        let route = self
-            .conn
-            .route_open(
-                &module,
-                &ctx.bind,
-                Some(&ScopeSelector::new(
-                    owner,
-                    scope.scope_ref.clone(),
-                    Some(scope.scope_epoch),
-                )),
-            )
-            .await
-            .map_err(|error| {
-                let code = match &error {
-                    ConnError::Rejected(message) => message.code().to_owned(),
-                    _ => SCOPE_UNVERIFIABLE.into(),
-                };
-                ToolPlaneError::ScopeRefused {
-                    code,
-                    detail: error.to_string(),
-                }
-            })?;
+        let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
+        let selector = ScopeSelector::new(owner, scope.scope_ref.clone(), Some(scope.scope_epoch));
+        let route = retry_route_open_with_scope_hold(
+            RouteOpenRetry::within(
+                DEFAULT_ROUTE_OPEN_PATIENCE.deadline,
+                DEFAULT_ROUTE_OPEN_PATIENCE.max_interval,
+            ),
+            Some(ScopeHold {
+                deadline: Instant::now() + self.scope_sync_hold,
+                max_interval: SCOPE_SYNC_HOLD_MAX_INTERVAL,
+            }),
+            Some(&lifecycle),
+            || self.conn.route_open(&module, &ctx.bind, Some(&selector)),
+        )
+        .await
+        .map_err(|error| {
+            let code = match &error {
+                RouteOpenError::Conn(ConnError::Rejected(message)) => message.code().to_owned(),
+                _ => SCOPE_UNVERIFIABLE.into(),
+            };
+            ToolPlaneError::ScopeRefused {
+                code,
+                detail: format!("approval scope recheck failed: {error:?}"),
+            }
+        })?;
         let _ = self.conn.route_close(&route).await;
         Ok(())
     }
@@ -5339,6 +5408,91 @@ mod tests {
     /// refusals, and resolves a call whose route closed by the scope's current state
     /// (`scope.describe`) and by what the call had already done.
     mod scope_carrier {
+        #[tokio::test]
+        async fn session_close_drops_unfinished_fence_results_and_eviction_keys() {
+            let (_, plane, _) = rig(vec![successful_tool_reply("a"), successful_tool_reply("b")]);
+            let first = ctx("same-batch", "first", "r", None);
+            let second = ctx("same-batch", "second", "r", None);
+            let read = call("read");
+            assert_completed_success(plane.dispatch(&first, &read).await);
+            assert_completed_success(plane.dispatch(&second, &read).await);
+            plane.close_session_routes(&first.bind).await;
+            {
+                let fence = plane.fence.lock().unwrap();
+                assert_eq!(fence.len(), 1);
+                let first_key = SubcToolPlane::session_key(&first.bind);
+                assert!(fence
+                    .by_batch
+                    .values()
+                    .flatten()
+                    .all(|(owner, _)| owner != &first_key));
+                assert!(fence
+                    .get(&(SubcToolPlane::session_key(&second.bind), read.tool_call_id))
+                    .is_some());
+            }
+            plane.close_session_routes(&second.bind).await;
+            assert!(plane.fence.lock().unwrap().by_batch.is_empty());
+        }
+
+        #[tokio::test]
+        async fn sibling_rebind_never_sends_an_old_batch_to_a_new_agent() {
+            for close_original in [false, true] {
+                let (conn, plane, describer) = rig(vec![successful_tool_reply("must not send")]);
+                describer.script("head", vec![live("head", 1, "agent-a")]);
+                let (scoped, read) = started(&plane).await;
+                let original = route_of(&plane, &scoped);
+                describer.script("head", vec![live("head", 1, "agent-b")]);
+                if close_original {
+                    conn.close(original);
+                } else {
+                    plane.forget_route(&scoped, "aft", original);
+                    plane
+                        .ensure_route(&scoped.bind, scoped.scope.as_ref(), "aft")
+                        .await
+                        .unwrap();
+                }
+                assert_drained(
+                    plane.dispatch(&scoped, &read).await,
+                    SCOPE_AGENT_CHANGED,
+                    false,
+                );
+                assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
+                assert!(
+                    plane
+                        .cached_route_channel_for_scope(&scoped.bind, scoped.scope.as_ref(), "aft")
+                        .is_none(),
+                    "an incompatible fresh route must not remain cached for siblings"
+                );
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn approval_recheck_retries_temporary_scope_refusals_but_not_final_refusals() {
+            let (conn, plane, _) = rig(Vec::new());
+            let scoped = ctx("approval", "s", "r", Some(scope("head", 1)));
+            conn.script_route_open_sequence(
+                "aft",
+                vec![
+                    RouteOpenScript::rejected("scope_not_synced — owner has not synced"),
+                    RouteOpenScript::default(),
+                ],
+            );
+            plane
+                .recheck_approval_scope(&scoped, &call("read"), Some("aft"))
+                .await
+                .unwrap();
+            assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 2);
+            conn.script_route_open_sequence(
+                "aft",
+                vec![RouteOpenScript::rejected("scope_ended — ended")],
+            );
+            assert!(plane
+                .recheck_approval_scope(&scoped, &call("read"), Some("aft"))
+                .await
+                .is_err());
+            assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 3);
+        }
+
         use super::*;
         use crate::scope_describe::DescribedScope;
         use subc_protocol::scope::{ScopeAttributes, ScopeKind};
@@ -6224,6 +6378,58 @@ mod approval_digest_contract_tests {
 
 #[cfg(test)]
 mod approved_queue_contract_tests {
+    #[tokio::test]
+    async fn ordinary_send_certainty_tracks_the_real_enqueue_boundary() {
+        for pre_enqueue in [true, false] {
+            let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+            if pre_enqueue {
+                module.close_writer_for_test();
+            }
+            let plane = SubcToolPlane::new(conn, "aft");
+            let ctx = BatchCtx {
+                batch_id: BatchId("ordinary".into()),
+                bind: BindIdentity::new("/project", "test", "ordinary"),
+                run_id: broca_protocol::RunId("run".into()),
+                scope: None,
+            };
+            plane.routes.lock().unwrap().insert(
+                SubcToolPlane::route_key(&ctx.bind, None, "aft"),
+                RouteState {
+                    handle: route,
+                    sem: Arc::new(Semaphore::new(1)),
+                    stamp: None,
+                },
+            );
+            let call = ToolCall {
+                tool_call_id: broca_protocol::ToolCallId("ordinary".into()),
+                tool_name: "edit".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            };
+            let result = if pre_enqueue {
+                plane.dispatch(&ctx, &call).await
+            } else {
+                let (result, ()) = tokio::join!(plane.dispatch(&ctx, &call), async {
+                    let request = module.next_request().await;
+                    assert!(module.reply(&request, b"invalid-json".to_vec()));
+                });
+                result
+            };
+            if pre_enqueue {
+                assert!(
+                    matches!(result, DispatchResult::NotSent { .. }),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, DispatchResult::SentButOutcomeUnknown { .. }),
+                    "{result:?}"
+                );
+            }
+            assert_eq!(module.pending_count_for_test(), 0);
+        }
+    }
+
     use super::*;
     use futures::FutureExt;
 

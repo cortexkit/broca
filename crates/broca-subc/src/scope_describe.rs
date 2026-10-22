@@ -63,6 +63,17 @@ pub struct ModuleScopeDescriber {
     next_corr: AtomicU64,
 }
 
+struct PendingDescribe<'a> {
+    describer: &'a ModuleScopeDescriber,
+    corr: u64,
+}
+
+impl Drop for PendingDescribe<'_> {
+    fn drop(&mut self) {
+        self.describer.pending.lock().unwrap().remove(&self.corr);
+    }
+}
+
 impl Default for ModuleScopeDescriber {
     fn default() -> Self {
         Self::new()
@@ -149,17 +160,22 @@ impl ScopeDescriber for ModuleScopeDescriber {
         .map_err(|error| error.to_string())?;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(corr, tx);
-        if writer.send(frame).await.is_err() {
-            self.pending.lock().unwrap().remove(&corr);
-            return Err("broca's module connection closed".into());
-        }
-        let reply = match tokio::time::timeout(DESCRIBE_TIMEOUT, rx).await {
+        // Cancellation can happen at either await, including before writer capacity exists.
+        let _pending = PendingDescribe {
+            describer: self,
+            corr,
+        };
+        let reply = match tokio::time::timeout(DESCRIBE_TIMEOUT, async {
+            writer.send(frame).await.map_err(|_| ())?;
+            rx.await.map_err(|_| ())
+        })
+        .await
+        {
             Ok(Ok(reply)) => reply,
             Ok(Err(_)) => return Err("broca's module connection closed".into()),
             Err(_) => {
-                self.pending.lock().unwrap().remove(&corr);
                 return Err(format!(
-                    "scope.describe got no reply within {DESCRIBE_TIMEOUT:?}"
+                    "scope.describe could not send and receive a reply within {DESCRIBE_TIMEOUT:?}"
                 ));
             }
         };
@@ -191,5 +207,81 @@ fn decode_reply(reply: &Frame) -> Result<DescribedScope, String> {
         }),
         Ok(other) => Err(format!("unexpected reply to scope.describe: {other:?}")),
         Err(error) => Err(format!("decode scope.describe reply: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+
+    fn owner() -> Principal {
+        Principal::Reserved {
+            module_id: "owner".into(),
+        }
+    }
+
+    fn queued_frame() -> Frame {
+        Frame::build(
+            FrameType::Ping,
+            Flags::new(false, Priority::Interactive, false),
+            0,
+            0,
+            1,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelled_describe_cleans_pending_before_and_after_enqueue() {
+        for full in [true, false] {
+            let describer = ModuleScopeDescriber::new();
+            let (writer, mut reader) = mpsc::channel(1);
+            if full {
+                writer.try_send(queued_frame()).unwrap();
+            }
+            describer.attach(writer);
+            let owner = owner();
+            let mut request = Box::pin(describer.describe(&owner, "scope"));
+            assert!(request.as_mut().now_or_never().is_none());
+            assert_eq!(describer.pending.lock().unwrap().len(), 1);
+            drop(request);
+            assert!(describer.pending.lock().unwrap().is_empty());
+            let written = reader.try_recv().unwrap();
+            assert_eq!(
+                written.header.ty,
+                if full {
+                    FrameType::Ping
+                } else {
+                    FrameType::Request
+                }
+            );
+            assert!(reader.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn describe_backpressure_is_inside_the_reply_deadline() {
+        let describer = ModuleScopeDescriber::new();
+        let (writer, mut reader) = mpsc::channel(1);
+        writer.try_send(queued_frame()).unwrap();
+        describer.attach(writer);
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            DESCRIBE_TIMEOUT + Duration::from_secs(1),
+            describer.describe(&owner(), "scope"),
+        )
+        .await
+        .expect("writer backpressure must obey the describe deadline")
+        .unwrap_err();
+        assert!(error.contains("could not send and receive"), "{error}");
+        assert_eq!(started.elapsed(), DESCRIBE_TIMEOUT);
+        assert!(describer.pending.lock().unwrap().is_empty());
+        assert_eq!(reader.try_recv().unwrap().header.ty, FrameType::Ping);
+        assert!(
+            reader.try_recv().is_err(),
+            "a timed-out describe must not enqueue later"
+        );
     }
 }

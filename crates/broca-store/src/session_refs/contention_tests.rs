@@ -510,14 +510,15 @@ fn interrupted_candidate_batch_is_replayed_before_census_completion() {
         [&address],
     )
     .unwrap();
+    let unreadable = census::run(
+        &mut conn,
+        &broca_core::ReadOnlyWalReader::new(&root),
+        None,
+        false,
+    )
+    .unwrap();
     assert!(
-        census::run(
-            &mut conn,
-            &broca_core::ReadOnlyWalReader::new(&root),
-            None,
-            false
-        )
-        .is_err(),
+        !unreadable.complete && unreadable.unreadable == 1,
         "a partial candidate is not proof that its WAL was completely read"
     );
     assert!(

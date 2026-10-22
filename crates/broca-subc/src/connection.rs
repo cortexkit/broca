@@ -95,9 +95,9 @@ const SUBSCRIBE_STREAM_BUFFER: usize = 4096;
 /// The standard per-frame response deadline for request/response calls. Public so callers
 /// of the deadline-parameterized [`SubcConnection::route_unary`] can pass the default.
 ///
-/// THIS IS A LIVENESS PROBE, NOT A WORK BUDGET, and every caller that inherits it today is a
-/// fast local round trip with no model in the loop: control RPCs and the vault's
-/// `credential.get`. A handler that does real work needs its own deadline instead — see
+/// This is a liveness budget for fast local control RPCs, not a provider work budget.
+/// Credential refresh can perform an upstream exchange and uses an explicit longer wait.
+/// A handler that does real work needs its own deadline instead — see
 /// [`TOOL_CALL_TIMEOUT`] for dispatch, and [`ROUTE_OPEN_ATTEMPT_TIMEOUT`] for route opens (the
 /// daemon's bind relay can outlast this value).
 ///
@@ -1277,6 +1277,19 @@ impl SubcConnection {
             .map_err(|error| ConnError::Rejected(decode_error_body(&error)))
     }
 
+    /// A unary request whose provider may perform bounded upstream work, such as token refresh.
+    /// The explicit reply budget does not change pending-registration cleanup on cancellation.
+    pub async fn route_request_raw_with_deadline(
+        &self,
+        route: &RouteHandle,
+        body: Vec<u8>,
+        deadline: Duration,
+    ) -> ConnResult<Vec<u8>> {
+        self.route_request_terminal_with_deadline(route, body, deadline)
+            .await?
+            .map_err(|error| ConnError::Rejected(decode_error_body(&error)))
+    }
+
     /// [`Self::route_request_raw`], keeping a typed refusal's `ERROR` body whole: `Ok(Ok(body))`
     /// for a Response, `Ok(Err(body))` for an Error frame. A caller that branches on an error's
     /// `detail` reads it here; `Rejected` keeps only its code and message.
@@ -1284,6 +1297,16 @@ impl SubcConnection {
         &self,
         route: &RouteHandle,
         body: Vec<u8>,
+    ) -> ConnResult<Result<Vec<u8>, Vec<u8>>> {
+        self.route_request_terminal_with_deadline(route, body, RESPONSE_TIMEOUT)
+            .await
+    }
+
+    async fn route_request_terminal_with_deadline(
+        &self,
+        route: &RouteHandle,
+        body: Vec<u8>,
+        deadline: Duration,
     ) -> ConnResult<Result<Vec<u8>, Vec<u8>>> {
         let corr = self.next_corr();
         let (runtime, _registration, mut rx) =
@@ -1313,7 +1336,9 @@ impl SubcConnection {
                 channel = route.channel, epoch = route.epoch, corr,
                 "route unary progress"
             );
-            let terminal = self.await_terminal(&runtime, &mut rx).await?;
+            let terminal = self
+                .await_terminal_deadline(&runtime, &mut rx, deadline)
+                .await?;
             match terminal.header.ty {
                 FrameType::Response => Ok(Ok(terminal.body)),
                 FrameType::Error => Ok(Err(terminal.body)),
@@ -1728,15 +1753,6 @@ impl SubcConnection {
                 "unexpected tool-call frame {ty:?}"
             ))),
         }
-    }
-
-    async fn await_terminal(
-        &self,
-        runtime: &Arc<ConnectionRuntime>,
-        rx: &mut mpsc::UnboundedReceiver<Frame>,
-    ) -> ConnResult<Frame> {
-        self.await_terminal_deadline(runtime, rx, RESPONSE_TIMEOUT)
-            .await
     }
 
     async fn await_terminal_deadline(

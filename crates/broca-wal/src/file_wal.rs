@@ -32,6 +32,7 @@ pub use human_prompt_count::{
 #[cfg(test)]
 thread_local! {
     static OPEN_STAGES: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    static OPEN_READ_CAP: Cell<u64> = const { Cell::new(DEFAULT_MAX_READ_BYTES) };
 }
 
 fn open_observed(_stage: &'static str) {
@@ -101,7 +102,6 @@ pub struct WalRangeRead {
     file_present: Option<bool>,
     archive_lookup_missed: bool,
     anchors: Vec<WalByteAnchor>,
-    used_features: Vec<String>,
 }
 
 impl WalRangeRead {
@@ -177,7 +177,6 @@ impl WalRangeRead {
             file_present: None,
             archive_lookup_missed: false,
             anchors,
-            used_features: Vec::new(),
         }
     }
 
@@ -191,7 +190,6 @@ impl WalRangeRead {
             file_present: None,
             archive_lookup_missed: false,
             anchors: Vec::new(),
-            used_features: Vec::new(),
         }
     }
 
@@ -201,12 +199,6 @@ impl WalRangeRead {
             .binary_search_by_key(&seq, |anchor| anchor.seq)
             .ok()
             .map(|index| self.anchors[index])
-    }
-
-    /// Feature requirements from the verified source frames, including explicit
-    /// gates not implied by decoded records. A suffix reports only its own frames.
-    pub fn used_features(&self) -> &[String] {
-        &self.used_features
     }
 }
 
@@ -585,7 +577,7 @@ impl FileWal {
     /// bricking an otherwise-recoverable session. A crash during an append followed by a
     /// resume-append is exactly the core recovery path, so this must be clean.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WalError> {
-        Self::open_inner(path.into(), None, None)
+        Self::open_inner(path.into(), None, String::new(), None)
     }
 
     // Callers of this test seam are all `#[cfg(unix)]` (the directory-fsync probe tests), so on
@@ -593,7 +585,7 @@ impl FileWal {
     #[cfg(test)]
     #[cfg_attr(not(unix), allow(dead_code))]
     fn open_with_probe(path: impl Into<PathBuf>, sync_probe: SyncProbe) -> Result<Self, WalError> {
-        Self::open_inner(path.into(), None, Some(sync_probe))
+        Self::open_inner(path.into(), None, String::new(), Some(sync_probe))
     }
 
     /// Open a WAL and record its diagnostic address when this call creates the file.
@@ -607,6 +599,24 @@ impl FileWal {
         session_addr: impl Into<String>,
         identity: impl Into<String>,
     ) -> Result<Self, WalError> {
+        Self::open_with_manifest_and_session_ref(
+            path,
+            manifest_path,
+            session_addr,
+            identity,
+            String::new(),
+        )
+    }
+
+    /// Open with the shared session reference already available to migration fencing.
+    /// Supplying it after open is too late to use the per-reference cut index.
+    pub fn open_with_manifest_and_session_ref(
+        path: impl Into<PathBuf>,
+        manifest_path: impl Into<PathBuf>,
+        session_addr: impl Into<String>,
+        identity: impl Into<String>,
+        session_ref: String,
+    ) -> Result<Self, WalError> {
         Self::open_inner(
             path.into(),
             Some(ManifestAppend {
@@ -614,6 +624,7 @@ impl FileWal {
                 session_addr: session_addr.into(),
                 identity: identity.into(),
             }),
+            session_ref,
             None,
         )
     }
@@ -621,10 +632,11 @@ impl FileWal {
     fn open_inner(
         path: PathBuf,
         manifest: Option<ManifestAppend>,
+        session_ref: String,
         #[cfg(test)] sync_probe: Option<SyncProbe>,
         #[cfg(not(test))] _sync_probe: Option<()>,
     ) -> Result<Self, WalError> {
-        crate::migration::guard(&path, "", true)?;
+        crate::migration::guard(&path, &session_ref, true)?;
         #[cfg(windows)]
         broca_owner_only::validate_if_exists(&path).map_err(WalError::Io)?;
         let mut newly_created_dirs = Vec::new();
@@ -644,12 +656,36 @@ impl FileWal {
         // Recover the valid records and metadata plus the byte offset where they end (the start of
         // any torn tail, or the whole file if intact).
         open_observed("replay");
-        let (records, valid_end, recovered_lineage_id) =
-            replay_path_with_valid_end(&path, DEFAULT_MAX_READ_BYTES)?;
+        #[cfg(test)]
+        let max_read_bytes = OPEN_READ_CAP.with(Cell::get);
+        #[cfg(not(test))]
+        let max_read_bytes = DEFAULT_MAX_READ_BYTES;
+        let recovered = match File::open(&path) {
+            Ok(file) => {
+                let size = file.metadata().map_err(WalError::Io)?.len();
+                if size > max_read_bytes {
+                    return Err(WalError::TooLarge {
+                        max_bytes: max_read_bytes,
+                        file_size: size,
+                    });
+                }
+                scan_prefix(
+                    std::io::BufReader::new(file),
+                    max_read_bytes,
+                    |_| None::<()>,
+                )?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                scan_prefix(std::io::empty(), max_read_bytes, |_| None::<()>)?
+            }
+            Err(error) => return Err(WalError::Io(error)),
+        };
+        let valid_end = recovered.valid_end;
+        let recovered_lineage_id = recovered.lineage_id;
         // Seq is 1-BASED: the first record is seq 1, so a watermark of 0
         // unambiguously means "nothing projected yet" and `tail_after_seq(0)`
         // includes the first record (the cold-start merge case).
-        let next_seq = records.last().map(|r| r.seq + 1).unwrap_or(1);
+        let next_seq = recovered.last_seq.map(|seq| seq + 1).unwrap_or(1);
         // If the file is longer than the last valid record, a torn tail exists — truncate it
         // so the file ends exactly at the last valid record, BEFORE opening the append
         // handle. The truncation uses a dedicated WRITE handle: an append-mode handle
@@ -718,7 +754,7 @@ impl FileWal {
             append_budget: DEFAULT_MAX_READ_BYTES,
             budget_scope: crate::size_limit::SizeScope::Session,
             feature_floor: None,
-            session_ref: String::new(),
+            session_ref,
             #[cfg(test)]
             sync_probe,
         })
@@ -839,6 +875,7 @@ impl FileWal {
             self.append_budget = self.recovery_cap;
         }
         let seq = self.next_seq;
+        let preencoded = frame.is_some();
         let record_bytes = match frame {
             Some(frame) => frame,
             None => encode(seq, fence, record).map_err(WalError::Frame)?,
@@ -863,6 +900,10 @@ impl FileWal {
                 max_bytes: self.append_budget,
                 file_size: required,
             });
+        }
+        if preencoded {
+            crate::framing::validate_preencoded(&record_bytes, seq, fence, record)
+                .map_err(WalError::Frame)?;
         }
         // Raise the floor BEFORE the frame exists, and refuse the append if it cannot be
         // raised. Placement reads the floor to decide which builds may run on this machine;
@@ -1043,74 +1084,126 @@ pub fn first_user_message_in(record: &WalRecord) -> Option<broca_protocol::Messa
         .cloned()
 }
 
-/// Decode frames from the start of a log until `found` returns a value, never reading past
-/// `max_bytes`. Returns that value (or `None` at the end of the log or a torn tail) with the
-/// number of bytes read.
+/// Decode only as far as the requested value. Damage is classified by the same
+/// decoder as full replay, with lookahead bounded by the caller's byte budget.
 fn read_prefix_until_from<T>(
+    file: impl Read,
+    max_bytes: u64,
+    found: impl FnMut(&FramedRecord) -> Option<T>,
+) -> Result<(Option<T>, u64), WalError> {
+    let scan = scan_prefix(file, max_bytes, found)?;
+    Ok((scan.found, scan.bytes_read))
+}
+
+struct PrefixScan<T> {
+    found: Option<T>,
+    bytes_read: u64,
+    valid_end: u64,
+    last_seq: Option<u64>,
+    lineage_id: Option<WalLineageId>,
+}
+
+fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError> {
+    let mut n = 0;
+    while n < bytes.len() {
+        match file.read(&mut bytes[n..]) {
+            Ok(0) => break,
+            Ok(read) => n += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(WalError::Io(error)),
+        }
+    }
+    Ok(n)
+}
+
+/// Strictly decode one body at a time, retaining only the caller's selected value.
+/// Recovery needs the verified end and sequence, not all historical message bodies.
+fn scan_prefix<T>(
     mut file: impl Read,
     max_bytes: u64,
     mut found: impl FnMut(&FramedRecord) -> Option<T>,
-) -> Result<(Option<T>, u64), WalError> {
-    let mut offset = 0usize;
-    let mut previous = None;
-    let mut lineage = None;
+) -> Result<PrefixScan<T>, WalError> {
+    let mut scan = PrefixScan {
+        found: None,
+        bytes_read: 0,
+        valid_end: 0,
+        last_seq: None,
+        lineage_id: None,
+    };
     loop {
+        let offset = scan.valid_end;
         let mut header = [0; crate::framing::HEADER_LEN];
-        match file.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok((None, offset as u64))
+        let available = max_bytes.saturating_sub(offset);
+        let header_budget = available.min(header.len() as u64) as usize;
+        let n = read_up_to(&mut file, &mut header[..header_budget])?;
+        scan.bytes_read += n as u64;
+        if n == 0 && header_budget != 0 {
+            return Ok(scan);
+        }
+        let mut frame = header[..n].to_vec();
+        if n == header.len() {
+            let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+            if len <= crate::framing::MAX_PAYLOAD_LEN {
+                let size = header.len() + len as usize;
+                // The declared payload may be a torn tail's damaged length. Read
+                // only within budget; exceptional classification below probes one
+                // more byte to distinguish EOF from an actually oversized source.
+                let bounded_size = size.min(usize::try_from(available).unwrap_or(usize::MAX));
+                frame.resize(bounded_size, 0);
+                let n = read_up_to(&mut file, &mut frame[header.len()..])?;
+                frame.truncate(header.len() + n);
+                scan.bytes_read += n as u64;
             }
-            Err(error) => return Err(WalError::Io(error)),
         }
-        let len = u32::from_le_bytes(header[..4].try_into().unwrap());
-        if len > crate::framing::MAX_PAYLOAD_LEN {
-            return Err(WalError::Corrupt {
-                offset,
-                source: FrameError::PayloadTooLarge { len },
-            });
-        }
-        let size = header.len() + len as usize;
-        if (offset as u64).saturating_add(size as u64) > max_bytes {
-            return Err(WalError::TooLarge {
-                max_bytes,
-                file_size: offset as u64 + size as u64,
-            });
-        }
-        let mut frame = Vec::with_capacity(size);
-        frame.extend_from_slice(&header);
-        frame.resize(size, 0);
-        match file.read_exact(&mut frame[header.len()..]) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok((None, (offset + size) as u64))
-            }
-            Err(error) => return Err(WalError::Io(error)),
-        }
-        match crate::framing::decode_next(&frame) {
-            crate::framing::DecodeStep::Record { framed, .. } => {
-                validate_contiguous_sequence(previous, 1, framed.seq)?;
-                previous = Some(framed.seq);
+        match decode_next_counted(&frame) {
+            DecodeStep::Record { framed, consumed } => {
+                validate_contiguous_sequence(scan.last_seq, 1, framed.seq)?;
+                scan.last_seq = Some(framed.seq);
+                scan.valid_end += consumed as u64;
                 if let Some(value) = found(&framed) {
-                    return Ok((Some(value), (offset + size) as u64));
+                    scan.found = Some(value);
+                    return Ok(scan);
                 }
             }
-            crate::framing::DecodeStep::Lineage { lineage_id, .. } => {
-                fold_lineage_id(&mut lineage, lineage_id)?
+            DecodeStep::Lineage {
+                lineage_id,
+                consumed,
+            } => {
+                fold_lineage_id(&mut scan.lineage_id, lineage_id)?;
+                scan.valid_end += consumed as u64;
             }
-            crate::framing::DecodeStep::Corrupt(source) => {
-                return Err(WalError::Corrupt { offset, source })
-            }
-            crate::framing::DecodeStep::NewerWriter { ver, missing } => {
+            DecodeStep::NewerWriter { ver, missing } => {
                 return Err(WalError::NewerWriter {
-                    offset,
+                    offset: offset as usize,
                     ver,
                     missing,
-                })
+                });
             }
-            crate::framing::DecodeStep::TornTail => return Ok((None, (offset + size) as u64)),
+            DecodeStep::Corrupt(_) | DecodeStep::TornTail => {
+                // Only the exceptional path reads ahead. A damaged length cannot tell
+                // us whether intact records follow it, so inspect the bounded suffix.
+                let before = frame.len();
+                file.take(available.saturating_sub(before as u64).saturating_add(1))
+                    .read_to_end(&mut frame)
+                    .map_err(WalError::Io)?;
+                scan.bytes_read += (frame.len() - before) as u64;
+                if frame.len() as u64 > available {
+                    return Err(WalError::TooLarge {
+                        max_bytes,
+                        file_size: offset + frame.len() as u64,
+                    });
+                }
+                decode_bytes_seeded(
+                    &frame,
+                    offset,
+                    scan.last_seq,
+                    1,
+                    Vec::new(),
+                    scan.lineage_id,
+                )?;
+                return Ok(scan);
+            }
         }
-        offset += size;
     }
 }
 
@@ -1248,7 +1341,6 @@ pub fn read_records_range(
                 complete_byte_end: None,
                 archive_lookup_missed: false,
                 anchors: Vec::new(),
-                used_features: Vec::new(),
             });
         }
         Err(error) => return Err(WalError::Io(error)),
@@ -1701,19 +1793,12 @@ fn decode_bytes_seeded(
 
 fn select_decoded_range(
     decoded: DecodedBytes,
-    bytes: &[u8],
-    absolute_start: u64,
+    _bytes: &[u8],
+    _absolute_start: u64,
     file_id: Option<u64>,
     after_seq: u64,
     through_seq: Option<u64>,
 ) -> Result<WalRangeRead, WalError> {
-    let used_features = crate::framing::verified_prefix_features(
-        &bytes[..(decoded.valid_end - absolute_start) as usize],
-    )
-    .map_err(|source| WalError::Corrupt {
-        offset: absolute_start as usize,
-        source,
-    })?;
     let source_head = decoded.records.last().map(|(r, _)| r.seq);
     let complete_end = decoded.valid_end;
     let mut range = select_range(
@@ -1723,7 +1808,6 @@ fn select_decoded_range(
         through_seq,
         decoded.lineage_id,
     );
-    range.used_features = used_features;
     if source_head.is_some() && range.next_anchor.map(|a| a.seq) == source_head {
         range.complete_byte_end = Some(complete_end);
     }
@@ -1868,6 +1952,294 @@ fn read_file_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, WalError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn range_reads_do_not_restore_unused_feature_collection_api_or_pass() {
+        let reader = include_str!("file_wal.rs");
+        let framing = include_str!("framing.rs");
+        for obsolete in [
+            concat!("pub fn used_", "features("),
+            concat!("used_", "features: Vec<String>"),
+        ] {
+            assert!(
+                !reader.contains(obsolete),
+                "range reads must not retain unused feature collection: {obsolete}"
+            );
+        }
+        assert!(
+            !framing.contains(concat!("fn verified_prefix_", "features(")),
+            "feature checks belong to the decoder, not a second pass over verified records"
+        );
+    }
+
+    #[test]
+    fn near_cap_torn_headers_recover_before_budget_refusal() {
+        fn open_with_cap(path: &Path, cap: u64) -> Result<FileWal, WalError> {
+            struct RestoreCap(u64);
+            impl Drop for RestoreCap {
+                fn drop(&mut self) {
+                    OPEN_READ_CAP.with(|cap| cap.set(self.0));
+                }
+            }
+            let _restore = RestoreCap(OPEN_READ_CAP.with(|limit| limit.replace(cap)));
+            FileWal::open(path)
+        }
+        fn verified_prefix(tag: &str) -> (PathBuf, Vec<u8>) {
+            let path = tmp(tag);
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append(7, &WalRecord::StepStarted { step_id: StepId(1) }, true)
+                .unwrap();
+            drop(wal);
+            let prefix = std::fs::read(&path).unwrap();
+            (path, prefix)
+        }
+        let next = WalRecord::StepStarted { step_id: StepId(2) };
+        let intact_frame = encode(2, 7, &next).unwrap();
+        let mut header = intact_frame[..crate::framing::HEADER_LEN].to_vec();
+        header[..4].copy_from_slice(&4096u32.to_le_bytes());
+        for slack in [0, 7] {
+            let (path, prefix) = verified_prefix(&format!("near-cap-torn-{slack}"));
+            let mut damaged = prefix.clone();
+            damaged.extend_from_slice(&header);
+            std::fs::write(&path, &damaged).unwrap();
+            let cap = damaged.len() as u64 + slack;
+            assert_eq!(replay_file(&path, cap).unwrap().len(), 1);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                damaged,
+                "readers never trim the tail"
+            );
+            let mut recovered = open_with_cap(&path, cap)
+                .expect("EOF within the cap is a recoverable torn tail, not an oversized WAL");
+            assert_eq!(recovered.last_seq(), 1);
+            assert_eq!(std::fs::read(&path).unwrap(), prefix);
+            assert_eq!(recovered.append(7, &next, true).unwrap(), 2);
+            drop(recovered);
+            assert_eq!(FileWal::open(&path).unwrap().replay().unwrap().len(), 2);
+        }
+
+        let (path, prefix) = verified_prefix("near-cap-intact-control");
+        let mut intact = prefix.clone();
+        intact.extend_from_slice(&intact_frame);
+        std::fs::write(&path, &intact).unwrap();
+        let cap = prefix.len() as u64 + crate::framing::HEADER_LEN as u64 + 1;
+        assert!(matches!(
+            scan_prefix(std::io::Cursor::new(&intact), cap, |_| None::<()>),
+            Err(WalError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            open_with_cap(&path, cap),
+            Err(WalError::TooLarge { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), intact);
+
+        let mut non_tail = prefix;
+        non_tail.extend_from_slice(&header);
+        non_tail.extend_from_slice(&intact_frame);
+        std::fs::write(&path, &non_tail).unwrap();
+        assert!(matches!(
+            open_with_cap(&path, non_tail.len() as u64),
+            Err(WalError::Corrupt {
+                source: FrameError::NonTailIncompleteFrame,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            non_tail,
+            "intact later data forbids tail repair"
+        );
+    }
+
+    #[test]
+    fn prefix_readers_share_replay_damage_policy_without_writing() {
+        let first = encode(1, 1, &WalRecord::StepStarted { step_id: StepId(1) }).unwrap();
+        let second = encode(2, 1, &WalRecord::StepStarted { step_id: StepId(2) }).unwrap();
+        for (tag, bytes, corrupt) in [
+            (
+                "bad-final-digest",
+                {
+                    let mut bytes = first.clone();
+                    *bytes.last_mut().unwrap() ^= 1;
+                    bytes
+                },
+                false,
+            ),
+            (
+                "damaged-nontail-length",
+                {
+                    let mut bytes = first.clone();
+                    bytes[..4].copy_from_slice(&4096u32.to_le_bytes());
+                    bytes.extend_from_slice(&second);
+                    bytes
+                },
+                true,
+            ),
+            (
+                "incomplete-final-frame",
+                first[..first.len() - 1].to_vec(),
+                false,
+            ),
+            (
+                "bad-nontail-digest",
+                {
+                    let mut bytes = first.clone();
+                    *bytes.last_mut().unwrap() ^= 1;
+                    bytes.extend_from_slice(&second);
+                    bytes
+                },
+                true,
+            ),
+        ] {
+            let path = tmp(tag);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(replay_file(&path, 8192).is_err(), corrupt, "{tag}");
+            assert_eq!(
+                read_first_run_started(&path, 8192).is_err(),
+                corrupt,
+                "{tag}"
+            );
+            assert_eq!(
+                read_first_user_message(&path, 8192).is_err(),
+                corrupt,
+                "{tag}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "readers must not repair {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_scan_decodes_strict_bodies_one_frame_at_a_time() {
+        struct BoundedReads(std::io::Cursor<Vec<u8>>);
+        impl Read for BoundedReads {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                assert!(out.len() <= 256, "recovery must not buffer the whole WAL");
+                self.0.read(out)
+            }
+        }
+        let mut bytes = Vec::new();
+        for seq in 1..=1000 {
+            bytes.extend_from_slice(
+                &encode(
+                    seq,
+                    1,
+                    &WalRecord::StepStarted {
+                        step_id: StepId(seq),
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let size = bytes.len() as u64;
+        let scan = scan_prefix(
+            BoundedReads(std::io::Cursor::new(bytes.clone())),
+            size,
+            |_| None::<()>,
+        )
+        .unwrap();
+        assert_eq!(scan.last_seq, Some(1000));
+        assert_eq!(scan.valid_end, size);
+        let invalid = crate::framing::encode_payload(
+            1001,
+            1,
+            br#"{"type":"step_started","step_id":"wrong"}"#,
+        )
+        .unwrap();
+        bytes.extend_from_slice(&invalid);
+        assert!(matches!(
+            scan_prefix(
+                std::io::Cursor::new(bytes),
+                size + invalid.len() as u64,
+                |_| None::<()>
+            ),
+            Err(WalError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn preencoded_mismatches_leave_wal_and_floor_unchanged() {
+        let path = tmp("preencoded-validation");
+        let floor = path.with_extension("floor");
+        let mut wal = FileWal::open(&path).unwrap().with_feature_floor(&floor);
+        let record = WalRecord::StepStarted { step_id: StepId(1) };
+        let other = WalRecord::StepStarted { step_id: StepId(2) };
+        let valid = encode(1, 7, &record).unwrap();
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut extra = valid.clone();
+        extra.extend_from_slice(&valid);
+        let before = std::fs::read(&path).unwrap();
+        for frame in [
+            encode(2, 7, &record).unwrap(),
+            encode(1, 8, &record).unwrap(),
+            encode(1, 7, &other).unwrap(),
+            valid[..valid.len() - 1].to_vec(),
+            corrupt,
+            extra,
+        ] {
+            assert!(wal.append_preencoded(7, &record, true, frame).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!floor.exists());
+            assert_eq!(wal.last_seq(), 0);
+        }
+        let gated: WalRecord = serde_json::from_value(serde_json::json!({
+            "type":"run_cancel_requested", "run_id":"run", "at":"now"
+        }))
+        .unwrap();
+        let ungated =
+            crate::framing::encode_payload(1, 7, &serde_json::to_vec(&gated).unwrap()).unwrap();
+        assert!(wal.append_preencoded(7, &gated, true, ungated).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            !floor.exists(),
+            "rejected frames must not publish feature requirements"
+        );
+        assert_eq!(wal.append_preencoded(7, &record, true, valid).unwrap(), 1);
+        assert_eq!(
+            FileWal::open(&path).unwrap().replay().unwrap()[0].record,
+            record
+        );
+    }
+
+    #[test]
+    fn writer_open_uses_reference_index_and_preserves_standalone_guard() {
+        let root = tmp("indexed-open");
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let reference = "0123456789abcdef0123456789abcdef";
+        let cut = root.join("agent-data/cuts/cut.json");
+        crate::migration::atomic_json(&root, &cut, &serde_json::json!({"intent":null})).unwrap();
+        crate::migration::rebuild_fence_index(&root).unwrap();
+        // A ready index makes an unrelated cut body unnecessary for this reference.
+        std::fs::write(&cut, b"not json").unwrap();
+        let path = root.join("wal/session.wal");
+        let open = || {
+            FileWal::open_with_manifest_and_session_ref(
+                &path,
+                root.join("manifest"),
+                "address",
+                "identity",
+                reference.into(),
+            )
+        };
+        assert!(open().is_ok());
+        assert!(
+            FileWal::open(&path).is_err(),
+            "unindexed opens must retain the full guard"
+        );
+        std::fs::write(
+            path.with_extension("moving"),
+            br#"{"cutId":"cut","endOffset":0,"lineage_id":"id"}"#,
+        )
+        .unwrap();
+        assert!(
+            open().is_err(),
+            "indexed opens must still check moving sidecars"
+        );
+    }
+
     #[test]
     fn first_episode_discriminator_reads_only_its_bounded_prefix() {
         struct Count {
@@ -4007,11 +4379,57 @@ mod tests {
     }
 
     #[test]
+    fn preencoded_append_uses_encoder_bytes_for_precise_floats_and_present_nulls() {
+        let path = tmp("preencoded-precise-null");
+        let mut wal = FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(path.with_extension("floor"));
+        let mut record = run_started(1);
+        let WalRecord::ModelStepFinished { hooks, .. } = &mut record else {
+            unreachable!()
+        };
+        *hooks = Some(Box::new(crate::record::Hooks {
+            original: Some(serde_json::Value::Null),
+            final_value: Some(serde_json::json!({"precise": 1.2345678901234567})),
+            ops: Vec::new(),
+            unavailable: None,
+        }));
+        let frame = encode(1, 7, &record).unwrap();
+        assert!(frame
+            .windows(b"1.2345678901234567".len())
+            .any(|bytes| bytes == b"1.2345678901234567"));
+        assert!(frame
+            .windows(br#""original":null"#.len())
+            .any(|bytes| bytes == br#""original":null"#));
+        let before = std::fs::metadata(&path).unwrap().len() as usize;
+        assert_eq!(
+            wal.append_preencoded(7, &record, true, frame.clone())
+                .unwrap(),
+            1
+        );
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(&written[before..before + frame.len()], frame.as_slice());
+
+        let next = run_started(2);
+        let pretty = serde_json::to_vec_pretty(&next).unwrap();
+        let noncanonical = crate::framing::encode_payload(2, 7, &pretty).unwrap();
+        assert!(
+            wal.append_preencoded(7, &next, true, noncanonical).is_err(),
+            "equal decoded values are not the encoder's measured bytes"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+        assert_eq!(
+            wal.append_preencoded(7, &next, true, encode(2, 7, &next).unwrap())
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn preencoded_append_reuses_the_measured_frame_bytes() {
         let path = tmp("preencoded");
         let record = run_started(1);
-        let payload = serde_json::to_string_pretty(&record).unwrap();
-        let frame = crate::framing::encode_payload(1, 1, payload.as_bytes()).unwrap();
+        let frame = encode(1, 1, &record).unwrap();
         let mut wal = FileWal::open(&path).unwrap();
         let before = std::fs::metadata(&path).unwrap().len() as usize;
         wal.append_preencoded(1, &record, true, frame.clone())

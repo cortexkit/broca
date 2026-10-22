@@ -109,20 +109,29 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     if operation == "private-mode" {
+        if !dry_run {
+            let liveness = writer_liveness(&state_root);
+            if liveness.state != "no" {
+                eprintln!(
+                    "store-maintenance: refusing offline permission repair: {} ({})",
+                    liveness.state, liveness.reason
+                );
+                return ExitCode::from(3);
+            }
+        }
         return private_mode(&state_root, dry_run);
     }
     if operation == "wal-manifest" {
         return wal_manifest(&state_root, manifest_write);
     }
-    let store = match SqliteStore::open(&database) {
+    let liveness = if dry_run {
+        WriterLiveness::stopped()
+    } else {
+        writer_liveness(&state_root)
+    };
+    let store = match open_maintenance_store(&state_root, dry_run, liveness) {
         Ok(store) => store,
-        Err(error) => {
-            eprintln!(
-                "store-maintenance: cannot open {}: {error}",
-                database.display()
-            );
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
 
     match operation.as_str() {
@@ -393,6 +402,30 @@ fn writer_liveness(state_root: &std::path::Path) -> WriterLiveness {
     ))
 }
 
+fn open_maintenance_store(
+    state_root: &std::path::Path,
+    read_only: bool,
+    liveness: WriterLiveness,
+) -> Result<SqliteStore, ExitCode> {
+    if !read_only && liveness.state != "no" {
+        eprintln!("store-maintenance: liveness {}; refusing offline mutation of {}: {}. Stop the daemon first.", liveness.state, state_root.display(), liveness.reason);
+        return Err(ExitCode::from(3));
+    }
+    let database = state_root.join("run-index.db");
+    let result = if read_only {
+        SqliteStore::open_read_only(&database)
+    } else {
+        SqliteStore::open(&database)
+    };
+    result.map_err(|error| {
+        eprintln!(
+            "store-maintenance: cannot open {}: {error}",
+            database.display()
+        );
+        ExitCode::from(2)
+    })
+}
+
 /// Report manifest coverage and per-session project-id observations by default; replace
 /// the sidecar only after an explicit `--write`. Observations belong in the report, never
 /// in sidecar mapping lines: the reader cannot distinguish a tab-separated suffix from
@@ -412,25 +445,9 @@ fn wal_manifest_with(
     write: bool,
     liveness: WriterLiveness,
 ) -> ExitCode {
-    // The whole-file rename can discard concurrent appends. Refuse before even
-    // opening SQLite: opening a store may initialise it and change its bytes.
-    if write && liveness.state != "no" {
-        eprintln!(
-            "store-maintenance: liveness {}; refusing offline mutation: {}. Stop the daemon first, \
-             or re-run without --write to report coverage only.", liveness.state, liveness.reason
-        );
-        return ExitCode::from(3);
-    }
-    let database = state_root.join("run-index.db");
-    let store = match SqliteStore::open(&database) {
+    let store = match open_maintenance_store(state_root, !write, liveness) {
         Ok(store) => store,
-        Err(error) => {
-            eprintln!(
-                "store-maintenance: cannot read {} for WAL manifest rebuild: {error}",
-                database.display()
-            );
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
     let wal_store = FileWalStore::new(state_root.join("wal"));
     let rebuild = match store.rebuild_wal_manifest(&wal_store) {
@@ -836,6 +853,124 @@ fn wal_fold(root: &std::path::Path, args: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use super::open_maintenance_store;
+    #[test]
+    fn reports_and_previews_open_read_only_without_schema_initialization() {
+        let root = temp_root("read-only-maintenance");
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let db = root.join("run-index.db");
+        drop(broca_store::SqliteStore::open(&db).unwrap());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DROP INDEX message_unattributed_session_idx", [])
+            .unwrap();
+        drop(conn);
+        let before = std::fs::read(&db).unwrap();
+        let store = open_maintenance_store(
+            &root,
+            true,
+            WriterLiveness {
+                state: "yes".into(),
+                reason: "live writer".into(),
+            },
+        )
+        .ok()
+        .unwrap();
+        let wal = FileWalStore::new(root.join("wal"));
+        store.preview_page_usage_backfill().unwrap();
+        store.preview_control_head_repair(&wal).unwrap();
+        store.preview_active_row_reconcile(&wal).unwrap();
+        drop(store);
+        assert_eq!(
+            wal_manifest_with(
+                &root,
+                false,
+                WriterLiveness::unknown("cannot inspect process".into())
+            ),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "reports must not initialize or migrate the database"
+        );
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let initialized: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='message_unattributed_session_idx')", [], |row| row.get(0)).unwrap();
+        assert!(!initialized, "report opens must not run init");
+    }
+
+    #[test]
+    fn every_mutating_maintenance_open_refuses_live_or_unknown_before_sqlite() {
+        for state in ["yes", "unknown"] {
+            let root = temp_root(&format!("maintenance-{state}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let result = open_maintenance_store(
+                &root,
+                false,
+                WriterLiveness {
+                    state: state.into(),
+                    reason: "injected liveness".into(),
+                },
+            );
+            assert!(matches!(result, Err(code) if code == ExitCode::from(3)));
+            assert!(
+                !root.join("run-index.db").exists(),
+                "liveness refusal must precede mutating SQLite open"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_rebuild_resolves_all_live_roots_and_refuses_conflicts() {
+        use broca_store::SqliteStore;
+        use broca_wal::{FileWal, Wal, WalRecord};
+        let root = temp_root("manifest-live-roots");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SqliteStore::open(root.join("run-index.db")).unwrap();
+        let wal_store = FileWalStore::new(root.join("wal"));
+        for (i, directory) in ["wal", "wal-ephemeral", "wal-durable"]
+            .into_iter()
+            .enumerate()
+        {
+            let session = BindIdentity::new("/project", "test", directory);
+            index_session(&store, &format!("run-{i}"), session.clone());
+            let ordinary = wal_store.wal_path(&session);
+            let path = root.join(directory).join(ordinary.file_name().unwrap());
+            let mut wal = FileWal::open(path).unwrap();
+            wal.append(
+                1,
+                &WalRecord::StepStarted {
+                    step_id: broca_protocol::StepId(1),
+                },
+                true,
+            )
+            .unwrap();
+        }
+        let rebuilt = store.rebuild_wal_manifest(&wal_store).unwrap();
+        assert_eq!(rebuilt.addresses.len(), 3);
+        assert_eq!(rebuilt.sessions_without_wal, 0);
+        drop(store);
+        assert_eq!(
+            wal_manifest_with(&root, true, WriterLiveness::stopped()),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            std::fs::read_to_string(wal_store.manifest_path())
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        let session = BindIdentity::new("/project", "test", "wal-durable");
+        FileWal::open(wal_store.wal_path(&session)).unwrap();
+        let store = SqliteStore::open(root.join("run-index.db")).unwrap();
+        assert!(
+            store.rebuild_wal_manifest(&wal_store).is_err(),
+            "conflicting placements must not become an arbitrary manifest mapping"
+        );
+    }
+
     use super::{state_root_refusal, wal_manifest_with, WriterLiveness};
     use broca_core::{
         session_addr, FileWalStore, RunIndex, RunIndexRow, RunIndexState, WalStore,
