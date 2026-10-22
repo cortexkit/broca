@@ -2240,6 +2240,42 @@ mod tests {
         );
     }
 
+    /// The writer refuses to open a session that a pending move intent names by its shared
+    /// reference, and creates no file. Store-level checks normally run first; this calls the
+    /// writer directly so its own guard is the only one in the way.
+    #[test]
+    fn writer_open_refuses_a_pending_move_intent_naming_its_reference() {
+        let root = tmp("intent-open");
+        std::fs::create_dir_all(root.join("wal")).unwrap();
+        let fenced = "fedcba9876543210fedcba9876543210";
+        crate::migration::atomic_json(
+            &root,
+            &root.join("agent-data/cuts/cut.json"),
+            &serde_json::json!({
+                "refs": [{"ref_kind": "broca-session", "ref": fenced}],
+                "intent": {"op": "activate", "request": {}},
+            }),
+        )
+        .unwrap();
+        let path = root.join("wal/session.wal");
+        let open = |reference: &str| {
+            FileWal::open_with_manifest_and_session_ref(
+                &path,
+                root.join("manifest"),
+                "address",
+                "identity",
+                reference.into(),
+            )
+        };
+        assert!(matches!(
+            open(fenced),
+            Err(WalError::SessionMoving { cut_id }) if cut_id == "cut"
+        ));
+        assert!(!path.exists(), "a refused open must not create the WAL");
+        // The intent names only its own reference; another session at this path opens.
+        assert!(open("0123456789abcdef0123456789abcdef").is_ok());
+    }
+
     #[test]
     fn first_episode_discriminator_reads_only_its_bounded_prefix() {
         struct Count {

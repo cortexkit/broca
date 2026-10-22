@@ -2456,3 +2456,44 @@ fn moved_sidecar_hides_archived_session_without_restoring_it() {
     assert_eq!(f.store.bytes_for_move(&session).unwrap(), Some(bytes));
     assert!(!path.exists());
 }
+
+/// A pending move intent naming an archived session refuses the store's write open before
+/// the archived copy is restored into the live tree. `FileWal` checks the same intent when
+/// it opens the file, but the store restores an archived member before calling it, so
+/// only the store's own check keeps a refused open from rewriting the live WAL.
+#[test]
+fn pending_move_intent_refuses_open_before_restoring_archived_copy() {
+    let f = Fixture::new();
+    let (session, bytes) = f.session("pending-intent-archive", Some(1));
+    assert_eq!(f.fold().removed, 1);
+    let path = f.store.wal_path(&session);
+    assert!(!path.exists());
+    let reference = cortexkit_role_llm_runner::session_ref(
+        &session.harness,
+        &session.project_root.to_string_lossy(),
+        &session.session,
+    );
+    let authority = f.root.join("agent-data/cuts/cut.json");
+    broca_wal::migration::atomic_json(
+        &f.root,
+        &authority,
+        &serde_json::json!({
+            "refs": [{"ref_kind": "broca-session", "ref": reference}],
+            "intent": {"op": "activate", "request": {}},
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        f.store.open(&session),
+        Err(broca_wal::WalError::SessionMoving { .. })
+    ));
+    assert!(
+        !path.exists(),
+        "a refused open must not restore the archived WAL"
+    );
+    // Once the intent is gone, the same open restores the archived copy, so the absence
+    // above is the fence's doing and not a missing archive.
+    fs::remove_file(&authority).unwrap();
+    drop(f.store.open(&session).unwrap());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
