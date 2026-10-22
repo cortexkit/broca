@@ -19732,8 +19732,10 @@ target = "--test it"
 test_file = "crates/broca-module/tests/it/delivery_order.rs"
 expect_red = ["delivery_order::a_named_sender_never_becomes_the_sessions_principal"]
 file = "crates/broca-module/src/actor.rs"
-old = "self.admitting_sent_by = request.principal.replace(owner);"
-new = "self.admitting_sent_by = request.principal.clone(); let _ = owner; // NON-VACUITY BREAK: keep the sender as the principal"
+old = """            if let Some(owner) = owner {
+                self.admitting_sent_by = request.principal.replace(owner);"""
+new = """            if let Some(owner) = owner {
+                self.admitting_sent_by = request.principal.clone(); let _ = owner; // NON-VACUITY BREAK: keep the sender as the principal"""
 
 [[control]]
 id = "delivery-order-torn-order-dropped"
@@ -20201,7 +20203,7 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::a_view_that_is_not_a_prefix_is_kept_not_fetched_again"]
 file = "crates/broca-core/src/compaction/runtime.rs"
-old = 'views.held = Some((ready.clone(), view.clone()));'
+old = 'views.held = Some((ready.clone(), (*view).clone()));'
 new = 'let _ = &views.held; // NON-VACUITY BREAK: fetch again at every boundary'
 
 [[control]]
@@ -20237,8 +20239,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::a_model_change_rides_for_a_view_and_applies_it"]
 file = "crates/broca-core/src/compaction/runtime.rs"
-old = '.clamp(1, MAX_REWRITE_RIDE_DEADLINE_MS);'
-new = '.max(1); // NON-VACUITY BREAK: wait the whole call budget'
+old = '.clamp(1, MAX_REWRITE_RIDE_DEADLINE_MS),'
+new = '.max(1), // NON-VACUITY BREAK: wait the whole call budget'
 
 [[control]]
 id = "compaction-subc-view-get-caller-session"
@@ -20606,8 +20608,8 @@ select = "expected"
 test_file = "crates/broca-module/src/serve.rs"
 expect_red = ["serve::context_ceiling_tests::a_ceiling_wait_status_is_active_with_reason_and_absolute_deadline"]
 file = "crates/broca-module/src/serve.rs"
-old = "reason: state\n                .ceiling_deadline_ms\n                .map(|_| \"context_ceiling_wait\".into()),"
-new = "reason: None, // NON-VACUITY BREAK"
+old = "(Some(_), _) => Some(\"context_ceiling_wait\".into()),"
+new = "(Some(_), _) => None, // NON-VACUITY BREAK"
 
 [[control]]
 id = "ceiling-live-status-reads-wait-deadline"
@@ -24324,3 +24326,227 @@ old = """        let released = service
             .release_abandoned()
             .map_err(|e| ServeIoError(format!("release System One batches left running: {e}")))?;"""
 new = """        let released = 0; // NON-VACUITY BREAK: leave a dead process's batches running."""
+
+[[control]]
+id = "compaction-view-with-cut-refused"
+guards = "A compaction view carrying a cut is refused cut_unsupported, so broca never claims a lineage starting at ordinal 0 after a cut (llm-runner 0.5.0 §4.5)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::a_view_with_a_cut_is_refused_and_the_same_view_without_it_applies"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "    if view.cut.is_some() {"
+new = "    if view.cut.is_some() && false { // NON-VACUITY BREAK: apply a view with a cut as if it had none."
+
+[[control]]
+id = "session-head-states-first-ordinal"
+guards = "session.head on a written session states first_ordinal 0, which HeadMeta::lineage_consistent requires (llm-runner 0.5.0 §4.3)"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::head_reports_the_session_without_bodies"]
+file = "crates/broca-module/src/serve.rs"
+old = "            first_ordinal: Some(0),"
+new = "            first_ordinal: None, // NON-VACUITY BREAK: leave the lineage's first ordinal off the head."
+
+[[control]]
+id = "session-head-states-no-attachments"
+guards = "session.head states input.attachments no, a known fact for a text-only send, never leaving it unknown (llm-runner 0.5.1 §4.3)"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/role.rs"
+expect_red = ["role::pinned_reply_bytes::session_head_lineage_members_are_pinned"]
+file = "crates/broca-wire/src/role.rs"
+old = "        cortexkit_role_llm_runner::read::attachments::NO,"
+new = "        cortexkit_role_llm_runner::read::attachments::UNKNOWN, // NON-VACUITY BREAK: report a known fact as unknown."
+
+[[control]]
+id = "client-message-id-in-send-identity"
+guards = "A send's client_message_id is part of its identity digest, so a re-send with another id is refused naming client_message_id (llm-runner 0.5.1 §9.11)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/admission.rs"
+expect_red = ["admission::tests::client_message_id_is_part_of_send_identity_and_kept_in_the_digest"]
+file = "crates/broca-core/src/admission.rs"
+old = "        client_message_id: client_message_id.clone(),"
+new = "        client_message_id: client_message_id.clone().filter(|_| false), // NON-VACUITY BREAK: drop the id from the identity."
+
+[[control]]
+id = "client-message-id-requires-wal-feature"
+guards = "A record whose identity digest carries a client_message_id is must-understand (client-message-id/v1), so an older build cannot answer a re-send differently"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/record/pinned_bytes_tests.rs"
+expect_red = ["record::pinned_bytes_tests::a_client_message_id_in_the_identity_digest_requires_its_reader_feature"]
+file = "crates/broca-wal/src/record.rs"
+old = "    serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.client_message_id.is_some())"
+new = "    serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.client_message_id.is_some() && false) // NON-VACUITY BREAK: write the id ungated."
+
+[[control]]
+id = "client-message-id-grammar-enforced"
+guards = "session.send refuses a client_message_id outside [A-Za-z0-9_-]{1,64} naming the field (llm-runner 0.5.1 §9.11)"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["client_message_id_wire_tests::invalid_client_message_ids_are_refused_naming_the_field"]
+file = "crates/broca-wire/src/lib.rs"
+old = "        .filter(|id| cortexkit_role_llm_runner::display::client_message_id_valid(id))"
+new = "        .filter(|id| !id.is_empty() || cortexkit_role_llm_runner::display::client_message_id_valid(id)) // NON-VACUITY BREAK: accept any non-empty id."
+
+[[control]]
+id = "client-message-id-queued-retry-compared"
+guards = "A retry of a still-queued send with another client_message_id is refused naming it, read from the Queued record's identity digest"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::client_message_id_is_part_of_the_send_identity_and_never_read"]
+file = "crates/broca-module/src/actor.rs"
+old = "            if existing_client_message_id != request.client_message_id {"
+new = "            if existing_client_message_id != request.client_message_id && false { // NON-VACUITY BREAK: answer a queued retry with another id as a retry."
+
+[[control]]
+id = "named-sender-interrupt-runs-under-owner"
+guards = "A plan-named sender's granted interrupt continues under the session owner's principal, never the sender's (llm-runner 0.5.2 §9.7)"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::a_named_senders_interrupt_needs_the_grant_and_runs_under_the_owner"]
+file = "crates/broca-module/src/actor.rs"
+old = """                Ok(StringSender::Interrupt(owner)) => {
+                    self.admitting_sent_by = request.principal.replace(owner);"""
+new = """                Ok(StringSender::Interrupt(owner)) => {
+                    let _ = owner; self.admitting_sent_by = request.principal.clone(); // NON-VACUITY BREAK: run the interrupt under the sender's principal."""
+
+[[control]]
+id = "named-sender-string-delivery-is-its-list"
+guards = "A plan-named sender's legacy queue or steer string is admitted as the list it stands for, not refused as an owner-only string (llm-runner 0.5.2 §9.7)"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::a_named_senders_string_delivery_is_its_list_and_runs_under_the_owner"]
+file = "crates/broca-module/src/actor.rs"
+old = "                Ok(StringSender::AsOrder(order)) => self.admitting_order = Some(order),"
+new = "                Ok(StringSender::AsOrder(order)) => drop(order), // NON-VACUITY BREAK: leave a named sender's string to the owner check."
+
+[[control]]
+id = "named-sender-interrupt-needs-grant"
+guards = "A plan-named sender may interrupt only with its interrupt grant; idle_start alone does not grant it (llm-runner 0.5.2 §9.7)"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/delivery_order.rs"
+expect_red = ["delivery_order::a_named_senders_interrupt_needs_the_grant_and_runs_under_the_owner"]
+file = "crates/broca-module/src/actor.rs"
+old = """            broca_protocol::Delivery::Interrupt => {
+                cortexkit_role_llm_runner::send::Delivery::Interrupt
+            }
+        };"""
+new = """            broca_protocol::Delivery::Interrupt => {
+                cortexkit_role_llm_runner::send::Delivery::Steer // NON-VACUITY BREAK: admit an interrupt on the idle_start grant.
+            }
+        };"""
+
+[[control]]
+id = "compaction-setup-freezes-ride-wait"
+guards = "A Setup answer's ride_wait_ms is frozen on the session's Setup record, so every later ride waits as long as the provider said (compaction-provider 0.5.1 §4)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::setup_freezes_a_ride_wait_within_the_cap_and_fails_any_other"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = """            // Frozen with the session like `ceiling`, so every later ride, a resumed run's
+            // included, waits as long as this answer said.
+            ride_wait_ms,"""
+new = """            // Frozen with the session like `ceiling`, so every later ride, a resumed run's
+            // included, waits as long as this answer said.
+            ride_wait_ms: ride_wait_ms.filter(|_| false), // NON-VACUITY BREAK: forget the provider's ride wait."""
+
+[[control]]
+id = "compaction-setup-refuses-ride-wait-above-cap"
+guards = "A Setup answer whose ride_wait_ms is 0, above broca's cap, or sent without a cap fails Setup instead of being honoured or clamped (compaction-provider 0.5.1 §4)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::setup_freezes_a_ride_wait_within_the_cap_and_fails_any_other"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "        if answer.is_ready() && answer.check_for(&asked).is_err() {"
+new = "        if answer.is_ready() && answer.check_for(&asked).is_err() && false { // NON-VACUITY BREAK: accept any ride_wait_ms."
+
+[[control]]
+id = "compaction-ride-uses-frozen-ride-wait"
+guards = "A rewrite ride's deadline is the session's frozen ride_wait_ms when Setup gave one (compaction-provider 0.5.1 §8)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_slow_ride_is_reported_as_a_compaction_wait_and_a_fast_one_is_not"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = """        let deadline_ms = match state.ride_wait_ms {
+            Some(wait) => wait,"""
+new = """        let deadline_ms = match state.ride_wait_ms {
+            Some(_) => MAX_REWRITE_RIDE_DEADLINE_MS, // NON-VACUITY BREAK: ignore the provider's ride wait."""
+
+[[control]]
+id = "compaction-slow-ride-reported-as-wait"
+guards = "A rewrite ride pending past COMPACTION_WAIT_REPORT_AFTER_MS is recorded as a runner-owned compaction_wait with its deadline (llm-runner 0.5.2 §6)"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::a_slow_ride_is_reported_as_a_compaction_wait_and_a_fast_one_is_not"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "if !reported && report_at < ends_at => {"
+new = "if !reported && report_at < ends_at && false => { // NON-VACUITY BREAK: never report a slow ride."
+
+[[control]]
+id = "run-status-reports-ride-wait-deadline"
+guards = "run.status reports a rewrite ride's wait by deadline_ms, so watchdogs key on the deadline, not the reason (llm-runner 0.5.2 §6)"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::context_ceiling_tests::a_ride_wait_reports_compaction_wait_by_its_deadline"]
+file = "crates/broca-module/src/serve.rs"
+old = "            deadline_ms: state.ceiling_deadline_ms.or(state.ride_wait_deadline_ms),"
+new = "            deadline_ms: state.ceiling_deadline_ms, // NON-VACUITY BREAK: drop the ride wait's deadline."
+
+[[control]]
+id = "projection-ride-wait-compaction-wait-unit"
+guards = "A reported ride wait projects one durable compaction_wait control unit with its deadline (llm-runner 0.5.2 §6, §7)"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/projection.rs"
+expect_red = ["projection::a_reported_ride_wait_projects_a_compaction_wait_unit"]
+file = "crates/broca-core/src/projection.rs"
+old = """        WalRecord::CompactionRideWait { deadline_ms, .. } => {
+            if let Some(run_id) = &state.run_id {"""
+new = """        WalRecord::CompactionRideWait { deadline_ms, .. } => {
+            if let Some(run_id) = state.run_id.as_ref().filter(|_| false) { // NON-VACUITY BREAK: project no wait unit."""

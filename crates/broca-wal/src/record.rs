@@ -566,6 +566,21 @@ pub enum WalRecord {
         step_id: StepId,
         detail: Option<broca_protocol::ContextCeilingDetail>,
     },
+    /// A rewrite ride (compaction-provider 0.5.1 §8) whose answer has been pending for
+    /// `COMPACTION_WAIT_REPORT_AFTER_MS` (llm-runner 0.5.2 §6): the step waits for it until
+    /// `deadline_ms`, the absolute time the ride's deadline ends, and the run reports
+    /// `compaction_wait` with that deadline until a `CompactionRideWaitEnded` follows. Written
+    /// only for a session with a compaction provider, in a gated frame requiring
+    /// `compaction-ride-wait/v1`, so no older build reads it as something it understands.
+    CompactionRideWait {
+        step_id: StepId,
+        deadline_ms: u64,
+    },
+    /// The ride a `CompactionRideWait` reported resolved: it answered, was refused, or its
+    /// deadline passed. Gated like the wait record.
+    CompactionRideWaitEnded {
+        step_id: StepId,
+    },
     /// Anthropic refused the strict schema's compiled grammar. From this barrier onward,
     /// the run renders non-strict and reports `grammar_too_large`, including after a crash.
     StructuredOutputDowngraded {
@@ -891,6 +906,12 @@ pub enum WalRecord {
         /// that dropped it would number the session from the wrong anchor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tag_checkpoint: Option<SetupTagCheckpoint>,
+        /// The Setup answer's `ride_wait_ms` (compaction-provider 0.5.1 §4): how long a rewrite
+        /// ride may hold a step, frozen with the session. Present only on a Setup record whose
+        /// answer carried one, and then must-understand (feature `compaction-ride-wait/v1`): a
+        /// reader that dropped it would give the session's rides its own short deadline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ride_wait_ms: Option<u64>,
     },
     /// Every other step outcome and the cursor it moves, in one durable frame. A wait
     /// answer is itself the wait entry, with the reason and bound in the same record.
@@ -1240,6 +1261,30 @@ impl WalRecord {
         } else {
             base
         };
+        // A send's client_message_id lives in its identity digest (see
+        // `SubmissionRequest::client_message_id`). An older build would read the digest without
+        // it and answer a re-send under the same `send_id` with another id as a plain retry,
+        // where this build refuses it `send_id_reuse`, so the record is must-understand.
+        let identity_digest = match self {
+            WalRecord::RunStarted {
+                request_identity_digest,
+                ..
+            }
+            | WalRecord::Queued {
+                request_identity_digest,
+                ..
+            }
+            | WalRecord::Steered {
+                request_identity_digest,
+                ..
+            } => request_identity_digest.as_deref(),
+            _ => None,
+        };
+        let base = if identity_digest.is_some_and(digest_carries_client_message_id) {
+            with_feature(base, crate::framing::CLIENT_MESSAGE_ID_FEATURE)
+        } else {
+            base
+        };
         let scope = match self {
             WalRecord::RunStarted { scope, .. } => scope.as_ref(),
             WalRecord::ToolCallDeferred { scope, .. } => Some(scope),
@@ -1331,6 +1376,17 @@ impl WalRecord {
             }
         ) {
             with_feature(base, crate::framing::COMPACTION_VIEW_FEATURE)
+        } else {
+            base
+        };
+        let base = if matches!(
+            self,
+            WalRecord::CompactionMessage {
+                ride_wait_ms: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::COMPACTION_RIDE_WAIT_FEATURE)
         } else {
             base
         };
@@ -1562,6 +1618,9 @@ impl WalRecord {
             STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE,
         };
         match self {
+            WalRecord::CompactionRideWait { .. } | WalRecord::CompactionRideWaitEnded { .. } => {
+                &[crate::framing::COMPACTION_RIDE_WAIT_FEATURE]
+            }
             WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
             | WalRecord::RunFinished {
@@ -1957,6 +2016,19 @@ fn input_cap_features(base: &[&str]) -> &'static [&'static str] {
 /// `base` with `feature` added in sorted position. The feature sets a record can require are a
 /// small fixed family, so each distinct union is built once and kept for the process lifetime;
 /// the cache is keyed by the address of `base`, which is always a static slice.
+/// Whether a stored request identity digest (a JSON object of per-field digests written by
+/// broca-core) carries the send's `client_message_id`. A digest that does not parse carries
+/// none: it is compared as an opaque string, and this build never writes such a digest with
+/// the member.
+fn digest_carries_client_message_id(digest: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        client_message_id: Option<serde::de::IgnoredAny>,
+    }
+    serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.client_message_id.is_some())
+}
+
 fn with_feature(base: &'static [&'static str], feature: &'static str) -> &'static [&'static str] {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -3668,6 +3740,7 @@ mod schema_tests {
                     context_management: None,
                     inherit_frozen: Default::default(),
                     structured_output: None,
+                    client_message_id: None,
                 }),
                 request_identity_digest: None,
                 principal: None,

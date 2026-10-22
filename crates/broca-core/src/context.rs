@@ -713,6 +713,8 @@ impl SessionReadStateKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionReadReason {
     ContextCeilingWait,
+    /// A rewrite ride's reported wait (llm-runner 0.5.2 §6).
+    CompactionWait,
     Terminal(RunFinishReason),
     Pause(PauseReason),
 }
@@ -721,6 +723,9 @@ impl SessionReadReason {
     pub fn as_str(self) -> &'static str {
         match self {
             SessionReadReason::ContextCeilingWait => "context_ceiling_wait",
+            SessionReadReason::CompactionWait => {
+                cortexkit_role_llm_runner::run::RUN_REASON_COMPACTION_WAIT
+            }
             SessionReadReason::Terminal(RunFinishReason::Completed) => "completed",
             SessionReadReason::Terminal(RunFinishReason::MaxSteps) => "max_steps",
             SessionReadReason::Terminal(RunFinishReason::BudgetExhausted) => "budget_exhausted",
@@ -1444,6 +1449,19 @@ fn lineage_state_from_replay_and_records(
             last_run_id: replay.run_id.clone(),
             state: SessionReadStateKind::Active,
             reason: Some(SessionReadReason::ContextCeilingWait),
+            error: None,
+            usage: None,
+        };
+    }
+    if replay
+        .compaction
+        .state()
+        .is_some_and(|state| state.ride_wait.is_some())
+    {
+        return SessionReadLineageState {
+            last_run_id: replay.run_id.clone(),
+            state: SessionReadStateKind::Active,
+            reason: Some(SessionReadReason::CompactionWait),
             error: None,
             usage: None,
         };

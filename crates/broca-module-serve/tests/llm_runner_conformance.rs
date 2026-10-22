@@ -1750,6 +1750,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::DeliveryOrder,
             Capability::Compaction,
             Capability::ModelView,
+            Capability::ClientMessageId,
         ]
         .into_iter()
         .collect();
@@ -2552,6 +2553,8 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "structured_output_not_inherited",
         "structured_output_external_ref_refused",
         "structured_output_sibling_never_dispatched",
+        // broca declares `client_message_id` (llm-runner 0.5.1 §9.11).
+        "client_message_id_resend_with_another_id_refused",
     ] {
         let case = report
             .cases

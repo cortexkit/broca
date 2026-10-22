@@ -574,6 +574,15 @@ pub struct SubmissionRequest {
     /// Absent costs no bytes on a queued record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output: Option<crate::structured_output::StructuredOutput>,
+    /// The caller's own id for the user message this send creates (llm-runner 0.5.1 §9.11):
+    /// 1 to 64 characters of `[A-Za-z0-9_-]`, checked where the send is decoded. It is never
+    /// rendered and never part of the message body. It is part of the send's identity, and it
+    /// is stored only there: the identity digest (`submission_identity_digest` in broca-core)
+    /// carries the value itself, and the `RunStarted`, `Steered` or `Queued` record that holds
+    /// the digest then requires the WAL feature `client-message-id/v1`. Never serialized with
+    /// the request, so a queued record's request bytes do not change.
+    #[serde(skip)]
+    pub client_message_id: Option<String>,
 }
 
 /// A runner parameter a send may leave to the session's frozen value; see
@@ -832,6 +841,7 @@ mod tests {
             service_tier: None,
             inherit_frozen: Default::default(),
             structured_output: None,
+            client_message_id: None,
         };
 
         let encoded = serde_json::to_value(&request).unwrap();
@@ -914,6 +924,7 @@ mod budget_compat_tests {
             context_management: None,
             inherit_frozen: Default::default(),
             structured_output: None,
+            client_message_id: None,
         };
         let encoded = serde_json::to_value(&request).unwrap();
         assert!(encoded.get("budget").is_none());

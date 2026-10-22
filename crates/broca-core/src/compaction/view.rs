@@ -313,6 +313,12 @@ pub fn rendered_history(state: &CompactionState, prompt: &[Message]) -> Vec<Mess
     }
 }
 
+/// The reason broca gives in `view_refused:<version>:<reason>` for a view that carries a `cut`.
+/// Refusal reasons are open strings (compaction-provider 0.5.0 `notice::refusal_reasons`); this
+/// one is broca's own, because the role names none for a runner that does not serve cut
+/// lineages.
+pub const CUT_UNSUPPORTED: &str = "cut_unsupported";
+
 /// What the runner does with a fetched view at a step boundary.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
@@ -422,7 +428,8 @@ pub fn decide_at(
         .map(|entry| (entry.ordinal, entry))
         .collect();
     let current = state.view.as_ref().map(|applied| applied.view.view_version);
-    match dispose_fetched(view, ready, current, lineage_id, |ordinal| {
+    // broca never cuts (see CUT_UNSUPPORTED below), so every lineage it serves starts at ordinal 0.
+    match dispose_fetched(view, ready, current, lineage_id, 0, |ordinal| {
         entries.get(&ordinal).cloned()
     }) {
         ViewDisposition::Apply => {}
@@ -436,6 +443,13 @@ pub fn decide_at(
     // did not list.
     if view.apply.is_some() {
         return Decision::Refuse(refusal_reasons::UNSUPPORTED_APPLY);
+    }
+    // A view with a cut starts a new lineage once it applies (compaction-provider 0.5.0 §7,
+    // llm-runner 0.5.0 §4.5): reads move to the cut's first retained ordinal and Setup runs
+    // again with `descends_from`. broca does not serve cut lineages yet, so it refuses the view
+    // rather than apply it and keep reporting a lineage that starts at ordinal 0 with no cut.
+    if view.cut.is_some() {
+        return Decision::Refuse(CUT_UNSUPPORTED);
     }
     // Authorship is judged against the stored transcript a provider copies from. The bytes a
     // view gives are sent exactly as given (compaction-provider CONTRACT.md §6: "replaced bytes

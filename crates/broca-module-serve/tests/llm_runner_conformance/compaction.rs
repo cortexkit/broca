@@ -52,6 +52,8 @@ pub(super) struct CompactionCall {
     /// The `harness` and `session` the Setup body reported.
     pub setup_harness: String,
     pub setup_session: String,
+    /// The `lineage_id` the Setup body carried, absent when it carried none.
+    pub lineage_id: Option<String>,
 }
 pub(super) const MODULE: &str = "conformance-compaction";
 pub(super) const MODEL_PREFIX: &str = "conformance-model-";
@@ -181,6 +183,7 @@ impl subc_client_rs::ModuleHandler for Provider {
                 route_identity,
                 setup_harness: params["harness"].as_str().unwrap_or_default().to_owned(),
                 setup_session: session.to_owned(),
+                lineage_id: params["lineage_id"].as_str().map(str::to_owned),
             });
             match state.script.setup.clone() {
                 CompactionSetup::Unavailable => {
@@ -685,6 +688,7 @@ impl BrocaSubject {
                     .map(
                         |call| cortexkit_role_llm_runner_conformance::CompactionCall {
                             request_id: call.request_id.clone(),
+                            lineage_id: call.lineage_id.clone(),
                             setup_identity:
                                 cortexkit_role_llm_runner_conformance::CompactionSetupIdentity {
                                     harness: call.setup_harness.clone(),
@@ -712,6 +716,10 @@ impl BrocaSubject {
                 model_inputs: state.inputs.clone(),
                 // Broca's host has no standalone Magic Context to hand a session to.
                 standalone_handoffs: 0,
+                // This scripted provider does not subscribe to the bus, so it captures no advance
+                // notices. Only the cut cases read them, and those need `publish_compaction_view`,
+                // which this adapter does not implement, so the kit reports them inapplicable.
+                notices: Vec::new(),
             },
         )
     }

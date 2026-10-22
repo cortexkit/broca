@@ -272,6 +272,7 @@ mod tests {
             stability: None,
             ceiling: None,
             tag_checkpoint: None,
+            ride_wait_ms: None,
         }
     }
 

@@ -610,6 +610,7 @@ pub(crate) fn indexed_run_state(
         },
         pause_reason: None,
         auth_selection: None,
+        ride_wait_deadline_ms: None,
     }))
 }
 
@@ -1262,7 +1263,37 @@ fn submission_from_config(
         context_management: config.context_management,
         inherit_frozen: Default::default(),
         structured_output: None,
+        client_message_id: None,
     }
+}
+
+/// How a send with a legacy string `delivery` is admitted ([`LineageActor::string_sender`]).
+enum StringSender {
+    /// The session's owner, or a caller the plan does not name: admitted as before.
+    Owner,
+    /// A plan-named sender's `queue` or `steer`, admitted and delivered as the list it stands
+    /// for.
+    AsOrder(broca_protocol::DeliveryOrder),
+    /// A plan-named sender's granted `interrupt`, continuing under this frozen principal.
+    Interrupt(broca_protocol::BindPrincipal),
+}
+
+/// The `senders` of the session's frozen plan, or none for a session admitted without one.
+fn frozen_plan_senders(
+    ownership: &broca_core::SessionOwnershipV1,
+) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
+    ownership
+        .first_episode
+        .as_ref()
+        .and_then(|first| first.manifest.as_ref())
+        .and_then(|manifest| {
+            serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
+        })
+        .and_then(|plan| {
+            plan.as_object()
+                .and_then(|plan| broca_fetch_plan::plan_senders(plan).ok())
+        })
+        .unwrap_or_default()
 }
 
 /// The actor's run state.
@@ -2849,6 +2880,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // the frozen scope (its tool routes carry the owner's) and never freezes, adopts or
         // reopens one. The sender itself is recorded only on its `DeliveryOrdered` record.
         self.admitting_sent_by = None;
+        // A plan-named sender may also send a legacy string `delivery` (llm-runner 0.5.2 §9.7):
+        // `queue` and `steer` stand for the lists `[idle_start]` and `[steer, idle_start]` and
+        // are admitted and delivered exactly as those lists, through the ordered path below;
+        // `interrupt` is admitted only on the sender's `interrupt` grant. Either way the run it
+        // starts or joins keeps the owner's principal and scope.
+        if self.admitting_order.is_none() {
+            match self.string_sender(&request, delivery).await {
+                Ok(StringSender::Owner) => {}
+                Ok(StringSender::AsOrder(order)) => self.admitting_order = Some(order),
+                Ok(StringSender::Interrupt(owner)) => {
+                    self.admitting_sent_by = request.principal.replace(owner);
+                    request.scope = broca_protocol::SendScope::Internal;
+                }
+                Err(outcome) => return outcome,
+            }
+        }
         if let Some(order) = self.admitting_order.clone() {
             let owner = match self.ordered_sender(&request, &order).await {
                 Ok(owner) => owner,
@@ -4764,6 +4811,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     differing: "delivery",
                 };
             }
+            // A retry carries the same client_message_id as the queued send, or none when it
+            // carried none (llm-runner §9.11). The queued request does not keep the id, so it is
+            // read from the identity digest the queued record stored.
+            let existing_client_message_id = existing
+                .request_identity_digest
+                .as_deref()
+                .and_then(broca_core::digest_client_message_id);
+            if existing_client_message_id != request.client_message_id {
+                return SendOutcome::SendIdReuse {
+                    differing: "client_message_id",
+                };
+            }
             // The title is deliberately not compared: it labels the send without being part of
             // its identity, so a retry carrying another title is answered `Pending` and the
             // queued record keeps the title it was written with.
@@ -4860,6 +4919,79 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let used = self.recorded_send_keys.contains_key(run_id)
             || self.ordered_submissions.contains_key(&submission_id);
         Ok(used && self.ordered_submissions.get(&submission_id) != self.admitting_order.as_ref())
+    }
+
+    /// How a send with a legacy string `delivery` is admitted: from the session's owner (or a
+    /// caller the owner check decides on, as before), as its list from a plan-named sender, or
+    /// as an interrupt from a named sender holding the `interrupt` grant, which then continues
+    /// under the session's frozen principal. Admission is `delivery_order::admit_delivery`'s.
+    async fn string_sender(
+        &mut self,
+        request: &SubmissionRequest,
+        delivery: broca_protocol::Delivery,
+    ) -> Result<StringSender, SendOutcome> {
+        let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = &request.principal else {
+            return Ok(StringSender::Owner);
+        };
+        let ownership = self.load_ownership().await.map_err(|error| {
+            SendOutcome::Transient(format!(
+                "cannot read the session's history for the sender check: {error}"
+            ))
+        })?;
+        if broca_core::scope_admission::decide_owner_access(
+            &ownership,
+            request.principal.as_ref(),
+            &request.scope,
+        )
+        .is_ok()
+        {
+            return Ok(StringSender::Owner);
+        }
+        let senders = frozen_plan_senders(&ownership);
+        // A caller the plan does not name meets the owner check further down, as it always has.
+        if !senders.iter().any(|sender| &sender.module == module_id) {
+            return Ok(StringSender::Owner);
+        }
+        let frozen = ownership
+            .scope
+            .as_ref()
+            .map(|scope| scope.owner.clone())
+            .or_else(|| ownership.first_principal.clone())
+            .ok_or_else(|| {
+                SendOutcome::Transient("the session has no frozen principal to send under".into())
+            })?;
+        let role_delivery = match delivery {
+            broca_protocol::Delivery::Queue => cortexkit_role_llm_runner::send::Delivery::Queue,
+            broca_protocol::Delivery::Steer => cortexkit_role_llm_runner::send::Delivery::Steer,
+            broca_protocol::Delivery::Interrupt => {
+                cortexkit_role_llm_runner::send::Delivery::Interrupt
+            }
+        };
+        cortexkit_role_llm_runner::delivery_order::admit_delivery(
+            module_id,
+            Some(&frozen.as_owner_string()),
+            &senders,
+            role_delivery,
+        )
+        .map_err(|(code, field)| SendOutcome::DeliveryRefused {
+            code,
+            field: field.unwrap_or("delivery"),
+            message: format!(
+                "the session's plan does not let module {module_id} send delivery {}",
+                delivery.as_str()
+            ),
+        })?;
+        Ok(
+            match cortexkit_role_llm_runner::delivery_order::legacy_equivalent(role_delivery) {
+                Some(modes) => StringSender::AsOrder(broca_protocol::DeliveryOrder {
+                    modes,
+                    dedupe_key: None,
+                    expires_at_ms: None,
+                    template: None,
+                }),
+                None => StringSender::Interrupt(frozen),
+            },
+        )
     }
 
     /// Whether the send being handled comes from the session's owner (`Ok(None)`), from a
@@ -5887,26 +6019,28 @@ impl<W: WalStore + 'static> LineageActor<W> {
             {
                 let live_step = step_progress.lock().unwrap().clone();
                 let title = self.live_run_title(run_id).await?;
-                let ceiling_deadline_ms = if self
+                let (ceiling_deadline_ms, ride_wait_deadline_ms) = if self
                     .first_episode
                     .get()
                     .and_then(|first| first.manifest.as_ref())
                     .is_some_and(|manifest| broca_core::compaction::has_compaction(manifest))
                 {
-                    self.load_checkpoint_at_head()
-                        .await?
-                        .compaction
-                        .as_ref()
-                        .and_then(|c| c.state())
-                        .and_then(|state| match state.ceiling_check {
+                    let checkpoint = self.load_checkpoint_at_head().await?;
+                    let state = checkpoint.compaction.as_ref().and_then(|c| c.state());
+                    (
+                        state.and_then(|state| match state.ceiling_check {
                             Some(broca_core::compaction::CeilingCheck::Waiting {
                                 deadline_ms,
                                 ..
                             }) => Some(deadline_ms),
                             _ => None,
-                        })
+                        }),
+                        state
+                            .and_then(|state| state.ride_wait)
+                            .map(|(_, deadline_ms)| deadline_ms),
+                    )
                 } else {
-                    None
+                    (None, None)
                 };
                 let head = self
                     .writer
@@ -5942,6 +6076,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     pause_reason: None,
                     auth_selection: None,
                     title,
+                    ride_wait_deadline_ms,
                 }));
             }
         }

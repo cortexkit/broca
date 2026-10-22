@@ -37,6 +37,14 @@ pub enum ControlUnit {
         reason: String,
         deadline_ms: u64,
     },
+    /// The run remains active while a rewrite ride's answer, pending for over a second, can
+    /// still arrive before this deadline (llm-runner 0.5.2 §6 `compaction_wait`). A
+    /// runner-owned wait: a reader recognizes it by `deadline_ms`, never by `reason`.
+    CompactionWait {
+        run_id: RunId,
+        reason: String,
+        deadline_ms: u64,
+    },
     /// A caller-supplied budget message was durably injected into the prompt.
     BudgetFired {
         run_id: RunId,

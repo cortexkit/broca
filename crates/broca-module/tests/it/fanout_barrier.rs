@@ -410,6 +410,7 @@ fn tag(u: &ControlUnit) -> &'static str {
         ControlUnit::Error { .. } => "Error",
         ControlUnit::DisplayReset => "DisplayReset",
         ControlUnit::ContextCeilingWait { .. } => "ContextCeilingWait",
+        ControlUnit::CompactionWait { .. } => "CompactionWait",
         ControlUnit::ApprovalRequest { .. } => "ApprovalRequest",
     }
 }

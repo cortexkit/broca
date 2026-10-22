@@ -90,6 +90,7 @@ impl SendParamsExt for SendParams {
             send_id,
             conversation_key,
             title,
+            client_message_id,
             model,
             tools,
             tool_choice,
@@ -219,6 +220,7 @@ impl SendParamsExt for SendParams {
             context_management,
             inherit_frozen: Default::default(),
             structured_output,
+            client_message_id,
         };
         Ok(SendRequest {
             session_class,
@@ -367,6 +369,7 @@ mod tests {
             directives: None,
             session_class: None,
             title: None,
+            client_message_id: None,
             on_restart: None,
             keep_warm: None,
             retention: None,

@@ -71,6 +71,7 @@ fn compaction_message(seq: u64, kind: CompactionMessageKind) -> FramedRecord {
             stability: setup.then(|| vec![CompactionStabilityRank { index: 0, rank: 7 }]),
             ceiling: None,
             tag_checkpoint: None,
+            ride_wait_ms: None,
         },
     )
 }

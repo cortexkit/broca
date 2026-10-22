@@ -215,6 +215,8 @@ impl RunRequest {
                 Default::default()
             },
             structured_output: self.structured_output.clone(),
+            // The run keeps a send's client_message_id only inside `request_identity_digest`.
+            client_message_id: None,
         }
     }
 
@@ -4432,7 +4434,8 @@ where
                     variant.clone(),
                     context_limit,
                     opts.generation.max_output_tokens,
-                );
+                )
+                .with_ride_wait_max_ms(crate::compaction::runtime::RIDE_WAIT_MAX_MS);
                 setup.lineage_id = Some(lineage_id.clone());
                 setup.newest = raw
                     .last()
@@ -4509,6 +4512,7 @@ where
                     provider.reasoning_is_prefix_bound(),
                     // The run's first step, where a view deferred over an open turn ends.
                     completed_steps == 0,
+                    step_id,
                 ))
                 .await?
             };

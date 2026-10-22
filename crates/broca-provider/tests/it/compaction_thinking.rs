@@ -137,6 +137,7 @@ fn applied(version: u64, to: u64) -> WalRecord {
         stability: None,
         ceiling: None,
         tag_checkpoint: None,
+        ride_wait_ms: None,
     }
 }
 

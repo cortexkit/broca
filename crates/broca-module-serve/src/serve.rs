@@ -2538,6 +2538,22 @@ where
             if let Some(refusal) = delivery_list_refusal(params.delivery.as_ref(), &describe) {
                 return send_error_body(writer, ver, channel, epoch, corr, refusal).await;
             }
+            // broca keeps a send's client_message_id only in the send's identity digest, which
+            // exists for a send that names its `send_id` (an unkeyed send's run id never
+            // repeats, so broca records no identity for it). An id on an unkeyed send would
+            // therefore be dropped; it is refused instead, naming the field.
+            if params.client_message_id.is_some() && params.send_id.is_none() {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("client_message_id".into()),
+                    "client_message_id requires send_id: broca stores it with the send's identity",
+                )
+                .await;
+            }
             if params
                 .cache
                 .as_ref()
@@ -4004,6 +4020,7 @@ fn send_field_of(differing: &str) -> Option<&'static str> {
         "service_tier" => "service_tier",
         "stop_when" => "stop_when",
         "context_management" => "context_management",
+        "client_message_id" => "client_message_id",
         _ => return None,
     })
 }

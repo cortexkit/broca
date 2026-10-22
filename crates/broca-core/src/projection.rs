@@ -94,6 +94,7 @@ pub fn classify_control_unit(unit: &ControlUnit) -> ControlClass {
         ControlUnit::RunStarted { .. }
         | ControlUnit::StepStarted { .. }
         | ControlUnit::ContextCeilingWait { .. }
+        | ControlUnit::CompactionWait { .. }
         | ControlUnit::BudgetFired { .. }
         | ControlUnit::AssistantMessage { .. }
         | ControlUnit::ToolCall { .. }
@@ -525,6 +526,17 @@ fn project_control_record<S: ControlProjectionSink>(
             }
         }
         WalRecord::ContextCeilingWait { .. } | WalRecord::ContextCeilingDecided { .. } => {}
+        WalRecord::CompactionRideWait { deadline_ms, .. } => {
+            if let Some(run_id) = &state.run_id {
+                push!(ControlUnit::CompactionWait {
+                    run_id: run_id.clone(),
+                    reason: cortexkit_role_llm_runner::run::RUN_REASON_COMPACTION_WAIT.into(),
+                    deadline_ms: *deadline_ms,
+                });
+            }
+        }
+        // The wait's end is visible as the step moving on; it emits no unit of its own.
+        WalRecord::CompactionRideWaitEnded { .. } => {}
         // Compaction changes model requests but these records emit no control unit.
         WalRecord::CompactionRequest { .. }
         | WalRecord::CompactionMessage { .. }

@@ -2149,6 +2149,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
             service_tier: None,
             inherit_frozen: Default::default(),
             structured_output: None,
+            client_message_id: None,
         }),
     };
     rig.wal

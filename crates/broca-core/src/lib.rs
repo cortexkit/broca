@@ -52,8 +52,8 @@ pub mod wal_fold;
 pub mod wal_writer;
 
 pub use admission::{
-    decode_admission_checkpoint, encode_admission_checkpoint, send_identity_difference,
-    send_identity_difference_with_conversation_key, send_identity_digest,
+    decode_admission_checkpoint, digest_client_message_id, encode_admission_checkpoint,
+    send_identity_difference, send_identity_difference_with_conversation_key, send_identity_digest,
     send_identity_digest_with_conversation_key, submission_difference,
     submission_identity_difference, submission_identity_digest, AdmissionCheckpointV1,
     BudgetReplayStateV1, EpisodeDisposition, FirstEpisodeV1, LastEpisodeV1, SessionOwnershipV1,
