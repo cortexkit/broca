@@ -387,6 +387,7 @@ fn run_started_over_unfinished_episode_is_corrupt() {
                 "the corruption names the UNFINISHED prior episode"
             );
         }
+        other => panic!("expected a corrupt lineage, got {other}"),
     }
 }
 

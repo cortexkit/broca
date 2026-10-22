@@ -209,7 +209,8 @@ fn cleaned_answer(text: &str) -> SessionReadMessage {
             clean: true,
         },
         &mut high,
-    );
+    )
+    .unwrap();
     entry.tags = broca_wire::tag_rows(0, &entry.message);
     entry
 }

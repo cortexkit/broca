@@ -73,6 +73,10 @@ pub enum ReplayError {
         episode_run_id: RunId,
         reason: String,
     },
+    /// Numbering the transcript's tags would pass `u64::MAX` (llm-runner
+    /// `tags::try_number_parts`): the session is refused rather than shown two parts with one
+    /// number.
+    TagNumbering(broca_protocol::tags::NumberingOverflow),
 }
 
 impl std::fmt::Display for ReplayError {
@@ -86,6 +90,7 @@ impl std::fmt::Display for ReplayError {
                 "corrupt lineage WAL at episode '{}': {reason}",
                 episode_run_id.0
             ),
+            ReplayError::TagNumbering(overflow) => write!(f, "{overflow}"),
         }
     }
 }
@@ -1365,7 +1370,9 @@ fn replay_seeded_with_compaction<'a>(
             compaction_session |= crate::compaction::has_compaction(manifest);
         }
         if let WalRecord::RunStarted { config, .. } = rec {
-            numbering.number_new(&mut prompt);
+            numbering
+                .number_new(&mut prompt)
+                .map_err(ReplayError::TagNumbering)?;
             numbering.start_run(config);
         }
         compaction.fold_at(rec, ordinal_base.saturating_add(prompt.len() as u64));
@@ -2033,17 +2040,23 @@ fn replay_seeded_with_compaction<'a>(
                 }
             }
         }
-        numbering.number_new(&mut prompt);
+        numbering
+            .number_new(&mut prompt)
+            .map_err(ReplayError::TagNumbering)?;
         if let WalRecord::CompactionMessage {
             kind: broca_wal::CompactionMessageKind::Setup,
             tag_checkpoint: Some(checkpoint),
             ..
         } = rec
         {
-            numbering.anchor_setup(&mut prompt, ordinal_base, &[], "", checkpoint);
+            numbering
+                .anchor_setup(&mut prompt, ordinal_base, &[], "", checkpoint)
+                .map_err(ReplayError::TagNumbering)?;
         }
     }
-    numbering.number_new(&mut prompt);
+    numbering
+        .number_new(&mut prompt)
+        .map_err(ReplayError::TagNumbering)?;
 
     // Fold any still-open batch's indeterminate calls (intent∧¬terminal) into the
     // list, then classify the LAST episode's trailing state.

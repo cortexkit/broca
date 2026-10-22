@@ -248,10 +248,10 @@ impl TagNumbering {
         prompt: &mut [broca_protocol::Message],
         from: usize,
         config: &broca_wal::RunConfig,
-    ) {
+    ) -> Result<(), broca_protocol::tags::NumberingOverflow> {
         let mut numbering = Self::new(TagSeed::from_prefix(&prompt[..from]), from);
         numbering.rules = computed_rules(config);
-        numbering.number_new(prompt);
+        numbering.number_new(prompt)
     }
 
     /// A run starts: from here on messages are numbered by its rules, after its checkpoint.
@@ -267,23 +267,32 @@ impl TagNumbering {
         self.high
     }
 
-    /// Number the messages appended to `prompt` since the last call.
-    pub fn number_new(&mut self, prompt: &mut [broca_protocol::Message]) {
+    /// Number the messages appended to `prompt` since the last call. Refused, with nothing
+    /// renumbered, when the numbers would pass `u64::MAX`.
+    pub fn number_new(
+        &mut self,
+        prompt: &mut [broca_protocol::Message],
+    ) -> Result<(), broca_protocol::tags::NumberingOverflow> {
         if prompt.len() < self.numbered {
             // The transcript lost its tail (a recovery rewrote it): continue after what is left.
             self.numbered = prompt.len();
             self.high = self.seed_high.max(broca_protocol::tags::high_after(prompt));
         }
-        for message in &mut prompt[self.numbered..] {
+        // Messages are counted as numbered one at a time, so a refusal leaves the ones after the
+        // refused message for the next call rather than skipping them.
+        let start = self.numbered;
+        for message in &mut prompt[start..] {
             match (message.part_tags(), self.rules) {
                 (Some(tags), _) => self.high = self.high.max(tags.high()),
                 (None, Some(rules)) => {
-                    broca_protocol::tags::number_message(message, rules, &mut self.high)
+                    broca_protocol::tags::number_message(message, rules, &mut self.high)?
                 }
                 (None, None) => {}
             }
+            self.numbered += 1;
         }
         self.numbered = prompt.len();
+        Ok(())
     }
 
     /// Anchor numbering at a compaction provider's Setup checkpoint: the cut message (`m<n>`,
@@ -300,7 +309,7 @@ impl TagNumbering {
         markers: &[cortexkit_role_llm_runner::tags::Marker],
         session: &str,
         checkpoint: &broca_wal::SetupTagCheckpoint,
-    ) -> bool {
+    ) -> Result<bool, broca_protocol::tags::NumberingOverflow> {
         let numbered = self.numbered.min(prompt.len());
         let index_of = |cut: &str| {
             cut.strip_prefix('m')
@@ -324,10 +333,10 @@ impl TagNumbering {
             }
             // The cut message is not in this stretch of the transcript, or the session is a
             // fork: nothing to re-anchor here.
-            _ => return false,
+            _ => return Ok(false),
         };
         let Some(index) = index_of(&cut) else {
-            return false;
+            return Ok(false);
         };
         let mut high = prompt[index]
             .part_tags()
@@ -346,12 +355,12 @@ impl TagNumbering {
                     clean: computed.clean,
                 });
             match rules {
-                Some(rules) => broca_protocol::tags::number_message(message, rules, &mut high),
+                Some(rules) => broca_protocol::tags::number_message(message, rules, &mut high)?,
                 None => high = high.max(message.part_tags().map_or(0, PartTags::high)),
             }
         }
         self.high = high;
-        true
+        Ok(true)
     }
 }
 
@@ -580,24 +589,28 @@ mod tests {
         let mut prompt = vec![user("a"), user("b"), user("c")];
         let mut numbering = TagNumbering::new(TagSeed::default(), 0);
         numbering.rules = Some(RENDER);
-        numbering.number_new(&mut prompt);
+        numbering.number_new(&mut prompt).unwrap();
         assert_eq!(numbers(&prompt), vec![Some(1), Some(2), Some(3)]);
         let checkpoint = broca_wal::SetupTagCheckpoint {
             tag_checkpoint: 500,
             cut: "m1".into(),
         };
-        assert!(numbering.anchor_setup(&mut prompt, 0, &[], "s", &checkpoint));
+        assert!(numbering
+            .anchor_setup(&mut prompt, 0, &[], "s", &checkpoint)
+            .unwrap());
         assert_eq!(numbers(&prompt), vec![Some(1), Some(501), Some(502)]);
         assert_eq!(numbering.high(), 502);
         prompt.push(user("d"));
-        numbering.number_new(&mut prompt);
+        numbering.number_new(&mut prompt).unwrap();
         assert_eq!(numbers(&prompt)[3], Some(503));
         // A cut outside this stretch of the transcript cannot anchor numbering.
         let gone = broca_wal::SetupTagCheckpoint {
             tag_checkpoint: 900,
             cut: "m40".into(),
         };
-        assert!(!numbering.anchor_setup(&mut prompt, 0, &[], "s", &gone));
+        assert!(!numbering
+            .anchor_setup(&mut prompt, 0, &[], "s", &gone)
+            .unwrap());
         assert_eq!(numbers(&prompt)[3], Some(503));
     }
 
@@ -609,21 +622,25 @@ mod tests {
         let mut prompt = vec![user("a"), user("b"), user("c")];
         let mut numbering = TagNumbering::new(TagSeed::default(), 0);
         numbering.rules = Some(RENDER);
-        numbering.number_new(&mut prompt);
+        numbering.number_new(&mut prompt).unwrap();
         let checkpoint = broca_wal::SetupTagCheckpoint {
             tag_checkpoint: 500,
             cut: "m0".into(),
         };
         let markers = [Marker::new("m2", true).with_checkpoint(MarkerCheckpoint::new(40, "s"))];
-        assert!(numbering.anchor_setup(&mut prompt, 0, &markers, "s", &checkpoint));
+        assert!(numbering
+            .anchor_setup(&mut prompt, 0, &markers, "s", &checkpoint)
+            .unwrap());
         assert_eq!(numbers(&prompt), vec![Some(1), Some(2), Some(41)]);
         // A marker no longer in effect is no anchor: the Setup checkpoint applies.
         let mut prompt = vec![user("a"), user("b"), user("c")];
         let mut numbering = TagNumbering::new(TagSeed::default(), 0);
         numbering.rules = Some(RENDER);
-        numbering.number_new(&mut prompt);
+        numbering.number_new(&mut prompt).unwrap();
         let reverted = [Marker::new("m2", false).with_checkpoint(MarkerCheckpoint::new(40, "s"))];
-        assert!(numbering.anchor_setup(&mut prompt, 0, &reverted, "s", &checkpoint));
+        assert!(numbering
+            .anchor_setup(&mut prompt, 0, &reverted, "s", &checkpoint)
+            .unwrap());
         assert_eq!(numbers(&prompt), vec![Some(501), Some(502), Some(503)]);
     }
 

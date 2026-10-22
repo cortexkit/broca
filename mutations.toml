@@ -22668,8 +22668,8 @@ select = "expected"
 test_file = "crates/broca-protocol/src/tags.rs"
 expect_red = ["tags::tests::computed_numbering_counts_only_parts_rendered_with_a_number"]
 file = "crates/broca-protocol/src/tags.rs"
-old = "                    .is_some_and(cortexkit_role_llm_runner::tags::counts);"
-new = "                    .is_some(); // NON-VACUITY BREAK: number every known part."
+old = "        ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => {\n            PartKind::Reasoning"
+new = "        ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => {\n            PartKind::AssistantText // NON-VACUITY BREAK: count reasoning as the model's text."
 
 [[control]]
 id = "tags-image-only-result-renders-its-label"
@@ -22800,3 +22800,16 @@ expect_red = ["actor::shown_number_tests::a_part_tag_names_the_number_its_part_s
 file = "crates/broca-module/src/actor.rs"
 old = "    if key_message != part.mid {"
 new = "    if key_message != part.mid && false { // NON-VACUITY BREAK: accept a part key of another message."
+
+[[control]]
+id = "tags-numbering-past-u64-max-is-refused"
+guards = "Tag numbering that would pass u64::MAX is refused with NumberingOverflow, never saturated into a repeated number"
+runner = "cargo"
+package = "broca-protocol"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-protocol/src/tags.rs"
+expect_red = ["tags::tests::numbering_past_u64_max_is_refused_never_repeated"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "    let numbers = cortexkit_role_llm_runner::tags::try_number_parts(base, &rendered)?;"
+new = "    #[allow(deprecated)] let numbers = cortexkit_role_llm_runner::tags::number_parts(base, &rendered); // NON-VACUITY BREAK: saturate instead of refusing."

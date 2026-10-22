@@ -5433,7 +5433,8 @@ mod caller_message_tests {
                 clean,
             },
             &mut high,
-        );
+        )
+        .unwrap();
         entry.tags = tag_rows(entry.ordinal, &entry.message);
         entry
     }

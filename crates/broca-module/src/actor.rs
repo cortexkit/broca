@@ -7609,7 +7609,8 @@ mod shown_number_tests {
                 clean: true,
             },
             &mut high,
-        );
+        )
+        .unwrap();
         broca_protocol::tags::number_message(
             &mut quiet,
             broca_protocol::tags::ComputedRules {
@@ -7617,7 +7618,8 @@ mod shown_number_tests {
                 clean: false,
             },
             &mut high,
-        );
+        )
+        .unwrap();
         let mut transcript = vec![shown, quiet];
         broca_protocol::content::stamp_ordinals(&mut transcript);
         assert_eq!(

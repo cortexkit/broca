@@ -748,6 +748,9 @@ pub enum RunError {
     /// The routing module refused to choose a provider account for this send. Refused before
     /// anything durable is written; the refusal says whether a later retry may be admitted.
     AccountSelectionRefused(AccountSelectionRefusal),
+    /// Numbering the transcript's tags would pass `u64::MAX` (llm-runner
+    /// `tags::try_number_parts`): the run is refused rather than show two parts one number.
+    TagNumbering(broca_protocol::tags::NumberingOverflow),
 }
 
 /// Routing's refusal to choose an account, copied verbatim, with broca's classification.
@@ -778,7 +781,8 @@ impl RunError {
             | Self::ContextManagementUnavailable { .. }
             | Self::RetainedSessionTooLarge { .. }
             | Self::SessionTooLarge { .. }
-            | Self::NewerWriter { .. } => ErrorClass::Permanent,
+            | Self::NewerWriter { .. }
+            | Self::TagNumbering(_) => ErrorClass::Permanent,
             Self::LeaseHeld(_)
             | Self::Lease(_)
             | Self::Wal(_)
@@ -805,6 +809,7 @@ impl std::fmt::Display for RunError {
                 missing.join(", ")
             ),
             RunError::Panicked => write!(f, "run task panicked before producing a terminal"),
+            RunError::TagNumbering(overflow) => write!(f, "{overflow}"),
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
             RunError::Transient(s) => write!(f, "run admission temporarily unavailable: {s}"),
@@ -4333,7 +4338,9 @@ where
             stamped_len,
         );
         stamped_len = opts.prompt.len();
-        tag_numbering.number_new(&mut mutable_call_options(&mut opts).prompt);
+        tag_numbering
+            .number_new(&mut mutable_call_options(&mut opts).prompt)
+            .map_err(RunError::TagNumbering)?;
         if let Some(raw) = &mut compaction_raw {
             if raw.len() < opts.prompt.len() {
                 raw.extend_from_slice(&opts.prompt[raw.len()..]);
@@ -4429,13 +4436,15 @@ where
                         // before anything of this run is rendered with a number.
                         if let (Some(_), Some(checkpoint)) = (computed_tags, &state.tag_checkpoint)
                         {
-                            tag_numbering.anchor_setup(
-                                &mut mutable_call_options(&mut opts).prompt,
-                                0,
-                                &[],
-                                "",
-                                checkpoint,
-                            );
+                            tag_numbering
+                                .anchor_setup(
+                                    &mut mutable_call_options(&mut opts).prompt,
+                                    0,
+                                    &[],
+                                    "",
+                                    checkpoint,
+                                )
+                                .map_err(RunError::TagNumbering)?;
                         }
                         compaction_state = Some(state);
                     }

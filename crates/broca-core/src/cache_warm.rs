@@ -483,7 +483,9 @@ pub fn last_recorded_request(
     // them, so the rebuild numbers them the same way.
     let placed = prompt.len();
     prompt.extend(prior.pending_steers);
-    crate::tags::TagNumbering::number_appended(&mut prompt, placed, &config);
+    crate::tags::TagNumbering::number_appended(&mut prompt, placed, &config).map_err(|error| {
+        RecordedRequestError::Unavailable(format!("number the held-back steers: {error}"))
+    })?;
     broca_protocol::content::stamp_ordinals_from(&mut prompt, 0);
     // A run frozen with `render_tags` sent its tagged user and tool-result text with the tag
     // prefix, after the guidance above; the rebuilt request must carry the same bytes. Any run

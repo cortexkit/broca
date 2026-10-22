@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use cortexkit_role_llm_runner::tags::{PartKind, TextWriter};
+pub use cortexkit_role_llm_runner::tags::NumberingOverflow;
+use cortexkit_role_llm_runner::tags::{PartKind, RenderedPart, TextWriter};
 
 use crate::content::{ContentBlock, Message, Role, ToolOutput};
 
@@ -407,23 +408,34 @@ pub fn exposed_model_text(clean: bool, text: &str) -> std::borrow::Cow<'_, str> 
 /// Number `message`, written under `rules`, after `high`, the highest number shown before it,
 /// and raise `high` past its counted parts. A part counts exactly when [`part_kind`] says it
 /// does; only a run that renders tags numbers anything. The parts are numbered in block order,
-/// the order a request renders them.
-pub fn number_message(message: &mut Message, rules: ComputedRules, high: &mut u64) {
+/// the order a request renders them, by llm-runner's `tags::try_number_parts`. Numbering that
+/// would pass `u64::MAX` is refused with its `NumberingOverflow`, and the message is left as
+/// it was: no two parts ever show one number.
+pub fn number_message(
+    message: &mut Message,
+    rules: ComputedRules,
+    high: &mut u64,
+) -> Result<(), NumberingOverflow> {
     let clean = rules.clean && message.role == Role::Assistant;
     let base = *high;
-    let parts = message
+    // The parts that count, with their block positions as their rendered order.
+    let counted: Vec<(usize, RenderedPart)> = message
         .content
         .iter()
-        .map(|block| {
-            let counted = rules.render
-                && part_kind(message.role, block, clean)
-                    .is_some_and(cortexkit_role_llm_runner::tags::counts);
-            counted.then(|| {
-                *high = high.saturating_add(1);
-                *high
-            })
+        .enumerate()
+        .filter_map(|(index, block)| {
+            let kind = part_kind(message.role, block, clean)?;
+            (rules.render && cortexkit_role_llm_runner::tags::counts(kind))
+                .then(|| (index, RenderedPart::new(kind, index as u64)))
         })
         .collect();
+    let rendered: Vec<RenderedPart> = counted.iter().map(|(_, part)| *part).collect();
+    let numbers = cortexkit_role_llm_runner::tags::try_number_parts(base, &rendered)?;
+    let mut parts = vec![None; message.content.len()];
+    for ((index, _), number) in counted.iter().zip(numbers) {
+        parts[*index] = number;
+    }
+    *high = parts.iter().flatten().copied().max().unwrap_or(base);
     message.set_tags(Some(Arc::new(PartTags {
         parts,
         computed: Some(ComputedTags {
@@ -432,6 +444,7 @@ pub fn number_message(message: &mut Message, rules: ComputedRules, high: &mut u6
             base,
         }),
     })));
+    Ok(())
 }
 
 /// The highest number `messages` show, numbered as they are: where numbering continues after
@@ -818,7 +831,7 @@ mod tests {
                 }),
             ],
         );
-        number_message(&mut assistant, RENDERING, &mut high);
+        number_message(&mut assistant, RENDERING, &mut high).unwrap();
         let tags = assistant.part_tags().unwrap();
         // "§4§" cleans to nothing, so it is empty text and shows no number.
         assert_eq!(tags.parts, vec![None, Some(8), None, None]);
@@ -843,7 +856,7 @@ mod tests {
                 }),
             ],
         );
-        number_message(&mut tool, RENDERING, &mut high);
+        number_message(&mut tool, RENDERING, &mut high).unwrap();
         assert_eq!(
             tool.part_tags().unwrap().parts,
             vec![Some(9), None, Some(10)]
@@ -858,9 +871,31 @@ mod tests {
                 clean: false,
             },
             &mut high,
-        );
+        )
+        .unwrap();
         assert_eq!(quiet.part_tags().unwrap().parts, vec![None]);
         assert_eq!(high, 10);
+    }
+
+    /// Numbering that would pass `u64::MAX` is refused with llm-runner's `NumberingOverflow`
+    /// and leaves the message as it was; numbering that ends exactly at `u64::MAX` is accepted.
+    /// No two parts ever show one number.
+    #[test]
+    fn numbering_past_u64_max_is_refused_never_repeated() {
+        let two = || Message::new(Role::User, vec![text("a"), text("b")]);
+        let mut message = two();
+        let mut high = u64::MAX - 1;
+        let overflow = number_message(&mut message, RENDERING, &mut high).unwrap_err();
+        assert_eq!((overflow.checkpoint, overflow.counted), (u64::MAX - 1, 2));
+        assert_eq!(high, u64::MAX - 1);
+        assert!(message.part_tags().is_none(), "nothing numbered");
+        let mut message = two();
+        let mut high = u64::MAX - 2;
+        number_message(&mut message, RENDERING, &mut high).unwrap();
+        assert_eq!(
+            message.part_tags().unwrap().parts,
+            vec![Some(u64::MAX - 1), Some(u64::MAX)]
+        );
     }
 
     /// A computed message renders by the computed rules: its own number before the text with
@@ -870,11 +905,11 @@ mod tests {
     fn computed_rendering_numbers_cleans_and_labels() {
         let mut high = 0;
         let mut user = Message::new(Role::User, vec![text("§9§ hello")]);
-        number_message(&mut user, RENDERING, &mut high);
+        number_message(&mut user, RENDERING, &mut high).unwrap();
         let mut assistant = Message::new(Role::Assistant, vec![text("§3§ hi as §1§ says")]);
-        number_message(&mut assistant, RENDERING, &mut high);
+        number_message(&mut assistant, RENDERING, &mut high).unwrap();
         let mut tool = Message::new(Role::Tool, vec![image_result("c")]);
-        number_message(&mut tool, RENDERING, &mut high);
+        number_message(&mut tool, RENDERING, &mut high).unwrap();
         let mut prompt = vec![user, assistant.clone(), tool];
         render_tags_into(&mut prompt, TagRendering::default());
         assert_eq!(prompt[0].content, vec![text("§1§ hello")]);
@@ -921,7 +956,8 @@ mod tests {
                     clean,
                 },
                 &mut high,
-            );
+            )
+            .unwrap();
             let exposed = exposed_message(&message);
             assert_eq!(exposed.content[0], text(expected), "clean={clean}");
             assert_eq!(exposed.content[1], raw.content[1]);
