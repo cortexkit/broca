@@ -1049,6 +1049,7 @@ async fn send_warm(
                 UNIX_EPOCH + Duration::from_millis(clock.now_ms()),
                 error,
             );
+            let error = opencode_payment_required(&request.url, code, error);
             return Err(broca_core::WarmFailure::Provider(error));
         }
         let usage = match family {
@@ -2878,6 +2879,7 @@ async fn drive_attempt(
             }
             None => error,
         };
+        let error = opencode_payment_required(&request.url, code, error);
         if code == 429
             && matches!(
                 request.family,
@@ -4163,6 +4165,49 @@ fn xai_spending_limit_reached(
     } else {
         None
     }
+}
+
+/// OpenCode's hosted gateways (Zen at `https://opencode.ai/zen/...` and Go at
+/// `https://opencode.ai/inference/go/...`) refuse a request from an account with no funds left
+/// with HTTP 402 Payment Required, for example
+/// `{"error":{"type":"server_error","message":"Upstream request failed: Insufficient account funds"}}`.
+/// The body's `error.type` is a generic `server_error` that also labels one-off upstream
+/// failures, so on its own it would let routing retry the same empty account. The status is the
+/// structured signal, so the decision keys on status 402 and the OpenCode endpoint, never on the
+/// message wording. Other hosts' 402s keep their own classification (OpenRouter's, for one, is a
+/// request its credit cannot pay for, not an empty balance).
+///
+/// Like the other `billing_exhausted` refusals it is permanent with no reset: the balance stays
+/// empty until someone tops it up, so re-sending within the run cannot succeed.
+fn opencode_payment_required(
+    request_url: &str,
+    status: u16,
+    error: ProviderError,
+) -> ProviderError {
+    if status != 402 || !is_opencode_gateway_url(request_url) {
+        return error;
+    }
+    ProviderError {
+        refusal: None,
+        class: ErrorClass::Permanent,
+        provider_code: Some(BILLING_EXHAUSTED.to_string()),
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+        ..error
+    }
+}
+
+/// Whether a request URL points at OpenCode's Zen or Go gateway.
+fn is_opencode_gateway_url(request_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(request_url) else {
+        return false;
+    };
+    url.host_str() == Some("opencode.ai")
+        && (url.path().starts_with("/zen/") || url.path().starts_with("/inference/go/"))
 }
 
 /// Kimi's weekly allowance refusal has no reset timestamp, so preserve the unknown reset rather
@@ -7811,6 +7856,91 @@ mod tests {
         assert_eq!(error.resets_at_ms, None);
         assert_eq!(server.request_bodies().len(), 1);
         assert!(waits.lock().unwrap().is_empty());
+    }
+
+    /// OpenCode Zen's refusal from an account with no funds left, captured verbatim from a
+    /// production run. The type is a generic `server_error`; the 402 status is the signal.
+    const OPENCODE_INSUFFICIENT_FUNDS_BODY: &str = r#"{"error":{"type":"server_error","message":"Upstream request failed: Insufficient account funds"}}"#;
+
+    /// Classifies an HTTP refusal through the same steps as a live attempt: the status and body
+    /// table, the account-limit decoders, then the endpoint-specific payment check.
+    fn classify_at_url(url: &str, status: u16, body: &str) -> ProviderError {
+        let headers = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
+        let family = WireFamilyId::OpenAiChat;
+        let error =
+            super::classify_http_error_in_family(status, body, None, None, Some(family), None);
+        let error =
+            classify_account_limit_exhausted(family, status, &headers, body, UNIX_EPOCH, error);
+        super::opencode_payment_required(url, status, error)
+    }
+
+    fn assert_opencode_billing_exhausted(error: &ProviderError) {
+        assert_eq!(error.class, ErrorClass::Permanent);
+        assert!(error.is_billing_exhausted());
+        assert_eq!(error.provider_code.as_deref(), Some(BILLING_EXHAUSTED));
+        assert_eq!(error.status, Some(402));
+        assert_eq!(error.resets_at_ms, None);
+        assert_eq!(error.account_ref, None);
+        assert_eq!(error.credential_id, None);
+        assert!(
+            error.message.contains("Insufficient account funds"),
+            "the provider's message is kept: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn opencode_zen_402_is_billing_exhausted() {
+        let error = classify_at_url(
+            "https://opencode.ai/zen/v1/chat/completions",
+            402,
+            OPENCODE_INSUFFICIENT_FUNDS_BODY,
+        );
+        assert_opencode_billing_exhausted(&error);
+    }
+
+    #[test]
+    fn opencode_go_402_is_billing_exhausted() {
+        let error = classify_at_url(
+            "https://opencode.ai/inference/go/v1/chat/completions",
+            402,
+            OPENCODE_INSUFFICIENT_FUNDS_BODY,
+        );
+        assert_opencode_billing_exhausted(&error);
+    }
+
+    #[test]
+    fn the_opencode_402_mapping_needs_status_402_and_an_opencode_gateway() {
+        let unchanged = classify_http_error(402, OPENCODE_INSUFFICIENT_FUNDS_BODY, None, None);
+        assert_eq!(unchanged.class, ErrorClass::Permanent);
+        assert_eq!(unchanged.provider_code.as_deref(), Some("server_error"));
+        for (url, status) in [
+            ("https://api.example.com/v1/chat/completions", 402),
+            ("https://openrouter.ai/api/v1/chat/completions", 402),
+            // OpenCode's host, but not one of its metered gateways.
+            ("https://opencode.ai/api/v1/chat/completions", 402),
+            // A look-alike host is not OpenCode.
+            (
+                "https://opencode.ai.example.com/zen/v1/chat/completions",
+                402,
+            ),
+            ("https://opencode.ai/zen/v1/chat/completions", 500),
+        ] {
+            let error = classify_at_url(url, status, OPENCODE_INSUFFICIENT_FUNDS_BODY);
+            assert!(!error.is_billing_exhausted(), "{url} {status}");
+            assert_eq!(
+                error.provider_code.as_deref(),
+                Some("server_error"),
+                "{url} {status}"
+            );
+        }
+        // OpenRouter's unaffordable-request 402 keeps its own code on its own host.
+        let openrouter = classify_at_url(
+            "https://openrouter.ai/api/v1/chat/completions",
+            402,
+            OPENROUTER_CREDIT_402_BODY,
+        );
+        assert!(openrouter.is_credit_insufficient());
     }
 
     fn chatgpt_retry_test_provider(server: &ScriptedServer) -> LiveProvider<RetryTestFamily> {
