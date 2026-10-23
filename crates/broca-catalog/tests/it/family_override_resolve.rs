@@ -166,7 +166,7 @@ mod gated {
         common::install_snapshot();
         let resolved = ok(
             resolve_provider(
-                "google/gemini-2.5-flash",
+                "google/antigravity-gemini-3.8-flash",
                 None,
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
@@ -196,19 +196,19 @@ mod gated {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["project"], serde_json::json!("proj-override"));
         assert_eq!(v["userAgent"], serde_json::json!("antigravity"));
-        assert_eq!(v["model"], serde_json::json!("gemini-2.5-flash"));
+        assert_eq!(v["model"], serde_json::json!("gemini-3.8-flash-medium"));
         // The inner gemini body is nested under `request`.
         assert!(v.get("request").and_then(|r| r.get("contents")).is_some());
     }
 
-    /// Antigravity's caller-facing prefix and untiered routes resolve before freeze, so the wire
-    /// carries the backend tier id while unrelated and already-tiered ids remain untouched.
+    /// Published defaults and historical tier spellings resolve before freeze. Both select
+    /// only backend ids explicitly named by the served alias row.
     #[test]
     fn antigravity_override_resolves_the_frozen_wire_tier() {
         common::install_snapshot();
         let resolved = ok(
             resolve_provider(
-                "google/antigravity-gemini-3.5-flash",
+                "google/antigravity-gemini-3.8-flash",
                 None,
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
@@ -232,10 +232,10 @@ mod gated {
             "aliased antigravity model resolves",
         );
 
-        assert_eq!(resolved.wire_model, "gemini-3.5-flash-low");
+        assert_eq!(resolved.wire_model, "gemini-3.8-flash-medium");
         let bytes = resolved.provider.render_request(&opts());
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["model"], serde_json::json!("gemini-3.5-flash-low"));
+        assert_eq!(v["model"], serde_json::json!("gemini-3.8-flash-medium"));
         assert_eq!(
             v["request"]["generationConfig"]["maxOutputTokens"],
             serde_json::json!(2048),
@@ -244,7 +244,7 @@ mod gated {
 
         let unchanged = ok(
             resolve_provider(
-                "google/antigravity-gemini-2.5-flash",
+                "google/antigravity-gemini-3.8-flash-low",
                 None,
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
@@ -265,9 +265,9 @@ mod gated {
                     clock: None,
                 },
             ),
-            "untiered antigravity 2.5 model resolves",
+            "published historical tier spelling resolves",
         );
-        assert_eq!(unchanged.wire_model, "gemini-2.5-flash");
+        assert_eq!(unchanged.wire_model, "gemini-3.8-flash-low");
 
         // A ChatGPT-family override must NOT strip anything: the prefix rule is scoped to
         // the codeassist family alone.
@@ -304,7 +304,7 @@ mod gated {
         common::install_snapshot();
         let resolved = ok(
             resolve_provider_with_client(
-                "google/antigravity-gemini-3.5-flash",
+                "google/antigravity-gemini-3.8-flash",
                 None,
                 None,
                 &AuthMode::Bearer("dummy-token".into()),

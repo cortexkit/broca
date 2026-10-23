@@ -415,8 +415,8 @@ fn install_drift_revision(reasoning: bool, output: u64) {
 }
 
 /// Resolve the drift model the way the executor does. `recorded` is the prior episode's
-/// RunConfig on a resume, and both restored inputs (host and output cap) come from it through
-/// the executor's own reader, so the test cannot restore something production does not.
+/// RunConfig on a resume. Using the executor's decoder ensures this test and production
+/// resume use the same complete recorded render bundle.
 fn resolve_drift_revision(
     recorded: Option<&broca_wal::RunConfig>,
     caller_max_tokens: Option<u32>,
@@ -431,6 +431,7 @@ fn resolve_drift_revision(
         record_version: None,
         in_run_refresh: None,
     };
+    let recorded_render = recorded.map(decode_recorded_render_config).transpose().unwrap();
     resolve_provider_for_episode(
         "anthropic/resume-drift",
         None,
@@ -442,6 +443,7 @@ fn resolve_drift_revision(
         },
         broca_provider::build_provider_http_client(),
         broca_catalog::live::EpisodeRenderConfig {
+            recorded_config: recorded_render.as_ref(),
             codeassist_identity: None,
             claude_code_persona: Default::default(),
             base_url: Some(
@@ -643,13 +645,11 @@ async fn resume_through_core(
     (codes, summary.reason, calls)
 }
 
-/// The control for the output-cap restore: a catalog-owned field OTHER than the output limit
-/// (reasoning) moved between start and resume, and the resume is still refused. Run with no
-/// caller cap so the restored cap is in play, which proves the restore does not mask drift in
-/// the rest of the frozen config.
+/// A changed reasoning fact affects new admissions, not an episode whose complete render
+/// bundle is already recorded. The resumed run must render its original bytes and proceed.
 #[tokio::test]
-async fn runtime_override_catalog_drift_refuses_resume() {
-    if !run_catalog_drift_child("runtime_override_catalog_drift_refuses_resume") {
+async fn runtime_override_catalog_drift_resumes_recorded_bytes() {
+    if !run_catalog_drift_child("runtime_override_catalog_drift_resumes_recorded_bytes") {
         return;
     }
     let root = broca_test_support::scratch_root()
@@ -658,7 +658,11 @@ async fn runtime_override_catalog_drift_refuses_resume() {
     let started = resolve_drift_revision(None, None);
     let recorded = drift_run_config(&drift_request(&root), &started);
     install_drift_revision(false, 8192);
+    assert_ne!(resolve_drift_revision(None, None).provider.render_config_blob(), started.provider.render_config_blob(), "the new catalog changes fresh admissions");
     let resumed = resolve_drift_revision(Some(&recorded), None);
+    assert_eq!(resumed.provider.render_config_blob(), started.provider.render_config_blob());
+    let prompt = broca_protocol::CallOptions::new(vec![]);
+    assert_eq!(resumed.provider.render_request(&prompt), started.provider.render_request(&prompt));
     assert_eq!(
         started.provider.renderer_version(),
         resumed.provider.renderer_version()
@@ -668,14 +672,9 @@ async fn runtime_override_catalog_drift_refuses_resume() {
     let (codes, reason, calls) = resume_through_core(&root, recorded, resumed).await;
     eprintln!("resume outcome: {reason:?}; provider_codes={codes:?}; provider_calls={calls}");
     std::fs::remove_dir_all(root).unwrap();
-    assert!(
-        codes
-            .iter()
-            .any(|code| code.as_deref() == Some("frozen_render_config_drift")),
-        "expected catalog-drift refusal, got {codes:?}; outcome={reason:?}; calls={calls}"
-    );
-    assert_eq!(reason, broca_protocol::caller::RunFinishReason::Interrupted);
-    assert_eq!(calls, 0);
+    assert!(codes.is_empty(), "a catalog change cannot refuse a recorded episode: {codes:?}");
+    assert_eq!(reason, broca_protocol::caller::RunFinishReason::Completed);
+    assert_eq!(calls, 1);
 }
 
 /// A send with no cap freezes the catalog's limit.output (A). The catalog then moves that fact
@@ -885,6 +884,7 @@ async fn a_non_chat_catalog_model_is_refused_at_admission() {
         models: Default::default(),
         withheld: vec![],
         uncertain: vec![],
+        wire_corrections: vec![],
     };
     let tier_row = serde_json::json!({
         "existence": "present",
@@ -1900,9 +1900,20 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
         let fresh_identity =
             broca_module_serve::codeassist_identity::for_episode(&request.session, None, 0, 0)
                 .unwrap();
+        // This route represents an older admitted Code Assist run, not a fresh catalog send.
+        // Its recorded backend id must remain reproducible even without a current tier row.
+        let historical = (route.family == WireFamilyId::GoogleCodeAssist).then(|| {
+            let mut config = broca_provider::families::google_codeassist_frozen_config("gemini-2.5-flash");
+            config.project_id = route.project_id.map(str::to_owned);
+            config.max_output_tokens = 2048;
+            config.caller_max_output_tokens = Some(2048);
+            config.codeassist_identity = fresh_identity.clone();
+            config
+        });
         let started = resolve_declared_route(
             route,
             broca_catalog::live::EpisodeRenderConfig {
+                recorded_config: historical.as_ref(),
                 codeassist_identity: fresh_identity.as_ref(),
                 ..Default::default()
             },
@@ -1925,10 +1936,11 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
         )
         .unwrap();
         assert_eq!(identity.is_none(), predates_text_state);
-        let resumed = resolve_declared_route(
-            route,
-            restored_episode_render(&recorded, identity.as_ref()),
-        );
+        let frozen = decode_recorded_render_config(&recorded).unwrap();
+        let resumed = resolve_declared_route(route, broca_catalog::live::EpisodeRenderConfig {
+            recorded_config: Some(&frozen),
+            ..restored_episode_render(&recorded, identity.as_ref())
+        });
         assert!(resumed.provider.reproduces_renderer_version(previous));
         let stated = resumed.provider.render_config_blob_for_version(previous);
         assert_eq!(stated, recorded.frozen_render_config, "{:?}", route.family);

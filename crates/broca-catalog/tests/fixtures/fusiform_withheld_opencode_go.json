@@ -1,0 +1,70 @@
+{
+  "source": "models.dev",
+  "catalog_version": 1792755357465,
+  "resolved_at_ms": 1792755517426,
+  "models": {
+    "opencode-go/minimax-m2.7": {
+      "capability.attachment": false,
+      "capability.input_modalities": [
+        "text"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 204800,
+      "limit.output": 131072,
+      "model.canonical_id": "minimax/MiniMax-M2.7",
+      "model.family": "minimax",
+      "model.open_weights": true,
+      "model.status": "deprecated",
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 60000000
+      },
+      "rate.cache_write": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 375000000
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 300000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 1200000000
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    }
+  }
+}

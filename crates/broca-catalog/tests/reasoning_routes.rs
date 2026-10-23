@@ -117,7 +117,7 @@ fn meta_reasoning_route_is_stateless_responses() {
 }
 
 #[test]
-fn responses_host_inventory_limits_new_policy_to_meta() {
+fn responses_hosts_follow_wire_packages_and_only_native_personas_get_replay_policy() {
     let catalog = catalog();
     let mut hosts: Vec<_> = catalog
         .provider_ids()
@@ -128,7 +128,25 @@ fn responses_host_inventory_limits_new_policy_to_meta() {
         })
         .collect();
     hosts.sort();
-    assert_eq!(hosts, ["meta", "openai", "xai"]);
+    assert_eq!(
+        hosts,
+        [
+            "infer",
+            "meta",
+            "neosmith",
+            "openai",
+            "perplexity-agent",
+            "vivgrid",
+            "xai"
+        ]
+    );
+    for provider in hosts {
+        assert_eq!(
+            !catalog.provider(provider).unwrap().static_options.is_null(),
+            ["meta", "openai", "xai"].contains(&provider),
+            "{provider} replay policy"
+        );
+    }
 }
 
 #[test]
@@ -280,7 +298,10 @@ fn recorded_bedrock_and_meta_configs_rebuild_without_adopting_new_policy() {
 #[test]
 fn non_reasoning_snapshot_models_keep_chat() {
     let catalog = catalog();
-    for (provider, model) in [("xai", "grok-composer-2.5-fast"), ("openai", "gpt-4.1")] {
+    for (provider, model) in [
+        ("xai", "grok-4.20-0309-non-reasoning"),
+        ("openai", "gpt-4.1"),
+    ] {
         let (spec, _) = catalog.model_for_serving(provider, model).unwrap();
         assert_eq!(spec.wire_family, WireFamilyId::OpenAiChat);
         assert!(spec.static_options.is_null());

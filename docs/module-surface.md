@@ -49,6 +49,22 @@ model identities or qualification rows, and repeated continuation tokens are
 protocol errors. A failed poll retains the previous memory snapshot and LKG and
 counts once toward catalog health, just as an unpaged failure does.
 
+Routing is resolved from each model row's `wire.npm`, `wire.api` and optional
+`wire.shape`; provenance (`from`) is an open string. An unstated endpoint or
+unsupported package/shape refuses a new send with the model and missing fact
+named. OpenAI, Anthropic, Google's Gemini API and xAI temporarily retain their
+existing native resolver paths until Fusiform serves their native default
+endpoints as curated facts. Code Assist and Meta subscription credentials
+permanently select their own required client protocol and endpoint.
+
+Code Assist reasoning tiers use `route.reasoning_wire_ids` and
+`route.reasoning_default`. A historical tier-suffixed id is recognized only by
+reverse lookup in the published tier map. A withdrawn model's `successor` is
+replacement advice, never a redirect. `wire_corrections` is logged for diagnosis
+and never selects a route. A resume restores its entire recorded render config
+before any catalog lookup, so changed or withdrawn routing facts cannot change
+the endpoint, wire family, model id or request bytes of an admitted run.
+
 The fusiform catalog service's reference pagination request/response fixtures
 have not yet been published. Until those fixtures confirm interoperability,
 Broca makes these compatibility assumptions:

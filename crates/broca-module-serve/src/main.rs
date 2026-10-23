@@ -2302,6 +2302,14 @@ mod executor {
             .and_then(|value| u32::try_from(value).ok())
     }
 
+    /// Decode the whole admission bundle so upstream routing changes cannot move a resumed run.
+    fn decode_recorded_render_config(
+        config: &broca_wal::RunConfig,
+    ) -> Result<broca_provider::wire::FrozenRenderConfig, String> {
+        serde_json::from_value(config.frozen_render_config.clone())
+            .map_err(|error| format!("recorded provider render config cannot be decoded: {error}"))
+    }
+
     /// The reasoning variant the episode froze at start, re-applied as recorded on resume. Read
     /// off the blob like the output cap, so a resume never re-derives it from the catalog.
     fn frozen_variant(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::FrozenVariant> {
@@ -4030,6 +4038,22 @@ mod executor {
                 .as_ref()
                 .filter(|_| !fresh_episode)
                 .and_then(|prior| frozen_variant(&prior.config));
+            // Endpoint, renderer and backend ids are admission inputs. Re-reading today's
+            // catalog would move or refuse an already admitted run after an upstream change.
+            let recorded_render_config = match prior_run
+                .as_ref()
+                .filter(|_| !fresh_episode)
+                .map(|prior| decode_recorded_render_config(&prior.config))
+                .transpose()
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    if let Some(ack) = job.on_admitted {
+                        let _ = ack.send(Err(RunError::Config(error.clone())));
+                    }
+                    return Err(RunError::Config(error));
+                }
+            };
             // For a ChatGPT auth-at-start pause, this provider exists solely to satisfy the
             // core's provider type until resume rebuilds real credentials and runs the pre-call
             // refreeze check. The core durably writes RunStarted and RunPaused without rendering or
@@ -4048,6 +4072,7 @@ mod executor {
                 &resolve_options,
                 self.provider_client.clone(),
                 broca_catalog::live::EpisodeRenderConfig {
+                    recorded_config: recorded_render_config.as_ref(),
                     wire_family: opencode_go_wire_family,
                     opencode_go_session_id: opencode_go_session_id.as_deref(),
                     opencode_go_reasoning_signature,
@@ -4076,10 +4101,8 @@ mod executor {
                         }),
                     codeassist_identity: codeassist_identity.as_ref(),
                     chatgpt_wire: chatgpt_wire.as_ref(),
-                    // Only the host and the output cap are restored. Re-resolve other catalog
-                    // fields so core's frozen_render_config_drift guard remains a real
-                    // comparison on resume. Changing the operator override must not move an
-                    // existing episode.
+                    // A fresh run takes the operator override; resumes use the full recorded
+                    // bundle above, including its exact endpoint presence or absence.
                     base_url: if let Some(prior) = prior_run.as_ref().filter(|_| !fresh_episode) {
                         prior
                             .config

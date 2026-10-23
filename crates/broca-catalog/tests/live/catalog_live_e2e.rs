@@ -321,12 +321,10 @@ mod gated {
         );
     }
 
-    /// The other direction: a provider we DELIBERATELY overlaid to an OpenAI-compatible
-    /// family IS served (the catalog's `provider()` returns it, and it's no longer pending).
-    /// This pins the overlay's effect so a regression that drops the overlay re-pends them.
+    /// Compatible packages with published endpoints resolve without generated overlay pins.
     #[test]
-    fn catalog_serves_overlaid_openai_compatible_providers() {
-        for pid in ["cerebras", "xai", "openrouter"] {
+    fn catalog_serves_fact_mapped_openai_compatible_providers() {
+        for pid in ["deepseek", "xai", "openrouter"] {
             assert!(
                 common::install_snapshot().provider(pid).is_some(),
                 "{pid} is overlaid to OpenAiChat and must be served"

@@ -4,17 +4,17 @@
 //! Admission only reads an immutable in-memory snapshot. A detached poll refreshes that snapshot
 //! and its disk last-known-good copy, so fusiform and filesystem latency never enter resolution.
 //!
-//! Layering: fusiform's point-in-time response is the base; the overlay is applied on top
-//! (a `patch` deep-merges onto an existing provider, an `add` introduces one
-//! not in the catalog). Overlay `wire_family` pins are either authored or
-//! generated — see `family.rs`. Known fields map into the typed spec; the FULL
+//! Fusiform owns model and provider facts, including wire packages, shapes, endpoints,
+//! reasoning tier ids and retirement successors. Broca maps packages and shapes to its
+//! implemented renderers. The overlay retains only native routing holds and renderer quirks.
+//! The legacy snapshot importer remains available for offline tooling. Its FULL
 //! original object is preserved verbatim in `raw` (forward-compat — models.dev adds
 //! fields, and an unmapped field must never be silently dropped). The renderer NEVER
 //! reads `raw`; any field that can change request bytes is promoted to a typed field
 //! (a test over the real snapshot enforces that every key is classified).
 //!
-//! Wire-family (renderer) selection is OUR decision, never sourced from the catalog —
-//! see `family.rs`.
+//! Renderer implementation is Broca's decision; the upstream protocol being implemented
+//! comes from the row's wire facts. See `family.rs`.
 #![forbid(unsafe_code)]
 
 pub mod family;
@@ -25,6 +25,7 @@ pub mod keep_warm;
 #[cfg(feature = "live")]
 pub mod live;
 pub mod merge;
+pub mod routing;
 pub mod runtime;
 
 pub use runtime::{
@@ -44,7 +45,7 @@ use family::{resolve_provider_family, FamilyResolution, ResolutionSource};
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Broca-owned corrections, additions, endpoints, and wire-family pins layered over fusiform.
+/// Native routing holds and renderer compatibility choices layered over Fusiform.
 const OVERLAY: &str = include_str!("../data/overlay.json");
 
 /// Where the vendored snapshot came from and when — so a stale catalog is visible
@@ -328,7 +329,28 @@ impl Catalog {
         let mut pending = Vec::new();
         for (id, entry) in &providers {
             let overlay_family = entry.get("wire_family").and_then(parse_family);
-            match resolve_provider_family(id, overlay_family) {
+            let resolution = resolve_provider_family(id, overlay_family);
+            let resolution = match resolution {
+                FamilyResolution::Pending { .. } => entry
+                    .get("npm")
+                    .and_then(Value::as_str)
+                    .and_then(|npm| family::wire_family(npm, None))
+                    .map(|family| FamilyResolution::Supported {
+                        family,
+                        source: ResolutionSource::WireFacts,
+                    })
+                    .or_else(|| {
+                        family::credential_persona_route(id, "oauth").map(|(family, _)| {
+                            FamilyResolution::Supported {
+                                family,
+                                source: ResolutionSource::CredentialPersona,
+                            }
+                        })
+                    })
+                    .unwrap_or(resolution),
+                _ => resolution,
+            };
+            match resolution {
                 FamilyResolution::Supported { family, source } => {
                     resolved_family.insert(id.clone(), (family, source));
                 }
@@ -468,6 +490,15 @@ impl Catalog {
         let model_family = model_entry
             .get("wire_family")
             .and_then(parse_family)
+            .or_else(|| {
+                model_entry
+                    .get("provider")
+                    .and_then(|provider| provider.get("npm"))
+                    .and_then(Value::as_str)
+                    .and_then(|npm| {
+                        family::wire_family(npm, model_entry.get("api").and_then(Value::as_str))
+                    })
+            })
             .unwrap_or(provider_family);
 
         let mut provider_spec = map_provider(provider_id, entry, model_family, raw_policy);
@@ -478,6 +509,12 @@ impl Catalog {
         // current docs list `/openai/v1`, `/google/v1beta`, and `/anthropic` alternatives.
         if let Some(base_url) = model_entry.get("base_url").and_then(Value::as_str) {
             provider_spec.base_url = base_url.to_string();
+        } else if let Some(api) = model_entry
+            .get("provider")
+            .and_then(|provider| provider.get("api"))
+            .and_then(Value::as_str)
+        {
+            provider_spec.base_url = api.to_string();
         }
         Some((provider_spec, map_model(model_id, model_entry, raw_policy)))
     }
@@ -654,6 +691,7 @@ fn map_provider(
     let base_url = entry
         .get("base_url")
         .and_then(Value::as_str)
+        .or_else(|| entry.get("api").and_then(Value::as_str))
         .unwrap_or("")
         .to_string();
     ProviderSpec {
@@ -890,12 +928,20 @@ mod tests {
     }
 
     #[test]
-    fn unpinned_openai_compatible_provider_is_pending() {
-        // The long-tail default used to be `npm == @ai-sdk/openai-compatible`.
-        // That rule is gone: without an overlay pin, deepseek is not served.
-        let c = Catalog::from_json_str(&base().to_string(), "{}").unwrap();
-        assert!(c.provider("deepseek").is_none());
-        assert!(c.pending_providers().iter().any(|p| p.id == "deepseek"));
+    fn published_package_resolves_metadata_without_an_overlay_pin() {
+        let mut facts = base();
+        let c = Catalog::from_json_str(&facts.to_string(), "{}").unwrap();
+        let provider = c
+            .provider("deepseek")
+            .expect("published compatible package and API resolve");
+        assert_eq!(provider.wire_family, WireFamilyId::OpenAiChat);
+        assert_eq!(provider.base_url, "https://api.deepseek.com");
+        facts["deepseek"].as_object_mut().unwrap().remove("api");
+        let c = Catalog::from_json_str(&facts.to_string(), "{}").unwrap();
+        assert!(
+            c.provider("deepseek").unwrap().base_url.is_empty(),
+            "metadata must not invent an endpoint; live admission requires wire.api"
+        );
     }
 
     #[test]
@@ -1310,18 +1356,15 @@ mod tests {
         );
     }
 
-    /// Lock representative overlay-served providers against the REAL bundled catalog.
-    /// Cerebras, xAI, and OpenRouter need overlay family pins, while their endpoint pins
-    /// are respectively authored, authored, and generated from the retired document field.
-    /// This asserts real model ids resolve through `model()` to OpenAI Chat at the expected
-    /// host, so losing either kind of pin fails here rather than silently rerouting requests.
+    /// Published package and endpoint facts replace duplicate overlay pins; native xAI
+    /// retains its renderer exception until curated endpoint facts are available.
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn overlay_served_providers_resolve_to_openai_chat_with_base_url() {
+    fn fact_served_providers_resolve_to_openai_chat_with_base_url() {
         // (provider, a real snapshot model id, expected base_url after overlay).
         let cases = [
-            ("cerebras", "gpt-oss-120b", "https://api.cerebras.ai/v1"),
-            ("xai", "grok-composer-2.5-fast", "https://api.x.ai/v1"),
+            ("deepseek", "deepseek-v4-flash", "https://api.deepseek.com"),
+            ("xai", "grok-4.20-0309-non-reasoning", "https://api.x.ai/v1"),
             // OpenRouter's base_url pin was generated from the snapshot's api value.
             (
                 "openrouter",
@@ -1347,7 +1390,16 @@ mod tests {
 
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn opencode_go_models_use_their_pinned_pi_protocol_and_endpoint() {
+    fn opencode_go_models_use_fusiform_pi_protocol_and_endpoint() {
+        let cache = crate::CatalogCache::empty();
+        cache
+            .install_for_test(
+                serde_json::from_str(include_str!("../tests/fixtures/fusiform_opencode_go.json"))
+                    .unwrap(),
+                crate::CatalogSource::Fusiform,
+            )
+            .unwrap();
+        let snapshot = cache.snapshot().unwrap();
         let cases = [
             (
                 "gpt-6-luna",
@@ -1370,11 +1422,6 @@ mod tests {
                 "https://opencode.ai/inference/go/v1",
             ),
             (
-                "grok-4.6",
-                WireFamilyId::OpenAiResponses,
-                "https://opencode.ai/inference/go/v1",
-            ),
-            (
                 "grok-4.7",
                 WireFamilyId::OpenAiResponses,
                 "https://opencode.ai/inference/go/v1",
@@ -1388,16 +1435,6 @@ mod tests {
                 "muse-spark-1.3-contributor",
                 WireFamilyId::OpenAiResponses,
                 "https://opencode.ai/inference/go/v1",
-            ),
-            (
-                "minimax-m2.5",
-                WireFamilyId::AnthropicMessages,
-                "https://opencode.ai/inference/go",
-            ),
-            (
-                "minimax-m2.7",
-                WireFamilyId::AnthropicMessages,
-                "https://opencode.ai/inference/go",
             ),
             (
                 "minimax-m3",
@@ -1429,23 +1466,13 @@ mod tests {
                 WireFamilyId::OpenAiChat,
                 "https://opencode.ai/inference/go/v1",
             ),
-            (
-                "qwen3.5-plus",
-                WireFamilyId::OpenAiChat,
-                "https://opencode.ai/inference/go/v1",
-            ),
-            (
-                "qwen3.6-plus",
-                WireFamilyId::OpenAiChat,
-                "https://opencode.ai/inference/go/v1",
-            ),
         ];
         for (model_id, family, base_url) in cases {
-            let (provider, _) = catalog()
-                .model("opencode-go", model_id)
-                .unwrap_or_else(|| panic!("opencode-go/{model_id} must be in the bundled catalog"));
-            assert_eq!(provider.wire_family, family, "{model_id} protocol pin");
-            assert_eq!(provider.base_url, base_url, "{model_id} endpoint pin");
+            let route = snapshot
+                .resolve_route("opencode-go", model_id)
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(route.0, family, "{model_id} protocol fact");
+            assert_eq!(route.1, base_url, "{model_id} endpoint fact");
         }
     }
 

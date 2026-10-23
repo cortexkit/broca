@@ -1,0 +1,1166 @@
+{
+  "source": "models.dev",
+  "catalog_version": 1792755357465,
+  "resolved_at_ms": 1792755517426,
+  "models": {
+    "opencode-go/beam-free": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/cat-jam-free": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": "deprecated",
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/claude-haiku-5-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/deepseek-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 384000
+    },
+    "opencode-go/deepseek-v4-flash": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": "deprecated"
+    },
+    "opencode-go/deepseek-v4-flash-vision-exp": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": "deprecated"
+    },
+    "opencode-go/deepseek-v4-pro": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/gemini-4-argon-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode-go/glm-5": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 202752,
+      "limit.output": 32768
+    },
+    "opencode-go/glm-5.1": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 202752,
+      "limit.output": 32768
+    },
+    "opencode-go/glm-5.2": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/glm-5.3": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/glm-5.3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/gpt-5.6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/gpt-6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/grok-4.5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 500000,
+      "limit.output": 500000,
+      "model.status": "deprecated"
+    },
+    "opencode-go/grok-4.6": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 500000,
+      "limit.output": 500000,
+      "model.status": null
+    },
+    "opencode-go/grok-4.7": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 500000,
+      "limit.output": 500000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/hy3": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 256000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/hy4-preview": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1024000,
+      "limit.output": 64000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/kimi-k2.5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 65536
+    },
+    "opencode-go/kimi-k2.6": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 65536,
+      "model.status": "deprecated"
+    },
+    "opencode-go/kimi-k2.7-code": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 262144,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/kimi-k3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/longcat-2.0": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/longcat-2.5-preview-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": "deprecated",
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/mimo-v2-omni": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 128000
+    },
+    "opencode-go/mimo-v2-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1048576,
+      "limit.output": 128000
+    },
+    "opencode-go/mimo-v2.5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/mimo-v2.5-pro": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/mimo-v2.6-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/mimo-v2.6-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/minimax-m2.5": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 204800,
+      "limit.output": 65536
+    },
+    "opencode-go/minimax-m2.7": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 204800,
+      "limit.output": 131072,
+      "model.status": "deprecated",
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/minimax-m3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/minimax-m3.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 512000,
+      "model.status": null,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/minimax-m3.1-flash-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 512000,
+      "model.status": "deprecated",
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/muse-spark-1.2": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1048576,
+      "limit.output": 131072
+    },
+    "opencode-go/muse-spark-1.2-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/muse-spark-1.3-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/omen-alpha": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 500000,
+      "limit.output": 128000
+    },
+    "opencode-go/ox-alpha-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 131072
+    },
+    "opencode-go/qwen3.5-plus": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 81920,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 65536
+    },
+    "opencode-go/qwen3.6-plus": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 81920,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": "deprecated"
+    },
+    "opencode-go/qwen3.7-max": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 262144,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": "deprecated"
+    },
+    "opencode-go/qwen3.7-plus": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 262144,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/qwen3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "xhigh"
+          ]
+        },
+        {
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/qwen3.8-max": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "xhigh"
+          ]
+        },
+        {
+          "max": 262144,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/space-bunny": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 524288,
+      "model.status": "deprecated",
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/space-bunny-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1048576,
+      "limit.output": 524288,
+      "model.status": "deprecated"
+    },
+    "opencode-go/step-5-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/step-5-preview-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": "deprecated",
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/union-alpha": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 131072
+    }
+  }
+}

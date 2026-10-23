@@ -34,6 +34,14 @@ mod gated {
     fn row(context: Value, output: Value) -> BTreeMap<String, Value> {
         BTreeMap::from([
             ("existence".into(), json!("present")),
+            (
+                "wire.npm".into(),
+                json!({"value":"@ai-sdk/anthropic", "from":"provider"}),
+            ),
+            (
+                "wire.api".into(),
+                json!({"value":"https://api.anthropic.com", "from":"provider"}),
+            ),
             ("limit.context".into(), context),
             ("limit.output".into(), output),
             ("capability.attachment".into(), json!(false)),
@@ -95,6 +103,7 @@ mod gated {
                 ]),
                 withheld: Vec::new(),
                 uncertain: Vec::new(),
+                wire_corrections: Vec::new(),
             };
             let cache = Arc::new(CatalogCache::empty());
             cache

@@ -57,6 +57,14 @@
           "policy": "models-dev-usd-v1"
         },
         "units": 150000000000
+      },
+      "wire.npm": {
+        "value": "@ai-sdk/anthropic",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://api.anthropic.com",
+        "from": "provider"
       }
     },
     "anthropic/claude-sonnet-4-5": {
@@ -121,6 +129,14 @@
           "policy": "models-dev-usd-v1"
         },
         "units": 15000000000
+      },
+      "wire.npm": {
+        "value": "@ai-sdk/anthropic",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://api.anthropic.com",
+        "from": "provider"
       }
     },
     "anyapi/anthropic/claude-opus-4-6": {
@@ -197,6 +213,14 @@
           "policy": "models-dev-usd-v1"
         },
         "units": 150000000000
+      },
+      "wire.npm": {
+        "value": "@ai-sdk/openai-compatible",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://fixture.example/v1",
+        "from": "provider"
       }
     },
     "fireworks-ai/accounts/fireworks/models/kimi-k2-instruct": {
@@ -245,6 +269,14 @@
           "policy": "models-dev-usd-v1"
         },
         "units": 2400000000
+      },
+      "wire.npm": {
+        "value": "@ai-sdk/openai-compatible",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://fixture.example/v1",
+        "from": "provider"
       }
     },
     "google/gemini-3.5-flash": {
@@ -289,6 +321,14 @@
           "policy": "models-dev-usd-v1"
         },
         "units": 15000000000
+      },
+      "wire.npm": {
+        "value": "@ai-sdk/google",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://generativelanguage.googleapis.com/v1beta",
+        "from": "provider"
       }
     },
     "openai/gpt-5.4-mini": {
@@ -407,6 +447,14 @@
           "policy": "models-dev-usd-v1"
         },
         "units": 2400000000
+      },
+      "wire.npm": {
+        "value": "@ai-sdk/openai",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://api.openai.com/v1",
+        "from": "provider"
       }
     },
     "openai/gpt-5.6-luna": {
@@ -535,6 +583,14 @@
           "policy": "models-dev-usd-v1"
         },
         "units": 2400000000
+      },
+      "wire.npm": {
+        "value": "@ai-sdk/openai",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://api.openai.com/v1",
+        "from": "provider"
       }
     },
     "xai/grok-4": {
@@ -579,6 +635,116 @@
           "policy": "models-dev-usd-v1"
         },
         "units": 15000000000
+      },
+      "wire.npm": {
+        "value": "@ai-sdk/openai-compatible",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://fixture.example/v1",
+        "from": "provider"
+      }
+    },
+    "google/antigravity-gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.canonical_id": "google/gemini-3.8-flash",
+      "model.family": "gemini-flash",
+      "model.open_weights": false,
+      "model.status": null,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 9,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini-flash",
+          "model_id": "gemini-3.8-flash",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 75000000
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini-flash",
+          "model_id": "gemini-3.8-flash",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 750000000
+      },
+      "rate.input_audio": {
+        "currency": "USD",
+        "exponent": 9,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini-flash",
+          "model_id": "gemini-3.8-flash",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 750000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini-flash",
+          "model_id": "gemini-3.8-flash",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 3750000000
+      },
+      "route.reasoning_default": "medium",
+      "route.reasoning_wire_ids": {
+        "high": "gemini-3.8-flash-high",
+        "low": "gemini-3.8-flash-low",
+        "medium": "gemini-3.8-flash-medium"
       }
     }
   },

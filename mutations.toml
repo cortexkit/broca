@@ -10063,20 +10063,19 @@ old = '        macos_exec_root(std::env::var_os("TMPDIR"))'
 new = '        std::env::current_exe().expect("test executable").ancestors().nth(3).expect("Cargo target directory").join("broca-exec") // NON-VACUITY BREAK: publish in Cargo target directory'
 
 [[control]]
-id = "meta-muse-overlay-responses-family"
-guards = "the Meta Muse model resolves from the authored overlay to first-party OpenAI Responses at api.meta.ai"
+id = "meta-muse-persona-responses-family"
+guards = "Meta OAuth curated rows use the credential-owned Responses client even without model wire metadata"
 runner = "cargo"
 package = "broca-catalog"
-target = "--lib"
-test_file = "crates/broca-catalog/src/lib.rs"
-expect_red = ["tests::meta_muse_resolves_to_first_party_openai_responses"]
-file = "crates/broca-catalog/data/overlay.json"
-old = '''      "base_url": "https://api.meta.ai/v1",
-      "base_url_source": "generated",
-      "wire_family": "openai_responses",'''
-new = '''      "base_url": "https://api.meta.ai/v1",
-      "base_url_source": "generated",
-      "wire_family": "openai_chat",''' # NON-VACUITY BREAK: route Meta Muse back to Chat Completions
+target = "--test routing_admission"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/routing_admission.rs"
+expect_red = ["facts_drive_admission_and_recorded_bytes_survive_refresh"]
+expect_message = "Meta credential persona"
+file = "crates/broca-catalog/src/family.rs"
+old = '.then_some((WireFamilyId::OpenAiResponses, "https://api.meta.ai/v1"))'
+new = '.then_some((WireFamilyId::OpenAiChat, "https://api.meta.ai/v1")) // NON-VACUITY BREAK: use the wrong Meta client grammar'
 
 [[control]]
 id = "meta-muse-oauth-subscription-basis"
@@ -12631,13 +12630,13 @@ new = '''            .is_some_and(|name| is_request_dump_filename(name) || !name
 
 [[control]]
 id = "catalog-overlay-authored-warm-prices"
-guards = "Compiled overlay-only models retain authored input output and cache prices"
+guards = "Synthetic legacy overlay additions retain authored input output and cache prices"
 runner = "cargo"
 package = "broca-catalog"
 features = ["live"]
 target = "--lib"
 test_file = "crates/broca-catalog/src/runtime.rs"
-expect_red = ["runtime::tests::compiled_overlay_only_model_retains_authored_warm_prices"]
+expect_red = ["runtime::tests::synthetic_overlay_model_retains_authored_warm_prices"]
 select = "expected"
 file = "crates/broca-catalog/src/runtime.rs"
 old = 'model.cost = crate::map_cost(value.as_ref());'
@@ -15543,7 +15542,7 @@ package = "broca-catalog"
 target = "--test reasoning_variants"
 features = ["live"]
 test_file = "crates/broca-catalog/tests/reasoning_variants.rs"
-expect_red = ["gated::code_assist_variant_without_a_catalog_row_is_refused_but_no_variant_is_admitted"]
+expect_red = ["gated::code_assist_unknown_route_refuses_with_or_without_variant"]
 file = "crates/broca-catalog/src/live.rs"
 old = 'let Some(options) = options else {'
 new = '''if options.is_none() { return Ok(()); } // NON-VACUITY BREAK: admit without applying
@@ -17338,19 +17337,18 @@ old = '| "agent_data.status"'
 new = '| "agent_data.status" | "agent_data.prepare" /* NON-VACUITY BREAK: cancel prepare after its freeze. */'
 
 [[control]]
-id = "antigravity-retired-route-is-refused"
-guards = "retired Antigravity bare and tier routes refuse during resolution with a live replacement"
+id = "catalog-successor-advice-from-fusiform"
+guards = "a withdrawn model names the successor Fusiform published rather than local replacement advice"
 runner = "cargo"
 package = "broca-catalog"
-target = "--lib"
+target = "--test routing_admission"
 features = ["live"]
-test_file = "crates/broca-catalog/src/live.rs"
-expect_red = ["live::tests::retired_antigravity_routes_refuse_with_live_replacements"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/routing_admission.rs"
+expect_red = ["facts_drive_admission_and_recorded_bytes_survive_refresh"]
 file = "crates/broca-catalog/src/live.rs"
-old = '''const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
-    ("gemini-3.7-flash", "google/antigravity-gemini-3.8-flash"),'''
-new = '''const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
-    // NON-VACUITY BREAK: forget the retired bare 3.7 route.'''
+old = '.successor(provider_id, model_id)'
+new = '.successor(provider_id, "missing-successor") // NON-VACUITY BREAK: ignore the served successor'
 # This proof checks the following behavior: a step-boundary cancellation is synced before its
 # acknowledgement can complete.
 # Windows runs only the test or tests named in this row, skipping all other tests in the broca-core
@@ -22816,7 +22814,7 @@ select = "expected"
 test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
 expect_red = ["executor::tests::a_non_chat_catalog_model_is_refused_at_admission"]
 file = "crates/broca-catalog/src/live.rs"
-old = "    refuse_non_chat_model(&catalog, provider_id, model_id)?;"
+old = "    refuse_non_chat_model(&catalog, provider_id, catalog_model_id)?;"
 new = "    // NON-VACUITY BREAK: admit every model kind to chat sends."
 
 [[control]]
@@ -24671,16 +24669,11 @@ package = "broca-catalog"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-catalog/src/lib.rs"
-expect_red = ["tests::opencode_go_models_use_their_pinned_pi_protocol_and_endpoint"]
-expect_message = "gpt-6-luna protocol pin"
-file = "crates/broca-catalog/src/lib.rs"
-old = '''        let model_family = model_entry
-            .get("wire_family")
-            .and_then(parse_family)
-            .unwrap_or(provider_family);
-'''
-new = '''        let model_family = provider_family; // NON-VACUITY BREAK: ignore the pinned model family so the catalog test must fail.
-'''
+expect_red = ["tests::opencode_go_models_use_fusiform_pi_protocol_and_endpoint"]
+expect_message = "gpt-6-luna protocol fact"
+file = "crates/broca-catalog/src/runtime.rs"
+old = 'model.wire_family = Some(family);'
+new = 'model.wire_family = Some(WireFamilyId::OpenAiChat); // NON-VACUITY BREAK: discard the model package grammar'
 
 
 [[control]]
@@ -24944,3 +24937,125 @@ old = '''    if let Some(tags) = recovered_result_tags {
         crate::tags::attach_parts(&mut results, Some(tags));
     }'''
 new = '''    let _ = recovered_result_tags; // NON-VACUITY BREAK: discard pending-turn stored tags'''
+
+[[control]]
+id = "catalog-missing-wire-api-refuses"
+guards = "a migrated provider without wire.api refuses a fresh send rather than guessing an endpoint"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test routing_admission"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/routing_admission.rs"
+expect_red = ["facts_drive_admission_and_recorded_bytes_survive_refresh"]
+expect_message = "withheld endpoint refuses"
+file = "crates/broca-catalog/src/routing.rs"
+old = '''        let api = self
+            .api
+            .as_ref()
+            .filter(|api| !api.value.trim().is_empty())
+            .ok_or("missing wire.api")?;'''
+new = '''        let api = self.api.clone().unwrap_or_else(|| WireFact { value: "https://guessed.example/v1".into(), from: "local".into() }); // NON-VACUITY BREAK: guess a withheld endpoint'''
+
+[[control]]
+id = "catalog-tier-wire-id-from-fusiform"
+guards = "a requested reasoning tier freezes Fusiform's opaque backend id rather than a local or default tier"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test routing_admission"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/routing_admission.rs"
+expect_red = ["facts_drive_admission_and_recorded_bytes_survive_refresh"]
+expect_message = "opaque-backend-high"
+file = "crates/broca-catalog/src/routing.rs"
+old = '.get(level)'
+new = '.get("medium") // NON-VACUITY BREAK: use the default tier instead of the served requested id'
+
+[[control]]
+id = "catalog-native-endpoint-hold-preserves-bytes"
+guards = "the temporary closed native exception keeps existing bytes while curated endpoint facts are absent"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test held_native_routing"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/held_native_routing.rs"
+expect_red = ["held_native_rows_render_byte_identically_without_endpoint_facts"]
+expect_message = "held native route"
+file = "crates/broca-catalog/src/family.rs"
+old = '["openai", "anthropic", "google", "xai"].contains(&provider)'
+new = '["anthropic", "google", "xai"].contains(&provider) // NON-VACUITY BREAK: drop the OpenAI endpoint hold'
+
+[[control]]
+id = "catalog-overlay-rejects-endpoint-copies"
+guards = "migrated provider endpoint facts cannot silently return to the compiled overlay"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/it/base_url_pins.rs"
+expect_red = ["base_url_pins::overlay_endpoint_copies_are_limited_to_the_native_holds"]
+file = "crates/broca-catalog/data/overlay.json"
+old = '"patch": {'
+new = '"patch": { "copied-provider": {"_comment":"NON-VACUITY BREAK: duplicate a provider endpoint", "base_url":"https://copied.example/v1", "base_url_source":"authored"},'
+
+[[control]]
+id = "catalog-equal-version-new-routing-facts-rebuild"
+guards = "an equal-version poll carrying newly requested routing facts replaces the old last-known-good index"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::an_equal_version_poll_that_newly_carries_routing_facts_rebuilds_the_index"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = '|| response_carries_routing_facts(&response) != current.carries_routing_facts'
+new = '|| false // NON-VACUITY BREAK: reuse an index built without routing facts'
+
+[[control]]
+id = "catalog-resume-keeps-recorded-routing"
+guards = "a resumed run restores the full recorded bundle before consulting changed or withdrawn catalog facts"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test routing_admission"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/routing_admission.rs"
+expect_red = ["facts_drive_admission_and_recorded_bytes_survive_refresh"]
+file = "crates/broca-catalog/src/live.rs"
+old = 'if let Some(recorded) = episode_render.recorded_config {'
+new = 'if let Some(recorded) = episode_render.recorded_config.filter(|_| false) { // NON-VACUITY BREAK: re-resolve a recorded run'
+
+[[control]]
+id = "catalog-renderer-pin-does-not-invent-a-model"
+guards = "a renderer pin cannot synthesize a missing upstream model row"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::native_renderer_pins_do_not_invent_missing_model_rows"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = 'if model_patch.is_renderer_pin_only() {'
+new = 'if false && model_patch.is_renderer_pin_only() { // NON-VACUITY BREAK: invent models from renderer pins'
+
+[[control]]
+id = "catalog-overlay-rejects-model-fact-copies"
+guards = "model cost and capability facts cannot return inside native renderer holds"
+runner = "cargo"
+package = "broca-catalog"
+target = "--test it"
+features = ["live"]
+select = "expected"
+test_file = "crates/broca-catalog/tests/it/wire_family_pins.rs"
+expect_red = ["wire_family_pins::overlay_renderer_choices_have_a_reason_and_no_generated_provider_pins"]
+file = "crates/broca-catalog/data/overlay.json"
+old = '''        "chatgpt-image-latest": {
+          "wire_family": "openai_chat",
+          "_comment": "Retain the existing native renderer selection until curated native routing facts replace the held resolver path."'''
+new = '''        "chatgpt-image-latest": {
+          "cost": {"input":1.0},
+          "wire_family": "openai_chat",
+          "_comment": "NON-VACUITY BREAK: copy a model cost into a renderer pin."'''

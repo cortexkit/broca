@@ -27,6 +27,14 @@ mod gated {
                 "anthropic/explicit-resume".into(),
                 BTreeMap::from([
                     ("existence".into(), json!("present")),
+                    (
+                        "wire.npm".into(),
+                        json!({"value":"@ai-sdk/anthropic", "from":"provider"}),
+                    ),
+                    (
+                        "wire.api".into(),
+                        json!({"value":"https://api.anthropic.com", "from":"provider"}),
+                    ),
                     ("limit.context".into(), json!(200_000)),
                     ("limit.output".into(), json!(output_limit)),
                     ("capability.attachment".into(), json!(false)),
@@ -36,6 +44,7 @@ mod gated {
             )]),
             withheld: Vec::new(),
             uncertain: Vec::new(),
+            wire_corrections: Vec::new(),
         }
     }
 

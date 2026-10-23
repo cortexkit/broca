@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 pub use broca_provider::credential_refresh::SharedSecretRefresher;
 use broca_provider::credential_refresh::{CredentialRefresher, ShapedSecretRefresher};
-use broca_provider::families::google_codeassist::tier_thinking_config;
 use broca_provider::families::{
     apply_anthropic_apikey_quirks, frozen_config_for_family, openai_chat_frozen_config,
     renderer_version_for, resolve_frozen,
@@ -73,135 +72,20 @@ impl AuthMethod {
     }
 }
 
-/// User-facing Antigravity routes that select a different backend tier on the wire. This mirrors
-/// `packages/core/src/model-registry.ts` at `GEMINI_35_FLASH_ROUTES`/`RESOLVER_ALIASES`; the
-/// corresponding output limits come from `packages/opencode/src/plugin/request.ts` at
-/// `getAgyMaxOutputTokens`. Mapping here, before freeze, means the frozen `wire_model_id` already
-/// holds the tier id and resumes reproduce the same rendered bytes without consulting this table.
-const ANTIGRAVITY_TIER_ALIASES: &[(&str, &str)] = &[
-    ("gemini-3.5-flash", "gemini-3.5-flash-low"),
-    ("gemini-3.5-flash-high", "gemini-3-flash-agent"),
-    ("gemini-3.5-flash-low", "gemini-3.5-flash-extra-low"),
-    // Live tier wire ids pass through unchanged; bare slugs select their default tier.
-    ("gemini-3.8-flash", "gemini-3.8-flash-medium"),
-    ("gemini-4-argon", "gemini-4-argon-medium"),
-    ("gemini-3-flash", "gemini-3-flash-medium"),
-    ("gemini-3-pro", "gemini-3-pro-low"),
-];
-
-/// Routes Google withdrew from Antigravity's daily endpoint, paired with a live replacement.
-/// AGAUTH's two `fetchAvailableModels` captures just before 2026-10-14T13:11Z, using clients
-/// 1.3.3 and 1.3.5, returned the same 29 routes. Compared with the 2026-10-12 map, these tier
-/// ids disappeared; their bare aliases must not reach the backend either. Update this list only
-/// from a fresh capture, not guesses from a 404 (which can also mean a stale client version).
-const RETIRED_ANTIGRAVITY_ROUTES: &[(&str, &str)] = &[
-    ("gemini-3.7-flash", "google/antigravity-gemini-3.8-flash"),
-    (
-        "gemini-3.7-flash-low",
-        "google/antigravity-gemini-3.8-flash",
-    ),
-    (
-        "gemini-3.7-flash-medium",
-        "google/antigravity-gemini-3.8-flash",
-    ),
-    (
-        "gemini-3.7-flash-high",
-        "google/antigravity-gemini-3.8-flash",
-    ),
-    ("gemini-3.6-flash", "google/antigravity-gemini-3.8-flash"),
-    (
-        "gemini-3.6-flash-low",
-        "google/antigravity-gemini-3.8-flash",
-    ),
-    (
-        "gemini-3.6-flash-medium",
-        "google/antigravity-gemini-3.8-flash",
-    ),
-    (
-        "gemini-3.6-flash-high",
-        "google/antigravity-gemini-3.8-flash",
-    ),
-    ("gemini-3.1-pro", "google/antigravity-gemini-4-argon"),
-    ("gemini-3.1-pro-low", "google/antigravity-gemini-4-argon"),
-    ("gemini-3.1-pro-high", "google/antigravity-gemini-4-argon"),
-    ("gemini-pro-agent", "google/antigravity-gemini-4-argon"),
-    // The Fusiform model-catalog repository's retirement commit 24ba360 records that both
-    // Google's served-model list and the native Antigravity plugin dropped this Claude route.
-    // No live Antigravity replacement has been verified.
-    ("claude-sonnet-4-6-thinking", "anthropic/claude-sonnet-5-5"),
-];
-
-fn retired_antigravity_replacement(model_id: &str) -> Option<&'static str> {
-    let stripped = model_id.strip_prefix("antigravity-").unwrap_or(model_id);
-    RETIRED_ANTIGRAVITY_ROUTES
-        .iter()
-        .find_map(|(route, replacement)| (*route == stripped).then_some(*replacement))
+/// Variant admission must use the same immutable snapshot that selected the default route.
+struct CodeAssistRoute<'a> {
+    catalog: &'a crate::CatalogSnapshot,
+    provider_id: &'a str,
+    model_id: &'a str,
 }
 
-/// Strip the harness-only route prefix, then resolve any user-facing Antigravity tier alias.
-///
-/// THE FALLBACK PASSES THE STRIPPED NAME THROUGH UNCHANGED, which is deliberate but sharp on
-/// both edges. Non-Gemini Antigravity models use plain backend names without tier aliases, so
-/// passthrough remains necessary. Known withdrawals are refused before reaching this conversion.
-///
-/// A GEMINI model with no entry can still become an opaque provider 404 because bare slugs do not
-/// necessarily name backend entities. This table records measured Antigravity routes rather than
-/// deriving them from the public catalog.
-///
-/// A daily 404 is not proof that an alias or model is absent because daily also gates Gemini
-/// models on the native client version. Before changing this table, verify the content User-Agent;
-/// `google_codeassist.rs` documents a controlled probe where changing only that version toggled
-/// the same request between 404 and 200.
-fn google_codeassist_wire_model_id(model_id: &str) -> &str {
-    let stripped = model_id.strip_prefix("antigravity-").unwrap_or(model_id);
-    ANTIGRAVITY_TIER_ALIASES
-        .iter()
-        .find_map(|(alias, wire_id)| (*alias == stripped).then_some(*wire_id))
-        .unwrap_or(stripped)
-}
-
-/// The thinking-level names a Code Assist tier suffix can spell. Only used to list the tiers a
-/// route has when a variant is refused; whether a name IS a tier is decided by
-/// [`google_codeassist_tier_wire_id`].
-const CODE_ASSIST_TIER_LEVELS: [&str; 4] = ["minimal", "low", "medium", "high"];
-
-/// The requested id with the harness route prefix and any tier suffix removed: the model whose
-/// tiers a reasoning variant chooses between (`antigravity-gemini-3.8-flash-high` ->
-/// `gemini-3.8-flash`).
-fn google_codeassist_tier_base(model_id: &str) -> &str {
-    let stripped = model_id.strip_prefix("antigravity-").unwrap_or(model_id);
-    CODE_ASSIST_TIER_LEVELS
-        .iter()
-        .find_map(|level| {
-            stripped
-                .strip_suffix(level)
-                .and_then(|prefix| prefix.strip_suffix('-'))
-        })
-        .unwrap_or(stripped)
-}
-
-/// The backend model id Code Assist sends when `level` is requested as a reasoning variant, or
-/// `None` when the family has no tier of that name for the requested model.
-///
-/// There is no separate variant table: the id is the one the caller would get by spelling the
-/// tier in the model id (`<base>-<level>`, through the same [`ANTIGRAVITY_TIER_ALIASES`]), and
-/// it counts as a tier only if the family's own tier table gives it thinking settings
-/// ([`tier_thinking_config`]). A request with no variant keeps the default tier the bare id is
-/// aliased to.
-fn google_codeassist_tier_wire_id(model_id: &str, level: &str) -> Option<String> {
-    let candidate = format!("{}-{level}", google_codeassist_tier_base(model_id));
-    let wire_id = google_codeassist_wire_model_id(&candidate);
-    tier_thinking_config(wire_id)
-        .is_some()
-        .then(|| wire_id.to_string())
-}
-
-/// The tier names the Code Assist family can render for the requested model, in level order.
-fn google_codeassist_tiers(model_id: &str) -> Vec<&'static str> {
-    CODE_ASSIST_TIER_LEVELS
-        .into_iter()
-        .filter(|level| google_codeassist_tier_wire_id(model_id, level).is_some())
-        .collect()
+impl CodeAssistRoute<'_> {
+    fn tier(&self, level: &str) -> Option<String> {
+        self.catalog
+            .code_assist_route(self.provider_id, self.model_id, Some(level))
+            .ok()
+            .map(|(_, wire)| wire)
+    }
 }
 
 /// Extra resolution inputs an auth method contributes: its identity, any wire-family override,
@@ -607,10 +491,13 @@ pub fn provider_for_recorded_config(
     .map_err(|error| error.to_string())
 }
 
-/// Render inputs for a catalog episode. Unlike the OpenAI-compatible URL override,
-/// these inputs never bypass catalog identity, family, quirks or auth resolution.
+/// Render inputs for an episode. Fresh episodes use catalog admission; a resume supplies
+/// `recorded_config` and refreshes only credentials, without re-resolving its route.
 #[derive(Clone, Copy, Default)]
 pub struct EpisodeRenderConfig<'a> {
+    /// A resumed run uses its complete recorded bundle, not a newly resolved catalog route.
+    /// The OpenCode Go session header is transport metadata and is restored separately.
+    pub recorded_config: Option<&'a FrozenRenderConfig>,
     /// Preserve a recorded OpenCode Go protocol when the model's current per-model pin changes.
     /// `None` means a fresh run should use today's catalog selection.
     pub wire_family: Option<WireFamilyId>,
@@ -803,8 +690,8 @@ impl EpisodeRenderConfig<'_> {
 }
 
 /// Resolve catalog identity and auth normally, changing only the episode's endpoint.
-/// On resume, callers supply the recorded host; all other catalog fields are resolved
-/// afresh so core can still refuse non-host frozen-config drift.
+/// On resume, callers supply the entire recorded config so no changed catalog field can
+/// move or refuse the already admitted episode.
 pub fn resolve_catalog_episode_with_client(
     model: &str,
     max_tokens: Option<u32>,
@@ -862,6 +749,50 @@ fn resolve_provider_inner(
         catalog_base_url,
         episode_render,
     } = context;
+    if let Some(recorded) = episode_render.recorded_config {
+        let provider_id = model
+            .split_once('/')
+            .map_or("openai-compatible", |(provider, _)| provider);
+        let mut frozen = recorded.clone();
+        frozen.opencode_go_session_id = episode_render.opencode_go_session_id.map(str::to_owned);
+        let family = frozen.family_id;
+        let auth_kind =
+            provider_route_auth_kind(provider_id, family, &crate::default_auth_kind(family));
+        let (handle, auth_desc, auth_method, refresher) =
+            if chatgpt_pause_only && family == WireFamilyId::OpenAiResponsesChatgpt {
+                (
+                    AuthHandle::None,
+                    format!("chatgpt-pause-only({provider_id})"),
+                    opts.auth_method,
+                    None,
+                )
+            } else {
+                let resolved = resolve_family_auth(auth, &frozen, &auth_kind, provider_id, opts)?;
+                (
+                    resolved.handle,
+                    resolved.auth_desc,
+                    resolved.auth_method,
+                    resolved.refresher,
+                )
+            };
+        let base_url = frozen
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "<family default>".into());
+        let wire_model = frozen.wire_model_id.clone();
+        let provider = resolved_live_provider(http_client, frozen, handle, refresher, opts)?;
+        return Ok(ProviderResolution {
+            provider,
+            auth_method,
+            family_id: family,
+            family: format!("{family:?}"),
+            base_url,
+            wire_model,
+            auth_desc,
+            provider_tag: provider_id.into(),
+            context_limit: None,
+        });
+    }
     // Resume restores admission's cap, regardless of a repeated explicit request or a
     // changed catalog maximum. Only a new episode computes the request/catalog minimum.
     let restored_max_tokens = episode_render.max_output_tokens;
@@ -906,7 +837,7 @@ fn resolve_provider_inner(
             episode_render.variant,
             opts.variant,
             model,
-            model,
+            None,
             None,
             None,
         )?;
@@ -960,26 +891,12 @@ fn resolve_provider_inner(
         )
     })?;
 
-    if opts.family_override == Some(WireFamilyId::GoogleCodeAssist) {
-        if let Some(replacement) = retired_antigravity_replacement(model_id) {
-            let advice = if replacement.starts_with("google/antigravity-") {
-                " (medium)"
-            } else {
-                " through the Anthropic provider"
-            };
-            return Err(format!(
-                "model '{model}' is unservable: Google withdrew this Antigravity route; \
-                 use '{replacement}'{advice} instead"
-            )
-            .into());
-        }
-    }
-
     // Taking the snapshot is an Arc clone over memory. It never opens fusiform or reads the LKG.
     // Without a catalog snapshot, provider resolution fails as configuration rather than
     // reporting an unsupported variant for a model whose options we cannot inspect.
     let catalog = crate::catalog().map_err(|error| error.to_string())?;
     let episode_render = EpisodeRenderConfig {
+        recorded_config: None,
         wire_family: episode_render.wire_family,
         opencode_go_session_id: episode_render.opencode_go_session_id,
         opencode_go_reasoning_signature: episode_render.opencode_go_reasoning_signature,
@@ -1006,11 +923,25 @@ fn resolve_provider_inner(
         claude_code_persona: episode_render.claude_code_persona,
     };
     if catalog.is_withdrawn(provider_id, model_id) {
+        let advice = catalog
+            .successor(provider_id, model_id)
+            .map(|successor| format!("use '{successor}' instead"))
+            .unwrap_or_else(|| "choose a different model for this episode".into());
         return Err(format!(
-            "catalog model '{provider_id}/{model_id}' was withdrawn upstream; choose a different model for this episode"
-        ).into());
+            "catalog model '{provider_id}/{model_id}' was withdrawn upstream; {advice}"
+        )
+        .into());
     }
-    refuse_non_chat_model(&catalog, provider_id, model_id)?;
+    let canonical_model = if opts.family_override == Some(WireFamilyId::GoogleCodeAssist) {
+        catalog
+            .code_assist_route(provider_id, model_id, opts.variant)
+            .ok()
+            .map(|route| route.0)
+    } else {
+        None
+    };
+    let catalog_model_id = canonical_model.as_deref().unwrap_or(model_id);
+    refuse_non_chat_model(&catalog, provider_id, catalog_model_id)?;
 
     // Mode 2b: an AUTH METHOD selected a wire family that OVERRIDES the catalog provider's
     // (Google Antigravity → google-codeassist, OpenAI ChatGPT → openai-responses-chatgpt).
@@ -1025,8 +956,14 @@ fn resolve_provider_inner(
         // boundary: run metadata keeps the canonical id, while the frozen render config carries
         // the stable wire model. Every other override family sends the id verbatim.
         let wire_model_id = match family {
-            WireFamilyId::GoogleCodeAssist => google_codeassist_wire_model_id(model_id),
-            _ => model_id,
+            WireFamilyId::GoogleCodeAssist => {
+                match catalog.code_assist_route(provider_id, model_id, opts.variant) {
+                    Ok((_, wire)) => wire,
+                    Err(_) if opts.variant.is_some() => model_id.to_string(),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            _ => model_id.to_string(),
         };
         // A ChatGPT id resolves only if the catalog lists it exactly, the same rule as every
         // catalog path. There are no tier suffixes: `-fast` and `-pro` ids are taken literally.
@@ -1043,13 +980,13 @@ fn resolve_provider_inner(
             )
             .into());
         }
-        let mut frozen = frozen_config_for_family(family, wire_model_id);
+        let mut frozen = frozen_config_for_family(family, &wire_model_id);
         // The override family owns the endpoint, but output capacity belongs to the model, so
         // the catalog answers it where it lists this provider/model. A tier alias the catalog
         // does not list gets the fallback rather than a guess about its base model's limit.
         frozen.max_output_tokens = max_tokens_for(
-            catalog.output_limit(provider_id, model_id),
-            catalog.context_limit(provider_id, model_id),
+            catalog.output_limit(provider_id, catalog_model_id),
+            catalog.context_limit(provider_id, catalog_model_id),
         );
         if let Some(base_url) = catalog_base_url {
             frozen.base_url = Some(catalog_override_base_url(base_url, family));
@@ -1092,19 +1029,23 @@ fn resolve_provider_inner(
             let auth_kind = crate::default_auth_kind(family);
             resolve_family_auth(auth, &frozen, &auth_kind, provider_id, opts)?
         };
-        // The variant is resolved against the requested id's catalog row. On Code Assist that
-        // is the id before tier-alias resolution, since the catalog does not list the aliases.
+        // A historical Code Assist tier spelling borrows options only from the alias row whose
+        // published tier map names that exact backend id.
         let options_spec = catalog
-            .model_for_serving(provider_id, model_id)
+            .model_for_serving(provider_id, catalog_model_id)
             .map(|(_, spec)| spec);
         apply_variant(
             &mut frozen,
             episode_render.variant,
             opts.variant,
             &format!("{provider_id}/{model_id}"),
-            model_id,
+            Some(CodeAssistRoute {
+                catalog: &catalog,
+                provider_id,
+                model_id,
+            }),
             options_spec.as_ref().map(|spec| &spec.reasoning_options),
-            catalog.output_limit(provider_id, model_id),
+            catalog.output_limit(provider_id, catalog_model_id),
         )?;
         // Priced against the same catalog row the variant resolves against.
         apply_service_tier(
@@ -1151,14 +1092,27 @@ fn resolve_provider_inner(
             // limit from a full one, and reporting nothing for a model the catalog describes
             // would understate a large window as an absent one.
             //
-            // A tier-aliased id the catalog does not list stays None. Resolving it to the base
-            // model's window would be a guess about whether the tier shares that window, and an
-            // absent limit is the honest answer where a wrong one is unrecoverable.
-            context_limit: catalog.context_limit(provider_id, model_id),
+            // Tier spellings use the row that explicitly published the selected backend id.
+            context_limit: catalog.context_limit(provider_id, catalog_model_id),
         });
     }
     let recorded_opencode_go_family = if provider_id == "opencode-go" {
         episode_render.wire_family
+    } else {
+        None
+    };
+    // Credential personas own their protocol and endpoint. Meta OAuth is an API client
+    // persona even when a curated model row has no models.dev wire metadata.
+    let persona_route = opts
+        .auth_method
+        .and_then(|method| crate::family::credential_persona_route(provider_id, method.as_token()))
+        .map(|(family, endpoint)| (family, endpoint.to_string()));
+    let route = if let Some(route) = persona_route {
+        Some(route)
+    } else if catalog.routing_facts(provider_id, model_id).is_some()
+        && !crate::family::native_endpoint_is_held(provider_id)
+    {
+        Some(catalog.resolve_route(provider_id, model_id)?)
     } else {
         None
     };
@@ -1185,6 +1139,10 @@ fn resolve_provider_inner(
                 )
             }
         })?;
+
+    if let Some((family, api)) = route {
+        provider_spec = crate::runtime::serving_provider_spec(provider_id, family, api);
+    }
 
     if provider_id == "opencode-go" {
         if let Some(base_url) = episode_render.base_url {
@@ -1224,7 +1182,7 @@ fn resolve_provider_inner(
         episode_render.variant,
         opts.variant,
         &format!("{provider_id}/{model_id}"),
-        model_id,
+        None,
         Some(&model_spec.reasoning_options),
         model_spec.limits.max_output,
     )?;
@@ -1367,32 +1325,26 @@ fn apply_variant(
     restored: Option<&FrozenVariant>,
     requested: Option<&str>,
     catalog_model: &str,
-    model_id: &str,
+    route: Option<CodeAssistRoute<'_>>,
     options: Option<&ReasoningOptions>,
     output_limit: Option<u64>,
 ) -> Result<(), ResolutionError> {
     let code_assist = frozen.family_id == WireFamilyId::GoogleCodeAssist;
     if let Some(restored) = restored {
-        // The tier is recomputed from the frozen name and this build's constant tier table, never
-        // from the catalog, so a row withdrawn since admission cannot move the resumed request.
-        // A frozen Code Assist variant with no tier of its name (frozen by an older build on an
-        // id without tiers) keeps rendering exactly as it was frozen.
-        if code_assist {
-            if let Some(tier) = google_codeassist_tier_wire_id(model_id, &restored.name) {
-                frozen.wire_model_id = tier;
-            }
-        }
         return freeze_variant(frozen, restored.clone()).map_err(ResolutionError::Config);
     }
     let Some(requested) = requested else {
         return Ok(());
     };
     if code_assist {
+        let route = route.ok_or_else(|| {
+            format!("model '{catalog_model}': missing Code Assist routing snapshot")
+        })?;
         return apply_code_assist_variant(
             frozen,
             requested,
             catalog_model,
-            model_id,
+            route,
             options,
             output_limit,
         );
@@ -1453,13 +1405,12 @@ fn apply_service_tier(
 /// - A defined name with a tier of that name for the model: applied by switching the wire model
 ///   id to that tier, whose thinking settings the renderer then sends.
 /// - A defined name with no such tier: refused, naming the tiers the route does have.
-/// - A model the family has no tiers for at all (`antigravity-claude-sonnet-4-6-thinking`,
-///   served through an alias row): refused because this route cannot send any level for it.
+/// - A row without published tier ids: refused because the backend id cannot be guessed.
 fn apply_code_assist_variant(
     frozen: &mut FrozenRenderConfig,
     requested: &str,
     catalog_model: &str,
-    model_id: &str,
+    route: CodeAssistRoute<'_>,
     options: Option<&ReasoningOptions>,
     output_limit: Option<u64>,
 ) -> Result<(), ResolutionError> {
@@ -1485,57 +1436,33 @@ fn apply_code_assist_variant(
         requested,
     )
     .map_err(ResolutionError::VariantUnsupported)?;
-    let tiers = google_codeassist_tiers(model_id);
+    let defined: Vec<String> = broca_provider::variant::derive_variants(
+        frozen.family_id,
+        &frozen.wire_model_id,
+        options,
+        output_limit,
+    )
+    .names()
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let tiers: Vec<String> = defined
+        .iter()
+        .filter(|level| route.tier(level).is_some())
+        .cloned()
+        .collect();
     if tiers.is_empty() {
-        return Err(ResolutionError::VariantUnsupported(
-            broca_provider::variant::VariantRefusal {
-                model: catalog_model.into(),
-                variant: requested.into(),
-                defined: broca_provider::variant::derive_variants(
-                    frozen.family_id,
-                    &frozen.wire_model_id,
-                    options,
-                    output_limit,
-                )
-                .names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-                reason: format!(
-                    "model '{catalog_model}' cannot use variant '{requested}': the Google Code \
-                     Assist route sends a reasoning level as a backend tier id and has no tiers \
-                     for '{}'",
-                    frozen.wire_model_id
-                ),
-            },
-        ));
+        return Err(ResolutionError::VariantUnsupported(broca_provider::variant::VariantRefusal {
+            model: catalog_model.into(), variant: requested.into(), defined,
+            reason: format!("model '{catalog_model}' cannot use variant '{requested}': missing route.reasoning_wire_ids; the Google Code Assist route has no tiers"),
+        }));
     }
-    let Some(tier) = google_codeassist_tier_wire_id(model_id, &variant.name) else {
-        return Err(ResolutionError::VariantUnsupported(
-            broca_provider::variant::VariantRefusal {
-                model: catalog_model.into(),
-                variant: requested.into(),
-                defined: broca_provider::variant::derive_variants(
-                    frozen.family_id,
-                    &frozen.wire_model_id,
-                    options,
-                    output_limit,
-                )
-                .names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-                reason: format!(
-            "model '{catalog_model}' defines variant '{requested}', but the Google Code Assist \
-             route cannot render it: this route sends a reasoning level as a backend tier, and \
-             its tiers for '{}' are [{}]. This is a limit of the route, not of the catalog; \
-             request one of those tiers or send no variant",
-            google_codeassist_tier_base(model_id),
-            tiers.join(", ")
-        ),
-            },
-        ));
-    };
+    let tier = route.tier(&variant.name).ok_or_else(|| {
+        ResolutionError::VariantUnsupported(broca_provider::variant::VariantRefusal {
+            model: catalog_model.into(), variant: requested.into(), defined,
+            reason: format!("model '{catalog_model}' cannot use variant '{requested}': route.reasoning_wire_ids has no tier '{requested}'; available tiers are [{}]", tiers.join(", ")),
+        })
+    })?;
     frozen.wire_model_id = tier;
     freeze_variant(frozen, variant).map_err(ResolutionError::Config)
 }
@@ -1984,6 +1911,19 @@ mod tests {
                 serde_json::from_str(include_str!("../data/overlay.json"))
                     .expect("bundled overlay is JSON");
             overlay["remove"][TEST_RETIRED_PROVIDER] = serde_json::json!([TEST_RETIRED_MODEL]);
+            let go: crate::FusiformCatalogResponse = serde_json::from_str(include_str!("../tests/fixtures/fusiform_opencode_go.json")).unwrap();
+            for (id, facts) in go.models.iter().filter(|(_, facts)| facts.get("existence").and_then(serde_json::Value::as_str) == Some("present")) {
+                let routing = crate::routing::RoutingFacts::decode(facts);
+                if let Ok((family, api)) = routing.route() {
+                    let model = id.strip_prefix("opencode-go/").unwrap();
+                    overlay["patch"]["opencode-go"]["models"][model] = serde_json::json!({
+                        "wire_family": family, "base_url": api,
+                        "reasoning": facts.get("capability.reasoning"),
+                        "tool_call": facts.get("capability.tool_call"),
+                        "limit": {"context": facts.get("limit.context"), "output": facts.get("limit.output")}
+                    });
+                }
+            }
             let catalog = crate::Catalog::from_json_str(
                 include_str!("../data/models.dev.json"),
                 &overlay.to_string(),
@@ -2489,242 +2429,103 @@ mod tests {
 
     #[test]
     fn retired_antigravity_routes_refuse_with_live_replacements() {
-        seed_catalog_for_resolution();
-        for (route, replacement) in [
-            ("gemini-3.7-flash", "google/antigravity-gemini-3.8-flash"),
-            (
-                "gemini-3.7-flash-low",
-                "google/antigravity-gemini-3.8-flash",
-            ),
-            (
-                "gemini-3.7-flash-medium",
-                "google/antigravity-gemini-3.8-flash",
-            ),
-            (
-                "gemini-3.7-flash-high",
-                "google/antigravity-gemini-3.8-flash",
-            ),
-            ("gemini-3.6-flash", "google/antigravity-gemini-3.8-flash"),
-            (
-                "gemini-3.6-flash-low",
-                "google/antigravity-gemini-3.8-flash",
-            ),
-            (
-                "gemini-3.6-flash-medium",
-                "google/antigravity-gemini-3.8-flash",
-            ),
-            (
-                "gemini-3.6-flash-high",
-                "google/antigravity-gemini-3.8-flash",
-            ),
-            ("gemini-3.1-pro", "google/antigravity-gemini-4-argon"),
-            ("gemini-3.1-pro-low", "google/antigravity-gemini-4-argon"),
-            ("gemini-3.1-pro-high", "google/antigravity-gemini-4-argon"),
-            ("gemini-pro-agent", "google/antigravity-gemini-4-argon"),
-            ("claude-sonnet-4-6-thinking", "anthropic/claude-sonnet-5-5"),
-        ] {
-            for prefix in ["", "antigravity-"] {
-                let model = format!("google/{prefix}{route}");
-                let result = resolve_provider(
-                    &model,
-                    None,
-                    2048,
-                    &AuthMode::Bearer("unused".into()),
-                    &ResolveOptions {
-                        auth_method: Some(AuthMethod::Antigravity),
-                        family_override: Some(WireFamilyId::GoogleCodeAssist),
-                        ..Default::default()
-                    },
-                );
-                let error = result
-                    .err()
-                    .unwrap_or_else(|| panic!("served retired {model}"));
-                assert!(matches!(error, ResolutionError::Config(_)));
-                let advice = if route == "claude-sonnet-4-6-thinking" {
-                    " through the Anthropic provider"
-                } else {
-                    " (medium)"
-                };
-                assert_eq!(
-                    error.to_string(),
-                    format!(
-                        "model '{model}' is unservable: Google withdrew this Antigravity route; \
-                         use '{replacement}'{advice} instead"
-                    )
-                );
-            }
-        }
+        let response = serde_json::from_str(include_str!(
+            "../tests/fixtures/routing-parity/fusiform-served-with-wire-facts.json"
+        ))
+        .unwrap();
+        let cache = crate::CatalogCache::empty();
+        cache
+            .install_for_test(response, crate::CatalogSource::Fusiform)
+            .unwrap();
+        let catalog = cache.snapshot().unwrap();
+        assert!(catalog.is_withdrawn("google", "antigravity-gemini-3.7-flash"));
+        assert_eq!(
+            catalog.successor("google", "antigravity-gemini-3.7-flash"),
+            Some("google/antigravity-gemini-3.8-flash")
+        );
+        assert!(catalog
+            .code_assist_route("google", "antigravity-gemini-3.7-flash", None)
+            .is_err());
     }
 
     #[test]
     fn live_antigravity_replacements_and_native_gemini_still_resolve() {
-        seed_catalog_for_resolution();
-        for (model, family, expected_wire_id) in [
-            (
-                "google/antigravity-gemini-3.8-flash",
-                Some(WireFamilyId::GoogleCodeAssist),
-                "gemini-3.8-flash-medium",
-            ),
-            (
-                "google/antigravity-gemini-4-argon",
-                Some(WireFamilyId::GoogleCodeAssist),
-                "gemini-4-argon-medium",
-            ),
-            // Pin the native family independently of catalog membership: these withdrawals
-            // concern Antigravity, not the ordinary Gemini API.
-            (
-                "google/gemini-3.1-pro",
-                Some(WireFamilyId::Gemini),
-                "gemini-3.1-pro",
-            ),
+        let response = serde_json::from_str(include_str!(
+            "../tests/fixtures/routing-parity/fusiform-served-with-wire-facts.json"
+        ))
+        .unwrap();
+        let cache = crate::CatalogCache::empty();
+        cache
+            .install_for_test(response, crate::CatalogSource::Fusiform)
+            .unwrap();
+        let catalog = cache.snapshot().unwrap();
+        for (model, wire) in [
+            ("antigravity-gemini-3.8-flash", "gemini-3.8-flash-medium"),
+            ("antigravity-gemini-4-argon", "gemini-4-argon-medium"),
         ] {
-            let result = resolve_provider(
-                model,
-                None,
-                2048,
-                &AuthMode::Bearer("unused".into()),
-                &ResolveOptions {
-                    family_override: family,
-                    project_id: Some("live-route-project"),
-                    ..Default::default()
-                },
+            assert_eq!(
+                catalog.code_assist_route("google", model, None).unwrap().1,
+                wire
             );
-            let resolved = result.unwrap_or_else(|error| panic!("{model}: {error}"));
-            assert_eq!(resolved.wire_model, expected_wire_id);
         }
+        assert!(catalog.contains_model("google", "gemini-3.8-flash"));
     }
 
     #[test]
     fn antigravity_wire_model_aliases_map_only_registered_routes() {
-        let assert_wire_bytes = |route: &str, wire_id: &str| {
-            use broca_provider::families::{google_codeassist_frozen_config, GoogleCodeAssist};
-            let mut actual =
-                google_codeassist_frozen_config(google_codeassist_wire_model_id(route));
-            let mut expected = google_codeassist_frozen_config(wire_id);
-            actual.project_id = Some("wire-bytes-project".into());
-            expected.project_id = Some("wire-bytes-project".into());
-            let mut request = anthropic_options();
-            request.step_context = Some(broca_protocol::StepContext {
-                session_address: None,
-                credential_id: None,
-                account_ref: None,
-                run_id: "live-route-bytes".into(),
-                step_index: 0,
-            });
+        let response = serde_json::from_str(include_str!(
+            "../tests/fixtures/routing-parity/fusiform-served-with-wire-facts.json"
+        ))
+        .unwrap();
+        let cache = crate::CatalogCache::empty();
+        cache
+            .install_for_test(response, crate::CatalogSource::Fusiform)
+            .unwrap();
+        let catalog = cache.snapshot().unwrap();
+        for level in ["low", "medium", "high"] {
+            let wire = format!("gemini-4-argon-{level}");
             assert_eq!(
-                GoogleCodeAssist.render(&actual, &request),
-                GoogleCodeAssist.render(&expected, &request),
-                "{route} wire bytes"
-            );
-        };
-        let mapped = [
-            ("gemini-3.5-flash", "gemini-3.5-flash-low"),
-            ("gemini-3.5-flash-high", "gemini-3-flash-agent"),
-            ("gemini-3.5-flash-low", "gemini-3.5-flash-extra-low"),
-            ("gemini-3.8-flash", "gemini-3.8-flash-medium"),
-            ("gemini-4-argon", "gemini-4-argon-medium"),
-            ("gemini-3-flash", "gemini-3-flash-medium"),
-            ("gemini-3-pro", "gemini-3-pro-low"),
-        ];
-        for (route, wire_id) in mapped {
-            assert_eq!(google_codeassist_wire_model_id(route), wire_id);
-            assert_wire_bytes(route, wire_id);
-            assert_wire_bytes(&format!("antigravity-{route}"), wire_id);
-            assert_eq!(
-                google_codeassist_wire_model_id(&format!("antigravity-{route}")),
-                wire_id
+                catalog
+                    .code_assist_route("google", &format!("antigravity-{wire}"), None)
+                    .unwrap(),
+                ("antigravity-gemini-4-argon".into(), wire)
             );
         }
-
-        // These live backend ids need no alias, including the literal 3.5-flash wire tiers.
-        for tier_id in [
-            "gemini-3.5-flash-extra-low",
-            "gemini-3.5-flash-lite",
-            "gemini-3.8-flash-low",
-            "gemini-3.8-flash-medium",
-            "gemini-3.8-flash-high",
-            "gemini-3.8-flash-tiered",
-            "gemini-3-flash-low",
-            "gemini-3-flash-medium",
-            "gemini-3-flash-high",
-            "gemini-3-pro-low",
-            "gemini-3-pro-high",
-            "gemini-4-argon-low",
-            "gemini-4-argon-medium",
-            "gemini-4-argon-high",
+        for model in [
+            "antigravity-gemini-3.5-flash",
+            "antigravity-gemini-3-flash",
+            "antigravity-gemini-3-pro",
+            "unmapped-model",
         ] {
-            assert_eq!(google_codeassist_wire_model_id(tier_id), tier_id);
-            assert_wire_bytes(tier_id, tier_id);
-            assert_wire_bytes(&format!("antigravity-{tier_id}"), tier_id);
-            assert_eq!(
-                google_codeassist_wire_model_id(&format!("antigravity-{tier_id}")),
-                tier_id
+            assert!(
+                catalog.code_assist_route("google", model, None).is_err(),
+                "{model}"
             );
         }
-
-        assert_eq!(
-            google_codeassist_wire_model_id("antigravity-gemini-2.5-flash"),
-            "gemini-2.5-flash"
-        );
-        assert_eq!(
-            google_codeassist_wire_model_id("gemini-3-pro-high"),
-            "gemini-3-pro-high"
-        );
-        assert_eq!(
-            google_codeassist_wire_model_id("unmapped-model"),
-            "unmapped-model"
-        );
     }
 
-    /// A Code Assist variant selects the same backend id the caller would get by spelling the
-    /// tier in the model id, and only ids with tier thinking settings count as tiers.
     #[test]
-    fn code_assist_variant_tiers_follow_the_route_aliases_and_the_family_tier_table() {
-        for (model, level, wire_id) in [
-            (
-                "antigravity-gemini-3.8-flash",
-                "high",
-                Some("gemini-3.8-flash-high"),
-            ),
-            (
-                "antigravity-gemini-3.8-flash",
-                "medium",
-                Some("gemini-3.8-flash-medium"),
-            ),
-            (
-                "antigravity-gemini-3.8-flash-high",
-                "low",
-                Some("gemini-3.8-flash-low"),
-            ),
-            ("antigravity-gemini-3.8-flash", "minimal", None),
-            // 3.5-flash's user-facing tiers are aliased to other backend ids.
-            (
-                "antigravity-gemini-3.5-flash",
-                "low",
-                Some("gemini-3.5-flash-extra-low"),
-            ),
-            (
-                "antigravity-gemini-3.5-flash",
-                "high",
-                Some("gemini-3-flash-agent"),
-            ),
-            ("antigravity-claude-sonnet-4-6-thinking", "high", None),
-        ] {
-            assert_eq!(
-                google_codeassist_tier_wire_id(model, level).as_deref(),
-                wire_id,
-                "{model} {level}"
-            );
-        }
+    fn code_assist_variant_tiers_follow_fusiform() {
+        let response = serde_json::from_str(include_str!(
+            "../tests/fixtures/routing-parity/fusiform-served-with-wire-facts.json"
+        ))
+        .unwrap();
+        let cache = crate::CatalogCache::empty();
+        cache
+            .install_for_test(response, crate::CatalogSource::Fusiform)
+            .unwrap();
+        let catalog = cache.snapshot().unwrap();
         assert_eq!(
-            google_codeassist_tiers("antigravity-gemini-3.8-flash"),
-            ["low", "medium", "high"]
+            catalog
+                .code_assist_route("google", "antigravity-gemini-3.8-flash-high", Some("low"))
+                .unwrap()
+                .1,
+            "gemini-3.8-flash-low"
         );
-        assert_eq!(
-            google_codeassist_tiers("antigravity-gemini-3.5-flash"),
-            ["low", "high"]
-        );
-        assert!(google_codeassist_tiers("antigravity-claude-sonnet-4-6-thinking").is_empty());
+        assert!(catalog
+            .code_assist_route("google", "antigravity-gemini-3.8-flash", Some("minimal"))
+            .unwrap_err()
+            .contains("no tier 'minimal'"));
     }
 
     #[test]
