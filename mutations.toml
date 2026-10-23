@@ -24336,3 +24336,15 @@ expect_red = ["compaction::view::tests::indexed_origins_still_refuse_a_user_copy
 file = "crates/broca-core/src/compaction/stored.rs"
 old = "Some(originals) => originals.origin_roles[role_index(role)],"
 new = "Some(originals) => { let _ = originals; false }, // NON-VACUITY BREAK: erase origins from the role index"
+
+[[control]]
+id = "model-projection-episode-metadata-binds-its-watermark"
+guards = "episode history computed at an older watermark forces replay and projection repair instead of reusing stale repetition counters"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-store --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-store/src/conformance/model_history.rs"
+expect_red = ["conformance::model_history::stale_episode_metadata_replays_and_repairs_instead_of_reusing_old_counters"]
+file = "crates/broca-store/src/lib.rs"
+old = "complete && span_seq == Some(watermark)"
+new = "complete && { let _ = (span_seq, watermark); true } /* NON-VACUITY BREAK: accept stale episode metadata */"

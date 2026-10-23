@@ -227,3 +227,61 @@ fn model_store_reads_begin_at_the_pages_episode_not_at_ordinal_zero() {
         .iter()
         .any(|row| row.message.role == Role::Tool));
 }
+
+#[test]
+fn stale_episode_metadata_replays_and_repairs_instead_of_reusing_old_counters() {
+    let session = session("model-guidance-stale-watermark");
+    let records = repeated_episodes(&session);
+    let store = SqliteStore::open_in_memory().unwrap();
+    Persister::project(&store, &session, &records).unwrap();
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute("UPDATE meta SET episode_spans_seq=watermark_seq-1", [])
+        .unwrap();
+    let snapshot = MaterializedStore::read_page_with_watermark(
+        &store,
+        &session,
+        Some(0),
+        u64::MAX,
+        ReadView::Model,
+    )
+    .unwrap();
+    assert!(
+        snapshot.model_history.is_none(),
+        "stale spans must not be exposed as a complete model snapshot"
+    );
+    assert!(Persister::projection_seed(&store, &session)
+        .unwrap()
+        .is_none());
+    let request = ModelPageRequest {
+        from_ordinal: Some(22),
+        limit: Some(2),
+        ..Default::default()
+    };
+    let reads = std::cell::Cell::new(0);
+    let actual = broca_core::read_session_model_page(&snapshot, &[], &request, || {
+        reads.set(reads.get() + 1);
+        Ok(records.clone())
+    })
+    .unwrap();
+    let mut expected = full_page(&records, &request);
+    expected.head = actual.head;
+    expected.lineage_id = actual.lineage_id.clone();
+    assert_eq!(actual, expected);
+    assert_eq!(reads.get(), 1);
+    Persister::project(&store, &session, &records).unwrap();
+    let repaired = MaterializedStore::read_page_with_watermark(
+        &store,
+        &session,
+        Some(0),
+        u64::MAX,
+        ReadView::Model,
+    )
+    .unwrap();
+    assert!(repaired.model_history.is_some());
+    assert!(Persister::projection_seed(&store, &session)
+        .unwrap()
+        .is_some());
+}

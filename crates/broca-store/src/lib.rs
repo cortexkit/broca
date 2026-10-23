@@ -1055,6 +1055,7 @@ impl SqliteStore {
             ("deferred_calls_json", "TEXT"),
             ("run_attribution_version", "INTEGER NOT NULL DEFAULT 0"),
             ("episode_spans_complete", "INTEGER NOT NULL DEFAULT 0"),
+            ("episode_spans_seq", "INTEGER"),
             ("open_episode_span", "INTEGER"),
         ] {
             if !columns.contains(column) {
@@ -1658,13 +1659,14 @@ impl SqliteStore {
             rusqlite::params![key, prepared.deferred_calls_json, RUN_ATTRIBUTION_VERSION],
         )?;
         tx.execute(
-            "UPDATE meta SET episode_spans_complete=1, open_episode_span=?2 WHERE session=?1",
+            "UPDATE meta SET episode_spans_complete=1, open_episode_span=?2, episode_spans_seq=?3 WHERE session=?1",
             rusqlite::params![
                 key,
                 prepared
                     .open_episode_span
                     .map(broca_core::projection_plan::u64_to_i64)
-                    .transpose()?
+                    .transpose()?,
+                prepared.new_watermark as i64
             ],
         )?;
         for run_id in prepared.withdrawals_owed_runs {
@@ -2041,14 +2043,7 @@ impl MaterializedStore for SqliteStore {
         let mut end = start.saturating_add(limit).min(prefix_len);
         let mut model_history = None;
         if view == broca_core::context::ReadView::Model {
-            let metadata: Option<(bool, Option<u64>)> = tx
-                .query_row(
-                    "SELECT episode_spans_complete, open_episode_span FROM meta WHERE session=?1",
-                    [&key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
+            let metadata = episode_history_metadata(&tx, &key).map_err(|e| e.to_string())?;
             if let Some((true, open_span)) = metadata {
                 // A result's guidance depends on earlier calls in its episode, not earlier
                 // episodes. One extra raw message preserves the page's continuation cursor.
@@ -2534,6 +2529,25 @@ fn current_projection_lineage_id(
         .flatten())
 }
 
+/// An older projector can advance the transcript without knowing the episode-span columns.
+/// Bind their completeness to the watermark they were actually computed from, so such writes
+/// make the new reader replay rather than reuse stale repetition counters.
+fn episode_history_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> rusqlite::Result<Option<(bool, Option<u64>)>> {
+    tx.query_row(
+        "SELECT episode_spans_complete, episode_spans_seq, watermark_seq, open_episode_span FROM meta WHERE session=?1",
+        [key],
+        |row| {
+            let complete: bool = row.get(0)?;
+            let span_seq: Option<i64> = row.get(1)?;
+            let watermark: i64 = row.get(2)?;
+            Ok((complete && span_seq == Some(watermark), row.get(3)?))
+        },
+    ).optional()
+}
+
 fn current_projection_position(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
@@ -2658,14 +2672,9 @@ fn projection_seed_from_complete_tx(
     else {
         return Ok(None);
     };
-    let (spans_complete, open_episode_span): (bool, Option<u64>) = tx.query_row(
-        "SELECT episode_spans_complete, open_episode_span FROM meta WHERE session=?1",
-        [key],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if !spans_complete {
+    let Some((true, open_episode_span)) = episode_history_metadata(tx, key)? else {
         return Ok(None);
-    }
+    };
     let checkpoint_run_id = admission_checkpoint
         .last_episode
         .as_ref()
