@@ -19610,12 +19610,18 @@ select = "expected"
 test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
 expect_red = ["runner_tags_determinism::a_repeated_tool_call_id_renders_live_as_its_rebuild"]
 file = "crates/broca-core/src/run.rs"
-old = '''    parts
-        .iter()
-        .any(Option::is_some)
-        .then(|| broca_protocol::tags::PartTags::new(parts))'''
-new = '''    let _ = parts.iter().any(Option::is_some); // NON-VACUITY BREAK: an untagged batch still gets empty live tags
-    Some(broca_protocol::tags::PartTags::new(parts))'''
+# The tag-collection helper serves only stored-ledger runs. Computed results must
+# remain untagged here: even an all-None tag vector suppresses step numbering.
+old = '''        let stored_result_tags = if computed_tags.is_none() {
+            live_result_tags(writer, &batch.results, &mut Default::default())
+        } else {
+            None
+        };'''
+new = '''        let stored_result_tags = if computed_tags.is_none() {
+            live_result_tags(writer, &batch.results, &mut Default::default())
+        } else {
+            Some(broca_protocol::tags::PartTags::new(vec![None; batch.results.len()])) // NON-VACUITY BREAK: mark unnumbered live results as already tagged
+        };'''
 
 [[control]]
 id = "runner-tags-steer-carries-its-record-tags"
