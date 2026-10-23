@@ -1204,12 +1204,23 @@ fn next_run_tool_calls_cursor(
     .map(Some)
 }
 
+fn frozen_auth_selection(state: &broca_core::ReconciledRunState) -> Option<String> {
+    // Reuse the admission selection already decoded for lifecycle resolution. Current
+    // routing and the vault's resolved alias are not the credential key the run froze.
+    state
+        .auth_selection
+        .as_ref()
+        .map(|selection| selection.credential_id.clone())
+        .filter(|credential_id| !credential_id.is_empty())
+}
+
 fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStatusResponse {
     use broca_core::RunIndexState as State;
 
     let Some(state) = state else {
         return RunStatusResponse::Unknown;
     };
+    let auth_selection = frozen_auth_selection(&state);
     let final_step_finish_reason = state.final_step_finish_reason;
     let undelivered_steers = state.undelivered_steers;
     let indeterminate_tool_calls = state.indeterminate_tool_calls;
@@ -1231,6 +1242,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
         // A runner-owned wait (llm-runner 0.5.2 §6) is whatever carries a deadline: the context
         // ceiling's wait for a view, else a rewrite ride's reported wait. `reason` only names it.
         State::Active => RunStatusResponse::Active {
+            auth_selection,
             reason: match (state.ceiling_deadline_ms, state.ride_wait_deadline_ms) {
                 (Some(_), _) => Some("context_ceiling_wait".into()),
                 (None, Some(_)) => {
@@ -1245,6 +1257,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             awaiting_approval: None,
         },
         State::Paused => RunStatusResponse::Paused {
+            auth_selection,
             pause_reason: state
                 .pause_reason
                 .filter(|reason| *reason == broca_protocol::PauseReason::Restart)
@@ -1276,6 +1289,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             title,
         },
         State::Interrupted => RunStatusResponse::Interrupted {
+            auth_selection,
             reason: None,
             error,
             final_step_finish_reason,
@@ -1287,6 +1301,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::Completed => RunStatusResponse::Completed {
+            auth_selection,
             directives: None,
             final_step_finish_reason,
             undelivered_steers,
@@ -1296,6 +1311,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::MaxSteps => RunStatusResponse::MaxSteps {
+            auth_selection,
             final_step_finish_reason,
             undelivered_steers,
             usage,
@@ -1304,6 +1320,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::BudgetExhausted => RunStatusResponse::BudgetExhausted {
+            auth_selection,
             detail: state
                 .budget_detail
                 .expect("budget terminal retains its durable detail"),
@@ -1315,6 +1332,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::ContextCeiling => RunStatusResponse::ContextCeiling {
+            auth_selection,
             context_ceiling: state
                 .context_ceiling
                 .expect("ceiling terminal retains its durable detail"),
@@ -1326,6 +1344,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::Cancelled => RunStatusResponse::Cancelled {
+            auth_selection,
             final_step_finish_reason,
             undelivered_steers,
             usage,
@@ -1334,6 +1353,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::Error => RunStatusResponse::Error {
+            auth_selection,
             final_step_finish_reason,
             undelivered_steers,
             usage,
@@ -1343,6 +1363,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             structured_output: structured_output.clone(),
         },
         State::TransformUnavailable => RunStatusResponse::TransformUnavailable {
+            auth_selection,
             final_step_finish_reason,
             undelivered_steers,
             usage,
@@ -2935,6 +2956,7 @@ impl ServeHandler for crate::LineageRegistry {
         let (state, mut records) = self
             .route_run_state_with_wal(session, run_id.clone())
             .await?;
+        let auth_selection = state.as_ref().and_then(frozen_auth_selection);
         let mut detail = state.as_ref().and_then(|state| state.budget_detail.clone());
         let mut context_ceiling = state
             .as_ref()
@@ -3020,6 +3042,7 @@ impl ServeHandler for crate::LineageRegistry {
             None
         };
         let response = broca_wire::RunResultResponse {
+            auth_selection,
             directives,
             usage,
             detail,
@@ -3490,6 +3513,7 @@ mod paused_auth_tests {
                     ride_wait_deadline_ms: None,
                 };
                 let value = serde_json::to_value(run_status_response(Some(state.clone()))).unwrap();
+                assert_eq!(value["auth_selection"], "requested-key");
                 assert_eq!(value["auth"]["path"], wire);
                 assert_eq!(value["auth"]["credential_id"], "resolved-key");
                 assert_eq!(
@@ -3507,9 +3531,19 @@ mod paused_auth_tests {
                     value["auth"],
                     serde_json::json!({"credential_id": "requested-key"})
                 );
+                legacy
+                    .auth_selection
+                    .as_mut()
+                    .unwrap()
+                    .credential_id
+                    .clear();
+                let value =
+                    serde_json::to_value(run_status_response(Some(legacy.clone()))).unwrap();
+                assert!(value.get("auth_selection").is_none());
                 legacy.auth_selection = None;
                 let value = serde_json::to_value(run_status_response(Some(legacy))).unwrap();
                 assert!(value.get("auth").is_none());
+                assert!(value.get("auth_selection").is_none());
             }
         }
     }

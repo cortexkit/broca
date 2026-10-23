@@ -5417,6 +5417,7 @@ mod tests {
             version: None,
         };
         let run_result = broca_wire::RunResultResponse {
+            auth_selection: None,
             directives: None,
             context_ceiling: None,
             usage: Default::default(),

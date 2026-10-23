@@ -603,13 +603,15 @@ pub(crate) fn indexed_run_state(
         title: row
             .title
             .or_else(|| reconciled.as_ref().and_then(|state| state.title.clone())),
+        auth_selection: reconciled
+            .as_ref()
+            .and_then(|state| state.auth_selection.clone()),
         error: if use_wal_error {
             reconciled.and_then(|state| state.error)
         } else {
             None
         },
         pause_reason: None,
-        auth_selection: None,
         ride_wait_deadline_ms: None,
     }))
 }
@@ -6074,7 +6076,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     retries_used: 0,
                     error: None,
                     pause_reason: None,
-                    auth_selection: None,
+                    auth_selection: self.approvals.auth_selection(run_id, head),
                     title,
                     ride_wait_deadline_ms,
                 }));

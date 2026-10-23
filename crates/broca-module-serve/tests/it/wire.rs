@@ -5925,6 +5925,23 @@ impl PreparedWalRoute {
         first_principal: Option<broca_protocol::BindPrincipal>,
         principal: Option<subc_protocol::Principal>,
     ) -> Self {
+        Self::start_prepared(
+            tag,
+            |path, _| damage(path),
+            reader,
+            first_principal,
+            principal,
+        )
+        .await
+    }
+
+    async fn start_prepared(
+        tag: &str,
+        prepare: impl FnOnce(&Path, &BindIdentity),
+        reader: Option<Arc<dyn broca_core::WalStore>>,
+        first_principal: Option<broca_protocol::BindPrincipal>,
+        principal: Option<subc_protocol::Principal>,
+    ) -> Self {
         let dir = tmpdir(tag);
         let (mut reg, wal) = registry_and_wal(&dir);
         if let Some(reader) = reader {
@@ -6012,7 +6029,7 @@ impl PreparedWalRoute {
             }
         }
         let wal_path = wal.wal_path(&session);
-        damage(&wal_path);
+        prepare(&wal_path, &session);
 
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -6126,6 +6143,116 @@ fn send_request() -> serde_json::Value {
 
 fn status_request() -> serde_json::Value {
     serde_json::json!({ "method": "run.status", "params": {} })
+}
+
+#[tokio::test]
+async fn run_status_frozen_auth_selection_matches_served_golden() {
+    let mut route = PreparedWalRoute::start_prepared(
+        "status-frozen-auth",
+        |path, session| {
+            let mut wal = broca_wal::FileWal::open(path).unwrap();
+            let mut config = min_config();
+            config.auth_selection = Some(
+                serde_json::from_value(serde_json::json!({
+                    "credential_id": "apikey:cline-pass",
+                    "resolved_credential_id": "apikey:other-alias"
+                }))
+                .unwrap(),
+            );
+            wal.append(
+                1,
+                &WalRecord::RunStarted {
+                    tags: None,
+                    session_class: None,
+                    retention: None,
+                    hooks: None,
+                    title: None,
+                    on_restart: None,
+                    keep_warm: None,
+                    marker_order_version: None,
+                    manifest: None,
+                    scope: None,
+                    send_id: None,
+                    request_identity_digest: None,
+                    project_id: None,
+                    principal: None,
+                    run_id: RunId("frozen-auth".into()),
+                    session: session.clone(),
+                    ts_ms: None,
+                    config: Box::new(config),
+                    input: vec![].into(),
+                    origin: broca_wal::RunOrigin::Fresh,
+                    submission_id: None,
+                },
+                true,
+            )
+            .unwrap();
+            wal.append(
+                1,
+                &WalRecord::RunFinished {
+                    interrupt_reason: None,
+                    reason: RunFinishReason::Error,
+                    ts_ms: None,
+                    usage: Usage::default(),
+                    retries_used: 0,
+                    error: Some(
+                        serde_json::from_value(serde_json::json!({
+                            "class": "permanent", "message": "credential is not entitled",
+                            "status": 403, "provider_code": "ENTITLEMENT_ERROR"
+                        }))
+                        .unwrap(),
+                    ),
+                },
+                true,
+            )
+            .unwrap();
+            drop(wal);
+            let dir = session.project_root.parent().unwrap();
+            let wal_store = FileWalStore::new(dir.join("wal"));
+            let records = wal_store.read_records(session).unwrap();
+            let store = broca_store::SqliteStore::open(dir.join("store.db")).unwrap();
+            store.project(session, &records).unwrap();
+        },
+        None,
+        None,
+        None,
+    )
+    .await;
+    for (corr, method) in [(2, "run.status"), (3, "run.result")] {
+        write_req(
+            &mut route.writer,
+            7,
+            corr,
+            serde_json::json!({
+                "method": method, "params": {"run_id": "frozen-auth"}
+            }),
+        )
+        .await;
+        let frame = tokio::time::timeout(Duration::from_secs(5), read_one(&mut route.reader))
+            .await
+            .expect("the run reply must arrive promptly");
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        let reply: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        if method == "run.status" {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../broca-wire/tests/golden/run_status.frozen_auth_selection.json");
+            if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+                std::fs::write(&path, &frame.body).unwrap();
+                println!("captured {}", String::from_utf8_lossy(&frame.body));
+            }
+            assert_eq!(frame.body, std::fs::read(path).unwrap());
+        }
+        assert_eq!(
+            reply["result"]["auth_selection"], "apikey:cline-pass",
+            "{method}"
+        );
+    }
+    route.finish().await;
 }
 
 fn subscribe_request() -> serde_json::Value {

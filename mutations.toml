@@ -19938,6 +19938,19 @@ old = "run.delivery = message.tags.delivery().cloned();"
 new = "run.delivery = None; // NON-VACUITY BREAK: lose the ordered receipt at projection"
 
 [[control]]
+id = "run-status-frozen-auth-selection-golden"
+guards = "run.status carries the admission credential key from its already-decoded run state"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/wire.rs"
+expect_red = ["wire::run_status_frozen_auth_selection_matches_served_golden"]
+file = "crates/broca-module/src/serve.rs"
+old = "let auth_selection = frozen_auth_selection(&state);"
+new = "let auth_selection = None; // NON-VACUITY BREAK: omit the frozen credential from status"
+
+[[control]]
 id = "session-read-refuses-missing-wal-for-indexed-prefix"
 guards = "missing indexed session history keeps its typed history_unreachable refusal instead of generic open_failed"
 runner = "cargo"

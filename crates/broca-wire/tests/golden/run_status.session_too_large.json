@@ -1,1 +1,1 @@
-{"state":"error","undelivered_steers":[],"retries_used":0,"error":{"class":"permanent","message":"session log cannot exceed 16384 bytes","provider_code":"session_too_large"}}
+{"state":"error","auth_selection":"oauth:anthropic","undelivered_steers":[],"retries_used":0,"error":{"class":"permanent","message":"session log cannot exceed 16384 bytes","provider_code":"session_too_large"}}

@@ -343,6 +343,10 @@ async fn joining_steer_auth_pin_is_refused_unless_it_names_the_frozen_credential
         })
         .expect("the run froze its auth selection");
     assert_eq!(frozen.credential_id, "oauth:anthropic:work");
+    assert_eq!(
+        result(&run_status(&mut rig, &run).await)["auth_selection"],
+        "oauth:anthropic:work"
+    );
 
     for (index, pin) in [
         serde_json::json!({"method": "apikey"}),
@@ -401,9 +405,25 @@ async fn joining_steer_auth_pin_is_refused_unless_it_names_the_frozen_credential
         2,
         "only the two matching steers were recorded"
     );
+    rig.script
+        .auth_selection
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .credential_id = "apikey:replacement".into();
+    assert_eq!(
+        result(&run_status(&mut rig, &run).await)["auth_selection"],
+        "oauth:anthropic:work"
+    );
     rig.script.hold_model(false);
     let records = rig.wait_for_finished(1).await;
-    assert_eq!(starts(&records), [run]);
+    assert_eq!(starts(&records), std::slice::from_ref(&run));
+    rig.wait_idle().await;
+    assert_eq!(
+        result(&run_status(&mut rig, &run).await)["auth_selection"],
+        "oauth:anthropic:work"
+    );
     rig.finish().await;
 }
 
