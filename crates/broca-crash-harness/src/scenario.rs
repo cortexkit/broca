@@ -343,6 +343,12 @@ pub async fn drive<W: WalStore>(
     provider: &ScriptedProvider,
     plane: &HarnessPlane,
 ) -> RunOutcome {
+    #[cfg(test)]
+    let control = {
+        let mut control = control;
+        crate::compaction::schedule_views(&mut control, &request, state_root);
+        control
+    };
     let lease = FileLeaseStore::new(state_root.join("lease"));
     let (tx, mut rx) = mpsc::channel(512);
     let collector = tokio::spawn(async move {
