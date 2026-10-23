@@ -25037,3 +25037,16 @@ expect_red = ["llm_runner_role::projected_control_mids_match_session_read_tool_s
 file = "crates/broca-core/src/placement.rs"
 old = "            next,\n            steers: 0,"
 new = "            next: next.saturating_add(1), // NON-VACUITY BREAK: shift every message placement.\n            steers: 0,"
+
+[[control]]
+id = "unsupported-output-refs-before-plan-overrides"
+guards = "A non-advertiser diagnoses plan.items[].output_refs before tools overrides and writes nothing for send, refresh or adoption"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::unsupported_output_refs_precedes_plan_overrides_and_never_writes"]
+file = "crates/broca-fetch-plan/src/plan.rs"
+old = "    if in_lists || in_compaction {"
+new = "    if in_lists && in_compaction { // NON-VACUITY BREAK: require two unsupported flags before refusing either."

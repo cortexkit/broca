@@ -1724,3 +1724,50 @@ async fn projected_control_mids_match_session_read_tool_steer_budget_and_resume(
     assert_projected_control_mids_match_read(&mut resumed).await;
     resumed.finish().await;
 }
+
+#[tokio::test]
+async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
+    use cortexkit_role_llm_runner::{capabilities as groups, describe::RoleDescribe, ops};
+    let mut rig = Rig::start_with_scopes("unsupported-output-refs").await;
+    let describe = call(&mut rig, ops::ROLE_DESCRIBE, serde_json::json!({})).await;
+    let describe: RoleDescribe = serde_json::from_value(result(&describe)).unwrap();
+    assert!(!describe.declares(groups::OUTPUT_REFS));
+    for flag in [true, false] {
+        let before = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
+        let wal = rig.wal_bytes();
+        let plan = serde_json::json!({"items":[{"output_refs":flag}]});
+        let mut requests = vec![(
+            ops::SESSION_SEND,
+            serde_json::json!({
+                "send_id":format!("unsupported-send-{flag}"),"prompt":"must not be stored",
+                "model":{"provider":"fake","model":"fake"},
+                "tools":[],"plan":plan.clone()
+            }),
+        )];
+        if describe.declares(groups::SESSION_CHANGE) {
+            requests.push((
+                ops::SESSION_REFRESH,
+                serde_json::json!({"plan":plan.clone(),"policy":"immediately","generation":1}),
+            ));
+        }
+        if describe.declares(groups::ADOPT) {
+            requests.push((
+                ops::SESSION_ADOPT,
+                serde_json::json!({"plan":plan,"send_id":format!("unsupported-adopt-{flag}")}),
+            ));
+        }
+        for (method, params) in requests {
+            let reply = call(&mut rig, method, params).await;
+            let error = refusal(&reply);
+            assert_eq!(error["code"], "invalid_params", "{method}: {error}");
+            assert_eq!(
+                error["detail"]["field"], "plan.items[].output_refs",
+                "{method}: {error}"
+            );
+            assert_eq!(rig.wal_bytes(), wal, "{method} must refuse before writing");
+            let after = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
+            assert_eq!(after, before, "{method} must preserve the session head");
+        }
+    }
+    rig.finish().await;
+}
