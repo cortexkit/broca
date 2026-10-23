@@ -248,6 +248,9 @@ fn deserialize_run_usage_value(
 /// as an open string. A run that has not ended carries no `final_message`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResultResponse {
+    /// The credential id frozen at admission, as in `run.status`; never an empty string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_selection: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directives: Option<Vec<cortexkit_role_llm_runner::directives::Directive>>,
     #[serde(default, deserialize_with = "deserialize_run_usage")]

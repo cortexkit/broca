@@ -2795,12 +2795,13 @@ pub fn reconcile_run_state<'a>(
             retries_used: 0,
             error: None,
             pause_reason: None,
-            auth_selection: None,
+            auth_selection,
             title,
             ride_wait_deadline_ms: None,
         });
     }
     found.map(|state| ReconciledRunState {
+        auth_selection,
         title,
         run_usage: run_usage.usage,
         ..state

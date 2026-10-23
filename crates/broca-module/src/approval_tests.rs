@@ -2099,6 +2099,49 @@ async fn durable_approval_cache_matches_seed_and_ignores_stale_markers() {
 }
 
 #[tokio::test]
+async fn cached_auth_selection_keeps_admission_identity_without_wal_reads() {
+    let rig = Rig::new(false);
+    rig.seed(true, false, false, false);
+    let mut frames = rig.frames();
+    let admission: broca_wal::AuthSelection = serde_json::from_value(serde_json::json!({
+        "credential_id": "apikey:cline-pass", "resolved_credential_id": "apikey:alias"
+    }))
+    .unwrap();
+    let WalRecord::RunStarted { config, .. } = &mut frames[0].record else {
+        panic!("the seed must begin with the run admission");
+    };
+    config.auth_selection = Some(admission.clone());
+    let live = crate::approval_state::ApprovalState::default();
+    for frame in &frames {
+        live.observe(frame.seq, frame.fence, None, &frame.record);
+    }
+    let head = frames.last().unwrap().seq;
+    let run = RunId("r".into());
+    assert_eq!(live.auth_selection(&run, head), Some(admission.clone()));
+    assert_eq!(live.auth_selection(&run, head + 1), None);
+    assert_eq!(live.auth_selection(&RunId("another".into()), head), None);
+    let mut refrozen = admission.clone();
+    refrozen.credential_id = "apikey:replacement".into();
+    live.observe(
+        head + 1,
+        1,
+        None,
+        &WalRecord::RunAuthRefrozen {
+            ts_ms: None,
+            auth_selection: refrozen,
+        },
+    );
+    assert_eq!(live.auth_selection(&run, head + 1), Some(admission.clone()));
+    let seeded = crate::approval_state::ApprovalState::default();
+    seeded.seed(None, head, Some(run.clone()), &frames, None, true);
+    assert_eq!(seeded.auth_selection(&run, head), Some(admission));
+    seeded.seed(None, head, Some(run.clone()), &frames[1..], None, true);
+    assert_eq!(seeded.auth_selection(&run, head), None);
+    live.healthy.store(false, Ordering::Release);
+    assert_eq!(live.auth_selection(&run, head + 1), None);
+}
+
+#[tokio::test]
 async fn actor_job_drain_releases_writer_before_reporting_completion() {
     let rig = Rig::new(false);
     let writer = Arc::new(WalHandle::spawn(rig.wal.open(&rig.key).unwrap(), 1).unwrap());

@@ -144,6 +144,7 @@ session.retract { session, submission_id }
 
 run.cancel { run_id, at?: "now" | "step_boundary" } → "ack" | "not_active" (§13)
 run.status { run_id | session }
+    auth_selection?: credential id exactly as frozen at admission (also on run.result); omitted, never empty, when none was frozen or its config is not cheaply readable; never re-derived from current routing.
 send.status { send_id }
     → { state, run_id?, step?, last_error?, head: cursor, title?, usage } (state enum §14)
 ```

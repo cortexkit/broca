@@ -1634,6 +1634,7 @@ mod approval_wire_tests {
     #[test]
     fn active_awaiting_approval_golden() {
         let response = RunStatusResponse::Active {
+            auth_selection: None,
             reason: None,
             deadline_ms: None,
             usage: None,
@@ -1838,10 +1839,14 @@ pub struct PausedRunAuth {
 }
 
 /// A run-keyed status response resolved from the live actor, durable index, or WAL.
+/// `auth_selection` is the credential id frozen at admission, never a current routing
+/// decision. It is absent when no credential was frozen or the frozen config is unavailable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RunStatusResponse {
     Active {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1865,6 +1870,8 @@ pub enum RunStatusResponse {
         awaiting_approval: Option<AwaitingApproval>,
     },
     Paused {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         /// Explicit restart-pause discriminator; authentication-pause replies omit this field to preserve their existing wire shape.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pause_reason: Option<broca_protocol::OpenPauseReason>,
@@ -1892,6 +1899,8 @@ pub enum RunStatusResponse {
         title: Option<String>,
     },
     Interrupted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         /// Diagnostic cause of the interruption, when the terminal records one. Its presence
@@ -1930,6 +1939,8 @@ pub enum RunStatusResponse {
     },
     Completed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         directives: Option<Vec<cortexkit_role_llm_runner::directives::Directive>>,
         #[serde(
             default,
@@ -1960,6 +1971,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     MaxSteps {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(
             default,
             deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
@@ -1989,6 +2002,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     BudgetExhausted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         detail: broca_protocol::BudgetExhaustedDetail,
         #[serde(
             default,
@@ -2014,6 +2029,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     ContextCeiling {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         context_ceiling: broca_protocol::ContextCeilingDetail,
         #[serde(
             default,
@@ -2037,6 +2054,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Cancelled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(
             default,
             deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
@@ -2066,6 +2085,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(
             default,
             deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
@@ -2099,6 +2120,8 @@ pub enum RunStatusResponse {
         structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     },
     TransformUnavailable {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_selection: Option<String>,
         #[serde(
             default,
             deserialize_with = "broca_protocol::content::deserialize_optional_caller_finish_reason",
@@ -2147,6 +2170,56 @@ mod open_state_tests {
             serde_json::from_str(r#"{"state":"future_runner_state","extra":"future field"}"#)
                 .unwrap();
         assert!(matches!(status, RunStatusResponse::Unknown));
+    }
+
+    #[test]
+    fn run_status_auth_selection_is_optional_and_round_trips() {
+        for state in [
+            "active",
+            "paused",
+            "interrupted",
+            "completed",
+            "max_steps",
+            "cancelled",
+            "error",
+            "transform_unavailable",
+        ] {
+            for selection in [None, Some("apikey:cline-pass")] {
+                let mut wire = serde_json::json!({"state": state});
+                if let Some(selection) = selection {
+                    wire["auth_selection"] = selection.into();
+                }
+                let status: RunStatusResponse = serde_json::from_value(wire).unwrap();
+                let encoded = serde_json::to_value(&status).unwrap();
+                assert_eq!(
+                    encoded.get("auth_selection").and_then(|v| v.as_str()),
+                    selection
+                );
+                assert_eq!(encoded.get("auth_selection").is_some(), selection.is_some());
+                assert_eq!(
+                    serde_json::from_value::<RunStatusResponse>(encoded).unwrap(),
+                    status
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_result_auth_selection_is_optional_and_round_trips() {
+        for selection in [None, Some("apikey:cline-pass")] {
+            let mut wire = serde_json::json!({"run_id": "run-1", "state": "error"});
+            if let Some(selection) = selection {
+                wire["auth_selection"] = selection.into();
+            }
+            let result: super::RunResultResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(result.auth_selection.as_deref(), selection);
+            let encoded = serde_json::to_value(&result).unwrap();
+            assert_eq!(encoded.get("auth_selection").is_some(), selection.is_some());
+            assert_eq!(
+                serde_json::from_value::<super::RunResultResponse>(encoded).unwrap(),
+                result
+            );
+        }
     }
 
     #[test]
@@ -4044,7 +4117,7 @@ mod tests {
         let bytes = include_bytes!("../tests/golden/run_status.context_overflow_anthropic.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "3adae8212da6e360bccb3749042dd951e493339885c04a2f31cf39f0ee99c106"
+            "dfe4248d27cbc09736639c53b9e6d0a158338e553d20f11b47801964c9ee9cc2"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4067,7 +4140,7 @@ mod tests {
         let bytes = include_bytes!("../tests/golden/run_status.billing_exhausted_xai.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "f07df1b323d8f3647244a19f71f789b1c34bbbb7ba2501e49533c67a95979070"
+            "2c7dde5dd91989a2d95170669ff367ce69d4eccbd86c5ecaf3a0aa6938de7e55"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4095,7 +4168,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.credit_insufficient_openrouter.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "b08ee350f532852dde29bf65be3457275bcb49ad2cd4bb84a848c41ac2f31aed"
+            "990411488c11dbe4e8ae47d36db3c663c80a656257a89caec8eec56f920c389b"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4125,7 +4198,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.billing_exhausted_anthropic_apikey.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "ae4eeb23f2a63b7f01310a255d289f88b59fa834b782ab2344d36a31da4521e1"
+            "c003efaaf2dc4fc88d742c3fbe38da331f8d6912dab22d0ce243f7f478323b97"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4155,7 +4228,7 @@ mod tests {
         let bytes = include_bytes!("../tests/golden/run_status.request_invalid_openai.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "f3c98f18ec6bc276b28958c1832f66ff14244e305bb47b976b93dfd39b7f7d58"
+            "cb03a7ce9d9fa35ff201b6efc4ce3824ab1bdd18da3594bd5c130c8878a86f25"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4180,7 +4253,7 @@ mod tests {
         let bytes = include_bytes!("../tests/golden/run_status.grammar_too_large.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "765110eaddd433895df1b9ef548f5a7e1318af772c6a21f5f42d83e761b13502"
+            "11f75a0f522e8f178a6a55f3e77b98dffd1eda031f71ccbeba8531fe2b6143bc"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4205,7 +4278,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.transient_rate_limited_credential.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "0808b7ea8077acca9e76567a7564bd20a892a58677a10c6b0c168bd4c85303ce"
+            "e31d5d8e7c850ff68c335ea2f7148b5590abaa6e827319549d209be83b87fbe2"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4230,7 +4303,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.account_limit_exhausted_code_assist.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "145639eefc4bbaea47e7e69f683c6e2306385e773089aa8e05f5a740aa96ffce"
+            "727d64c8b28f7215d38c74e0b89cca5294c4fbaedeea248fdb1aa31e15761ef5"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4353,6 +4426,7 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Error {
+                auth_selection: None,
                 title: None,
                 final_step_finish_reason: None,
                 undelivered_steers: None,
@@ -4369,6 +4443,7 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Paused {
+                auth_selection: None,
                 title: None,
                 pause_reason: None,
                 usage: None,
@@ -4945,6 +5020,7 @@ mod restart_wire_tests {
     fn restart_pause_status_and_invalid_policy_match_goldens() {
         scope_refusal_golden::assert_golden(
             RunStatusResponse::Paused {
+                auth_selection: None,
                 title: None,
                 pause_reason: Some(broca_protocol::PauseReason::Restart.into()),
                 usage: None,
@@ -5138,6 +5214,7 @@ mod title_wire_tests {
         assert_eq!(
             status,
             RunStatusResponse::Completed {
+                auth_selection: None,
                 directives: None,
                 final_step_finish_reason: Some(FinishReason::Stop),
                 undelivered_steers: Some(Vec::new()),
@@ -5167,6 +5244,7 @@ mod title_wire_tests {
         // A live run's status carries the title too, and an untitled one keeps its bare shape.
         assert_eq!(
             serde_json::to_value(RunStatusResponse::Active {
+                auth_selection: None,
                 reason: None,
                 deadline_ms: None,
                 usage: None,
@@ -5183,6 +5261,7 @@ mod title_wire_tests {
             )
             .unwrap(),
             RunStatusResponse::Active {
+                auth_selection: None,
                 reason: None,
                 deadline_ms: None,
                 usage: None,
