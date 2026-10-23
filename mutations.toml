@@ -25337,3 +25337,154 @@ expect_red = ["subc_plane::tests::release_builds_exclude_test_only_hooks"]
 file = "crates/broca-subc/src/subc_plane.rs"
 old = "#[cfg(debug_assertions)]\n    #[doc(hidden)]\n    pub fn with_scope_sync_hold_for_test("
 new = "// NON-VACUITY BREAK: ship the scope hold test override\n    #[doc(hidden)]\n    pub fn with_scope_sync_hold_for_test("
+[[control]]
+id = "system-one-scope-required"
+guards = "A classifier route without a daemon work stamp refuses before sending or persisting a batch, even if its body supplies scope fields"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::unscoped_classifier_call_writes_and_sends_nothing"]
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = '''    Err(Refusal::new(
+        "scope_required",
+        "classifier calls require a daemon-stamped agent/run or flow scope",
+    ))'''
+new = '''    Ok(BatchScope::Run { agent_id: "forged".into(), run_id: "forged".into() }) // NON-VACUITY BREAK: admit unscoped work.'''
+
+[[control]]
+id = "system-one-basal-flow-required"
+guards = "Basal classifier calls require a flow stamp, not merely an agent-run stamp"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::basal_classifier_requires_a_flow_even_with_a_run_stamp"]
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = "    if broca_core::scope_admission::is_flow_only(principal)"
+new = "    if broca_core::scope_admission::is_flow_only(principal) && false // NON-VACUITY BREAK: admit Basal without a flow."
+
+[[control]]
+id = "system-one-retry-scope-frozen"
+guards = "A resend cannot serve or reattribute a batch admitted under another scope"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::classifier_retry_cannot_move_its_original_scope"]
+file = "crates/broca-store/src/system_one.rs"
+old = "        if scope.as_deref() != Some(scope_json.as_str()) {"
+new = "        if scope.as_deref() != Some(scope_json.as_str()) && false { // NON-VACUITY BREAK: ignore attribution mismatch."
+
+[[control]]
+id = "system-one-paid-outcome-has-export-intent"
+guards = "A paid classifier outcome cannot commit without a durable metering intent"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::scoped_classifier_exports_one_measurement_per_paid_item_and_none_on_resend"]
+file = "crates/broca-store/src/system_one.rs"
+old = "        if let Some(context) = fact {"
+new = "        if let Some(context) = fact.filter(|_| false) { // NON-VACUITY BREAK: lose the paid item's intent."
+
+[[control]]
+id = "system-one-export-replay-unique"
+guards = "Replaying a durable measurement after export committed but before acknowledgement cannot append another fact"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one_tests.rs"
+expect_red = ["system_one::tests::paid_outcome_and_outbox_survive_reopen_and_publish_only_once"]
+file = "crates/broca-store/src/export_index.rs"
+old = '''         CREATE TABLE IF NOT EXISTS export_facts (
+             export_seq   INTEGER PRIMARY KEY AUTOINCREMENT,
+             fact_id      TEXT NOT NULL UNIQUE,'''
+new = '''         CREATE TABLE IF NOT EXISTS export_facts (
+             export_seq   INTEGER PRIMARY KEY AUTOINCREMENT,
+             fact_id      TEXT NOT NULL, -- NON-VACUITY BREAK: remove the durable replay fence.'''
+
+[[control]]
+id = "system-one-startup-replays-export-intents"
+guards = "Startup publishes measurement intents left by a dead process before it serves calls"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::startup_replays_committed_measurement_intents_before_serving"]
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = "        self.flush_facts()?;"
+new = "        let _ = &self.export; // NON-VACUITY BREAK: leave committed intents unpublished at startup."
+
+[[control]]
+id = "system-one-flow-not-owner-run"
+guards = "A flow's metering attribution stays a flow, never its owner agent or an invented run"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::flow_classifier_measurement_never_inherits_its_owner_agent_or_run"]
+file = "crates/broca-store/src/system_one.rs"
+old = "                BatchScope::Flow { flow_id } => (None, Some(flow_id)),"
+new = "                BatchScope::Flow { flow_id } => (Some(flow_id), None), // NON-VACUITY BREAK: mislabel flow work as a run."
+
+[[control]]
+id = "system-one-unreported-output-stays-absent"
+guards = "An unreported output-token measurement never becomes a fabricated zero"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::scoped_classifier_exports_one_measurement_per_paid_item_and_none_on_resend"]
+file = "crates/broca-store/src/system_one.rs"
+old = "                    output_tokens: outcome.output_tokens,"
+new = "                    output_tokens: outcome.output_tokens.or(Some(0)), // NON-VACUITY BREAK: invent an unreported measurement."
+
+[[control]]
+id = "system-one-shipped-charge-basis"
+guards = "TypeSafe and Workers AI API keys are classified as metered by the shipped provider/method table"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/billing_routing.rs"
+expect_red = ["billing_routing::tests::system_one_api_keys_resolve_metered_from_the_shipped_table"]
+file = "crates/broca-module-serve/src/billing_routing.rs"
+old = '            ("apikey", "typesafe"),'
+new = '            ("oauth", "typesafe"), // NON-VACUITY BREAK: omit the TypeSafe API-key metering row.'
+
+[[control]]
+id = "system-one-vault-pin-not-routing-key"
+guards = "The usage measurement carries the credential pin actually resolved for the provider attempt"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/workers_ai_tests.rs"
+expect_red = ["system_one::workers_ai_tests::workers_ai_metering_uses_the_attempts_resolved_credential_and_only_measured_usage"]
+file = "crates/broca-module-serve/src/system_one/workers_ai.rs"
+old = "        let auth_selection = secret.as_ref().and_then(|s| s.auth_selection.clone());"
+new = "        let auth_selection = self.credential.credential_id(); // NON-VACUITY BREAK: substitute the lookup key for the vault's pin."
+
+[[control]]
+id = "system-one-charge-basis-resolver-not-constant"
+guards = "A classifier measurement uses its configured provider/method charge-basis table rather than a hard-coded basis"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::classifier_fact_resolves_charge_basis_from_its_configured_table"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = '''                        charge_basis,
+                        charge_basis_mapping_version,'''
+new = '''                        charge_basis: { let _ = charge_basis; broca_core::ChargeBasis::MeteredApi }, // NON-VACUITY BREAK: bypass the configured table.
+                        charge_basis_mapping_version,'''

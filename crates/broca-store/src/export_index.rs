@@ -135,6 +135,54 @@ fn u64_to_i64(value: u64, field: &str) -> Result<i64, ExportError> {
 }
 
 impl SqliteStore {
+    /// Publish a sessionless measurement once. The caller's durable outbox keeps these exact
+    /// bytes until this transaction commits, so a crash between databases can only replay it.
+    pub fn emit_system_one_fact(
+        &self,
+        fact: &broca_core::system_one_fact::SystemOneFact,
+    ) -> Result<bool, ExportError> {
+        let json = serde_json::to_string(fact).map_err(storage)?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| storage("store mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO export_facts (fact_id, run_id, segment_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![fact.fact_id, fact.run_id.as_deref().unwrap_or(""), json],
+        ).map_err(storage)?;
+        let stored: String = tx
+            .query_row(
+                "SELECT segment_json FROM export_facts WHERE fact_id=?1",
+                [&fact.fact_id],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if stored != json {
+            return Err(storage(
+                "System One fact identity collided with different immutable bytes",
+            ));
+        }
+        let high_water: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(export_seq), 0) FROM export_facts",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        tx.execute(
+            "UPDATE export_meta SET high_water=?1 WHERE id=1",
+            [high_water],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        self.export_high_water
+            .fetch_max(i64_to_u64(high_water, "high_water")?, Ordering::Release);
+        Ok(inserted != 0)
+    }
+
     /// The current export high-water mark cached from `export_meta` at open and
     /// advanced after every committed fact batch.
     pub fn high_water(&self) -> u64 {
@@ -938,7 +986,12 @@ mod tests {
         assert_eq!(stored["resolved_credential_id"], "apikey:kimi-for-coding");
         let page = store.read_export_page(None, 1).unwrap();
         assert_eq!(
-            page.facts[0].segment.resolved_credential_id.as_deref(),
+            page.facts[0]
+                .segment
+                .as_session()
+                .unwrap()
+                .resolved_credential_id
+                .as_deref(),
             Some("apikey:kimi-for-coding")
         );
         drop(store);
@@ -977,7 +1030,10 @@ mod tests {
             serde_json::json!({"min_ttl_ms": 600_000, "force_refresh": false, "op": "get"})
         );
         let page = store.read_export_page(None, 1).unwrap();
-        assert_eq!(page.facts[0].segment.vault_request, Some(request));
+        assert_eq!(
+            page.facts[0].segment.as_session().unwrap().vault_request,
+            Some(request)
+        );
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1264,9 +1320,22 @@ mod tests {
         let page = store.read_export_page(None, 1).unwrap();
         assert_eq!(page.facts.len(), 1);
         assert_eq!(page.facts[0].export_seq, 1);
-        assert_eq!(page.facts[0].segment.segment_ordinal, 0);
-        assert_eq!(page.facts[0].segment.charge_basis, ChargeBasis::MeteredApi);
-        assert_eq!(page.facts[0].segment.usage_policy_version, Some(2));
+        assert_eq!(
+            page.facts[0].segment.as_session().unwrap().segment_ordinal,
+            0
+        );
+        assert_eq!(
+            page.facts[0].segment.as_session().unwrap().charge_basis,
+            ChargeBasis::MeteredApi
+        );
+        assert_eq!(
+            page.facts[0]
+                .segment
+                .as_session()
+                .unwrap()
+                .usage_policy_version,
+            Some(2)
+        );
         let segment_json = serde_json::to_value(&page.facts[0].segment).unwrap();
         assert_eq!(
             segment_json["usage_policy_version"], 2,
@@ -1287,7 +1356,15 @@ mod tests {
                 .is_none(),
             "reading an old fact must not back-stamp the field on re-export"
         );
-        assert_eq!(page.facts[0].segment.usage.input_tokens, Some(10));
+        assert_eq!(
+            page.facts[0]
+                .segment
+                .as_session()
+                .unwrap()
+                .usage
+                .input_tokens,
+            Some(10)
+        );
         assert_eq!(
             page.next,
             Some(ExportCursor {
@@ -1301,8 +1378,22 @@ mod tests {
         let second = store.read_export_page(page.next, 1).unwrap();
         assert_eq!(second.facts.len(), 1);
         assert_eq!(second.facts[0].export_seq, 2);
-        assert_eq!(second.facts[0].segment.segment_ordinal, 1);
-        assert_eq!(second.facts[0].segment.usage_policy_version, Some(2));
+        assert_eq!(
+            second.facts[0]
+                .segment
+                .as_session()
+                .unwrap()
+                .segment_ordinal,
+            1
+        );
+        assert_eq!(
+            second.facts[0]
+                .segment
+                .as_session()
+                .unwrap()
+                .usage_policy_version,
+            Some(2)
+        );
         assert_eq!(
             second.next,
             Some(ExportCursor {
@@ -1411,7 +1502,11 @@ mod tests {
                 "the simulated crash leaves the terminal run absent before restart catch-up"
             );
             assert_eq!(
-                before_catch_up.facts[0].segment.usage_policy_version,
+                before_catch_up.facts[0]
+                    .segment
+                    .as_session()
+                    .unwrap()
+                    .usage_policy_version,
                 Some(2),
                 "the v2-era fact written before the crash stays versioned"
             );
@@ -1429,13 +1524,34 @@ mod tests {
         );
         let page = reopened.read_export_page(None, 10).unwrap();
         assert_eq!(page.facts.len(), 2, "catch-up emits exactly one new fact");
-        assert_eq!(page.facts[0].segment.run_id.0, "run-live");
-        assert_eq!(page.facts[0].segment.occurred_at_ms, Some(400));
-        assert_eq!(page.facts[0].segment.usage_policy_version, Some(2));
-        assert_eq!(page.facts[1].export_seq, 2);
-        assert_eq!(page.facts[1].segment.run_id, missed_run);
         assert_eq!(
-            page.facts[1].segment.usage_policy_version, None,
+            page.facts[0].segment.as_session().unwrap().run_id.0,
+            "run-live"
+        );
+        assert_eq!(
+            page.facts[0].segment.as_session().unwrap().occurred_at_ms,
+            Some(400)
+        );
+        assert_eq!(
+            page.facts[0]
+                .segment
+                .as_session()
+                .unwrap()
+                .usage_policy_version,
+            Some(2)
+        );
+        assert_eq!(page.facts[1].export_seq, 2);
+        assert_eq!(
+            page.facts[1].segment.as_session().unwrap().run_id,
+            missed_run
+        );
+        assert_eq!(
+            page.facts[1]
+                .segment
+                .as_session()
+                .unwrap()
+                .usage_policy_version,
+            None,
             "catch-up must preserve the pre-v2 WAL's unversioned usage semantics"
         );
         assert!(
@@ -1446,7 +1562,7 @@ mod tests {
             "an unversioned recovered fact must omit the field rather than stamp 0 or 1"
         );
         assert_eq!(
-            page.facts[1].segment.occurred_at_ms,
+            page.facts[1].segment.as_session().unwrap().occurred_at_ms,
             Some(200),
             "catch-up preserves occurrence time from the WAL rather than allocation order"
         );

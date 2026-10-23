@@ -28,7 +28,7 @@ pub mod credential;
 pub mod typesafe;
 pub mod workers_ai;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -125,6 +125,12 @@ impl BatchCatalog for LiveCatalog {
 pub enum ProviderReply {
     /// HTTP 200, with the body as received.
     Answered(Vec<u8>),
+    /// An answer tied to the credential resolved for this attempt, not a later lookup.
+    AttributedAnswer {
+        body: Vec<u8>,
+        auth_selection: Option<String>,
+        account_ref: Option<String>,
+    },
     /// Any other HTTP status, with the wait the provider asked for, if it asked.
     Status {
         status: u16,
@@ -235,11 +241,25 @@ pub struct SystemOne {
     pins: Vec<ModelPin>,
     config: Config,
     /// Batch ids a call in this process holds now: the in-process half of single flight.
-    claims: Mutex<HashSet<String>>,
+    claims: Mutex<HashMap<String, broca_store::system_one::BatchScope>>,
     call_slots: Arc<Semaphore>,
     model_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
     in_flight: Arc<AtomicUsize>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    metrics: Mutex<Metrics>,
+    export: Option<Arc<broca_store::SqliteStore>>,
+    charge_basis: Arc<crate::billing_routing::ChargeBasisTable>,
+}
+
+/// Process-lifetime observations only. No batch ids, questions, states or answers enter health.
+#[derive(Default, serde::Serialize)]
+struct Metrics {
+    batches_answered: u64,
+    batches_failed: u64,
+    items_answered: u64,
+    items_failed: u64,
+    spend_nanos_by_model: std::collections::BTreeMap<String, u64>,
+    last_provider_error: std::collections::BTreeMap<String, String>,
 }
 
 /// The wall clock in milliseconds since the Unix epoch.
@@ -267,11 +287,55 @@ impl SystemOne {
             pins,
             call_slots: Arc::new(Semaphore::new(config.process_calls.max(1))),
             config,
-            claims: Mutex::new(HashSet::new()),
+            claims: Mutex::new(HashMap::new()),
             model_slots: Mutex::new(HashMap::new()),
             in_flight,
             clock: Arc::new(now_ms),
+            metrics: Mutex::new(Metrics::default()),
+            export: None,
+            charge_basis: Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
         }
+    }
+
+    /// Reuse the daemon-wide immutable export stream, without opening any session projection.
+    pub fn with_export(
+        mut self,
+        export: Arc<broca_store::SqliteStore>,
+        charge_basis: Arc<crate::billing_routing::ChargeBasisTable>,
+    ) -> Self {
+        self.export = Some(export);
+        self.charge_basis = charge_basis;
+        self
+    }
+
+    fn flush_facts(&self) -> Result<(), String> {
+        let Some(export) = &self.export else {
+            return Ok(());
+        };
+        for pending in self.store.pending_facts().map_err(|e| e.to_string())? {
+            if export
+                .emit_system_one_fact(&pending.fact)
+                .map_err(|e| e.to_string())?
+            {
+                let mut metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
+                let spend = metrics
+                    .spend_nanos_by_model
+                    .entry(pending.fact.model.clone())
+                    .or_default();
+                *spend = spend.saturating_add(pending.spend_nanos);
+            }
+            self.store
+                .acknowledge_fact(&pending.fact.fact_id)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn health(&self) -> serde_json::Value {
+        let metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
+        let mut value = serde_json::to_value(&*metrics).expect("health counters encode");
+        value["batches_in_flight"] = self.in_flight.load(Ordering::Relaxed).into();
+        value
     }
 
     /// Replace the clock; tests drive retention with it.
@@ -282,6 +346,7 @@ impl SystemOne {
 
     /// Release every batch a previous process left running. Call once, before serving.
     pub fn release_abandoned(&self) -> Result<usize, String> {
+        self.flush_facts()?;
         self.store.release_abandoned().map_err(|e| e.to_string())
     }
 
@@ -385,7 +450,12 @@ impl SystemOne {
     /// Answer one request on a classifier route. The reply is the `result` text, or the body
     /// of the `ERROR` frame. `role.describe` is answered at once; `classify.run` on the
     /// caller's task (see [`Self::spawn_call`]).
-    pub async fn answer(self: Arc<Self>, body: &[u8]) -> Result<Box<RawValue>, Vec<u8>> {
+    pub async fn answer(
+        self: Arc<Self>,
+        body: &[u8],
+        principal: Option<&broca_protocol::BindPrincipal>,
+        send: &broca_protocol::SendScope,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
         #[derive(serde::Deserialize)]
         struct Envelope<'a> {
             method: String,
@@ -415,7 +485,16 @@ impl SystemOne {
                 serde_json::value::to_raw_value(&self.describe())
                     .map_err(|e| error_body(INTERNAL_ERROR, &e.to_string()))
             }
-            OP_CLASSIFY_RUN => self.spawn_call(params.to_owned()).await,
+            OP_CLASSIFY_RUN => {
+                let scope = caller_scope(principal, send).map_err(|e| {
+                    self.metrics
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .batches_failed += 1;
+                    refusal_body(&e)
+                })?;
+                self.spawn_call(params.to_owned(), scope).await
+            }
             other => Err(error_body(
                 "unknown_method",
                 &format!("unknown method '{other}' on a classifier/v1 route"),
@@ -425,7 +504,11 @@ impl SystemOne {
 
     /// Run one `classify.run` on a task of its own and wait for it. A panic inside answers
     /// this call `internal_error`; the batch it held is released by its hold's drop.
-    pub async fn spawn_call(self: Arc<Self>, params: String) -> Result<Box<RawValue>, Vec<u8>> {
+    pub async fn spawn_call(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
         // Raised here and lowered by the task itself, so a caller that stops waiting (its
         // route closed) does not hide a call that is still running.
         let gauge = Arc::clone(&self.in_flight);
@@ -435,9 +518,9 @@ impl SystemOne {
         let task = tokio::spawn(async move {
             let _lowered = lowered;
             let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
-            classify::run(&service, &params).await
+            classify::run(&service, &params, &scope).await
         });
-        match task.await {
+        let result = match task.await {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(refusal)) => Err(refusal_body(&refusal)),
             Err(error) => {
@@ -447,8 +530,51 @@ impl SystemOne {
                     "serving this call failed inside broca; re-send the batch",
                 )))
             }
+        };
+        let mut metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
+        if result.is_ok() {
+            metrics.batches_answered += 1;
+        } else {
+            metrics.batches_failed += 1;
+        }
+        result
+    }
+}
+
+fn caller_scope(
+    principal: Option<&broca_protocol::BindPrincipal>,
+    send: &broca_protocol::SendScope,
+) -> Result<broca_store::system_one::BatchScope, Refusal> {
+    use broca_store::system_one::BatchScope;
+    let stamp = match send {
+        broca_protocol::SendScope::Stamped(bind) => Some(&bind.scope),
+        _ => None,
+    };
+    if broca_core::scope_admission::is_flow_only(principal)
+        && stamp.and_then(|s| s.flow_id.as_ref()).is_none()
+    {
+        return Err(Refusal::new(
+            "flow_scope_required",
+            "Basal classifier calls require a daemon-stamped flow scope",
+        ));
+    }
+    if let Some(stamp) = stamp {
+        if let Some(flow_id) = &stamp.flow_id {
+            return Ok(BatchScope::Flow {
+                flow_id: flow_id.clone(),
+            });
+        }
+        if let (Some(agent_id), Some(run_id)) = (&stamp.agent_id, &stamp.run_id) {
+            return Ok(BatchScope::Run {
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+            });
         }
     }
+    Err(Refusal::new(
+        "scope_required",
+        "classifier calls require a daemon-stamped agent/run or flow scope",
+    ))
 }
 
 /// Lowers the busy gauge when a call ends, however it ends.

@@ -1338,6 +1338,7 @@ where
             if bind.classifier {
                 spawn_classifier_request(
                     frame.body,
+                    bind.clone(),
                     routes.system_one.clone(),
                     writer,
                     request_tasks,
@@ -1811,6 +1812,7 @@ async fn handle_control_request(
             // routing fared. Null in a process with no vault credential source, which asks
             // routing nothing.
             "account_selection": crate::account_routing::published_metrics(),
+            "system_one": routes.system_one.as_ref().map(|service| service.health()),
                 });
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
@@ -4170,6 +4172,7 @@ fn bind_role(
 /// (which would end the connection).
 fn spawn_classifier_request(
     body: Vec<u8>,
+    bind: BindObservation,
     service: Option<Arc<crate::system_one::SystemOne>>,
     writer: &EgressSender<Frame>,
     request_tasks: &mut JoinSet<Result<(), ServeIoError>>,
@@ -4178,7 +4181,14 @@ fn spawn_classifier_request(
     let writer = writer.clone();
     request_tasks.spawn(async move {
         let answered = match service {
-            Some(service) => tokio::spawn(async move { service.answer(&body).await }).await,
+            Some(service) => {
+                tokio::spawn(async move {
+                    service
+                        .answer(&body, bind.principal.as_ref(), &bind.scope)
+                        .await
+                })
+                .await
+            }
             None => Ok(Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
                 "unknown_method",
                 "this build serves no classifier/v1 role",

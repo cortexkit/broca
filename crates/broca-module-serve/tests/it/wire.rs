@@ -1845,8 +1845,11 @@ async fn retired_usage_export_is_unknown_and_terminal_facts_remain() {
     .await;
     let page = page.expect("terminal emission should publish one usage fact");
     assert_eq!(page.facts.len(), 1);
-    assert_eq!(page.facts[0].segment.charge_basis, ChargeBasis::Unknown);
-    assert_eq!(page.facts[0].segment.session, session);
+    assert_eq!(
+        page.facts[0].segment.as_session().unwrap().charge_basis,
+        ChargeBasis::Unknown
+    );
+    assert_eq!(page.facts[0].segment.as_session().unwrap().session, session);
     drop(cwriter);
     drop(creader);
     let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
@@ -2824,6 +2827,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // daemon's restart drain waits on, so an idle daemon must read 0 here or every restart
         // would wait out its drain ceiling.
         "system_one_batches_in_flight",
+        "system_one",
     ]
     .into_iter()
     .collect();

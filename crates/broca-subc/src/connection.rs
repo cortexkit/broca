@@ -1221,6 +1221,29 @@ impl SubcConnection {
         .await
     }
 
+    /// Open the classifier role under a daemon-held work scope. The selector is resolved by
+    /// the daemon, not trusted as caller-supplied attribution by the classifier.
+    pub async fn route_open_classifier_scoped_within(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: subc_protocol::scope::ScopeSelector,
+        retry: RouteOpenRetry,
+    ) -> ConnResult<RouteHandle> {
+        retry_route_open(retry, None, || {
+            self.route_open_target(
+                RouteTarget::ManagementSurface {
+                    module_id: module_id.to_owned(),
+                },
+                identity,
+                Some(scope.clone()),
+                Some(classifier_role_versions()),
+            )
+        })
+        .await
+        .map_err(RouteOpenError::into_conn)
+    }
+
     /// `route.open` to a management surface declaring `role_versions`, retrying a temporary
     /// refusal until `retry` runs out. A module that cannot serve the declared roles refuses
     /// the bind, and the open fails with its refusal.

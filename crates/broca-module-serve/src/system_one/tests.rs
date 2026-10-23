@@ -193,14 +193,20 @@ fn params(batch: &str, model: &str, states: &[&str], max_cost_usd: Option<f64>) 
 
 /// The reply text of an admitted call.
 async fn admitted(rig: &Rig, params: String) -> String {
-    match Arc::clone(&rig.service).spawn_call(params).await {
+    match Arc::clone(&rig.service)
+        .spawn_call(params, test_scope())
+        .await
+    {
         Ok(reply) => reply.get().to_owned(),
         Err(body) => panic!("refused: {}", String::from_utf8_lossy(&body)),
     }
 }
 
 async fn refused(rig: &Rig, params: String) -> Value {
-    match Arc::clone(&rig.service).spawn_call(params).await {
+    match Arc::clone(&rig.service)
+        .spawn_call(params, test_scope())
+        .await
+    {
         Ok(reply) => panic!("admitted: {}", reply.get()),
         Err(body) => serde_json::from_slice(&body).unwrap(),
     }
@@ -317,7 +323,7 @@ async fn a_resend_after_an_interrupted_call_asks_only_unanswered_items() {
     let service = Arc::clone(&rig.service);
     let call = {
         let body = body.clone();
-        tokio::spawn(async move { classify::run(&service, &body).await })
+        tokio::spawn(async move { classify::run(&service, &body, &test_scope()).await })
     };
     while rig.stand_in.held.load(Ordering::SeqCst) == 0 {
         rig.stand_in.entered.notified().await;
@@ -328,14 +334,17 @@ async fn a_resend_after_an_interrupted_call_asks_only_unanswered_items() {
     let _ = call.await;
     // The dropped call's hold is released on its own; wait for the blocking release.
     for _ in 0..1000 {
-        if !rig.service.claims.lock().unwrap().contains("crash") {
+        if !rig.service.claims.lock().unwrap().contains_key("crash") {
             break;
         }
         tokio::task::yield_now().await;
     }
     let mut reply = None;
     for _ in 0..1000 {
-        match Arc::clone(&rig.service).spawn_call(body.clone()).await {
+        match Arc::clone(&rig.service)
+            .spawn_call(body.clone(), test_scope())
+            .await
+        {
             Ok(text) => {
                 reply = Some(text.get().to_owned());
                 break;
@@ -387,7 +396,7 @@ async fn a_batch_a_dead_process_held_is_released_at_startup_and_resumed() {
     let body = params("dead", JEV, &["a", "b"], None);
     let call = {
         let body = body.clone();
-        tokio::spawn(async move { classify::run(&service, &body).await })
+        tokio::spawn(async move { classify::run(&service, &body, &test_scope()).await })
     };
     while first.stand_in.held.load(Ordering::SeqCst) == 0 {
         first.stand_in.entered.notified().await;
@@ -428,7 +437,7 @@ async fn a_concurrent_call_for_a_held_batch_is_refused_at_once() {
         vec![Script::Held(Arc::clone(&gate), noul("0.4", None))],
     );
     let body = params("flight", JEV, &["a"], None);
-    let first = tokio::spawn(Arc::clone(&rig.service).spawn_call(body.clone()));
+    let first = tokio::spawn(Arc::clone(&rig.service).spawn_call(body.clone(), test_scope()));
     while rig.stand_in.held.load(Ordering::SeqCst) == 0 {
         rig.stand_in.entered.notified().await;
     }
@@ -711,7 +720,7 @@ async fn a_panic_answers_its_call_and_releases_the_batch() {
     let mut reply = None;
     for _ in 0..1000 {
         if let Ok(text) = Arc::clone(&rig.service)
-            .spawn_call(params("panic", JEV, &["a"], None))
+            .spawn_call(params("panic", JEV, &["a"], None), test_scope())
             .await
         {
             reply = Some(text);
@@ -798,7 +807,7 @@ async fn retention_deletes_a_batch_seven_days_after_its_first_admission() {
     );
     stand_in.script("a", vec![Script::Answer(noul("0.1", None))]);
     Arc::clone(&service)
-        .spawn_call(params("old", JEV, &["a"], None))
+        .spawn_call(params("old", JEV, &["a"], None), test_scope())
         .await
         .unwrap();
     now.fetch_add(broca_store::system_one::RETENTION_MS - 1, Ordering::SeqCst);
@@ -806,7 +815,7 @@ async fn retention_deletes_a_batch_seven_days_after_its_first_admission() {
     now.fetch_add(1, Ordering::SeqCst);
     assert_eq!(service.sweep().await.unwrap(), 1);
     Arc::clone(&service)
-        .spawn_call(params("old", JEV, &["a"], None))
+        .spawn_call(params("old", JEV, &["a"], None), test_scope())
         .await
         .unwrap();
     assert_eq!(
@@ -866,4 +875,29 @@ async fn the_store_never_touches_the_run_index_or_any_wal() {
         after, before,
         "only system-one.db is new; nothing else changed"
     );
+}
+
+fn test_scope() -> broca_store::system_one::BatchScope {
+    broca_store::system_one::BatchScope::Run {
+        agent_id: "agent".into(),
+        run_id: "run".into(),
+    }
+}
+
+#[tokio::test]
+async fn health_counts_new_outcomes_and_provider_codes_without_item_content() {
+    let rig = rig();
+    rig.stand_in
+        .script("private-state", vec![Script::Status(400, None)]);
+    admitted(&rig, params("private-batch", JEV, &["private-state"], None)).await;
+    let before = rig.service.health();
+    assert_eq!(before["batches_answered"], 1);
+    assert_eq!(before["items_failed"], 1);
+    assert_eq!(before["last_provider_error"]["typesafe"], "400");
+    assert!(!before.to_string().contains("private"));
+    admitted(&rig, params("private-batch", JEV, &["private-state"], None)).await;
+    let after = rig.service.health();
+    assert_eq!(after["batches_answered"], 2);
+    assert_eq!(after["items_failed"], 1);
+    assert_eq!(after["batches_in_flight"], 0);
 }

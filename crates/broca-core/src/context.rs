@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use crate::billing::{ChargeBasisResolver, SpendSegment};
+use crate::billing::ChargeBasisResolver;
 use crate::wal_writer::WalStore;
 use broca_protocol::FinishReason;
 use broca_protocol::{
@@ -514,7 +514,7 @@ pub struct ExportCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportFact {
     pub export_seq: u64,
-    pub segment: SpendSegment,
+    pub segment: crate::system_one_fact::UsageExportSegment,
 }
 
 /// A consistent page read from the daemon-wide usage export index.

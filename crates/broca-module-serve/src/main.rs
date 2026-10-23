@@ -626,7 +626,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .with_run_index(run_index.clone())
         .with_materialized_store(run_index.clone())
         .with_export_index(run_index.clone())
-        .with_charge_basis_resolver(charge_basis_table)
+        .with_charge_basis_resolver(charge_basis_table.clone())
         .with_cap_store(cap_store.clone());
     if let Some(ttl) = idle_ttl {
         opener_builder = opener_builder.with_idle_ttl(ttl);
@@ -665,18 +665,21 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         let clef = workers_ai(broca_module_serve::system_one::workers_ai::CLEF_MODEL_PATH)?;
         let clef_flash =
             workers_ai(broca_module_serve::system_one::workers_ai::CLEF_FLASH_MODEL_PATH)?;
-        let service = Arc::new(broca_module_serve::system_one::SystemOne::new(
-            store,
-            broca_module_serve::serve::process_launch_id(),
-            Arc::new(broca_module_serve::system_one::LiveCatalog),
-            vec![
-                broca_module_serve::system_one::ModelPin::jev(Arc::new(typesafe)),
-                broca_module_serve::system_one::ModelPin::clef(clef),
-                broca_module_serve::system_one::ModelPin::clef_flash(clef_flash),
-            ],
-            config,
-            registry.batches_in_flight_gauge(),
-        ));
+        let service = Arc::new(
+            broca_module_serve::system_one::SystemOne::new(
+                store,
+                broca_module_serve::serve::process_launch_id(),
+                Arc::new(broca_module_serve::system_one::LiveCatalog),
+                vec![
+                    broca_module_serve::system_one::ModelPin::jev(Arc::new(typesafe)),
+                    broca_module_serve::system_one::ModelPin::clef(clef),
+                    broca_module_serve::system_one::ModelPin::clef_flash(clef_flash),
+                ],
+                config,
+                registry.batches_in_flight_gauge(),
+            )
+            .with_export(run_index.clone(), charge_basis_table),
+        );
         let released = service
             .release_abandoned()
             .map_err(|e| ServeIoError(format!("release System One batches left running: {e}")))?;

@@ -244,15 +244,16 @@ fn seed_catalog(state_root: &Path, served: Served) {
 }
 
 struct Rig {
-    // Held so the daemon lives as long as the rig; only the Unix kill test reads its pid.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    daemon: broca_test_support::RigChild,
+    // Dropping the rig stops the supervised process tree, including the scope owner.
+    _daemon: broca_test_support::RigChild,
     served: Served,
     connection_file: PathBuf,
     project_root: PathBuf,
     egress_host: String,
     state: Arc<StandIn>,
     state_root: PathBuf,
+    owner_nonce: PathBuf,
+    basal_nonce: PathBuf,
 }
 
 async fn start_rig(name: &str, served: Served) -> Option<Rig> {
@@ -303,9 +304,41 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
     )
     .unwrap();
     let connection_file = runtime_dir.join("subc-connection.json");
+    let stub = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
+    assert!(
+        stub.exists(),
+        "classifier scoped rig needs fake-aft-stub: {}",
+        stub.display()
+    );
+    let owner_nonce = root.join("owner.nonce");
+    let basal_nonce = root.join("basal.nonce");
+    let owner_events = root.join("owner-events.jsonl");
+    let scopes = root.join("scopes.json");
+    std::fs::write(
+        &scopes,
+        serde_json::to_vec(&json!([{
+            "ref": "classifier-run", "scope_epoch": 1, "kind": "head",
+        "attributes": {"agent_id": "classifier-agent", "run_id": "classifier-run"}
+        , "carriers": [{"principal": {"kind": "reserved", "module_id": "basal"}}]
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
     let config = json!({
         "version": 1,
+        "scope_authority_owners": ["classifier-owner"],
         "modules": {
+            "basal": {
+                "program": broca_test_support::ckdev_binary(&stub, broca_test_support::scratch_root()),
+                "args": [], "reserved": true, "enabled": true,
+                "env": {"FAKE_AFT_MODULE_ID": "basal", "FAKE_AFT_LAUNCH_NONCE_PATH": basal_nonce}
+            },
+            "classifier-owner": {
+                "program": broca_test_support::ckdev_binary(&stub, broca_test_support::scratch_root()),
+                "args": [], "reserved": true, "enabled": true,
+                "env": {"FAKE_AFT_MODULE_ID": "classifier-owner", "FAKE_AFT_SCOPE_SYNC_PATH": scopes,
+                    "FAKE_AFT_EVENTS_PATH": owner_events, "FAKE_AFT_LAUNCH_NONCE_PATH": owner_nonce}
+            },
             "broca": {
                 "program": broca_test_support::ckdev_binary(
                     Path::new(env!("CARGO_BIN_EXE_ck-broca")),
@@ -359,14 +392,29 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
         }
     })
     .await;
+    broca_test_support::wait_until("classifier scope sync", || async {
+        let text = std::fs::read_to_string(&owner_events).unwrap_or_default();
+        if text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| event["kind"] == "scope_sync_response")
+        {
+            Ok(())
+        } else {
+            Err("scope not synced".to_owned())
+        }
+    })
+    .await;
     Some(Rig {
-        daemon,
+        _daemon: daemon,
         served,
         connection_file,
         project_root: project_root.canonicalize().unwrap(),
         egress_host,
         state,
         state_root,
+        owner_nonce,
+        basal_nonce,
     })
 }
 
@@ -378,21 +426,73 @@ struct BrocaClassifierRoute {
 
 impl Rig {
     async fn open(&self) -> Result<BrocaClassifierRoute, String> {
+        self.open_as(true, false).await
+    }
+
+    async fn open_as(&self, scoped: bool, basal: bool) -> Result<BrocaClassifierRoute, String> {
+        let nonce = if basal {
+            &self.basal_nonce
+        } else {
+            &self.owner_nonce
+        };
+        broca_test_support::wait_until("classifier caller nonce", || async {
+            std::fs::read_to_string(nonce)
+                .map_err(|e| e.to_string())
+                .and_then(|s| {
+                    if s.trim().is_empty() {
+                        Err("empty nonce".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+        })
+        .await;
         let connection = Arc::new(
-            SubcConnection::connect(&self.connection_file)
-                .await
-                .map_err(|e| format!("connect: {e}"))?,
+            SubcConnection::connect_with_consumer_identity(
+                &self.connection_file,
+                Some(subc_control::ConsumerIdentity {
+                    module_id: if basal {
+                        "basal".into()
+                    } else {
+                        "classifier-owner".into()
+                    },
+                    launch_nonce: std::fs::read_to_string(nonce)
+                        .map_err(|e| e.to_string())?
+                        .trim()
+                        .into(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("connect: {e}"))?,
         );
         let identity =
             broca_protocol::BindIdentity::new(self.project_root.clone(), "core", "classifier");
-        let route = connection
-            .route_open_classifier_within(
-                "broca",
-                &identity,
-                RouteOpenRetry::within(Duration::from_secs(60), Duration::from_millis(200)),
-            )
-            .await
-            .map_err(|e| format!("route.open: {e}"))?;
+        let route = if !scoped {
+            connection
+                .route_open_classifier_within(
+                    "broca",
+                    &identity,
+                    RouteOpenRetry::within(Duration::from_secs(60), Duration::from_millis(200)),
+                )
+                .await
+                .map_err(|e| format!("route.open: {e}"))?
+        } else {
+            connection
+                .route_open_classifier_scoped_within(
+                    "broca",
+                    &identity,
+                    subc_protocol::scope::ScopeSelector::new(
+                        subc_protocol::Principal::Reserved {
+                            module_id: "classifier-owner".into(),
+                        },
+                        "classifier-run",
+                        Some(1),
+                    ),
+                    RouteOpenRetry::within(Duration::from_secs(60), Duration::from_millis(200)),
+                )
+                .await
+                .map_err(|e| format!("route.open: {e}"))?
+        };
         Ok(BrocaClassifierRoute { connection, route })
     }
 }
@@ -665,19 +765,21 @@ async fn route_roles_are_chosen_at_the_bind_through_the_real_daemon() {
     }
 }
 
-/// Every process the daemon `pid` runs directly: broca, in these rigs.
+/// Select broca alone from the daemon roster so crash tests leave the scope owner alive.
 #[cfg(unix)]
-fn children(pid: u32) -> Vec<u32> {
-    std::process::Command::new("pgrep")
-        .args(["-P", &pid.to_string()])
-        .output()
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|line| line.trim().parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+fn children(state_root: &Path) -> Vec<u32> {
+    let path = state_root
+        .parent()
+        .unwrap()
+        .join("data-home/cortexkit/run/live-children.json");
+    let roster: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    roster["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|child| child["module_id"] == "broca")
+        .map(|child| u32::try_from(child["pid"].as_u64().unwrap()).unwrap())
+        .collect()
 }
 
 /// The batch's `(state, owner)` and its recorded outcomes `(index, kind, body)`, read straight
@@ -784,7 +886,9 @@ async fn a_batch_in_flight_when_broca_is_killed_is_released_and_resumed() {
     );
     assert_eq!((outcomes[0].0, outcomes[0].1.as_str()), (0, "answered"));
 
-    let broca = children(rig.daemon.id().unwrap());
+    let before_facts = system_one_facts(&rig.state_root, "killed");
+    assert_eq!(before_facts.len(), 1);
+    let broca = children(&rig.state_root);
     assert!(!broca.is_empty(), "broca is supervised by the daemon");
     for pid in &broca {
         let killed = std::process::Command::new("kill")
@@ -806,7 +910,7 @@ async fn a_batch_in_flight_when_broca_is_killed_is_released_and_resumed() {
         .open()
         .await
         .expect("the restarted broca serves a route");
-    let after: Vec<u32> = children(rig.daemon.id().unwrap());
+    let after: Vec<u32> = children(&rig.state_root);
     assert!(
         after.iter().all(|pid| !broca.contains(pid)),
         "a new broca process serves: before {broca:?}, after {after:?}"
@@ -864,6 +968,17 @@ async fn a_batch_in_flight_when_broca_is_killed_is_released_and_resumed() {
     let (state, _, outcomes) = store_view(&rig.state_root, "killed");
     assert_eq!(state, "idle");
     assert_eq!(outcomes.len(), 3);
+    let facts = system_one_facts(&rig.state_root, "killed");
+    assert_eq!(facts.len(), 3);
+    assert_eq!(
+        facts[0], before_facts[0],
+        "restart must preserve the first paid item's exact bytes"
+    );
+    assert!(matches!(
+        route.request("classify.run", &params).await.unwrap(),
+        Reply::Response(_)
+    ));
+    assert_eq!(system_one_facts(&rig.state_root, "killed"), facts);
     // Let the held connection from the killed process go.
     let held = rig
         .state
@@ -875,4 +990,125 @@ async fn a_batch_in_flight_when_broca_is_killed_is_released_and_resumed() {
     if let Some(release) = held {
         release.notify_one();
     }
+}
+
+fn system_one_facts(state_root: &Path, batch: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        state_root.join("run-index.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut statement = conn.prepare("SELECT segment_json FROM export_facts WHERE json_extract(segment_json, '$.kind')='system_one' AND json_extract(segment_json, '$.batch_id')=?1 ORDER BY json_extract(segment_json, '$.item_index')").unwrap();
+    statement
+        .query_map([batch], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn assert_no_batch_or_fact(rig: &Rig, batch: &str) {
+    let conn = rusqlite::Connection::open_with_flags(
+        rig.state_root.join("system-one.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let batches: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM batch WHERE batch_id=?1",
+            [batch],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let items: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM item_outcome WHERE batch_id=?1",
+            [batch],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((batches, items), (0, 0));
+    assert!(system_one_facts(&rig.state_root, batch).is_empty());
+    assert!(rig.state.calls.lock().unwrap().is_empty());
+}
+
+fn simple_params(batch: &str) -> String {
+    json!({"batch_id": batch, "model": JEV,
+        "questions": {"q": {"type": "noul", "instructions": "Is it flagged?"}},
+        "items": [{"state": "a"}, {"state": "b"}]})
+    .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unscoped_real_classifier_route_refuses_without_writes_or_provider_calls() {
+    let Some(rig) = start_rig("unscoped", Served::Jev).await else {
+        return;
+    };
+    let route = rig.open_as(false, false).await.unwrap();
+    let Reply::Error(error) = route
+        .request("classify.run", &simple_params("unscoped"))
+        .await
+        .unwrap()
+    else {
+        panic!("unscoped request admitted")
+    };
+    assert_eq!(error.code, "scope_required");
+    assert_no_batch_or_fact(&rig, "unscoped");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn basal_real_classifier_route_without_flow_is_refused() {
+    let Some(rig) = start_rig("basal", Served::Jev).await else {
+        return;
+    };
+    for scoped in [false, true] {
+        let route = rig.open_as(scoped, true).await.unwrap();
+        let Reply::Error(error) = route
+            .request("classify.run", &simple_params("basal"))
+            .await
+            .unwrap()
+        else {
+            panic!("Basal request admitted without flow")
+        };
+        assert_eq!(error.code, "flow_scope_required");
+        assert_no_batch_or_fact(&rig, "basal");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scoped_real_classifier_route_exports_paid_items_once_across_resends() {
+    let Some(rig) = start_rig("facts", Served::Jev).await else {
+        return;
+    };
+    for state in ["a", "b"] {
+        rig.state.scripts.lock().unwrap().insert(state_key(&Value::String(state.into())),
+            Scripted::Answer(r#"{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":0.5}},"usage":{"input_tokens":100}}"#.into()));
+    }
+    let route = rig.open().await.unwrap();
+    let params = simple_params("paid");
+    assert!(matches!(
+        route.request("classify.run", &params).await.unwrap(),
+        Reply::Response(_)
+    ));
+    let facts = system_one_facts(&rig.state_root, "paid");
+    assert_eq!(facts.len(), 2);
+    for (index, json) in facts.iter().enumerate() {
+        let fact: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(fact["item_index"], index);
+        assert_eq!(fact["run_id"], "classifier-run");
+        assert_eq!(fact["usage"]["input_tokens"], 100);
+        assert!(fact["usage"].get("output_tokens").is_none());
+        assert!(fact.get("agent_id").is_none() && fact.get("flow_id").is_none());
+    }
+    assert!(matches!(
+        route.request("classify.run", &params).await.unwrap(),
+        Reply::Response(_)
+    ));
+    assert_eq!(system_one_facts(&rig.state_root, "paid"), facts);
+    assert!(rig
+        .state
+        .calls
+        .lock()
+        .unwrap()
+        .values()
+        .all(|calls| *calls == 1));
 }

@@ -376,7 +376,7 @@ where
     assert_eq!(page.high_water, 1);
     assert_eq!(page.facts.len(), 1);
     assert_eq!(page.facts[0].export_seq, 1);
-    assert_eq!(page.facts[0].segment.run_id, run_id);
+    assert_eq!(page.facts[0].segment.as_session().unwrap().run_id, run_id);
     assert_eq!(
         page.next,
         Some(ExportCursor {
@@ -478,10 +478,15 @@ where
     let stamped_fact = page
         .facts
         .iter()
-        .find(|fact| fact.segment.run_id == stamped_run)
+        .find(|fact| fact.segment.as_session().unwrap().run_id == stamped_run)
         .expect("stamped fact present");
     assert_eq!(
-        stamped_fact.segment.account_ref.as_deref(),
+        stamped_fact
+            .segment
+            .as_session()
+            .unwrap()
+            .account_ref
+            .as_deref(),
         Some("acct-uuid-321"),
         "the frozen vault account_id round-trips verbatim through the export fact"
     );
@@ -497,10 +502,11 @@ where
     let bare_fact = page
         .facts
         .iter()
-        .find(|fact| fact.segment.run_id == bare_run)
+        .find(|fact| fact.segment.as_session().unwrap().run_id == bare_run)
         .expect("bare fact present");
     assert_eq!(
-        bare_fact.segment.account_ref, None,
+        bare_fact.segment.as_session().unwrap().account_ref,
+        None,
         "a run with no vault account reads back with account_ref absent"
     );
     // The stored shape omits the key entirely (legacy rows stay unlabeled, never null/empty):

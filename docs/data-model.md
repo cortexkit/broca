@@ -736,6 +736,24 @@ separate-reasoning normalizer), `usage` (`Usage`, section 2.5), `usage_by_servic
 `pricing_at_ms`, `pricing_at_precision`, `occurred_at_ms`, `occurred_at_precision`,
 `terminal_reason` (final slice only). New fields are only ever added.
 
+Session facts have no `kind` member and retain the shape above. Sessionless classifier
+facts dispatch on `kind: "system_one"` before decoding. They contain `fact_id`,
+`batch_id`, `item_index`, `provider`, `model`, optional `auth_selection` (the resolved
+credential pin) and `account_ref`, exactly one of `run_id` or `flow_id`, `charge_basis`,
+`charge_basis_mapping_version`, `charge_basis_overrides`, `usage` (only reported
+`input_tokens` and `output_tokens`, each absent when unreported), and `occurred_at_ms`.
+There is no session, agent id, estimated usage, or price. Astrocyte prices these
+measurements against its catalog. A flow fact leaves the SQL `run_id` index column
+empty; the JSON carries its `flow_id` rather than an invented run identity.
+
+System One fact ids use domain-separated, length-prefixed SHA-256 over
+`system_one/v1`, source instance id, role, batch id, first-admission timestamp and
+item index. Thus a resend keeps its id, but new work admitted after seven-day batch
+expiry gets another id. `system-one.db` commits the exact fact bytes to a durable
+outbox in the same transaction as the paid outcome and frozen-rate ceiling spend.
+Publishing inserts once into `export_facts`, then acknowledges the outbox. A crash
+on either side of that acknowledgement only replays the same immutable bytes.
+
 A run gets a new slice at every `run_config_refrozen` and `run_auth_refrozen`. A slice's
 `usage` is the sum of its `model_step_finished` usages.
 
