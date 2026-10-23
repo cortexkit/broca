@@ -10,6 +10,7 @@
 
 pub mod actor;
 pub mod cache;
+mod compaction_watch;
 pub mod executor;
 pub mod fanout;
 pub mod opener;

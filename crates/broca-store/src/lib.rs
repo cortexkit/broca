@@ -1765,6 +1765,16 @@ impl SqliteStore {
 }
 
 impl MaterializedStore for SqliteStore {
+    fn materialized_message_count(&self, session: &BindIdentity) -> Result<Option<u64>, String> {
+        let key = Self::key(session);
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let (_, prefix_len) = current_projection_position(&tx, &key).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        u64::try_from(prefix_len)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
     fn read_run_event(&self, event_key: &str) -> Result<Option<(BindIdentity, Vec<u8>)>, String> {
         self.get_bus_event(event_key).map_err(|e| e.to_string())
     }
@@ -3835,6 +3845,27 @@ mod tests {
     #[test]
     fn paged_reads_use_persisted_prefix_length() {
         crate::conformance::paged_reads_return_atomic_meta_and_rows(sqlite_store());
+    }
+
+    /// The message count admission reads is the materialized prefix: zero before any
+    /// projection, then every projected transcript message, and it grows with each projection.
+    #[test]
+    fn materialized_message_count_is_the_projected_prefix() {
+        use crate::conformance::{base_records, session, text_turn};
+        let store = sqlite_store();
+        let s = session("counted");
+        assert_eq!(store.materialized_message_count(&s).unwrap(), Some(0));
+        let mut records = base_records(&s);
+        records.extend(text_turn(2, 1, "first"));
+        Persister::project(&store, &s, &records).unwrap();
+        assert_eq!(store.materialized_message_count(&s).unwrap(), Some(2));
+        records.extend(text_turn(4, 2, "second"));
+        Persister::project(&store, &s, &records).unwrap();
+        assert_eq!(store.materialized_message_count(&s).unwrap(), Some(3));
+        assert_eq!(
+            store.materialized_message_count(&session("other")).unwrap(),
+            Some(0)
+        );
     }
 
     #[test]

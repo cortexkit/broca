@@ -270,16 +270,22 @@ impl Rig {
     }
 
     async fn send_manifest(&self, manifest: Option<Arc<PlanManifest>>) {
+        let result = self.submit("run", manifest).await;
+        assert!(matches!(result, SendOutcome::Active { .. }), "{result:?}");
+    }
+
+    /// Send under `run_id`, carrying a plan with `manifest` when one is given, and return the
+    /// coordinator's answer.
+    async fn submit(&self, run_id: &str, manifest: Option<Arc<PlanManifest>>) -> SendOutcome {
         let request = serde_json::from_value(json!({
             "model":{"provider_module_id":"stub","model_id":"model"},
             "input":[text(Role::User, "user")], "context_limit":100000
         }))
         .unwrap();
-        let result = self
-            .registry
+        self.registry
             .route_submission_with_plan(
                 &self.key,
-                RunId("run".into()),
+                RunId(run_id.into()),
                 request,
                 RunKind::FreshOrResume,
                 SendKey::RunId,
@@ -292,8 +298,12 @@ impl Rig {
                 }),
             )
             .await
-            .unwrap();
-        assert!(matches!(result, SendOutcome::Active { .. }), "{result:?}");
+            .unwrap()
+    }
+
+    /// Every WAL record the session holds.
+    fn records(&self) -> Vec<broca_wal::FramedRecord> {
+        broca_core::WalStore::read_records(self.wal.as_ref(), &self.key).unwrap()
     }
 
     async fn prompt(&self) -> Vec<Message> {
@@ -353,6 +363,68 @@ async fn setup_head_renders_and_the_notice_is_durable_before_the_model_call() {
         "no view applies before the first one arrives"
     );
     assert!(!headers.contains_key("descends_from"));
+    rig.close().await;
+}
+
+/// A session enrolls in compaction only on its first episode, when it has no stored messages
+/// yet: a session whose first episode ran without a plan cannot take one naming a compaction
+/// provider later. Its send is refused `plan_drift` (no frozen plan, the plan it sent) and writes
+/// nothing, so a long session can never start compacting over the whole history it already holds.
+#[tokio::test]
+async fn a_session_first_run_without_a_plan_cannot_enroll_in_compaction_later() {
+    let rig = Rig::new(0);
+    rig.send(false).await;
+    // The planless run holds its model call, so its WAL is quiet while the plan is refused.
+    rig.prompt().await;
+    let before = rig.records();
+    let refused = rig.submit("later", Some(manifest())).await;
+    let SendOutcome::PlanRefused(refusal) = refused else {
+        panic!("a later compaction plan must be refused: {refused:?}");
+    };
+    assert_eq!(refusal.code(), "plan_drift");
+    assert_eq!(refusal.detail(), json!({"sent": "plan"}));
+    assert_eq!(rig.records(), before, "the refused send wrote nothing");
+    rig.close().await;
+}
+
+/// An imported session froze no plan on its import episode, so a plan naming a compaction
+/// provider is refused `plan_drift` on its first send after the import, and nothing is written.
+#[tokio::test]
+async fn an_imported_session_cannot_enroll_in_compaction() {
+    let rig = Rig::new(0);
+    let imported = rig
+        .registry
+        .route_import(
+            &rig.key,
+            broca_core::ImportRequest {
+                project_id: None,
+                principal: None,
+                run_id: RunId("import".into()),
+                session: rig.key.clone(),
+                messages: vec![
+                    text(Role::User, "imported question"),
+                    text(Role::Assistant, "imported answer"),
+                ],
+                origin: broca_core::ImportOrigin {
+                    source_ref: "test:compaction-enrollment".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(imported, broca_module::actor::ImportOutcome::Imported(_)),
+        "{imported:?}"
+    );
+    let before = rig.records();
+    assert!(!before.is_empty());
+    let refused = rig.submit("after-import", Some(manifest())).await;
+    let SendOutcome::PlanRefused(refusal) = refused else {
+        panic!("a compaction plan after an import must be refused: {refused:?}");
+    };
+    assert_eq!(refusal.code(), "plan_drift");
+    assert_eq!(refusal.detail(), json!({"sent": "plan"}));
+    assert_eq!(rig.records(), before, "the refused send wrote nothing");
     rig.close().await;
 }
 

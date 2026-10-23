@@ -406,6 +406,11 @@ tools is refused before it can freeze that list, even if it queues or steers; it
 retrofit a plan (the existing `plan_drift` rule still applies). Omitting tools does not
 revalidate or replace an older run's frozen tool list.
 
+A session freezes its fetch plan on its first episode, so compaction enrollment happens only on
+a session's first episode, before it has stored messages. A session whose first episode ran
+without a plan, including one seeded by `session.import`, refuses a later plan naming a
+compaction provider as `plan_drift`, and the refused send writes nothing.
+
 `role.describe.capabilities` includes `send_tool_reply_bound` (a broca extension). A tool
 declared directly in `session.send.tools` may carry `reply: {"max_ms": N}`, the longest one of
 its calls may take to answer, with N from 1 to 86,400,000 (the bound a tool provider's catalog
