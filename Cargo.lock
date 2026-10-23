@@ -584,6 +584,7 @@ name = "broca-subc"
 version = "0.3.250"
 dependencies = [
  "async-trait",
+ "base64",
  "broca-core",
  "broca-diagnostics",
  "broca-fetch-plan",
@@ -597,6 +598,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "sha2",
  "subc-client-rs 0.29.3",
  "subc-control 0.31.0",
  "subc-os",

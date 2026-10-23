@@ -3874,6 +3874,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn legacy_dispatch_rendering_stays_byte_identical() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "content": [{"type": "text", "text": "12:"}, {"type": "text", "text": "00"}],
+                    "structuredContent": {"ignored": true}
+                }),
+                include_str!("../tests/fixtures/content_v1/legacy_text.json"),
+            ),
+            (
+                serde_json::json!({
+                    "content": [
+                        {"type": "text", "text": "before"},
+                        {"type": "image", "mimeType": "image/png", "data": "aGVsbG8=", "width": 1, "height": 1},
+                        {"type": "text", "text": "after"}
+                    ],
+                    "isError": true,
+                    "errorCode": "provider_error"
+                }),
+                include_str!("../tests/fixtures/content_v1/legacy_image_error.json"),
+            ),
+            (
+                serde_json::json!({"structuredContent": {"program_facing": "still visible on legacy path"}}),
+                include_str!("../tests/fixtures/content_v1/legacy_structured.json"),
+            ),
+        ];
+        // Even a reply shaped like content/v1 stays legacy without route and catalog opt-in.
+        for (raw, golden) in cases {
+            let conn = ScriptedToolPlaneConnection::new(
+                vec![vec![catalog_entry("aft", &["read"])]; 2],
+                vec![Ok(raw)],
+            );
+            let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+            let ctx = batch_ctx("legacy-render");
+            let mut call = call("read");
+            call.tool_call_id = ToolCallId("call_01".into());
+            let manifest = ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]);
+            plane
+                .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+                .await
+                .unwrap();
+            let DispatchResult::Completed(result) = plane.dispatch(&ctx, &call).await else {
+                panic!("legacy call did not complete");
+            };
+            let rendered = crate::content_v1::tests::render_model_request(result);
+            assert_eq!(String::from_utf8(rendered).unwrap(), golden.trim_end());
+            assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
     fn legacy_map_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
         let is_error = raw
             .get("isError")
