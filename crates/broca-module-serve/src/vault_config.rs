@@ -128,10 +128,9 @@ pub enum VaultHandlesError {
 impl std::fmt::Display for VaultHandlesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VaultHandlesError::Unresolvable => write!(
-                f,
-                "BROCA_AUTH_SOURCE=vault but no config home to locate the handle map"
-            ),
+            VaultHandlesError::Unresolvable => {
+                write!(f, "no config home to locate the developer handle map")
+            }
             VaultHandlesError::ExplicitMissing { path, source } => write!(
                 f,
                 "{HANDLES_PATH_ENV} selects missing vault handles file {}: {source}",

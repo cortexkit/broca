@@ -44,6 +44,7 @@ mod approval_gate;
 mod cache_shared_prefix_render;
 mod captured_replay_e2e;
 mod chatgpt_websocket_live;
+mod credential_source_guard;
 mod early_args_boot;
 mod engram_descriptor;
 mod graceful_stop_real_daemon;

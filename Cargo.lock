@@ -261,6 +261,7 @@ version = "0.3.249"
 dependencies = [
  "base64",
  "broca-core",
+ "broca-module-serve",
  "broca-owner-only",
  "broca-protocol",
  "broca-provider",
@@ -490,6 +491,7 @@ dependencies = [
  "broca-core",
  "broca-crash-harness",
  "broca-diagnostics",
+ "broca-module-serve",
  "broca-owner-only",
  "broca-protocol",
  "broca-replay",
@@ -587,6 +589,7 @@ dependencies = [
  "broca-core",
  "broca-diagnostics",
  "broca-fetch-plan",
+ "broca-module-serve",
  "broca-protocol",
  "broca-provider",
  "broca-test-support",

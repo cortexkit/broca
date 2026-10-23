@@ -41,6 +41,7 @@ tracing.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+broca-module-serve = { path = "../broca-module-serve" }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Shared account-id vectors used by the Codex auth tests.
 cortexkit-chatgpt-policy = { workspace = true, features = ["test-vectors"] }

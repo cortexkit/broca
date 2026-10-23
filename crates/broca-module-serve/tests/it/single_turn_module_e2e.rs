@@ -714,7 +714,7 @@ impl Daemon {
         Self::start_with_env_and_aft_modules(
             tag,
             "",
-            &[("BROCA_AUTH_SOURCE", "vault")],
+            &[],
             &[],
             &[],
             Some(VaultSeed {
@@ -943,30 +943,7 @@ impl Daemon {
                 });
             }
         }
-        if broca_env
-            .iter()
-            .any(|(key, value)| *key == "BROCA_AUTH_SOURCE" && *value == "vault")
-        {
-            let handles_path = dir.join("vault-handles.json");
-            setup(
-                "write vault handles fixture",
-                std::fs::write(
-                    &handles_path,
-                    r#"{"handles":{"apikey:openai":"ckh_test_only"}}"#,
-                )
-                .ok(),
-            )?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                setup(
-                    "restrict vault handles to 0600",
-                    std::fs::set_permissions(&handles_path, std::fs::Permissions::from_mode(0o600))
-                        .ok(),
-                )?;
-            }
-            config["modules"]["broca"]["env"]["BROCA_VAULT_HANDLES_PATH"] =
-                json!(handles_path.to_string_lossy());
+        if vault_seed.is_some() {
             // Point BROCA_AUTH_METHODS_PATH at an explicit file so developer settings cannot
             // leak into the rig. The Meta capture case declares its OAuth method here; other
             // vault cases declare no overrides and use the API-key fallback. The file must
@@ -2492,13 +2469,7 @@ async fn empty_tools_send_completes_when_tool_module_rejects_binds() {
 /// A missing credentials module degrades health without preventing broca from registering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vault_dependency_is_resolved_after_registering() {
-    let Some(daemon) = Daemon::start_with_broca_env(
-        "vault-register-first",
-        "",
-        &[("BROCA_AUTH_SOURCE", "vault")],
-    )
-    .await
-    else {
+    let Some(daemon) = Daemon::start_with_broca_env("vault-register-first", "", &[]).await else {
         return;
     };
 

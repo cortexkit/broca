@@ -31,8 +31,7 @@ use broca_provider::families::{
 };
 use broca_provider::wire::{AuthHandle, FrozenRenderConfig};
 use live_common::{
-    gemini_api_key, opencode_api_key, opencode_oauth_token, run_live, LiveOutcome, LiveResult,
-    LiveSpec,
+    gemini_api_key, run_live, vault_api_key, vault_oauth_token, LiveOutcome, LiveResult, LiveSpec,
 };
 use serde_json::json;
 
@@ -43,7 +42,7 @@ const DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 // ───────────────────────── auth (skip-clean when absent) ─────────────────────────
 
 fn anthropic_auth() -> Option<AuthHandle> {
-    opencode_oauth_token("anthropic").map(AuthHandle::Bearer)
+    vault_oauth_token("anthropic").map(AuthHandle::Bearer)
 }
 
 fn gemini_auth() -> Option<AuthHandle> {
@@ -55,7 +54,7 @@ fn gemini_auth() -> Option<AuthHandle> {
 
 /// DeepSeek backs the OpenAI-Chat family live (openai-compatible at a different host).
 fn deepseek_auth() -> Option<(AuthHandle, FrozenRenderConfig)> {
-    let key = opencode_api_key("deepseek")?;
+    let key = vault_api_key("deepseek")?;
     let mut frozen = openai_chat_frozen_config(DEEPSEEK_MODEL);
     frozen.base_url = Some("https://api.deepseek.com".into());
     Some((AuthHandle::Bearer(key), frozen))

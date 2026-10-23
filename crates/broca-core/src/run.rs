@@ -511,7 +511,7 @@ pub struct RunControl {
     /// an auth-required resume compares it with the durable selection and records a separate
     /// off-render auth refreeze when it changed. Persisting the credential id keeps ordinary
     /// resumes on the same method, while persisting the vault account labels billing with the
-    /// account that handled each segment. `None` means no vault auth source (the OpenCode/mock
+    /// account that handled each segment. `None` means no vault token (for example, the mock
     /// path) and cannot produce an auth refreeze because there is no resolved selection to write.
     pub auth_selection: Option<broca_wal::AuthSelection>,
     /// The model's context-window limit, resolved at admission from a caller override or the

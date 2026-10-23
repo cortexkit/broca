@@ -65,3 +65,5 @@ pub use serve::{
 pub use vault_config::{
     scoped_not_found_message, VaultAddressing, VaultCredentialIds, VaultHandles, VaultHandlesError,
 };
+
+pub mod devtools;

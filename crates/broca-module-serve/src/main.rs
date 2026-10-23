@@ -171,14 +171,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // no credentials module to open it against). Gates the vault connection below.
     let mock_provider_path = provider_base_url.is_some();
 
-    // Credential source: default the credential vault, or the pre-vault OpenCode auth file
-    // when BROCA_AUTH_SOURCE=opencode. Selecting the vault opens a SECOND outbound consumer
-    // connection to the same daemon (a process-global credentials route; credentials are
-    // handle-keyed, not session-keyed) and loads the provider→handle map. A misconfiguration
-    // here fails loud at startup (no silent fallback to the old source).
-    let auth_source =
-        executor::AuthSource::from_env(std::env::var("BROCA_AUTH_SOURCE").ok().as_deref())
-            .map_err(ServeIoError)?;
+    // Real provider calls use a second outbound consumer connection for handle-keyed vault
+    // credentials. Mock providers need no credential route.
 
     // EVERY OUTBOUND MODULE ID COMES FROM HERE, and so does the manifest's `consumes`
     // declaration, which is handed the same struct below. Routes below read these fields
@@ -203,7 +197,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
             .as_deref(),
-        auth_source == executor::AuthSource::Vault && !mock_provider_path,
+        !mock_provider_path,
     )
     .with_account_selection(&account_selection)
     .with_bus_events(bus_event_config.enabled);
@@ -332,7 +326,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&catalog_cache),
     )));
 
-    // Both vault and OpenCode use the same provider→method defaults to name the credential
+    // Provider→method defaults name the vault credential
     // selected for a run. The mock path deliberately skips this load; see the rule on
     // `method_config_for_launch`.
     let auth_methods = method_config_for_launch(mock_provider_path, || {
@@ -361,7 +355,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         plan_conn.clone(),
         broca_subc::RouteOpenRetry::default_patience(),
     )))
-    .with_methods(auth_methods.clone())
     .with_provider_overrides(provider_overrides)
     .with_claude_code_install_id(
         match broca_module_serve::claude_code_identity::load_or_create_install_id(&state_root) {
@@ -1315,36 +1308,6 @@ mod executor {
     /// cold-starts its code index, which on a large project can take seconds).
     const BIND_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Where the executor gets a provider credential. Selected by `BROCA_AUTH_SOURCE`
-    /// (default `vault`). The vault is the authoritative source for every credential kind
-    /// (api-key included), resolving a fresh, refresh-on-expiry token per run; `opencode`
-    /// opts back into reading the static pre-vault auth file.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum AuthSource {
-        /// Read the OpenCode auth file (the pre-vault behavior; opt-in via
-        /// `BROCA_AUTH_SOURCE=opencode`).
-        Opencode,
-        /// Resolve a fresh, refresh-on-expiry token from the credential vault (the default).
-        Vault,
-    }
-
-    impl AuthSource {
-        /// Parse `BROCA_AUTH_SOURCE`. Unset/empty ⇒ `Vault` (the default — the credential
-        /// vault is now the authoritative source for all credential kinds). `opencode`
-        /// selects the pre-vault auth-file behavior. A non-empty unrecognized value is a
-        /// MISCONFIGURATION — fail loud rather than silently fall back (which would hide an
-        /// operator's typo and quietly use a different auth source than they asked for).
-        pub fn from_env(value: Option<&str>) -> Result<Self, String> {
-            match value.map(str::trim) {
-                None | Some("") | Some("vault") => Ok(AuthSource::Vault),
-                Some("opencode") => Ok(AuthSource::Opencode),
-                Some(other) => Err(format!(
-                    "BROCA_AUTH_SOURCE must be 'opencode' or 'vault', got {other:?}"
-                )),
-            }
-        }
-    }
-
     use broca_catalog::live::WireFamilyId;
     use broca_module_serve::account_routing::{AccountChoice, RoutingClient};
     use broca_module_serve::{AuthMethod, CacheTtlTable, CredentialId};
@@ -1408,88 +1371,19 @@ mod executor {
     /// `Chatgpt` renders the codex `/responses` (`OpenAiResponsesChatgpt`).
     pub use broca_module_serve::family_for_method;
 
-    /// The one OpenCode method/selection decision used by family routing, the consistency guard,
-    /// and durable metadata.
-    struct OpencodeEpisodeAuth {
-        selection: Option<broca_core::AuthSelection>,
-        method: Option<AuthMethod>,
-    }
-
-    /// Resolve OpenCode auth metadata before provider construction. Fresh runs prefer a caller
-    /// pin, then the configured provider method, then the auth-file entry type. Resumes ignore all
-    /// three and recover the method from the frozen credential id so drift cannot change the family.
-    fn opencode_auth_for_episode(
-        fresh_episode: bool,
-        frozen_credential_id: Option<&str>,
-        discovered_method: Option<AuthMethod>,
-        pinned_method: Option<AuthMethod>,
-        methods: &broca_module_serve::MethodConfig,
-        provider_id: &str,
-    ) -> OpencodeEpisodeAuth {
-        if fresh_episode {
-            let method = pinned_method
-                .or_else(|| methods.method_for(provider_id))
-                .or(discovered_method);
-            let selection = method.map(|method| broca_core::AuthSelection {
-                credential_id: broca_module_serve::CredentialId::new(method, provider_id, None)
-                    .to_id_string(),
-                // OpenCode auth entries carry no vault account id.
-                account_ref: None,
-                resolved_credential_id: None,
-                // OpenCode auth never asks the vault for anything.
-                vault_request: None,
-                // Nor routing: the OpenCode file has no accounts to choose between.
-                account_decision: None,
-            });
-            OpencodeEpisodeAuth { selection, method }
-        } else {
-            let selection = frozen_credential_id.map(|id| broca_core::AuthSelection {
-                credential_id: id.to_string(),
-                // A resumed OpenCode run keeps no vault account id.
-                account_ref: None,
-                resolved_credential_id: None,
-                vault_request: None,
-                account_decision: None,
-            });
-            let method = frozen_credential_id
-                .and_then(broca_module_serve::CredentialId::parse)
-                .map(|credential| credential.method);
-            OpencodeEpisodeAuth { selection, method }
-        }
-    }
-
-    /// OpenCode auth entries expose only an access token/API key and their generic type. Unlike
-    /// the vault payload, they do not provide Antigravity's required cloud project, so selecting
-    /// that body grammar must fail before admission rather than silently falling back to Gemini.
-    fn validate_opencode_method_metadata(
-        provider_id: &str,
-        method: Option<AuthMethod>,
-    ) -> Result<(), RunError> {
-        if method == Some(AuthMethod::Antigravity) {
-            return Err(RunError::Config(format!(
-                "auth method 'antigravity' for provider '{provider_id}' requires a project_id, \
-                 but BROCA_AUTH_SOURCE=opencode provides no project metadata"
-            )));
-        }
-        Ok(())
-    }
-
     /// The full auth resolution for a run: how to authenticate, whether to pause for re-auth,
     /// what to freeze, and (for the consistency guard) which method was chosen. NO `Debug`
     /// derive — `mode` can carry a secret token.
     pub struct AuthResolution {
-        /// How the provider authenticates (the shaped credential, or none/opencode).
+        /// How the provider authenticates (the shaped vault credential, or none for mocks).
         pub mode: AuthMode,
         /// Set when the credential needs re-auth: admit then pause (no provider call).
         pub pause: Option<ProviderError>,
         /// The credential id to FREEZE into a fresh run's RunConfig. `None` on the mock path;
-        /// OpenCode resolves its configured-or-discovered method before provider construction.
         /// On a resume this is the already-frozen value (re-frozen is a no-op — the loop only
         /// writes it on a fresh RunStarted).
         pub selection: Option<broca_core::AuthSelection>,
         /// The resolved method used by provider-family selection and the consistency guard.
-        /// OpenCode resolves it before provider construction from config/auth-file metadata on a
-        /// fresh run or from the frozen credential id on resume.
         pub method: Option<AuthMethod>,
         /// The cloud project the credential carries — `Some` only for an Antigravity
         /// credential (a body render input the google-codeassist family freezes). `None`
@@ -2152,7 +2046,7 @@ mod executor {
 
     /// The credential the run actually USED, paired with the record_version of the token it
     /// was served — the identity a post-run wire-auth-failure report needs. `None` when the
-    /// run never got a vault token: the mock path, a frozen OpenCode selection, a pre-loop
+    /// run never got a vault token: the mock path, a selection without a served token, a pre-loop
     /// `needs_reauth` pause (the vault already knows; no provider call was made), or a
     /// version-less resolution (nothing served, nothing to CAS against). Requiring BOTH pieces
     /// structurally prevents a report that could invalidate a version the run never saw.
@@ -2449,7 +2343,7 @@ mod executor {
 
     /// The opened credential-vault consumer plus how each credential is addressed. Present only
     /// when the auth source is the vault AND the connection opened at startup; absent for the
-    /// OpenCode default. Process-global (credentials are not session-keyed), so one client
+    /// mock credential-free path. Process-global (credentials are not session-keyed), so one client
     /// serves every session and provider.
     pub struct VaultAuth {
         pub client: broca_subc::VaultClient,
@@ -2767,25 +2661,15 @@ mod executor {
         /// Configured hosts change only the endpoint. Keeping them out of provider_base_url
         /// prevents them from disabling credentials and cache planning like the mock path.
         provider_overrides: broca_module_serve::provider_overrides::ProviderOverrides,
-        /// The credential source. `None` ⇒ the OpenCode default; `Some` ⇒ resolve a fresh
-        /// token from the vault per run (the opt-in cutover, off until an operator selects it).
-        /// Shared so a run's in-step token refresher can reach the vault from the provider's
-        /// transport task.
+        /// Vault access shared with the provider transport's in-step token refresher.
+        /// Absent only for mock providers and executors not yet configured for real calls.
         vault: Option<Arc<VaultAuth>>,
-        /// Provider→method defaults used to name a credential on the OpenCode path after its
-        /// reader identifies the entry type. The value contains no secrets and is also held by
-        /// the vault path for handle lookup.
-        methods: broca_module_serve::MethodConfig,
         /// The per-session context-management defaults, used when an episode is admitted or
         /// resumed to decide (or refuse) the value it runs under.
         context_management: broca_module_serve::context_management::ContextManagementConfig,
         /// Prompt-cache defaults loaded once at boot. Resolution is pure and runs only when a
         /// fresh episode is admitted; resumes reuse the policy already frozen in the WAL.
         cache_table: CacheTtlTable,
-        /// Where the OpenCode credential source reads its auth file. `None` ⇒ the HOME-derived
-        /// OpenCode path, which is what every production launch uses. Only tests set it, so a
-        /// unit test reads a fixture instead of the operator's real credential file.
-        opencode_auth_path: Option<std::path::PathBuf>,
         /// The routing module broca asks which provider account a new run uses, and reports
         /// each run's account evidence to. `None` without the vault credential source.
         routing: Option<Arc<RoutingClient>>,
@@ -2830,10 +2714,8 @@ mod executor {
                 provider_base_url,
                 provider_overrides: Default::default(),
                 vault: None,
-                methods: broca_module_serve::MethodConfig::empty(),
                 context_management: Default::default(),
                 cache_table: CacheTtlTable::shipped_defaults(),
-                opencode_auth_path: None,
                 routing: None,
                 claude_code_install_id: None,
                 cc_suffix_memo: Default::default(),
@@ -3066,17 +2948,7 @@ mod executor {
             .await
         }
 
-        /// Read OpenCode credentials from this file instead of the HOME-derived one. Test-only:
-        /// production has no reason to read another file, and HOME cannot be changed per test
-        /// because every test in the process shares it.
-        #[cfg(test)]
-        pub fn with_opencode_auth_path(mut self, path: std::path::PathBuf) -> Self {
-            self.opencode_auth_path = Some(path);
-            self
-        }
-
-        /// Select the credential vault as the auth source (the cutover). Without this the
-        /// executor uses the OpenCode default — so the vault is opt-in by construction.
+        /// Install the credential vault required for real provider calls.
         pub fn with_vault(mut self, vault: VaultAuth) -> Self {
             self.vault = Some(Arc::new(vault));
             self
@@ -3097,12 +2969,6 @@ mod executor {
             overrides: broca_module_serve::provider_overrides::ProviderOverrides,
         ) -> Self {
             self.provider_overrides = overrides;
-            self
-        }
-
-        /// Install the auth-method defaults loaded during process boot.
-        pub fn with_methods(mut self, methods: broca_module_serve::MethodConfig) -> Self {
-            self.methods = methods;
             self
         }
 
@@ -3190,7 +3056,7 @@ mod executor {
 
         /// Decide this run's auth: the mock path needs none; the vault path resolves the
         /// provider's method → credential id → handle → a fresh token (mapping the outcome);
-        /// otherwise the OpenCode default. Returns the resolution auth mode plus an optional
+        /// otherwise refusing a missing vault. Returns the resolution auth mode plus an optional
         /// pause-for-reauth error (set only when the vault is authoritative that the
         /// credential is dead — the run admits then pauses, making no provider call).
         ///
@@ -3256,51 +3122,9 @@ mod executor {
                     in_run_refresh: None,
                 });
             }
-            let Some(vault) = self.vault.as_ref() else {
-                if let Some(account) = pinned_account {
-                    return Err(RunError::Config(format!(
-                        "auth account pin '{account}' requires the vault credential source; \
-                         BROCA_AUTH_SOURCE=opencode cannot select account-scoped credentials"
-                    )));
-                }
-                // OpenCode's file records only generic api/oauth entry types. Resolve the
-                // configured/frozen effective method before choosing a provider family; otherwise
-                // a special method would be stamped only after the plain catalog family was built.
-                let discovered_method = if fresh_episode {
-                    match self.opencode_auth_path.as_deref() {
-                        Some(path) => {
-                            broca_catalog::live::opencode_auth_method_at(path, provider_id)
-                        }
-                        None => broca_catalog::live::opencode_auth_method(provider_id),
-                    }
-                } else {
-                    None
-                };
-                let episode_auth = opencode_auth_for_episode(
-                    fresh_episode,
-                    frozen_credential_id,
-                    discovered_method,
-                    pinned_method,
-                    &self.methods,
-                    provider_id,
-                );
-                validate_opencode_method_metadata(provider_id, episode_auth.method)?;
-                return Ok(AuthResolution {
-                    // The provider resolver reads the secret later; an injected file travels in
-                    // the mode so that read uses the same file as the method lookup above.
-                    mode: match &self.opencode_auth_path {
-                        Some(path) => AuthMode::FromOpencodeFile(path.clone()),
-                        None => AuthMode::FromOpencode,
-                    },
-                    pause: None,
-                    selection: episode_auth.selection,
-                    method: episode_auth.method,
-                    project_id: None,
-                    account_id: None,
-                    record_version: None,
-                    in_run_refresh: None,
-                });
-            };
+            let vault = self.vault.as_ref().ok_or_else(|| {
+                RunError::Config("credential vault is required for real provider calls".into())
+            })?;
             // Resume re-uses the frozen credential id verbatim; a fresh run resolves the caller
             // pin before config (api-key fallback for the long tail). `select_credential_id`
             // owns that branch so the resume invariant is unit-tested in isolation.
@@ -3708,7 +3532,7 @@ mod executor {
             // RunConfig of the last episode) — never re-resolve the method from config/router
             // (a drift would change the wire family and bust the cache). A NEW episode
             // (append) resolves fresh — it's a new run with its own method. A fresh run / an
-            // opencode-prior run reads None and resolves from config.
+            // A prior run without a frozen credential id resolves from config.
             let frozen_credential_id: Option<String> = if fresh_episode {
                 None
             } else {
@@ -3719,7 +3543,7 @@ mod executor {
             };
 
             // Authentication comes from no credential for mock, a fresh vault token, or the
-            // opencode default. If the vault says the credential needs re-authentication, we
+            // credential source. If the vault says the credential needs re-authentication, we
             // still resolve the provider without auth to record the correct RunStarted, then
             // pause before any provider call. Auth attaches after rendering and is excluded
             // from the config hash, so omitting it does not change the frozen config.
@@ -4255,8 +4079,8 @@ mod executor {
             // loop's controls. The pause admits the run then writes RunPaused{AuthRequired}
             // (resumable). The selection is frozen into a fresh RunStarted's RunConfig so a
             // later resume re-gets the SAME credential (the loop ignores it on a resume —
-            // the value is already durable). Mock stays None; a fresh OpenCode run carries the
-            // method-qualified id discovered from its auth-file entry.
+            // the value is already durable). Mock stays None; a real run carries the
+            // method-qualified vault credential id.
             let mut control = job.control;
             control.hook_plane = self.hook_plane();
             // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
@@ -4305,7 +4129,7 @@ mod executor {
             // USED (only when we proceeded with a vault token — `pause` is None means we got a
             // token and called the provider). A pre-loop `needs_reauth` pause is excluded (the
             // vault already knows; no provider call was made, so there's no wire rejection to
-            // report). `None` on the mock/OpenCode paths (neither has a vault record version) or
+            // report). `None` on the mock path (which has no vault record version) or
             // a pre-loop pause.
             let used_credential = used_credential_for_report(
                 &resolution.pause,
@@ -4741,24 +4565,6 @@ mod executor {
         }
 
         #[test]
-        fn auth_source_parses_default_and_explicit() {
-            // Default (unset/empty) is now the vault.
-            assert_eq!(AuthSource::from_env(None).unwrap(), AuthSource::Vault);
-            assert_eq!(AuthSource::from_env(Some("")).unwrap(), AuthSource::Vault);
-            assert_eq!(
-                AuthSource::from_env(Some(" vault ")).unwrap(),
-                AuthSource::Vault
-            );
-            // opencode is the explicit opt-back-in to the pre-vault auth file.
-            assert_eq!(
-                AuthSource::from_env(Some("opencode")).unwrap(),
-                AuthSource::Opencode
-            );
-            // A non-empty unrecognized value is a loud misconfiguration, not a silent default.
-            assert!(AuthSource::from_env(Some("voult")).is_err());
-        }
-
-        #[test]
         fn family_for_method_drives_wire_changing_families() {
             // Header-only methods keep the catalog family (None); wire-changing methods name
             // their family — the single authority that drives resolve_provider AND the guard.
@@ -4775,10 +4581,8 @@ mod executor {
         }
 
         fn load_method_config(label: &str, defaults: &str) -> broca_module_serve::MethodConfig {
-            let path = broca_test_support::scratch_root().join(format!(
-                "broca-opencode-methods-{label}-{}.json",
-                std::process::id()
-            ));
+            let path = broca_test_support::scratch_root()
+                .join(format!("broca-methods-{label}-{}.json", std::process::id()));
             std::fs::write(&path, format!(r#"{{"defaults":{defaults}}}"#)).unwrap();
             let methods = broca_module_serve::MethodConfig::load(&path).unwrap();
             std::fs::remove_file(path).unwrap();
@@ -4932,136 +4736,6 @@ mod executor {
         }
 
         #[test]
-        fn opencode_freeze_uses_discovered_method_and_preserves_resume_selection() {
-            let methods = load_method_config(
-                "stamp",
-                r#"{"deepseek":"apikey","anthropic":"oauth","google":"antigravity"}"#,
-            );
-
-            let fresh = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::ApiKey),
-                None,
-                &methods,
-                "deepseek",
-            );
-            assert_eq!(fresh.method, Some(AuthMethod::ApiKey));
-            assert_eq!(
-                fresh.selection.as_ref().unwrap().resolved_credential_id,
-                None
-            );
-            // OpenCode auth makes no vault request, so none is recorded.
-            assert_eq!(fresh.selection.as_ref().unwrap().vault_request, None);
-            assert_eq!(
-                fresh.selection.map(|selection| selection.credential_id),
-                Some("apikey:deepseek".to_string())
-            );
-
-            // A configured special-backend method wins over the generic OAuth entry type, and
-            // both the family driver and durable stamp consume that same method.
-            let antigravity = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &methods,
-                "google",
-            );
-            assert_eq!(antigravity.method, Some(AuthMethod::Antigravity));
-            assert_eq!(
-                antigravity
-                    .selection
-                    .as_ref()
-                    .map(|selection| selection.credential_id.as_str()),
-                Some("antigravity:google")
-            );
-            assert_eq!(
-                antigravity.method.and_then(family_for_method),
-                Some(WireFamilyId::GoogleCodeAssist)
-            );
-
-            let empty_methods = broca_module_serve::MethodConfig::empty();
-            let unknown =
-                opencode_auth_for_episode(true, None, None, None, &empty_methods, "unknown");
-            assert!(unknown.selection.is_none());
-            assert_eq!(unknown.method, None);
-
-            let generic_oauth = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &empty_methods,
-                "provider-with-oauth",
-            );
-            assert_eq!(generic_oauth.method, Some(AuthMethod::Oauth));
-            assert_eq!(
-                generic_oauth
-                    .selection
-                    .map(|selection| selection.credential_id),
-                Some("oauth:provider-with-oauth".to_string())
-            );
-
-            // A legacy OpenCode WAL with no selection remains unselected on resume.
-            let legacy = opencode_auth_for_episode(
-                false,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &methods,
-                "deepseek",
-            );
-            assert!(legacy.selection.is_none());
-            assert_eq!(legacy.method, None);
-
-            // A newer resume carries the exact frozen id and ignores both current config and the
-            // auth-file entry type.
-            let resumed = opencode_auth_for_episode(
-                false,
-                Some("oauth:deepseek:work"),
-                Some(AuthMethod::ApiKey),
-                None,
-                &methods,
-                "deepseek",
-            );
-            assert_eq!(resumed.method, Some(AuthMethod::Oauth));
-            assert_eq!(
-                resumed.selection.as_ref().unwrap().resolved_credential_id,
-                None
-            );
-            assert_eq!(resumed.selection.as_ref().unwrap().vault_request, None);
-            assert_eq!(
-                resumed.selection.map(|selection| selection.credential_id),
-                Some("oauth:deepseek:work".to_string())
-            );
-        }
-
-        #[test]
-        fn configured_opencode_chatgpt_selects_the_codex_family() {
-            let methods = load_method_config("chatgpt", r#"{"openai":"chatgpt"}"#);
-            let auth = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &methods,
-                "openai",
-            );
-            validate_opencode_method_metadata("openai", auth.method).unwrap();
-            assert_eq!(
-                auth.selection
-                    .as_ref()
-                    .map(|selection| selection.credential_id.as_str()),
-                Some("chatgpt:openai")
-            );
-
-            let family = auth.method.and_then(family_for_method);
-            let resolved = resolve_for_test("openai/gpt-5.3-codex", auth.method, family);
-            assert_eq!(resolved.family_id, WireFamilyId::OpenAiResponsesChatgpt);
-        }
-
-        #[test]
         fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
             install_test_catalog();
             let options = broca_catalog::live::ResolveOptions {
@@ -5177,47 +4851,7 @@ mod executor {
         }
 
         #[test]
-        fn opencode_antigravity_fails_loud_without_project_metadata_and_resume_keeps_method() {
-            let configured = load_method_config("antigravity", r#"{"google":"antigravity"}"#);
-            let fresh = opencode_auth_for_episode(
-                true,
-                None,
-                Some(AuthMethod::Oauth),
-                None,
-                &configured,
-                "google",
-            );
-            assert_eq!(fresh.method, Some(AuthMethod::Antigravity));
-            assert!(matches!(
-                validate_opencode_method_metadata("google", fresh.method),
-                Err(RunError::Config(message))
-                    if message.contains("requires a project_id")
-                        && message.contains("BROCA_AUTH_SOURCE=opencode")
-            ));
-
-            // Current config and auth-file discovery must not replace the frozen method.
-            let removed_config = broca_module_serve::MethodConfig::empty();
-            let resumed = opencode_auth_for_episode(
-                false,
-                Some("antigravity:google"),
-                Some(AuthMethod::Oauth),
-                None,
-                &removed_config,
-                "google",
-            );
-            assert_eq!(resumed.method, Some(AuthMethod::Antigravity));
-            assert_eq!(
-                resumed.method.and_then(family_for_method),
-                Some(WireFamilyId::GoogleCodeAssist)
-            );
-            assert!(matches!(
-                validate_opencode_method_metadata("google", resumed.method),
-                Err(RunError::Config(message)) if message.contains("requires a project_id")
-            ));
-        }
-
-        #[test]
-        fn generic_opencode_methods_keep_catalog_family_render_bytes() {
+        fn generic_methods_keep_catalog_family_render_bytes() {
             let opts = broca_protocol::request::CallOptions::new(Vec::new());
             let baseline = resolve_for_test("google/gemini-2.5-flash", None, None);
             let baseline_bytes = baseline.provider.render_request(&opts);
@@ -5272,7 +4906,7 @@ mod executor {
                 used_credential_for_report(&pause, selection(), Some(7)),
                 None
             );
-            // An OpenCode selection is metadata only; with no vault-served version it cannot
+            // A selection without a vault-served version is metadata only; it cannot
             // produce a report call to the credentials module.
             assert_eq!(used_credential_for_report(&None, selection(), None), None);
             assert_eq!(used_credential_for_report(&None, None, Some(7)), None);
@@ -5936,8 +5570,8 @@ mod executor {
         }
 
         #[test]
-        fn opencode_wal_selection_resolves_the_metered_api_charge_basis() {
-            let mut started = run_started(1, "opencode-run");
+        fn wal_selection_resolves_the_metered_api_charge_basis() {
+            let mut started = run_started(1, "unversioned-run");
             if let broca_wal::WalRecord::RunStarted { config, .. } = &mut started.record {
                 config.model = broca_protocol::request::ModelHandle::new("deepseek", "chat");
                 config.auth_selection = Some(broca_core::AuthSelection {

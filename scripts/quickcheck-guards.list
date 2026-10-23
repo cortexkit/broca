@@ -10,6 +10,7 @@ broca-module-serve|admission_wal_read_budget|fresh_episode_admission_does_not_ad
 # Restricts scope-stamp identity reads to the named identity adapters.
 broca-module-serve|it|scope_stamp_source::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/scope_stamp_source.rs|broca_reads_stamp_identity_only_in_scope_adapters|Scans workspace sources for scope-stamp reads outside approved adapters.
 # Prevents shipped Rust sources from reading the launch nonce directly.
+broca-module-serve|it|credential_source_guard::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/credential_source_guard.rs|shipped_sources_never_name_another_apps_credential_store|Scans shipped sources, tests and scripts for another application's removed credential-store path.
 broca-module-serve|launch_nonce|no_shipped_code_reads_a_launch_nonce_variable_directly|broca-module-serve/test-clock|crates/broca-module-serve/tests/launch_nonce.rs|no_shipped_code_reads_a_launch_nonce_variable_directly|Keeps production launch-nonce reads behind the shared accessor.
 # Ensures daemon executable environment reads use the shared resolver.
 broca-test-support|subc_bin_guard|real_daemon_binary_environment_reads_use_shared_resolver|-|crates/broca-test-support/tests/subc_bin_guard.rs|real_daemon_binary_environment_reads_use_shared_resolver|Finds direct daemon-binary environment reads across workspace sources.

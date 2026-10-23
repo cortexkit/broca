@@ -1657,7 +1657,7 @@ mod tests {
 
     #[test]
     fn run_without_vault_identity_serializes_no_account_ref_key() {
-        // An opencode/mock run has no auth_selection; its serialized fact must OMIT the
+        // A credential-free mock run has no auth_selection; its serialized fact must OMIT the
         // account_ref key entirely (the consumer maps absent to unlabeled:<provider>), never
         // emit null or an empty string.
         let records = vec![

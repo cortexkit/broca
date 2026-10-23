@@ -15,7 +15,7 @@ use serde_json::json;
 
 const MODEL: &str = "gpt-4o-mini";
 
-// /v1/responses requires the api.responses.write scope, which the opencode OAuth token
+// /v1/responses requires the api.responses.write scope, which the ChatGPT OAuth token
 // (ChatGPT/Codex) lacks (it 401s). So this sources the OpenAI PLATFORM key specifically.
 fn auth() -> Result<AuthHandle, String> {
     openai_platform_key()
