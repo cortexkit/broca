@@ -6961,6 +6961,7 @@ fn tool_args_rejection_records(
     let mut existing = std::collections::HashMap::new();
     for result in rejected {
         records.push(WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
@@ -7343,6 +7344,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 CallPlan::Dispatch(c) => {
                     let seq = writer
                         .record(WalRecord::ToolDispatchIntent {
+                            dispatched_at_ms: None,
                             hooks: c.hooks.clone(),
                             batch_id: batch_id.clone(),
                             tool_call_id: c.tool_call_id.clone(),
@@ -7373,6 +7375,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolNoDispatch {
+                        dispatched_at_ms: None,
                         tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
@@ -7386,6 +7389,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
                         tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
@@ -7413,6 +7417,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolNoDispatch {
+                        dispatched_at_ms: None,
                         tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
@@ -7426,6 +7431,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
                         tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
@@ -7438,6 +7444,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 }
                 CallPlan::Synthetic { result, reason } => {
                     writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
                         tags: None,
                         hooks: None,
                         batch_id: batch_id.clone(),
@@ -7450,6 +7457,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 }
                 CallPlan::Stopped(tool_call_id) => {
                     writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
                         tags: None,
                         hooks: None,
                         batch_id: batch_id.clone(),
@@ -7599,6 +7607,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: r.hooks.take(),
                 batch_id: batch_id.clone(),
@@ -8208,6 +8217,7 @@ async fn finalize_hard_stop(
             .iter()
             .any(|result| result.tool_call_id == r.tool_call_id);
         writer.record(WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
@@ -9541,6 +9551,7 @@ mod tests {
             is_error: false,
         };
         let prior_record = WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
@@ -10866,6 +10877,7 @@ mod approval_gate {
         history.record(
             writer,
             WalRecord::ApprovalRecorded {
+                closed_at_ms: None,
                 tags: None,
                 call_key: call.key.clone(),
                 call_id: call.call().tool_call_id,
@@ -10885,6 +10897,7 @@ mod approval_gate {
     ) -> Result<(), RunError> {
         for call in open {
             writer.record(WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 batch_id: ctx.batch_id.clone(),
                 result: Arc::new(crate::resume::not_dispatched_result(
@@ -10981,6 +10994,7 @@ mod approval_gate {
     ) -> Result<(), RunError> {
         if let Some(outcome) = resolution.outcome.take() {
             let record = WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 batch_id: ctx.batch_id.clone(),
                 result: Arc::clone(&resolution.result),
@@ -11233,7 +11247,10 @@ mod approval_gate {
             .map_err(|error| RunError::Wal(format!("freeze approved arguments: {error}")))?;
         use sha2::Digest;
         let args_hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+        // Filing retains this exact Prepared record after sync, so observe its time before
+        // sharing it; the filed record must still equal the durable record.
         let prepared = WalRecord::ToolCallDeferred {
+            deferred_at_ms: epoch_millis(),
             batch_id: ctx.batch_id.clone(),
             call_id: call.tool_call_id.clone(),
             executor: broca_wal::DeferredExecutor::Broca,
@@ -11276,6 +11293,7 @@ mod approval_gate {
             CallPlan::Dispatch(call) => {
                 let seq = writer
                     .record(WalRecord::ToolDispatchIntent {
+                        dispatched_at_ms: None,
                         batch_id: ctx.batch_id.clone(),
                         tool_call_id: call.tool_call_id.clone(),
                         tool_name: Some(call.tool_name.clone()),
@@ -11297,6 +11315,7 @@ mod approval_gate {
                 hooks,
             } => {
                 writer.record(WalRecord::ToolNoDispatch {
+                    dispatched_at_ms: None,
                     tags: None,
                     batch_id: ctx.batch_id.clone(),
                     tool_call_id: tool_call_id.clone(),
@@ -11310,6 +11329,7 @@ mod approval_gate {
                 hooks,
             } => {
                 writer.record(WalRecord::ToolResult {
+                    finished_at_ms: None,
                     tags: None,
                     batch_id: ctx.batch_id.clone(),
                     result: Arc::clone(result),
@@ -11979,7 +11999,7 @@ mod approval_gate {
                                 let Slot::Held(held) = &slots[index] else { unreachable!() };
                                 let held = held.clone(); let call = held.call();
                                 let WalRecord::ToolCallDeferred { module, schema_pin, args_jcs, .. } = &*held.prepared else { unreachable!() };
-                                history.record(writer, WalRecord::ToolDispatchIntent { batch_id: ctx.batch_id.clone(), tool_call_id: call.tool_call_id.clone(), tool_name: Some(call.tool_name.clone()),
+                                history.record(writer, WalRecord::ToolDispatchIntent { dispatched_at_ms: None, batch_id: ctx.batch_id.clone(), tool_call_id: call.tool_call_id.clone(), tool_name: Some(call.tool_name.clone()),
                                     args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone(), hooks: None,
                                     approval_digest: None, call_key: Some(held.key.clone()) });
                                 writer.sync().await?;

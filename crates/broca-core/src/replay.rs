@@ -3628,6 +3628,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn prepared(id: &str, batch: &str) -> WalRecord {
         WalRecord::ToolCallDeferred {
+            deferred_at_ms: None,
             batch_id: BatchId(batch.into()),
             call_id: ToolCallId(id.into()),
             executor: DeferredExecutor::Broca,
@@ -3661,6 +3662,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn approval(id: &str, key: &str, decision: DeferredDecision) -> WalRecord {
         WalRecord::ApprovalRecorded {
+            closed_at_ms: None,
             tags: None,
             call_key: key.into(),
             call_id: ToolCallId(id.into()),
@@ -3718,6 +3720,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn terminal(id: &str, withdrawal: Option<WithdrawElicitation>) -> WalRecord {
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: BatchId("b".into()),
@@ -3900,6 +3903,7 @@ pub(crate) mod deferred_tests {
             prepared("approved", "b"),
             approval("approved", "key-approved", DeferredDecision::Approved),
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b".into()),
                 tool_call_id: ToolCallId("approved".into()),

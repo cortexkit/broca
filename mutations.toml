@@ -19751,6 +19751,7 @@ file = "crates/broca-core/src/run.rs"
 old = '''    for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: r.hooks.take(),'''
 new = '''    let early = deliver_ordered_with_results(writer, ordered, run_id, resolutions.iter().map(|r| r.result.as_ref())); // NON-VACUITY BREAK: write the delivered text into the stored results
@@ -19762,6 +19763,7 @@ new = '''    let early = deliver_ordered_with_results(writer, ordered, run_id, r
     for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: r.hooks.take(),'''
 
@@ -24944,3 +24946,68 @@ old = '''    if let Some(tags) = recovered_result_tags {
         crate::tags::attach_parts(&mut results, Some(tags));
     }'''
 new = '''    let _ = recovered_result_tags; // NON-VACUITY BREAK: discard pending-turn stored tags'''
+
+[[control]]
+id = "wal-tool-times-must-understand"
+guards = "Timed tool records require tool-times/v1 and older readers refuse them by name"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::tool_times_are_must_understand_and_legacy_records_remain_untimed"]
+file = "crates/broca-wal/src/record.rs"
+old = "            with_feature(base, crate::framing::TOOL_TIMES_FEATURE)"
+new = "            base // NON-VACUITY BREAK: hide recorded tool times from older readers."
+
+[[control]]
+id = "wal-tool-times-publish-floor"
+guards = "The first timed tool record cannot precede publication of the tool-times/v1 feature floor"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::tool_times_publish_the_feature_floor_before_the_first_timed_record"]
+file = "crates/broca-wal/src/record.rs"
+old = "            with_feature(base, crate::framing::TOOL_TIMES_FEATURE)"
+new = "            base // NON-VACUITY BREAK: write tool times without raising the feature floor."
+
+[[control]]
+id = "core-tool-times-observed-before-crash-cut"
+guards = "An intent's observed time survives recovery and a recovery terminal records its own observed finish"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/tool_times_tests.rs"
+expect_red = ["wal_writer::tool_times_tests::crash_cut_preserves_observed_intent_time_and_records_recovery_finish"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "                *at = crate::run::epoch_millis();"
+new = "                *at = None; // NON-VACUITY BREAK: leave newly written tool records untimed."
+
+[[control]]
+id = "wal-deferred-tool-times-must-understand"
+guards = "Deferred and closing-approval observations cannot be discarded by older readers"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::deferred_tool_times_are_must_understand_and_legacy_times_are_absent"]
+file = "crates/broca-wal/src/record.rs"
+old = "            with_feature(base, crate::framing::TOOL_TIMES_FEATURE)"
+new = "            base // NON-VACUITY BREAK: hide deferred tool times from older readers."
+
+[[control]]
+id = "core-declined-approval-records-closing-time"
+guards = "A declined deferred call's durable closing observation survives restart without a replay-time replacement"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/tool_times_tests.rs"
+expect_red = ["wal_writer::tool_times_tests::declined_deferred_call_retains_its_recorded_closing_time_after_restart"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "                *closed_at_ms = crate::run::epoch_millis();"
+new = "                *closed_at_ms = None; // NON-VACUITY BREAK: discard the approval closing observation."

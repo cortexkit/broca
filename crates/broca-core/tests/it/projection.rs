@@ -143,6 +143,7 @@ fn tool_result(id: &str, text: &str) -> WalRecord {
 
 fn tool_result_with_outcome(id: &str, text: &str, outcome: DispatchOutcome) -> WalRecord {
     WalRecord::ToolResult {
+        finished_at_ms: None,
         tags: None,
         hooks: None,
         batch_id: BatchId("b1".into()),
@@ -359,6 +360,7 @@ fn interrupted_projection_matches_replay_and_excludes_abandoned_call() {
         framed(
             4,
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 tool_call_id: ToolCallId("c1".into()),
@@ -373,6 +375,7 @@ fn interrupted_projection_matches_replay_and_excludes_abandoned_call() {
         framed(
             5,
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 tool_call_id: ToolCallId("c2".into()),
@@ -495,6 +498,7 @@ fn completed_terminal_omits_indeterminate_set() {
         framed(
             3,
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 tool_call_id: ToolCallId("c1".into()),
@@ -971,6 +975,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             planned_calls: vec![ToolCallId("c1".into()), ToolCallId("c2".into())],
         },
         WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             hooks: None,
             batch_id: BatchId("b-all".into()),
             tool_call_id: ToolCallId("c1".into()),
@@ -982,6 +987,7 @@ fn all_projection_record_variants() -> Vec<FramedRecord> {
             call_key: None,
         },
         WalRecord::ToolNoDispatch {
+            dispatched_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: BatchId("b-all".into()),

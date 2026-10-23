@@ -2534,6 +2534,7 @@ async fn a_dispatched_intent_names_the_module_its_call_is_routed_to() {
             let WalRecord::ToolDispatchIntent {
                 module_id,
                 schema_pin,
+                dispatched_at_ms,
                 ..
             } = intent
             else {
@@ -2541,10 +2542,17 @@ async fn a_dispatched_intent_names_the_module_its_call_is_routed_to() {
             };
             assert_eq!(module_id.as_deref(), target, "{label}");
             assert_eq!(schema_pin, &None, "{label}");
+            assert!(
+                dispatched_at_ms.is_some(),
+                "{label}: the writer records the tool observation"
+            );
             let gated: &[&str] = if target.is_some() {
-                &[broca_wal::DISPATCH_MODULE_FEATURE]
+                &[
+                    broca_wal::DISPATCH_MODULE_FEATURE,
+                    broca_wal::TOOL_TIMES_FEATURE,
+                ]
             } else {
-                &[]
+                &[broca_wal::TOOL_TIMES_FEATURE]
             };
             assert_eq!(intent.required_features(), gated, "{label}");
         }

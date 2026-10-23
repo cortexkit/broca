@@ -75,6 +75,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
             speed_used: None,
         },
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: BatchId("b1".into()),

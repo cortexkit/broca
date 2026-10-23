@@ -248,6 +248,7 @@ mod tests {
             })),
             batch_started(),
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("r-b1".into()),
                 tool_call_id: ToolCallId("t1".into()),

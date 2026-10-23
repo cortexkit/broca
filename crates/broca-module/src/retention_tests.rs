@@ -2476,6 +2476,7 @@ fn seed_owed_question_with_scope_at(
     wal.append(
         1,
         &WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             batch_id: broca_protocol::BatchId("b".into()),
             result: broca_core::not_dispatched_result(&broca_protocol::ToolCallId("c".into()))
@@ -3625,6 +3626,7 @@ async fn assert_tight_crash_recovery(open_batch: bool) {
         wal.append(
             1,
             &WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 batch_id: broca_protocol::BatchId("b".into()),
                 tool_call_id: broca_protocol::ToolCallId("c".into()),
                 tool_name: Some("edit".into()),

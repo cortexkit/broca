@@ -2404,6 +2404,34 @@ impl WalHandle {
         reserved_terminal: bool,
         assigned: &mut Option<Vec<MessageTags>>,
     ) -> RecordOutcome {
+        // Observe time once at enqueue, before encoding or publication. Recovered records
+        // retain an existing observation rather than acquiring a restart-time replacement.
+        match &mut record {
+            WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: at,
+                ..
+            }
+            | WalRecord::ToolNoDispatch {
+                dispatched_at_ms: at,
+                ..
+            }
+            | WalRecord::ToolResult {
+                finished_at_ms: at, ..
+            }
+            | WalRecord::ToolCallDeferred {
+                deferred_at_ms: at, ..
+            } if at.is_none() => {
+                *at = crate::run::epoch_millis();
+            }
+            WalRecord::ApprovalRecorded {
+                closed_at_ms,
+                closing_result: Some(_),
+                ..
+            } if closed_at_ms.is_none() => {
+                *closed_at_ms = crate::run::epoch_millis();
+            }
+            _ => {}
+        }
         *assigned = match self.stamp_tags(&mut record) {
             Ok(assigned) => assigned,
             Err(error) => {
@@ -3855,3 +3883,6 @@ pub(crate) mod retention_tests;
 
 #[cfg(test)]
 mod session_class_tests;
+
+#[cfg(test)]
+mod tool_times_tests;

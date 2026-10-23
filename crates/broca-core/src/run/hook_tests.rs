@@ -36,6 +36,20 @@ fn writer() -> (WalHandle, Arc<Mutex<Vec<WalRecord>>>) {
         records,
     )
 }
+
+fn records_with_observed_result_times(records: &Mutex<Vec<WalRecord>>) -> Vec<WalRecord> {
+    let mut records = records.lock().unwrap().clone();
+    for record in &mut records {
+        if let WalRecord::ToolResult { finished_at_ms, .. } = record {
+            // Content and source order are deterministic; the observation clock is not.
+            assert!(
+                finished_at_ms.take().is_some(),
+                "a written result has an observed finish time"
+            );
+        }
+    }
+    records
+}
 enum Reply {
     Answer(HookAnswer),
     Unavailable,
@@ -1189,6 +1203,7 @@ async fn excluded_unknown(interrupted: bool) {
 
 fn result_record(id: &str, text: &str) -> WalRecord {
     WalRecord::ToolResult {
+        finished_at_ms: None,
         tags: None,
         batch_id: BatchId("b".into()),
         result: Arc::new(ToolResult {
@@ -1241,7 +1256,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
     assert!(!seal.deposit_hook(second, result_record("a", "loop-must-not-write")));
     seal.record_hook_fallbacks(&writer).await.unwrap();
     assert_eq!(
-        *records.lock().unwrap(),
+        records_with_observed_result_times(&records),
         vec![
             model,
             result_record("z", "answered-z"),
@@ -1264,7 +1279,7 @@ async fn loop_wins_handover_and_seal_writes_no_second_terminal() {
     seal.seal_and_collect(std::time::Duration::ZERO).await;
     seal.record_hook_fallbacks(&writer).await.unwrap();
     assert_eq!(
-        *records.lock().unwrap(),
+        records_with_observed_result_times(&records),
         vec![result_record("a", "answered")]
     );
     let _ = writer.shutdown().await;
@@ -2324,7 +2339,7 @@ async fn lost_post_tool_handover_parks_before_batch_or_turn_markers() {
     assert!(records.lock().unwrap().is_empty());
     seal.record_hook_fallbacks(&writer).await.unwrap();
     assert_eq!(
-        *records.lock().unwrap(),
+        records_with_observed_result_times(&records),
         vec![result_record("c", "fallback")]
     );
     let _ = writer.shutdown().await;

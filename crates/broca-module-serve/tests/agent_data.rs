@@ -215,6 +215,7 @@ impl Rig {
                 planned_calls: vec![call.clone()],
             },
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 batch_id: batch.clone(),
                 tool_call_id: call.clone(),
                 tool_name: Some("read_file".into()),
@@ -226,6 +227,7 @@ impl Rig {
                 call_key: None,
             },
             WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 batch_id: batch.clone(),
                 result: Arc::new(ToolResult {
@@ -255,13 +257,11 @@ impl Rig {
             },
         ];
         if owes_withdrawal {
-            records[3] = WalRecord::ToolCallDeferred {
-                batch_id: batch, call_id: ToolCallId(format!("{run}-call")), executor:broca_wal::DeferredExecutor::Broca,
-                module:Some("aft".into()),tool:"read_file".into(),schema_pin:None,args_jcs:r#"{"path":"fixture.txt"}"#.into(),
-                args_hash:broca_wal::migration::digest(br#"{"path":"fixture.txt"}"#),
-                scope:serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"agent"},"ref":"approval-scope","scope_epoch":1})).unwrap(),
-                ask:broca_wal::DeferredAsk {prompt:"Allow file read?".into(),options:vec![],expires_at_ms:1000,on_expiry:broca_wal::OnExpiry::Deny,material_damage:false,late_execution:broca_wal::LateExecution::Execute},
-            };
+            records[3] = WalRecord::ToolCallDeferred { deferred_at_ms: None, batch_id: batch, call_id: ToolCallId(format!("{run}-call")), executor:broca_wal::DeferredExecutor::Broca,
+            module:Some("aft".into()),tool:"read_file".into(),schema_pin:None,args_jcs:r#"{"path":"fixture.txt"}"#.into(),
+            args_hash:broca_wal::migration::digest(br#"{"path":"fixture.txt"}"#),
+            scope:serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"agent"},"ref":"approval-scope","scope_epoch":1})).unwrap(),
+            ask:broca_wal::DeferredAsk {prompt:"Allow file read?".into(),options:vec![],expires_at_ms:1000,on_expiry:broca_wal::OnExpiry::Deny,material_damage:false,late_execution:broca_wal::LateExecution::Execute}, };
         }
         let mut wal = self.wal.open(session).unwrap();
         let mut prepared_key = None;

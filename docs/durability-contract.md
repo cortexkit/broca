@@ -45,6 +45,14 @@ does not poison the writer, and leaves room for a permanent `run_finished{reason
 error}` terminal: `session_too_large` for ordinary sessions, or the unchanged
 `retained_session_too_large` for retained sessions.
 
+`tool-times/v1` gates optional Unix-millisecond observations on
+`tool_dispatch_intent.dispatched_at_ms`, `tool_no_dispatch.dispatched_at_ms`,
+`tool_result.finished_at_ms`, `tool_call_deferred.deferred_at_ms`, and
+`approval_recorded.closed_at_ms` (only for a closing result); the writer publishes
+the feature floor before the first timed record. These observations never enter
+model requests; an older untimed record remains untimed rather than acquiring a
+replay-time replacement.
+
 | Record | fsync point | Purpose |
 |---|---|---|
 | `run_started{run_id, session, config, input}` | **ONE atomic record, synced BEFORE the first provider call** / | run open + the AUTHORITATIVE config + user input in a SINGLE record. Atomic-by-construction: a torn start leaves EITHER nothing OR a fully-started run, never a partial (config/input missing) that resume would reconstruct as a divergent (empty-prompt) request. `run_id` is the start-run idempotency key. An optional `scope{owner, ref, scope_epoch}` freezes the scope a scoped session was admitted under, on every one of its episodes; it is MUST-UNDERSTAND (feature `scope/v1`), so a record carrying it is written only in a `ver` 3 frame requiring that name, and a build without it refuses the WAL as NewerWriter rather than ignore the scope and admit a send from someone other than the scope's owner. The writer adds `scope/v1` to the state root's `wal-feature-floor` before the first such frame, and refuses the append if it cannot. A send the owner check refuses (or that adoption refuses) writes nothing. An optional `manifest` freezes what a session's first send fetched from its tool providers (the plan exactly as received and its identity, each provider's answered tools and text or the reason an optional text-only provider was absent, the tools offered to the model, the joined system text, digests and versions); it is MUST-UNDERSTAND (feature `plan-manifest/v1`), written only in a `ver` 3 frame requiring that name, so a build without it refuses the WAL as NewerWriter rather than render the session without its frozen tools. This build reads it and writes none. |

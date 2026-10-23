@@ -205,6 +205,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
     STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
     TOOL_REPLY_FEATURE,
+    TOOL_TIMES_FEATURE,
 ];
 
 /// Google RPC quota details on a stored provider error must not be silently discarded on read.
@@ -309,6 +310,10 @@ pub const STRUCTURED_OUTPUT_PARAGRAPH_FEATURE: &str = "structured-output-paragra
 /// such a WAL: decoding the tool would silently drop the deadline, and the resumed or drained
 /// run would cut that tool's long calls at the default wait and end the run interrupted.
 pub const TOOL_REPLY_FEATURE: &str = "tool-reply/v1";
+
+/// Preserve the tool timestamps subscriptions replay after a restart; older readers refuse
+/// these frames rather than silently discarding the observations.
+pub const TOOL_TIMES_FEATURE: &str = "tool-times/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -979,6 +984,7 @@ mod tests {
                 STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
                 STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
                 TOOL_REPLY_FEATURE,
+                TOOL_TIMES_FEATURE,
             ]
         );
         assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
@@ -1419,6 +1425,127 @@ mod tests {
                 matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [TOOL_REPLY_FEATURE]),
                 "an older reader refuses {declared} by name"
             );
+        }
+    }
+
+    #[test]
+    fn tool_times_are_must_understand_and_legacy_records_remain_untimed() {
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != TOOL_TIMES_FEATURE)
+            .collect();
+        for (mut value, field) in [
+            (
+                serde_json::json!({"type":"tool_dispatch_intent","batch_id":"b","tool_call_id":"c","args":{}}),
+                "dispatched_at_ms",
+            ),
+            (
+                serde_json::json!({"type":"tool_no_dispatch","batch_id":"b","tool_call_id":"c","reason":{"kind":"denied","reason":"no"}}),
+                "dispatched_at_ms",
+            ),
+            (
+                serde_json::json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"c","output":{"kind":"text","text":"ok"},"is_error":false},"outcome":"completed"}),
+                "finished_at_ms",
+            ),
+        ] {
+            let legacy: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            let legacy_bytes = encode(1, 1, &legacy).unwrap();
+            assert!(legacy.required_features().is_empty());
+            assert!(serde_json::to_value(&legacy).unwrap().get(field).is_none());
+            assert!(matches!(
+                decode_next_with(&legacy_bytes, &older),
+                DecodeStep::Record { .. }
+            ));
+            value[field] = serde_json::json!(1_800_000_000_123_u64);
+            let timed: WalRecord = serde_json::from_value(value).unwrap();
+            assert_eq!(timed.required_features(), &[TOOL_TIMES_FEATURE]);
+            let bytes = encode(1, 1, &timed).unwrap();
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [TOOL_TIMES_FEATURE])
+            );
+            let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
+                panic!("the current reader must retain tool observation times");
+            };
+            assert_eq!(framed.record, timed);
+        }
+    }
+
+    #[test]
+    fn tool_times_publish_the_feature_floor_before_the_first_timed_record() {
+        use crate::{FileWal, Wal, WalError};
+        let root = broca_test_support::scratch_root().join(format!(
+            "tool-times-floor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("session.wal");
+        let floor = root.join("wal-feature-floor");
+        let legacy: WalRecord = serde_json::from_value(serde_json::json!({
+            "type":"tool_no_dispatch","batch_id":"b","tool_call_id":"c",
+            "reason":{"kind":"denied","reason":"no"}
+        }))
+        .unwrap();
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        value["dispatched_at_ms"] = serde_json::json!(1_800_000_000_123_u64);
+        let timed: WalRecord = serde_json::from_value(value).unwrap();
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &legacy, true).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(!floor.exists());
+        assert!(matches!(
+            wal.append(1, &timed, true),
+            Err(WalError::FeatureFloor { path: None, .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(wal);
+        let mut wal = FileWal::open(&path).unwrap().with_feature_floor(&floor);
+        wal.append(1, &timed, true).unwrap();
+        assert_eq!(
+            crate::floor::read_floor(&floor).unwrap(),
+            std::collections::BTreeSet::from([TOOL_TIMES_FEATURE.to_owned()])
+        );
+        assert_eq!(wal.replay().unwrap().last().unwrap().record, timed);
+    }
+
+    #[test]
+    fn deferred_tool_times_are_must_understand_and_legacy_times_are_absent() {
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != TOOL_TIMES_FEATURE)
+            .collect();
+        for (mut value, field) in [
+            (
+                serde_json::json!({"type":"tool_call_deferred","batch_id":"b","call_id":"c","executor":"broca","module":"tools","tool":"edit","args_jcs":"{}","args_hash":"hash","scope":{"owner":{"kind":"reserved","module_id":"agent"},"ref":"s","scope_epoch":1},"ask":{"prompt":"Allow?","options":[],"expires_at_ms":1000,"on_expiry":"deny","material_damage":false,"late_execution":"execute"}}),
+                "deferred_at_ms",
+            ),
+            (
+                serde_json::json!({"type":"approval_recorded","call_key":"key","call_id":"c","decision":"declined","closing_result":{"tool_call_id":"c","output":{"kind":"text","text":"pre_tool_declined"},"is_error":true}}),
+                "closed_at_ms",
+            ),
+        ] {
+            let legacy: WalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert!(!legacy.required_features().contains(&TOOL_TIMES_FEATURE));
+            assert!(serde_json::to_value(&legacy).unwrap().get(field).is_none());
+            assert!(matches!(
+                decode_next_with(&encode(1, 1, &legacy).unwrap(), &older),
+                DecodeStep::Record { .. }
+            ));
+            value[field] = serde_json::json!(1_800_000_000_123_u64);
+            let timed: WalRecord = serde_json::from_value(value).unwrap();
+            assert!(timed.required_features().contains(&TOOL_TIMES_FEATURE));
+            let bytes = encode(1, 1, &timed).unwrap();
+            assert!(
+                matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [TOOL_TIMES_FEATURE])
+            );
+            let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
+                panic!("timed approval records decode");
+            };
+            assert_eq!(framed.record, timed);
         }
     }
 

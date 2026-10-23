@@ -2238,7 +2238,13 @@ async fn approved_schema_pin_is_refused_instead_of_silently_dropped_by_raw_carri
         planned_calls: vec![ToolCallId("c".into())],
     });
     let mut prepared = crate::replay::deferred_tests::prepared("c", &batch.0);
-    if let WalRecord::ToolCallDeferred { schema_pin, .. } = &mut prepared {
+    if let WalRecord::ToolCallDeferred {
+        schema_pin,
+        deferred_at_ms,
+        ..
+    } = &mut prepared
+    {
+        *deferred_at_ms = epoch_millis();
         *schema_pin = Some(broca_wal::DispatchSchemaPin {
             schema_digest: "sha256:pinned".into(),
             semantics: 1,
@@ -2247,6 +2253,7 @@ async fn approved_schema_pin_is_refused_instead_of_silently_dropped_by_raw_carri
     let seq = rig.writer.record(prepared.clone()).into_result().unwrap();
     let key = crate::context::call_key(rig.writer.lineage_id().unwrap(), seq);
     let approval = WalRecord::ApprovalRecorded {
+        closed_at_ms: None,
         tags: None,
         call_key: key,
         call_id: ToolCallId("c".into()),
@@ -2482,6 +2489,7 @@ async fn running_approved_resume_without_elicitation_plane_never_dispatches() {
         .unwrap();
     let key = crate::context::call_key(writer.lineage_id().unwrap(), prepared.seq);
     writer.record(WalRecord::ApprovalRecorded {
+        closed_at_ms: None,
         tags: None,
         call_key: key,
         call_id: ToolCallId("c".into()),

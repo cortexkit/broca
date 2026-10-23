@@ -1367,6 +1367,7 @@ mod tests {
                 run_started(&session),
                 tool_step(),
                 WalRecord::ToolResult {
+                    finished_at_ms: None,
                     tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("b1".into()),
@@ -2520,6 +2521,7 @@ mod tests {
             framed(
                 3,
                 WalRecord::ToolResult {
+                    finished_at_ms: None,
                     tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("b1".into()),

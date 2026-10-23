@@ -149,6 +149,7 @@ impl ClosedSession {
         for (index, (id, args)) in calls.iter().enumerate() {
             let tool_call_id = ToolCallId(id.clone());
             self.append(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 batch_id: batch_id.clone(),
                 tool_call_id: tool_call_id.clone(),
                 tool_name: Some("write_file".into()),
@@ -161,6 +162,7 @@ impl ClosedSession {
             });
             if let Some(results) = results {
                 self.append(WalRecord::ToolResult {
+                    finished_at_ms: None,
                     batch_id: batch_id.clone(),
                     result: Arc::new(ToolResult {
                         tool_call_id,
@@ -259,6 +261,7 @@ impl ClosedSession {
             planned_calls: vec![call_id.clone(), call_id.clone()],
         });
         self.append(WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             batch_id: batch_id.clone(),
             tool_call_id: call_id.clone(),
             tool_name: Some("write_file".into()),
@@ -270,6 +273,7 @@ impl ClosedSession {
             call_key: None,
         });
         self.append(WalRecord::ToolResult {
+            finished_at_ms: None,
             batch_id: batch_id.clone(),
             result: Arc::new(ToolResult {
                 tool_call_id: call_id.clone(),
@@ -286,6 +290,7 @@ impl ClosedSession {
             tags: None,
         });
         self.append(WalRecord::ToolResult {
+            finished_at_ms: None,
             batch_id: batch_id.clone(),
             result: Arc::new(ToolResult {
                 tool_call_id: call_id,
@@ -779,6 +784,7 @@ async fn completed_directives_match_all_published_vectors_and_old_run_bytes() {
                 planned_calls: vec![ToolCallId("ignored".into())],
             });
             session.append(WalRecord::ToolResult {
+                finished_at_ms: None,
                 batch_id: batch_id.clone(),
                 result: Arc::new(ToolResult {
                     tool_call_id: ToolCallId("ignored".into()),

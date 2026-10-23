@@ -2291,6 +2291,7 @@ fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
         framed(
             seq_base + 2,
             WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: batch_id.clone(),

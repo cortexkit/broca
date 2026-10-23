@@ -11249,6 +11249,7 @@ mod import_idempotency_tests {
             planned_calls: vec![ToolCallId("call-1".into())],
         });
         writer.record(broca_wal::WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             hooks: None,
             batch_id: broca_protocol::BatchId("b1".into()),
             tool_call_id: ToolCallId("call-1".into()),
