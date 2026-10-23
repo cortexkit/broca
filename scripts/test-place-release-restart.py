@@ -19,6 +19,7 @@ exit 0 on everything else, so the placement gate's smoke run passes and
 from __future__ import annotations
 
 import os
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -59,6 +60,11 @@ class RestartTests(unittest.TestCase):
                 check=True, capture_output=True,
             )
         self.old_inode = self.dest.stat().st_ino
+        for client in ("broca-session", "broca-run"):
+            src = self.tmp / f"{client}.c"
+            src.write_text(f'#include <stdio.h>\nint main(void) {{ puts("{client} 0.0.1"); return 0; }}\n')
+            subprocess.run(["cc", "-o", str(self.tmp / f"{client}.staged"), str(src)], check=True)
+            shutil.copy2(self.tmp / f"{client}.staged", self.tmp / client)
         self.rollback = self.tmp / "rollback"
         self.ck_log = self.tmp / "ck.log"
         ck = self.tmp / "ck"
@@ -142,6 +148,18 @@ printf 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\\nck-broca %s user tx
 
     def restarted(self) -> bool:
         return self.ck_log.exists() and "module restart broca" in self.ck_log.read_text()
+
+    def test_client_resigning_preserves_staged_postsign_hashes(self) -> None:
+        expected = {}
+        for client in ("broca-session", "broca-run"):
+            staged = self.tmp / f"{client}.staged"
+            subprocess.run(["codesign", "--force", "--sign", "-", "-o", "runtime",
+                            "--identifier", client, str(staged)], check=True, capture_output=True)
+            expected[client] = hashlib.sha256(staged.read_bytes()).hexdigest()
+        result = self.place([0])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for client, sha in expected.items():
+            self.assertEqual(hashlib.sha256((self.tmp / client).read_bytes()).hexdigest(), sha)
 
     def test_restart_only_clear_gate_restarts_and_prints_new_pid(self) -> None:
         before = self.dest.read_bytes()

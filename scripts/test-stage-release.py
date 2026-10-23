@@ -44,7 +44,7 @@ def staging_block():
     """
     src = SCRIPT.read_text()
     start = src.index('SEAM="$HOME/.local/share/cortexkit/staging"')
-    end = src.index("# THE CURRENT-ARTIFACT MANIFEST")
+    end = src.index("# Clients are signed in private scratch too:")
     block = src[start:end]
     # Guard against extracting something that no longer contains what these arms are about.
     # These are present in BOTH the fixed and the pre-fix versions on purpose. A guard naming

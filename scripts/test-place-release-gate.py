@@ -85,6 +85,12 @@ int main(int argc, char **argv) {
         shutil.copy2(self.dest, self.staged)
         with self.staged.open("ab") as output:
             output.write(b"\nnew-release-marker\n")
+        for client in ("broca-session", "broca-run"):
+            source.write_text(f'#include <stdio.h>\nint main(void) {{ puts("{client} 0.0.1"); return 0; }}\n')
+            staged_client = self.tmp / f"{client}.staged"
+            subprocess.run(["cc", str(source), "-o", str(staged_client)], check=True, capture_output=True)
+            shutil.copy2(staged_client, self.dest.parent / client)
+            write_client_sidecar(staged_client)
         self.env = dict(os.environ, BROCA_STATE_ROOT=str(self.state),
                         ROLLBACK_DIR=str(self.tmp / "rollback"))
         self.env.pop("PLACE_RELEASE_GATE_CMD", None)
@@ -112,7 +118,7 @@ int main(int argc, char **argv) {
                               text=True, timeout=60)
 
     def verify(self, sha: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(VERIFY), "--bin", str(self.dest), "--sha", sha,
+        return subprocess.run(["bash", str(VERIFY), "--bin", str(self.dest), "--sha", sha, "--staged", str(self.staged),
                                "--marker", "new-release-marker", "--control", "ck-broca"],
                               env=self.env, capture_output=True, text=True, timeout=30)
 
@@ -336,7 +342,7 @@ int main(int argc, char **argv) {
             self.assertEqual(placed.returncode, 0, placed.stdout + placed.stderr + log.read_text())
             new_pid = self.shell('broca_pid_for_binary "$1"', str(self.dest)).stdout.strip()
             self.assertNotEqual(old_pid, new_pid)
-            verified = subprocess.run(["bash", str(VERIFY), "--bin", str(self.dest), "--sha", sha,
+            verified = subprocess.run(["bash", str(VERIFY), "--bin", str(self.dest), "--sha", sha, "--staged", str(self.staged),
                                       "--marker", "ck-broca", "--control", "broca"], env=self.env,
                                      capture_output=True, text=True, timeout=60)
             self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
@@ -499,6 +505,18 @@ def stub_binary(
     (dwarf / "ck-broca").write_bytes(f"debug symbols for {path.name} {version}".encode())
 
 
+def write_client_sidecar(path: Path) -> None:
+    Path(str(path) + ".sha256.postsign").write_text(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+    )
+
+
+def stub_client(path: Path, name: str, version: str = "0.3.149") -> None:
+    stub_binary(path, version=version, signed="adhoc,runtime")
+    path.write_bytes(path.read_bytes().replace(b"ck-broca ", f"{name} ".encode()))
+    write_client_sidecar(path)
+
+
 def read_flags(path: Path) -> str | None:
     data = path.read_bytes()
     i = data.rfind(SIG_MARK)
@@ -524,6 +542,9 @@ class GateBase(unittest.TestCase):
         self.codesign_log = self.tmp / "codesign.log"
         self.fake_bin = self.tmp / "fake-bin"
         self.fake_bin.mkdir()
+        for client in ("broca-session", "broca-run"):
+            stub_client(self.tmp / f"{client}.staged", client)
+            shutil.copy2(self.tmp / f"{client}.staged", self.bindir / client)
         for name, body in (
             ("codesign", CODESIGN_STUB),
             ("stat", STAT_STUB),
@@ -855,9 +876,10 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         self.assertEqual(read_flags(self.dest), "adhoc,runtime")
         self.assertIn("signing   flags=adhoc,runtime", result.stdout)
         sign_calls = [l for l in self.codesign_log.read_text().splitlines() if " -s " in f" {l} "]
-        self.assertEqual(len(sign_calls), 1, sign_calls)
-        self.assertIn("-o runtime", sign_calls[0])
-        self.assertIn("--identifier ck-broca", sign_calls[0])
+        self.assertEqual(len(sign_calls), 3, sign_calls)
+        for call, name in zip(sign_calls, ("ck-broca", "broca-session", "broca-run")):
+            self.assertIn("-o runtime", call)
+            self.assertIn(f"--identifier {name}", call)
 
     def test_placement_carries_the_dsym_and_keeps_the_old_one_with_rollback(self) -> None:
         self.deploy(signed="adhoc,runtime")
@@ -951,7 +973,7 @@ class VerifyDeploySigningTests(GateBase):
 
     def verify(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(VERIFY), "--bin", str(self.dest),
+            ["bash", str(VERIFY), "--bin", str(self.dest), "--staged", str(self.staged),
              "--marker", "wal-known-features", "--control", "missing required"],
             env=self.env(BROCA_TEST_BIN=str(self.dest)),
             capture_output=True,

@@ -48,6 +48,7 @@ python3 scripts/verify-mutation-platforms.py
 suites=(
     scripts/test-check-path-deps.py
     scripts/test-stage-release.py
+    scripts/tests/test-release-clients.py
     scripts/test-release.py
     scripts/test-prune-staging.py
     # Stubs codesign, file, stat, ps and lsof, so the placement gate's macOS-only signing
