@@ -1237,10 +1237,12 @@ mod subscription_tests {
             assert!(stderr.contains(marker), "missing {marker}: {stderr}");
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
+        // libtest prints `test <name> ... ` without a newline before the child's own output, so
+        // the marker can sit mid-line rather than at its start.
         let dir = stdout
             .lines()
-            .find_map(|line| line.strip_prefix("RIG_DIR="))
-            .unwrap();
+            .find_map(|line| line.split_once("RIG_DIR=").map(|(_, dir)| dir.trim()))
+            .unwrap_or_else(|| panic!("child printed no RIG_DIR= line: {stdout}"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
