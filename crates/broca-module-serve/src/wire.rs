@@ -12,10 +12,9 @@ use broca_protocol::{BindIdentity, RunId, SubmissionRequest};
 use serde::{Deserialize, Serialize};
 
 pub use broca_wire::{
-    AuthParams, CacheParams, CancelParams, CapInstallParams, CapMutationResponse,
-    CapMutationResult, CursorWire, FromWire, ModelParams, ReadParams, ReadResult, RetractParams,
-    RouteRequest, RunStatusResponse, SendParams, SendResult, SessionReadLineageState,
-    SessionReadMessage, SessionReadResponse, SpendDeltaParams, StatusParams, SubscribeEvent,
+    AuthParams, CacheParams, CancelParams, CursorWire, FromWire, ModelParams, ReadParams,
+    ReadResult, RetractParams, RouteRequest, RunStatusResponse, SendParams, SendResult,
+    SessionReadLineageState, SessionReadMessage, SessionReadResponse, StatusParams, SubscribeEvent,
     SubscribeParams, VaultAuditMissing, VaultAuditParams, VaultAuditResponse, VaultAuditRow,
 };
 

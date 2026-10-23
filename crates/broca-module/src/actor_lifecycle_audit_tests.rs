@@ -334,8 +334,6 @@ impl Fixture {
             materialized_store: None,
             export_index: None,
             charge_basis_resolver: None,
-            cap_store: None,
-            pending_capped_export: None,
             startup_recovery_pending: false,
             prior_snapshot: None,
             pending_fifo: Vec::new(),
@@ -699,31 +697,4 @@ async fn restart_admission_stops_when_a_nested_command_finds_the_writer_poisoned
     fixture.actor.stop_active_run().await;
     drop(fixture.actor.lease.take());
     let _ = std::fs::remove_dir_all(&fixture.root);
-}
-
-#[test]
-fn queued_sends_survive_budget_denials_that_clear_by_waiting() {
-    let denied = |reason: &str| RunError::BudgetDenied {
-        cap_id: "cap".into(),
-        reason: reason.into(),
-    };
-    for reason in ["stale", "unresolved_spend", "trailing_watermark"] {
-        assert!(
-            !queued_admission_is_permanent(&denied(reason)),
-            "a queued send denied for {reason} must stay queued"
-        );
-    }
-    // A source mismatch clears only when the cap provider re-applies the cap against this export
-    // store, which nothing in broca triggers, so a queued send is failed rather than left waiting.
-    for reason in [
-        "hard_cap_exceeded",
-        "export_index_unavailable",
-        "export_source_mismatch",
-        "unknown_reason",
-    ] {
-        assert!(
-            queued_admission_is_permanent(&denied(reason)),
-            "a queued send denied for {reason} is failed"
-        );
-    }
 }

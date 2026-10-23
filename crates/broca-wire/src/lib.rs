@@ -46,81 +46,6 @@ pub struct RouteRequest {
     pub params: serde_json::Value,
 }
 
-/// `cap.install` params. Cap operations are daemon-scoped; the bound route identity
-/// is intentionally not part of the request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapInstallParams {
-    pub cap_id: String,
-    pub cap_version: u64,
-    pub op: broca_core::CapOperation,
-    pub scope_key: String,
-    pub project_root: Option<String>,
-    pub constraint_dim: String,
-    pub period: String,
-    pub period_tz: String,
-    pub hard_cap_nanos: i64,
-    pub max_staleness_ms: u64,
-    pub replaces_cap_id: Option<String>,
-    #[serde(default)]
-    pub baseline: Option<broca_core::CapBaseline>,
-}
-
-impl CapInstallParams {
-    pub fn into_core(self) -> broca_core::CapInstallRequest {
-        broca_core::CapInstallRequest {
-            cap_id: self.cap_id,
-            cap_version: self.cap_version,
-            op: self.op,
-            scope_key: self.scope_key,
-            project_root: self.project_root,
-            constraint_dim: self.constraint_dim,
-            period: self.period,
-            period_tz: self.period_tz,
-            hard_cap_nanos: self.hard_cap_nanos,
-            max_staleness_ms: self.max_staleness_ms,
-            replaces_cap_id: self.replaces_cap_id,
-            baseline: self.baseline,
-        }
-    }
-}
-
-/// `spend.delta` params carrying a pre-priced increment and both full watermarks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpendDeltaParams {
-    pub cap_id: String,
-    pub cap_version: u64,
-    pub from_watermark: broca_core::CapWatermark,
-    pub to_watermark: broca_core::CapWatermark,
-    pub priced_delta_nanos: i64,
-    pub unresolved_delta: i64,
-    pub period_bucket: String,
-}
-
-impl SpendDeltaParams {
-    pub fn into_core(self) -> broca_core::SpendDeltaRequest {
-        broca_core::SpendDeltaRequest {
-            cap_id: self.cap_id,
-            cap_version: self.cap_version,
-            from_watermark: self.from_watermark,
-            to_watermark: self.to_watermark,
-            priced_delta_nanos: self.priced_delta_nanos,
-            unresolved_delta: self.unresolved_delta,
-            period_bucket: self.period_bucket,
-        }
-    }
-}
-
-/// Total success body for both cap mutations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapMutationResponse {
-    pub result: CapMutationResult,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapMutationResult {
-    pub applied_watermark: broca_core::AppliedCapWatermark,
-}
-
 fn deserialize_on_restart<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<broca_protocol::request::OnRestart>, D::Error> {
@@ -3786,47 +3711,6 @@ mod tests {
         }));
         assert_json_round_trip::<FromWire>(serde_json::json!({"wal_seq": 8, "sub_index": 2}));
         assert_json_round_trip::<CursorWire>(serde_json::json!({"wal_seq": 8, "sub_index": 2}));
-        assert_json_round_trip::<CapInstallParams>(serde_json::json!({
-            "cap_id": "cap-org-x",
-            "cap_version": 4,
-            "op": "install",
-            "scope_key": "subject",
-            "project_root": "/abs/path",
-            "constraint_dim": "spend_dollars",
-            "period": "2026-07",
-            "period_tz": "Europe/Madrid",
-            "hard_cap_nanos": 50000000000i64,
-            "max_staleness_ms": 60000,
-            "replaces_cap_id": null,
-            "baseline": {
-                "spend_nanos": 1200000000i64,
-                "unresolved_count": 0,
-                "watermark": {
-                    "source_instance_id": "source-a",
-                    "source_epoch": 1,
-                    "consumed_export_seq": 40
-                },
-                "period_bucket": "2026-07",
-                "as_of_ms": 1789000000000i64
-            }
-        }));
-        assert_json_round_trip::<SpendDeltaParams>(serde_json::json!({
-            "cap_id": "cap-org-x",
-            "cap_version": 4,
-            "from_watermark": {
-                "source_instance_id": "source-a",
-                "source_epoch": 1,
-                "consumed_export_seq": 40
-            },
-            "to_watermark": {
-                "source_instance_id": "source-a",
-                "source_epoch": 1,
-                "consumed_export_seq": 55
-            },
-            "priced_delta_nanos": 340000000i64,
-            "unresolved_delta": 0,
-            "period_bucket": "2026-07"
-        }));
     }
 
     #[test]
@@ -4023,35 +3907,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cap_baseline_without_period_bucket_deserializes() {
-        let params: CapInstallParams = serde_json::from_value(serde_json::json!({
-            "cap_id": "cap-org-x",
-            "cap_version": 4,
-            "op": "install",
-            "scope_key": "subject",
-            "project_root": null,
-            "constraint_dim": "spend_dollars",
-            "period": "calendar_month",
-            "period_tz": "Europe/Madrid",
-            "hard_cap_nanos": 50000000000i64,
-            "max_staleness_ms": 60000,
-            "replaces_cap_id": null,
-            "baseline": {
-                "spend_nanos": 1200000000i64,
-                "unresolved_count": 0,
-                "watermark": {
-                    "source_instance_id": "source-a",
-                    "source_epoch": 1,
-                    "consumed_export_seq": 40
-                },
-                "as_of_ms": 1789000000000i64
-            }
-        }))
-        .unwrap();
-        assert_eq!(params.baseline.unwrap().period_bucket, None);
-    }
-
-    #[test]
     fn moved_response_types_round_trip_without_shape_drift() {
         assert_json_round_trip::<SendResult>(serde_json::json!({
             "state": "active", "run_id": "run-1"
@@ -4086,15 +3941,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy_read.lineage_id, None);
-        assert_json_round_trip::<CapMutationResponse>(serde_json::json!({
-            "result": {
-                "applied_watermark": {
-                    "source_instance_id": "source-a",
-                    "source_epoch": 1,
-                    "seq": 55
-                }
-            }
-        }));
         assert_run_status_round_trip(serde_json::json!({
             "state": "completed",
             "final_step_finish_reason": "stop",

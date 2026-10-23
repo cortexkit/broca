@@ -10527,25 +10527,6 @@ file = "crates/broca-store/src/lib.rs"
 old = "    match broca_owner_only::OpenOptions::new()"
 new = "    match std::fs::OpenOptions::new() /* NON-VACUITY BREAK */"
 
-# This proof checks the following behavior: caps database uses the same pre-initialisation ACL boundary
-# as the run index.
-# Windows runs only the test or tests named in this row, skipping all other tests in the broca-store
-# --lib target because running the full target exceeds the 10-minute replay limit.
-
-[[control]]
-id = "windows-caps-check-before-init"
-guards = "caps database uses the same pre-initialisation ACL boundary as the run index"
-runner = "cargo"
-package = "broca-store"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-store/src/lib.rs"
-expect_red = ["windows_acl_tests::windows_sqlite_refuses_acl_before_initialisation"]
-platforms = ["windows"]
-file = "crates/broca-store/src/caps.rs"
-old = "        super::prepare_private_sqlite(path).map_err(storage)?;"
-new = "        let _ = path; // NON-VACUITY BREAK"
-
 [[control]]
 id = "windows-manifest-replacement-owner-only"
 guards = "maintenance manifest replacement checks private temporary files before cleanup"
@@ -23047,46 +23028,6 @@ old = """                    if self.writer_poisoned {
                         ));
                     }"""
 new = """                    // NON-VACUITY BREAK: keep admitting under a poisoned writer."""
-
-[[control]]
-id = "actor-queued-send-survives-clearing-budget-denials"
-guards = "A durably queued send denied for stale caps, unresolved spend or a lagging cap mirror stays queued; hard-cap, unavailable-index and source-mismatch denials fail it"
-runner = "cargo"
-package = "broca-module"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
-expect_red = ["actor::lifecycle_audit_tests::queued_sends_survive_budget_denials_that_clear_by_waiting"]
-expect_message = "must stay queued"
-file = "crates/broca-module/src/actor.rs"
-old = """            Self::UnresolvedSpend | Self::TrailingWatermark | Self::Stale => true,
-            Self::HardCapExceeded | Self::ExportIndexUnavailable | Self::ExportSourceMismatch => {
-                false
-            }"""
-new = """            Self::TrailingWatermark => true, // NON-VACUITY BREAK: only the trailing watermark keeps a queued send.
-            Self::UnresolvedSpend
-            | Self::Stale
-            | Self::HardCapExceeded
-            | Self::ExportIndexUnavailable
-            | Self::ExportSourceMismatch => false,"""
-
-[[control]]
-id = "actor-queued-send-fails-on-export-source-mismatch"
-guards = "A durably queued send denied because the cap mirror names another export source fails instead of waiting, since nothing in broca realigns it"
-runner = "cargo"
-package = "broca-module"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-module/src/actor_lifecycle_audit_tests.rs"
-expect_red = ["actor::lifecycle_audit_tests::queued_sends_survive_budget_denials_that_clear_by_waiting"]
-expect_message = "is failed"
-file = "crates/broca-module/src/actor.rs"
-old = """            Self::UnresolvedSpend | Self::TrailingWatermark | Self::Stale => true,
-            Self::HardCapExceeded | Self::ExportIndexUnavailable | Self::ExportSourceMismatch => {
-                false
-            }"""
-new = """            Self::UnresolvedSpend | Self::TrailingWatermark | Self::Stale | Self::ExportSourceMismatch => true, // NON-VACUITY BREAK: let a source mismatch keep a queued send waiting.
-            Self::HardCapExceeded | Self::ExportIndexUnavailable => false,"""
 
 [[control]]
 id = "core-model-page-sizes-each-entry-once"

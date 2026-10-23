@@ -55,16 +55,10 @@ fn the_tracked_descriptor_declares_brocas_ten_entries_with_their_classes() {
     got.sort();
 
     let mut want: Vec<(String, String, String)> = [
-        // `rebuild` IS IMPRECISE HERE AND IS KEPT DELIBERATELY. The class means "safely
-        // skippable at capture", which is true, but it READS as "the owner can reproject
-        // this" -- and broca cannot: `crates/broca-wal/src/record.rs` has zero cap-shaped
-        // records (control: RunStarted and two others do exist), because cap rows arrive as
-        // `cap.install` over the wire. ASTRO then corrected the other half: their v2 cutover
-        // deleted the cap delivery machine, so no peer re-provides it either. On machine loss
-        // caps.db is simply gone, and nothing recovers it. Zero rows today, so nothing is at
-        // risk; the fleet ruling (ENGRAM, #store-contract) was to record the recovery rather
-        // than grow a taxonomy for one instance. If a producer ever returns, its contract is
-        // written first and this row changes with it.
+        // `caps.db` is left over from spend caps, which broca no longer has: nothing opens or
+        // writes it, and it is left on disk rather than deleted. The entry stays so engram still
+        // knows what the file is. `rebuild` only means "safely skippable at capture"; nothing
+        // reprojects it, and nothing needs to, because no build reads it.
         ("broca/caps", "rebuild", "whole-db"),
         ("broca/durable-wals", "portable", "filetree"),
         ("broca/durable-archive", "portable", "filetree"),

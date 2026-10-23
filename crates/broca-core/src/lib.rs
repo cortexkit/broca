@@ -17,7 +17,6 @@ pub mod billing;
 mod budget_kernel;
 pub mod cache_warm;
 pub mod capability;
-pub mod caps;
 pub mod clock;
 pub mod compaction;
 pub mod consent;
@@ -67,10 +66,6 @@ pub use billing::{
 };
 pub use capability::{
     AllowAll, ApprovalPolicy, CapabilityViolation, DenyAll, ScriptedApproval, ToolManifest,
-};
-pub use caps::{
-    AppliedCapWatermark, CapBaseline, CapInstallRequest, CapMutation, CapOperation, CapRow,
-    CapStore, CapStoreError, CapWatermark, SpendDeltaRequest,
 };
 pub use clock::Clock;
 pub use compaction::{

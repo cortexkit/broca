@@ -723,11 +723,6 @@ pub enum RunError {
     SendIdReuse {
         differing: &'static str,
     },
-    /// Admission was denied by a durable budget cap before any WAL write.
-    BudgetDenied {
-        cap_id: String,
-        reason: String,
-    },
     /// A session's system prompt can only be introduced by the first episode. Later turns may
     /// re-send the same bytes for convenience, but they must not silently change or add system
     /// instructions because that would fork the conversation contract and change every later
@@ -777,7 +772,6 @@ impl RunError {
             Self::Config(_)
             | Self::VariantUnsupported(_)
             | Self::SendIdReuse { .. }
-            | Self::BudgetDenied { .. }
             | Self::SystemPromptChanged
             | Self::ContextManagementChanged { .. }
             | Self::ContextManagementUnavailable { .. }
@@ -815,9 +809,6 @@ impl std::fmt::Display for RunError {
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
             RunError::Transient(s) => write!(f, "run admission temporarily unavailable: {s}"),
-            RunError::BudgetDenied { cap_id, reason } => {
-                write!(f, "budget_denied: cap '{cap_id}' ({reason})")
-            }
             RunError::SendIdReuse { differing } => write!(
                 f,
                 "run_id/send_id was already used by a send with different {differing}; retries must be byte-identical and a new send needs a new send_id"

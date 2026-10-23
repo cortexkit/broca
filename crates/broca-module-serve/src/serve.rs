@@ -58,14 +58,13 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::{
-    OP_BASELINE, OP_CANCEL, OP_CAP_INSTALL, OP_HEAD, OP_IMPORT, OP_READ, OP_RESOLVE, OP_RETRACT,
-    OP_ROLE_DESCRIBE, OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS,
-    OP_SPEND_DELTA, OP_STATUS, OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
+    OP_BASELINE, OP_CANCEL, OP_HEAD, OP_IMPORT, OP_READ, OP_RESOLVE, OP_RETRACT, OP_ROLE_DESCRIBE,
+    OP_RUN_EVENT_GET, OP_RUN_RESULT, OP_RUN_TOOL_CALLS, OP_SEND, OP_SEND_STATUS, OP_STATUS,
+    OP_SUBSCRIBE, OP_VAULT_AUDIT, OP_WARM,
 };
 use crate::wire::{
-    CancelParams, CapInstallParams, CapMutationResult, FromWireExt, ImportParams, ImportResult,
-    RetractParams, RouteRequest, SendParams, SendParamsExt, SendResult, SpendDeltaParams,
-    StatusParams, SubscribeParams,
+    CancelParams, FromWireExt, ImportParams, ImportResult, RetractParams, RouteRequest, SendParams,
+    SendParamsExt, SendResult, StatusParams, SubscribeParams,
 };
 
 const HELLO_CORR: u64 = 1;
@@ -2333,82 +2332,6 @@ where
         }
     }
     match req.method.as_str() {
-        OP_CAP_INSTALL => {
-            let params: CapInstallParams = match serde_json::from_value(req.params) {
-                Ok(params) => params,
-                Err(error) => {
-                    return send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "invalid_params",
-                        &error.to_string(),
-                    )
-                    .await;
-                }
-            };
-            match handler.cap_install(params.into_core()).await {
-                Ok(broca_core::CapMutation::Applied(watermark)) => {
-                    let response = CapMutationResult {
-                        applied_watermark: watermark,
-                    };
-                    send_json_response(writer, ver, channel, epoch, corr, &response).await
-                }
-                Ok(broca_core::CapMutation::BaselineRequired) => {
-                    send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "baseline_required",
-                        "baseline_required",
-                    )
-                    .await
-                }
-                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
-            }
-        }
-        OP_SPEND_DELTA => {
-            let params: SpendDeltaParams = match serde_json::from_value(req.params) {
-                Ok(params) => params,
-                Err(error) => {
-                    return send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "invalid_params",
-                        &error.to_string(),
-                    )
-                    .await;
-                }
-            };
-            match handler.spend_delta(params.into_core()).await {
-                Ok(broca_core::CapMutation::Applied(watermark)) => {
-                    let response = CapMutationResult {
-                        applied_watermark: watermark,
-                    };
-                    send_json_response(writer, ver, channel, epoch, corr, &response).await
-                }
-                Ok(broca_core::CapMutation::BaselineRequired) => {
-                    send_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "baseline_required",
-                        "baseline_required",
-                    )
-                    .await
-                }
-                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
-            }
-        }
         OP_SEND_STATUS => {
             let params: broca_wire::SendStatusRequest =
                 match serde_json::from_value(req.params.clone()) {
@@ -3711,9 +3634,6 @@ fn refused_send_code(error: &ServeError) -> String {
         }
         ServeError::SendIdReuse { .. } => "send_id_reuse".into(),
         ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient".into(),
-        ServeError::BaselineRequired => "baseline_required".into(),
-        ServeError::CapUnavailable(_) => "cap_unavailable".into(),
-        ServeError::BudgetDenied { .. } => "budget_denied".into(),
         ServeError::Import(_) => "import_rejected".into(),
         ServeError::ImportIdReuse => "import_id_reuse".into(),
         ServeError::ImportBusy => "import_busy".into(),
@@ -3878,9 +3798,6 @@ async fn send_serve_error(
         }
         ServeError::SendIdReuse { .. } => "send_id_reuse",
         ServeError::Transient(_) | ServeError::TagsAwaitSetup => "transient",
-        ServeError::BaselineRequired => "baseline_required",
-        ServeError::CapUnavailable(_) => "cap_unavailable",
-        ServeError::BudgetDenied { .. } => "budget_denied",
         ServeError::ContextCeiling(detail) => {
             let body = ErrorBody::new(
                 cortexkit_role_llm_runner::errors::CONTEXT_CEILING,
@@ -4531,8 +4448,8 @@ fn method_code(method: &str) -> u8 {
         OP_IMPORT => 11,
         OP_HEAD => 12,
         OP_BASELINE => 13,
-        OP_CAP_INSTALL => 14,
-        OP_SPEND_DELTA => 15,
+        // 14 and 15 named the removed spend-cap operations (`cap.install`, `spend.delta`).
+        // They are not reused, so a code in an older stall report keeps its meaning.
         OP_RUN_RESULT => 16,
         OP_WARM => 17,
         OP_RESOLVE => 18,

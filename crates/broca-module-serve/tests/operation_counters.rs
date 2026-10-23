@@ -34,8 +34,6 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "run.tool_calls",
     "session.baseline",
     "session.warm",
-    "cap.install",
-    "spend.delta",
     "vault.audit",
     "session.subscribe",
     // Served only on routes opened for the classifier role, and counted like the others.

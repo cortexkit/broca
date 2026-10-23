@@ -19,10 +19,9 @@ use broca_catalog::live::{
     WireFamilyId,
 };
 use broca_core::{
-    run_loop_on_writer_admitted, AllowAll, CapBaseline, CapInstallRequest, CapMutation,
-    CapOperation, CapRow, CapStore, CapStoreError, CapWatermark, ChargeBasis, FileLeaseStore,
-    FileWalStore, MaterializedStore, OutputEvent, Provider, RunError, RunIndex, RunSummary,
-    SpendDeltaRequest, StartMode, StubProvider, StubToolPlane, WalStore,
+    run_loop_on_writer_admitted, AllowAll, ChargeBasis, FileLeaseStore, FileWalStore,
+    MaterializedStore, OutputEvent, Provider, RunError, RunSummary, StartMode, StubProvider,
+    StubToolPlane, WalStore,
 };
 use broca_module::executor::{RunExecutor, RunJob, RunKind};
 use broca_module::serve::{
@@ -571,73 +570,6 @@ fn registry(dir: &Path) -> Arc<LineageRegistry> {
     registry_and_wal(dir).0
 }
 
-type CapRig = (
-    Arc<LineageRegistry>,
-    Arc<broca_store::CapsStore>,
-    Arc<AtomicUsize>,
-    Arc<broca_store::SqliteStore>,
-    Arc<FileWalStore>,
-);
-
-struct LegacyNegativeCapStore {
-    row: CapRow,
-}
-
-impl CapStore for LegacyNegativeCapStore {
-    fn install_cap(&self, _request: &CapInstallRequest) -> Result<CapMutation, CapStoreError> {
-        unreachable!("legacy admission fixture is read-only")
-    }
-
-    fn apply_spend_delta(
-        &self,
-        _request: &SpendDeltaRequest,
-    ) -> Result<CapMutation, CapStoreError> {
-        unreachable!("legacy admission fixture is read-only")
-    }
-
-    fn matching_caps(&self, scope_key: &str, project_root: &Path) -> Vec<CapRow> {
-        (self.row.active
-            && self.row.scope_key == scope_key
-            && self
-                .row
-                .project_root
-                .as_deref()
-                .is_none_or(|root| root == project_root.to_string_lossy()))
-        .then(|| self.row.clone())
-        .into_iter()
-        .collect()
-    }
-}
-
-fn registry_with_caps(dir: &Path) -> CapRig {
-    let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
-    let caps = Arc::new(broca_store::CapsStore::open(dir.join("caps.db")).unwrap());
-    let started = Arc::new(AtomicUsize::new(0));
-    let exec = Arc::new(FakeExec {
-        wal_store: wal.clone(),
-        started: started.clone(),
-        hold: None,
-    });
-    let resolver = Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1));
-    let opener = DefaultOpener::new(lease, wal.clone(), exec)
-        .with_run_index(store.clone())
-        .with_materialized_store(store.clone())
-        .with_export_index(store.clone())
-        .with_charge_basis_resolver(resolver)
-        .with_cap_store(caps.clone());
-    let wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
-    let store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
-    let registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
-        Arc::new(opener),
-        Some(wal_reader),
-        Some(store_reader),
-        Some(caps.clone()),
-    ));
-    (registry, caps, started, store, wal)
-}
-
 fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_store::SqliteStore>) {
     let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
     let wal = Arc::new(FileWalStore::new(dir.join("wal")));
@@ -674,138 +606,6 @@ fn no_durable_records(wal: &dyn broca_core::WalStore, session: &BindIdentity) ->
         Ok(records) => records.is_empty(),
         Err(broca_wal::WalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => panic!("reading the session WAL failed: {error}"),
-    }
-}
-
-#[tokio::test]
-async fn over_cap_admission_is_typed_and_leaves_no_wal_or_run_index_row() {
-    use broca_module::serve::ServeHandler;
-
-    let dir = tmpdir("budget-denied");
-    let (registry, caps, started, store, wal) = registry_with_caps(&dir);
-    let session = BindIdentity::new(dir.join("proj"), "runner", "budget");
-    registry
-        .cap_install(CapInstallRequest {
-            cap_id: "cap-org-x".into(),
-            cap_version: 1,
-            op: CapOperation::Install,
-            scope_key: "runner".into(),
-            project_root: Some(session.project_root.display().to_string()),
-            constraint_dim: "spend_dollars".into(),
-            period: "calendar_month".into(),
-            period_tz: "Europe/Madrid".into(),
-            hard_cap_nanos: 10,
-            max_staleness_ms: 60_000,
-            replaces_cap_id: None,
-            baseline: Some(CapBaseline {
-                spend_nanos: 10,
-                unresolved_count: 0,
-                watermark: CapWatermark {
-                    source_instance_id: "source-a".into(),
-                    source_epoch: 1,
-                    consumed_export_seq: 0,
-                },
-                period_bucket: Some("2026-07".into()),
-                as_of_ms: i64::MAX,
-            }),
-        })
-        .await
-        .expect("cap install is acknowledged after commit");
-
-    let request = SubmissionRequest {
-        directives: None,
-        on_restart: None,
-        keep_warm: None,
-        scope: Default::default(),
-        project_id: None,
-        principal: None,
-        model: ModelHandle::new("fake", "fake"),
-        input: vec![Message::new(
-            Role::User,
-            vec![ContentBlock::Text {
-                text: "hello".into(),
-            }],
-        )],
-        tools: Some(vec![]),
-        policy_allowed: Default::default(),
-        tool_choice: Default::default(),
-        generation: Default::default(),
-        cache: None,
-        budget: None,
-        auth: None,
-        context_limit: None,
-        work_class: None,
-        variant: None,
-        service_tier: None,
-        stop_when: vec![],
-        context_management: None,
-        inherit_frozen: Default::default(),
-        structured_output: None,
-        client_message_id: None,
-    };
-    let error = registry
-        .send(broca_module::serve::SendRequest {
-            session_class: None,
-            retention: None,
-            stop_sequences_named: false,
-            title: None,
-            conversation_key: None,
-            delivery: Default::default(),
-            session: session.clone(),
-            run_id: broca_protocol::RunId("run-denied".into()),
-            send_id: None,
-            request: Box::new(request),
-            skip_materialization: false,
-            kind: RunKind::FreshOrResume,
-            plan: None,
-            order: None,
-        })
-        .await
-        .expect_err("hard cap should deny before execution");
-    assert!(matches!(
-        error,
-        ServeError::BudgetDenied { cap_id, reason }
-            if cap_id == "cap-org-x" && reason == "hard_cap_exceeded"
-    ));
-    assert_eq!(started.load(Ordering::SeqCst), 0);
-    assert!(no_durable_records(wal.as_ref(), &session));
-    assert!(store.lookup_run("run-denied").unwrap().is_none());
-    assert!(caps.row("cap-org-x").unwrap().active);
-}
-
-fn unknown_charge_basis(_: &str, _: &str) -> (ChargeBasis, u32) {
-    (ChargeBasis::Unknown, 1)
-}
-
-fn under_cap_request(
-    session: &BindIdentity,
-    source_instance_id: String,
-    source_epoch: u64,
-    consumed_export_seq: u64,
-) -> CapInstallRequest {
-    CapInstallRequest {
-        cap_id: "cap-under-limit".into(),
-        cap_version: 1,
-        op: CapOperation::Install,
-        scope_key: session.harness.clone(),
-        project_root: Some(session.project_root.display().to_string()),
-        constraint_dim: "spend_dollars".into(),
-        period: "calendar_month".into(),
-        period_tz: "Europe/Madrid".into(),
-        hard_cap_nanos: 100,
-        max_staleness_ms: 60_000,
-        replaces_cap_id: None,
-        baseline: Some(CapBaseline {
-            spend_nanos: 0,
-            unresolved_count: 0,
-            watermark: CapWatermark {
-                source_instance_id,
-                source_epoch,
-                consumed_export_seq,
-            },
-            period_bucket: Some("2026-07".into()),
-            as_of_ms: i64::MAX,
-        }),
     }
 }
 
@@ -856,377 +656,6 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
         plan: None,
         order: None,
     }
-}
-
-fn budget_send(session: BindIdentity, run_id: &str) -> SendRequest {
-    SendRequest {
-        session_class: None,
-        retention: None,
-        stop_sequences_named: false,
-        title: None,
-        conversation_key: None,
-        delivery: Default::default(),
-        session,
-        run_id: broca_protocol::RunId(run_id.into()),
-        send_id: None,
-        request: Box::new(SubmissionRequest {
-            directives: None,
-            on_restart: None,
-            keep_warm: None,
-            scope: Default::default(),
-            project_id: None,
-            principal: None,
-            model: ModelHandle::new("fake", "fake"),
-            input: vec![Message::new(
-                Role::User,
-                vec![ContentBlock::Text {
-                    text: "hello".into(),
-                }],
-            )],
-            tools: Some(vec![]),
-            policy_allowed: Default::default(),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            cache: None,
-            budget: None,
-            auth: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![],
-            context_management: None,
-            inherit_frozen: Default::default(),
-            structured_output: None,
-            client_message_id: None,
-        }),
-        skip_materialization: false,
-        kind: RunKind::FreshOrResume,
-        plan: None,
-        order: None,
-    }
-}
-
-async fn assert_budget_watermark_case(
-    name: &str,
-    foreign_source: bool,
-    epoch_offset: u64,
-    consumed_export_seq: u64,
-    expected_denial: Option<&str>,
-) {
-    let dir = tmpdir(name);
-    let (registry, _caps, started, store, _wal) = registry_with_caps(&dir);
-    let session = BindIdentity::new(dir.join("proj"), "runner", name);
-    let source_instance_id = if foreign_source {
-        "foreign-export-source".into()
-    } else {
-        store.source_instance_id().to_string()
-    };
-    registry
-        .cap_install(under_cap_request(
-            &session,
-            source_instance_id,
-            store.source_epoch() + epoch_offset,
-            consumed_export_seq,
-        ))
-        .await
-        .unwrap();
-
-    let result = registry
-        .send(budget_send(session, &format!("run-{name}")))
-        .await;
-    match expected_denial {
-        Some(expected_reason) => {
-            assert!(matches!(
-                result,
-                Err(ServeError::BudgetDenied { cap_id, reason })
-                    if cap_id == "cap-under-limit" && reason == expected_reason
-            ));
-            assert_eq!(started.load(Ordering::SeqCst), 0);
-        }
-        None => {
-            assert!(matches!(result, Ok(SendResponse::Active { .. })));
-            assert_eq!(started.load(Ordering::SeqCst), 1);
-        }
-    }
-}
-
-#[tokio::test]
-async fn budget_admission_validates_the_complete_export_position() {
-    assert_budget_watermark_case(
-        "budget-foreign-source",
-        true,
-        0,
-        0,
-        Some("export_source_mismatch"),
-    )
-    .await;
-    assert_budget_watermark_case(
-        "budget-foreign-epoch",
-        false,
-        1,
-        0,
-        Some("export_source_mismatch"),
-    )
-    .await;
-    assert_budget_watermark_case(
-        "budget-future-sequence",
-        false,
-        0,
-        1,
-        Some("export_source_mismatch"),
-    )
-    .await;
-    assert_budget_watermark_case("budget-matching-position", false, 0, 0, None).await;
-}
-
-#[tokio::test]
-async fn unresolved_decrement_to_zero_allows_admission_at_the_export_head() {
-    let dir = tmpdir("budget-unresolved-zero");
-    let (registry, caps, started, store, _wal) = registry_with_caps(&dir);
-    let session = BindIdentity::new(dir.join("proj"), "runner", "resolved");
-    let exported_run = RunId("run-export-head".into());
-    let records = vec![
-        FramedRecord {
-            seq: 1,
-            fence: 1,
-            record: WalRecord::RunStarted {
-                tags: None,
-                session_class: None,
-                retention: None,
-                hooks: None,
-                title: None,
-                on_restart: None,
-                keep_warm: None,
-                marker_order_version: None,
-                manifest: None,
-                scope: None,
-                send_id: None,
-                request_identity_digest: None,
-                project_id: None,
-                principal: None,
-                run_id: exported_run.clone(),
-                session: session.clone(),
-                ts_ms: Some(100),
-                config: Box::new(min_config()),
-                input: vec![].into(),
-                origin: broca_wal::RunOrigin::Fresh,
-                submission_id: None,
-            },
-        },
-        FramedRecord {
-            seq: 2,
-            fence: 1,
-            record: WalRecord::RunFinished {
-                interrupt_reason: None,
-                reason: RunFinishReason::Completed,
-                ts_ms: Some(200),
-                usage: Usage::default(),
-                error: None,
-                retries_used: 0,
-            },
-        },
-    ];
-    store
-        .emit_export_run(&records, &exported_run, &unknown_charge_basis)
-        .unwrap();
-    assert_eq!(store.high_water(), 1);
-
-    let mut cap = under_cap_request(
-        &session,
-        store.source_instance_id().to_string(),
-        store.source_epoch(),
-        0,
-    );
-    cap.baseline.as_mut().unwrap().unresolved_count = 1;
-    registry.cap_install(cap).await.unwrap();
-    assert!(matches!(
-        registry
-            .apply_spend_delta(SpendDeltaRequest {
-                cap_id: "cap-under-limit".into(),
-                cap_version: 1,
-                from_watermark: CapWatermark {
-                    source_instance_id: store.source_instance_id().to_string(),
-                    source_epoch: store.source_epoch(),
-                    consumed_export_seq: 0,
-                },
-                to_watermark: CapWatermark {
-                    source_instance_id: store.source_instance_id().to_string(),
-                    source_epoch: store.source_epoch(),
-                    consumed_export_seq: 1,
-                },
-                priced_delta_nanos: 0,
-                unresolved_delta: -1,
-                period_bucket: "2026-07".into(),
-            })
-            .await
-            .unwrap(),
-        CapMutation::Applied(_)
-    ));
-    assert_eq!(caps.row("cap-under-limit").unwrap().unresolved_count, 0);
-
-    let result = registry
-        .send(budget_send(session, "run-after-unresolved-zero"))
-        .await;
-    assert!(matches!(result, Ok(SendResponse::Active { .. })));
-    assert_eq!(started.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn legacy_negative_unresolved_row_denies_admission_after_upgrade() {
-    let dir = tmpdir("budget-legacy-negative");
-    let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
-    let started = Arc::new(AtomicUsize::new(0));
-    let exec = Arc::new(FakeExec {
-        wal_store: wal.clone(),
-        started: started.clone(),
-        hold: None,
-    });
-    let session = BindIdentity::new(dir.join("proj"), "runner", "legacy-negative");
-    let cap_store: Arc<dyn CapStore> = Arc::new(LegacyNegativeCapStore {
-        row: CapRow {
-            cap_id: "cap-legacy-negative".into(),
-            cap_version: 1,
-            scope_key: session.harness.clone(),
-            project_root: Some(session.project_root.display().to_string()),
-            constraint_dim: "spend_dollars".into(),
-            period: "calendar_month".into(),
-            period_tz: "Europe/Madrid".into(),
-            hard_cap_nanos: 100,
-            max_staleness_ms: 60_000,
-            replaces_cap_id: None,
-            period_bucket: Some("2026-07".into()),
-            spend_nanos: 0,
-            unresolved_count: -1,
-            applied_watermark: CapWatermark {
-                source_instance_id: store.source_instance_id().to_string(),
-                source_epoch: store.source_epoch(),
-                consumed_export_seq: store.high_water(),
-            },
-            as_of_ms: i64::MAX,
-            active: true,
-            replaced_by: None,
-        },
-    });
-    let resolver = Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1));
-    let opener = DefaultOpener::new(lease, wal.clone(), exec)
-        .with_run_index(store.clone())
-        .with_materialized_store(store.clone())
-        .with_export_index(store.clone())
-        .with_charge_basis_resolver(resolver)
-        .with_cap_store(cap_store.clone());
-    let wal_reader: Arc<dyn WalStore> = wal;
-    let store_reader: Arc<dyn MaterializedStore> = store;
-    let registry = LineageRegistry::new_with_reader_and_caps(
-        Arc::new(opener),
-        Some(wal_reader),
-        Some(store_reader),
-        Some(cap_store),
-    );
-
-    let error = registry
-        .send(budget_send(session, "run-legacy-negative"))
-        .await
-        .expect_err("a persisted negative unresolved count must fail closed");
-    assert!(matches!(
-        error,
-        ServeError::BudgetDenied { cap_id, reason }
-            if cap_id == "cap-legacy-negative" && reason == "unresolved_spend"
-    ));
-    assert_eq!(started.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn conflicting_late_cap_replacement_does_not_create_an_admission_blocker() {
-    let dir = tmpdir("budget-conflicting-replacement");
-    let (registry, caps, started, store, _wal) = registry_with_caps(&dir);
-    let session = BindIdentity::new(dir.join("proj"), "runner", "replacement");
-    let source_instance_id = store.source_instance_id().to_string();
-    let source_epoch = store.source_epoch();
-    let high_water = store.high_water();
-
-    let mut cap_a = under_cap_request(
-        &session,
-        source_instance_id.clone(),
-        source_epoch,
-        high_water,
-    );
-    cap_a.cap_id = "cap-a".into();
-    registry.cap_install(cap_a).await.unwrap();
-
-    let mut cap_c = under_cap_request(
-        &session,
-        source_instance_id.clone(),
-        source_epoch,
-        high_water,
-    );
-    cap_c.cap_id = "cap-c".into();
-    cap_c.replaces_cap_id = Some("cap-a".into());
-    registry.cap_install(cap_c).await.unwrap();
-
-    let mut delayed_cap_b =
-        under_cap_request(&session, source_instance_id, source_epoch, high_water);
-    delayed_cap_b.cap_id = "cap-b".into();
-    delayed_cap_b.replaces_cap_id = Some("cap-a".into());
-    delayed_cap_b.baseline.as_mut().unwrap().spend_nanos = delayed_cap_b.hard_cap_nanos;
-    assert!(matches!(
-        registry.cap_install(delayed_cap_b).await,
-        Err(ServeError::BaselineRequired)
-    ));
-
-    let retired = caps.row("cap-a").unwrap();
-    assert_eq!(retired.replaced_by.as_deref(), Some("cap-c"));
-    assert!(caps.row("cap-c").unwrap().active);
-    assert!(caps.row("cap-b").is_none());
-
-    let result = registry
-        .send(budget_send(session, "run-conflicting-replacement"))
-        .await;
-    assert!(matches!(result, Ok(SendResponse::Active { .. })));
-    assert_eq!(started.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn replacing_the_export_database_keeps_surviving_caps_fail_closed() {
-    let dir = tmpdir("budget-export-replacement");
-    let old_source_instance_id = {
-        let (registry, caps, _started, store, wal) = registry_with_caps(&dir);
-        let session = BindIdentity::new(dir.join("proj"), "runner", "replacement");
-        registry
-            .cap_install(under_cap_request(
-                &session,
-                store.source_instance_id().to_string(),
-                store.source_epoch(),
-                0,
-            ))
-            .await
-            .unwrap();
-        let source_instance_id = store.source_instance_id().to_string();
-        drop(registry);
-        drop(caps);
-        drop(store);
-        drop(wal);
-        source_instance_id
-    };
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(dir.join(format!("store.db{suffix}")));
-    }
-
-    let (registry, _caps, started, replacement, _wal) = registry_with_caps(&dir);
-    assert_ne!(replacement.source_instance_id(), old_source_instance_id);
-    let session = BindIdentity::new(dir.join("proj"), "runner", "replacement");
-    let error = registry
-        .send(budget_send(session, "run-after-export-replacement"))
-        .await
-        .expect_err("a cap anchored to the replaced export source must deny admission");
-    assert!(matches!(
-        error,
-        ServeError::BudgetDenied { cap_id, reason }
-            if cap_id == "cap-under-limit" && reason == "export_source_mismatch"
-    ));
-    assert_eq!(started.load(Ordering::SeqCst), 0);
 }
 
 struct BlockingSendHandler {
@@ -1374,205 +803,6 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
         .join(format!("broca-serve-{}-{tag}-{call}", std::process::id()));
     std::fs::create_dir_all(dir.join("proj")).unwrap();
     dir
-}
-
-/// Assert the EXACT body a cap mutation returns, member by member.
-///
-/// A consumer specification is pinned to this shape: ASTRO's validator treats any success
-/// body that is not exactly this as malformed, and a malformed success authorizes no
-/// outbox retirement -- so an added member does not degrade their delivery, it wedges
-/// every cap at the first install. Asserting one field's VALUE (as the assertions above
-/// do) cannot see a new member appear, which is precisely the change that would break
-/// them silently on my side and loudly on theirs.
-///
-/// Three properties they depend on, all checked here: the envelope nests the watermark
-/// under `result` rather than carrying it at top level, the result is closed at exactly
-/// one member, and the watermark is closed at exactly three.
-fn assert_cap_mutation_shape(body: &serde_json::Value) {
-    let top = body.as_object().expect("response body is an object");
-    assert_eq!(
-        top.keys().collect::<Vec<_>>(),
-        vec!["result"],
-        "the response envelope carries exactly one member, `result`"
-    );
-    let result = top["result"].as_object().expect("result is an object");
-    assert_eq!(
-        result.keys().collect::<Vec<_>>(),
-        vec!["applied_watermark"],
-        "a cap mutation result is closed at one member"
-    );
-    let watermark = result["applied_watermark"]
-        .as_object()
-        .expect("applied_watermark is an object");
-    let mut members: Vec<&String> = watermark.keys().collect();
-    members.sort();
-    assert_eq!(
-        members,
-        vec!["seq", "source_epoch", "source_instance_id"],
-        "the applied watermark is closed at three members"
-    );
-    assert!(
-        watermark["source_instance_id"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty()),
-        "source_instance_id is a non-empty string"
-    );
-    assert!(watermark["source_epoch"].is_u64(), "source_epoch is a u64");
-    assert!(watermark["seq"].is_u64(), "seq is a u64");
-}
-#[tokio::test]
-async fn cap_mutations_use_total_success_and_baseline_error_wire_contracts() {
-    let dir = tmpdir("cap-wire");
-    let (registry, _caps, _started, _store, _wal) = registry_with_caps(&dir);
-    let (client, server) = tokio::io::duplex(64 * 1024);
-    let (mut creader, mut cwriter) = tokio::io::split(client);
-    let (sreader, swriter) = tokio::io::split(server);
-    let serve_registry = registry.clone();
-    let serve = tokio::spawn(async move {
-        let _ = serve_connection(
-            sreader,
-            swriter,
-            "broca",
-            serve_registry.clone(),
-            serve_registry,
-            broca_module_serve::serve::VaultGauge::not_in_use(),
-        )
-        .await;
-    });
-
-    let hello = read_one(&mut creader).await;
-    let hello_ack = Frame::build(
-        FrameType::HelloAck,
-        Flags::new(false, Priority::Passive, false),
-        0,
-        0,
-        hello.header.corr,
-        serde_json::to_vec(&ModuleHelloAckBody {
-            negotiated_ver: PROTOCOL_VERSION,
-            subc_ops: vec![],
-            subc_capabilities: vec![],
-            storage: None,
-            machine_id: None,
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    write_frame(&mut cwriter, &hello_ack).await.unwrap();
-    let project_root = dir.join("proj");
-    write_req(
-        &mut cwriter,
-        0,
-        10,
-        serde_json::to_value(ModuleControlRequest::RouteBind {
-            route_channel: 7,
-            epoch: 2,
-            target: RouteTarget::ManagementSurface {
-                module_id: "broca".into(),
-            },
-            identity: SubcBindIdentity::new(project_root.clone(), "runner", "cap-wire"),
-            principal: None,
-            consumer_capabilities: None,
-            admission_facts: None,
-            scope: None,
-            role_versions: None,
-            call_mode: None,
-        })
-        .unwrap(),
-    )
-    .await;
-    assert_eq!(read_one(&mut creader).await.header.ty, FrameType::Response);
-
-    write_req_epoch(
-        &mut cwriter,
-        7,
-        2,
-        11,
-        serde_json::json!({
-            "method": "cap.install",
-            "params": {
-                "cap_id": "cap-wire",
-                "cap_version": 4,
-                "op": "install",
-                "scope_key": "runner",
-                "project_root": project_root.display().to_string(),
-                "constraint_dim": "spend_dollars",
-                "period": "calendar_month",
-                "period_tz": "Europe/Madrid",
-                "hard_cap_nanos": 50,
-                "max_staleness_ms": 60000,
-                "replaces_cap_id": null,
-                "baseline": {
-                    "spend_nanos": 1,
-                    "unresolved_count": 0,
-                    "watermark": {
-                        "source_instance_id": "source-a",
-                        "source_epoch": 1,
-                        "consumed_export_seq": 40
-                    },
-                    "period_bucket": "2026-07",
-                    "as_of_ms": 9223372036854775807i64
-                }
-            }
-        }),
-    )
-    .await;
-    let installed = read_one(&mut creader).await;
-    assert_eq!(installed.header.ty, FrameType::Response);
-    let installed: serde_json::Value = serde_json::from_slice(&installed.body).unwrap();
-    assert_eq!(installed["result"]["applied_watermark"]["seq"], 40);
-    assert_cap_mutation_shape(&installed);
-
-    write_req_epoch(
-        &mut cwriter,
-        7,
-        2,
-        12,
-        serde_json::json!({
-            "method": "spend.delta",
-            "params": {
-                "cap_id": "cap-wire",
-                "cap_version": 4,
-                "from_watermark": {"source_instance_id": "source-a", "source_epoch": 1, "consumed_export_seq": 40},
-                "to_watermark": {"source_instance_id": "source-a", "source_epoch": 1, "consumed_export_seq": 41},
-                "priced_delta_nanos": 0,
-                "unresolved_delta": 0,
-                "period_bucket": "2026-07"
-            }
-        }),
-    )
-    .await;
-    let applied = read_one(&mut creader).await;
-    assert_eq!(applied.header.ty, FrameType::Response);
-    let applied: serde_json::Value = serde_json::from_slice(&applied.body).unwrap();
-    assert_eq!(applied["result"]["applied_watermark"]["seq"], 41);
-    assert_cap_mutation_shape(&applied);
-
-    write_req_epoch(
-        &mut cwriter,
-        7,
-        2,
-        13,
-        serde_json::json!({
-            "method": "spend.delta",
-            "params": {
-                "cap_id": "cap-wire",
-                "cap_version": 4,
-                "from_watermark": {"source_instance_id": "other-source", "source_epoch": 9, "consumed_export_seq": 0},
-                "to_watermark": {"source_instance_id": "other-source", "source_epoch": 9, "consumed_export_seq": 1},
-                "priced_delta_nanos": 1,
-                "unresolved_delta": 0,
-                "period_bucket": "2026-07"
-            }
-        }),
-    )
-    .await;
-    let rejected = read_one(&mut creader).await;
-    assert_eq!(rejected.header.ty, FrameType::Error);
-    let rejected: ErrorBody = serde_json::from_slice(&rejected.body).unwrap();
-    assert_eq!(rejected.code, "baseline_required");
-
-    serve.abort();
-    let _ = serve.await;
 }
 
 /// Answers `vault.audit` with a fixed result and counts the calls.
@@ -1850,6 +1080,149 @@ async fn retired_usage_export_is_unknown_and_terminal_facts_remain() {
         ChargeBasis::Unknown
     );
     assert_eq!(page.facts[0].segment.as_session().unwrap().session, session);
+    drop(cwriter);
+    drop(creader);
+    let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cap.install` and `spend.delta` were removed: any caller the daemon admitted could call them,
+/// and nothing recorded who installed a cap, so any local module could remove a cap or report
+/// spend against one. A call to either name, with the params the operations used to accept, must
+/// get the same unknown-method refusal as any other name broca does not serve, open no session
+/// actor, write nothing to the session's WAL, and create no `caps.db`.
+#[tokio::test]
+async fn removed_spend_cap_operations_are_unknown_methods_that_write_nothing() {
+    let dir = tmpdir("removed-cap-ops");
+    let (reg, wal) = registry_and_wal(&dir);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (mut creader, mut cwriter) = tokio::io::split(client);
+    let (sreader, swriter) = tokio::io::split(server);
+    let serve_reg = reg.clone();
+    let serve = tokio::spawn(async move {
+        let _ = serve_connection(
+            sreader,
+            swriter,
+            "broca",
+            serve_reg.clone(),
+            serve_reg,
+            broca_module_serve::serve::VaultGauge::not_in_use(),
+        )
+        .await;
+    });
+
+    let hello = read_one(&mut creader).await;
+    let hello_ack = Frame::build(
+        FrameType::HelloAck,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        hello.header.corr,
+        serde_json::to_vec(&ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: vec![],
+            subc_capabilities: vec![],
+            storage: None,
+            machine_id: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    write_frame(&mut cwriter, &hello_ack).await.unwrap();
+
+    let session = BindIdentity::new(dir.join("proj"), "runner", "removed-cap-ops");
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 7,
+        epoch: 2,
+        target: RouteTarget::ManagementSurface {
+            module_id: "broca".into(),
+        },
+        identity: SubcBindIdentity::new(
+            session.project_root.clone(),
+            session.harness.clone(),
+            session.session.clone(),
+        ),
+        principal: None,
+        consumer_capabilities: None,
+        admission_facts: None,
+        scope: None,
+        role_versions: None,
+        call_mode: None,
+    };
+    write_req(&mut cwriter, 0, 10, serde_json::to_value(bind).unwrap()).await;
+    assert_eq!(read_one(&mut creader).await.header.ty, FrameType::Response);
+
+    // Params in the exact shape each operation used to accept, so the refusal cannot come from
+    // a params decoder rejecting a malformed body.
+    let watermark = |seq: u64| serde_json::json!({"source_instance_id": "source-a", "source_epoch": 1, "consumed_export_seq": seq});
+    let calls = [
+        (
+            "cap.install",
+            serde_json::json!({
+                "cap_id": "cap-org-x",
+                "cap_version": 1,
+                "op": "remove",
+                "scope_key": "runner",
+                "project_root": session.project_root.display().to_string(),
+                "constraint_dim": "spend_dollars",
+                "period": "calendar_month",
+                "period_tz": "Europe/Madrid",
+                "hard_cap_nanos": 10,
+                "max_staleness_ms": 60000,
+                "replaces_cap_id": null,
+                "baseline": {
+                    "spend_nanos": 0,
+                    "unresolved_count": 0,
+                    "watermark": watermark(0),
+                    "period_bucket": "2026-07",
+                    "as_of_ms": 1789000000000i64
+                }
+            }),
+        ),
+        (
+            "spend.delta",
+            serde_json::json!({
+                "cap_id": "cap-org-x",
+                "cap_version": 1,
+                "from_watermark": watermark(0),
+                "to_watermark": watermark(1),
+                "priced_delta_nanos": 5,
+                "unresolved_delta": 0,
+                "period_bucket": "2026-07"
+            }),
+        ),
+    ];
+    for (corr, (method, params)) in (11..).zip(calls) {
+        write_req_epoch(
+            &mut cwriter,
+            7,
+            2,
+            corr,
+            serde_json::json!({"method": method, "params": params}),
+        )
+        .await;
+        let refused = read_one(&mut creader).await;
+        assert_eq!(refused.header.ty, FrameType::Error, "{method}");
+        assert_eq!(refused.header.corr, corr, "{method}");
+        let body: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+        assert_eq!(body["code"], "unknown_method", "{method}");
+        assert_eq!(
+            body["message"],
+            format!("unknown method '{method}'"),
+            "{method}"
+        );
+    }
+
+    assert_eq!(reg.slot_counts().open, 0, "a refused call opens no session");
+    assert!(
+        no_durable_records(wal.as_ref(), &session),
+        "a refused call writes nothing to the session's WAL"
+    );
+    assert!(
+        !dir.join("caps.db").exists(),
+        "nothing creates the old cap table"
+    );
+
     drop(cwriter);
     drop(creader);
     let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
@@ -7056,7 +6429,7 @@ async fn transient_open_failed_wal_refusal_golden() {
 #[tokio::test]
 async fn undecodable_control_request_errors_and_keeps_connection_alive() {
     let dir = tmpdir("invalid-control-request");
-    let (registry, _caps, _started, _store, _wal) = registry_with_caps(&dir);
+    let (registry, _store) = registry_with_export(&dir);
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);

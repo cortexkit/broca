@@ -28,10 +28,6 @@ pub const OP_CANCEL: &str = "run.cancel";
 pub const OP_STATUS: &str = "run.status";
 pub const OP_RUN_EVENT_GET: &str = "run.event.get";
 pub const OP_READ: &str = "session.read";
-/// Daemon-scoped durable budget-cap mutations.
-pub const OP_CAP_INSTALL: &str = "cap.install";
-
-pub const OP_SPEND_DELTA: &str = "spend.delta";
 /// Daemon-scoped read of the credential vault's listing under broca's grants.
 pub const OP_VAULT_AUDIT: &str = "vault.audit";
 /// The held-open stream observability surface.
@@ -256,21 +252,6 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             description: Some(
                 "Keep the provider's prompt cache warm: re-send the session's most recent request with no output, and report what it cost."
                     .to_string(),
-            ),
-        },
-        ManagementOperation {
-            name: OP_CAP_INSTALL.to_string(),
-            kind: ManagementOperationKind::Mutate,
-            description: Some(
-                "Install or remove a spend cap. Enforcement is at admission, and refusals fail closed."
-                    .to_string(),
-            ),
-        },
-        ManagementOperation {
-            name: OP_SPEND_DELTA.to_string(),
-            kind: ManagementOperationKind::Mutate,
-            description: Some(
-                "Apply a spend increment against an installed cap's watermark.".to_string(),
             ),
         },
         ManagementOperation {

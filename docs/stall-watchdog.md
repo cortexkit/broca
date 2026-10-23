@@ -22,8 +22,9 @@ The reader has an atomic phase, method code, route channel and entry time. There
 are no payloads, session IDs, method strings or correlation IDs in markers.
 Method codes: 0 unknown/not decoded, 1 route.bind, 2 health.check, 3 send, 4 read,
 5 subscribe, 6 status, 7 cancel, 8 retract, 9 role.describe, 10 vault.audit,
-11 import, 12 head, 13 baseline, 14 cap.install, 15 spend.delta, 16 run.result,
-17 warm, 255 other. Phase `dispatch` also covers decoding and synchronous work
+11 import, 12 head, 13 baseline, 16 run.result, 17 warm, 18 resolve,
+19 run.tool_calls, 255 other. Codes 14 and 15 named the removed `cap.install` and
+`spend.delta` operations and are not reused. Phase `dispatch` also covers decoding and synchronous work
 between the narrower await phases. Spawned request tasks cannot overwrite the
 reader marker. A phase includes its synchronous logs: logger contention is
 explicitly **not instrumented**, so a frozen phase is not proof its awaited

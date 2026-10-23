@@ -617,7 +617,6 @@ struct Inner {
     /// Cache only identities and the position after their represented WAL records. Prompts,
     /// queued requests and plan manifests stay out of this bounded, read-only cache.
     owner_snapshots: Mutex<OwnerSnapshots>,
-    cap_store: Option<Arc<dyn broca_core::CapStore>>,
     stopping: tokio_util::sync::CancellationToken,
     seal: tokio_util::sync::CancellationToken,
     seal_state: Mutex<SealState>,
@@ -1113,7 +1112,7 @@ impl LineageRegistry {
     }
 
     pub fn new(opener: Arc<dyn LineageOpener>) -> Self {
-        Self::new_with_reader_and_caps(opener, None, None, None)
+        Self::new_with_sources(opener, None, None)
     }
 
     /// Build a registry that can serve read-only transcript pages without opening an actor.
@@ -1122,15 +1121,14 @@ impl LineageRegistry {
         wal_store: Arc<dyn broca_core::WalStore>,
         store: Option<Arc<dyn broca_core::MaterializedStore>>,
     ) -> Self {
-        Self::new_with_reader_and_caps(opener, Some(wal_store), store, None)
+        Self::new_with_sources(opener, Some(wal_store), store)
     }
 
-    /// Build a registry with the optional read-only sources and daemon-scoped cap table.
-    pub fn new_with_reader_and_caps(
+    /// Build a registry with the optional read-only sources.
+    pub fn new_with_sources(
         opener: Arc<dyn LineageOpener>,
         wal_store: Option<Arc<dyn broca_core::WalStore>>,
         store: Option<Arc<dyn broca_core::MaterializedStore>>,
-        cap_store: Option<Arc<dyn broca_core::CapStore>>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -1155,7 +1153,6 @@ impl LineageRegistry {
                 frozen_senders: Mutex::new(BoundedSessionCache::new(SESSION_CACHE_SESSIONS)),
                 live_ownership: Mutex::new(HashMap::new()),
                 owner_snapshots: Mutex::new(OwnerSnapshots::default()),
-                cap_store,
                 stopping: tokio_util::sync::CancellationToken::new(),
                 seal: tokio_util::sync::CancellationToken::new(),
                 seal_state: Mutex::new(SealState::default()),
@@ -2237,38 +2234,6 @@ impl LineageRegistry {
                 Err(_) => continue,
             }
         }
-    }
-
-    /// Apply a cap-table mutation without opening a session actor or touching a session WAL.
-    pub async fn install_cap(
-        &self,
-        request: broca_core::CapInstallRequest,
-    ) -> Result<broca_core::CapMutation, broca_core::CapStoreError> {
-        let Some(store) = self.inner.cap_store.clone() else {
-            return Err(broca_core::CapStoreError::Storage(
-                "cap table is not configured".into(),
-            ));
-        };
-        spawn_blocking(JobKind::StoreWrite, move || store.install_cap(&request))
-            .await
-            .map_err(|error| broca_core::CapStoreError::Storage(error.to_string()))?
-    }
-
-    /// Apply a spend delta without opening a session actor or touching a session WAL.
-    pub async fn apply_spend_delta(
-        &self,
-        request: broca_core::SpendDeltaRequest,
-    ) -> Result<broca_core::CapMutation, broca_core::CapStoreError> {
-        let Some(store) = self.inner.cap_store.clone() else {
-            return Err(broca_core::CapStoreError::Storage(
-                "cap table is not configured".into(),
-            ));
-        };
-        spawn_blocking(JobKind::StoreWrite, move || {
-            store.apply_spend_delta(&request)
-        })
-        .await
-        .map_err(|error| broca_core::CapStoreError::Storage(error.to_string()))?
     }
 
     /// Route a `run.cancel` to the lineage (same reopen-retry discipline as `send`).

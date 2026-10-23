@@ -110,6 +110,10 @@ RST: [RFC 9293 §3.10.7.4](https://www.rfc-editor.org/rfc/rfc9293.html#section-3
 requires outstanding SEND/RECEIVE operations to receive reset responses and moves
 TCP to CLOSED. An unrelated write error remains a serve error.
 
+broca has no spend-cap operations. `cap.install` and `spend.delta` were removed: a call to
+either gets the ordinary `unknown_method` refusal and writes nothing. Budget enforcement
+across sessions is not built (see SECURITY.md).
+
 ```
 session.read { from_ordinal?, limit?, include_tools?, after_mid?, lineage_id?, max_bytes?,
                  include_originals? }
@@ -1214,7 +1218,7 @@ refusal is counted in `health.check` as `reverse_requests_refused`.
   wal-archive/, wal-archive-durable/ ← sealed archive containers of cold WALs
   run-index.db              ← SQLite: the durable run index, materialized transcript,
                               admission checkpoints, usage export facts
-  caps.db                   ← SQLite: budget caps, a durability domain of its own
+  caps.db                   ← left over from removed spend caps; broca no longer opens it
   leases/                   ← single-writer lease files
 ```
 WAL = source of truth (portable unit); `run-index.db` = derived projection. Resume =
