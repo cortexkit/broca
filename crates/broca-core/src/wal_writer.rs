@@ -17,7 +17,7 @@ use broca_diagnostics::{spawn_blocking, JobKind};
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +41,9 @@ pub use projection_gap::{
 };
 mod session_index;
 pub use session_index::{agent_session_ref, SessionRefIndex};
+
+/// A writer opened under a session lease, and the lease its caller keeps.
+pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
 
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
@@ -81,6 +84,23 @@ pub trait WalStore: Send + Sync {
         _session_class: Option<&str>,
     ) -> Result<Box<dyn Wal + Send>, WalError> {
         self.open_with_retention(session, retention)
+    }
+
+    /// Open a writer for `session` under `lease` and return the lease the caller keeps. A
+    /// store may wrap the lease to start work that must wait until the lease is released,
+    /// such as retention enrollment. The default opens with `open_with_class` and returns the
+    /// lease unchanged.
+    fn open_writer(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+        lease: Box<dyn LeaseHandle>,
+    ) -> Result<WriterAndLease, WalError> {
+        Ok((
+            self.open_with_class(session, retention, session_class)?,
+            lease,
+        ))
     }
 
     /// The lowest runner tag a new lineage at `session` may use. When retention deleted an
@@ -786,6 +806,18 @@ impl FileWalStore {
         retention: Option<u64>,
         session_class: Option<&str>,
     ) -> Result<Box<dyn Wal + Send>, WalError> {
+        self.open_observed(session, retention, session_class)
+            .map(|(wal, _retained)| wal)
+    }
+
+    /// Open the writer and also return its shared retained flag. The flag is set when the WAL
+    /// lives under the ephemeral root, or once a retained first run places it there.
+    fn open_observed(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+    ) -> Result<(Box<dyn Wal + Send>, Arc<AtomicBool>), WalError> {
         self.check_move(session, true)?;
         let lookup = self.archived_member(session)?;
         let path = if let Some(member) = lookup.member {
@@ -860,14 +892,18 @@ impl FileWalStore {
                 self.backup_classes.clone(),
             ),
         );
-        Ok(Box::new(retention_changes::ObservedWal {
-            inner: wal,
-            address: Arc::from(session_addr(session)),
-            changes: self.retention_changes.clone(),
+        let retained = Arc::new(AtomicBool::new(retained));
+        Ok((
+            Box::new(retention_changes::ObservedWal {
+                inner: wal,
+                address: Arc::from(session_addr(session)),
+                changes: self.retention_changes.clone(),
+                retained: retained.clone(),
+                session: session.clone(),
+                durable_observer: self.durable_observer.clone(),
+            }),
             retained,
-            session: session.clone(),
-            durable_observer: self.durable_observer.clone(),
-        }))
+        ))
     }
 
     /// Resolve only after live absence: a live WAL is authoritative even when an archive
@@ -1340,6 +1376,22 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn open_writer(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+        lease: Box<dyn LeaseHandle>,
+    ) -> Result<WriterAndLease, WalError> {
+        let (wal, retained) = self.open_observed(session, retention, session_class)?;
+        let lease = Box::new(retention_changes::ReleaseHintLease {
+            inner: Some(lease),
+            address: Arc::from(session_addr(session)),
+            changes: self.retention_changes.clone(),
+            retained,
+        });
+        Ok((wal, lease))
+    }
     fn read_records_tail_bounded(
         &self,
         session: &BindIdentity,
@@ -2093,8 +2145,8 @@ impl WalHandle {
         let check_session = session.clone();
         let opened = spawn_blocking(JobKind::WalWriter, move || {
             let fence = lease.epoch();
-            let wal = wal_store
-                .open_with_class(&session, retention, session_class.as_deref())
+            let (wal, lease) = wal_store
+                .open_writer(&session, retention, session_class.as_deref(), lease)
                 .map_err(WalOpenError::from_wal)?;
             let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::Failed)?;
             Ok::<_, WalOpenError>((wal, last_seq, fence, lease))

@@ -4951,6 +4951,55 @@ async fn raw_writer_enrolls_without_walk_and_expires_on_deadline() {
     assert!(rig.store.retention_pending_deletions().unwrap().is_empty());
 }
 
+/// Production closes a session writer before it releases the session lease. A sweep that
+/// runs between those two steps cannot enroll the changed session, because enrollment needs
+/// the lease. Enrollment must still follow once the lease is released, without waiting for a
+/// recovery directory walk.
+#[tokio::test]
+async fn sweep_between_writer_close_and_lease_release_still_enrolls_after_release() {
+    let rig = Rig::new();
+    let registry = rig.registry(None);
+    registry.boot_retention().await.unwrap();
+    let walks = rig.service.directory_walks.load(Ordering::Relaxed);
+    let lease = rig.service.lease(&rig.key).unwrap();
+    let (writer, lease) = broca_core::WalHandle::open_and_spawn_observed_with_retention(
+        rig.service.wal.clone(),
+        rig.key.clone(),
+        lease,
+        None,
+        Some(1),
+    )
+    .await
+    .unwrap();
+    rig.service.remember_session(&rig.key).unwrap();
+    writer.record(started(&rig.key, "r1", Some(1), 100));
+    writer.record(finished(200));
+    writer.sync().await.unwrap();
+    writer.shutdown().await.unwrap();
+
+    assert_eq!(registry.sweep_once(1199).await.unwrap(), 0);
+    assert!(
+        rig.store
+            .lookup_live_retention_lineage(&rig.key)
+            .unwrap()
+            .is_none(),
+        "enrollment cannot happen while the session lease is still held"
+    );
+
+    drop(lease);
+    assert_eq!(registry.sweep_once(1199).await.unwrap(), 0);
+    assert!(
+        rig.store
+            .lookup_live_retention_lineage(&rig.key)
+            .unwrap()
+            .is_some(),
+        "releasing the lease must make the changed session eligible for the next sweep"
+    );
+    assert_eq!(rig.service.directory_walks.load(Ordering::Relaxed), walks);
+    assert_eq!(registry.sweep_once(1200).await.unwrap(), 1);
+    assert!(!rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+}
+
 #[tokio::test]
 async fn boot_recovers_rowless_wal_after_losing_writer_hints() {
     let rig = Rig::new();

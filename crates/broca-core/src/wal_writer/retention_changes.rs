@@ -4,8 +4,10 @@ use std::collections::HashSet;
 
 const CAPACITY: usize = 4096;
 
-/// Raw maintenance writers and actor writers share this queue. It performs no I/O;
-/// overflow requests a recovery walk, and process loss is covered by boot recovery.
+/// Writers queue a retained session's address here when they close, and again when the
+/// session lease they were opened under is released, so the next sweep can enroll it without
+/// a directory walk. It performs no I/O; overflow requests a recovery walk, and process loss
+/// is covered by boot recovery.
 #[derive(Default)]
 pub(super) struct Changes {
     state: Mutex<State>,
@@ -42,16 +44,64 @@ pub(super) struct ObservedWal {
     pub inner: Box<dyn Wal + Send>,
     pub address: Arc<str>,
     pub changes: Arc<Changes>,
-    pub retained: bool,
+    /// Shared with the writer's `ReleaseHintLease`, if any. Set at open when the WAL lives
+    /// under the ephemeral root, or when a run start with a retention policy is appended to a
+    /// default-placement WAL (that first append places the WAL under the ephemeral root). The
+    /// flag is set even if that append fails; the next sweep drops a hint whose WAL is absent.
+    pub retained: Arc<AtomicBool>,
     pub session: BindIdentity,
     pub durable_observer: Option<Arc<DurableWalObserver>>,
 }
 
 impl Drop for ObservedWal {
     fn drop(&mut self) {
-        // The next sweep consumes this hint after the actor releases its lease, so deferred
-        // enrollment does not have to reopen a live session on every pass.
-        if self.retained {
+        // Hints are queued only once the writer is gone, so a sweep does not reopen a session
+        // that is still being written. A writer opened through `WalStore::open_writer` queues
+        // the address again once its lease is released.
+        if self.retained.load(Ordering::Acquire) {
+            self.changes.changed(&self.address);
+        }
+    }
+}
+
+/// A session lease that queues its retained address after the lease itself is released.
+///
+/// Writers close their WAL before they release the session lease, and enrollment needs that
+/// lease. A sweep that runs between those two steps consumes the address queued when the WAL
+/// closed, finds the lease held and drops the address. Queuing it again after the release
+/// lets the next sweep enroll the session without a recovery walk.
+pub(super) struct ReleaseHintLease {
+    /// Always `Some` until `drop`, which releases the lease before queuing the address.
+    pub inner: Option<Box<dyn LeaseHandle>>,
+    pub address: Arc<str>,
+    pub changes: Arc<Changes>,
+    /// The flag of the writer opened under this lease, read when the lease is released.
+    pub retained: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for ReleaseHintLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReleaseHintLease")
+            .field("inner", &self.inner)
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LeaseHandle for ReleaseHintLease {
+    fn epoch(&self) -> u64 {
+        self.inner.as_ref().expect("lease held until drop").epoch()
+    }
+    fn key(&self) -> &cortexkit_lease::LeaseKey {
+        self.inner.as_ref().expect("lease held until drop").key()
+    }
+}
+
+impl Drop for ReleaseHintLease {
+    fn drop(&mut self) {
+        // Release first: a sweep that takes the address must be able to acquire the lease.
+        drop(self.inner.take());
+        if self.retained.load(Ordering::Acquire) {
             self.changes.changed(&self.address);
         }
     }
@@ -73,15 +123,15 @@ impl ObservedWal {
             }
         }
     }
-    fn observe(&mut self, record: &WalRecord) {
+
+    /// A default-placement WAL becomes retained when its first run carries a retention
+    /// policy. Only the flag is set here; the address is queued when the writer closes.
+    fn note_retention(&self, record: &WalRecord) {
         if let WalRecord::RunStarted {
             retention: Some(_), ..
         } = record
         {
-            self.retained = true;
-        }
-        if self.retained {
-            self.changes.changed(&self.address);
+            self.retained.store(true, Ordering::Release);
         }
     }
 }
@@ -89,7 +139,7 @@ impl ObservedWal {
 impl Wal for ObservedWal {
     fn append(&mut self, fence: u64, record: &WalRecord, sync: bool) -> Result<u64, WalError> {
         let result = self.inner.append(fence, record, sync);
-        self.observe(record);
+        self.note_retention(record);
         if sync && result.is_ok() {
             self.durable();
         }
@@ -104,7 +154,7 @@ impl Wal for ObservedWal {
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
         let result = self.inner.append_preencoded(fence, record, sync, frame);
-        self.observe(record);
+        self.note_retention(record);
         if sync && result.is_ok() {
             self.durable();
         }
@@ -188,7 +238,7 @@ mod tests {
                 }),
                 address: Arc::from("address"),
                 changes: Arc::default(),
-                retained: false,
+                retained: Arc::default(),
                 session: BindIdentity::new("/", "test", "s"),
                 durable_observer: Some(Arc::new(move |_, seq, _| {
                     output
