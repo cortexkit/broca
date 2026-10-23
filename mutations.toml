@@ -3958,8 +3958,8 @@ target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/send_delivery.rs"
 expect_red = ["send_delivery::a_steer_during_a_tool_call_joins_the_running_turn_after_the_result"]
 file = "crates/broca-core/src/run.rs"
-old = "        mutable_call_options(&mut opts).prompt.push(answer);\n        let result_tags = live_result_tags(writer, &batch.results, &mut Default::default());"
-new = "        mutable_call_options(&mut opts).prompt.push(answer);\n        // NON-VACUITY BREAK: take waiting steers between the call and its result\n        let mut early_steers = control.steer.as_ref().map(|inbox| inbox.take_at_step(|| {})).unwrap_or_default();\n        mutable_call_options(&mut opts).prompt.append(&mut early_steers);\n        let result_tags = live_result_tags(writer, &batch.results, &mut Default::default());"
+old = "        let stored_result_tags = if computed_tags.is_none() {"
+new = "        // NON-VACUITY BREAK: take waiting steers between the call and its result\n        let mut early_steers = control.steer.as_ref().map(|inbox| inbox.take_at_step(|| {})).unwrap_or_default();\n        mutable_call_options(&mut opts).prompt.append(&mut early_steers);\n        let stored_result_tags = if computed_tags.is_none() {"
 
 [[control]]
 id = "steer-extends-final-step"
