@@ -341,6 +341,9 @@ struct AttemptTrace {
     input_transformations_unmeasured: bool,
     /// Set before the attempt is sent when it re-sends the step with a refreshed token.
     credential_refresh: Option<CredentialRefresh>,
+    /// The provider refusal a Responses websocket wrapped in an error frame, when one ended this
+    /// attempt; see [`responses_websocket::WrappedErrorFrame`].
+    wrapped_error_frame: Option<Box<responses_websocket::WrappedErrorFrame>>,
     /// The account evidence the response carried; see [`broca_protocol::AttemptAccountObservation`].
     account_observation: broca_protocol::AttemptAccountObservation,
 }
@@ -4597,6 +4600,28 @@ fn http_error_in_family(
         {
             Some(BILLING_EXHAUSTED.to_string())
         }
+        // OpenAI's empty prepaid balance (`credit_balance_exhausted`, error type
+        // `insufficient_quota`) is about the credential, not this request, so it gets the code
+        // that names the credential and stops routing to it. An unknown family is included
+        // because public callers may hold only the body, and these codes are OpenAI's own.
+        code_now
+            if matches!(
+                family,
+                None | Some(
+                    WireFamilyId::OpenAiChat
+                        | WireFamilyId::OpenAiResponses
+                        | WireFamilyId::OpenAiResponsesChatgpt
+                )
+            ) && crate::normalize::openai_billing_exhausted(
+                code_now,
+                body.as_ref()
+                    .and_then(|body| body.get("error").filter(|v| v.is_object()).or(Some(body)))
+                    .and_then(|error| error.get("type"))
+                    .and_then(Value::as_str),
+            ) =>
+        {
+            Some(BILLING_EXHAUSTED.to_string())
+        }
         _ => provider_code,
     };
     let overflow_code = family.and_then(|family| {
@@ -4736,6 +4761,10 @@ mod tests {
 
     mod inception {
         include!("transport_inception_tests.rs");
+    }
+
+    mod openai_billing {
+        include!("transport_openai_billing_tests.rs");
     }
 
     async fn assert_offloaded_render_matches_direct<F>(
@@ -7844,6 +7873,56 @@ mod tests {
         assert!(error.is_billing_exhausted());
         assert_eq!(error.provider_code.as_deref(), Some(BILLING_EXHAUSTED));
         assert_eq!(error.resets_at_ms, None);
+    }
+
+    /// OpenAI's HTTP answer for an empty prepaid balance is `billing_exhausted` for the OpenAI
+    /// families and for a body with no family, keyed on either its `credit_balance_exhausted`
+    /// code or its `insufficient_quota` type, and keeps the provider's message. Another family's
+    /// body with the same code is left alone.
+    #[test]
+    fn openai_credit_balance_exhausted_http_body_is_billing_exhausted() {
+        const CREDIT_BODY: &str = r#"{"error":{"message":"You have no credits remaining. Add credits to continue using the API.","type":"insufficient_quota","param":null,"code":"credit_balance_exhausted"}}"#;
+        const TYPE_ONLY_BODY: &str = r#"{"error":{"message":"You have no credits remaining. Add credits to continue using the API.","type":"insufficient_quota","param":null,"code":null}}"#;
+        const CODE_ONLY_BODY: &str = r#"{"error":{"message":"You have no credits remaining. Add credits to continue using the API.","code":"credit_balance_exhausted"}}"#;
+        for family in [
+            None,
+            Some(WireFamilyId::OpenAiChat),
+            Some(WireFamilyId::OpenAiResponses),
+            Some(WireFamilyId::OpenAiResponsesChatgpt),
+        ] {
+            for body in [CREDIT_BODY, TYPE_ONLY_BODY, CODE_ONLY_BODY] {
+                for status in [400, 402, 429] {
+                    let error = super::http_error_in_family(status, body, None, family, None);
+                    assert_eq!(
+                        error.class,
+                        ErrorClass::Permanent,
+                        "{family:?} {status} {body}"
+                    );
+                    assert_eq!(
+                        error.provider_code.as_deref(),
+                        Some(BILLING_EXHAUSTED),
+                        "{family:?} {status} {body}"
+                    );
+                    assert!(
+                        error.message.contains("You have no credits remaining"),
+                        "{}",
+                        error.message
+                    );
+                    assert_eq!(error.status, Some(status));
+                }
+            }
+        }
+        let error = super::http_error_in_family(
+            400,
+            CODE_ONLY_BODY,
+            None,
+            Some(WireFamilyId::Gemini),
+            None,
+        );
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("credit_balance_exhausted")
+        );
     }
 
     #[test]

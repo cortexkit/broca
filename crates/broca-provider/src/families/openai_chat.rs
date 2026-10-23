@@ -1034,17 +1034,15 @@ impl StreamNormalizer for OpenAiChatNormalizer {
 
 fn openai_chat_stream_error(envelope: &Value) -> Option<ProviderError> {
     let error = envelope.get("error")?.as_object()?;
-    let provider_code = error
-        .get("code")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("type").and_then(Value::as_str));
-    let provider_code = provider_code.map(|c| {
-        if c == "insufficient_quota" {
-            broca_protocol::error::BILLING_EXHAUSTED
-        } else {
-            c
-        }
-    });
+    let code = error.get("code").and_then(Value::as_str);
+    let error_type = error.get("type").and_then(Value::as_str);
+    // An exhausted prepaid balance is about the credential, not this request: relabel it so the
+    // run's terminal names the credential and routing stops using it.
+    let provider_code = if crate::normalize::openai_billing_exhausted(code, error_type) {
+        Some(broca_protocol::error::BILLING_EXHAUSTED)
+    } else {
+        code.or(error_type)
+    };
     let status = error_status(error, envelope);
     let retry_after_secs = retry_after_secs(error, envelope);
     let message = error

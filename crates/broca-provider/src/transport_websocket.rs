@@ -29,6 +29,8 @@ const BETA: &str = "responses_websockets=2026-02-06";
 // Only the first 512 bytes of a refused upgrade's body are read, and only to recognise a ChatGPT
 // usage-limit refusal (whose body is about 200 bytes). The body is never logged or stored.
 const UPGRADE_BODY_CLASSIFY_LIMIT: usize = 512;
+// How much of a wrapped error frame the local WARN line carries; see `WrappedErrorFrame`.
+const WRAPPED_FRAME_LOG_LIMIT: usize = 1024;
 
 const DISTINCT_LIMIT: usize = 4096;
 
@@ -814,10 +816,17 @@ pub(super) async fn drive(
         // Backends can echo authorization headers in error bodies or parser diagnostics.
         // Only typed ceiling evidence has a message built entirely from safe metadata.
         if failure.output_ceiling.is_none() {
-            failure.error.message = format!(
-                "Responses websocket attempt failed ({:?}); response body omitted",
-                failure.outcome
-            );
+            failure.error.message = match trace
+                .wrapped_error_frame
+                .as_deref()
+                .filter(|_| failure.outcome == AttemptOutcome::HttpError)
+            {
+                Some(frame) => frame.run_error_message(),
+                None => format!(
+                    "Responses websocket attempt failed ({:?}); response body omitted",
+                    failure.outcome
+                ),
+            };
         }
         failure.error.provider_code = failure
             .error
@@ -1130,6 +1139,7 @@ pub(super) fn warn_failure_decision(
         output_seen = trace.output_seen,
         retry_decision = decision,
         retry_reason = reason,
+        error_frame = trace.wrapped_error_frame.as_deref().map(|frame| frame.log_body.as_str()),
         "model websocket attempt failed"
     );
 }
@@ -1186,6 +1196,7 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
     let headers = response_headers(&headers);
     let text = String::from_utf8_lossy(raw);
     let family = crate::spec::WireFamilyId::OpenAiResponsesChatgpt;
+    trace.wrapped_error_frame = Some(Box::new(WrappedErrorFrame::read(status, &value)));
     let error = classify_http_error(status, &text, retry, None);
     let error = classify_chatgpt_upstream_key_rejection(family, status, &text, error);
     let error =
@@ -1203,6 +1214,108 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
             .get("x-should-retry")
             .is_some_and(|value| value.eq_ignore_ascii_case("false"));
     Some(AttemptFailure::http(error, forbidden))
+}
+
+/// A provider refusal the Responses websocket wrapped in an error frame (`{"type":"error",
+/// "status":400,"error":{...}}`), kept so the attempt's failure can say why without carrying the
+/// frame's text.
+///
+/// The frame answers a `response.create` that was already sent, so its `error.message` can quote
+/// the request back: a schema refusal repeats the schema, and backends have echoed credentials.
+/// The run error is returned to the caller that started the run, so it gets only
+/// [`Self::run_error_message`]: the HTTP status and the frame's short identifier fields, each kept
+/// only when it has an identifier's shape, so none of them can hold a sentence of request content.
+/// The frame's message text is never part of it.
+///
+/// A copy of the frame, minus any `headers` object it wraps and cut to
+/// [`WRAPPED_FRAME_LOG_LIMIT`] bytes, goes only to broca's own WARN line for the failed attempt
+/// (`log_body`). broca's log is written on the machine that ran the request, which already holds
+/// the full transcript in its session log, so the frame adds nothing that machine did not have;
+/// and it is often the only place the backend's reason (such as a model the account cannot use) is
+/// written down. Ephemeral sessions, which promise to retain no content, never log it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct WrappedErrorFrame {
+    status: u16,
+    code: Option<String>,
+    error_type: Option<String>,
+    param: Option<String>,
+    /// The frame without its `headers` objects, cut to [`WRAPPED_FRAME_LOG_LIMIT`] bytes.
+    pub(super) log_body: String,
+}
+
+impl WrappedErrorFrame {
+    fn read(status: u16, frame: &Value) -> Self {
+        let field = |pointer: &str| frame.pointer(pointer).and_then(Value::as_str);
+        let identifier = |value: Option<&str>| {
+            value
+                .filter(|value| crate::safe_provider_subcode(value))
+                .map(str::to_owned)
+        };
+        let mut logged = frame.clone();
+        if let Some(object) = logged.as_object_mut() {
+            object.remove("headers");
+            if let Some(error) = object.get_mut("error").and_then(Value::as_object_mut) {
+                error.remove("headers");
+            }
+        }
+        let mut log_body = logged.to_string();
+        if log_body.len() > WRAPPED_FRAME_LOG_LIMIT {
+            let mut end = WRAPPED_FRAME_LOG_LIMIT;
+            while !log_body.is_char_boundary(end) {
+                end -= 1;
+            }
+            log_body.truncate(end);
+        }
+        Self {
+            status,
+            code: identifier(field("/error/code")),
+            error_type: identifier(field("/error/type")),
+            param: field("/error/param")
+                .or_else(|| field("/param"))
+                .filter(|param| safe_error_param(param))
+                .map(str::to_owned),
+            log_body,
+        }
+    }
+
+    /// `Responses websocket attempt failed (HttpError 400); code=<c> type=<t> param=<p>; message
+    /// omitted`, naming only the fields the frame had in an identifier's shape. With none, the
+    /// message says the body was omitted, as for every other websocket failure.
+    pub(super) fn run_error_message(&self) -> String {
+        let fields = [
+            ("code", &self.code),
+            ("type", &self.error_type),
+            ("param", &self.param),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name}={value}")))
+        .collect::<Vec<_>>();
+        if fields.is_empty() {
+            format!(
+                "Responses websocket attempt failed (HttpError {}); response body omitted",
+                self.status
+            )
+        } else {
+            format!(
+                "Responses websocket attempt failed (HttpError {}); {}; message omitted",
+                self.status,
+                fields.join(" ")
+            )
+        }
+    }
+}
+
+/// Whether an `error.param` may be named in a run error: 1 to 128 characters, each a lowercase
+/// ASCII letter, a digit, `_`, `.`, `[` or `]`. That is the shape of the request path OpenAI puts
+/// there (`text.format.schema`, `input[3].content`). It has no space, `:`, `/`, `-` or capital, so
+/// it cannot hold a sentence, a URL, a bearer token or a JWT. Any other value is left out.
+fn safe_error_param(param: &str) -> bool {
+    (1..=128).contains(&param.len())
+        && param.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'_' | b'.' | b'[' | b']')
+        })
 }
 
 fn extend_wrapped_headers(headers: &mut reqwest::header::HeaderMap, source: &Value) {

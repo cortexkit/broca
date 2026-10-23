@@ -174,6 +174,22 @@ fn openai_chat_in_band_errors_follow_the_error_class_contract() {
             None,
         ),
         (
+            "an empty prepaid balance is billing exhaustion",
+            json!({"message": "You have no credits remaining.", "code": "credit_balance_exhausted", "type": "insufficient_quota"}),
+            ErrorClass::Permanent,
+            None,
+            Some("billing_exhausted"),
+            None,
+        ),
+        (
+            "the insufficient_quota type alone is billing exhaustion, even with a 429",
+            json!({"message": "quota gone", "code": "some_new_quota_code", "type": "insufficient_quota", "status": 429}),
+            ErrorClass::Permanent,
+            Some(429),
+            Some("billing_exhausted"),
+            None,
+        ),
+        (
             "plan entitlement is permanent",
             json!({"message": "not included", "code": "usage_not_included"}),
             ErrorClass::Permanent,

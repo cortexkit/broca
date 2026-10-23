@@ -709,6 +709,20 @@ pub(crate) fn classify_error(code: Option<&str>, status: Option<u16>) -> Option<
     }
 }
 
+/// Whether an OpenAI error says the organization's prepaid credit or quota is used up, so the
+/// credential that sent it cannot be served until someone pays. OpenAI says so in three ways: the
+/// older `insufficient_quota` code, the `credit_balance_exhausted` code its API sends when a
+/// prepaid balance reaches zero, or an error whose `type` is `insufficient_quota` whatever its
+/// code. `code` and `error_type` are the error object's own `code` and `type` fields, from an HTTP
+/// error body or from an in-band stream error event alike. Callers relabel a match
+/// [`broca_protocol::error::BILLING_EXHAUSTED`], which is permanent and names the credential.
+pub(crate) fn openai_billing_exhausted(code: Option<&str>, error_type: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("insufficient_quota" | "credit_balance_exhausted")
+    ) || error_type == Some("insufficient_quota")
+}
+
 /// Apply the provider-code table before generic HTTP-status defaults. An in-band error with no
 /// status therefore fails permanent when its code is unknown; the generic transient quota rule
 /// applies only when the provider actually identifies the error as status 429.

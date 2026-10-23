@@ -2145,7 +2145,16 @@ async fn websocket_errors_and_warnings_never_echo_headers_or_payloads() {
         .with_subscriber(logs.clone())
         .await
         .unwrap_err();
-        let diagnostics = format!("{:?} {:?}", failure.error, logs.0.lock().unwrap());
+        // A wrapped error frame's own text may reach broca's local WARN line, in its
+        // `error_frame` field only (see `WrappedErrorFrame`); never the headers it wraps.
+        let mut warnings = logs.0.lock().unwrap().clone();
+        for warning in &mut warnings {
+            if let Some(frame) = warning.remove("error_frame") {
+                assert!(!frame.contains("PRIVATE-HEADER-VALUE"), "{frame}");
+                assert!(!frame.contains("x-private"), "{frame}");
+            }
+        }
+        let diagnostics = format!("{:?} {:?}", failure.error, warnings);
         for private in ["PRIVATE-", "mock-token", "Bearer", "codex_cli_rs"] {
             assert!(
                 !diagnostics.contains(private),
@@ -3150,7 +3159,9 @@ fn wrapped_request_invalid_frame_extracts_type_and_code_only() {
 
 /// Through the real websocket step: the refusal ends the step on its one attempt, carries the
 /// typed code and detail through the websocket failure handling (which replaces the message and
-/// keeps only allowlisted codes), and still omits the body.
+/// keeps only allowlisted codes), and still omits the frame's message. The run error's message
+/// names the frame's status and its identifier-shaped fields so a reader can tell why the request
+/// was refused; the schema path in `param` is such an identifier, the schema text is not.
 #[tokio::test]
 async fn websocket_request_invalid_ends_the_step_with_typed_code_and_no_body() {
     let mock = Mock::start(
@@ -3174,12 +3185,12 @@ async fn websocket_request_invalid_ends_the_step_with_typed_code_and_no_body() {
     assert_eq!(error.status, Some(400));
     assert_eq!(
         error.message,
-        "Responses websocket attempt failed (HttpError); response body omitted"
+        "Responses websocket attempt failed (HttpError 400); code=invalid_json_schema type=invalid_request_error param=text.format.schema; message omitted"
     );
     let rendered = serde_json::to_string(error).unwrap();
     assert!(!rendered.contains("PRIVATE-SCHEMA-TEXT"), "{rendered}");
     assert!(!rendered.contains("mock-token"), "{rendered}");
-    assert!(!rendered.contains("text.format.schema"), "{rendered}");
+    assert!(!rendered.contains("Invalid schema"), "{rendered}");
     assert!(events.iter().any(|event| matches!(
         event,
         NormalizedEvent::Control(ProviderControl::Error {
@@ -3189,4 +3200,115 @@ async fn websocket_request_invalid_ends_the_step_with_typed_code_and_no_body() {
     )));
     assert_eq!(attempts(&events).len(), 1);
     assert_eq!(mock.observed.lock().unwrap().requests.len(), 1);
+}
+
+const MODEL_REFUSAL_TEXT: &str =
+    "The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account.";
+
+/// A wrapped refusal with no identifier-shaped field (one that explains itself only in prose,
+/// such as a refusal of a model the account cannot use) names its status and still omits the
+/// frame's text from the run error.
+#[tokio::test]
+async fn websocket_wrapped_refusal_without_identifier_fields_names_only_its_status() {
+    for frame in [
+        serde_json::json!({"type":"error","status":400,"error":{"message":MODEL_REFUSAL_TEXT}}),
+        serde_json::json!({"type":"error","status":400,"error":{"detail":MODEL_REFUSAL_TEXT}}),
+        // Fields that are not identifier-shaped are left out, never rewritten.
+        serde_json::json!({"type":"error","status":400,"error":{"message":MODEL_REFUSAL_TEXT,"code":"Not An Identifier","param":"input: Bearer mock-token"}}),
+    ] {
+        let mock = Mock::start(vec![vec![frame.clone()], text_events()], false, false).await;
+        let provider = provider(&mock);
+        let events = step(&provider, 1, &opts()).await;
+        let error = terminal_error(&events);
+        assert_eq!(error.class, ErrorClass::Permanent, "{frame}");
+        assert_eq!(error.status, Some(400));
+        assert_eq!(
+            error.message,
+            "Responses websocket attempt failed (HttpError 400); response body omitted",
+            "{frame}"
+        );
+        assert_eq!(attempts(&events).len(), 1);
+    }
+}
+
+/// The wrapped frame's identifier fields are read from `error`, with `param` also accepted at the
+/// top level of the frame, and the logged copy drops every `headers` object and is capped.
+#[test]
+fn wrapped_error_frame_keeps_identifier_fields_and_a_capped_header_free_log_body() {
+    let long = "x".repeat(4096);
+    let frame = serde_json::json!({
+        "type":"error",
+        "status":400,
+        "param":"input[3].content",
+        "headers":{"x-private":"PRIVATE-HEADER-VALUE"},
+        "error":{"type":"invalid_request_error","code":"model_not_supported","message":long,"headers":{"set-cookie":"PRIVATE-COOKIE"}}
+    });
+    let mut trace = AttemptTrace::default();
+    responses_websocket::wrapped_error(frame.to_string().as_bytes(), &mut trace)
+        .expect("a wrapped 400 is a refusal");
+    let recorded = trace.wrapped_error_frame.expect("the frame is kept");
+    assert_eq!(
+        recorded.run_error_message(),
+        "Responses websocket attempt failed (HttpError 400); code=model_not_supported type=invalid_request_error param=input[3].content; message omitted"
+    );
+    assert_eq!(recorded.log_body.len(), 1024);
+    assert!(
+        !recorded.log_body.contains("PRIVATE-"),
+        "{}",
+        recorded.log_body
+    );
+    assert!(
+        !recorded.log_body.contains("headers"),
+        "{}",
+        recorded.log_body
+    );
+}
+
+/// The failed attempt's WARN line carries the wrapped frame in its `error_frame` field, capped at
+/// 1 KiB, so the backend's reason can be read in broca's own log, while the returned run error's
+/// message omits the frame's text.
+#[tokio::test]
+async fn websocket_wrapped_refusal_warn_carries_the_capped_frame() {
+    use tracing::instrument::WithSubscriber;
+    let padding = "p".repeat(2048);
+    let frame = serde_json::json!({"type":"error","status":400,"error":{"detail":MODEL_REFUSAL_TEXT,"padding":padding},"headers":{"x-private":"PRIVATE-HEADER-VALUE"}});
+    let mock = Mock::start(vec![vec![frame]], true, false).await;
+    let provider = provider(&mock);
+    let mut request: PreparedHttpRequest = provider
+        .family
+        .endpoint(
+            &provider.frozen,
+            &provider.current_auth().auth,
+            provider.render_request(&opts()),
+        )
+        .into();
+    request.family = Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt);
+    let (tx, _rx) = mpsc::channel(256);
+    let mut trace = AttemptTrace::default();
+    let logs = super::chunk_error_tests::ProviderWarnings::default();
+    let failure = responses_websocket::drive(
+        &provider.websocket,
+        &provider.client,
+        &request,
+        &provider.clock,
+        provider.family.normalizer(&provider.frozen, StepId(1)),
+        &tx,
+        &mut trace,
+    )
+    .with_subscriber(logs.clone())
+    .await
+    .unwrap_err();
+    assert!(!failure.error.message.contains(MODEL_REFUSAL_TEXT));
+    let warnings = logs.0.lock().unwrap();
+    let attempt = warnings
+        .iter()
+        .find(|warning| {
+            warning.get("message").map(String::as_str) == Some("model websocket attempt failed")
+        })
+        .expect("one WARN for the failed attempt");
+    assert_eq!(attempt["transport"], "websocket");
+    let logged = &attempt["error_frame"];
+    assert!(logged.contains(MODEL_REFUSAL_TEXT), "{logged}");
+    assert_eq!(logged.len(), 1024);
+    assert!(!logged.contains("PRIVATE-HEADER-VALUE"), "{logged}");
 }

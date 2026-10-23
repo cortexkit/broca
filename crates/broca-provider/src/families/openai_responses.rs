@@ -1440,6 +1440,10 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let code = error.get("code").and_then(Value::as_str);
+    let error_type = error.get("type").and_then(Value::as_str);
+    // An exhausted prepaid balance is about the credential, not this request: relabel it so the
+    // run's terminal names the credential and routing stops using it.
+    let billing_exhausted = crate::normalize::openai_billing_exhausted(code, error_type);
     let message = if private_diagnostics {
         "Responses websocket backend reported an error; response body omitted".to_owned()
     } else {
@@ -1452,7 +1456,6 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
             format!("OpenAI Responses stream reported an error (event {event_type:?}, {code_description})")
         })
     };
-    let error_type = error.get("type").and_then(Value::as_str);
     if private_diagnostics {
         // Error messages, codes and even event discriminators are arbitrary backend strings.
         tracing::warn!(
@@ -1472,18 +1475,19 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
         provider_details: None,
         provider_subcode: None,
         refusal: None,
-        class: response_error_class(event, code),
+        class: if billing_exhausted {
+            ErrorClass::Permanent
+        } else {
+            response_error_class(event, code)
+        },
         message,
         status: None,
         retry_after_secs: None,
-        provider_code: code.map(|c| {
-            if c == "insufficient_quota" {
-                broca_protocol::error::BILLING_EXHAUSTED
-            } else {
-                c
-            }
-            .to_owned()
-        }),
+        provider_code: if billing_exhausted {
+            Some(broca_protocol::error::BILLING_EXHAUSTED.to_owned())
+        } else {
+            code.map(str::to_owned)
+        },
         resets_at_ms: None,
         resets_at_source: None,
         limit_window: None,
