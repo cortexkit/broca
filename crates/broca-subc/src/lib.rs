@@ -19,6 +19,7 @@
 pub mod compaction_plane;
 pub mod connection;
 pub mod consent;
+pub mod content_v1;
 pub mod hook_plane;
 pub mod plan_fetch;
 mod role_route;

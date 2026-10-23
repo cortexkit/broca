@@ -1,0 +1,1 @@
+{"max_tokens":2048,"messages":[{"content":[{"content":"12:00","is_error":false,"tool_use_id":"call_01","type":"tool_result"}],"role":"user"}],"model":"content-v1-model","stream":true,"system":[{"text":"You are Claude Code, Anthropic's official CLI for Claude.","type":"text"}],"thinking":{"budget_tokens":1024,"type":"enabled"}}

@@ -30,6 +30,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+base64 = "=0.22.1"
+sha2.workspace = true
 
 [dev-dependencies]
 cortexkit-role-tool-provider-conformance.workspace = true
