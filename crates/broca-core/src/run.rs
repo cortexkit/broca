@@ -4165,6 +4165,7 @@ where
             // The resumed turn belongs to this (last) episode → stamp its model, matching
             // what replay stamps for the same turn (C7 byte-identity).
             cfg.model.clone(),
+            computed_tags.is_none(),
             &budget_firings,
             control.emit_control_payloads,
             control.stop_requested.as_ref(),
@@ -5489,7 +5490,13 @@ where
         };
         crate::tags::attach(&mut answer, writer.take_step_tags(step_id).as_ref());
         mutable_call_options(&mut opts).prompt.push(answer);
-        let result_tags = live_result_tags(writer, &batch.results, &mut Default::default());
+        // Computed-tag runs number this appended message at the next step boundary. Only a
+        // legacy stored-ledger run needs the result tags assigned by the WAL writer here.
+        let stored_result_tags = if computed_tags.is_none() {
+            live_result_tags(writer, &batch.results, &mut Default::default())
+        } else {
+            None
+        };
         let mut results = Message {
             cache_prefix_blocks: None,
             role: Role::Tool,
@@ -5502,7 +5509,9 @@ where
             ordinal: None,
             tags: Default::default(),
         };
-        crate::tags::attach_parts(&mut results, result_tags);
+        if let Some(tags) = stored_result_tags {
+            crate::tags::attach_parts(&mut results, Some(tags));
+        }
         if let (Some(originals), Some(original)) = (originals.as_mut(), original_results) {
             originals.retain_change(opts.prompt.len(), original, &results);
         }
@@ -6333,6 +6342,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     prompt: &mut Vec<Message>,
     originals: Option<&mut crate::compaction::OriginalMessages>,
     origin: ModelHandle,
+    stored_tag_rules: bool,
     budget_firings: &[BudgetFiring],
     emit_control_payloads: bool,
     stop: Option<&CancellationToken>,
@@ -6468,7 +6478,13 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     };
     crate::tags::attach(&mut answer, assistant_tags.as_ref());
     prompt.push(answer);
-    let result_tags = live_result_tags(writer, &batch.results, &mut existing_tags);
+    // Recovered stored-ledger results keep their recorded tags; computed-tag results are
+    // numbered with the rest of the appended prompt at the next step boundary.
+    let recovered_result_tags = if stored_tag_rules {
+        live_result_tags(writer, &batch.results, &mut existing_tags)
+    } else {
+        None
+    };
     let mut results = Message {
         cache_prefix_blocks: None,
         role: Role::Tool,
@@ -6481,7 +6497,9 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         ordinal: None,
         tags: Default::default(),
     };
-    crate::tags::attach_parts(&mut results, result_tags);
+    if let Some(tags) = recovered_result_tags {
+        crate::tags::attach_parts(&mut results, Some(tags));
+    }
     if let (Some(originals), Some(original)) = (originals, original_results) {
         originals.retain_change(prompt.len(), original, &results);
     }

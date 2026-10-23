@@ -19541,7 +19541,7 @@ new = '''            (Role::Assistant, ContentBlock::Text { text } | ContentBloc
 
 [[control]]
 id = "runner-tags-live-results-render-as-their-rebuild"
-guards = "A render_tags run attaches each tool result's tag to the message it adds live, so its request equals the request rebuilt from the WAL"
+guards = "the live computed-numbering path assigns model-facing tags to appended messages, including tool results, so live requests equal their WAL rebuilds"
 runner = "cargo"
 package = "broca-core"
 target = "--test it"
@@ -19549,10 +19549,10 @@ select = "expected"
 test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
 expect_red = ["runner_tags_determinism::a_steer_mid_run_renders_live_as_its_rebuild"]
 file = "crates/broca-core/src/run.rs"
-old = '''        crate::tags::attach_parts(&mut results, result_tags);
-        if let (Some(originals), Some(original)) = (originals.as_mut(), original_results)'''
-new = '''        let _ = result_tags; // NON-VACUITY BREAK: the live tool message carries no tags
-        if let (Some(originals), Some(original)) = (originals.as_mut(), original_results)'''
+old = '''        tag_numbering
+            .number_new(&mut mutable_call_options(&mut opts).prompt)
+            .map_err(RunError::TagNumbering)?;'''
+new = '''        let _ = &mut tag_numbering; // NON-VACUITY BREAK: do not number live computed-tag messages'''
 
 [[control]]
 id = "runner-tags-steer-carries-its-record-tags"
@@ -24348,3 +24348,33 @@ expect_red = ["conformance::model_history::stale_episode_metadata_replays_and_re
 file = "crates/broca-store/src/lib.rs"
 old = "complete && span_seq == Some(watermark)"
 new = "complete && { let _ = (span_seq, watermark); true } /* NON-VACUITY BREAK: accept stale episode metadata */"
+
+[[control]]
+id = "runner-tags-stored-live-results-keep-writer-tags"
+guards = "a resumed stored-ledger episode attaches the WAL writer's tags to newly completed live tool results"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --test it \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
+expect_red = ["runner_tags_determinism::a_stored_ledger_resume_keeps_live_and_pending_result_tags"]
+expect_message = "stored-complete"
+file = "crates/broca-core/src/run.rs"
+old = '''        if let Some(tags) = stored_result_tags {
+            crate::tags::attach_parts(&mut results, Some(tags));
+        }'''
+new = '''        let _ = stored_result_tags; // NON-VACUITY BREAK: discard the live stored-ledger tags'''
+
+[[control]]
+id = "runner-tags-stored-pending-results-keep-recorded-tags"
+guards = "completing a stored-ledger pending turn keeps recovered and newly assigned result tags instead of relying on computed numbering"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-core --test it \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
+expect_red = ["runner_tags_determinism::a_stored_ledger_resume_keeps_live_and_pending_result_tags"]
+expect_message = "stored-pending"
+file = "crates/broca-core/src/run.rs"
+old = '''    if let Some(tags) = recovered_result_tags {
+        crate::tags::attach_parts(&mut results, Some(tags));
+    }'''
+new = '''    let _ = recovered_result_tags; // NON-VACUITY BREAK: discard pending-turn stored tags'''
