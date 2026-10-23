@@ -1394,6 +1394,10 @@ impl RetryClock {
     }
 
     async fn sleep(&self, delay: Duration) {
+        // Keep the marker on the retry path even when no virtual waits were configured:
+        // release admission must reject any linked test-harness transport.
+        #[cfg(feature = "test-harness")]
+        tracing::info!("BROCA_TEST_HARNESS_VIRTUAL_RETRY_WAITS_V1");
         #[cfg(any(test, feature = "test-harness"))]
         if let Some(waits) = &self.virtual_waits {
             waits.lock().unwrap().push(delay);

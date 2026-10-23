@@ -84,6 +84,7 @@ suites=(
     scripts/test-dependency-features.py
     scripts/test-cargo-watchdog.py
     scripts/tests/test_clock_safety.py
+    scripts/tests/test_release_fences.py
     # Maintenance scripts refuse to write while a writer's liveness is unknown.
     scripts/lib/test_liveness.py
     # Every suite file in scripts/ is listed in one of the arrays in this file.

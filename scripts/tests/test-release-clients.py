@@ -32,7 +32,7 @@ class StageClientsTests(unittest.TestCase):
             root = Path(directory)
             scripts = root / "scripts"
             scripts.mkdir()
-            for name in ("stage-release.sh", "dsym.sh", "wal-floor.sh", "running-image.sh", "signing-posture.sh"):
+            for name in ("stage-release.sh", "dsym.sh", "wal-floor.sh", "running-image.sh", "signing-posture.sh", "nonshipping-markers.sh"):
                 shutil.copy2(ROOT / "scripts" / name, scripts / name)
             script = scripts / "stage-release.sh"
             script.write_text(script.read_text().replace(

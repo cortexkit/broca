@@ -135,6 +135,7 @@ source "$REPO_ROOT/scripts/wal-floor.sh"
 source "$REPO_ROOT/scripts/running-image.sh"
 source "$REPO_ROOT/scripts/dsym.sh"
 source "$REPO_ROOT/scripts/release-clients.sh"
+source "$REPO_ROOT/scripts/nonshipping-markers.sh"
 GATE_LOG="$(mktemp "${TMPDIR:-/tmp}/place-gate.XXXXXX")"
 ACTIVE_RUNS_FILE="$(mktemp "${TMPDIR:-/tmp}/place-runs.XXXXXX")"
 TMP=""
@@ -485,6 +486,10 @@ run_candidate() {
   perl -e 'alarm shift; exec @ARGV or exit 127' "${PLACE_RELEASE_RUN_SECONDS:-30}" "$@" </dev/null
 }
 
+# Read the final signed copy, not the caller's staging path, before executing or publishing it.
+broca_refuse_nonshipping_markers "$TMP" place-release || \
+  gate_refuse nonshipping-marker "$TMP" "the copy contains test-only code, or its marker could not be checked."
+
 if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
 PLACED_FLAGS="$(broca_codesign_flags "$TMP" || true)"
 DEPLOYED_FLAGS="$(broca_codesign_flags "$DEST" || true)"
@@ -610,6 +615,8 @@ for i in 0 1; do
       gate_refuse client-signing "$client_tmp" "the client has get-task-allow."
     fi
   fi
+  broca_refuse_nonshipping_markers "$client_tmp" place-release || \
+    gate_refuse nonshipping-marker "$client_tmp" "the client contains test-only code, or its marker could not be checked."
   client_version="$(run_candidate "$client_tmp" --version)" \
     || gate_refuse client-version "$client_tmp" "the client's --version failed."
   [ "$client_version" = "$client ${SMOKE_LINE#ck-broca }" ] \

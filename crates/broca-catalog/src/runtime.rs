@@ -16,7 +16,13 @@ use serde_json::Map;
 use serde_json::Value;
 
 use crate::family::{resolve_provider_family, FamilyResolution};
-use crate::{Catalog, CatalogError, OVERLAY};
+#[cfg(any(test, feature = "test-support"))]
+use crate::Catalog;
+use crate::{CatalogError, OVERLAY};
+
+// Snapshot replacement bypasses refresh validation and must not be available to shipping code.
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!("catalog test-support cannot be enabled in a release build");
 
 /// Catalog fields fetched from fusiform for accepting sends and maintaining prompt caches.
 /// Accepting a send freezes its run configuration before any record is written.
@@ -235,6 +241,7 @@ impl Default for ServingModel {
 }
 
 impl ServingModel {
+    #[cfg(any(test, feature = "test-support"))]
     fn from_spec(
         model: &ModelSpec,
         model_family: WireFamilyId,
@@ -803,6 +810,7 @@ impl ServingCatalog {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn from_catalog(catalog: &Catalog) -> Self {
         let mut providers = BTreeMap::new();
         for (provider_id, (provider_family, _)) in &catalog.resolved_family {
@@ -1904,6 +1912,7 @@ impl CatalogCache {
     /// Install a document without touching disk. This is intended for focused tests that prove the
     /// admission path remains independent from a concurrently slow or failed poll.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn install_for_test(
         &self,
         response: FusiformCatalogResponse,
@@ -1916,6 +1925,7 @@ impl CatalogCache {
 
     /// Install an already assembled catalog for tests which exercise legacy snapshot fixtures.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn install_parsed_for_test(
         &self,
         catalog: &Catalog,

@@ -30,4 +30,5 @@ tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
+broca-catalog = { path = "../broca-catalog", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

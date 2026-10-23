@@ -260,6 +260,7 @@ name = "broca-catalog"
 version = "0.3.250"
 dependencies = [
  "base64",
+ "broca-catalog",
  "broca-core",
  "broca-owner-only",
  "broca-protocol",

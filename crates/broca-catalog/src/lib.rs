@@ -177,7 +177,8 @@ pub struct Catalog {
     pending: Vec<PendingProvider>,
     /// provider ids introduced by the overlay `add` block (not in the snapshot).
     overlay_added: Vec<String>,
-    /// Models suppressed by the overlay `remove` block, retained after their serving rows are gone.
+    /// Suppressed identities retained only to seed the test fixture cache after rows are removed.
+    #[cfg(any(test, feature = "test-support"))]
     overlay_removed_models: BTreeMap<String, BTreeSet<String>>,
     /// Explicit upstream withdrawals retained from fusiform's `include_retired` response. These
     /// are not serveable rows, but keeping the identity distinguishes a withdrawal from a typo.
@@ -300,6 +301,7 @@ impl Catalog {
 
         // Suppress retired models after the merge, so a suppression can target a row that
         // `patch` also touches and the ordering stays obvious: merge, then delete.
+        #[cfg(any(test, feature = "test-support"))]
         let mut overlay_removed_models: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (provider_id, model_ids) in validated_remove {
             let entry = providers
@@ -316,6 +318,7 @@ impl Catalog {
                         model: model_id.to_string(),
                     });
                 }
+                #[cfg(any(test, feature = "test-support"))]
                 overlay_removed_models
                     .entry(provider_id.clone())
                     .or_default()
@@ -347,6 +350,7 @@ impl Catalog {
             resolved_family,
             pending,
             overlay_added,
+            #[cfg(any(test, feature = "test-support"))]
             overlay_removed_models,
             withdrawn_models: BTreeSet::new(),
             metadata: None,
