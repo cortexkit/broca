@@ -384,6 +384,17 @@ fn echo_openrouter_details(message: &Message, wire: &mut Value) {
 
 // Preserve user block boundaries without changing the legacy scalar form for one text block.
 fn user_text_content(blocks: &[ContentBlock]) -> Value {
+    if blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Media(_)))
+    {
+        return Value::Array(blocks.iter().filter_map(|block| match block {
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => Some(json!({"type":"text", "text":text})),
+            ContentBlock::Media(media) => Some(json!({"type":"text", "text":broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
+            ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. }
+            | ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_) => None,
+        }).collect());
+    }
     let texts: Vec<&str> = blocks
         .iter()
         .filter_map(|block| match block {
@@ -439,6 +450,10 @@ fn convert_tool_choice(tc: &ToolChoice, name_map: &crate::tool_name_alias::ToolN
 
 fn tool_output_text(out: &ToolOutput) -> String {
     match out {
+        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+            parts,
+            broca_protocol::MediaMarkerReason::Carrier,
+        ),
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),

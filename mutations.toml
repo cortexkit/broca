@@ -24247,3 +24247,55 @@ expect_red = ["system_one::tests::the_catalog_row_decides_the_kind_refusals"]
 file = "crates/broca-module-serve/src/system_one/classify.rs"
 old = "            None => CatalogRow::Kindless,"
 new = "            None => CatalogRow::Kind(CLASSIFIER_KIND), // NON-VACUITY BREAK: read a kindless row as a classifier."
+
+[[control]]
+id = "media-marker-fixed-vocabulary"
+guards = "Media omission markers keep their fixed spelling and remain distinct from legacy image placeholders"
+runner = "cargo"
+select = "expected"
+package = "broca-protocol"
+target = "--lib"
+test_file = "crates/broca-protocol/src/media_tests.rs"
+expect_red = ["media_tests::media_markers_pin_vocabulary_and_never_match_image_placeholders"]
+file = "crates/broca-protocol/src/content.rs"
+old = '        "[media not shown: kind={} mime={} bytes={} sha256={} reason={}]",'
+new = '        "[media omitted: kind={} mime={} bytes={} sha256={} reason={}]", // NON-VACUITY BREAK: change the fixed marker grammar.'
+
+[[control]]
+id = "media-wal-all-carriers-must-understand"
+guards = "Every native media carrier and marker-only Parts output refuses an older WAL reader by feature name"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing/media_content_tests.rs"
+expect_red = ["framing::media_content_tests::media_content_is_must_understand_in_every_carrier"]
+file = "crates/broca-wal/src/record.rs"
+old = '        let base = if self.carries_media_content() {'
+new = '        let base = if false && self.carries_media_content() { // NON-VACUITY BREAK: omit the media grammar gate.'
+
+[[control]]
+id = "media-provider-parts-source-order"
+guards = "Every family renders text/media/text and multiple media with ordered carrier markers"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+target = "--lib"
+test_file = "crates/broca-provider/src/families/media_baseline_tests.rs"
+expect_red = ["families::media_baseline_tests::every_family_renders_parts_as_ordered_carrier_markers"]
+file = "crates/broca-protocol/src/content.rs"
+old = '        .join("\n")'
+new = '        .join("") // NON-VACUITY BREAK: erase part boundaries in the text-only carrier.'
+
+[[control]]
+id = "media-repetition-stored-digest"
+guards = "Multipart repetition identity includes the stored media digest and ordered text bytes"
+runner = "cargo"
+select = "expected"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/tool_repetition.rs"
+expect_red = ["tool_repetition::tests::multipart_repetition_identity_is_ordered_text_and_media_digest"]
+file = "crates/broca-core/src/tool_repetition.rs"
+old = '                        serde_json::json!({"sha256":media.sha256})'
+new = '                        serde_json::json!({"sha256":media.mime}) // NON-VACUITY BREAK: compare MIME instead of captured byte identity.'

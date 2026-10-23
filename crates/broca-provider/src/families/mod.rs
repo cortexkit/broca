@@ -33,6 +33,9 @@ pub mod openai_responses_chatgpt;
 
 pub use openai_responses_chatgpt::OpenAiResponsesChatgpt;
 
+#[cfg(test)]
+mod media_baseline_tests;
+
 use broca_protocol::{
     request::{CallOptions, GenerationConfig, ModelHandle, ToolChoice},
     Usage,

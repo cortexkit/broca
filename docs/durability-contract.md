@@ -85,6 +85,29 @@ outbound bytes on resume. State is echoed only when its format tag names the tar
 protocol and the assistant message's recorded provider/model IDs both match the target model.
 Unknown origins fail closed; visible text remains portable.
 
+Media references and ordered multipart tool outputs require **`media-content/v1`**. Any
+`Parts` output requires it, even one containing only failure-marker text: older readers cannot
+decode the new output kind. A record without the new grammar keeps its prior features and bytes.
+The reader and writer ship in the same release, an exception to the reader-first skip contract.
+Before the first media frame, the writer durably raises `wal-feature-floor`; if that fails, it
+appends nothing. Placement blocks rollback to a build lacking the feature, and such a reader
+refuses the WAL as `NewerWriter` naming `media-content/v1` before decoding content.
+
+| Carrying record | `media-content/v1` condition |
+|---|---|
+| `run_started` | Input contains a media block or Parts output, or a hook subject carries either |
+| `steered` | Input contains a media block or Parts output, or a hook subject carries either |
+| `queued` | Request input contains a media block or Parts output, or a hook subject carries either |
+| `model_step_finished` | Assistant content contains a media block or Parts output, or a hook subject carries either |
+| `tool_result` | Result uses Parts, or a hook subject carries a media block or Parts output |
+| `late_result` | Result uses Parts |
+| `approval_recorded` | Closing result uses Parts |
+| `send_delivered` | Carried input contains a media block or Parts output |
+| `tool_no_dispatch` | A hook subject carries a media block or Parts output |
+| `tool_dispatch_intent` | A hook subject carries a media block or Parts output (not arbitrary tool arguments) |
+| `compaction_message` | Replacement contains a media block or Parts output |
+| `compaction_view_applied` | The opaque view's native edit or replacement content carries a media block or Parts output |
+
 OpenRouter's `redacted_reasoning` blocks with `provider_format: "open_router"` and frozen
 `reasoning_echo.format: "open_router_details"` policies require **`openrouter-reasoning/v1`**.
 The reader and writer for this feature ship together. It is distinct from

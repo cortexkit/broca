@@ -363,6 +363,7 @@ fn reply_shape(content: &[ContentBlock]) -> Value {
     let mut tool_calls = 0;
     for block in content {
         match block {
+            ContentBlock::Media(_) => {}
             ContentBlock::Reasoning { .. } => reasoning += 1,
             ContentBlock::RedactedReasoning {
                 provider_format, ..

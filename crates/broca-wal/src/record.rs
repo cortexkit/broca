@@ -114,6 +114,9 @@ pub struct HookOp {
 /// skippable: an older build would silently compute the wrong session from it. Such a record
 /// requires a must-understand feature through `required_features`, shipped in a reader
 /// release before any writer uses it, never reliance on the `Unknown` arm to hide it.
+/// `media-content/v1` is a same-release reader/writer exception: its writer raises the
+/// machine's feature floor before the first media frame. Placement and WAL open then refuse
+/// older builds by feature name, so rollback past that release is blocked after media is written.
 ///
 /// The EXHAUSTIVE matches on this enum name `Unknown` explicitly, so adding a variant still
 /// fails to compile at each of them until someone decides what it means there. Many other
@@ -1219,6 +1222,11 @@ impl WalRecord {
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
         let base = self.base_required_features();
+        let base = if self.carries_media_content() {
+            with_feature(base, crate::framing::MEDIA_CONTENT_FEATURE)
+        } else {
+            base
+        };
         let base = if matches!(
             self,
             WalRecord::RunFinished {
@@ -1369,6 +1377,102 @@ impl WalRecord {
             WalRecord::RunStarted { config, .. } => declares(&config.tools),
             WalRecord::Queued { request, .. } => request.tools.as_deref().is_some_and(declares),
             _ => false,
+        }
+    }
+
+    fn carries_media_content(&self) -> bool {
+        use broca_protocol::{ContentBlock, ToolOutput};
+        let result = |result: &ToolResult| matches!(result.output, ToolOutput::Parts { .. });
+        let blocks = |content: &[ContentBlock]| {
+            content.iter().any(|block| match block {
+                ContentBlock::Media(_) => true,
+                ContentBlock::ToolResult(value) => result(value),
+                ContentBlock::Text { .. }
+                | ContentBlock::TextWithState { .. }
+                | ContentBlock::Reasoning { .. }
+                | ContentBlock::RedactedReasoning { .. }
+                | ContentBlock::ToolCall(_) => false,
+            })
+        };
+        let messages = |messages: &[Message]| messages.iter().any(|m| blocks(&m.content));
+        let hooks = |hooks: &Option<Box<Hooks>>| {
+            hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .original
+                    .iter()
+                    .chain(hooks.final_value.iter())
+                    .any(json_carries_media_content)
+            })
+        };
+        match self {
+            Self::RunStarted {
+                input, hooks: h, ..
+            }
+            | Self::Steered {
+                input, hooks: h, ..
+            } => messages(input) || hooks(h),
+            Self::Queued {
+                request, hooks: h, ..
+            } => messages(&request.input) || hooks(h),
+            Self::ModelStepFinished {
+                assistant_message,
+                hooks: h,
+                ..
+            } => blocks(&assistant_message.content) || hooks(h),
+            Self::ToolResult {
+                result: value,
+                hooks: h,
+                ..
+            } => result(value) || hooks(h),
+            Self::LateResult { result: value, .. } => result(value),
+            Self::ApprovalRecorded { closing_result, .. } => {
+                closing_result.as_deref().is_some_and(result)
+            }
+            Self::SendDelivered { input, .. } => {
+                input.as_deref().is_some_and(|input| messages(input))
+            }
+            Self::ToolNoDispatch { hooks: h, .. } | Self::ToolDispatchIntent { hooks: h, .. } => {
+                hooks(h)
+            }
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            Self::CompactionViewApplied { view, .. } => {
+                serde_json::from_str::<Value>(view.as_json_text())
+                    .is_ok_and(|view| view_carries_media_content(&view))
+            }
+            Self::ModelAttemptFinished { .. }
+            | Self::StepStarted { .. }
+            | Self::ToolBatchStarted { .. }
+            | Self::ToolBatchFinished { .. }
+            | Self::TurnFinished { .. }
+            | Self::BudgetFired { .. }
+            | Self::InputTokenCapFrozen { .. }
+            | Self::InputTokenBudgetExhausted { .. }
+            | Self::ContextCeilingWait { .. }
+            | Self::ContextCeilingDecided { .. }
+            | Self::StructuredOutputDowngraded { .. }
+            | Self::StructuredOutputResult { .. }
+            | Self::RunFinished { .. }
+            | Self::RunCancelRequested { .. }
+            | Self::RunPaused { .. }
+            | Self::RunConfigRefrozen { .. }
+            | Self::RunAuthRefrozen { .. }
+            | Self::Retracted { .. }
+            | Self::ApprovalRequested { .. }
+            | Self::ApprovalResolved { .. }
+            | Self::ResumeStarted { .. }
+            | Self::CacheWarmed { .. }
+            | Self::CompactionRequest { .. }
+            | Self::CompactionAnswer { .. }
+            | Self::CompactionWait { .. }
+            | Self::CompactionNotice { .. }
+            | Self::ToolCallDeferred { .. }
+            | Self::AwaitingApproval { .. }
+            | Self::LateApprovalRecorded { .. }
+            | Self::LateDispatchIntent { .. }
+            | Self::QuestionWithdrawalAcknowledged { .. }
+            | Self::DeliveryOrdered { .. }
+            | Self::SendEnded { .. }
+            | Self::Unknown => false,
         }
     }
 
@@ -1765,6 +1869,61 @@ impl WalRecord {
             _ => &[],
         }
     }
+}
+
+/// Hook subjects and view edits contain native content inside otherwise opaque envelopes.
+/// Inspect only those envelopes, never arbitrary tool JSON or tool-call arguments.
+fn json_carries_media_content(value: &Value) -> bool {
+    use broca_protocol::{ContentBlock, ToolOutput};
+    if let Ok(block) = serde_json::from_value::<ContentBlock>(value.clone()) {
+        return match block {
+            ContentBlock::Media(_) => true,
+            ContentBlock::ToolResult(result) => matches!(result.output, ToolOutput::Parts { .. }),
+            ContentBlock::Text { .. }
+            | ContentBlock::TextWithState { .. }
+            | ContentBlock::Reasoning { .. }
+            | ContentBlock::RedactedReasoning { .. }
+            | ContentBlock::ToolCall(_) => false,
+        };
+    }
+    if let Ok(result) = serde_json::from_value::<ToolResult>(value.clone()) {
+        return matches!(result.output, ToolOutput::Parts { .. });
+    }
+    match value {
+        Value::Array(values) => values.iter().any(json_carries_media_content),
+        Value::Object(values) => values.values().any(json_carries_media_content),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+fn view_carries_media_content(view: &Value) -> bool {
+    let native = |value: &Value| {
+        value
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .is_some_and(|value| json_carries_media_content(&value))
+    };
+    view.get("ranges")
+        .and_then(Value::as_array)
+        .is_some_and(|ranges| {
+            ranges.iter().any(|range| {
+                match range.get("kind").and_then(Value::as_str) {
+                    Some("replace") => range.get("bytes").is_some_and(native),
+                    Some("keep") => {
+                        range
+                            .get("edits")
+                            .and_then(Value::as_array)
+                            .is_some_and(|edits| {
+                                edits
+                                    .iter()
+                                    .any(|edit| edit.get("bytes").is_some_and(native))
+                            })
+                    }
+                    // Unknown range kinds cannot contribute native content this reader assembles.
+                    Some(_) | None => false,
+                }
+            })
+        })
 }
 
 /// Cancellation points recorded in the WAL. The run.cancel endpoint rejects all other strings

@@ -150,6 +150,8 @@ const LINEAGE_PAYLOAD_LEN: u32 = 16;
 pub const GATED_FRAMING_VERSION: u8 = 3;
 pub const INTERRUPT_REASON_FEATURE: &str = "interrupt-reason/v1";
 pub const TURN_DIRECTIVES_FEATURE: &str = "turn-directives/v1";
+/// Media references and ordered tool parts extend closed content enums.
+pub const MEDIA_CONTENT_FEATURE: &str = "media-content/v1";
 
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
@@ -178,6 +180,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     FLOW_SCOPE_FEATURE,
     GOOGLE_RPC_ERROR_DETAILS_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
+    MEDIA_CONTENT_FEATURE,
     OPENROUTER_REASONING_FEATURE,
     PLAN_MANIFEST_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
@@ -751,6 +754,9 @@ mod deferred_call_tests;
 mod openrouter_reasoning_tests;
 
 #[cfg(test)]
+mod media_content_tests;
+
+#[cfg(test)]
 mod retention_tests;
 
 #[cfg(test)]
@@ -950,6 +956,7 @@ mod tests {
                 FLOW_SCOPE_FEATURE,
                 GOOGLE_RPC_ERROR_DETAILS_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
+                MEDIA_CONTENT_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
                 PLAN_MANIFEST_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,

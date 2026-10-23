@@ -488,6 +488,7 @@ fn convert_content(
     blocks
         .iter()
         .filter_map(|block| match block {
+            ContentBlock::Media(media) => Some(json!({"text": broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
             // Drop an empty text part (Bedrock rejects `text:""`). Defensive against foreign input; the owned normalizers never emit empty text.
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
                 if text.is_empty() =>
@@ -539,6 +540,17 @@ fn convert_tool_result(
 
 fn convert_tool_output(output: &ToolOutput) -> Vec<Value> {
     match output {
+        ToolOutput::Parts { parts } => {
+            let text = broca_protocol::content::media_parts_text(
+                parts,
+                broca_protocol::MediaMarkerReason::Carrier,
+            );
+            if text.is_empty() {
+                vec![json!({"json": text})]
+            } else {
+                vec![json!({"text": text})]
+            }
+        }
         // Bedrock rejects blank text blocks. A JSON empty string preserves an empty tool result
         // without inventing prose for the model; `toolResult.status` still carries error state.
         ToolOutput::Text { text } if text.is_empty() => vec![json!({ "json": text })],
@@ -1616,6 +1628,8 @@ mod tests {
 
     fn legacy_convert_tool_output(output: &ToolOutput) -> Vec<Value> {
         match output {
+            // Multipart output had no representation in the legacy model.
+            ToolOutput::Parts { .. } => Vec::new(),
             ToolOutput::Text { text } => vec![json!({ "text": text })],
             ToolOutput::Json { value } => vec![json!({ "json": value })],
             ToolOutput::Denied { reason } => vec![json!({ "text": format!("denied: {reason}") })],
