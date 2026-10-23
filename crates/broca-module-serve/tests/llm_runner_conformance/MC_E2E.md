@@ -51,14 +51,23 @@ The run checks, in order:
   tags of the two oldest, and Magic Context acknowledges it;
 - turns with more tool output continue until the advance notice's estimate
   passes 50% of the 128,000-token window (`execute_threshold_percentage` 50);
-- on the step after that, Magic Context publishes a `view_ready` above every
-  version seen before. If none arrives within the shared hang guard, the test
-  fails naming the session ref and the last notice seq;
-- intake pauses after the receipt commit so the durable receipt is checked
-  before ACK, then the broker ACK, the applied view, and that broca applied
-  the newest announced version;
-- the view drops or replaces parts, the stamped outputs are no longer sent, and
-  the next model request is smaller than the one before it;
+- Magic Context may publish a view after any advance notice, including the
+  first, with or without drops; broca applies such early views as usual and the
+  test makes no assumption about them;
+- once broca's log has handled every `view_ready` seen so far, the receipt gate
+  is armed for the next one, just before the step after the crossing. Magic
+  Context then publishes a `view_ready` above the newest view broca has applied.
+  If none reaches the gate within the shared hang guard, the test fails naming
+  the session ref, the announced versions and any published before the gate;
+- with that view's ACK held, broca's store holds a durable receipt for exactly
+  that `(session_ref, view_version)`, or its WAL already records a decision on
+  it (applied, refused, or passed over for a newer view), since a decision
+  clears the receipt; then the broker ACK, the applied view, and that broca
+  applied the newest announced version;
+- the history broca assembles under the applied view (as `view.get` returned
+  it, recorded in the WAL) no longer holds the parts of the dropped tags, the
+  stamped outputs are no longer sent, and the next model request is smaller
+  than the one before it;
 - a real process kill mid-step is followed by identical request bytes on resume.
 
 Not checked: views Magic Context hands over during a ride (a rewrite broca asks
