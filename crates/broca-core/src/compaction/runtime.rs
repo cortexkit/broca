@@ -224,6 +224,38 @@ pub(crate) struct BoundaryViews {
     held: Option<(ViewReady, CompactionView)>,
 }
 
+/// The run and step at whose boundary a view is offered, named in the line that logs the
+/// decision.
+#[derive(Clone, Copy)]
+pub(crate) struct StepAt<'a> {
+    pub run_id: &'a str,
+    pub step: u64,
+    /// Versions this boundary already passed over for a newer one, named in the decision line.
+    pub superseded: &'a [u64],
+}
+
+/// What offering one fetched view at a boundary came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Offered {
+    Applied,
+    /// A newer version is known; the caller offers the newest instead.
+    Superseded,
+    NotApplied,
+}
+
+/// The most versions one boundary passes over for newer ones before it stops and leaves the
+/// rest to the next boundary, so a provider publishing without pause cannot hold it forever.
+const MAX_SUPERSEDED: usize = 8;
+
+/// Versions as one log field value: `1,2`.
+fn version_list(versions: &[u64]) -> String {
+    versions
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub(crate) struct Runtime<'a> {
     pub provider: &'a str,
     pub bind: &'a BindIdentity,
@@ -234,11 +266,15 @@ pub(crate) struct Runtime<'a> {
 
 /// Apply an announcement while no run owns the writer. The caller supplies the exact
 /// offline renderer for the last episode; no model or credential request is made here.
+/// `views` is the session's inbox of announced views: when a newer version is announced while
+/// `ready`'s view is fetched, that newer one is fetched and decided instead, so the session's
+/// prefix is rewritten once, for the newest view.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_idle_view(
     bind: &BindIdentity,
     writer: &crate::WalHandle,
     plane: &Arc<dyn CompactionPlane>,
+    views: Option<Arc<dyn CompactionViews>>,
     ready: &ViewReady,
     state: &mut CompactionState,
     prompt: &[Message],
@@ -252,7 +288,10 @@ pub async fn apply_idle_view(
         .lineage_id()
         .ok_or_else(|| crate::RunError::Wal("compaction requires a lineage".into()))?
         .to_string();
-    let control = crate::RunControl::default();
+    let control = crate::RunControl {
+        compaction_views: views,
+        ..crate::RunControl::default()
+    };
     let runtime = Runtime {
         provider: &state.provider.clone(),
         bind,
@@ -260,21 +299,53 @@ pub async fn apply_idle_view(
         writer,
         control: &control,
     };
-    let already_applied = state
-        .applied_view_version(&lineage)
-        .is_some_and(|version| version >= ready.view_version);
-    let (decision, event) = if already_applied {
-        (view::Decision::Stale, None)
-    } else {
-        let fetched = match runtime.view_get(ready).await {
+    let mut ready = ready.clone();
+    let mut superseded: Vec<u64> = Vec::new();
+    let decided = |ready: &ViewReady, superseded: &[u64], choice: &str, reason: &str| {
+        if superseded.is_empty() {
+            tracing::info!(target: "compaction", session_ref = %ready.session_ref,
+                view_version = ready.view_version, choice, reason,
+                "compaction view decided at the idle boundary");
+        } else {
+            tracing::info!(target: "compaction", session_ref = %ready.session_ref,
+                view_version = ready.view_version, choice, reason,
+                superseded = %version_list(superseded),
+                "compaction view decided at the idle boundary");
+        }
+    };
+    let mut already_applied = false;
+    let mut decision = view::Decision::Stale;
+    let mut event = None;
+    for _ in 0..MAX_SUPERSEDED {
+        already_applied = state
+            .applied_view_version(&lineage)
+            .is_some_and(|version| version >= ready.view_version);
+        if already_applied {
+            decided(&ready, &superseded, "applied", "already_applied");
+            (decision, event) = (view::Decision::Stale, None);
+            break;
+        }
+        let fetched = match runtime.view_get(&ready).await {
             Fetch::View(view) => *view,
-            Fetch::Unavailable | Fetch::Refused(_) => return Ok(false),
+            Fetch::Unavailable => {
+                decided(&ready, &superseded, "not_fetched", "view_get_unavailable");
+                return Ok(false);
+            }
+            Fetch::Refused(code) => {
+                decided(
+                    &ready,
+                    &superseded,
+                    "not_fetched",
+                    &format!("view_get_refused:{code}"),
+                );
+                return Ok(false);
+            }
         };
-        runtime
+        (decision, event) = runtime
             .offer_view(
                 state,
                 &fetched,
-                ready,
+                &ready,
                 &lineage,
                 prompt,
                 stored,
@@ -282,8 +353,22 @@ pub async fn apply_idle_view(
                 // No run owns the writer, so this is no run's first step.
                 false,
             )
-            .await?
-    };
+            .await?;
+        let (choice, reason) = decision.choice();
+        decided(&ready, &superseded, choice, reason);
+        if !matches!(decision, view::Decision::Superseded) {
+            break;
+        }
+        superseded.push(ready.view_version);
+        // The newest announced version above every one passed over. None when only the
+        // provider's answer was newer: its own announcement brings it to a later pass.
+        let Some(newer) = control.compaction_views.as_deref().and_then(|inbox| {
+            inbox.newest_ready(&ready.session_ref, &lineage, Some(ready.view_version))
+        }) else {
+            break;
+        };
+        ready = newer;
+    }
     let applied = matches!(decision, view::Decision::Apply(_)) || already_applied;
     if let Some(notice) = view::next_notice(
         state,
@@ -527,6 +612,11 @@ impl Runtime<'_> {
                             // The boundary's own offer (views_at_boundary) already ended any
                             // deferral at a run's first step; a ceiling ride only adds views.
                             false,
+                            StepAt {
+                                run_id: &run_id.0,
+                                step: step_id.0,
+                                superseded: &[],
+                            },
                             &mut events,
                         )
                         .await?;
@@ -605,6 +695,11 @@ impl Runtime<'_> {
                                     stored,
                                     provider.reasoning_is_prefix_bound(),
                                     false,
+                                    StepAt {
+                                        run_id: &run_id.0,
+                                        step: step_id.0,
+                                        superseded: &[],
+                                    },
                                     &mut events,
                                 )
                                 .await?;
@@ -849,13 +944,17 @@ impl Runtime<'_> {
         stored: super::StoredTranscript<'_>,
         prefix_bound: bool,
         run_start: bool,
-        step_id: broca_protocol::StepId,
+        at: StepAt<'_>,
     ) -> Result<Vec<Event>, crate::RunError> {
         let mut events = Vec::new();
+        // Versions passed over at this boundary because a newer one was known by the time
+        // each was decided; the newest is the only one applied.
+        let mut superseded = Vec::new();
         if let Some(cause) = view::rewrite_ride_cause(state, model) {
+            let step_id = broca_protocol::StepId(at.step);
             if let Some(view) = Box::pin(self.ride(state, step_id, session_ref, cause)).await? {
                 let ready = ViewReady::for_view(&view);
-                let applied = Box::pin(self.offer(
+                match Box::pin(self.offer(
                     views,
                     state,
                     &view,
@@ -865,11 +964,14 @@ impl Runtime<'_> {
                     stored,
                     prefix_bound,
                     run_start,
+                    at,
                     &mut events,
                 ))
-                .await?;
-                if applied {
-                    return Ok(events);
+                .await?
+                {
+                    Offered::Applied => return Ok(events),
+                    Offered::Superseded => superseded.push(view.view_version),
+                    Offered::NotApplied => {}
                 }
             }
         }
@@ -877,48 +979,61 @@ impl Runtime<'_> {
             return Ok(events);
         };
         let current = state.view.as_ref().map(|applied| applied.view.view_version);
-        let Some(ready) = inbox
-            .newest_ready(session_ref, lineage_id, current)
-            .filter(|ready| views.declined != Some(ready.view_version))
-        else {
-            return Ok(events);
-        };
-        let fetched = match &views.held {
-            Some((held, view)) if *held == ready => view.clone(),
-            _ if self.now() < views.unavailable_until => return Ok(events),
-            _ => match Box::pin(self.view_get(&ready)).await {
-                Fetch::View(view) => {
-                    views.held = Some((ready.clone(), (*view).clone()));
-                    *view
-                }
-                Fetch::Refused(code) => {
-                    tracing::info!(
-                        view_version = ready.view_version,
-                        %code,
-                        "compaction provider refused view.get; keeping the current view"
-                    );
-                    views.declined = Some(ready.view_version);
-                    return Ok(events);
-                }
-                Fetch::Unavailable => {
-                    views.unavailable_until = self.now().saturating_add(30_000);
-                    return Ok(events);
-                }
-            },
-        };
-        Box::pin(self.offer(
-            views,
-            state,
-            &fetched,
-            &ready,
-            lineage_id,
-            prompt,
-            stored,
-            prefix_bound,
-            run_start,
-            &mut events,
-        ))
-        .await?;
+        for _ in 0..MAX_SUPERSEDED {
+            // Above both the rendered view and every version this boundary passed over, so a
+            // version superseded by the provider's own newer answer is not fetched again here.
+            let after = current.max(superseded.iter().copied().max());
+            let Some(ready) = inbox
+                .newest_ready(session_ref, lineage_id, after)
+                .filter(|ready| views.declined != Some(ready.view_version))
+            else {
+                return Ok(events);
+            };
+            let fetched = match &views.held {
+                Some((held, view)) if *held == ready => view.clone(),
+                _ if self.now() < views.unavailable_until => return Ok(events),
+                _ => match Box::pin(self.view_get(&ready)).await {
+                    Fetch::View(view) => {
+                        views.held = Some((ready.clone(), (*view).clone()));
+                        *view
+                    }
+                    Fetch::Refused(code) => {
+                        tracing::info!(
+                            view_version = ready.view_version,
+                            %code,
+                            "compaction provider refused view.get; keeping the current view"
+                        );
+                        views.declined = Some(ready.view_version);
+                        return Ok(events);
+                    }
+                    Fetch::Unavailable => {
+                        views.unavailable_until = self.now().saturating_add(30_000);
+                        return Ok(events);
+                    }
+                },
+            };
+            let offered = Box::pin(self.offer(
+                views,
+                state,
+                &fetched,
+                &ready,
+                lineage_id,
+                prompt,
+                stored,
+                prefix_bound,
+                run_start,
+                StepAt {
+                    superseded: &superseded,
+                    ..at
+                },
+                &mut events,
+            ))
+            .await?;
+            if offered != Offered::Superseded {
+                return Ok(events);
+            }
+            superseded.push(ready.view_version);
+        }
         Ok(events)
     }
 
@@ -935,8 +1050,9 @@ impl Runtime<'_> {
         stored: super::StoredTranscript<'_>,
         prefix_bound: bool,
         run_start: bool,
+        at: StepAt<'_>,
         events: &mut Vec<Event>,
-    ) -> Result<bool, crate::RunError> {
+    ) -> Result<Offered, crate::RunError> {
         let version = fetched.view_version;
         let (decision, event) = Box::pin(self.offer_stored_view(
             state,
@@ -949,15 +1065,35 @@ impl Runtime<'_> {
             run_start,
         ))
         .await?;
+        // One line for each applied or refused view, and for the first boundary that defers
+        // a version; a held view is offered again at every later boundary, and repeating the
+        // line there would bury the others.
+        let first_report = views.reported != Some(version);
+        if let view::Decision::Apply(_)
+        | view::Decision::Refuse(_)
+        | view::Decision::Defer(_)
+        | view::Decision::Superseded = &decision
+        {
+            let (choice, reason) = decision.choice();
+            if !matches!(decision, view::Decision::Defer(_)) || first_report {
+                if at.superseded.is_empty() {
+                    tracing::info!(target: "compaction", run_id = at.run_id, step = at.step,
+                        view_version = version, choice, reason,
+                        "compaction view decided at a step boundary");
+                } else {
+                    tracing::info!(target: "compaction", run_id = at.run_id, step = at.step,
+                        view_version = version, choice, reason,
+                        superseded = %version_list(at.superseded),
+                        "compaction view decided at a step boundary");
+                }
+            }
+        }
         match &decision {
             // A refused, rejected or stale view is never offered to this run again. A deferred
             // view is offered at every later boundary, and so is one that is not (yet) a prefix
             // of this transcript: it may cover messages this run has still to write again after
             // a restart.
-            view::Decision::Refuse(reason) => {
-                tracing::info!(view_version = version, reason, "compaction view refused");
-                views.declined = Some(version);
-            }
+            view::Decision::Refuse(_) => views.declined = Some(version),
             view::Decision::Rejected(problem) => {
                 tracing::info!(view_version = version, problem = %problem.name(), "compaction view rejected");
                 views.declined = Some(version);
@@ -966,6 +1102,8 @@ impl Runtime<'_> {
             // Not (yet) a prefix of this transcript: held and offered again at every later
             // boundary, so it is not logged here, where it would repeat at each one.
             view::Decision::Discard | view::Decision::Defer(_) | view::Decision::Apply(_) => {}
+            // A newer version replaces this one; the caller offers that one instead.
+            view::Decision::Superseded => views.held = None,
         }
         if views.reported != Some(version) {
             if let Some(event) = event {
@@ -977,7 +1115,11 @@ impl Runtime<'_> {
         if applied || views.declined == Some(version) {
             views.held = None;
         }
-        Ok(applied)
+        Ok(match decision {
+            view::Decision::Apply(_) => Offered::Applied,
+            view::Decision::Superseded => Offered::Superseded,
+            _ => Offered::NotApplied,
+        })
     }
 
     /// Offer a fetched view at a step boundary: decide what to do with it
@@ -1028,16 +1170,32 @@ impl Runtime<'_> {
         prefix_bound: bool,
         run_start: bool,
     ) -> Result<(view::Decision, Option<Event>), crate::RunError> {
-        let decision = view::decide_stored_at(
-            fetched,
-            ready,
-            state,
-            lineage_id,
-            prompt,
-            stored,
-            prefix_bound,
-            run_start,
-        );
+        // The newest version wins. One announced (and so durably receipted) while this one was
+        // fetched, or one the provider answered in its place, supersedes it. The check runs just
+        // before the decision, with no wait between them; a version announced later, while the
+        // applied record is being written, is applied at a later boundary.
+        let newer_announced = self
+            .control
+            .compaction_views
+            .as_deref()
+            .and_then(|inbox| {
+                inbox.newest_ready(&ready.session_ref, lineage_id, Some(ready.view_version))
+            })
+            .is_some();
+        let decision = if newer_announced || fetched.view_version > ready.view_version {
+            view::Decision::Superseded
+        } else {
+            view::decide_stored_at(
+                fetched,
+                ready,
+                state,
+                lineage_id,
+                prompt,
+                stored,
+                prefix_bound,
+                run_start,
+            )
+        };
         if let view::Decision::Apply(choice) = &decision {
             self.apply_view(state, fetched, choice.clone()).await?;
         }
