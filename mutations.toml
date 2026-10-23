@@ -24944,3 +24944,18 @@ old = '''    if let Some(tags) = recovered_result_tags {
         crate::tags::attach_parts(&mut results, Some(tags));
     }'''
 new = '''    let _ = recovered_result_tags; // NON-VACUITY BREAK: discard pending-turn stored tags'''
+
+[[control]]
+id = "opencode-402-is-billing-exhausted"
+guards = "OpenCode Zen's and Go's HTTP 402 for an empty account balance is a permanent billing_exhausted refusal, not a generic server_error"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport.rs"
+expect_red = ["transport::tests::opencode_zen_402_is_billing_exhausted", "transport::tests::opencode_go_402_is_billing_exhausted"]
+expect_message = "billing_exhausted"
+file = "crates/broca-provider/src/transport.rs"
+old = '''    if status != 402 || !is_opencode_gateway_url(request_url) {'''
+new = '''    if status != 402 || !is_opencode_gateway_url(request_url) || true { // NON-VACUITY BREAK: never map OpenCode's 402 to billing_exhausted.'''
