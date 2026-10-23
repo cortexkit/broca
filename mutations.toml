@@ -19610,12 +19610,18 @@ select = "expected"
 test_file = "crates/broca-core/tests/it/runner_tags_determinism.rs"
 expect_red = ["runner_tags_determinism::a_repeated_tool_call_id_renders_live_as_its_rebuild"]
 file = "crates/broca-core/src/run.rs"
-old = '''    parts
-        .iter()
-        .any(Option::is_some)
-        .then(|| broca_protocol::tags::PartTags::new(parts))'''
-new = '''    let _ = parts.iter().any(Option::is_some); // NON-VACUITY BREAK: an untagged batch still gets empty live tags
-    Some(broca_protocol::tags::PartTags::new(parts))'''
+# The tag-collection helper serves only stored-ledger runs. Computed results must
+# remain untagged here: even an all-None tag vector suppresses step numbering.
+old = '''        let stored_result_tags = if computed_tags.is_none() {
+            live_result_tags(writer, &batch.results, &mut Default::default())
+        } else {
+            None
+        };'''
+new = '''        let stored_result_tags = if computed_tags.is_none() {
+            live_result_tags(writer, &batch.results, &mut Default::default())
+        } else {
+            Some(broca_protocol::tags::PartTags::new(vec![None; batch.results.len()])) // NON-VACUITY BREAK: mark unnumbered live results as already tagged
+        };'''
 
 [[control]]
 id = "runner-tags-steer-carries-its-record-tags"
@@ -25106,3 +25112,70 @@ expect_red = ["framing::media_content_tests::hook_tool_arguments_never_require_m
 file = "crates/broca-wal/src/record.rs"
 old = '        MediaHookSubject::ToolInput => false,'
 new = '        MediaHookSubject::ToolInput => MediaBlock::deserialize(value).is_ok_and(|block| block.carries_media()), // NON-VACUITY BREAK: treat opaque tool arguments as native content.'
+
+[[control]]
+id = "catalog-input-modalities-requested"
+guards = "The Fusiform poll requests input modalities so Claude image and PDF claims reach admission"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::live_fusiform_input_modalities_reach_serving_models"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = '    "capability.input_modalities",'
+new = '    // NON-VACUITY BREAK: omit the input-modality request prefix.'
+
+[[control]]
+id = "catalog-input-modalities-live-serving"
+guards = "The compact Fusiform serving model carries its own input modalities into ModelSpec"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::live_fusiform_input_modalities_reach_serving_models"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = '            input_modalities: self.input_modalities,'
+new = '            input_modalities: { let _ = self.input_modalities; InputModalities::default() }, // NON-VACUITY BREAK: drop live modalities at serving.'
+
+[[control]]
+id = "catalog-input-modalities-snapshot-source"
+guards = "The models.dev mapper reads modalities.input rather than output modalities or Fusiform-shaped keys"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/lib.rs"
+expect_red = ["tests::snapshot_input_modalities_use_only_the_snapshot_source"]
+file = "crates/broca-catalog/src/lib.rs"
+old = '            .and_then(|modalities| modalities.get("input"))'
+new = '            .and_then(|modalities| modalities.get("output")) // NON-VACUITY BREAK: use output support as input support.'
+
+[[control]]
+id = "catalog-input-modalities-malformed-unknown"
+guards = "A malformed modality list must clear every claim to unknown, even when an entry names image"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::malformed_fusiform_input_modalities_still_serve_text"]
+file = "crates/broca-provider/src/spec.rs"
+old = '            .filter(|entries| entries.iter().all(Value::is_string))'
+new = '            .filter(|_| true) // NON-VACUITY BREAK: accept malformed lists as known modality claims.'
+
+[[control]]
+id = "catalog-input-modalities-equal-version-upgrade"
+guards = "A same-version Fusiform poll rebuilds an older index when the newly requested modality fact arrives"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::an_equal_version_poll_that_newly_carries_input_modalities_rebuilds_the_index"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = '''                    || response_carries_input_modalities(&response)
+                        != current.carries_input_modalities'''
+new = '''                    || false && response_carries_input_modalities(&response)
+                        != current.carries_input_modalities // NON-VACUITY BREAK: reuse an index fetched without modalities.'''

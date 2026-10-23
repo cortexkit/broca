@@ -7,8 +7,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use broca_provider::spec::{
-    Capabilities, CapabilityFlag, CostSchedule, CostTier, Limits, ModelSpec, Overlay, ProviderSpec,
-    ReasoningOptions, WireFamilyId,
+    Capabilities, CapabilityFlag, CostSchedule, CostTier, InputModalities, Limits, ModelSpec,
+    Overlay, ProviderSpec, ReasoningOptions, WireFamilyId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(test)]
@@ -44,6 +44,7 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "limit.context",
     "limit.output",
     "capability.attachment",
+    "capability.input_modalities",
     "capability.reasoning",
     "capability.reasoning_options",
     "capability.tool_call",
@@ -122,6 +123,8 @@ struct LoadedCatalog {
     /// version as the next poll and no kinds, and reusing its index would keep admitting a
     /// non-chat model to `session.send` until fusiform happened to mint a new version.
     carries_model_kinds: bool,
+    /// An equal-version poll can add modalities that an older prefix list did not request.
+    carries_input_modalities: bool,
     /// Present rows this catalog left out or kept from the catalog it replaced, because their
     /// facts could not be used. Shared with an equal-version republish, which reuses the index
     /// these describe.
@@ -134,6 +137,13 @@ fn response_carries_model_kinds(response: &FusiformCatalogResponse) -> bool {
         .models
         .values()
         .any(|facts| facts.contains_key("model.kind"))
+}
+
+fn response_carries_input_modalities(response: &FusiformCatalogResponse) -> bool {
+    response
+        .models
+        .values()
+        .any(|facts| facts.contains_key("capability.input_modalities"))
 }
 
 impl LoadedCatalog {
@@ -195,6 +205,7 @@ struct ServingModel {
     /// served.
     output_limit: Option<u64>,
     attachment: CapabilityFlag,
+    input_modalities: InputModalities,
     reasoning: CapabilityFlag,
     tool_call: CapabilityFlag,
     /// `capability.structured_output`. Like the three flags above, fusiform omits it on rows
@@ -223,6 +234,7 @@ impl Default for ServingModel {
             context_limit: None,
             output_limit: None,
             attachment: CapabilityFlag::Absent,
+            input_modalities: InputModalities::default(),
             reasoning: CapabilityFlag::Absent,
             tool_call: CapabilityFlag::Absent,
             structured_output: CapabilityFlag::Absent,
@@ -248,6 +260,7 @@ impl ServingModel {
             context_limit: model.limits.context,
             output_limit: model.limits.max_output,
             attachment: model.capabilities.attachment,
+            input_modalities: model.input_modalities,
             reasoning: model.capabilities.reasoning,
             tool_call: model.capabilities.tool_call,
             structured_output: model.capabilities.structured_output,
@@ -274,6 +287,7 @@ impl ServingModel {
                 interleaved: CapabilityFlag::Absent,
                 structured_output: self.structured_output,
             },
+            input_modalities: self.input_modalities,
             limits: Limits {
                 context: self.context_limit,
                 max_input: None,
@@ -1180,6 +1194,10 @@ fn serving_model_from_facts(
         context_limit: context_fact(identity, facts)?,
         output_limit: output_fact(identity, facts)?,
         attachment: optional_capability_fact(identity, facts, "capability.attachment")?,
+        input_modalities: facts
+            .get("capability.input_modalities")
+            .map(InputModalities::from_value)
+            .unwrap_or_default(),
         reasoning: reasoning_fact(identity, facts)?,
         tool_call: optional_capability_fact(identity, facts, "capability.tool_call")?,
         structured_output: optional_capability_fact(
@@ -1818,6 +1836,8 @@ impl CatalogCache {
                     || response_carries_mode_rates(&response) != current.carries_mode_rates
                     || response_carries_warm_rates(&response) != current.carries_warm_rates
                     || response_carries_model_kinds(&response) != current.carries_model_kinds
+                    || response_carries_input_modalities(&response)
+                        != current.carries_input_modalities
                 {
                     let rebuilt = Arc::new(loaded(
                         &response,
@@ -1846,6 +1866,7 @@ impl CatalogCache {
                     carries_mode_rates: current.carries_mode_rates,
                     carries_warm_rates: current.carries_warm_rates,
                     carries_model_kinds: current.carries_model_kinds,
+                    carries_input_modalities: current.carries_input_modalities,
                     excluded_rows: Arc::clone(&current.excluded_rows),
                 });
                 self.install(refreshed);
@@ -1933,6 +1954,7 @@ impl CatalogCache {
             carries_warm_rates: true,
             // The vendored snapshot serves no `model.kind`.
             carries_model_kinds: false,
+            carries_input_modalities: false,
             excluded_rows: Arc::from([]),
         });
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
@@ -2001,6 +2023,7 @@ fn loaded(
         carries_mode_rates: response_carries_mode_rates(response),
         carries_warm_rates: response_carries_warm_rates(response),
         carries_model_kinds: response_carries_model_kinds(response),
+        carries_input_modalities: response_carries_input_modalities(response),
         excluded_rows: assembled.excluded_rows.into(),
     })
 }
@@ -2372,6 +2395,137 @@ mod tests {
             withheld: Vec::new(),
             uncertain: Vec::new(),
         }
+    }
+
+    #[test]
+    fn live_fusiform_input_modalities_reach_serving_models() {
+        let mut response = response(100);
+        let facts = response
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap();
+        facts.insert("capability.attachment".into(), serde_json::json!(false));
+        facts.insert(
+            "capability.input_modalities".into(),
+            serde_json::json!(["text", "image", "pdf", "future-modality"]),
+        );
+        // Apply the catalog.get prefix filter so a missing request cannot pass this test.
+        for facts in response.models.values_mut() {
+            facts.retain(|fact, _| {
+                FUSIFORM_FACT_PREFIXES
+                    .iter()
+                    .any(|prefix| fact.starts_with(prefix))
+            });
+        }
+        let cache = CatalogCache::empty();
+        cache.refresh(response).unwrap();
+        let snapshot = cache.snapshot().unwrap();
+        assert_eq!(snapshot.source(), CatalogSource::Fusiform);
+        let (_, model) = snapshot
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(
+            model.input_modalities,
+            InputModalities {
+                text: Some(true),
+                image: Some(true),
+                pdf: Some(true),
+                audio: Some(false),
+                video: Some(false),
+            }
+        );
+        assert_eq!(model.capabilities.attachment, CapabilityFlag::Known(false));
+    }
+
+    #[test]
+    fn malformed_fusiform_input_modalities_still_serve_text() {
+        for value in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!("image")),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!({"input": ["image"]})),
+            Some(serde_json::json!(["image", 42])),
+            Some(serde_json::json!([null])),
+        ] {
+            let cache = CatalogCache::empty();
+            let mut before = response(100);
+            before
+                .models
+                .get_mut("anthropic/claude-sonnet-4-5")
+                .unwrap()
+                .insert(
+                    "capability.input_modalities".into(),
+                    serde_json::json!(["text", "image", "pdf"]),
+                );
+            cache.refresh(before).unwrap();
+            let mut after = response(200);
+            after.catalog_version += 1;
+            let facts = after.models.get_mut("anthropic/claude-sonnet-4-5").unwrap();
+            facts.insert("capability.attachment".into(), serde_json::json!(true));
+            // A snapshot-shaped key is not a second source for a Fusiform row.
+            facts.insert(
+                "modalities".into(),
+                serde_json::json!({"input": ["image", "pdf"]}),
+            );
+            if let Some(value) = value.clone() {
+                facts.insert("capability.input_modalities".into(), value);
+            }
+            cache.refresh(after).unwrap();
+            let snapshot = cache.snapshot().unwrap();
+            let (provider, model) = snapshot
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .expect("unknown modalities must not exclude a text-serving row");
+            assert_eq!(
+                model.input_modalities,
+                InputModalities::default(),
+                "{value:?}"
+            );
+            assert_eq!(cache.health(200).unwrap().rows_excluded, 0);
+            resolve_frozen(
+                &provider,
+                &model,
+                4096,
+                renderer_version_for(provider.wire_family),
+            )
+            .expect("text configuration remains usable with unknown modalities");
+        }
+    }
+
+    #[test]
+    fn an_equal_version_poll_that_newly_carries_input_modalities_rebuilds_the_index() {
+        let cache = CatalogCache::empty();
+        cache.refresh(response(100)).unwrap();
+        let before = cache.snapshot().unwrap();
+        let mut after = response(200);
+        after
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .insert(
+                "capability.input_modalities".into(),
+                serde_json::json!(["text", "image", "pdf"]),
+            );
+        cache.refresh(after.clone()).unwrap();
+        let snapshot = cache.snapshot().unwrap();
+        assert!(!snapshot.shares_index_with(&before));
+        assert_eq!(
+            snapshot
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap()
+                .1
+                .input_modalities
+                .pdf,
+            Some(true)
+        );
+        cache.refresh(after).unwrap();
+        assert!(cache.snapshot().unwrap().shares_index_with(&snapshot));
+        assert!(before
+            .model_for_serving("anthropic", "claude-sonnet-4-5")
+            .unwrap()
+            .1
+            .input_modalities
+            .is_unknown());
     }
 
     /// Fusiform's `capability.structured_output` maps like the other capability facts, except

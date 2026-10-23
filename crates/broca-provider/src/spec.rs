@@ -150,6 +150,9 @@ pub struct ModelSpec {
     pub family: Option<String>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// Input modalities stated by this catalog source, independent of `capabilities.attachment`.
+    #[serde(default, skip_serializing_if = "InputModalities::is_unknown")]
+    pub input_modalities: InputModalities,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
@@ -170,6 +173,44 @@ pub struct ModelSpec {
     /// Catalog passthrough — INGESTION-ONLY, never read on the render path.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub raw: Value,
+}
+
+/// Per-modality catalog claims: `None` is unknown, not an assertion of support.
+///
+/// A valid input list states both what is accepted and what is not. An absent, null or
+/// malformed list says nothing about any modality; it must not prevent text serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct InputModalities {
+    pub text: Option<bool>,
+    pub image: Option<bool>,
+    pub pdf: Option<bool>,
+    pub audio: Option<bool>,
+    pub video: Option<bool>,
+}
+
+impl InputModalities {
+    /// Read Fusiform's `capability.input_modalities` or models.dev's `modalities.input`.
+    /// Unknown string entries are ignored, but a non-string entry makes the list malformed.
+    pub fn from_value(value: &Value) -> Self {
+        let Some(entries) = value
+            .as_array()
+            .filter(|entries| entries.iter().all(Value::is_string))
+        else {
+            return Self::default();
+        };
+        let contains = |name: &str| Some(entries.iter().any(|entry| entry.as_str() == Some(name)));
+        Self {
+            text: contains("text"),
+            image: contains("image"),
+            pdf: contains("pdf"),
+            audio: contains("audio"),
+            video: contains("video"),
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// One catalog capability flag, keeping the three producer statements distinct.
@@ -466,6 +507,56 @@ pub struct Overlay {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_modality_lists_distinguish_known_from_unknown() {
+        for (value, expected) in [
+            (
+                serde_json::json!(["text", "image", "pdf", "audio", "video", "future", "image"]),
+                InputModalities {
+                    text: Some(true),
+                    image: Some(true),
+                    pdf: Some(true),
+                    audio: Some(true),
+                    video: Some(true),
+                },
+            ),
+            (
+                serde_json::json!([]),
+                InputModalities {
+                    text: Some(false),
+                    image: Some(false),
+                    pdf: Some(false),
+                    audio: Some(false),
+                    video: Some(false),
+                },
+            ),
+            (
+                serde_json::json!(["Image", "document", "future"]),
+                InputModalities {
+                    text: Some(false),
+                    image: Some(false),
+                    pdf: Some(false),
+                    audio: Some(false),
+                    video: Some(false),
+                },
+            ),
+            (
+                serde_json::json!(["image", null]),
+                InputModalities::default(),
+            ),
+            (serde_json::json!(null), InputModalities::default()),
+            (serde_json::json!("image"), InputModalities::default()),
+        ] {
+            assert_eq!(InputModalities::from_value(&value), expected, "{value}");
+        }
+        let model: ModelSpec = serde_json::from_value(serde_json::json!({"id": "legacy"})).unwrap();
+        assert!(model.input_modalities.is_unknown());
+        assert!(serde_json::to_value(model)
+            .unwrap()
+            .get("input_modalities")
+            .is_none());
+    }
 
     /// The `WireFamilyId` wire strings are a stable contract: they're written by hand
     /// in the catalog overlay and stored in the frozen run config. Pin them so a
