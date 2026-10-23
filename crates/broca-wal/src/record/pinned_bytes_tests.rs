@@ -68,6 +68,30 @@ fn pre_cancel_at_boundaries_keep_their_bytes_and_frame_requirements() {
     }
 }
 
+/// Credential selections as every build up to now writes them, with every optional member
+/// present and with none. A selection that names how its credential authenticates is a later,
+/// gated addition; these shapes must keep their exact bytes and stay readable by any build, so
+/// they require no reader feature and keep the ungated frame version.
+#[test]
+fn auth_selections_without_a_frozen_method_keep_their_bytes_and_frame_requirements() {
+    use crate::framing::{encode, FRAMING_VERSION, HEADER_LEN};
+
+    for pinned in [
+        r#"{"type":"run_started","run_id":"r","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"anthropic","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"auth_selection":{"credential_id":"oauth:anthropic:work","account_ref":"acct-1","resolved_credential_id":"oauth:anthropic:work","vault_request":{"min_ttl_ms":600000,"op":"get_scoped"},"account_decision":{"conversation_key":"broca-session:abc","conversation_key_source":"session","path":"routed","admission_id":"r","decision_id":"acd-1"}}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+        r#"{"type":"run_started","run_id":"r","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"deepseek","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"auth_selection":{"credential_id":"apikey:deepseek"}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
+        r#"{"type":"run_auth_refrozen","ts_ms":5,"auth_selection":{"credential_id":"oauth:anthropic:work","account_ref":"acct-1","resolved_credential_id":"oauth:anthropic:shared","vault_request":{"min_ttl_ms":600000,"op":"get_scoped"},"account_decision":{"path":"pinned","admission_id":"r"}}}"#,
+        r#"{"type":"run_auth_refrozen","auth_selection":{"credential_id":"oauth:anthropic:work"}}"#,
+    ] {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        assert!(record.required_features().is_empty(), "{pinned}");
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], FRAMING_VERSION);
+        assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
+    }
+}
+
 #[test]
 fn attempt_bytes_before_content_progress_stay_identical() {
     let pinned = include_str!("../../tests/fixtures/model_attempt_before_progress.json").trim_end();
