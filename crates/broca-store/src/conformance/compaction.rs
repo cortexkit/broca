@@ -127,6 +127,58 @@ fn assert_model_snapshot(snapshot: &StorePageSnapshot, records: &[FramedRecord])
     assert_eq!(snapshot.prefix_len, (start + snapshot.rows.len()) as u64);
 }
 
+#[test]
+fn raw_pages_backfill_the_setup_summary_once_without_loading_replacements_again() {
+    let store = crate::SqliteStore::open_in_memory().unwrap();
+    let session = session("raw-setup-summary");
+    let mut before_setup = base_records(&session);
+    before_setup.extend(text_turn(1, 1, "before Setup"));
+    Persister::project(&store, &session, &before_setup).unwrap();
+    assert!(!page(&store, &session, ReadView::Raw).compaction_setup_seen);
+
+    let mut records = before_setup;
+    records.push(compaction_message(3, CompactionMessageKind::Setup));
+    records.extend(text_turn(4, 2, "after Setup"));
+    Persister::project(&store, &session, &records).unwrap();
+    let expected = page(&store, &session, ReadView::Raw);
+    assert!(expected.compaction_setup_seen);
+    assert_eq!(expected.compaction, None);
+
+    let key = crate::SqliteStore::key(&session);
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE meta SET compaction_setup_seen=NULL WHERE session=?1",
+            [&key],
+        )
+        .unwrap();
+    assert_eq!(page(&store, &session, ReadView::Raw), expected);
+    let cached: bool = store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT compaction_setup_seen FROM meta WHERE session=?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(cached);
+
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE meta SET admission_checkpoint_json='not a checkpoint' WHERE session=?1",
+            [&key],
+        )
+        .unwrap();
+    assert_eq!(page(&store, &session, ReadView::Raw), expected);
+}
+
 /// Replacement state and transcript rows share one watermark. An uncommitted turn or
 /// a failed projection must leave both at the last successfully projected turn.
 pub fn model_pages_return_atomic_compaction_and_rows<S: PageUsageConformance>(store: S) {
@@ -164,6 +216,7 @@ pub fn model_pages_return_atomic_compaction_and_rows<S: PageUsageConformance>(st
             "raw and head reads do not expose compaction"
         );
         assert_eq!(raw.watermark_seq, old.watermark_seq);
+        assert!(raw.compaction_setup_seen);
     }
 
     append_step(&mut records);
