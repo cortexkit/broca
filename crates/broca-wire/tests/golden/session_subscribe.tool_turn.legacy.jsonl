@@ -1,0 +1,10 @@
+{"kind":"control","cursor":{"wal_seq":1,"sub_index":0},"unit":{"type":"run_started","run_id":"@RUN_ID@"}}
+{"kind":"control","cursor":{"wal_seq":2,"sub_index":0},"unit":{"type":"step_started","step_id":1}}
+{"kind":"control","cursor":{"wal_seq":3,"sub_index":0},"unit":{"type":"assistant_message","message":{"message_id":"m","content":[{"type":"tool_call","tool_call_id":"call-1","tool_name":"work","input":{}}]}}}
+{"kind":"control","cursor":{"wal_seq":3,"sub_index":1},"unit":{"type":"tool_call","call":{"tool_call_id":"call-1","tool_name":"work","input":{}}}}
+{"kind":"control","cursor":{"wal_seq":3,"sub_index":2},"unit":{"type":"step_finished","step_id":1,"usage":{},"finish_reason":"tool_calls"}}
+{"kind":"control","cursor":{"wal_seq":6,"sub_index":0},"unit":{"type":"tool_result","result":{"tool_call_id":"call-1","output":{"kind":"text","text":"worked"},"is_error":false}}}
+{"kind":"control","cursor":{"wal_seq":9,"sub_index":0},"unit":{"type":"step_started","step_id":2}}
+{"kind":"control","cursor":{"wal_seq":10,"sub_index":0},"unit":{"type":"assistant_message","message":{"message_id":"m","content":[{"type":"text","text":"answer"}]}}}
+{"kind":"control","cursor":{"wal_seq":10,"sub_index":1},"unit":{"type":"step_finished","step_id":2,"usage":{},"finish_reason":"stop"}}
+{"kind":"control","cursor":{"wal_seq":11,"sub_index":0},"unit":{"type":"run_finished","run_id":"@RUN_ID@","reason":"completed","usage":{},"final_step_finish_reason":"stop","retries_used":0}}

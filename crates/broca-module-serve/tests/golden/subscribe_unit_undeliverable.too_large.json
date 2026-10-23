@@ -1,1 +1,1 @@
-{"code":"subscribe_unit_undeliverable","message":"subscribe unit exceeds the transport frame limit","detail":{"cursor":{"sub_index":1,"wal_seq":42},"frame_bytes":6291650,"limit":4194304,"reason":"too_large"}}
+{"code":"subscribe_unit_undeliverable","message":"subscribe unit exceeds the transport frame limit","detail":{"cursor":{"sub_index":1,"wal_seq":42},"frame_bytes":6291691,"limit":4194304,"reason":"too_large"},"seq":2,"event":{"type":"display_reset"}}

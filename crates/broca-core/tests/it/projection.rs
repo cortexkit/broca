@@ -222,11 +222,27 @@ fn run_started_projects_submission_id_on_live_and_replay_paths() {
             },
         ),
         (
+            Cursor::new(1, 1),
+            ControlUnit::MessageBoundary { mid: "m0".into() },
+        ),
+        (
+            Cursor::new(1, 2),
+            ControlUnit::MessageBoundary { mid: "m0".into() },
+        ),
+        (
             Cursor::new(2, 0),
             ControlUnit::RunStarted {
                 run_id: RunId("queued".into()),
                 submission_id: Some(submission_id),
             },
+        ),
+        (
+            Cursor::new(2, 1),
+            ControlUnit::MessageBoundary { mid: "m1".into() },
+        ),
+        (
+            Cursor::new(2, 2),
+            ControlUnit::MessageBoundary { mid: "m1".into() },
         ),
     ];
 
@@ -1109,11 +1125,10 @@ fn cursor_only_projection_matches_full_projection_for_every_record_prefix() {
     }
 }
 
-/// A steered message carries no control unit (the stream carries no caller input), so the
-/// control stream of a WAL with one is the stream without it, cursor for cursor, and the last
-/// cursor through the steer is the one before it.
+/// The steer record carries no unit. Its message boundaries appear only when the next step
+/// places the held input, after that step's existing payload and without moving old cursors.
 #[test]
-fn a_steered_record_projects_no_control_unit() {
+fn a_steered_record_has_no_unit_until_placement_boundary() {
     let steered = WalRecord::Steered {
         tags: None,
         retention: None,
@@ -1141,8 +1156,39 @@ fn a_steered_record_projects_no_control_unit() {
         .filter(|frame| frame.seq != 2)
         .cloned()
         .collect();
-    assert_eq!(project_control(&with), project_control(&without));
-    assert_eq!(project_control(&with).len(), 2);
+    let projected = project_control(&with);
+    assert_eq!(
+        projected,
+        vec![
+            (
+                Cursor::new(1, 0),
+                ControlUnit::StepStarted { step_id: StepId(1) }
+            ),
+            (
+                Cursor::new(3, 0),
+                ControlUnit::StepStarted { step_id: StepId(2) }
+            ),
+            (
+                Cursor::new(3, 1),
+                ControlUnit::MessageBoundary { mid: "m0".into() }
+            ),
+            (
+                Cursor::new(3, 2),
+                ControlUnit::MessageBoundary { mid: "m0".into() }
+            ),
+        ]
+    );
+    let old_payloads: Vec<_> = projected
+        .iter()
+        .filter(|(_, unit)| !matches!(unit, ControlUnit::MessageBoundary { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(old_payloads, project_control(&without));
+    assert!(projected.iter().all(|(cursor, _)| cursor.wal_seq != 2));
+    assert_eq!(
+        last_control_cursor_through(&with, Some(2)),
+        Some(Cursor::new(1, 0))
+    );
 }
 
 /// A rewrite ride's reported wait (llm-runner 0.5.2 §6) projects one durable `compaction_wait`

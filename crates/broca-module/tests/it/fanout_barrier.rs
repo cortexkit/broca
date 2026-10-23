@@ -357,7 +357,7 @@ async fn collect_until_terminal(rx: &mut mpsc::Receiver<Delivery>) -> Vec<Contro
     {
         match d {
             Delivery::Control(event) => {
-                let (cursor, unit) = event.as_ref();
+                let (cursor, unit, _) = event.as_ref();
                 if let Some(prev) = last_cursor {
                     assert!(
                         *cursor > prev,
@@ -388,17 +388,21 @@ async fn collect_until_terminal(rx: &mut mpsc::Receiver<Delivery>) -> Vec<Contro
 fn expected_units() -> Vec<&'static str> {
     vec![
         "RunStarted",
+        "MessageBoundary",
+        "MessageBoundary",
         "StepStarted",
         "AssistantMessage",
         "ToolCall",
         "StepFinished",
         "ToolResult",
+        "MessageBoundary",
         "RunFinished",
     ]
 }
 
 fn tag(u: &ControlUnit) -> &'static str {
     match u {
+        ControlUnit::MessageBoundary { .. } => "MessageBoundary",
         ControlUnit::RunStarted { .. } => "RunStarted",
         ControlUnit::StepStarted { .. } => "StepStarted",
         ControlUnit::BudgetFired { .. } => "BudgetFired",

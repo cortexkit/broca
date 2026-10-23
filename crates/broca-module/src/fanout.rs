@@ -34,8 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use broca_core::{
-    advance_control_projection_state, project_control_with_state, ControlProjectionState, Cursor,
-    SessionStore, WalStore,
+    advance_control_projection_state, ControlProjectionState, Cursor, SessionStore, WalStore,
 };
 use broca_protocol::caller::ControlUnit;
 use broca_protocol::BindIdentity;
@@ -44,7 +43,36 @@ use tokio_util::sync::CancellationToken;
 
 /// One cursor-tagged control unit on the stream. The bounded Tokio broadcast channel shares this
 /// tuple behind an [`Arc`] so each receiver clones a pointer, not the owned message/tool payload.
-pub type ControlEvent = (Cursor, ControlUnit);
+pub type ControlEvent = (
+    Cursor,
+    ControlUnit,
+    cortexkit_role_llm_runner::live::LiveEvent,
+);
+
+fn project_events(
+    records: &[broca_wal::FramedRecord],
+    state: &mut ControlProjectionState,
+) -> Result<Vec<ControlEvent>, String> {
+    broca_core::project_control_with_mids(records, state).map(|frames| {
+        frames
+            .into_iter()
+            .map(|frame| (frame.cursor, frame.unit, frame.event))
+            .collect()
+    })
+}
+
+#[cfg(test)]
+fn project_control_with_state(
+    records: &[broca_wal::FramedRecord],
+    state: &mut ControlProjectionState,
+) -> Vec<ControlEvent> {
+    project_events(records, state).expect("fixture placement is valid")
+}
+
+#[cfg(test)]
+fn project_control(records: &[broca_wal::FramedRecord]) -> Vec<ControlEvent> {
+    project_control_with_state(records, &mut Default::default())
+}
 
 /// What a subscriber receives on the unified session stream. Per the module surface, one
 /// `session.subscribe` carries BOTH the reliable+replayable control stream and the
@@ -105,7 +133,7 @@ struct AttachReplay {
     /// The resolved attach point; `Live` becomes "after the prefix's last cursor".
     from: FromCursor,
     /// The units past the attach point, in order.
-    units: Vec<(Cursor, ControlUnit)>,
+    units: Vec<ControlEvent>,
     /// How many control units were constructed, delivered or not. Only tests read it: it is
     /// how they show that an attach does not build the history it skips.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -123,17 +151,20 @@ fn replay_for_attach(
     records: Vec<broca_wal::FramedRecord>,
     h: u64,
     from: AttachFrom,
-) -> AttachReplay {
+) -> Result<AttachReplay, String> {
     let durable_prefix: Vec<broca_wal::FramedRecord> =
         records.into_iter().filter(|f| f.seq <= h).collect();
     let seeded_h = durable_prefix.last().map_or(0, |record| record.seq);
     let mut state = ControlProjectionState::default();
-    match from {
+    Ok(match from {
         // Live uses the existing strictly-after comparison once the barrier has projected H.
         // An empty lineage has no cursor to resume after, but Start is equivalent because its
         // replay is empty.
         AttachFrom::Live => {
             let last = advance_control_projection_state(&durable_prefix, &mut state);
+            if let Some(error) = state.placement_error() {
+                return Err(error.to_owned());
+            }
             AttachReplay {
                 state,
                 seeded_h,
@@ -150,7 +181,7 @@ fn replay_for_attach(
                 }
             };
             advance_control_projection_state(&durable_prefix[..skipped], &mut state);
-            let projected = project_control_with_state(&durable_prefix[skipped..], &mut state);
+            let projected = project_events(&durable_prefix[skipped..], &mut state)?;
             let built = projected.len();
             AttachReplay {
                 state,
@@ -158,12 +189,12 @@ fn replay_for_attach(
                 from,
                 units: projected
                     .into_iter()
-                    .filter(|(cursor, _)| from.includes(*cursor))
+                    .filter(|(cursor, _, _)| from.includes(*cursor))
                     .collect(),
                 built,
             }
         }
-    }
+    })
 }
 
 /// The attach-barrier decision for a unit arriving on the LIVE ring (step 2 of the
@@ -734,11 +765,20 @@ async fn projector_loop(
                 gate_seed_required = None;
                 deferred_gate_seed = None;
                 covered_head = covered_head.max(seed.head);
-                for framed in buffered.drain(..).filter(|record| record.seq > seed.head) {
-                    for event in broca_core::project_control_with_state(
+                for framed in std::mem::take(&mut buffered).into_iter().filter(|record| record.seq > seed.head) {
+                    let events = match project_events(
                         std::slice::from_ref(&*framed),
                         &mut projection_state,
                     ) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            tracing::error!(target: "fanout", %error, "durable control placement failed");
+                            let _ = detach_ring.send(());
+                            reset_projection_handshake(&mut projection_state, &mut seeded, &mut buffered);
+                            break;
+                        }
+                    };
+                    for event in events {
                         let _ = ring.send(Arc::new(event));
                     }
                     covered_head = covered_head.max(framed.seq);
@@ -761,10 +801,19 @@ async fn projector_loop(
                         if framed.seq <= covered_head {
                             continue;
                         }
-                        for event in broca_core::project_control_with_state(
+                        let events = match project_events(
                             std::slice::from_ref(&*framed),
                             &mut projection_state,
                         ) {
+                            Ok(events) => events,
+                            Err(error) => {
+                                tracing::error!(target: "fanout", %error, "durable control placement failed");
+                                let _ = detach_ring.send(());
+                                reset_projection_handshake(&mut projection_state, &mut seeded, &mut buffered);
+                                continue;
+                            }
+                        };
+                        for event in events {
                             // A send error means no live subscribers right now — fine, the WAL is
                             // the source of truth and a future attach replays from it.
                             let _ = ring.send(Arc::new(event));
@@ -849,6 +898,9 @@ async fn try_live_projection_seed<W: WalStore + 'static>(
             return None;
         }
         advance_control_projection_state(records, &mut state);
+        if state.placement_error().is_some() {
+            return None;
+        }
         Some(state)
     })
     .await
@@ -952,7 +1004,19 @@ async fn subscriber_task<W: WalStore + 'static>(
         })
         .await
         {
-            Ok(replay) => replay,
+            Ok(Ok(replay)) => replay,
+            Ok(Err(error)) => {
+                slot.as_mut()
+                    .expect("subscriber slot remains owned during replay")
+                    .report_gate_owner_failure();
+                let _ = deliver(
+                    &sink,
+                    &cancel,
+                    Delivery::Error(format!("WAL placement failed: {error}")),
+                )
+                .await;
+                return;
+            }
             Err(error) => {
                 slot.as_mut()
                     .expect("subscriber slot remains owned during replay")
@@ -981,8 +1045,8 @@ async fn subscriber_task<W: WalStore + 'static>(
                 .expect("subscriber slot remains owned during seed handoff")
                 .projection_seed_handed_off();
         }
-        for (cursor, unit) in replay {
-            if deliver(&sink, &cancel, Delivery::Control(Arc::new((cursor, unit))))
+        for event in replay {
+            if deliver(&sink, &cancel, Delivery::Control(Arc::new(event)))
                 .await
                 .is_break()
             {
@@ -1385,16 +1449,28 @@ mod tests {
             }
         }
         let h = records.len() as u64;
-        let full = broca_core::project_control(&records);
+        let full = project_control(&records);
         let whole_state = state_through(&records);
-        let cursor = full[full.len() - 3].0;
+        let cursor = full
+            .iter()
+            .rev()
+            .find(|event| matches!(event.1, ControlUnit::StepFinished { .. }))
+            .unwrap()
+            .0;
 
         let resumed = replay_for_attach(
             records.clone(),
             h,
             AttachFrom::Cursor(FromCursor::After(cursor)),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.units,
+            full.iter()
+                .filter(|(next, ..)| *next > cursor)
+                .cloned()
+                .collect::<Vec<_>>()
         );
-        assert_eq!(resumed.units, full[full.len() - 2..].to_vec());
         assert_eq!(resumed.state, whole_state);
         assert_eq!(resumed.seeded_h, h);
         assert!(
@@ -1404,7 +1480,7 @@ mod tests {
             full.len()
         );
 
-        let live = replay_for_attach(records.clone(), h, AttachFrom::Live);
+        let live = replay_for_attach(records.clone(), h, AttachFrom::Live).unwrap();
         assert_eq!(
             live.built, 0,
             "a live attach delivers no replay and builds none"
@@ -1413,7 +1489,8 @@ mod tests {
         assert_eq!(live.state, whole_state);
         assert!(matches!(live.from, FromCursor::After(last) if last == full.last().unwrap().0));
 
-        let from_start = replay_for_attach(records, h, AttachFrom::Cursor(FromCursor::Start));
+        let from_start =
+            replay_for_attach(records, h, AttachFrom::Cursor(FromCursor::Start)).unwrap();
         assert_eq!(from_start.units, full);
     }
 
@@ -1764,14 +1841,14 @@ mod tests {
             },
             &mut fast_state,
         );
-        let expected_tail: Vec<_> = broca_core::project_control(match full_range.records() {
+        let expected_tail: Vec<_> = project_control(match full_range.records() {
             broca_wal::WalRangeRecords::Complete(records)
             | broca_wal::WalRangeRecords::Partial(records)
             | broca_wal::WalRangeRecords::Unknown(records) => records,
             broca_wal::WalRangeRecords::Absent => &[],
         })
         .into_iter()
-        .filter(|(cursor, _)| cursor.wal_seq > watermark)
+        .filter(|(cursor, ..)| cursor.wal_seq > watermark)
         .collect();
         assert_eq!(fast_tail, expected_tail);
         assert!(matches!(
@@ -1781,7 +1858,8 @@ mod tests {
                 ControlUnit::RunFinished {
                     final_step_finish_reason: Some(FinishReason::Stop),
                     ..
-                }
+                },
+                _,
             )]
         ));
 
@@ -1887,9 +1965,9 @@ mod tests {
         let full_records = wal_store
             .read_records(&session)
             .expect("read full WAL oracle");
-        let expected_tail: Vec<_> = broca_core::project_control(&full_records)
+        let expected_tail: Vec<_> = project_control(&full_records)
             .into_iter()
-            .filter(|(cursor, _)| cursor.wal_seq > watermark)
+            .filter(|(cursor, ..)| cursor.wal_seq > watermark)
             .collect();
         assert_eq!(fast_tail, expected_tail);
         assert!(matches!(
@@ -1899,7 +1977,8 @@ mod tests {
                 ControlUnit::RunFinished {
                     final_step_finish_reason: None,
                     ..
-                }
+                },
+                _,
             )]
         ));
 
@@ -2468,7 +2547,8 @@ mod tests {
                 ControlUnit::RunFinished {
                     final_step_finish_reason: Some(FinishReason::Stop),
                     ..
-                }
+                },
+                _,
             )
         ));
         assert!(matches!(
@@ -2529,7 +2609,8 @@ mod tests {
                 ControlUnit::RunFinished {
                     final_step_finish_reason: Some(FinishReason::ToolCalls),
                     ..
-                }
+                },
+                _,
             )
         ));
         assert!(matches!(
@@ -2570,7 +2651,7 @@ mod tests {
             ),
             framed(4, run_finished()),
         ];
-        let expected = broca_core::project_control(&records);
+        let expected = project_control(&records);
         let gate = SubscriberGate::new();
         let owner = gate.begin_attach();
         let later = gate.begin_attach();
@@ -2622,9 +2703,9 @@ mod tests {
                     .expect("ring remains open"),
             );
         }
-        let mut owner_view = broca_core::project_control(&records[..2]);
+        let mut owner_view = project_control(&records[..2]);
         owner_view.extend(live.iter().map(|event| event.as_ref().clone()));
-        let mut later_view = broca_core::project_control(&records[..3]);
+        let mut later_view = project_control(&records[..3]);
         later_view.extend(
             live.iter()
                 .filter(|event| event.0.wal_seq > 3)
@@ -2681,11 +2762,19 @@ mod tests {
         );
 
         // Send 1 event to the ring. The subscriber task receives it and delivers it (succeeds, filling the sink buffer).
-        let event1 = (Cursor::new(1, 0), ControlUnit::DisplayReset);
+        let event1 = (
+            Cursor::new(1, 0),
+            ControlUnit::DisplayReset,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+        );
         fanout.ring.send(Arc::new(event1)).unwrap();
 
         // Send 2nd event to the ring. The subscriber task receives it and blocks on deliver (since sink is full).
-        let event2 = (Cursor::new(2, 0), ControlUnit::DisplayReset);
+        let event2 = (
+            Cursor::new(2, 0),
+            ControlUnit::DisplayReset,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+        );
         // Give it a tiny bit of time to make sure the first event is processed.
         tokio::time::sleep(Duration::from_millis(10)).await;
         fanout.ring.send(Arc::new(event2)).unwrap();
@@ -2696,7 +2785,11 @@ mod tests {
         // Overflow the control ring so the subscriber lags.
         // RING_CAPACITY is 1024, so sending 1025 events is enough.
         for i in 0..1025 {
-            let event = (Cursor::new(3 + i, 0), ControlUnit::DisplayReset);
+            let event = (
+                Cursor::new(3 + i, 0),
+                ControlUnit::DisplayReset,
+                cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+            );
             let _ = fanout.ring.send(Arc::new(event));
         }
 
@@ -2900,7 +2993,7 @@ mod tests {
                 },
             },
         ];
-        let full = broca_core::project_control(&records);
+        let full = project_control(&records);
         let split = 2;
         let mut replay_state = ControlProjectionState::default();
         let replay = project_control_with_state(&records[..split], &mut replay_state);
@@ -2914,8 +3007,8 @@ mod tests {
 
         let step_cursors: Vec<Cursor> = replay
             .iter()
-            .filter(|(cursor, _)| cursor.wal_seq == 2)
-            .map(|(cursor, _)| *cursor)
+            .filter(|(cursor, ..)| cursor.wal_seq == 2)
+            .map(|(cursor, ..)| *cursor)
             .collect();
         assert_eq!(
             step_cursors,
@@ -2924,12 +3017,13 @@ mod tests {
                 Cursor::new(2, 1),
                 Cursor::new(2, 2),
                 Cursor::new(2, 3),
+                Cursor::new(2, 4),
             ],
             "the replay side of the handoff preserves every multi-unit record cursor"
         );
 
         let (observer_tx, observer_rx) = broadcast::channel(4);
-        let (ring, mut ring_rx) = broadcast::channel(4);
+        let (ring, mut ring_rx) = broadcast::channel(expected_live.len().max(4));
         let (detach_ring, _) = broadcast::channel(1);
         let cancel = CancellationToken::new();
         let (seed_tx, seed_rx) = mpsc::unbounded_channel();
@@ -3017,7 +3111,11 @@ mod tests {
         drop(deliveries);
         fanout
             .ring
-            .send(Arc::new((Cursor::new(1, 0), ControlUnit::DisplayReset)))
+            .send(Arc::new((
+                Cursor::new(1, 0),
+                ControlUnit::DisplayReset,
+                cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+            )))
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -3043,7 +3141,11 @@ mod tests {
             "an actor with no subscriber must not reserve either ring"
         );
         // Before any subscriber exists a publish reaches nobody, as it did with an eager ring.
-        let unit = Arc::new((Cursor::new(1, 0), ControlUnit::DisplayReset));
+        let unit = Arc::new((
+            Cursor::new(1, 0),
+            ControlUnit::DisplayReset,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+        ));
         assert!(fanout.ring.send(unit.clone()).is_err());
         assert!(
             !fanout.ring.is_allocated(),
@@ -3069,7 +3171,11 @@ mod tests {
             fanout.display_ring.is_allocated(),
             "the first subscriber creates the display ring"
         );
-        let unit = Arc::new((Cursor::new(2, 0), ControlUnit::DisplayReset));
+        let unit = Arc::new((
+            Cursor::new(2, 0),
+            ControlUnit::DisplayReset,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+        ));
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 // The subscriber task may still be replaying; keep publishing until it is live.

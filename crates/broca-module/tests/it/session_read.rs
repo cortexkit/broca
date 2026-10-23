@@ -3201,7 +3201,7 @@ async fn read_head_resumes_subscribe_without_gaps_or_duplicates() {
         .expect("post-head unit arrives")
         .expect("stream stays open")
         {
-            Delivery::Control(event) => actual.push(event.as_ref().clone()),
+            Delivery::Control(event) => actual.push((event.0, event.1.clone())),
             Delivery::Display(_) => {}
             other => panic!("unexpected delivery after read head: {other:?}"),
         }

@@ -44,7 +44,8 @@ async fn one_tool_turn(tag: &str) -> (Rig, String) {
 
 /// A `session.read` and a `session.subscribe` from the start, each with no params, of a session
 /// whose one run called a tool, pinned byte for byte. Run attribution is emitted without
-/// requiring new request parameters; subscriptions retain their existing event bytes.
+/// requiring new request parameters; existing cursor/unit bytes remain pinned separately from
+/// added live metadata and message boundaries.
 #[tokio::test]
 async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
     let (mut rig, run_id) = one_tool_turn("pin-read").await;
@@ -94,14 +95,86 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
         .iter()
         .map(|f| normalized(&f.body, &run_id, &lineage_id))
         .collect();
+    let legacy: Vec<_> = events
+        .iter()
+        .filter_map(|body| {
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            if value["unit"]["type"] == "message_boundary" {
+                return None;
+            }
+            let split = body
+                .rfind(",\"seq\":")
+                .expect("live members follow the unchanged payload");
+            Some(format!("{}}}", &body[..split]))
+        })
+        .collect();
+    assert_eq!(
+        legacy.join("\n"),
+        pinned("session_subscribe.tool_turn.legacy.jsonl")
+    );
+    for (index, body) in events.iter().enumerate() {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(value["seq"], index as u64 + 1);
+        cortexkit_role_llm_runner::live::LiveEvent::decode_strict(&value["event"]).unwrap();
+    }
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        let sample = format!("{}\n", events.join("\n"));
+        std::fs::write(golden_path("session_subscribe.tool_turn.jsonl"), &sample).unwrap();
+        println!("GOLDEN_BEGIN session_subscribe.tool_turn.jsonl\n{sample}GOLDEN_END session_subscribe.tool_turn.jsonl");
+    }
     assert_eq!(
         events.join("\n"),
-        pinned("session_subscribe.tool_turn.jsonl")
+        tool_turn_sample_with_recorded_times(
+            &pinned("session_subscribe.tool_turn.jsonl"),
+            &rig.records(),
+        )
     );
     rig.finish().await;
 }
 
 // ---- helpers ------------------------------------------------------------------------------
+
+/// Keep the captured frame template, substituting only this run's two WAL observations.
+/// The expected clocks come from durable records, never from the stream being checked.
+fn tool_turn_sample_with_recorded_times(sample: &str, records: &[broca_wal::WalRecord]) -> String {
+    sample
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let (field, start) = match value["event"]["type"].as_str() {
+                Some("tool_started") => ("started_at", true),
+                Some("tool_finished") => ("finished_at", false),
+                _ => return line.to_owned(),
+            };
+            let call = value["event"]["tool_call_id"].as_str().unwrap();
+            let recorded = records
+                .iter()
+                .find_map(|record| match record {
+                    broca_wal::WalRecord::ToolDispatchIntent {
+                        tool_call_id,
+                        dispatched_at_ms,
+                        ..
+                    } if start && tool_call_id.0 == call => Some(*dispatched_at_ms),
+                    broca_wal::WalRecord::ToolResult {
+                        result,
+                        finished_at_ms,
+                        ..
+                    } if !start && result.tool_call_id.0 == call => Some(*finished_at_ms),
+                    _ => None,
+                })
+                .flatten()
+                .expect("the real tool turn recorded its observation");
+            let captured = value["event"][field]
+                .as_u64()
+                .expect("the sample retains the real captured time");
+            line.replace(
+                &format!("\"{field}\":{captured}"),
+                &format!("\"{field}\":{recorded}"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// The role's error body of a refusal frame.
 fn refusal(frame: &Frame) -> serde_json::Value {
@@ -1607,8 +1680,9 @@ async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
     let units = broca_core::project_control_with_mids(&frames, &mut Default::default()).unwrap();
     let mut checked = 0;
     for frame in units {
-        let matches = |message: &Message| {
+        let matches = |mid: &str, message: &Message| {
             match &frame.unit {
+                ControlUnit::MessageBoundary { mid: boundary } => boundary == mid,
             ControlUnit::AssistantMessage { message: assistant } => message.role == Role::Assistant && message.content == assistant.content,
             ControlUnit::ToolCall { call } => message.role == Role::Assistant && message.content.iter().any(|block| matches!(block, ContentBlock::ToolCall(stored) if stored.tool_call_id == call.tool_call_id)),
             ControlUnit::ToolResult { result } => message.role == Role::Tool && message.content.iter().any(|block| matches!(block, ContentBlock::ToolResult(stored) if stored.tool_call_id == result.tool_call_id)),
@@ -1620,7 +1694,7 @@ async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
         if let Some(ordinal) = frame.message_ordinal {
             let (entry, _) = stored
                 .iter()
-                .find(|(_, message)| matches(message))
+                .find(|(entry, message)| matches(&entry.mid, message))
                 .unwrap_or_else(|| {
                     panic!(
                         "control payload has no session.read message: {:?}",
@@ -1640,6 +1714,7 @@ async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
                 !matches!(
                     frame.unit,
                     ControlUnit::AssistantMessage { .. }
+                        | ControlUnit::MessageBoundary { .. }
                         | ControlUnit::ToolCall { .. }
                         | ControlUnit::ToolResult { .. }
                         | ControlUnit::StepStarted { .. }
@@ -1769,5 +1844,125 @@ async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
             assert_eq!(after, before, "{method} must preserve the session head");
         }
     }
+    rig.finish().await;
+}
+
+fn assert_stream_sequences(frames: &[Frame]) -> Vec<serde_json::Value> {
+    let values: Vec<serde_json::Value> = frames
+        .iter()
+        .map(|frame| {
+            assert_eq!(
+                frame.header.ty,
+                FrameType::StreamData,
+                "{}",
+                String::from_utf8_lossy(&frame.body)
+            );
+            serde_json::from_slice(&frame.body).unwrap()
+        })
+        .collect();
+    assert!(!values.is_empty());
+    for (index, value) in values.iter().enumerate() {
+        assert_eq!(value["seq"], index as u64 + 1, "{value}");
+        cortexkit_role_llm_runner::live::LiveEvent::decode_strict(&value["event"]).unwrap();
+    }
+    values
+}
+
+#[tokio::test]
+async fn one_stream_sequence_counts_both_lanes_and_restarts_for_each_subscribe() {
+    let mut rig = Rig::start("live-sequence").await;
+    rig.script.push(&[Step::Stream(vec![ContentBlock::Text {
+        text: "streamed text".into(),
+    }])]);
+    rig.script.hold_model(true);
+    rig.send("sequence-turn", "task", None).await;
+    let script = rig.script.clone();
+    let first = rig
+        .subscribe_collect_after_attach(
+            9,
+            serde_json::json!({"from":"start"}),
+            Duration::from_secs(1),
+            move || script.hold_model(false),
+        )
+        .await;
+    let values = assert_stream_sequences(&first);
+    assert!(values.iter().any(|value| value["kind"] == "control"));
+    assert!(
+        values.iter().any(|value| value["kind"] == "display"),
+        "the forwarder must count actual display arrivals"
+    );
+    assert!(values
+        .iter()
+        .any(|value| value["event"]["type"] == "run_finished"));
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let second = rig
+        .subscribe_collect(
+            10,
+            serde_json::json!({"from":"start"}),
+            Duration::from_millis(500),
+        )
+        .await;
+    assert_stream_sequences(&second);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn live_tool_observations_and_control_bytes_survive_a_real_serve_restart() {
+    let (mut rig, _) = one_tool_turn("live-tool-restart").await;
+    let records = rig.records();
+    let started = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::ToolDispatchIntent {
+                dispatched_at_ms, ..
+            } => *dispatched_at_ms,
+            _ => None,
+        })
+        .expect("the real tool call recorded its dispatch observation");
+    let finished = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::ToolResult { finished_at_ms, .. } => *finished_at_ms,
+            _ => None,
+        })
+        .expect("the real tool call recorded its finish observation");
+    let before = rig
+        .subscribe_collect(
+            9,
+            serde_json::json!({"from":"start"}),
+            Duration::from_millis(500),
+        )
+        .await;
+    let values = assert_stream_sequences(&before);
+    assert!(values
+        .iter()
+        .any(|value| value["event"]["type"] == "tool_started"
+            && value["event"]["started_at"] == started));
+    assert!(values
+        .iter()
+        .any(|value| value["event"]["type"] == "tool_finished"
+            && value["event"]["finished_at"] == finished));
+    // Closing a connection alone does not release a live registry's writer lease.
+    let bytes = rig.wal_bytes();
+    assert!(rig.registry().stop_and_seal().await);
+    assert_eq!(
+        rig.wal_bytes(),
+        bytes,
+        "stopping an already-finished run writes nothing"
+    );
+    rig = rig.restart().await;
+    let after = rig
+        .subscribe_collect(
+            9,
+            serde_json::json!({"from":"start"}),
+            Duration::from_millis(500),
+        )
+        .await;
+    assert_stream_sequences(&after);
+    assert_eq!(
+        before.iter().map(|frame| &frame.body).collect::<Vec<_>>(),
+        after.iter().map(|frame| &frame.body).collect::<Vec<_>>()
+    );
     rig.finish().await;
 }

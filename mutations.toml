@@ -22580,7 +22580,7 @@ package = "broca-wire"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-wire/src/lib.rs"
-expect_red = ["open_state_tests::unknown_subscribe_envelopes_and_event_types_reset_display_state"]
+expect_red = ["open_state_tests::unknown_lanes_and_display_reset_while_unknown_control_units_are_named"]
 file = "crates/broca-wire/src/lib.rs"
 old = "    Display {\n        event: DisplayEvent,\n    },\n    #[serde(other)]\n    Unknown,\n}"
 new = "    Display {\n        event: DisplayEvent,\n    },\n    Unknown, // NON-VACUITY BREAK: reject future subscribe lanes\n}"
@@ -24176,8 +24176,8 @@ test_file = "crates/broca-module/src/fanout.rs"
 expect_red = ["fanout::tests::an_attach_builds_only_the_units_it_delivers"]
 expect_message = "a resume near the head must not build the session's whole history"
 file = "crates/broca-module/src/fanout.rs"
-old = "            advance_control_projection_state(&durable_prefix[..skipped], &mut state);\n            let projected = project_control_with_state(&durable_prefix[skipped..], &mut state);"
-new = "            let _ = skipped; // NON-VACUITY BREAK: materialize the whole prefix.\n            let projected = project_control_with_state(&durable_prefix, &mut state);"
+old = "            advance_control_projection_state(&durable_prefix[..skipped], &mut state);\n            let projected = project_events(&durable_prefix[skipped..], &mut state)?;"
+new = "            let _ = skipped; // NON-VACUITY BREAK: materialize the whole prefix.\n            let projected = project_events(&durable_prefix, &mut state)?;"
 
 [[control]]
 id = "serve-request-panic-is-answered"
@@ -25065,3 +25065,94 @@ expect_red = ["held_call_tests::release_registered_future_call_keeps_release_unt
 file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
 old = "            Some(gate) => {\n                // Release is a permit for an installed script, not a claim that it arrived."
 new = "            Some(gate) if gate.arrived.load(std::sync::atomic::Ordering::SeqCst) => { // NON-VACUITY BREAK: reject release before provider arrival.\n                // Release is a permit for an installed script, not a claim that it arrived."
+
+[[control]]
+id = "live-stream-sequence-shared-counter"
+guards = "Each real subscribe stream starts at one and counts control and display arrivals together"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::one_stream_sequence_counts_both_lanes_and_restarts_for_each_subscribe"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ;"
+new = "        let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ + 1; // NON-VACUITY BREAK: skip the first stream position."
+
+[[control]]
+id = "wire-subscribe-unknown-unit-name"
+guards = "An unknown control-unit type retains its name and cursor instead of becoming a known reset"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["live_subscribe_tests::unknown_control_units_keep_their_name_cursor_and_payload"]
+file = "crates/broca-wire/src/lib.rs"
+old = "                        if let Some(unit_type) = unknown_type {"
+new = "                        if let Some(unit_type) = unknown_type.filter(|_| false) { // NON-VACUITY BREAK: erase unknown unit identity."
+
+[[control]]
+id = "live-message-boundaries-complete"
+guards = "Input and held messages receive a finished boundary as well as a started boundary"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/projection/live_tests.rs"
+expect_red = ["projection::live_tests::message_boundaries_complete_every_stored_message_without_moving_old_cursors"]
+file = "crates/broca-core/src/projection.rs"
+old = "        sink.boundary(ordinal, || message_event(Some(ordinal), true));"
+new = "        let _ = ordinal; // NON-VACUITY BREAK: omit the stored input's finished boundary."
+
+[[control]]
+id = "live-existing-payload-cursors-stable"
+guards = "Adding lifecycle units never renumbers existing payload sub_index values"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/projection/live_tests.rs"
+expect_red = ["projection::live_tests::message_boundaries_complete_every_stored_message_without_moving_old_cursors"]
+file = "crates/broca-core/src/projection.rs"
+old = "            next_sub_index: 0,"
+new = "            next_sub_index: 1, // NON-VACUITY BREAK: move every pre-existing payload cursor."
+
+[[control]]
+id = "live-declined-frame-recorded-closing-time"
+guards = "The declined tool_finished frame carries the closing approval's recorded time"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/projection/live_tests.rs"
+expect_red = ["projection::live_tests::declined_deferred_call_finishes_once_with_its_recorded_closing_time"]
+file = "crates/broca-core/src/projection.rs"
+old = "        bytes as u64,\n        observed_at,\n    ))"
+new = "        bytes as u64,\n        observed_at.filter(|_| false), // NON-VACUITY BREAK: discard the recorded closing observation.\n    ))"
+
+[[control]]
+id = "live-unrecorded-frame-time-not-invented"
+guards = "An imported historical call's unrecorded finish remains absent, never a zero stand-in"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/projection/live_tests.rs"
+expect_red = ["projection::live_tests::imported_input_calls_get_lifecycle_events_without_inventing_times"]
+file = "crates/broca-core/src/projection.rs"
+old = "        bytes as u64,\n        observed_at,\n    ))"
+new = "        bytes as u64,\n        observed_at.or(Some(0)), // NON-VACUITY BREAK: invent a historical finish time.\n    ))"
+
+[[control]]
+id = "live-stream-terminal-sequence"
+guards = "The transport StreamEnd keeps the next shared stream sequence and typed reset metadata"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::subscribe_transport_terminals_keep_stream_sequence_and_event"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                seq: next_seq,"
+new = "                seq: next_seq + 1, // NON-VACUITY BREAK: skip the terminal stream position."

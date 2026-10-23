@@ -1493,6 +1493,14 @@ async fn run_turn(
                     RunTurnAction::Ignore | RunTurnAction::Continue => {}
                 }
             }
+            Ok(SubscribeEvent::UnknownControlUnit {
+                wal_seq,
+                sub_index,
+                unit_type,
+                ..
+            }) => {
+                emit_unknown_control_unit(json, wal_seq, sub_index, &unit_type);
+            }
             Ok(SubscribeEvent::Display(_)) => {} // lossy display, not asserted on
             Err(e) => return Err(format!("decode subscribe event: {e}")),
         }
@@ -1519,6 +1527,16 @@ fn display_line(event: &broca_protocol::DisplayEvent) -> serde_json::Value {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64);
     serde_json::json!({"event": "display", "type": kind, "chars": chars, "at_ms": at_ms})
+}
+
+fn emit_unknown_control_unit(json: bool, wal_seq: u64, sub_index: u32, unit_type: &str) {
+    emit(
+        json,
+        &serde_json::json!({
+            "event":"unknown_control_unit", "wal_seq":wal_seq, "sub_index":sub_index, "type":unit_type,
+        }),
+        || format!("UNKNOWN_CONTROL_UNIT type={unit_type} cursor={wal_seq}:{sub_index}"),
+    );
 }
 
 /// A pure observer: subscribe and drain the control stream, printing each event, until
@@ -1574,6 +1592,15 @@ async fn observe(
                         break;
                     }
                 }
+            }
+            Ok(SubscribeEvent::UnknownControlUnit {
+                wal_seq,
+                sub_index,
+                unit_type,
+                ..
+            }) => {
+                last_cursor = Some((wal_seq, sub_index));
+                emit_unknown_control_unit(json, wal_seq, sub_index, &unit_type);
             }
             Ok(SubscribeEvent::Display(event)) => {
                 if display {

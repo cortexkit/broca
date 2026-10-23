@@ -199,6 +199,8 @@ impl PartialEq for TagSlot {
     }
 }
 
+impl Eq for TagSlot {}
+
 impl TagSlot {
     pub fn new(tags: Option<Arc<PartTags>>) -> Self {
         Self {

@@ -487,7 +487,7 @@ async fn run_started_submission_id(
             .expect("the control stream remains open");
         match delivery {
             Delivery::Control(event) => {
-                let (_, unit) = event.as_ref();
+                let (_, unit, _) = event.as_ref();
                 if let ControlUnit::RunStarted {
                     run_id,
                     submission_id,
