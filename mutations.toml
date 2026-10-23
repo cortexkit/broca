@@ -3626,30 +3626,17 @@ old = "            if matches!(refusal, Err(mpsc::error::TrySendError::Closed(_)
 new = "            if matches!(refusal, Err(mpsc::error::TrySendError::Closed(_))) {\n                break;\n            }\n            // NON-VACUITY BREAK: also route the request to the forward waiters\n        }\n        let key = (channel, epoch, frame.header.corr);"
 
 [[control]]
-id = "route-open-single-flight"
-guards = "concurrent route opens for one route join one series of attempts instead of each retrying on its own"
-runner = "cargo"
-package = "broca-subc"
-target = "--lib"
-test_file = "crates/broca-subc/src/connection.rs"
-expect_red = ["connection::route_open_sharing_tests::fifty_callers_for_one_route_share_one_series_of_attempts", "connection::route_open_sharing_tests::callers_for_different_routes_never_share_an_open", "connection::route_open_sharing_tests::a_terminal_refusal_reaches_every_joined_caller_at_once"]
-only = false
-file = "crates/broca-subc/src/connection.rs"
-old = "            match flights.get(&key).and_then(Weak::upgrade) {"
-new = "            match flights.get(&key).and_then(Weak::upgrade).filter(|_| false) { // NON-VACUITY BREAK: never join an open in progress"
-
-[[control]]
 id = "route-open-backoff-grows"
 guards = "the wait between refused route opens doubles from 100 ms up to its cap instead of staying flat"
 runner = "cargo"
 package = "broca-subc"
 target = "--lib"
 test_file = "crates/broca-subc/src/connection.rs"
-expect_red = ["connection::route_open_sharing_tests::the_wait_between_refused_attempts_doubles_to_five_seconds", "connection::route_open_sharing_tests::fifty_callers_for_one_route_share_one_series_of_attempts"]
+expect_red = ["connection::module_gate_tests::the_wait_between_refused_attempts_doubles_to_five_seconds"]
 only = false
 file = "crates/broca-subc/src/connection.rs"
-old = "                            state.envelope = (envelope * 2).min(max_interval);"
-new = "                            state.envelope = envelope; // NON-VACUITY BREAK: the backoff never grows"
+old = "                    None => envelope = (envelope * 2).min(retry.max_interval),"
+new = "                    None => envelope = envelope, // NON-VACUITY BREAK: the backoff never grows"
 
 [[control]]
 id = "route-open-module-gate-closes"
@@ -3658,11 +3645,47 @@ runner = "cargo"
 package = "broca-subc"
 target = "--lib"
 test_file = "crates/broca-subc/src/connection.rs"
-expect_red = ["connection::route_open_sharing_tests::fifty_routes_to_a_stopped_module_make_one_probe_per_tick_between_them", "connection::route_open_sharing_tests::only_module_availability_closes_the_gate_and_scope_refusals_leave_it_alone", "connection::route_open_sharing_tests::a_caller_waiting_at_a_closed_gate_leaves_at_its_own_deadline"]
+expect_red = ["connection::module_gate_tests::fifty_routes_to_a_stopped_module_make_one_probe_per_tick_between_them", "connection::module_gate_tests::only_evidence_that_the_module_is_up_opens_the_gate"]
 only = false
 file = "crates/broca-subc/src/connection.rs"
-old = "            Err(ConnError::Rejected(message)) if is_module_availability_refusal(message.code()) => {"
-new = "            Err(ConnError::Rejected(message)) if false && is_module_availability_refusal(message.code()) => { // NON-VACUITY BREAK: the gate never closes"
+old = "        Err(ConnError::Rejected(message)) if is_module_availability_refusal(message.code()) => {"
+new = "        Err(ConnError::Rejected(message)) if false && is_module_availability_refusal(message.code()) => { // NON-VACUITY BREAK: the gate never closes"
+
+[[control]]
+id = "route-open-gate-probe-turn-identity"
+guards = "an abandoned probe from an earlier gate period releases only its own turn, so two probes never run at once"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::module_gate_tests::a_stale_probe_drop_does_not_let_two_probes_run"]
+file = "crates/broca-subc/src/connection.rs"
+old = "                Some(closed) if closed.probe == Some(probe) => {"
+new = "                Some(closed) if closed.probe.is_some() && probe < u64::MAX => { // NON-VACUITY BREAK: release whichever turn is running"
+
+[[control]]
+id = "route-open-gate-stale-refusal"
+guards = "an availability refusal from an open admitted before the gate's last reopen does not close it again"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::module_gate_tests::a_stale_refusal_does_not_close_a_reopened_gate"]
+file = "crates/broca-subc/src/connection.rs"
+old = "                if epoch != state.epoch {"
+new = "                if false && epoch != state.epoch { // NON-VACUITY BREAK: any old refusal closes the gate again"
+
+[[control]]
+id = "route-open-gate-retires-on-reconnect"
+guards = "when a connection generation ends, callers waiting at its module gates go on at once to open on the new generation"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::module_gate_tests::a_reconnect_lets_waiters_on_the_old_gate_open_on_the_new_one"]
+file = "crates/broca-subc/src/connection.rs"
+old = "                        _ = self.retired.cancelled() => {}"
+new = "                        // NON-VACUITY BREAK: waiters do not wake when their generation ends"
 
 [[control]]
 id = "bash-watch-deadline-grace"
