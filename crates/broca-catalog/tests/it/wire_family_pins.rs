@@ -67,45 +67,11 @@ fn go_rows_follow_their_published_packages_and_shapes() {
 }
 
 #[test]
-fn overlay_renderer_choices_have_a_reason_and_no_generated_provider_pins() {
+fn overlay_cannot_restore_local_model_format_tables() {
     let overlay: Value = serde_json::from_str(include_str!("../../data/overlay.json")).unwrap();
-    for (provider, patch) in overlay["patch"].as_object().unwrap() {
-        assert!(
-            patch["_comment"]
-                .as_str()
-                .is_some_and(|comment| !comment.is_empty()),
-            "{provider}"
-        );
-        if patch.get("wire_family").is_some() {
-            assert!(
-                ["openai", "xai"].contains(&provider.as_str()),
-                "{provider}: provider grammar belongs to wire facts"
-            );
-            assert_eq!(patch["wire_family_source"], "authored");
-        }
-        for (model, patch) in patch
-            .get("models")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flatten()
-        {
-            assert!(
-                patch
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .all(|key| ["wire_family", "_comment"].contains(&key.as_str())),
-                "{provider}/{model}: model facts belong to Fusiform"
-            );
-        }
-    }
-    assert_eq!(
-        overlay["patch"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["openai", "xai"]
+    assert!(
+        overlay["patch"].as_object().unwrap().is_empty(),
+        "model formats belong to served wire.npm/wire.shape facts"
     );
+    assert!(overlay["add"].as_object().unwrap().is_empty());
 }

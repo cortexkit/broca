@@ -1,5 +1,7 @@
 //! Capture routing decisions for a supplied model-usage list without sending provider requests.
 //! The output can be compared with a later catalog build before removing routing data.
+//! This captures the tuple baseline; `full_url_parity` is the blocking URL gate because
+//! equal bases do not prove that two family paths produce the same request URL.
 #[cfg(not(feature = "live"))]
 fn main() {
     panic!("routing_snapshot requires --features live");
@@ -19,6 +21,25 @@ mod gated {
     use broca_provider::spec::WireFamilyId;
     use serde_json::{json, Value};
 
+    fn endpoint(route: &Value) -> Option<String> {
+        let family: WireFamilyId = serde_json::from_value(route.get("family")?.clone()).ok()?;
+        let mut frozen = broca_provider::families::frozen_config_for_family(
+            family,
+            route.get("wire_model_id")?.as_str()?,
+        );
+        frozen.base_url = route
+            .get("base_url")
+            .and_then(Value::as_str)
+            .filter(|base| !base.is_empty() && !base.starts_with('<'))
+            .map(str::to_owned);
+        frozen.project_id = Some("parity-only".into());
+        Some(
+            broca_provider::registry::wire_family(family)?
+                .endpoint(&frozen, &broca_provider::wire::AuthHandle::None, Vec::new())
+                .url,
+        )
+    }
+
     fn comparison(id: &str, before: &Value, after: &Value, deprecated: bool) -> &'static str {
         if before == after {
             return "unchanged";
@@ -32,6 +53,12 @@ mod gated {
         let (provider, _) = id.split_once('/').unwrap();
         if before["family"] == after["family"] && before["wire_model_id"] == after["wire_model_id"]
         {
+            if before["tiers"] == after["tiers"]
+                && endpoint(before) == endpoint(after)
+                && endpoint(before).is_some()
+            {
+                return "same full request URL";
+            }
             if before["base_url"] == after["base_url"] && id.starts_with("google/antigravity-") {
                 return "published tier reverse lookup; default bytes unchanged";
             }
@@ -102,12 +129,7 @@ mod gated {
                 }
             } else {
                 let route = if facts && snapshot.contains_model(provider_id, model_id) {
-                    if broca_catalog::family::native_endpoint_is_held(provider_id) {
-                        snapshot
-                            .model_for_serving(provider_id, model_id)
-                            .map(|(provider, _)| (provider.wire_family, provider.base_url))
-                            .ok_or_else(|| "no served catalog row".to_string())
-                    } else if provider_id == "meta" {
+                    if provider_id == "meta" {
                         // Meta subscription credentials require its Responses client endpoint,
                         // independently of whether a model row has models.dev wire metadata.
                         Ok((

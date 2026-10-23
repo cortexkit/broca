@@ -307,7 +307,20 @@ PROVIDER-INVALID (Anthropic rejects it).
     prove coverage of the entire sealed member region before reporting absence or
     caching membership; damaged member headers never justify serving older history.
 2. **`run_config` is authoritative** — rebuild the request config from it; reject
-   if caller-supplied config conflicts.
+   if caller-supplied config conflicts. Provider construction restores the entire recorded
+   frozen render bundle, including its endpoint, wire family, model id, limits and reasoning
+   choices. It does not re-resolve the model against today's catalog; a changed or withdrawn
+   catalog row therefore cannot move or refuse the admitted request. Credentials may refresh,
+   but must keep the auth shape selected by the recorded route, including Bearer auth for an
+   opaque explicit endpoint.
+
+   Renderer compatibility comes from the current family's declared version table, never a
+   version number copied from the WAL. An unsupported version produces permanent
+   `renderer_version_drift`; a null or undecodable bundle produces permanent
+   `frozen_render_config_unverifiable`. These guards run before any model call. For a supported
+   earlier version, the current renderer's version-specific blob must still equal the recorded
+   blob; otherwise the permanent refusal is `frozen_render_config_drift`. The existing explicit
+   auth-at-start refreeze rules remain separate and apply only before any model attempt.
 3. **Fold by TURN:**
    - `run_started` (config + input) → base prompt.
    - a `model_step_finished` assistant message with NO tool calls → prompt-commit.

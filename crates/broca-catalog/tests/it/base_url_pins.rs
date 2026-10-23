@@ -9,7 +9,7 @@ use broca_provider::{
 use serde_json::Value;
 
 #[test]
-fn served_endpoints_equal_the_rows_facts_and_missing_endpoints_refuse() {
+fn served_apis_freeze_to_equivalent_full_request_urls() {
     let response: FusiformCatalogResponse =
         serde_json::from_str(include_str!("../fixtures/fusiform_opencode_go.json")).unwrap();
     let cache = CatalogCache::empty();
@@ -26,11 +26,37 @@ fn served_endpoints_equal_the_rows_facts_and_missing_endpoints_refuse() {
         let (provider, model) = identity.split_once('/').unwrap();
         match facts.get("wire.api") {
             Some(api) => {
-                assert_eq!(
-                    snapshot.resolve_route(provider, model).unwrap().1,
-                    api["value"].as_str().unwrap(),
-                    "{identity}"
-                );
+                let (family, base) = snapshot.resolve_route(provider, model).unwrap();
+                let raw = api["value"].as_str().unwrap().trim_end_matches('/');
+                let expected = match family {
+                    WireFamilyId::AnthropicMessages if raw.ends_with("/v1") => {
+                        format!("{raw}/messages")
+                    }
+                    WireFamilyId::AnthropicMessages => format!("{raw}/v1/messages"),
+                    WireFamilyId::OpenAiChat => format!("{raw}/chat/completions"),
+                    WireFamilyId::OpenAiResponses => format!("{raw}/responses"),
+                    WireFamilyId::Gemini => {
+                        format!("{raw}/models/{model}:streamGenerateContent?alt=sse")
+                    }
+                    _ => panic!("unexpected Go family for {identity}"),
+                };
+                let mut candidate =
+                    broca_provider::families::frozen_config_for_family(family, model);
+                candidate.base_url = Some(base);
+                let candidate_url = wire_family(family)
+                    .unwrap()
+                    .endpoint(&candidate, &AuthHandle::None, Vec::new())
+                    .url;
+                assert_eq!(candidate_url, expected, "{identity}: served full URL");
+                let (pinned, _) = snapshot.model_for_serving(provider, model).unwrap();
+                let mut held =
+                    broca_provider::families::frozen_config_for_family(pinned.wire_family, model);
+                held.base_url = Some(pinned.base_url);
+                let held_url = wire_family(held.family_id)
+                    .unwrap()
+                    .endpoint(&held, &AuthHandle::None, Vec::new())
+                    .url;
+                assert_eq!(held_url, expected, "{identity}: held full URL");
                 compared += 1;
             }
             None => {
@@ -46,37 +72,20 @@ fn served_endpoints_equal_the_rows_facts_and_missing_endpoints_refuse() {
         }
     }
     assert_eq!(compared, 29, "all Pi-routed Go rows are compared");
-    assert_eq!(refused, 5, "every withheld Go endpoint refuses");
+    assert_eq!(
+        refused, 6,
+        "every withheld Go endpoint refuses, including new unrouted models"
+    );
 }
 
 #[test]
-fn overlay_endpoint_copies_are_limited_to_the_native_holds() {
+fn overlay_has_no_local_endpoint_or_model_format_pins() {
     let overlay: Value = serde_json::from_str(include_str!("../../data/overlay.json")).unwrap();
-    let mut endpoints = Vec::new();
-    for (provider, patch) in overlay["patch"].as_object().unwrap() {
-        assert!(
-            patch["_comment"]
-                .as_str()
-                .is_some_and(|comment| !comment.is_empty()),
-            "{provider} needs a reason"
-        );
-        if patch.get("base_url").is_some() {
-            assert_eq!(patch["base_url_source"], "authored", "{provider}");
-            endpoints.push(provider.as_str());
-        }
-        for (model, patch) in patch
-            .get("models")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flatten()
-        {
-            assert!(
-                patch.get("base_url").is_none(),
-                "{provider}/{model}: endpoint belongs to Fusiform"
-            );
-        }
-    }
-    assert_eq!(endpoints, ["openai", "xai"]);
+    assert!(
+        overlay["patch"].as_object().unwrap().is_empty(),
+        "published route facts must not be copied into a local overlay"
+    );
+    assert!(overlay["add"].as_object().unwrap().is_empty());
 }
 
 #[test]
@@ -88,14 +97,12 @@ fn provider_without_endpoint_pin_uses_the_family_default_endpoint() {
         &provider,
         &model,
         4096,
-        renderer_version_for(WireFamilyId::OpenAiChat),
+        renderer_version_for(WireFamilyId::OpenAiResponses),
     )
     .unwrap();
     assert_eq!(frozen.base_url, None);
-    let request = wire_family(WireFamilyId::OpenAiChat).unwrap().endpoint(
-        &frozen,
-        &AuthHandle::None,
-        Vec::new(),
-    );
-    assert_eq!(request.url, "https://api.openai.com/v1/chat/completions");
+    let request = wire_family(WireFamilyId::OpenAiResponses)
+        .unwrap()
+        .endpoint(&frozen, &AuthHandle::None, Vec::new());
+    assert_eq!(request.url, "https://api.openai.com/v1/responses");
 }

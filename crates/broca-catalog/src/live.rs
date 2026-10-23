@@ -370,6 +370,16 @@ pub fn resolve_catalog_episode_at_base_url(
     http_client: ProviderHttpClient,
     render: EpisodeRenderConfig<'_>,
 ) -> Result<ProviderResolution, ResolutionError> {
+    if render.recorded_config.is_some() {
+        return resolve_catalog_episode_with_client(
+            model,
+            max_tokens,
+            auth,
+            opts,
+            http_client,
+            render,
+        );
+    }
     let use_catalog = model
         .split_once('/')
         .is_some_and(|(provider_id, model_id)| {
@@ -450,8 +460,8 @@ pub fn resolve_chatgpt_pause_episode_with_client(
 ///
 /// Unlike resolving the episode again, nothing about the config is re-derived from the catalog,
 /// so the provider renders exactly the bytes the recorded config pins: what re-sending a recorded
-/// request (a prompt-cache warm) needs. The catalog is read only for how the provider takes its
-/// credential; a model it no longer lists takes the family's default.
+/// request (a prompt-cache warm) needs. Auth follows the frozen route's family and opaque-endpoint
+/// distinction, not today's catalog.
 // The credential, its method and both account references are separate inputs on purpose: the
 // caller resolved them, and grouping them would only rename the same values.
 #[allow(clippy::too_many_arguments)]
@@ -466,12 +476,13 @@ pub fn provider_for_recorded_config(
     http_client: ProviderHttpClient,
     clock: &broca_core::clock::Clock,
 ) -> Result<Box<dyn broca_core::provider::Provider>, String> {
-    let auth_kind = crate::catalog()
-        .ok()
-        .and_then(|catalog| catalog.model_for_serving(provider_id, model_id))
-        .filter(|(provider_spec, _)| provider_spec.wire_family == frozen.family_id)
-        .map(|(provider_spec, _)| provider_spec.auth_kind.clone())
-        .unwrap_or_else(|| crate::default_auth_kind(frozen.family_id));
+    let model = format!("{provider_id}/{model_id}");
+    let provider_id = recorded_auth_provider(&frozen, &model, provider_id);
+    let auth_kind = provider_route_auth_kind(
+        provider_id,
+        frozen.family_id,
+        &crate::default_auth_kind(frozen.family_id),
+    );
     let opts = ResolveOptions {
         auth_method,
         account_id: served_account_ref,
@@ -489,6 +500,21 @@ pub fn provider_for_recorded_config(
         clock.clone(),
     )
     .map_err(|error| error.to_string())
+}
+
+/// Opaque endpoint admission sends the full input model verbatim, whereas catalog
+/// admission sends its model part. That frozen distinction preserves Bearer auth
+/// even if the catalog or the operator's endpoint settings change before resume.
+fn recorded_auth_provider<'a>(
+    frozen: &FrozenRenderConfig,
+    model: &str,
+    provider: &'a str,
+) -> &'a str {
+    if frozen.family_id == WireFamilyId::OpenAiChat && frozen.wire_model_id == model {
+        "openai-compatible"
+    } else {
+        provider
+    }
 }
 
 /// Render inputs for an episode. Fresh episodes use catalog admission; a resume supplies
@@ -750,12 +776,16 @@ fn resolve_provider_inner(
         episode_render,
     } = context;
     if let Some(recorded) = episode_render.recorded_config {
-        let provider_id = model
+        let model_provider = model
             .split_once('/')
             .map_or("openai-compatible", |(provider, _)| provider);
+        let provider_id = recorded_auth_provider(recorded, model, model_provider);
         let mut frozen = recorded.clone();
         frozen.opencode_go_session_id = episode_render.opencode_go_session_id.map(str::to_owned);
         let family = frozen.family_id;
+        // The provider represents today's code. Core must ask the family's independent
+        // compatibility table before comparing a blob restamped to the recorded version.
+        frozen.renderer_version = renderer_version_for(family);
         let auth_kind =
             provider_route_auth_kind(provider_id, family, &crate::default_auth_kind(family));
         let (handle, auth_desc, auth_method, refresher) =
@@ -793,11 +823,11 @@ fn resolve_provider_inner(
             context_limit: None,
         });
     }
-    // Resume restores admission's cap, regardless of a repeated explicit request or a
-    // changed catalog maximum. Only a new episode computes the request/catalog minimum.
-    let restored_max_tokens = episode_render.max_output_tokens;
+    // Compatibility callers can override the cap while constructing a config. Production
+    // resumes take the complete recorded-config branch above, never this partial override.
+    let max_tokens_override = episode_render.max_output_tokens;
     let max_tokens_for = |output_limit: Option<u64>, context_limit: Option<u64>| {
-        restored_max_tokens.unwrap_or_else(|| {
+        max_tokens_override.unwrap_or_else(|| {
             caller_max_tokens.map_or_else(
                 || default_max_output_tokens(output_limit, context_limit),
                 |requested| {
@@ -1109,9 +1139,7 @@ fn resolve_provider_inner(
         .map(|(family, endpoint)| (family, endpoint.to_string()));
     let route = if let Some(route) = persona_route {
         Some(route)
-    } else if catalog.routing_facts(provider_id, model_id).is_some()
-        && !crate::family::native_endpoint_is_held(provider_id)
-    {
+    } else if catalog.routing_facts(provider_id, model_id).is_some() {
         Some(catalog.resolve_route(provider_id, model_id)?)
     } else {
         None

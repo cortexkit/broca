@@ -32,9 +32,9 @@ broca-provider|it|fixture_coverage::|broca-provider/live,broca-provider/test-har
 # Pins the embedded served-payload fixture's wire shape.
 broca-catalog|it|fusiform_wire_fixture::|broca-catalog/live|crates/broca-catalog/tests/it/fusiform_wire_fixture.rs|the_served_shape_carries_the_facts_broca_consumes|Checks local catalog payload fixture data without network access.
 # Checks row endpoints and refusal of withheld routing facts.
-broca-catalog|it|base_url_pins::|broca-catalog/live|crates/broca-catalog/tests/it/base_url_pins.rs|served_endpoints_equal_the_rows_facts_and_missing_endpoints_refuse|Checks served endpoint facts and named missing-fact refusals from local fixtures.
+broca-catalog|it|base_url_pins::|broca-catalog/live|crates/broca-catalog/tests/it/base_url_pins.rs|served_apis_freeze_to_equivalent_full_request_urls|Checks served full URLs under SDK/renderer conventions and named missing-fact refusals.
 # Checks authored renderer exceptions rather than copied provider inventories.
-broca-catalog|it|wire_family_pins::|broca-catalog/live|crates/broca-catalog/tests/it/wire_family_pins.rs|overlay_renderer_choices_have_a_reason_and_no_generated_provider_pins|Keeps native holds and genuine renderer quirks explicit.
+broca-catalog|it|wire_family_pins::|broca-catalog/live|crates/broca-catalog/tests/it/wire_family_pins.rs|overlay_cannot_restore_local_model_format_tables|Prevents a local model-format table from reappearing.
 # Checks test rigs use development-linked binaries rather than shipped names.
 broca-test-support|ckdev_guard|-|-|crates/broca-test-support/tests/ckdev_guard.rs|test_code_never_spawns_ck_binaries_under_production_names|Checks test rig launches use development-linked binaries rather than shipped names.
 # Checks long-lived test rigs use owned output files instead of runner stdio.

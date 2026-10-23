@@ -1,4 +1,7 @@
 {
+  "source": "models.dev",
+  "catalog_version": 1792784518157,
+  "resolved_at_ms": 1792787066962,
   "models": {
     "anthropic/claude-fable-5-1": {
       "capability.attachment": true,
@@ -21,6 +24,10 @@
       "limit.context": 1000000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/anthropic"
@@ -41,6 +48,10 @@
       "limit.context": 200000,
       "limit.output": 64000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/anthropic"
@@ -67,6 +78,10 @@
       "limit.context": 1000000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/anthropic"
@@ -93,6 +108,10 @@
       "limit.context": 1000000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/anthropic"
@@ -122,6 +141,10 @@
       "limit.context": 1000000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/anthropic"
@@ -566,6 +589,10 @@
       "limit.context": 1048576,
       "limit.output": 65536,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/google"
@@ -908,6 +935,10 @@
       "limit.context": 1050000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -934,6 +965,10 @@
       "limit.context": 400000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -961,6 +996,10 @@
       "limit.context": 1050000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -988,6 +1027,10 @@
       "limit.context": 1050000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -1015,6 +1058,10 @@
       "limit.context": 1050000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -1041,6 +1088,10 @@
       "limit.context": 1050000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -1068,6 +1119,10 @@
       "limit.context": 1050000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -1095,6 +1150,10 @@
       "limit.context": 1050000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -1121,6 +1180,10 @@
       "limit.context": 1050000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -1148,6 +1211,10 @@
       "limit.context": 1050000,
       "limit.output": 128000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/openai"
@@ -1614,6 +1681,10 @@
       "limit.context": 500000,
       "limit.output": 500000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.x.ai/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/xai"
@@ -1639,13 +1710,324 @@
       "limit.context": 500000,
       "limit.output": 500000,
       "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.x.ai/v1"
+      },
       "wire.npm": {
         "from": "provider",
         "value": "@ai-sdk/xai"
       }
     }
   },
-  "source": "models.dev",
-  "catalog_version": 1792755357465,
-  "resolved_at_ms": 1792755517426
+  "wire_corrections": [
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-fable-5-1",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-haiku-4-5",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-opus-5",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-opus-5-5",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-sonnet-5",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.8-flash",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.4",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.4-mini",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.6",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.6-sol",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.6-terra",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6-astra",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6-sol",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6.1-sol",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-daybreak-blue-latest",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-v4.1-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6-luna",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k2.7-code",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m3.1-flash-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.6",
+      "provider": "xai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.x.ai/developers/quickstart#step-4-make-your-first-request",
+        "repo": "https://docs.x.ai"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.7",
+      "provider": "xai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.x.ai/developers/quickstart#step-4-make-your-first-request",
+        "repo": "https://docs.x.ai"
+      },
+      "withheld": false
+    }
+  ]
 }

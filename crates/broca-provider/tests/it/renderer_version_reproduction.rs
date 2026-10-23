@@ -389,16 +389,16 @@ mod live {
         }
     }
 
-    /// A provider not at its family's current version (one rebuilt from a recorded config)
-    /// reproduces only its own version: the declarations describe the current code only.
+    /// Rebuilding state with an old label does not load an old renderer implementation.
+    /// Compatibility is declared by today's code, independently of that stored label.
     #[test]
-    fn a_provider_rebuilt_at_an_old_version_reproduces_only_that_version() {
+    fn a_recorded_version_cannot_override_the_current_compatibility_table() {
         let mut frozen = openai_responses_chatgpt_frozen_config("model");
         frozen.renderer_version = 6;
         frozen.provider_text_state = false;
         let rebuilt = provider(frozen);
-        assert!(rebuilt.reproduces_renderer_version(6));
-        assert!(!rebuilt.reproduces_renderer_version(7));
-        assert!(!rebuilt.reproduces_renderer_version(8));
+        assert!(!rebuilt.reproduces_renderer_version(6));
+        assert!(rebuilt.reproduces_renderer_version(7));
+        assert!(rebuilt.reproduces_renderer_version(8));
     }
 }

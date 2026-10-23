@@ -13,7 +13,7 @@ mod gated {
 
     use broca_catalog::live::{
         resolve_catalog_episode_with_client, AuthMethod, AuthMode, EpisodeRenderConfig,
-        ResolveOptions,
+        FrozenRenderConfig, ResolveOptions,
     };
     use broca_catalog::{CatalogCache, CatalogSource, FusiformCatalogResponse};
     use serde_json::json;
@@ -57,7 +57,7 @@ mod gated {
             .install_for_test(catalog(1, 64_000), CatalogSource::Fusiform)
             .unwrap();
         broca_catalog::install_global_catalog_cache(cache.clone());
-        let resolve = |restored| {
+        let resolve = |recorded: Option<&FrozenRenderConfig>| {
             resolve_catalog_episode_with_client(
                 "anthropic/explicit-resume",
                 Some(100_000),
@@ -68,7 +68,7 @@ mod gated {
                 },
                 broca_provider::build_provider_http_client(),
                 EpisodeRenderConfig {
-                    max_output_tokens: restored,
+                    recorded_config: recorded,
                     ..Default::default()
                 },
             )
@@ -76,8 +76,7 @@ mod gated {
         };
         let admitted = resolve(None).provider.render_config_blob();
         assert_eq!(admitted["max_output_tokens"], 64_000);
-        let frozen_cap =
-            Some(u32::try_from(admitted["max_output_tokens"].as_u64().unwrap()).unwrap());
+        let frozen: FrozenRenderConfig = serde_json::from_value(admitted.clone()).unwrap();
 
         cache
             .install_for_test(catalog(2, 8_192), CatalogSource::Fusiform)
@@ -87,7 +86,7 @@ mod gated {
             8_192,
             "a new admission must observe the lowered catalog maximum"
         );
-        let resumed = resolve(frozen_cap).provider.render_config_blob();
+        let resumed = resolve(Some(&frozen)).provider.render_config_blob();
         assert_eq!(
             resumed["max_output_tokens"], 64_000,
             "a resume must retain the cap frozen at admission, even with an explicit caller cap"

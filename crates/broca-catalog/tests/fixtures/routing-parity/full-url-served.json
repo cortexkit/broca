@@ -1,0 +1,5681 @@
+{
+  "source": "models.dev",
+  "catalog_version": 1792784518157,
+  "resolved_at_ms": 1792787066962,
+  "models": {
+    "anthropic/claude-fable-5-1": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "anthropic/claude-haiku-4-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "min": 1024,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 64000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "anthropic/claude-opus-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "anthropic/claude-opus-5-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "anthropic/claude-sonnet-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.anthropic.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "cline-pass/cline-pass/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.cline.bot/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "cline-pass/cline-pass/glm-5.3": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.cline.bot/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "cline-pass/cline-pass/glm-5.3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.cline.bot/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "cline-pass/cline-pass/muse-spark-1.3-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.cline.bot/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "cloudflare-workers-ai/@cf/zai-org/glm-5.2": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 256000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "cloudflare-workers-ai/@cf/zai-org/glm-5.3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 1048576,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "deepseek/deepseek-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 393216,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.deepseek.com"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.fireworks.ai/inference/v1/"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "fireworks-ai/accounts/fireworks/models/glm-5p3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048573,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.fireworks.ai/inference/v1/"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "fireworks-ai/accounts/fireworks/models/qwen3p8-max": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.fireworks.ai/inference/v1/"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "fireworks-ai/accounts/fireworks/routers/deepseek-flash-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.fireworks.ai/inference/v1/"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "fireworks-ai/accounts/fireworks/routers/glm-flash-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048573,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.fireworks.ai/inference/v1/"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "fireworks-ai/accounts/fireworks/routers/qwen-max-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.fireworks.ai/inference/v1/"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "google/antigravity-gemini-3.7-flash": {
+      "existence": "absent",
+      "successor": "google/antigravity-gemini-3.8-flash"
+    },
+    "google/antigravity-gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "route.reasoning_default": "medium",
+      "route.reasoning_wire_ids": {
+        "high": "gemini-3.8-flash-high",
+        "low": "gemini-3.8-flash-low",
+        "medium": "gemini-3.8-flash-medium"
+      }
+    },
+    "google/antigravity-gemini-4-argon": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 32768,
+      "model.status": null,
+      "route.reasoning_default": "medium",
+      "route.reasoning_wire_ids": {
+        "high": "gemini-4-argon-high",
+        "low": "gemini-4-argon-low",
+        "medium": "gemini-4-argon-medium"
+      }
+    },
+    "google/deep-research-max-preview-04-2026": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 131072,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/deep-research-preview-04-2026": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 131072,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-2.5-computer-use-preview-10-2025": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 128000,
+      "limit.output": 64000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-2.5-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 24576,
+          "min": 0,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-2.5-flash-image": {
+      "capability.attachment": true,
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 32768,
+      "limit.output": 32768,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-2.5-flash-lite": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 24576,
+          "min": 512,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-2.5-flash-preview-tts": {
+      "capability.attachment": false,
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 8192,
+      "limit.output": 16384,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-2.5-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "max": 32768,
+          "min": 128,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-2.5-pro-preview-tts": {
+      "capability.attachment": false,
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 8192,
+      "limit.output": 16384,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3-flash-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3-pro-image": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 65536,
+      "limit.output": 32768,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3-pro-image-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 131072,
+      "limit.output": 32768,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.1-flash-image": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 131072,
+      "limit.output": 32768,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.1-flash-image-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 65536,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.1-flash-lite": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.1-flash-lite-image": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 65536,
+      "limit.output": 4096,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.1-flash-lite-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": "deprecated",
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.1-flash-live-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 131072,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.1-flash-tts-preview": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 8192,
+      "limit.output": 16384,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.1-pro-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.1-pro-preview-customtools": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.5-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.5-flash-lite": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.5-live-translate-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 16384,
+      "limit.output": 32768,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.6-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.7-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-4-argon": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 32768,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-embedding-001": {
+      "capability.attachment": false,
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 2048,
+      "limit.output": 1,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-embedding-2": {
+      "capability.attachment": true,
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 8192,
+      "limit.output": 1,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-flash-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-flash-lite-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-omni-flash-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 131072,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemini-pro-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemma-4-26b-a4b-it": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 32768,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/gemma-4-31b-it": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 32768,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/lyria-3-clip-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.structured_output": false,
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/lyria-3-pro-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.structured_output": false,
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "inception/mercury-2": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 128000,
+      "limit.output": 50000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.inceptionlabs.ai/v1/"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "kimi-code-plan-global/k3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.kimi.ai/coding/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "kimi-code-plan-global/k3-256k": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.kimi.ai/coding/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "meta/muse-spark-1.3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.meta.ai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "meta/muse-spark-1.3-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.meta.ai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "meta/muse-wonder-1.0": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.meta.ai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "meta/muse-wonder-full-1.0": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": null
+    },
+    "ofox/google/gemini-3.1-pro-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://api.ofox.ai/gemini/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "ofox/google/gemini-3.5-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://api.ofox.ai/gemini/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "ofox/google/gemini-3.5-flash-lite": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://api.ofox.ai/gemini/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "ofox/google/gemini-3.6-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://api.ofox.ai/gemini/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "ofox/google/gemini-3.7-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://api.ofox.ai/gemini/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "ofox/google/gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://api.ofox.ai/gemini/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "ofox/google/gemini-4-argon": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://api.ofox.ai/gemini/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "ollama-cloud/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://ollama.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "ollama-cloud/glm-5.3": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://ollama.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "ollama-cloud/glm-5.3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://ollama.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "ollama-cloud/minimax-m3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 512000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://ollama.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "openai/gpt-5.4": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-5.4-mini": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 400000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-5.6": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-5.6-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-5.6-terra": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-6-astra": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-6-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-6.1-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-daybreak-blue-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/beam-free": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/cat-jam-free": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": "deprecated",
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/claude-haiku-5-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/deepseek-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 384000
+    },
+    "opencode-go/deepseek-v4-flash": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": "deprecated"
+    },
+    "opencode-go/deepseek-v4-flash-vision-exp": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": "deprecated"
+    },
+    "opencode-go/deepseek-v4-pro": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/gemini-4-argon-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode-go/glm-5": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 202752,
+      "limit.output": 32768
+    },
+    "opencode-go/glm-5.1": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 202752,
+      "limit.output": 32768
+    },
+    "opencode-go/glm-5.2": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/glm-5.3": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/glm-5.3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/gpt-5.6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/gpt-6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/grok-4.5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 500000,
+      "limit.output": 500000,
+      "model.status": "deprecated"
+    },
+    "opencode-go/grok-4.6": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 500000,
+      "limit.output": 500000,
+      "model.status": null
+    },
+    "opencode-go/grok-4.7": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 500000,
+      "limit.output": 500000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/hy3": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 256000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/hy4-preview": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1024000,
+      "limit.output": 64000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/kimi-k2.5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 65536
+    },
+    "opencode-go/kimi-k2.6": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 65536,
+      "model.status": "deprecated"
+    },
+    "opencode-go/kimi-k2.7-code": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 262144,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/kimi-k3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/kimi-k3.1-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/longcat-2.0": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/longcat-2.5-preview-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": "deprecated",
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/mimo-v2-omni": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 128000
+    },
+    "opencode-go/mimo-v2-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1048576,
+      "limit.output": 128000
+    },
+    "opencode-go/mimo-v2.5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/mimo-v2.5-pro": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/mimo-v2.6-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/mimo-v2.6-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/minimax-m2.5": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 204800,
+      "limit.output": 65536
+    },
+    "opencode-go/minimax-m2.7": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 204800,
+      "limit.output": 131072,
+      "model.status": "deprecated",
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/minimax-m3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/minimax-m3.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 512000,
+      "model.status": null,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/minimax-m3.1-flash-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 512000,
+      "model.status": "deprecated",
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/muse-spark-1.2": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1048576,
+      "limit.output": 131072
+    },
+    "opencode-go/muse-spark-1.2-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/muse-spark-1.3-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "opencode-go/omen-alpha": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 500000,
+      "limit.output": 128000
+    },
+    "opencode-go/ox-alpha-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 131072
+    },
+    "opencode-go/qwen3.5-plus": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 81920,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 65536
+    },
+    "opencode-go/qwen3.6-plus": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 81920,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": "deprecated"
+    },
+    "opencode-go/qwen3.7-max": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 262144,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": "deprecated"
+    },
+    "opencode-go/qwen3.7-plus": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 262144,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/qwen3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "xhigh"
+          ]
+        },
+        {
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/qwen3.8-max": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "xhigh"
+          ]
+        },
+        {
+          "max": 262144,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/anthropic"
+      }
+    },
+    "opencode-go/space-bunny": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 524288,
+      "model.status": "deprecated",
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/space-bunny-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 1048576,
+      "limit.output": 524288,
+      "model.status": "deprecated"
+    },
+    "opencode-go/step-5-preview": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://opencode.ai/inference/go/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/step-5-preview-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 65536,
+      "model.status": "deprecated",
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode-go/union-alpha": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.tool_call": true,
+      "existence": "absent",
+      "limit.context": 262144,
+      "limit.output": 131072
+    },
+    "opencode/deepseek-v4-flash": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/openai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/openai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode/deepseek-v4.1-flash-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 32000,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/openai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
+    "opencode/gemini-3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/google/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode/gemini-3-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": "deprecated",
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/google/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode/gemini-3.1-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/google/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode/gemini-3.5-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/google/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode/gemini-3.5-flash-lite": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/google/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode/gemini-3.6-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/google/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode/gemini-3.7-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/google/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode/gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/google/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode/gemini-4-argon": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/google/v1beta"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "opencode/muse-spark-1.3-contributor-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": "deprecated",
+      "wire.api": {
+        "from": "model",
+        "value": "https://opencode.ai/inference/openai/v1"
+      },
+      "wire.npm": {
+        "from": "model",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openrouter/deepseek/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 943718,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://openrouter.ai/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@openrouter/ai-sdk-provider"
+      }
+    },
+    "openrouter/google/gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://openrouter.ai/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@openrouter/ai-sdk-provider"
+      }
+    },
+    "openrouter/openai/gpt-5.6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://openrouter.ai/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@openrouter/ai-sdk-provider"
+      }
+    },
+    "openrouter/openai/gpt-5.6-luna-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://openrouter.ai/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@openrouter/ai-sdk-provider"
+      }
+    },
+    "openrouter/openai/gpt-6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://openrouter.ai/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@openrouter/ai-sdk-provider"
+      }
+    },
+    "openrouter/openai/gpt-6-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://openrouter.ai/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@openrouter/ai-sdk-provider"
+      }
+    },
+    "openrouter/openai/gpt-6.1-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000,
+      "model.status": null,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://openrouter.ai/api/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@openrouter/ai-sdk-provider"
+      }
+    },
+    "xai/grok-4.6": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 500000,
+      "limit.output": 500000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.x.ai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/xai"
+      }
+    },
+    "xai/grok-4.7": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 500000,
+      "limit.output": 500000,
+      "model.status": null,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.x.ai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/xai"
+      }
+    }
+  },
+  "wire_corrections": [
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-fable-5-1",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-haiku-4-5",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-opus-5",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-opus-5-5",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-sonnet-5",
+      "provider": "anthropic",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.anthropic.com/claude/reference/getting-started-with-the-api; https://docs.anthropic.com/en/api/messages#messages-create",
+        "repo": "https://docs.anthropic.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deep-research-max-preview-04-2026",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deep-research-preview-04-2026",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-2.5-computer-use-preview-10-2025",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-2.5-flash",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-2.5-flash-image",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-2.5-flash-lite",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-2.5-flash-preview-tts",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-2.5-pro",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-2.5-pro-preview-tts",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3-flash-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3-pro-image",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3-pro-image-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.1-flash-image",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.1-flash-image-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.1-flash-lite",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.1-flash-lite-image",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.1-flash-lite-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.1-flash-live-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.1-flash-tts-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.1-pro-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.1-pro-preview-customtools",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.5-flash",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.5-flash-lite",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.5-live-translate-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.6-flash",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.7-flash",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-3.8-flash",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-4-argon",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-embedding-001",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-embedding-2",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-flash-latest",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-flash-lite-latest",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-omni-flash-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-pro-latest",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemma-4-26b-a4b-it",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemma-4-31b-it",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "lyria-3-clip-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "lyria-3-pro-preview",
+      "provider": "google",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://ai.google.dev/gemini-api/docs/generate-content/text-generation#rest",
+        "repo": "https://ai.google.dev"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.4",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.4-mini",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.6",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.6-sol",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.6-terra",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6-astra",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6-luna",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6-sol",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6.1-sol",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-daybreak-blue-latest",
+      "provider": "openai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://platform.openai.com/docs/api-reference/responses/create?lang=csharp#example",
+        "repo": "https://platform.openai.com"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "beam-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "cat-jam-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-haiku-5-5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-v4-flash-vision-exp",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-v4-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-v4.1-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-4-argon-contributor",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5.1",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5.2",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5.3",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5.3-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.6-luna",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6-luna",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.6",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.7",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "hy3",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "hy4-preview",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k2.5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k2.6",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k2.7-code",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k3",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k3.1-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "longcat-2.0",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "longcat-2.5-preview-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2-omni",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2.5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2.5-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2.6-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2.6-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m2.5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m2.7",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m3",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m3.1-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m3.1-flash-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "muse-spark-1.2",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "muse-spark-1.2-contributor",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "muse-spark-1.3-contributor",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "omen-alpha",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "ox-alpha-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.5-plus",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.6-plus",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.7-max",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.7-plus",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.8-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.8-max",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "space-bunny",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "space-bunny-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "step-5-preview",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "step-5-preview-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "union-alpha",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.6",
+      "provider": "xai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.x.ai/developers/quickstart#step-4-make-your-first-request",
+        "repo": "https://docs.x.ai"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.7",
+      "provider": "xai",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "accessed 2026-10-23",
+        "file": "https://docs.x.ai/developers/quickstart#step-4-make-your-first-request",
+        "repo": "https://docs.x.ai"
+      },
+      "withheld": false
+    }
+  ]
+}

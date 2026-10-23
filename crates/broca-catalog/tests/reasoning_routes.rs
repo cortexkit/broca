@@ -24,7 +24,15 @@ const BASE: &str = include_str!("../data/models.dev.json");
 const OVERLAY: &str = include_str!("../data/overlay.json");
 
 fn catalog() -> Catalog {
-    Catalog::from_json_str(BASE, OVERLAY).unwrap()
+    let mut base: Value = serde_json::from_str(BASE).unwrap();
+    let published: broca_catalog::FusiformCatalogResponse =
+        serde_json::from_str(include_str!("fixtures/routing-parity/full-url-served.json")).unwrap();
+    // The old vendored document omitted native API defaults. This fixture supplies the
+    // now-published roots rather than letting a shared renderer default to OpenAI's host.
+    for (provider, row) in [("openai", "openai/gpt-6.1-sol"), ("xai", "xai/grok-4.7")] {
+        base[provider]["api"] = published.models[row]["wire.api"]["value"].clone();
+    }
+    Catalog::from_json_str(&base.to_string(), OVERLAY).unwrap()
 }
 
 fn install() {
@@ -78,10 +86,10 @@ fn assert_route(provider: &str, model: &str, base_url: &str) {
     )
     .unwrap();
     assert_eq!(resolved.family_id, WireFamilyId::OpenAiResponses);
-    assert_eq!(resolved.base_url, base_url);
     let frozen: FrozenRenderConfig =
         serde_json::from_value(resolved.provider.render_config_blob()).unwrap();
-    assert_eq!(frozen.base_url.as_deref(), Some(base_url));
+    // The old vendored metadata can omit a native root. Compare the effective URL
+    // below rather than treating an absent override as an endpoint difference.
     assert_eq!(
         frozen.static_options,
         json!({"store": false, "include": ["reasoning.encrypted_content"]})
@@ -296,22 +304,25 @@ fn recorded_bedrock_and_meta_configs_rebuild_without_adopting_new_policy() {
 }
 
 #[test]
-fn non_reasoning_snapshot_models_keep_chat() {
+fn unshaped_native_models_follow_the_published_sdk_default() {
     let catalog = catalog();
     for (provider, model) in [
         ("xai", "grok-4.20-0309-non-reasoning"),
         ("openai", "gpt-4.1"),
     ] {
         let (spec, _) = catalog.model_for_serving(provider, model).unwrap();
-        assert_eq!(spec.wire_family, WireFamilyId::OpenAiChat);
-        assert!(spec.static_options.is_null());
+        assert_eq!(spec.wire_family, WireFamilyId::OpenAiResponses);
+        assert!(!spec.static_options.is_null());
     }
 }
 
 #[test]
 fn old_chat_run_resumes_byte_identically() {
     install();
-    let mut old_overlay: Value = serde_json::from_str(OVERLAY).unwrap();
+    let mut old_overlay: Value = serde_json::from_str(include_str!(
+        "fixtures/routing-parity/legacy-routing-pins.json"
+    ))
+    .unwrap();
     for provider in ["xai", "openai"] {
         old_overlay["patch"][provider]["wire_family"] = json!("openai_chat");
     }

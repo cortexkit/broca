@@ -1,19 +1,10 @@
 //! Map upstream wire packages and API shapes to Broca's implemented renderers.
 //!
 //! Runtime admission requires a row's routing facts, except for credential-owned client
-//! personas and the closed native endpoint holds below. The provider-id resolver remains
-//! for those holds and for the legacy snapshot importer; it must never supply a guessed
-//! grammar or endpoint for a migrated provider whose facts are missing.
+//! personas. The provider-id resolver is compatibility metadata for old documents that
+//! did not contain packages; it is never permission to send when live wire facts are missing.
 
 use broca_provider::spec::WireFamilyId;
-
-/// Fusiform will publish native SDK default endpoints as sourced, curated facts.
-/// Until those facts are served, these providers retain the existing resolver path.
-/// Delete this closed exception list when the curated endpoints land; an unknown
-/// endpoint on any other provider must refuse instead of borrowing a renderer default.
-pub fn native_endpoint_is_held(provider: &str) -> bool {
-    ["openai", "anthropic", "google", "xai"].contains(&provider)
-}
 
 /// Meta subscription credentials require the Meta Responses client. This endpoint is
 /// credential policy, including for curated rows that have no models.dev wire metadata.
@@ -31,7 +22,8 @@ pub(crate) fn credential_persona_route(
 pub fn wire_family(npm: &str, shape: Option<&str>) -> Option<WireFamilyId> {
     use WireFamilyId::*;
     match (npm, shape) {
-        ("@ai-sdk/openai" | "@ai-sdk/xai", None | Some("responses")) => Some(OpenAiResponses),
+        ("@ai-sdk/openai", None | Some("responses")) => Some(OpenAiResponses),
+        ("@ai-sdk/xai", None | Some("responses")) => Some(OpenAiResponses),
         ("@ai-sdk/openai" | "@ai-sdk/openai-compatible", Some("completions")) => Some(OpenAiChat),
         ("@ai-sdk/openai-compatible" | "@ai-sdk/amazon-bedrock/mantle", Some("responses")) => {
             Some(OpenAiResponses)
@@ -47,8 +39,8 @@ pub fn wire_family(npm: &str, shape: Option<&str>) -> Option<WireFamilyId> {
     }
 }
 
-/// Legacy native renderer defaults retained by the closed endpoint holds. Migrated
-/// providers resolve their package and shape through `wire_family` instead.
+/// Compatibility metadata for legacy documents with no package field. Published packages
+/// take precedence, and live admission still requires complete row routing facts.
 const NATIVE_FAMILIES: &[(&str, WireFamilyId)] = &[
     ("anthropic", WireFamilyId::AnthropicMessages),
     ("openai", WireFamilyId::OpenAiChat),

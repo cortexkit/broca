@@ -52,10 +52,12 @@ counts once toward catalog health, just as an unpaged failure does.
 Routing is resolved from each model row's `wire.npm`, `wire.api` and optional
 `wire.shape`; provenance (`from`) is an open string. An unstated endpoint or
 unsupported package/shape refuses a new send with the model and missing fact
-named. OpenAI, Anthropic, Google's Gemini API and xAI temporarily retain their
-existing native resolver paths until Fusiform serves their native default
-endpoints as curated facts. Code Assist and Meta subscription credentials
-permanently select their own required client protocol and endpoint.
+named. Native defaults are now published as curated facts, not local endpoint pins.
+Code Assist and Meta subscription credentials permanently select their own required
+client protocol and endpoint. Go rows that Pi does not route have no published
+`wire.api`; they refuse because that fact is missing, with the model and missing fact
+named, without a local model list or guessed provider-default URL. Unknown members such as `wire_corrections.notes`
+remain diagnostic data and do not affect decoding or routing.
 
 Code Assist reasoning tiers use `route.reasoning_wire_ids` and
 `route.reasoning_default`. A historical tier-suffixed id is recognized only by
@@ -616,7 +618,7 @@ Omitting the variant renders exactly what the same send rendered before variants
 **Code Assist (Antigravity) renders a variant as a backend tier.** Which levels a model
 accepts still comes from its catalog row; fusiform serves alias rows for several Antigravity ids
 (`antigravity-gemini-3.8-flash` carries `gemini-3.8-flash`'s facts). How a level is sent is the
-family's: Code Assist selects a different backend model id by tier suffix, so `high` on
+family's: Code Assist selects the backend id published in `route.reasoning_wire_ids`, so `high` on
 `antigravity-gemini-3.8-flash` sends `gemini-3.8-flash-high` with that tier's thinking settings,
 exactly as if the caller had spelled the tier in the id. With no variant the bare id keeps its
 default tier (`gemini-3.8-flash-medium`). A level the row defines but the live route has no tier
@@ -629,8 +631,9 @@ row does not define is refused as above.
 A variant is also refused with `variant_unsupported` if the id has no catalog row (its variants
 cannot be known), or the Code Assist route has no tiers for the model (it cannot apply the
 variant). The message identifies the missing catalog row or route tiers; `defined` is empty
-without a catalog row and otherwise lists the catalog-defined variants. Neither refusal prevents
-sending the model with no variant through an explicit Code Assist route.
+without a catalog row and otherwise lists the catalog-defined variants. A fresh send without
+a variant still requires a published tier map and default; no suffix or bare-id fallback is
+guessed when those route facts are missing.
 
 `antigravity-gemini-4-argon` defaults to `gemini-4-argon-medium`; its `low`, `medium`, and `high`
 variants select the corresponding native tier ids. Argon tiers use uppercase `thinkingLevel`

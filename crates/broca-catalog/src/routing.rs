@@ -5,6 +5,21 @@ use broca_provider::spec::WireFamilyId;
 use serde::Deserialize;
 use serde_json::Value;
 
+/// Fusiform's wire.api follows models.dev's published Anthropic-root convention:
+/// the root already includes `/v1` (https://models.dev/api.json). Broca's unchanged
+/// Anthropic renderer instead adds `/v1/messages` to a versionless root
+/// (broca-provider/src/families/anthropic_messages.rs).
+/// Adapt only served roots before freeze; operator overrides and recorded configs
+/// already use Broca's convention and must not be rewritten.
+pub(crate) fn renderer_base_url(family: WireFamilyId, served: &str) -> String {
+    if family == WireFamilyId::AnthropicMessages {
+        if let Some(base) = served.trim_end_matches('/').strip_suffix("/v1") {
+            return base.to_string();
+        }
+    }
+    served.to_string()
+}
+
 /// Provenance is an open string: a new producer source does not change the served value.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct WireFact {
@@ -74,7 +89,7 @@ impl RoutingFacts {
                     self.shape.as_ref().map(|s| &s.value)
                 )
             })?;
-        Ok((family, api.value.clone()))
+        Ok((family, renderer_base_url(family, &api.value)))
     }
 
     pub fn tier(&self, requested: Option<&str>) -> Result<String, String> {
@@ -137,6 +152,31 @@ mod tests {
                 .successor
                 .as_deref(),
             Some("google/antigravity-gemini-3.8-flash")
+        );
+    }
+
+    #[test]
+    fn corrected_provider_and_go_goldens_use_renderer_root_conventions() {
+        let native = row("catalog.get — provider default endpoint");
+        assert_eq!(native.api.as_ref().unwrap().from, "curated");
+        assert_eq!(
+            native.route().unwrap(),
+            (
+                WireFamilyId::OpenAiResponses,
+                "https://api.openai.com/v1".into()
+            )
+        );
+        let go = row("catalog.get — pi Anthropic effective endpoint");
+        assert_eq!(
+            go.api.as_ref().unwrap().value,
+            "https://opencode.ai/inference/go/v1"
+        );
+        assert_eq!(
+            go.route().unwrap(),
+            (
+                WireFamilyId::AnthropicMessages,
+                "https://opencode.ai/inference/go".into()
+            )
         );
     }
 

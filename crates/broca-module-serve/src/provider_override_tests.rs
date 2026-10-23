@@ -734,6 +734,8 @@ fn install_tier_revision(fast_mode_priced: bool) {
     };
     let mut row = serde_json::json!({
         "existence": "present",
+        "wire.npm": {"value":"@ai-sdk/anthropic","from":"provider"},
+        "wire.api": {"value":"https://api.anthropic.com/v1","from":"curated"},
         "limit.context": 200000,
         "limit.output": 64000,
         "capability.attachment": false,
@@ -888,6 +890,8 @@ async fn a_non_chat_catalog_model_is_refused_at_admission() {
     };
     let tier_row = serde_json::json!({
         "existence": "present",
+        "wire.npm": {"value":"@ai-sdk/anthropic","from":"provider"},
+        "wire.api": {"value":"https://api.anthropic.com/v1","from":"curated"},
         "limit.context": 200000,
         "capability.attachment": false,
         "capability.reasoning": false,
@@ -1941,6 +1945,7 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
             recorded_config: Some(&frozen),
             ..restored_episode_render(&recorded, identity.as_ref())
         });
+        assert_eq!(resumed.provider.renderer_version(), renderer_version_for(route.family), "resume provider must identify the current implementation");
         assert!(resumed.provider.reproduces_renderer_version(previous));
         let stated = resumed.provider.render_config_blob_for_version(previous);
         assert_eq!(stated, recorded.frozen_render_config, "{:?}", route.family);
@@ -1967,3 +1972,29 @@ async fn every_declared_previous_version_resumes_through_the_executor_restore_pa
         }
     }
 }
+
+// These readers construct historical partial-config fixtures. Production resume decodes
+// the complete recorded bundle instead of rebuilding it from individual fields.
+fn fixture_field<T: serde::de::DeserializeOwned>(config: &broca_wal::RunConfig, key: &str) -> Option<T> {
+    serde_json::from_value(config.frozen_render_config.get(key)?.clone()).ok()
+}
+fn frozen_max_output_tokens(config: &broca_wal::RunConfig) -> Option<u32> { fixture_field(config, "max_output_tokens") }
+fn frozen_variant(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::FrozenVariant> { fixture_field(config, "variant") }
+fn frozen_thinking_echo_scope(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::ThinkingEchoScope> {
+    match fixture_field(config, "reasoning")? {
+        broca_provider::policy::ReasoningPolicy::AnthropicInterleaved { echo_scope, .. } => Some(echo_scope),
+        _ => None,
+    }
+}
+fn frozen_thinking_cross_model(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::CrossModelThinking> {
+    match fixture_field(config, "reasoning")? {
+        broca_provider::policy::ReasoningPolicy::AnthropicInterleaved { cross_model, .. } => Some(cross_model),
+        _ => None,
+    }
+}
+fn frozen_claude_code_persona(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::ClaudeCodePersona> { fixture_field(config, "claude_code_persona") }
+fn frozen_responses_tools_non_strict(config: &broca_wal::RunConfig) -> bool { fixture_field(config, "responses_tools_non_strict").unwrap_or(false) }
+fn frozen_reasoning_content_required(config: &broca_wal::RunConfig) -> bool { fixture_field(config, "reasoning_content_required").unwrap_or(false) }
+fn frozen_reasoning_echo(config: &broca_wal::RunConfig) -> Option<broca_provider::policy::ReasoningEchoPolicy> { fixture_field(config, "reasoning_echo") }
+fn frozen_provider_text_state(config: &broca_wal::RunConfig) -> bool { fixture_field(config, "provider_text_state").unwrap_or(false) }
+fn frozen_service_tier(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::ServiceTier> { config.service_tier }

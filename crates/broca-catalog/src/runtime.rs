@@ -747,27 +747,23 @@ impl ServingCatalog {
                                 FamilyResolution::Supported { family, .. } => Some(family),
                                 FamilyResolution::Pending { .. } => None,
                             };
-                        let family = if crate::family::native_endpoint_is_held(&provider_id) {
-                            legacy_family
-                        } else {
-                            routing[identity]
-                                .npm
-                                .as_ref()
-                                .and_then(|npm| {
-                                    crate::family::wire_family(
-                                        &npm.value,
-                                        routing[identity]
-                                            .shape
-                                            .as_ref()
-                                            .map(|shape| shape.value.as_str()),
-                                    )
-                                })
-                                .or_else(|| {
-                                    crate::family::credential_persona_route(&provider_id, "oauth")
-                                        .map(|route| route.0)
-                                })
-                                .or(legacy_family)
-                        };
+                        let family = routing[identity]
+                            .npm
+                            .as_ref()
+                            .and_then(|npm| {
+                                crate::family::wire_family(
+                                    &npm.value,
+                                    routing[identity]
+                                        .shape
+                                        .as_ref()
+                                        .map(|shape| shape.value.as_str()),
+                                )
+                            })
+                            .or_else(|| {
+                                crate::family::credential_persona_route(&provider_id, "oauth")
+                                    .map(|route| route.0)
+                            })
+                            .or(legacy_family);
                         RuntimeProviderOverlay::serving_provider(
                             provider_overlay,
                             &provider_id,
@@ -3314,19 +3310,21 @@ mod tests {
     }
 
     #[test]
-    fn native_renderer_pins_do_not_invent_missing_model_rows() {
+    fn a_renderer_only_patch_cannot_invent_a_model_row() {
         let mut page = response(10);
         page.models.insert(
             "openai/fixture-present".into(),
             page.models["anthropic/claude-sonnet-4-5"].clone(),
         );
-        let cache = CatalogCache::empty();
-        cache.refresh(page).unwrap();
+        let overlay: RuntimeOverlay =
+            serde_json::from_value(serde_json::json!({"patch":{"openai":{
+                "wire_family":"openai_responses", "models":{"gpt-4.1":{"wire_family":"openai_chat"}}
+            }}}))
+            .unwrap();
+        let (catalog, _) =
+            ServingCatalog::from_fusiform_with_overlay(&page.models, overlay).unwrap();
         assert!(
-            !cache
-                .snapshot()
-                .unwrap()
-                .contains_model("openai", "gpt-4.1"),
+            !catalog.contains_model("openai", "gpt-4.1"),
             "a renderer pin is not evidence of model existence"
         );
     }

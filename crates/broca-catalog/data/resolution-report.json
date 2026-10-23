@@ -67,7 +67,7 @@
     "npm": "@aihubmix/ai-sdk-provider",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "aihubmix: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "aihubmix: unsupported published wire package"
   },
   {
     "provider_id": "ainetcafe",
@@ -157,7 +157,7 @@
     "provider_id": "anthropic",
     "npm": "@ai-sdk/anthropic",
     "resolved_family": "anthropic_messages",
-    "resolution_source": "provider_id",
+    "resolution_source": "wire_facts",
     "pending_reason": ""
   },
   {
@@ -193,14 +193,14 @@
     "npm": "@ai-sdk/azure",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "azure: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "azure: unsupported published wire package"
   },
   {
     "provider_id": "azure-cognitive-services",
     "npm": "@ai-sdk/azure",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "azure-cognitive-services: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "azure-cognitive-services: unsupported published wire package"
   },
   {
     "provider_id": "bailing",
@@ -284,7 +284,7 @@
     "npm": "ai-gateway-provider",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "cloudflare-ai-gateway: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "cloudflare-ai-gateway: unsupported published wire package"
   },
   {
     "provider_id": "cloudflare-workers-ai",
@@ -298,7 +298,7 @@
     "npm": "@ai-sdk/cohere",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "cohere: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "cohere: unsupported published wire package"
   },
   {
     "provider_id": "coralbricks",
@@ -354,7 +354,7 @@
     "npm": "@ai-sdk/deepinfra",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "deepinfra: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "deepinfra: unsupported published wire package"
   },
   {
     "provider_id": "deepseek",
@@ -466,7 +466,7 @@
     "npm": "gitlab-ai-provider",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "gitlab: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "gitlab: unsupported published wire package"
   },
   {
     "provider_id": "gmicloud",
@@ -479,7 +479,7 @@
     "provider_id": "google",
     "npm": "@ai-sdk/google",
     "resolved_family": "gemini",
-    "resolution_source": "provider_id",
+    "resolution_source": "wire_facts",
     "pending_reason": ""
   },
   {
@@ -487,14 +487,14 @@
     "npm": "@ai-sdk/google-vertex",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "google-vertex: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "google-vertex: unsupported published wire package"
   },
   {
     "provider_id": "google-vertex-anthropic",
     "npm": "@ai-sdk/google-vertex/anthropic",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "google-vertex-anthropic: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "google-vertex-anthropic: unsupported published wire package"
   },
   {
     "provider_id": "greenpt",
@@ -508,7 +508,7 @@
     "npm": "@ai-sdk/groq",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "groq: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "groq: unsupported published wire package"
   },
   {
     "provider_id": "helicone",
@@ -774,7 +774,7 @@
     "npm": "merge-gateway-ai-sdk-provider",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "merge-gateway: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "merge-gateway: unsupported published wire package"
   },
   {
     "provider_id": "meta",
@@ -816,7 +816,7 @@
     "npm": "@ai-sdk/mistral",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "mistral: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "mistral: unsupported published wire package"
   },
   {
     "provider_id": "mixlayer",
@@ -976,7 +976,7 @@
     "provider_id": "openai",
     "npm": "@ai-sdk/openai",
     "resolved_family": "openai_responses",
-    "resolution_source": "overlay",
+    "resolution_source": "wire_facts",
     "pending_reason": ""
   },
   {
@@ -1040,7 +1040,7 @@
     "npm": "@ai-sdk/perplexity",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "perplexity: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "perplexity: unsupported published wire package"
   },
   {
     "provider_id": "perplexity-agent",
@@ -1096,7 +1096,7 @@
     "npm": "@qvac/ai-sdk-provider",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "qvac: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "qvac: unsupported published wire package"
   },
   {
     "provider_id": "regolo-ai",
@@ -1138,14 +1138,14 @@
     "npm": "@saladtechnologies-oss/ai-sdk-provider",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "salad-cloud: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "salad-cloud: unsupported published wire package"
   },
   {
     "provider_id": "sap-ai-core",
     "npm": "@jerome-benoit/sap-ai-provider-v2",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "sap-ai-core: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "sap-ai-core: unsupported published wire package"
   },
   {
     "provider_id": "sarvam",
@@ -1320,7 +1320,7 @@
     "npm": "@ai-sdk/togetherai",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "togetherai: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "togetherai: unsupported published wire package"
   },
   {
     "provider_id": "tokengo",
@@ -1376,7 +1376,7 @@
     "npm": "@ai-sdk/vercel",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "v0: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "v0: unsupported published wire package"
   },
   {
     "provider_id": "vancine",
@@ -1390,14 +1390,14 @@
     "npm": "venice-ai-sdk-provider",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "venice: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "venice: unsupported published wire package"
   },
   {
     "provider_id": "vercel",
     "npm": "@ai-sdk/gateway",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "vercel: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "vercel: unsupported published wire package"
   },
   {
     "provider_id": "vispark",
@@ -1460,13 +1460,13 @@
     "npm": "watsonx-ai-provider",
     "resolved_family": null,
     "resolution_source": "pending",
-    "pending_reason": "watsonx: no overlay wire_family pin and no provider-id hand-table entry"
+    "pending_reason": "watsonx: unsupported published wire package"
   },
   {
     "provider_id": "xai",
     "npm": "@ai-sdk/xai",
     "resolved_family": "openai_responses",
-    "resolution_source": "overlay",
+    "resolution_source": "wire_facts",
     "pending_reason": ""
   },
   {

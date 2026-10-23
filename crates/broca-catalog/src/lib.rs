@@ -6,7 +6,7 @@
 //!
 //! Fusiform owns model and provider facts, including wire packages, shapes, endpoints,
 //! reasoning tier ids and retirement successors. Broca maps packages and shapes to its
-//! implemented renderers. The overlay retains only native routing holds and renderer quirks.
+//! implemented renderers. The serving overlay contains no copied model routing facts.
 //! The legacy snapshot importer remains available for offline tooling. Its FULL
 //! original object is preserved verbatim in `raw` (forward-compat — models.dev adds
 //! fields, and an unmapped field must never be silently dropped). The renderer NEVER
@@ -329,7 +329,14 @@ impl Catalog {
         let mut pending = Vec::new();
         for (id, entry) in &providers {
             let overlay_family = entry.get("wire_family").and_then(parse_family);
-            let resolution = resolve_provider_family(id, overlay_family);
+            let resolution =
+                if overlay_family.is_some() || entry.get("npm").and_then(Value::as_str).is_none() {
+                    resolve_provider_family(id, overlay_family)
+                } else {
+                    FamilyResolution::Pending {
+                        reason: format!("{id}: unsupported published wire package"),
+                    }
+                };
             let resolution = match resolution {
                 FamilyResolution::Pending { .. } => entry
                     .get("npm")
@@ -525,7 +532,7 @@ impl Catalog {
             .and_then(|provider| provider.get("api"))
             .and_then(Value::as_str)
         {
-            provider_spec.base_url = api.to_string();
+            provider_spec.base_url = routing::renderer_base_url(model_family, api);
         }
         Some((provider_spec, map_model(model_id, model_entry, raw_policy)))
     }
@@ -702,9 +709,14 @@ fn map_provider(
     let base_url = entry
         .get("base_url")
         .and_then(Value::as_str)
-        .or_else(|| entry.get("api").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_string();
+        .map(str::to_string)
+        .or_else(|| {
+            entry
+                .get("api")
+                .and_then(Value::as_str)
+                .map(|api| routing::renderer_base_url(family, api))
+        })
+        .unwrap_or_default();
     ProviderSpec {
         id: provider_id.to_string(),
         wire_family: family,
@@ -1379,15 +1391,13 @@ mod tests {
         );
     }
 
-    /// Published package and endpoint facts replace duplicate overlay pins; native xAI
-    /// retains its renderer exception until curated endpoint facts are available.
+    /// Published package and endpoint facts replace duplicate overlay pins.
     #[cfg(feature = "bundled-catalog")]
     #[test]
     fn fact_served_providers_resolve_to_openai_chat_with_base_url() {
         // (provider, a real snapshot model id, expected base_url after overlay).
         let cases = [
             ("deepseek", "deepseek-v4-flash", "https://api.deepseek.com"),
-            ("xai", "grok-4.20-0309-non-reasoning", "https://api.x.ai/v1"),
             // OpenRouter's root comes directly from its published API field.
             (
                 "openrouter",
@@ -1559,14 +1569,26 @@ mod tests {
         assert!(serving_model.raw.is_null());
     }
 
-    /// The bundled catalog must keep OpenAI's provider-specific token-limit override scoped to
-    /// OpenAI itself while leaving the OpenAI-compatible long tail on the family default.
+    #[cfg(feature = "bundled-catalog")]
+    fn published_chat_shape_fixture() -> Catalog {
+        Catalog::from_json_str(&json!({
+            "openai":{"npm":"@ai-sdk/openai","api":"https://api.openai.com/v1","models":{
+                "chat-fixture":{"reasoning":false,"provider":{"shape":"completions"}},
+                "second-chat-fixture":{"reasoning":false,"provider":{"shape":"completions"}}
+            }},
+            "deepseek":{"npm":"@ai-sdk/openai-compatible","api":"https://api.deepseek.com","models":{"compatible-fixture":{"reasoning":false}}}
+        }).to_string(), "{}").unwrap()
+    }
+
+    /// Explicit published Chat shapes keep the native token-field quirk without
+    /// inferring a model's protocol from its name or reasoning capability.
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn bundled_openai_chat_models_use_max_completion_tokens_but_long_tail_keeps_max_tokens() {
-        for model_id in ["gpt-4.1", "gpt-4o"] {
-            let (spec, _model) = catalog().model("openai", model_id).unwrap_or_else(|| {
-                panic!("openai/{model_id} must resolve from the bundled snapshot")
+    fn published_chat_shapes_keep_the_native_token_field_quirk_scoped() {
+        let catalog = published_chat_shape_fixture();
+        for model_id in ["chat-fixture", "second-chat-fixture"] {
+            let (spec, _model) = catalog.model("openai", model_id).unwrap_or_else(|| {
+                panic!("openai/{model_id} must resolve from its published shape")
             });
             assert_eq!(spec.wire_family, WireFamilyId::OpenAiChat);
             assert_eq!(
@@ -1576,8 +1598,8 @@ mod tests {
             );
         }
 
-        let (deepseek, _model) = catalog()
-            .model("deepseek", "deepseek-v4-flash")
+        let (deepseek, _model) = catalog
+            .model("deepseek", "compatible-fixture")
             .expect("deepseek/deepseek-v4-flash must stay on the OpenAI-compatible family default");
         assert_eq!(deepseek.wire_family, WireFamilyId::OpenAiChat);
         assert_eq!(
@@ -1590,15 +1612,15 @@ mod tests {
     /// long-tail family default `max_tokens`.
     #[cfg(feature = "bundled-catalog")]
     #[test]
-    fn bundled_openai_chat_render_uses_max_completion_tokens() {
+    fn published_chat_shape_renders_max_completion_tokens() {
         use broca_protocol::content::{ContentBlock, Message, Role};
         use broca_protocol::request::CallOptions;
         use broca_provider::families::{renderer_version_for, resolve_frozen};
         use broca_provider::registry::wire_family;
 
-        let (provider_spec, model_spec) = catalog()
-            .model("openai", "gpt-4.1")
-            .expect("openai/gpt-4.1 must resolve from the bundled snapshot");
+        let (provider_spec, model_spec) = published_chat_shape_fixture()
+            .model("openai", "chat-fixture")
+            .expect("the explicit Chat shape resolves");
         let family = provider_spec.wire_family;
         assert_eq!(family, WireFamilyId::OpenAiChat);
 

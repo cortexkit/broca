@@ -1,7 +1,7 @@
 {
   "source": "models.dev",
-  "catalog_version": 1792755357465,
-  "resolved_at_ms": 1792755517426,
+  "catalog_version": 1792784518157,
+  "resolved_at_ms": 1792787066962,
   "models": {
     "opencode-go/beam-free": {
       "capability.attachment": false,
@@ -85,7 +85,7 @@
       "model.status": null,
       "wire.api": {
         "from": "curated",
-        "value": "https://opencode.ai/inference/go"
+        "value": "https://opencode.ai/inference/go/v1"
       },
       "wire.npm": {
         "from": "model",
@@ -572,6 +572,30 @@
         "value": "@ai-sdk/openai-compatible"
       }
     },
+    "opencode-go/kimi-k3.1-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072,
+      "model.status": null,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
+    },
     "opencode-go/longcat-2.0": {
       "capability.attachment": false,
       "capability.reasoning": true,
@@ -744,7 +768,7 @@
       "model.status": null,
       "wire.api": {
         "from": "curated",
-        "value": "https://opencode.ai/inference/go"
+        "value": "https://opencode.ai/inference/go/v1"
       },
       "wire.npm": {
         "from": "model",
@@ -980,7 +1004,7 @@
       "model.status": null,
       "wire.api": {
         "from": "curated",
-        "value": "https://opencode.ai/inference/go"
+        "value": "https://opencode.ai/inference/go/v1"
       },
       "wire.npm": {
         "from": "model",
@@ -1014,7 +1038,7 @@
       "model.status": null,
       "wire.api": {
         "from": "curated",
-        "value": "https://opencode.ai/inference/go"
+        "value": "https://opencode.ai/inference/go/v1"
       },
       "wire.npm": {
         "from": "model",
@@ -1049,7 +1073,7 @@
       "model.status": null,
       "wire.api": {
         "from": "curated",
-        "value": "https://opencode.ai/inference/go"
+        "value": "https://opencode.ai/inference/go/v1"
       },
       "wire.npm": {
         "from": "model",
@@ -1162,5 +1186,777 @@
       "limit.context": 262144,
       "limit.output": 131072
     }
-  }
+  },
+  "wire_corrections": [
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "beam-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "cat-jam-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "claude-haiku-5-5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-v4-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-v4-flash-vision-exp",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-v4-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "deepseek-v4.1-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gemini-4-argon-contributor",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5.1",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5.2",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5.3",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "glm-5.3-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-5.6-luna",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "gpt-6-luna",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.6",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "grok-4.7",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "hy3",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "hy4-preview",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k2.5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k2.6",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k2.7-code",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k3",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "kimi-k3.1-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "longcat-2.0",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "longcat-2.5-preview-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2-omni",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2.5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2.5-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2.6-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "mimo-v2.6-pro",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m2.5",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m2.7",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m3",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m3.1-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "minimax-m3.1-flash-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "muse-spark-1.2",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "muse-spark-1.2-contributor",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "muse-spark-1.3-contributor",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "omen-alpha",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "ox-alpha-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.5-plus",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.6-plus",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.7-max",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.7-plus",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.8-flash",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "qwen3.8-max",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "space-bunny",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "space-bunny-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "step-5-preview",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": false
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "step-5-preview-free",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    },
+    {
+      "established_at_ms": 1792713600000,
+      "established_by": "fusiform",
+      "field": "wire.api",
+      "model": "union-alpha",
+      "provider": "opencode-go",
+      "review_by_ms": 1797897600000,
+      "source_ref": {
+        "commit": "74f46864",
+        "file": "packages/ai/src/providers/opencode-go.ts; @earendil-works/pi-ai@1.4.0/dist/providers/data/opencode-go.json (API group / chat:<model-id>)",
+        "repo": "https://github.com/earendil-works/pi"
+      },
+      "withheld": true
+    }
+  ]
 }
