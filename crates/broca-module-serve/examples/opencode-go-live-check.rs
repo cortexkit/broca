@@ -398,10 +398,14 @@ fn initial_prompt(case: Case) -> Vec<Message> {
 
 fn options_for_step(history: &[Message], case: Case, plan: &StepPlan) -> CallOptions {
     let tools = plan.tool.map(tool_definition).into_iter().collect();
-    let choice = plan
-        .tool
-        .map(|name| ToolChoice::Tool { name: name.into() })
-        .unwrap_or(ToolChoice::None);
+    // Offer the step's tool with `auto`, as production runs do. Forcing a named tool is not a
+    // production shape, and thinking models such as Kimi refuse it while thinking is on
+    // ("tool_choice 'specified' is incompatible with thinking enabled").
+    let choice = if plan.tool.is_some() {
+        ToolChoice::Auto
+    } else {
+        ToolChoice::None
+    };
     request_options(history, case.model_id(), tools, choice, case.output_cap())
 }
 
@@ -639,11 +643,20 @@ impl Observation {
 fn safe_provider_error(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let error = value.get("error")?;
-    error
+    let code = error
         .get("code")
         .or_else(|| error.get("type"))
+        .and_then(Value::as_str)?;
+    // The provider's own message names the refused field; it is request feedback, not a
+    // credential, and is cut to a bounded length before it is printed.
+    let message = error
+        .get("message")
         .and_then(Value::as_str)
-        .map(str::to_owned)
+        .map(|message| message.chars().take(300).collect::<String>());
+    Some(match message {
+        Some(message) => format!("{code}: {message}"),
+        None => code.to_owned(),
+    })
 }
 
 fn normalize_response(
@@ -660,9 +673,16 @@ fn normalize_response(
     String,
 > {
     let mut normalizer = family.normalizer(frozen, step_id);
-    let events = normalizer
+    let mut events = normalizer
         .push(bytes)
         .map_err(|error| format!("normalize provider response: {error}"))?;
+    // End of stream, as the production transport signals it. Chat-format normalizers emit the
+    // assembled assistant message only here; without it every Chat reply reads as empty.
+    events.extend(
+        normalizer
+            .finish()
+            .map_err(|error| format!("finish provider response: {error}"))?,
+    );
     let mut assistant = None;
     let mut usage = broca_protocol::usage::Usage::default();
     let mut provider_error = None;
@@ -828,6 +848,24 @@ async fn send_live_request(
     } else {
         (None, Default::default(), safe_provider_error(&bytes))
     };
+    if (200..300).contains(&status) && assistant.is_none() {
+        // A success the normalizer could not read is a wire-shape finding: show the start and
+        // end of the stream (synthetic fixture content only) so the shape can be compared.
+        let text = String::from_utf8_lossy(&bytes);
+        let head: String = text.chars().take(1500).collect();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(800)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        eprintln!(
+            "unreadable 2xx body ({} bytes), head:\n{head}\n...tail:\n{tail}",
+            bytes.len()
+        );
+    }
     let tool_calls = tool_names(assistant.as_ref());
     let error = if (200..300).contains(&status) {
         stream_error
