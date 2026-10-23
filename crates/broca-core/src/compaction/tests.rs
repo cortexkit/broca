@@ -720,6 +720,11 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
     captured.fold(&setup_record(None));
     let raw = raw();
     let snapshot = crate::StorePageSnapshot {
+        model_history: Some(crate::context::ModelHistory {
+            spans: vec![],
+            open_span: None,
+            row_ranges: std::iter::once(0..raw.len() as u64).collect(),
+        }),
         prefix_len: raw.len() as u64,
         rows: raw
             .iter()

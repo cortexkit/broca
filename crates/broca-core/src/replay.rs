@@ -1035,6 +1035,8 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
 /// Persisted state needed to project a WAL suffix without replaying the materialized prefix.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionSeed {
+    /// First model-produced message of the episode open at the watermark, if it has one.
+    pub open_episode_span: Option<u64>,
     pub watermark_seq: u64,
     pub anchor: Option<WalByteAnchor>,
     pub prefix_len: u64,
@@ -1055,6 +1057,7 @@ pub struct ProjectionSeed {
 impl ProjectionSeed {
     pub fn empty() -> Self {
         Self {
+            open_episode_span: None,
             watermark_seq: 0,
             anchor: None,
             prefix_len: 0,
@@ -1075,6 +1078,8 @@ impl ProjectionSeed {
 /// The store-ready result of folding records after a [`ProjectionSeed`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionDelta {
+    pub episode_spans: Vec<std::ops::Range<u64>>,
+    pub open_episode_span: Option<u64>,
     pub messages: Vec<Message>,
     pub message_runs: Vec<Option<RunAttribution>>,
     pub run_finals: BTreeMap<u64, RunAttribution>,
@@ -1180,6 +1185,15 @@ pub fn replay_projection_tail(
     if admission_checkpoint.compaction.is_some() {
         admission_checkpoint.compaction = Some(tail_state.compaction.clone());
     }
+    let (episode_spans, open_episode_span) = projected_episode_spans(
+        &tail_state,
+        truncate_prefix_to.unwrap_or(seed.prefix_len),
+        if truncate_prefix_to.is_some() {
+            None
+        } else {
+            seed.open_episode_span
+        },
+    );
     let last_run_id = tail_state.run_id.or_else(|| seed.last_run_id.clone());
     debug_assert_eq!(
         last_run_id.as_ref(),
@@ -1189,6 +1203,8 @@ pub fn replay_projection_tail(
             .map(|episode| &episode.run_id)
     );
     Ok(ProjectionDelta {
+        episode_spans,
+        open_episode_span,
         messages: tail_state.prompt,
         message_runs: tail_state.message_runs,
         run_finals: tail_state.run_finals,
@@ -1207,6 +1223,40 @@ pub fn replay_projection_tail(
             seed.last_run_id.as_ref(),
         ),
     })
+}
+
+/// Continue the materialized episode across a replay seam, closing it before the next
+/// episode's input. Tail replay alone only knows the first model message after the seam.
+pub(crate) fn projected_episode_spans(
+    state: &ReplayState,
+    base: u64,
+    previous_open: Option<u64>,
+) -> (Vec<std::ops::Range<u64>>, Option<u64>) {
+    let episodes = state.render_episodes.as_deref().unwrap_or_default();
+    let first_boundary = episodes
+        .first()
+        .map_or(state.prompt.len(), |e| e.prompt_start);
+    let mut spans = Vec::new();
+    if let Some(start) = previous_open {
+        spans.push(start..base + first_boundary as u64);
+    }
+    spans.extend(
+        state
+            .episode_step_spans
+            .iter()
+            .flatten()
+            .filter(|span| previous_open.is_none() || span.start >= first_boundary)
+            .map(|span| base + span.start as u64..base + span.end as u64),
+    );
+    let open = match episodes.last() {
+        Some(episode) => spans
+            .iter()
+            .rev()
+            .find(|span| span.start >= base + episode.prompt_start as u64)
+            .map(|span| span.start),
+        None => previous_open.or_else(|| spans.last().map(|span| span.start)),
+    };
+    (spans, open)
 }
 
 /// Validate a budgeted projection/admission seed before it can affect replay.
@@ -3093,6 +3143,7 @@ pub(crate) mod projection_boundary_tests {
             unreachable!("fixture starts a run")
         };
         ProjectionSeed {
+            open_episode_span: Some(1),
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,

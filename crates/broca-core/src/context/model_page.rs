@@ -154,8 +154,6 @@ pub fn read_session_model_page(
         }
     }
     let head = crate::last_control_cursor_through(tail, None).or(snapshot.control_head);
-    // Rows do not carry episode spans. Even a complete prefix needs the WAL if the
-    // single-observer test discovers guidance, because counters reset per episode.
     let mut raw: Vec<Message> = snapshot
         .rows
         .iter()
@@ -175,7 +173,29 @@ pub fn read_session_model_page(
         false,
         snapshot.tag_seed,
     )?;
-    raw.extend(tail_state.prompt);
+    let history = snapshot.model_history.as_ref();
+    if snapshot.watermark_seq == 0 && compaction.is_none() {
+        compaction = Some(tail_state.compaction.clone());
+    }
+    let (tail_spans, _) = crate::replay::projected_episode_spans(
+        &tail_state,
+        snapshot.prefix_len,
+        history.and_then(|history| history.open_span),
+    );
+    let mut spans = history.map_or_else(Vec::new, |history| {
+        history
+            .spans
+            .iter()
+            .filter(|span| Some(span.start) != history.open_span)
+            .cloned()
+            .collect()
+    });
+    spans.extend(tail_spans);
+    let total_len = snapshot.prefix_len + tail_state.prompt.len() as u64;
+    for (i, mut message) in tail_state.prompt.into_iter().enumerate() {
+        message.ordinal = Some(snapshot.prefix_len + i as u64);
+        raw.push(message);
+    }
     let has_compaction_plan = tail.iter().any(|frame| match &frame.record {
         WalRecord::RunStarted {
             manifest: Some(manifest),
@@ -183,14 +203,40 @@ pub fn read_session_model_page(
         } => crate::compaction::has_compaction(manifest),
         _ => false,
     });
+    let rows_complete = history.map_or(snapshot.prefix_len == 0, |history| {
+        history
+            .row_ranges
+            .iter()
+            .flat_map(|range| range.clone())
+            .eq(snapshot.rows.iter().map(|row| row.ordinal))
+    });
+    let limit = request
+        .limit
+        .unwrap_or(SESSION_READ_DEFAULT_LIMIT)
+        .clamp(1, SESSION_READ_MAX_LIMIT);
+    let hidden_through = compaction
+        .as_ref()
+        .and_then(CompactionCheckpoint::state)
+        .and_then(|state| state.applied.as_ref())
+        .map_or(0, |applied| applied.range.to);
+    let needed = request
+        .from_ordinal
+        .unwrap_or_else(|| total_len.saturating_sub(limit))
+        .max(hidden_through);
+    let end = needed
+        .saturating_add(limit)
+        .saturating_add(1)
+        .min(total_len);
+    let start_index = raw.partition_point(|message| message.ordinal.is_some_and(|o| o < needed));
+    let window_complete = (needed..end).eq(raw[start_index..]
+        .iter()
+        .take(end.saturating_sub(needed) as usize)
+        .filter_map(|message| message.ordinal));
+    // A compaction recorded only in the WAL tail can move the visible window beyond the
+    // page captured by the store. Replay that uncommon seam rather than invent a continuation.
     let needs_full = (compaction.is_none() && (has_compaction_plan || snapshot.watermark_seq > 0))
-        || snapshot.rows.len() as u64 != snapshot.prefix_len
-        || raw.iter().any(|message| {
-            message
-                .content
-                .iter()
-                .any(|block| matches!(block, broca_protocol::ContentBlock::ToolResult(_)))
-        });
+        || !rows_complete
+        || !window_complete;
     let lineage_id = snapshot.lineage_id.clone();
     if needs_full {
         let records = complete_read().map_err(ModelPageError::CompleteRead)?;
@@ -212,8 +258,15 @@ pub fn read_session_model_page(
         if compaction.is_none() {
             compaction = Some(prior.compaction);
         }
+    } else {
+        // Every displayed result is preceded by its episode's model-step history. Other
+        // episodes reset the observer, so their hidden rows are unnecessary for these bytes.
+        for span in spans {
+            let from = raw.partition_point(|m| m.ordinal.is_some_and(|o| o < span.start));
+            let to = raw.partition_point(|m| m.ordinal.is_some_and(|o| o < span.end));
+            crate::run::restore_repetition_guidance(&mut raw[from..to]);
+        }
     }
-    broca_protocol::content::stamp_ordinals(&mut raw);
     let applied = compaction
         .as_ref()
         .and_then(CompactionCheckpoint::state)

@@ -1,5 +1,5 @@
-//! Request bytes of a run frozen with `render_tags` under the computed tag rules are the bytes a
-//! rebuild from the WAL gives, at every step. That is broca's resume rule: a resumed run renders
+//! Request bytes of a run frozen with `render_tags` are the bytes a rebuild from the WAL gives
+//! at every step, under both computed numbering and legacy stored-ledger rules. That is broca's resume rule: a resumed run renders
 //! from the WAL, so a live request that differed from the rebuild would change the prompt the
 //! provider has cached.
 //!
@@ -437,6 +437,92 @@ async fn a_steer_mid_run_renders_live_as_its_rebuild() {
         assert!(third
             .iter()
             .any(|text| text.ends_with("§ checking again") && text.starts_with('§')));
+    }
+}
+
+#[tokio::test]
+async fn a_stored_ledger_resume_keeps_live_and_pending_result_tags() {
+    for family in FAMILIES {
+        let source_store = FileWalStore::new(scratch(&label("stored-source", family)));
+        let name = "stored-tags";
+        let source = run(
+            &source_store,
+            request(name, None),
+            tool_loop_with_steer(),
+            None,
+            family,
+        )
+        .await;
+        let pending_cut = source
+            .records
+            .iter()
+            .position(|frame| matches!(frame.record, WalRecord::ToolBatchStarted { .. }))
+            .unwrap()
+            + 1;
+        let complete_cut = source
+            .records
+            .iter()
+            .position(|frame| matches!(frame.record, WalRecord::TurnFinished { .. }))
+            .unwrap()
+            + 1;
+
+        for (case, cut) in [("complete", complete_cut), ("pending", pending_cut)] {
+            let label = label(&format!("stored-{case}"), family);
+            let store = FileWalStore::new(scratch(&label));
+            let session = request(name, None).session;
+            let writer = WalHandle::spawn(store.open(&session).unwrap(), 1).unwrap();
+            // Write an episode frozen under legacy stored-ledger rules through the real writer,
+            // which stamps its tags. Resume must keep that mode instead of switching rules.
+            for frame in &source.records[..cut] {
+                let mut record = frame.record.clone();
+                if let WalRecord::RunStarted { config, .. } = &mut record {
+                    config.computed_tags = None;
+                    config.render_tags = true;
+                }
+                writer.record(record).into_result().unwrap();
+            }
+            writer.shutdown().await.unwrap();
+            let prefix = store.read_records(&session).unwrap();
+            assert!(
+                !wal_tags(&prefix).is_empty(),
+                "{label}: legacy fixture stores tags"
+            );
+            if case == "pending" {
+                let records: Vec<_> = prefix.iter().map(|frame| frame.record.clone()).collect();
+                assert!(matches!(
+                    broca_core::replay(&records).unwrap().resolution,
+                    broca_core::ReplayResolution::Resume { pending: Some(_) }
+                ));
+            }
+
+            let resumed = run(
+                &store,
+                request(name, None),
+                tool_loop_with_steer(),
+                None,
+                family,
+            )
+            .await;
+            assert_eq!(resumed.reason, RunFinishReason::Completed, "{label}");
+            assert_eq!(
+                resumed
+                    .records
+                    .iter()
+                    .filter(|frame| { matches!(frame.record, WalRecord::RunStarted { .. }) })
+                    .count(),
+                1,
+                "{label}: resume must not open a computed-tag episode"
+            );
+            assert!(
+                resumed.calls.len() >= 2,
+                "{label}: exercise a newly completed live tool turn"
+            );
+            assert!(
+                wal_tags(&resumed.records).len() > wal_tags(&prefix).len(),
+                "{label}: the resumed writer still assigns ledger tags"
+            );
+            assert_live_matches_rebuilt(&label, &resumed, prefix.len());
+        }
     }
 }
 

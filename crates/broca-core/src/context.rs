@@ -100,9 +100,20 @@ pub struct StorePageRow {
     pub run: Option<crate::RunAttribution>,
 }
 
+/// Rebuildable model-guidance coordinates captured with a page's rows and watermark.
+/// Missing metadata means replay, not an episode without repeated calls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelHistory {
+    pub spans: Vec<std::ops::Range<u64>>,
+    pub open_span: Option<u64>,
+    /// The exact ordinal ranges the store read, including episode history and lookahead.
+    pub row_ranges: Vec<std::ops::Range<u64>>,
+}
+
 /// The metadata and requested rows captured by one store transaction for `session.read`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePageSnapshot {
+    pub model_history: Option<ModelHistory>,
     pub watermark_seq: u64,
     /// WAL identity represented by the materialized rows. Without a known matching
     /// WAL identity, readers must discard these rows and replay the complete WAL.
@@ -136,6 +147,7 @@ pub struct StorePageSnapshot {
 impl StorePageSnapshot {
     pub fn empty() -> Self {
         Self {
+            model_history: None,
             last_title: None,
             deferred_calls: None,
             watermark_seq: 0,
@@ -1305,7 +1317,10 @@ pub fn resume_state_from_store(
         !prefix.prefix.is_empty(),
         crate::tags::TagSeed::from_prefix(&prefix.prefix),
     )?;
-    let mut prompt = prefix.prefix.clone();
+    // Leave room for the resumed run's next turns. Cloning the exact-capacity prefix would
+    // otherwise copy the entire transcript again when the first new message is appended.
+    let mut prompt = Vec::with_capacity(prefix.prefix.len() + tail_state.prompt.len() + 256);
+    prompt.extend_from_slice(&prefix.prefix);
     if materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail) {
         prompt.clear();
     }
@@ -1862,6 +1877,19 @@ mod tests {
         BatchId, ErrorClass, MessageId, RunId, StepId, ToolCallId, Usage,
     };
     use broca_wal::{AuthSelection, DispatchOutcome, FramedRecord, RunConfig, WalRecord};
+
+    #[test]
+    fn resume_prompt_reserves_room_for_new_turns() {
+        let mut prefix = StorePrefix::empty();
+        prefix.prefix = vec![Message::new(Role::User, vec![]); 1000];
+        let mut state = resume_state_from_store(&prefix, &[], None, None, None).unwrap();
+        assert!(state.prompt.capacity() >= state.prompt.len() + 256);
+        let original = state.prompt.as_ptr();
+        state
+            .prompt
+            .extend(vec![Message::new(Role::Assistant, vec![]); 256]);
+        assert_eq!(state.prompt.as_ptr(), original);
+    }
 
     fn interrupted() -> WalRecord {
         WalRecord::RunFinished {
@@ -2425,6 +2453,7 @@ mod tests {
             })
             .collect();
         StorePageSnapshot {
+            model_history: None,
             last_title: None,
             deferred_calls: None,
             compaction: None,

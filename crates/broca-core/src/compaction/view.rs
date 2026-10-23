@@ -78,6 +78,8 @@ impl Announced {
 /// `session.read` returns it. `None` for a message without an ordinal.
 pub fn transcript_message(message: &Message) -> Option<TranscriptMessage> {
     let ordinal = message.ordinal?;
+    #[cfg(test)]
+    super::carried_encoding_tests::note_encoded();
     Some(TranscriptMessage::new(
         ordinal,
         format!("m{ordinal}"),
@@ -91,10 +93,18 @@ pub fn transcript_message(message: &Message) -> Option<TranscriptMessage> {
 /// The transcript messages of `prompt`: every message with an ordinal, in order, except
 /// system messages, which the runner places ahead of the history itself (as it does under
 /// Setup's initial message).
-fn transcript(prompt: &[Message]) -> impl Iterator<Item = &Message> {
+fn transcript(prompt: &[Message]) -> impl DoubleEndedIterator<Item = &Message> {
     prompt
         .iter()
         .filter(|message| message.ordinal.is_some() && message.role != Role::System)
+}
+
+/// Locate a half-open ordinal range in the stamped, append-only prompt. Unstamped system
+/// messages, when present, precede the transcript and are not part of an ordinal range.
+pub(super) fn ordinal_range(prompt: &[Message], from: u64, to: u64) -> &[Message] {
+    let start = prompt.partition_point(|m| m.ordinal.is_none_or(|o| o < from));
+    let end = start + prompt[start..].partition_point(|m| m.ordinal.is_some_and(|o| o < to));
+    &prompt[start..end]
 }
 
 /// Why a view cannot be assembled over the transcript.
@@ -130,15 +140,11 @@ pub fn assemble(
 fn assemble_judged(
     view: &CompactionView,
     prompt: &[Message],
-    stored: Option<&[Message]>,
+    stored: Option<super::StoredTranscript<'_>>,
 ) -> Result<Vec<Message>, AssemblyProblem> {
     use crate::compaction_provider::view::ViewRange;
-    let stored_at = |ordinal: u64| {
-        stored.and_then(|stored| transcript(stored).find(|m| m.ordinal == Some(ordinal)))
-    };
-    let in_range = |from: u64, to: u64| {
-        transcript(prompt).filter(move |m| m.ordinal.is_some_and(|o| o >= from && o < to))
-    };
+    let stored_at = |ordinal: u64| stored.and_then(|stored| stored.at(ordinal));
+    let in_range = |from: u64, to: u64| transcript(ordinal_range(prompt, from, to));
     let mut out = Vec::new();
     for range in &view.ranges {
         match range {
@@ -174,9 +180,28 @@ fn assemble_judged(
             ViewRange::Replace { from, to, bytes } => {
                 let values: Vec<Value> = serde_json::from_str(bytes)
                     .map_err(|_| AssemblyProblem::Rejected(ViewProblem::ReplacementNotArray))?;
+                let candidates: Vec<_> = values.iter().filter_map(native_schema_message).collect();
                 let carried: Option<Vec<Message>> = stored.map(|stored| {
-                    transcript(stored)
-                        .filter(|m| m.ordinal.is_some_and(|o| o >= *from && o < *to))
+                    if !candidates.iter().any(|candidate| {
+                        candidate.origin.is_some()
+                            || candidate.content.iter().any(super::is_signed)
+                            || stored.has_model_origin(candidate.role)
+                    }) {
+                        return Vec::new();
+                    }
+                    stored
+                        .range(*from, *to)
+                        // A different role or content cannot be an unchanged signed copy, nor
+                        // an otherwise unchanged message with its model origin removed.
+                        .filter(|original| {
+                            candidates.iter().any(|candidate| {
+                                candidate.role == original.role
+                                    && candidate.content == original.content
+                                    && (original.origin.is_some()
+                                        || candidate.origin.is_some()
+                                        || candidate.content.iter().any(super::is_signed))
+                            })
+                        })
                         .cloned()
                         .collect()
                 });
@@ -199,11 +224,7 @@ fn assemble_judged(
         }
     }
     let covered = view.covers_through.ordinal;
-    out.extend(
-        transcript(prompt)
-            .filter(|m| m.ordinal.is_some_and(|o| o > covered))
-            .cloned(),
-    );
+    out.extend(transcript(ordinal_range(prompt, covered.saturating_add(1), u64::MAX)).cloned());
     Ok(out)
 }
 
@@ -423,14 +444,35 @@ pub fn decide_at(
     prefix_bound: bool,
     run_start: bool,
 ) -> Decision {
-    let entries: BTreeMap<u64, TranscriptMessage> = transcript(prompt)
-        .filter_map(transcript_message)
-        .map(|entry| (entry.ordinal, entry))
-        .collect();
+    decide_stored_at(
+        view,
+        ready,
+        state,
+        lineage_id,
+        prompt,
+        super::StoredTranscript::plain(stored),
+        prefix_bound,
+        run_start,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_stored_at(
+    view: &CompactionView,
+    ready: &ViewReady,
+    state: &CompactionState,
+    lineage_id: &str,
+    prompt: &[Message],
+    stored: super::StoredTranscript<'_>,
+    prefix_bound: bool,
+    run_start: bool,
+) -> Decision {
     let current = state.view.as_ref().map(|applied| applied.view.view_version);
     // broca never cuts (see CUT_UNSUPPORTED below), so every lineage it serves starts at ordinal 0.
     match dispose_fetched(view, ready, current, lineage_id, 0, |ordinal| {
-        entries.get(&ordinal).cloned()
+        transcript(ordinal_range(prompt, ordinal, ordinal.saturating_add(1)))
+            .next()
+            .and_then(transcript_message)
     }) {
         ViewDisposition::Apply => {}
         ViewDisposition::Stale => return Decision::Stale,
@@ -568,6 +610,7 @@ impl std::fmt::Display for ViewNotRenderable {
 pub(crate) fn render(
     opts: &broca_protocol::CallOptions,
     state: &CompactionState,
+    systems: &[usize],
 ) -> Option<Result<broca_protocol::CallOptions, ViewNotRenderable>> {
     let applied = state.view.as_ref()?;
     let mut history = match assemble(&applied.view, &opts.prompt) {
@@ -580,12 +623,7 @@ pub(crate) fn render(
         }
     };
     apply_strips(&mut history, &state.strips, strips_copies(state));
-    let mut prompt: Vec<_> = opts
-        .prompt
-        .iter()
-        .filter(|m| m.role == Role::System)
-        .cloned()
-        .collect();
+    let mut prompt: Vec<_> = systems.iter().map(|&i| opts.prompt[i].clone()).collect();
     let history_start = prompt.len();
     prompt.extend(history);
     let mut view = opts.with_prompt(prompt);
@@ -596,32 +634,7 @@ pub(crate) fn render(
             .applied
             .as_ref()
             .map(|applied| applied.thinking_prefix_len),
-        episodes: opts
-            .render_episodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, episode)| {
-                let end = opts
-                    .render_episodes
-                    .get(index + 1)
-                    .map_or(usize::MAX, |next| next.prompt_start);
-                let kept = view.prompt[history_start..].iter().position(|m| {
-                    m.ordinal
-                        .is_some_and(|o| o >= episode.prompt_start as u64 && o < end as u64)
-                })?;
-                let first_user = episode.first_user.and_then(|first| {
-                    view.prompt[history_start..]
-                        .iter()
-                        .position(|m| m.ordinal == Some(first as u64))
-                        .map(|i| history_start + i)
-                });
-                Some(broca_protocol::request::EpisodeRenderInput {
-                    prompt_start: history_start + kept,
-                    first_user,
-                    frozen_config: episode.frozen_config.clone(),
-                })
-            })
-            .collect(),
+        episodes: super::retained_episodes(opts, &view.prompt, history_start),
     });
     Some(Ok(view))
 }
@@ -660,7 +673,15 @@ pub fn next_notice(
     prompt: &[Message],
     facts: NoticeFacts<'_>,
 ) -> Option<AdvanceNotice> {
-    let through = transcript(prompt).last()?;
+    let through = transcript(prompt).next_back()?;
+    notice_through(state, through, facts)
+}
+
+pub(crate) fn notice_through(
+    state: &CompactionState,
+    through: &Message,
+    facts: NoticeFacts<'_>,
+) -> Option<AdvanceNotice> {
     let through_ordinal = through.ordinal?;
     let through_digest = content_digest(&serde_json::to_value(through).expect("native JSON"));
     let applied = state.applied_view_version(facts.lineage_id);

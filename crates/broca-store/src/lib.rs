@@ -332,6 +332,8 @@ impl ProjectionPlan {
 }
 
 struct PreparedProjection {
+    episode_spans: Vec<std::ops::Range<u64>>,
+    open_episode_span: Option<u64>,
     expected_watermark: u64,
     expected_lineage_id: Option<String>,
     reset: bool,
@@ -572,6 +574,8 @@ impl SqliteStore {
         tx.execute("DELETE FROM message WHERE session=?1", [&key])
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM message_tag WHERE session=?1", [&key])
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM episode_span WHERE session=?1", [&key])
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM meta WHERE session=?1", [&key])
             .map_err(|e| e.to_string())?;
@@ -1006,7 +1010,13 @@ impl SqliteStore {
                   prefix_len INTEGER,
                   admission_checkpoint_json TEXT
              );
-             CREATE TABLE IF NOT EXISTS message (
+              CREATE TABLE IF NOT EXISTS episode_span (
+                  session TEXT NOT NULL,
+                  start_ord INTEGER NOT NULL,
+                  end_ord INTEGER NOT NULL,
+                  PRIMARY KEY (session, start_ord)
+              );
+              CREATE TABLE IF NOT EXISTS message (
                  session TEXT NOT NULL,
                  ord     INTEGER NOT NULL,
                  json    TEXT NOT NULL,
@@ -1091,6 +1101,9 @@ impl SqliteStore {
             ("last_title", "TEXT"),
             ("deferred_calls_json", "TEXT"),
             ("run_attribution_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("episode_spans_complete", "INTEGER NOT NULL DEFAULT 0"),
+            ("episode_spans_seq", "INTEGER"),
+            ("open_episode_span", "INTEGER"),
         ] {
             if !columns.contains(column) {
                 conn.execute(
@@ -1462,6 +1475,8 @@ impl SqliteStore {
                 },
                 NeutralPlan::Write(prepared) => {
                     ProjectionPlan::Write(Box::new(PreparedProjection {
+                        episode_spans: prepared.episode_spans,
+                        open_episode_span: prepared.open_episode_span,
                         expected_watermark: prepared.expected_watermark,
                         expected_lineage_id: prepared.expected_lineage_id,
                         reset: prepared.reset,
@@ -1558,6 +1573,7 @@ impl SqliteStore {
                 return Ok(expected_watermark);
             }
             ProjectionPlan::Reset { .. } => {
+                tx.execute("DELETE FROM episode_span WHERE session=?1", [key])?;
                 tx.execute("DELETE FROM message WHERE session=?1", [key])?;
                 tx.execute("DELETE FROM message_tag WHERE session=?1", [key])?;
                 tx.execute("DELETE FROM meta WHERE session=?1", [key])?;
@@ -1577,10 +1593,19 @@ impl SqliteStore {
         };
 
         if prepared.reset {
+            tx.execute("DELETE FROM episode_span WHERE session=?1", [key])?;
             tx.execute("DELETE FROM message WHERE session=?1", [key])?;
             tx.execute("DELETE FROM message_tag WHERE session=?1", [key])?;
             tx.execute("DELETE FROM meta WHERE session=?1", [key])?;
         } else if let Some(truncate_to) = prepared.truncate_prefix_to {
+            tx.execute(
+                "DELETE FROM episode_span WHERE session=?1 AND start_ord>=?2",
+                rusqlite::params![key, truncate_to],
+            )?;
+            tx.execute(
+                "UPDATE episode_span SET end_ord=MIN(end_ord,?2) WHERE session=?1",
+                rusqlite::params![key, truncate_to],
+            )?;
             tx.execute(
                 "DELETE FROM message WHERE session=?1 AND ord>=?2",
                 rusqlite::params![key, truncate_to],
@@ -1591,6 +1616,16 @@ impl SqliteStore {
             )?;
         }
         let mut next_ord = prepared.next_ord;
+        for span in &prepared.episode_spans {
+            tx.execute(
+                "INSERT OR REPLACE INTO episode_span (session,start_ord,end_ord) VALUES (?1,?2,?3)",
+                rusqlite::params![
+                    key,
+                    broca_core::projection_plan::u64_to_i64(span.start)?,
+                    broca_core::projection_plan::u64_to_i64(span.end)?
+                ],
+            )?;
+        }
         let mut tags_json = prepared.message_tags_json.into_iter();
         for (json, run_json) in prepared
             .message_json
@@ -1674,6 +1709,17 @@ impl SqliteStore {
         tx.execute(
             "UPDATE meta SET deferred_calls_json=?2, run_attribution_version=?3 WHERE session=?1",
             rusqlite::params![key, prepared.deferred_calls_json, RUN_ATTRIBUTION_VERSION],
+        )?;
+        tx.execute(
+            "UPDATE meta SET episode_spans_complete=1, open_episode_span=?2, episode_spans_seq=?3 WHERE session=?1",
+            rusqlite::params![
+                key,
+                prepared
+                    .open_episode_span
+                    .map(broca_core::projection_plan::u64_to_i64)
+                    .transpose()?,
+                prepared.new_watermark as i64
+            ],
         )?;
         for run_id in prepared.withdrawals_owed_runs {
             tx.execute(
@@ -2017,39 +2063,123 @@ impl MaterializedStore for SqliteStore {
             .map_err(|e| e.to_string())?
             .flatten();
 
-        let start = from_ordinal.unwrap_or_else(|| prefix_len.saturating_sub(limit));
-        let end = start.saturating_add(limit).min(prefix_len);
-        let start_i64 = i64::try_from(start).unwrap_or(i64::MAX);
-        let end_i64 = i64::try_from(end).unwrap_or(i64::MAX);
+        // Only model pages need the replacement payload. Read it in the rows' transaction,
+        // and skip its hidden raw range when locating the page and its lookahead.
+        let compaction = if view == broca_core::context::ReadView::Model {
+            let checkpoint_json: Option<String> = tx
+                .query_row(
+                    "SELECT admission_checkpoint_json FROM meta WHERE session=?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .flatten();
+            checkpoint_json
+                .as_deref()
+                .and_then(decode_admission_checkpoint)
+                .filter(|checkpoint| checkpoint.at_seq == watermark_seq)
+                .and_then(|checkpoint| checkpoint.compaction)
+        } else {
+            None
+        };
+        let hidden_through = compaction
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.state())
+            .and_then(|state| state.applied.as_ref())
+            .map_or(0, |applied| applied.range.to);
+        let mut start = from_ordinal
+            .unwrap_or_else(|| prefix_len.saturating_sub(limit))
+            .max(hidden_through)
+            .min(prefix_len);
+        let mut end = start.saturating_add(limit).min(prefix_len);
+        let mut model_history = None;
+        if view == broca_core::context::ReadView::Model {
+            let metadata = episode_history_metadata(&tx, &key).map_err(|e| e.to_string())?;
+            if let Some((true, open_span)) = metadata {
+                // A result's guidance depends on earlier calls in its episode, not earlier
+                // episodes. One extra raw message preserves the page's continuation cursor.
+                end = end.saturating_add(1).min(prefix_len);
+                let containing: Option<(u64, u64)> = tx.query_row(
+                    "SELECT start_ord,end_ord FROM episode_span WHERE session=?1 AND start_ord<=?2 ORDER BY start_ord DESC LIMIT 1",
+                    rusqlite::params![key, start as i64], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional().map_err(|e| e.to_string())?;
+                if let Some((episode_start, _)) =
+                    containing.filter(|(_, episode_end)| start < *episode_end)
+                {
+                    start = episode_start;
+                }
+                let mut row_ranges = std::iter::once(start..end).collect::<Vec<_>>();
+                if let Some(open) = open_span {
+                    if open <= end {
+                        row_ranges[0] = start.min(open)..prefix_len;
+                        start = row_ranges[0].start;
+                        end = prefix_len;
+                    } else {
+                        row_ranges.push(open..prefix_len);
+                    }
+                }
+                let mut spans = Vec::new();
+                for range in &row_ranges {
+                    let mut stmt = tx.prepare("SELECT start_ord,end_ord FROM episode_span WHERE session=?1 AND start_ord>=?2 AND start_ord<?3 ORDER BY start_ord").map_err(|e| e.to_string())?;
+                    let found = stmt
+                        .query_map(
+                            rusqlite::params![key, range.start as i64, range.end as i64],
+                            |row| Ok(row.get::<_, u64>(0)?..row.get::<_, u64>(1)?),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    spans.extend(
+                        found
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                model_history = Some(broca_core::context::ModelHistory {
+                    spans,
+                    open_span,
+                    row_ranges,
+                });
+            }
+        }
+        let row_ranges = model_history.as_ref().map_or_else(
+            || std::iter::once(start..end).collect::<Vec<_>>(),
+            |history| history.row_ranges.clone(),
+        );
         let mut stmt = tx
             .prepare(
                 "SELECT ord, json, run_json, tags_json FROM message
                  WHERE session=?1 AND ord>=?2 AND ord<?3 ORDER BY ord ASC",
             )
             .map_err(|e| e.to_string())?;
-        let encoded = stmt
-            .query_map(rusqlite::params![key, start_i64, end_i64], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
         let mut rows = Vec::new();
-        for encoded_row in encoded {
-            let (ordinal, json, run_json, tags_json) = encoded_row.map_err(|e| e.to_string())?;
-            let run_json = run_json.ok_or(broca_core::StorePageReadError::AttributionStale)?;
-            let run = serde_json::from_str(&run_json).map_err(|e| e.to_string())?;
-            let ordinal = u64::try_from(ordinal).map_err(|e| e.to_string())?;
-            let mut message = decode_message(json, tags_json).map_err(|e| e.to_string())?;
-            message.ordinal = Some(ordinal);
-            rows.push(StorePageRow {
-                ordinal,
-                message,
-                run,
-            });
+        for range in row_ranges {
+            let encoded = stmt
+                .query_map(
+                    rusqlite::params![key, range.start as i64, range.end as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            for encoded_row in encoded {
+                let (ordinal, json, run_json, tags_json) =
+                    encoded_row.map_err(|e| e.to_string())?;
+                let run_json = run_json.ok_or(broca_core::StorePageReadError::AttributionStale)?;
+                let run = serde_json::from_str(&run_json).map_err(|e| e.to_string())?;
+                let ordinal = u64::try_from(ordinal).map_err(|e| e.to_string())?;
+                let mut message = decode_message(json, tags_json).map_err(|e| e.to_string())?;
+                message.ordinal = Some(ordinal);
+                rows.push(StorePageRow {
+                    ordinal,
+                    message,
+                    run,
+                });
+            }
         }
         drop(stmt);
 
@@ -2093,28 +2223,9 @@ impl MaterializedStore for SqliteStore {
             .transpose()
             .map_err(|e| e.to_string())?
             .flatten();
-        // Only model pages need the potentially large replacement payload. Decode it in the
-        // same transaction as the rows so the view cannot come from a newer projection.
-        let compaction = if view == broca_core::context::ReadView::Model {
-            let checkpoint_json: Option<String> = tx
-                .query_row(
-                    "SELECT admission_checkpoint_json FROM meta WHERE session=?1",
-                    [&key],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-                .flatten();
-            checkpoint_json
-                .as_deref()
-                .and_then(decode_admission_checkpoint)
-                .filter(|checkpoint| checkpoint.at_seq == watermark_seq)
-                .and_then(|checkpoint| checkpoint.compaction)
-        } else {
-            None
-        };
         tx.commit().map_err(|e| e.to_string())?;
         Ok(StorePageSnapshot {
+            model_history,
             deferred_calls,
             compaction,
             watermark_seq,
@@ -2470,6 +2581,25 @@ fn current_projection_lineage_id(
         .flatten())
 }
 
+/// An older projector can advance the transcript without knowing the episode-span columns.
+/// Bind their completeness to the watermark they were actually computed from, so such writes
+/// make the new reader replay rather than reuse stale repetition counters.
+fn episode_history_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> rusqlite::Result<Option<(bool, Option<u64>)>> {
+    tx.query_row(
+        "SELECT episode_spans_complete, episode_spans_seq, watermark_seq, open_episode_span FROM meta WHERE session=?1",
+        [key],
+        |row| {
+            let complete: bool = row.get(0)?;
+            let span_seq: Option<i64> = row.get(1)?;
+            let watermark: i64 = row.get(2)?;
+            Ok((complete && span_seq == Some(watermark), row.get(3)?))
+        },
+    ).optional()
+}
+
 fn current_projection_position(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
@@ -2594,6 +2724,9 @@ fn projection_seed_from_complete_tx(
     else {
         return Ok(None);
     };
+    let Some((true, open_episode_span)) = episode_history_metadata(tx, key)? else {
+        return Ok(None);
+    };
     let checkpoint_run_id = admission_checkpoint
         .last_episode
         .as_ref()
@@ -2619,6 +2752,7 @@ fn projection_seed_from_complete_tx(
         return Ok(None);
     };
     Ok(Some(ProjectionSeed {
+        open_episode_span,
         deferred_calls: serde_json::from_str(&deferred_calls_json)?,
         watermark_seq,
         anchor,
@@ -4814,6 +4948,14 @@ mod tests {
             .expect("read initial prefix");
         let before_admission = MaterializedStore::read_admission_snapshot(&store, &session)
             .expect("read initial metadata");
+        let before_model = MaterializedStore::read_page_with_watermark(
+            &store,
+            &session,
+            Some(0),
+            500,
+            broca_core::ReadView::Model,
+        )
+        .unwrap();
 
         store
             .conn
@@ -4834,6 +4976,15 @@ mod tests {
             .expect("read rolled-back metadata");
         assert_eq!(after_prefix, before_prefix);
         assert_eq!(after_admission, before_admission);
+        let after_model = MaterializedStore::read_page_with_watermark(
+            &store,
+            &session,
+            Some(0),
+            500,
+            broca_core::ReadView::Model,
+        )
+        .unwrap();
+        assert_eq!(after_model.model_history, before_model.model_history);
     }
 
     #[test]

@@ -1153,15 +1153,15 @@ async fn measure_size(target: usize) -> Report {
     let (read_newest, _) = measure(|| read(None));
     let (read_from_cut, read_cut_messages) = measure(|| read(Some(fixture.cut)));
     let (read_from_zero, _) = measure(|| read(Some(0)));
-    // The model view of session.read, as the module's registry serves it: the store page is
-    // always read from ordinal 0 with the largest limit, and core may ask for the complete WAL.
+    // Match the registry's page request. The store expands model reads to the episode history
+    // needed for guidance; core still requests complete WAL replay for legacy projections.
     let complete_reads = AtomicU64::new(0);
     let (model_read_from_cut, _) = measure(|| {
         let page = MaterializedStore::read_page_with_watermark(
             fixture.store.as_ref(),
             &session,
-            Some(0),
-            broca_core::SESSION_READ_MAX_LIMIT,
+            Some(fixture.cut),
+            PAGE_LIMIT,
             broca_core::context::ReadView::Model,
         )
         .expect("read store page");

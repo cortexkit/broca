@@ -25,15 +25,17 @@ use broca_wal::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
 pub use broca_wal::MAX_REPLACEMENT_BYTES;
+mod stored;
 pub use runtime::{
     apply_idle_view, CompactionConfig, CompactionPlane, CompactionUnavailable, CompactionViews,
     ViewReadyInbox,
 };
+pub(crate) use stored::{OriginalMessages, StoredTranscript};
 pub(crate) mod runtime;
 #[cfg(feature = "test-clock")]
 pub mod test_control;
@@ -759,18 +761,27 @@ pub fn model_options(
     opts: &broca_protocol::CallOptions,
     state: &CompactionState,
 ) -> Result<broca_protocol::CallOptions, view::ViewNotRenderable> {
-    if let Some(view) = view::render(opts, state) {
+    let systems: Vec<_> = opts
+        .prompt
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| (m.role == Role::System).then_some(i))
+        .collect();
+    model_options_indexed(opts, state, &systems)
+}
+
+pub(crate) fn model_options_indexed(
+    opts: &broca_protocol::CallOptions,
+    state: &CompactionState,
+    systems: &[usize],
+) -> Result<broca_protocol::CallOptions, view::ViewNotRenderable> {
+    if let Some(view) = view::render(opts, state, systems) {
         return view;
     }
     let Some(applied) = &state.applied else {
         return Ok(opts.clone());
     };
-    let mut prompt: Vec<_> = opts
-        .prompt
-        .iter()
-        .filter(|m| m.role == Role::System)
-        .cloned()
-        .collect();
+    let mut prompt: Vec<_> = systems.iter().map(|&i| opts.prompt[i].clone()).collect();
     let replacement_start = prompt.len();
     prompt.extend(applied.replacement.iter().cloned().map(|mut m| {
         m.ordinal = None;
@@ -778,9 +789,9 @@ pub fn model_options(
     }));
     let tail_start = prompt.len();
     prompt.extend(
-        opts.prompt
+        view::ordinal_range(&opts.prompt, applied.range.to, u64::MAX)
             .iter()
-            .filter(|m| m.role != Role::System && m.ordinal.is_some_and(|o| o >= applied.range.to))
+            .filter(|m| m.role != Role::System)
             .cloned(),
     );
     let mut view = opts.with_prompt(prompt);
@@ -797,36 +808,77 @@ pub fn model_options(
     // retained raw messages; replacement messages must not inherit episode decorations.
     view.render_episodes = Arc::new(broca_protocol::request::RenderHistory {
         compaction_prefix_len: Some(applied.thinking_prefix_len),
-        episodes: opts
-            .render_episodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, episode)| {
-                let end = opts
-                    .render_episodes
-                    .get(index + 1)
-                    .map_or(usize::MAX, |next| next.prompt_start);
-                let retained = view.prompt[tail_start..].iter().position(|m| {
-                    m.ordinal
-                        .is_some_and(|o| o >= episode.prompt_start as u64 && o < end as u64)
-                })?;
-                let first_user = episode
-                    .first_user
-                    .and_then(|first| {
-                        view.prompt[tail_start..]
-                            .iter()
-                            .position(|m| m.ordinal == Some(first as u64))
-                    })
-                    .map(|i| tail_start + i);
-                Some(broca_protocol::request::EpisodeRenderInput {
-                    prompt_start: tail_start + retained,
-                    first_user,
-                    frozen_config: episode.frozen_config.clone(),
-                })
-            })
-            .collect(),
+        episodes: retained_episodes(opts, &view.prompt, tail_start),
     });
     Ok(view)
+}
+
+/// Translate only episodes represented by retained transcript messages. Searching the episode
+/// boundaries from each retained ordinal avoids walking episodes hidden by a compaction view.
+fn retained_episodes(
+    opts: &broca_protocol::CallOptions,
+    prompt: &[Message],
+    start: usize,
+) -> Vec<broca_protocol::request::EpisodeRenderInput> {
+    let mut kept = BTreeMap::new();
+    let mut positions = BTreeMap::new();
+    for (position, message) in prompt.iter().enumerate().skip(start) {
+        let Some(ordinal) = message.ordinal else {
+            continue;
+        };
+        positions.entry(ordinal).or_insert(position);
+        let end = opts
+            .render_episodes
+            .partition_point(|episode| episode.prompt_start as u64 <= ordinal);
+        if let Some(index) = end.checked_sub(1) {
+            kept.entry(index).or_insert(position);
+        }
+    }
+    kept.into_iter()
+        .map(|(index, position)| {
+            let episode = &opts.render_episodes[index];
+            broca_protocol::request::EpisodeRenderInput {
+                prompt_start: position,
+                first_user: episode
+                    .first_user
+                    .and_then(|first| positions.get(&(first as u64)).copied()),
+                frozen_config: episode.frozen_config.clone(),
+            }
+        })
+        .collect()
+}
+
+/// One boundary's rendered model input and its exact wire size. Only an accepted view can
+/// change this input during a ceiling wait; notices and wait records do not change it.
+#[derive(Default)]
+pub(crate) struct BoundaryRequest {
+    options: Option<broca_protocol::CallOptions>,
+    view_version: Option<u64>,
+    pub(crate) bytes: usize,
+}
+
+impl BoundaryRequest {
+    pub(crate) fn refresh(
+        &mut self,
+        opts: &broca_protocol::CallOptions,
+        state: &CompactionState,
+        systems: &[usize],
+        render: impl FnOnce(&broca_protocol::CallOptions) -> Vec<u8>,
+    ) -> Result<(), view::ViewNotRenderable> {
+        let version = state.view.as_ref().map(|view| view.view.view_version);
+        if self.options.is_some() && self.view_version == version {
+            return Ok(());
+        }
+        let options = model_options_indexed(opts, state, systems)?;
+        self.bytes = render(&options).len();
+        self.options = Some(options);
+        self.view_version = version;
+        Ok(())
+    }
+
+    pub(crate) fn into_options(self) -> broca_protocol::CallOptions {
+        self.options.expect("boundary request was rendered")
+    }
 }
 
 pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) -> u64 {
@@ -894,6 +946,12 @@ mod carried_encoding_tests {
 
     pub(super) fn note_encoded() {
         ENCODED.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    pub(super) fn measure<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        ENCODED.with(|cell| cell.set(0));
+        let result = run();
+        (result, ENCODED.with(std::cell::Cell::get))
     }
 
     fn text(role: Role, text: String) -> Message {
