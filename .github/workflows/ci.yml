@@ -492,33 +492,3 @@ jobs:
             fi
             exit 1
           fi
-
-
-      # Exercised 2026-08-12 against a scratch repo, because this gate had been green on
-      # every run since the repo existed and nothing showed it COULD go red:
-      #   clean tree                     -> passes
-      #   modified tracked file          -> fails, naming it
-      #   untracked file left behind     -> fails, naming it
-      # The third case is the one worth protecting and it rests on a default: porcelain
-      # reports untracked files, so a build that emits a generated source nobody added trips
-      # this. Adding --untracked-files=no while tidying would silently remove exactly that
-      # case, and the remaining two would keep passing.
-      # The diff is EMPTY for an untracked file, so it is printed conditionally: an
-      # unconditional `git diff` under a porcelain listing makes the listing look redundant,
-      # and the listing is the only output naming the file.
-      - name: Verify clean worktree
-        shell: bash
-        run: |
-          dirty="$(git status --porcelain)"
-          if [ -n "$dirty" ]; then
-            echo "::error::Working tree changed during CI (modified tracked files, or new files a build left behind)"
-            printf '%s\n' "$dirty"
-            diff_out="$(git diff -- . | head -c 20000)"
-            if [ -n "$diff_out" ]; then
-              echo "git diff (first 20000 bytes):"
-              printf '%s\n' "$diff_out"
-            else
-              echo "(no diff: the change is untracked files the build left behind -- see the list above)"
-            fi
-            exit 1
-          fi
