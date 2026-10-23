@@ -605,6 +605,65 @@ fn enrollment_warns_with_kind_for_an_unreadable_wal() {
 }
 
 #[test]
+fn live_writer_deferral_waits_for_writer_release_before_retrying() {
+    let rig = Rig::new();
+    rig.seed(1, 100, Some(200));
+    let lease = rig.service.lease(&rig.key).unwrap();
+    let wal = rig
+        .service
+        .wal
+        .open_with_retention(&rig.key, Some(1))
+        .unwrap();
+    rig.service.file_work.store(0, Ordering::Relaxed);
+    let walks_before = rig.service.directory_walks.load(Ordering::Relaxed);
+    let capture = broca_test_support::LogCapture::new();
+
+    capture.in_scope(|| assert_eq!(rig.service.enroll_changes().unwrap(), 0));
+
+    let logs: Vec<_> = capture
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event.target == "retention.enrollment" && event.message() == "enrollment deferred"
+        })
+        .collect();
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert_eq!(logs[0].level, tracing::Level::DEBUG);
+    assert_eq!(logs[0].fields["kind"], "live_writer");
+    let first_pass_work = rig.service.file_work.load(Ordering::Relaxed);
+    assert!(
+        first_pass_work > 0,
+        "the initial attempt must inspect the WAL before discovering the held lease"
+    );
+
+    let (pending_changes, overflow) = rig.service.wal.take_retention_changes();
+    assert!(
+        pending_changes.is_empty() && !overflow,
+        "{pending_changes:?}, overflow={overflow}"
+    );
+    rig.service.enroll_changes().unwrap();
+    assert_eq!(
+        rig.service.directory_walks.load(Ordering::Relaxed),
+        walks_before + 1,
+        "recovery does not rescan the directory after its first pass"
+    );
+    assert_eq!(
+        rig.service.file_work.load(Ordering::Relaxed),
+        first_pass_work,
+        "a held writer is not reopened on each sweep"
+    );
+
+    drop(wal);
+    drop(lease);
+    assert_eq!(rig.service.enroll_changes().unwrap(), 1);
+    assert!(rig
+        .store
+        .lookup_live_retention_lineage(&rig.key)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn enrollment_defers_a_busy_store_at_debug_with_a_counter() {
     let mut rig = Rig::new();
     rig.seed(1, 100, Some(200));
@@ -2045,6 +2104,11 @@ async fn sweep_retries_sidecarless_boot_enrollment_after_lease_release_within_bo
     let deadline = before + 1000;
     let registry = rig.registry(None);
     let lease = rig.service.lease(&rig.key).unwrap();
+    let wal = rig
+        .service
+        .wal
+        .open_with_retention(&rig.key, Some(1))
+        .unwrap();
     assert_eq!(registry.boot_retention().await.unwrap(), 0);
     assert_eq!(registry.sweep_once(deadline).await.unwrap(), 0);
     assert!(path.exists());
@@ -2057,6 +2121,7 @@ async fn sweep_retries_sidecarless_boot_enrollment_after_lease_release_within_bo
     assert!(rig.store.lookup_run("r1").unwrap().is_none());
     assert!(rig.service.tombstones(&rig.key).unwrap().is_empty());
 
+    drop(wal);
     drop(lease);
     fs::write(
         rig.root.join("test-clock"),
