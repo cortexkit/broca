@@ -6248,6 +6248,9 @@ fn append_repetition_guidance(result: &mut ToolResult, guidance: &str) {
     let suffix = format!("\n\n{LABEL}{guidance}");
 
     match &mut result.output {
+        ToolOutput::Parts { parts } => {
+            parts.push(broca_protocol::ToolOutputPart::Text { text: suffix })
+        }
         ToolOutput::Text { text } => text.push_str(&suffix),
         ToolOutput::Denied { reason } => reason.push_str(&suffix),
         ToolOutput::Error { message } => message.push_str(&suffix),
@@ -7721,6 +7724,23 @@ fn cap_tool_result(result: &mut ToolResult, run_id: &RunId, tool_name: &str, hea
     // Denied's provider-facing prefix is included; small outputs retain their original variant.
     let serialized;
     let text = match &result.output {
+        // Cap text parts only; capture-time media validation owns size limits for stored objects.
+        ToolOutput::Parts { .. } => {
+            if let ToolOutput::Parts { parts } = &mut result.output {
+                let mut remaining = limit;
+                for part in parts.iter_mut() {
+                    if let broca_protocol::ToolOutputPart::Text { text } = part {
+                        let mut end = text.len().min(remaining);
+                        while !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        text.truncate(end);
+                        remaining -= end;
+                    }
+                }
+            }
+            return;
+        }
         ToolOutput::Text { text } => text.as_str(),
         ToolOutput::Error { message } => message.as_str(),
         ToolOutput::Denied { reason } => {

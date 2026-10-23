@@ -115,6 +115,10 @@ pub fn append_to_result(result: &mut ToolResult, text: &str) {
         ToolOutput::Text { text: output } => output.push_str(text),
         ToolOutput::Error { message } => message.push_str(text),
         ToolOutput::Json { .. } | ToolOutput::Denied { .. } => {}
+        // The Rendering contract keeps multipart results in source order, including appended text.
+        ToolOutput::Parts { parts } => {
+            parts.push(broca_protocol::ToolOutputPart::Text { text: text.into() })
+        }
     }
 }
 

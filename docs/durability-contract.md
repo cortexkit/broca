@@ -85,6 +85,32 @@ outbound bytes on resume. State is echoed only when its format tag names the tar
 protocol and the assistant message's recorded provider/model IDs both match the target model.
 Unknown origins fail closed; visible text remains portable.
 
+Media references and ordered multipart tool outputs require **`media-content/v1`**. Any
+`Parts` output requires it, even one containing only failure-marker text: older readers cannot
+decode the new output kind. A record without the new grammar keeps its prior features and bytes.
+The reader and writer ship in the same release, an exception to the reader-first skip contract.
+Before the first media frame, the writer durably raises `wal-feature-floor`; if that fails, it
+appends nothing. Placement blocks rollback to a build lacking the feature, and such a reader
+refuses the WAL as `NewerWriter` naming `media-content/v1` before decoding content.
+
+| Carrying record | `media-content/v1` condition |
+|---|---|
+| `run_started` | Input contains a media block or Parts output, or a hook subject carries either |
+| `steered` | Input contains a media block or Parts output, or a hook subject carries either |
+| `queued` | Request input contains a media block or Parts output, or a hook subject carries either |
+| `model_step_finished` | Assistant content contains a media block or Parts output, or a hook subject carries either |
+| `tool_result` | Result uses Parts, or a post-tool hook subject uses Parts; pre-tool refusal subjects are arguments, not native content |
+| `late_result` | Result uses Parts |
+| `approval_recorded` | Closing result uses Parts |
+| `send_delivered` | Carried input contains a media block or Parts output |
+| `compaction_message` | Replacement contains a media block or Parts output |
+| `compaction_view_applied` | The opaque view's native edit or replacement content carries a media block or Parts output |
+
+Hook subjects are interpreted by phase: pre-user subjects are message arrays, post-assistant
+subjects are assistant messages, and post-tool subjects are tool results. Pre-tool subjects on
+dispatch intents, no-dispatch records and intentless refusal results are opaque arguments;
+media-looking data inside them or inside tool JSON never adds `media-content/v1`.
+
 OpenRouter's `redacted_reasoning` blocks with `provider_format: "open_router"` and frozen
 `reasoning_echo.format: "open_router_details"` policies require **`openrouter-reasoning/v1`**.
 The reader and writer for this feature ship together. It is distinct from

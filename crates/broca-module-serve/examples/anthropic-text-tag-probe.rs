@@ -222,6 +222,7 @@ fn response_shape(content: &[ContentBlock]) -> String {
     let mut tool_use = 0;
     for block in content {
         match block {
+            ContentBlock::Media(_) => {}
             ContentBlock::Reasoning { text, signature } => thinking_details.push(format!(
                 "signature_present={},signature_nonempty={},text_empty={}",
                 signature.is_some(),

@@ -461,6 +461,11 @@ fn content_output(content: Value) -> ToolOutput {
 
 fn output_text(content: &Value) -> String {
     match content_output(content.clone()) {
+        // Media ingress requires owned captures; this text adapter never emits references.
+        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+            &parts,
+            broca_protocol::MediaMarkerReason::NotRequested,
+        ),
         ToolOutput::Text { text } => text,
         ToolOutput::Json { value } => value_text(&value),
         ToolOutput::Denied { reason } => reason,

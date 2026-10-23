@@ -1,0 +1,9 @@
+[
+  {"type":"media","kind":"image","mime":"image/png","byte_size":42,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","width":3,"height":2},
+  {"type":"media","kind":"document","mime":"application/pdf","byte_size":42,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+  {"type":"media","kind":"audio","mime":"audio/wav","byte_size":42,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+  {"type":"media","kind":"video","mime":"video/mp4","byte_size":42,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+  {"type":"tool_result","tool_call_id":"call","output":{"kind":"parts","parts":[{"kind":"text","text":"before"},{"kind":"media","media":{"kind":"image","mime":"image/png","byte_size":42,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","width":3,"height":2}},{"kind":"text","text":"after"}]},"is_error":false},
+  {"type":"tool_result","tool_call_id":"call","output":{"kind":"parts","parts":[{"kind":"text","text":"[media not shown: kind=image mime=image/png bytes=42 sha256=0123456789ab reason=store_failed]"}]},"is_error":false},
+  {"type":"tool_result","tool_call_id":"call","output":{"kind":"parts","parts":[{"kind":"text","text":"before"},{"kind":"media","media":{"kind":"image","mime":"image/png","byte_size":42,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","width":3,"height":2}},{"kind":"text","text":"after"}]},"is_error":true}
+]

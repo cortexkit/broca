@@ -370,6 +370,8 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
         }
     };
     Some(match block {
+        // Runner tags currently assign no number to a standalone media block.
+        ContentBlock::Media(_) => return None,
         ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => match role {
             Role::System => PartKind::TurnSystem,
             Role::Assistant => text_kind(&exposed_model_text(clean, text), PartKind::AssistantText),
@@ -390,6 +392,18 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
                 text_kind(message, PartKind::ToolResultText)
             }
             ToolOutput::Json { .. } => return None,
+            ToolOutput::Parts { parts } => {
+                if !parts.is_empty()
+                    && parts.iter().all(|part| {
+                        matches!(part,
+                    crate::ToolOutputPart::Media { media } if media.kind == crate::MediaKind::Image)
+                    })
+                {
+                    PartKind::ToolResultImageOnly
+                } else {
+                    PartKind::ToolResultText
+                }
+            }
         },
     })
 }
@@ -530,6 +544,33 @@ fn render_computed(message: &mut Message, tags: &PartTags, computed: ComputedTag
                             cortexkit_role_llm_runner::tags::render_counted_text(number, message);
                     }
                     ToolOutput::Json { .. } => {}
+                    ToolOutput::Parts { parts } => {
+                        let image_only = !parts.is_empty() && parts.iter().all(|part| matches!(part,
+                            crate::ToolOutputPart::Media { media } if media.kind == crate::MediaKind::Image));
+                        if image_only {
+                            parts.insert(
+                                0,
+                                crate::ToolOutputPart::Text {
+                                    text: cortexkit_role_llm_runner::tags::image_label(number),
+                                },
+                            );
+                        } else if let Some(crate::ToolOutputPart::Text { text }) = parts
+                            .iter_mut()
+                            .find(|part| matches!(part, crate::ToolOutputPart::Text { .. }))
+                        {
+                            *text =
+                                cortexkit_role_llm_runner::tags::render_counted_text(number, text);
+                        } else {
+                            parts.insert(
+                                0,
+                                crate::ToolOutputPart::Text {
+                                    text: cortexkit_role_llm_runner::tags::render_counted_text(
+                                        number, "",
+                                    ),
+                                },
+                            );
+                        }
+                    }
                 }
             }
             _ => {}

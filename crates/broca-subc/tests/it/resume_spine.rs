@@ -546,6 +546,7 @@ fn assert_all_output_results_are_real_stub_text(events: &[OutputEvent]) {
 
 fn tool_output_text(output: &ToolOutput) -> &str {
     match output {
+        ToolOutput::Parts { .. } => "",
         ToolOutput::Text { text } => text,
         ToolOutput::Error { message } => message,
         ToolOutput::Denied { reason } => reason,

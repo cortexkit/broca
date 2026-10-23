@@ -154,6 +154,11 @@ pub(super) async fn resolve_hooked<T: ToolPlane>(
     let runtime = hooks.expect("subscribed implies an installed runtime");
     let original = Arc::clone(&resolution.result);
     let text = match &original.output {
+        // Media provenance permits only captured references; legacy text hooks receive markers.
+        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+            parts,
+            broca_protocol::MediaMarkerReason::Carrier,
+        ),
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Error { message } => message.clone(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),

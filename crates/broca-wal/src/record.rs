@@ -114,6 +114,9 @@ pub struct HookOp {
 /// skippable: an older build would silently compute the wrong session from it. Such a record
 /// requires a must-understand feature through `required_features`, shipped in a reader
 /// release before any writer uses it, never reliance on the `Unknown` arm to hide it.
+/// `media-content/v1` is a same-release reader/writer exception: its writer raises the
+/// machine's feature floor before the first media frame. Placement and WAL open then refuse
+/// older builds by feature name, so rollback past that release is blocked after media is written.
 ///
 /// The EXHAUSTIVE matches on this enum name `Unknown` explicitly, so adding a variant still
 /// fails to compile at each of them until someone decides what it means there. Many other
@@ -1241,6 +1244,11 @@ impl WalRecord {
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
         let base = self.base_required_features();
+        let base = if self.carries_media_content() {
+            with_feature(base, crate::framing::MEDIA_CONTENT_FEATURE)
+        } else {
+            base
+        };
         let base = if matches!(
             self,
             WalRecord::RunFinished {
@@ -1426,6 +1434,116 @@ impl WalRecord {
             WalRecord::RunStarted { config, .. } => declares(&config.tools),
             WalRecord::Queued { request, .. } => request.tools.as_deref().is_some_and(declares),
             _ => false,
+        }
+    }
+
+    fn carries_media_content(&self) -> bool {
+        use broca_protocol::{ContentBlock, ToolOutput};
+        let result = |result: &ToolResult| matches!(result.output, ToolOutput::Parts { .. });
+        let blocks = |content: &[ContentBlock]| {
+            content.iter().any(|block| match block {
+                ContentBlock::Media(_) => true,
+                ContentBlock::ToolResult(value) => result(value),
+                ContentBlock::Text { .. }
+                | ContentBlock::TextWithState { .. }
+                | ContentBlock::Reasoning { .. }
+                | ContentBlock::RedactedReasoning { .. }
+                | ContentBlock::ToolCall(_) => false,
+            })
+        };
+        let messages = |messages: &[Message]| messages.iter().any(|m| blocks(&m.content));
+        let hooks = |hooks: &Option<Box<Hooks>>, subject| {
+            hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .original
+                    .iter()
+                    .chain(hooks.final_value.iter())
+                    .any(|value| hook_subject_carries_media(value, subject))
+            })
+        };
+        match self {
+            Self::RunStarted {
+                input, hooks: h, ..
+            }
+            | Self::Steered {
+                input, hooks: h, ..
+            } => messages(input) || hooks(h, MediaHookSubject::Messages),
+            Self::Queued {
+                request, hooks: h, ..
+            } => messages(&request.input) || hooks(h, MediaHookSubject::Messages),
+            Self::ModelStepFinished {
+                assistant_message,
+                hooks: h,
+                ..
+            } => blocks(&assistant_message.content) || hooks(h, MediaHookSubject::Assistant),
+            Self::ToolResult {
+                result: value,
+                hooks: h,
+                reason,
+                ..
+            } => {
+                // Intentless pre-tool refusals store arguments, not a post-tool result.
+                let pre_tool = matches!(
+                    reason.as_deref(),
+                    Some("pre_tool_denied" | "pre_tool_unavailable")
+                ) || h
+                    .as_ref()
+                    .is_some_and(|hooks| hooks.ops.iter().any(|op| op.hook == "pre_tool"));
+                let subject = if pre_tool {
+                    MediaHookSubject::ToolInput
+                } else {
+                    MediaHookSubject::Result
+                };
+                result(value) || hooks(h, subject)
+            }
+            Self::LateResult { result: value, .. } => result(value),
+            Self::ApprovalRecorded { closing_result, .. } => {
+                closing_result.as_deref().is_some_and(result)
+            }
+            Self::SendDelivered { input, .. } => {
+                input.as_deref().is_some_and(|input| messages(input))
+            }
+            Self::ToolNoDispatch { hooks: h, .. } | Self::ToolDispatchIntent { hooks: h, .. } => {
+                hooks(h, MediaHookSubject::ToolInput)
+            }
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            Self::CompactionViewApplied { view, .. } => view_carries_media_content(view),
+            Self::ModelAttemptFinished { .. }
+            | Self::StepStarted { .. }
+            | Self::ToolBatchStarted { .. }
+            | Self::ToolBatchFinished { .. }
+            | Self::TurnFinished { .. }
+            | Self::BudgetFired { .. }
+            | Self::InputTokenCapFrozen { .. }
+            | Self::InputTokenBudgetExhausted { .. }
+            | Self::ContextCeilingWait { .. }
+            | Self::ContextCeilingDecided { .. }
+            | Self::StructuredOutputDowngraded { .. }
+            | Self::StructuredOutputResult { .. }
+            | Self::RunFinished { .. }
+            | Self::RunCancelRequested { .. }
+            | Self::RunPaused { .. }
+            | Self::RunConfigRefrozen { .. }
+            | Self::RunAuthRefrozen { .. }
+            | Self::Retracted { .. }
+            | Self::ApprovalRequested { .. }
+            | Self::ApprovalResolved { .. }
+            | Self::ResumeStarted { .. }
+            | Self::CacheWarmed { .. }
+            | Self::CompactionRequest { .. }
+            | Self::CompactionAnswer { .. }
+            | Self::CompactionWait { .. }
+            | Self::CompactionRideWait { .. }
+            | Self::CompactionRideWaitEnded { .. }
+            | Self::CompactionNotice { .. }
+            | Self::ToolCallDeferred { .. }
+            | Self::AwaitingApproval { .. }
+            | Self::LateApprovalRecorded { .. }
+            | Self::LateDispatchIntent { .. }
+            | Self::QuestionWithdrawalAcknowledged { .. }
+            | Self::DeliveryOrdered { .. }
+            | Self::SendEnded { .. }
+            | Self::Unknown => false,
         }
     }
 
@@ -1825,6 +1943,118 @@ impl WalRecord {
             _ => &[],
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum MediaHookSubject {
+    Messages,
+    Assistant,
+    Result,
+    ToolInput,
+}
+
+/// Decode the phase's known subject shape once, borrowing its fields. Tool input is opaque:
+/// a media-looking object in arguments is not native content and must not raise the floor.
+fn hook_subject_carries_media(value: &Value, subject: MediaHookSubject) -> bool {
+    match subject {
+        MediaHookSubject::Messages => Vec::<MediaMessage>::deserialize(value)
+            .is_ok_and(|messages| messages.iter().any(MediaMessage::carries_media)),
+        MediaHookSubject::Assistant => {
+            MediaMessage::deserialize(value).is_ok_and(|message| message.carries_media())
+        }
+        MediaHookSubject::Result => {
+            MediaToolResult::deserialize(value).is_ok_and(|result| result.output.kind == "parts")
+        }
+        MediaHookSubject::ToolInput => false,
+    }
+}
+
+// These borrowed projections read only native grammar discriminators. Unrelated fields,
+// notably tool-call input and JSON result values, are ignored without copying their trees.
+#[derive(Deserialize)]
+struct MediaMessage<'a> {
+    #[serde(borrow)]
+    content: Vec<MediaBlock<'a>>,
+}
+
+impl MediaMessage<'_> {
+    fn carries_media(&self) -> bool {
+        self.content.iter().any(MediaBlock::carries_media)
+    }
+}
+
+#[derive(Deserialize)]
+struct MediaBlock<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: std::borrow::Cow<'a, str>,
+    #[serde(default, borrow)]
+    output: Option<MediaOutput<'a>>,
+}
+
+impl MediaBlock<'_> {
+    fn carries_media(&self) -> bool {
+        self.kind == "media"
+            || (self.kind == "tool_result"
+                && self
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.kind == "parts"))
+    }
+}
+
+#[derive(Deserialize)]
+struct MediaToolResult<'a> {
+    #[serde(borrow)]
+    output: MediaOutput<'a>,
+}
+
+#[derive(Deserialize)]
+struct MediaOutput<'a> {
+    #[serde(borrow)]
+    kind: std::borrow::Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+struct MediaView<'a> {
+    #[serde(borrow)]
+    ranges: Vec<MediaViewRange<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MediaViewRange<'a> {
+    Keep {
+        #[serde(default, borrow)]
+        edits: Vec<MediaViewEdit<'a>>,
+    },
+    Replace {
+        #[serde(borrow)]
+        bytes: std::borrow::Cow<'a, str>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct MediaViewEdit<'a> {
+    #[serde(default, borrow)]
+    bytes: Option<std::borrow::Cow<'a, str>>,
+}
+
+fn view_carries_media_content(view: &OpaqueJson) -> bool {
+    serde_json::from_str::<MediaView>(view.as_json_text()).is_ok_and(|view| {
+        view.ranges.iter().any(|range| match range {
+            MediaViewRange::Keep { edits } => edits.iter().any(|edit| {
+                edit.bytes.as_ref().is_some_and(|bytes| {
+                    serde_json::from_str::<MediaBlock>(bytes)
+                        .is_ok_and(|block| block.carries_media())
+                })
+            }),
+            MediaViewRange::Replace { bytes } => serde_json::from_str::<Vec<MediaMessage>>(bytes)
+                .is_ok_and(|messages| messages.iter().any(MediaMessage::carries_media)),
+            MediaViewRange::Other => false,
+        })
+    })
 }
 
 /// Cancellation points recorded in the WAL. The run.cancel endpoint rejects all other strings

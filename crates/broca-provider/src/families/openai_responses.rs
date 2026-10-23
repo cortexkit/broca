@@ -424,6 +424,17 @@ fn reasoning_request_item(raw_response_item: &str, stateless: bool) -> Option<Va
 
 // Preserve user block boundaries as input_text parts, retaining scalars for single text blocks.
 fn user_text_content(blocks: &[ContentBlock]) -> Value {
+    if blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Media(_)))
+    {
+        return Value::Array(blocks.iter().filter_map(|block| match block {
+            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => Some(json!({"type":"input_text", "text":text})),
+            ContentBlock::Media(media) => Some(json!({"type":"input_text", "text":broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
+            ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. }
+            | ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_) => None,
+        }).collect());
+    }
     let texts: Vec<&str> = blocks
         .iter()
         .filter_map(|block| match block {
@@ -487,6 +498,12 @@ fn convert_assistant_items(
     let mut text = String::new();
     for block in &message.content {
         match block {
+            ContentBlock::Media(media) => {
+                text.push_str(&broca_protocol::content::media_not_shown_marker(
+                    media,
+                    broca_protocol::MediaMarkerReason::Carrier,
+                ))
+            }
             ContentBlock::Text { text: part } => text.push_str(part),
             ContentBlock::TextWithState {
                 text: part,
@@ -607,6 +624,10 @@ pub(crate) fn convert_tool_choice(
 
 fn tool_output_text(out: &ToolOutput) -> String {
     match out {
+        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+            parts,
+            broca_protocol::MediaMarkerReason::Carrier,
+        ),
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),

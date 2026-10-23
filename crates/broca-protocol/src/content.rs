@@ -255,9 +255,125 @@ pub struct TextProviderState {
     pub data: String,
 }
 
+/// The modality of a captured, byte-backed object. The bytes live in the media store, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    Image,
+    Document,
+    Audio,
+    Video,
+}
+
+impl MediaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Document => "document",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+/// Metadata over the decoded bytes of a captured object; never bytes or base64.
+/// Only images have dimensions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MediaRefFields")]
+pub struct MediaRef {
+    pub kind: MediaKind,
+    pub mime: String,
+    pub byte_size: u64,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MediaRefFields {
+    kind: MediaKind,
+    mime: String,
+    byte_size: u64,
+    sha256: String,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+impl TryFrom<MediaRefFields> for MediaRef {
+    type Error = &'static str;
+
+    fn try_from(fields: MediaRefFields) -> Result<Self, Self::Error> {
+        if fields.kind == MediaKind::Image {
+            if fields.width.is_none() || fields.height.is_none() {
+                return Err("image media requires width and height");
+            }
+        } else if fields.width.is_some() || fields.height.is_some() {
+            return Err("only image media has width and height");
+        }
+        Ok(Self {
+            kind: fields.kind,
+            mime: fields.mime,
+            byte_size: fields.byte_size,
+            sha256: fields.sha256,
+            width: fields.width,
+            height: fields.height,
+        })
+    }
+}
+
+/// Why a captured item is represented by text instead of provider-native media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaMarkerReason {
+    Modality,
+    Carrier,
+    Mime,
+    Undecodable,
+    TooLarge,
+    RequestCap,
+    Aged,
+    Provenance,
+    StoreFailed,
+    /// Read-only fallback for a reader that did not opt into media references.
+    NotRequested,
+}
+
+impl MediaMarkerReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Modality => "modality",
+            Self::Carrier => "carrier",
+            Self::Mime => "mime",
+            Self::Undecodable => "undecodable",
+            Self::TooLarge => "too_large",
+            Self::RequestCap => "request_cap",
+            Self::Aged => "aged",
+            Self::Provenance => "provenance",
+            Self::StoreFailed => "store_failed",
+            Self::NotRequested => "not_requested",
+        }
+    }
+}
+
+pub fn media_not_shown_marker(media: &MediaRef, reason: MediaMarkerReason) -> String {
+    let digest: String = media.sha256.chars().take(12).collect();
+    format!(
+        "[media not shown: kind={} mime={} bytes={} sha256={} reason={}]",
+        media.kind.as_str(),
+        media.mime,
+        media.byte_size,
+        digest,
+        reason.as_str()
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
+    Media(MediaRef),
     Text {
         text: String,
     },
@@ -325,6 +441,9 @@ pub enum ToolOutput {
     Json {
         value: Value,
     },
+    Parts {
+        parts: Vec<ToolOutputPart>,
+    },
     /// Approval denied by policy — still fed back as `tool_result{is_error}` so
     /// the assistant's tool_use has a matching result and the model can adapt.
     Denied {
@@ -334,6 +453,26 @@ pub enum ToolOutput {
     Error {
         message: String,
     },
+}
+
+/// The nested reference keeps a part's discriminator separate from the media modality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolOutputPart {
+    Text { text: String },
+    Media { media: MediaRef },
+}
+
+/// Text-only rendering in source order, also used by readers that did not request media.
+pub fn media_parts_text(parts: &[ToolOutputPart], reason: MediaMarkerReason) -> String {
+    parts
+        .iter()
+        .map(|part| match part {
+            ToolOutputPart::Text { text } => text.clone(),
+            ToolOutputPart::Media { media } => media_not_shown_marker(media, reason),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The assembled assistant message — text + reasoning + tool-call blocks in

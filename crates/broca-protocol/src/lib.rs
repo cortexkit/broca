@@ -53,6 +53,9 @@ pub mod structured_output;
 pub mod tags;
 pub mod usage;
 
+#[cfg(test)]
+mod media_tests;
+
 // Convenience re-exports for the common wire surface.
 pub use approval::{ApprovalRequest, ApprovalResponse};
 pub use caller::{
@@ -60,8 +63,9 @@ pub use caller::{
 };
 pub use canonical::canonical_json_bytes;
 pub use content::{
-    AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, Message, Role,
-    TextProviderFormat, TextProviderState, ToolCall, ToolOutput, ToolResult,
+    AssistantMessage, ContentBlock, EncryptedReasoningFormat, FinishReason, MediaKind,
+    MediaMarkerReason, MediaRef, Message, Role, TextProviderFormat, TextProviderState, ToolCall,
+    ToolOutput, ToolOutputPart, ToolResult,
 };
 pub use cortexkit_role_llm_runner::errors::ContextCeilingDetail;
 pub use cortexkit_role_llm_runner::run::BudgetExhaustedDetail;

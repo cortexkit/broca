@@ -303,6 +303,7 @@ fn convert_user_parts(
     blocks
         .iter()
         .filter_map(|block| match block {
+            ContentBlock::Media(media) => Some(json!({"text": broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
             // Drop an empty text part (Gemini rejects `text:""`). Defensive — see above.
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
                 if text.is_empty() =>
@@ -331,6 +332,7 @@ fn convert_model_parts(
     let mut call_index: u32 = 0;
     for (idx, b) in blocks.iter().enumerate() {
         match b {
+            ContentBlock::Media(media) => parts.push(json!({"text": broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
             // Drop an empty text part (Gemini rejects `text:""`). Defensive — see above.
             ContentBlock::Text { text } if text.is_empty() => {}
             ContentBlock::Text { text } => parts.push(json!({ "text": text })),
@@ -462,6 +464,9 @@ fn convert_tool_result_part(result: &ToolResult, id_to_name: &BTreeMap<String, S
 
 fn function_response_payload(out: &ToolOutput) -> Value {
     match out {
+        ToolOutput::Parts { parts } => {
+            json!({"result": broca_protocol::content::media_parts_text(parts, broca_protocol::MediaMarkerReason::Carrier)})
+        }
         ToolOutput::Text { text } => json!({ "result": text }),
         // Gemini models FunctionResponse.response as a protobuf Struct, so it must be a JSON
         // object. Keep objects unchanged and give every other JSON value the same `result`

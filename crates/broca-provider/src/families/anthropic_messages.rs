@@ -1025,6 +1025,7 @@ fn convert_content(
         .iter()
         .enumerate()
         .filter_map(|(idx, b)| match b {
+            ContentBlock::Media(media) => Some(json!({"type":"text", "text": broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
             // Drop an empty text part (Anthropic rejects `text:""`). Defensive against
             // foreign input; the owned normalizers never produce empty text.
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
@@ -1087,6 +1088,10 @@ fn convert_content(
 
 fn tool_output_text(out: &ToolOutput) -> String {
     match out {
+        ToolOutput::Parts { parts } => broca_protocol::content::media_parts_text(
+            parts,
+            broca_protocol::MediaMarkerReason::Carrier,
+        ),
         ToolOutput::Text { text } => text.clone(),
         ToolOutput::Json { value } => value.to_string(),
         ToolOutput::Denied { reason } => format!("denied: {reason}"),

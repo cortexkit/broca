@@ -159,6 +159,8 @@ pub const CLIENT_MESSAGE_ID_FEATURE: &str = "client-message-id/v1";
 /// build without it would give the session's rides its own short deadline), and the
 /// `CompactionRideWait` / `CompactionRideWaitEnded` records of a ride whose wait was reported.
 pub const COMPACTION_RIDE_WAIT_FEATURE: &str = "compaction-ride-wait/v1";
+/// Media references and ordered tool parts extend closed content enums.
+pub const MEDIA_CONTENT_FEATURE: &str = "media-content/v1";
 
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
@@ -189,6 +191,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     FLOW_SCOPE_FEATURE,
     GOOGLE_RPC_ERROR_DETAILS_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
+    MEDIA_CONTENT_FEATURE,
     OPENROUTER_REASONING_FEATURE,
     PLAN_MANIFEST_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
@@ -762,6 +765,9 @@ mod deferred_call_tests;
 mod openrouter_reasoning_tests;
 
 #[cfg(test)]
+mod media_content_tests;
+
+#[cfg(test)]
 mod retention_tests;
 
 #[cfg(test)]
@@ -963,6 +969,7 @@ mod tests {
                 FLOW_SCOPE_FEATURE,
                 GOOGLE_RPC_ERROR_DETAILS_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
+                MEDIA_CONTENT_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
                 PLAN_MANIFEST_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,

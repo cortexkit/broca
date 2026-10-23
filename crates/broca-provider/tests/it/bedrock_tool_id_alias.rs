@@ -90,6 +90,7 @@ fn legacy_verbatim_ids(prompt: &[Message]) -> (String, String) {
                 .content
                 .iter()
                 .filter_map(|block| match block {
+                    ContentBlock::Media(_) => None,
                     ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
                         Some(json!({"text": text}))
                     }

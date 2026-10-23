@@ -297,6 +297,12 @@ fn render_native(message: &Value) -> Result<Vec<Value>, String> {
                 let output: broca_protocol::ToolOutput =
                     serde_json::from_value(b["output"].clone()).map_err(|e| e.to_string())?;
                 let text = match output {
+                    broca_protocol::ToolOutput::Parts { parts } => {
+                        broca_protocol::content::media_parts_text(
+                            &parts,
+                            broca_protocol::MediaMarkerReason::NotRequested,
+                        )
+                    }
                     broca_protocol::ToolOutput::Text { text } => text,
                     broca_protocol::ToolOutput::Json { value } => value.to_string(),
                     broca_protocol::ToolOutput::Denied { reason } => format!("denied: {reason}"),
