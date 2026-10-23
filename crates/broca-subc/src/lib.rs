@@ -32,10 +32,10 @@ pub mod vault;
 
 pub use compaction_plane::SubcCompactionPlane;
 pub use connection::{
-    classifier_role_versions, rejection_is_module_reloading, rejection_is_unknown_channel,
-    ConnError, FrameDropGauge, ModuleHealthSnapshot, RouteHandle, RouteOpenRetry, SubcConnection,
-    SubscribeStream, CLASSIFIER_ROLE_VERSIONS, FRAME_DROPS, ROUTE_OPEN_ATTEMPT_TIMEOUT,
-    ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL,
+    classifier_role_versions, rejection_is_unknown_channel, ConnError, FrameDropGauge,
+    ModuleHealthSnapshot, RouteHandle, RouteOpenRetry, SubcConnection, SubscribeStream,
+    CLASSIFIER_ROLE_VERSIONS, FRAME_DROPS, ROUTE_OPEN_ATTEMPT_TIMEOUT, ROUTE_OPEN_RETRY_DEADLINE,
+    ROUTE_OPEN_RETRY_INTERVAL,
 };
 pub use consent::{
     AnswersPage, ConsentClient, ConsentError, ConsentRecord, ConsentState, FilingReply,

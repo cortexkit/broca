@@ -10,7 +10,7 @@ use broca_core::tool_plane::{
 use broca_protocol::{BindIdentity, SessionScope};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use subc_protocol::scope::{ScopeSelector, CAP_SCOPES_V1};
+use subc_protocol::scope::CAP_SCOPES_V1;
 
 use crate::connection::{ConnError, RouteHandle, RouteOpenRetry, SubcConnection};
 
@@ -180,19 +180,15 @@ impl ConsentClient {
                 detail: None,
             });
         }
-        let owner =
-            crate::subc_plane::owner_principal(scope).map_err(|message| ConsentError::Refused {
+        let selector = crate::subc_plane::frozen_scope_selector(scope).map_err(|message| {
+            ConsentError::Refused {
                 code: "scope_unverifiable".into(),
                 message,
                 detail: None,
-            })?;
+            }
+        })?;
         let route = conn
-            .route_open_management_scoped_within(
-                CONSENT_MODULE,
-                identity,
-                ScopeSelector::new(owner, scope.scope_ref.clone(), Some(scope.scope_epoch)),
-                retry,
-            )
+            .route_open_management_scoped_within(CONSENT_MODULE, identity, selector, retry)
             .await?;
         Ok(Self::on_route(conn, route, REPLY_TIMEOUT))
     }
@@ -723,12 +719,14 @@ mod tests {
         let plane = ScopedConsentPlane::new(Arc::new(conn), RouteOpenRetry::default_patience());
         let ctx = scoped_ctx();
 
-        for _ in 0..2 {
+        for attempt in 0..2 {
             tokio::time::advance(Duration::from_secs(60)).await;
             let started = tokio::time::Instant::now();
             let (client, ()) = tokio::time::timeout(Duration::from_secs(5), async {
                 tokio::join!(plane.client(&ctx), async {
-                    advertise_scopes(&mut module).await;
+                    if attempt == 0 {
+                        advertise_scopes(&mut module).await;
+                    }
                     let first = module.next_request().await;
                     let body: Value = serde_json::from_slice(&first.body).unwrap();
                     assert_eq!(body["op"], "route.open");

@@ -18,7 +18,8 @@ use serde_json::Value;
 use subc_protocol::scope::{ScopeSelector, CAP_SCOPES_V1};
 use subc_protocol::tool_call::ToolCallRequest;
 
-use crate::connection::{ConnError, RouteHandle, SubcConnection};
+use crate::connection::{RouteHandle, SubcConnection};
+use crate::role_route::open_error;
 
 /// The refusal code a provider answers a fetch with when the same fetch may succeed if sent
 /// again; admission retries such a refusal until its deadline.
@@ -85,17 +86,14 @@ impl SubcPlanFetcher {
             }
             Err(error) => return Err(FetchError::Lost(error.to_string())),
         }
-        let owner =
-            crate::subc_plane::owner_principal(scope).map_err(|detail| FetchError::Refused {
+        let selector = crate::subc_plane::frozen_scope_selector(scope).map_err(|detail| {
+            FetchError::Refused {
                 code: "scope_unverifiable".into(),
                 detail: Some(Value::String(detail)),
                 retryable: false,
-            })?;
-        Ok(Some(ScopeSelector::new(
-            owner,
-            scope.scope_ref.clone(),
-            Some(scope.scope_epoch),
-        )))
+            }
+        })?;
+        Ok(Some(selector))
     }
 
     async fn call(&self, provider: &str, op: &str, arguments: Value) -> Result<Value, FetchError> {
@@ -112,7 +110,7 @@ impl SubcPlanFetcher {
             .route_unary_reply(&route, body, FETCH_REPLY_TIMEOUT)
             .await
         {
-            Ok(Ok(reply)) => decode_reply(&reply),
+            Ok(Ok(reply)) => decode_reply(provider, &reply),
             Ok(Err(refusal)) => {
                 let retryable = refusal.code == TRANSIENT;
                 Err(FetchError::provider_refused(
@@ -150,9 +148,8 @@ fn fetch_body(op: &str, arguments: Value) -> Result<Vec<u8>, FetchError> {
     .map_err(|error| FetchError::Lost(error.to_string()))
 }
 
-/// A provider's answer: the op's answer object itself, or the same object as the text of a
-/// tool result for a provider that wraps every reply as one.
-fn decode_reply(reply: &[u8]) -> Result<Value, FetchError> {
+/// A catalog is a bare CatalogAnswer, not a tool-call result envelope.
+fn decode_reply(provider: &str, reply: &[u8]) -> Result<Value, FetchError> {
     let value: Value = serde_json::from_slice(reply).map_err(|error| {
         invalid_answer(&format!(
             "reply is not JSON ({error}): {}",
@@ -165,6 +162,10 @@ fn decode_reply(reply: &[u8]) -> Result<Value, FetchError> {
         .filter(|_| value.get("catalog_digest").is_none() && value.get("subscriptions").is_none());
     match wrapped {
         Some(content) => {
+            // Keep wrapped catalogs for one release so WARNs identify providers needing a fix.
+            // Delete this fallback in the next release if no wrapped-catalog WARN appears.
+            tracing::warn!(target: "subc.plan_fetch", provider_module = provider,
+                "provider returned a wrapped tool.catalog answer; expected a bare CatalogAnswer");
             let text = content
                 .iter()
                 .find_map(|part| part.get("text").and_then(Value::as_str));
@@ -193,25 +194,6 @@ fn invalid_answer(message: &str) -> FetchError {
         message,
         false,
     )
-}
-
-/// How a refused or failed `route.open` is reported to admission.
-fn open_error(error: ConnError) -> FetchError {
-    match error {
-        ConnError::Rejected(message) => {
-            let code = message.code();
-            if code == subc_protocol::error_codes::UNKNOWN_MODULE {
-                FetchError::UnknownModule
-            } else {
-                FetchError::Refused {
-                    code: code.to_owned(),
-                    detail: None,
-                    retryable: subc_protocol::error_codes::is_retryable_route_open(code),
-                }
-            }
-        }
-        other => FetchError::Lost(other.to_string()),
-    }
 }
 
 /// Admits plans over one subc consumer connection, with a fresh [`SubcPlanFetcher`] (and fresh
@@ -275,6 +257,57 @@ impl Fetcher for SubcPlanFetcher {
 mod preset_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn fetch_and_consent_without_scopes_fail_closed_on_the_same_cached_capabilities() {
+        let (conn, _, mut module) = SubcConnection::in_process_for_test(1, 1);
+        let conn = Arc::new(conn);
+        let identity = BindIdentity::new("/p", "broca", "s");
+        let scope = SessionScope {
+            owner: broca_protocol::BindPrincipal::Reserved {
+                module_id: "broca".into(),
+            },
+            scope_ref: "s".into(),
+            scope_epoch: 7,
+            flow_id: None,
+            sender: None,
+            agent_id: None,
+            run_id: None,
+        };
+        let fetcher = SubcPlanFetcher::new(conn.clone(), identity.clone(), Some(scope.clone()));
+        let (selector, ()) = tokio::join!(fetcher.selector(), async {
+            let request = module.next_request().await;
+            let reply = subc_control::ClientControlResponse::ServerDescribe {
+                protocol_ver: 1,
+                subc_ops: vec![],
+                capabilities: vec![],
+                connected_clients: 1,
+                counters: None,
+                build_git_sha: None,
+                build_lock_digest: None,
+                capability_requirements: vec![],
+                machine_id: None,
+            };
+            assert!(module.reply(&request, serde_json::to_vec(&reply).unwrap()));
+        });
+        assert!(
+            matches!(selector, Err(FetchError::Refused { code, retryable: false, .. }) if code == "scope_unsupported")
+        );
+        let consent = crate::ConsentClient::open(
+            conn,
+            &identity,
+            &scope,
+            crate::RouteOpenRetry::default_patience(),
+        )
+        .await;
+        assert!(
+            matches!(consent, Err(crate::ConsentError::Refused { code, .. }) if code == "scope_unsupported")
+        );
+        assert!(
+            module.take_written_for_test().is_empty(),
+            "neither scoped operation may open an unscoped route"
+        );
+    }
+
     /// A reply broca cannot read carries what was wrong, so the admission warning names the cause.
     #[test]
     fn unreadable_replies_carry_their_cause() {
@@ -290,7 +323,7 @@ mod preset_tests {
             ),
         ];
         for (reply, expected) in cases {
-            match decode_reply(reply) {
+            match decode_reply("preset-provider", reply) {
                 Err(FetchError::ProviderRefused {
                     code,
                     message,
@@ -304,6 +337,33 @@ mod preset_tests {
                 other => panic!("expected a refusal naming its cause, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn wrapped_catalog_warns_once_with_provider_while_bare_catalog_is_quiet() {
+        let answer = serde_json::json!({"catalog_digest": "digest", "tools": []});
+        let wrapped =
+            serde_json::json!({"content": [{"type": "text", "text": answer.to_string()}]});
+        let capture = broca_test_support::LogCapture::new();
+        capture.in_scope(|| {
+            assert_eq!(
+                decode_reply("bare-provider", &serde_json::to_vec(&answer).unwrap()).unwrap(),
+                answer
+            );
+            assert_eq!(
+                decode_reply("wrapped-provider", &serde_json::to_vec(&wrapped).unwrap()).unwrap(),
+                answer
+            );
+        });
+        let warnings: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.target == "subc.plan_fetch" && event.level == tracing::Level::WARN
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].fields["provider_module"], "wrapped-provider");
     }
 
     #[test]
