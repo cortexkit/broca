@@ -24299,3 +24299,30 @@ expect_red = ["tool_repetition::tests::multipart_repetition_identity_is_ordered_
 file = "crates/broca-core/src/tool_repetition.rs"
 old = '                        serde_json::json!({"sha256":media.sha256})'
 new = '                        serde_json::json!({"sha256":media.mime}) // NON-VACUITY BREAK: compare MIME instead of captured byte identity.'
+
+[[control]]
+id = "media-hook-typed-native-subject"
+guards = "Typed pre-user hook message subjects carrying media raise the WAL feature floor"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing/media_content_tests.rs"
+expect_red = ["framing::media_content_tests::hook_native_media_subjects_require_the_feature"]
+file = "crates/broca-wal/src/record.rs"
+old = '''        MediaHookSubject::Messages => Vec::<MediaMessage>::deserialize(value)
+            .is_ok_and(|messages| messages.iter().any(MediaMessage::carries_media)),'''
+new = '        MediaHookSubject::Messages => false, // NON-VACUITY BREAK: ignore native hook message media.'
+
+[[control]]
+id = "media-hook-tool-input-is-opaque"
+guards = "A pre-tool hook argument shaped like native media is data, never a media feature claim"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing/media_content_tests.rs"
+expect_red = ["framing::media_content_tests::hook_tool_arguments_never_require_media_content"]
+file = "crates/broca-wal/src/record.rs"
+old = '        MediaHookSubject::ToolInput => false,'
+new = '        MediaHookSubject::ToolInput => MediaBlock::deserialize(value).is_ok_and(|block| block.carries_media()), // NON-VACUITY BREAK: treat opaque tool arguments as native content.'

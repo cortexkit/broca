@@ -1395,13 +1395,13 @@ impl WalRecord {
             })
         };
         let messages = |messages: &[Message]| messages.iter().any(|m| blocks(&m.content));
-        let hooks = |hooks: &Option<Box<Hooks>>| {
+        let hooks = |hooks: &Option<Box<Hooks>>, subject| {
             hooks.as_ref().is_some_and(|hooks| {
                 hooks
                     .original
                     .iter()
                     .chain(hooks.final_value.iter())
-                    .any(json_carries_media_content)
+                    .any(|value| hook_subject_carries_media(value, subject))
             })
         };
         match self {
@@ -1410,20 +1410,35 @@ impl WalRecord {
             }
             | Self::Steered {
                 input, hooks: h, ..
-            } => messages(input) || hooks(h),
+            } => messages(input) || hooks(h, MediaHookSubject::Messages),
             Self::Queued {
                 request, hooks: h, ..
-            } => messages(&request.input) || hooks(h),
+            } => messages(&request.input) || hooks(h, MediaHookSubject::Messages),
             Self::ModelStepFinished {
                 assistant_message,
                 hooks: h,
                 ..
-            } => blocks(&assistant_message.content) || hooks(h),
+            } => blocks(&assistant_message.content) || hooks(h, MediaHookSubject::Assistant),
             Self::ToolResult {
                 result: value,
                 hooks: h,
+                reason,
                 ..
-            } => result(value) || hooks(h),
+            } => {
+                // Intentless pre-tool refusals store arguments, not a post-tool result.
+                let pre_tool = matches!(
+                    reason.as_deref(),
+                    Some("pre_tool_denied" | "pre_tool_unavailable")
+                ) || h
+                    .as_ref()
+                    .is_some_and(|hooks| hooks.ops.iter().any(|op| op.hook == "pre_tool"));
+                let subject = if pre_tool {
+                    MediaHookSubject::ToolInput
+                } else {
+                    MediaHookSubject::Result
+                };
+                result(value) || hooks(h, subject)
+            }
             Self::LateResult { result: value, .. } => result(value),
             Self::ApprovalRecorded { closing_result, .. } => {
                 closing_result.as_deref().is_some_and(result)
@@ -1432,13 +1447,10 @@ impl WalRecord {
                 input.as_deref().is_some_and(|input| messages(input))
             }
             Self::ToolNoDispatch { hooks: h, .. } | Self::ToolDispatchIntent { hooks: h, .. } => {
-                hooks(h)
+                hooks(h, MediaHookSubject::ToolInput)
             }
             Self::CompactionMessage { replacement, .. } => messages(replacement),
-            Self::CompactionViewApplied { view, .. } => {
-                serde_json::from_str::<Value>(view.as_json_text())
-                    .is_ok_and(|view| view_carries_media_content(&view))
-            }
+            Self::CompactionViewApplied { view, .. } => view_carries_media_content(view),
             Self::ModelAttemptFinished { .. }
             | Self::StepStarted { .. }
             | Self::ToolBatchStarted { .. }
@@ -1871,59 +1883,116 @@ impl WalRecord {
     }
 }
 
-/// Hook subjects and view edits contain native content inside otherwise opaque envelopes.
-/// Inspect only those envelopes, never arbitrary tool JSON or tool-call arguments.
-fn json_carries_media_content(value: &Value) -> bool {
-    use broca_protocol::{ContentBlock, ToolOutput};
-    if let Ok(block) = serde_json::from_value::<ContentBlock>(value.clone()) {
-        return match block {
-            ContentBlock::Media(_) => true,
-            ContentBlock::ToolResult(result) => matches!(result.output, ToolOutput::Parts { .. }),
-            ContentBlock::Text { .. }
-            | ContentBlock::TextWithState { .. }
-            | ContentBlock::Reasoning { .. }
-            | ContentBlock::RedactedReasoning { .. }
-            | ContentBlock::ToolCall(_) => false,
-        };
-    }
-    if let Ok(result) = serde_json::from_value::<ToolResult>(value.clone()) {
-        return matches!(result.output, ToolOutput::Parts { .. });
-    }
-    match value {
-        Value::Array(values) => values.iter().any(json_carries_media_content),
-        Value::Object(values) => values.values().any(json_carries_media_content),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+#[derive(Clone, Copy)]
+enum MediaHookSubject {
+    Messages,
+    Assistant,
+    Result,
+    ToolInput,
+}
+
+/// Decode the phase's known subject shape once, borrowing its fields. Tool input is opaque:
+/// a media-looking object in arguments is not native content and must not raise the floor.
+fn hook_subject_carries_media(value: &Value, subject: MediaHookSubject) -> bool {
+    match subject {
+        MediaHookSubject::Messages => Vec::<MediaMessage>::deserialize(value)
+            .is_ok_and(|messages| messages.iter().any(MediaMessage::carries_media)),
+        MediaHookSubject::Assistant => {
+            MediaMessage::deserialize(value).is_ok_and(|message| message.carries_media())
+        }
+        MediaHookSubject::Result => {
+            MediaToolResult::deserialize(value).is_ok_and(|result| result.output.kind == "parts")
+        }
+        MediaHookSubject::ToolInput => false,
     }
 }
 
-fn view_carries_media_content(view: &Value) -> bool {
-    let native = |value: &Value| {
-        value
-            .as_str()
-            .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            .is_some_and(|value| json_carries_media_content(&value))
-    };
-    view.get("ranges")
-        .and_then(Value::as_array)
-        .is_some_and(|ranges| {
-            ranges.iter().any(|range| {
-                match range.get("kind").and_then(Value::as_str) {
-                    Some("replace") => range.get("bytes").is_some_and(native),
-                    Some("keep") => {
-                        range
-                            .get("edits")
-                            .and_then(Value::as_array)
-                            .is_some_and(|edits| {
-                                edits
-                                    .iter()
-                                    .any(|edit| edit.get("bytes").is_some_and(native))
-                            })
-                    }
-                    // Unknown range kinds cannot contribute native content this reader assembles.
-                    Some(_) | None => false,
-                }
-            })
+// These borrowed projections read only native grammar discriminators. Unrelated fields,
+// notably tool-call input and JSON result values, are ignored without copying their trees.
+#[derive(Deserialize)]
+struct MediaMessage<'a> {
+    #[serde(borrow)]
+    content: Vec<MediaBlock<'a>>,
+}
+
+impl MediaMessage<'_> {
+    fn carries_media(&self) -> bool {
+        self.content.iter().any(MediaBlock::carries_media)
+    }
+}
+
+#[derive(Deserialize)]
+struct MediaBlock<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: std::borrow::Cow<'a, str>,
+    #[serde(default, borrow)]
+    output: Option<MediaOutput<'a>>,
+}
+
+impl MediaBlock<'_> {
+    fn carries_media(&self) -> bool {
+        self.kind == "media"
+            || (self.kind == "tool_result"
+                && self
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.kind == "parts"))
+    }
+}
+
+#[derive(Deserialize)]
+struct MediaToolResult<'a> {
+    #[serde(borrow)]
+    output: MediaOutput<'a>,
+}
+
+#[derive(Deserialize)]
+struct MediaOutput<'a> {
+    #[serde(borrow)]
+    kind: std::borrow::Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+struct MediaView<'a> {
+    #[serde(borrow)]
+    ranges: Vec<MediaViewRange<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MediaViewRange<'a> {
+    Keep {
+        #[serde(default, borrow)]
+        edits: Vec<MediaViewEdit<'a>>,
+    },
+    Replace {
+        #[serde(borrow)]
+        bytes: std::borrow::Cow<'a, str>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct MediaViewEdit<'a> {
+    #[serde(default, borrow)]
+    bytes: Option<std::borrow::Cow<'a, str>>,
+}
+
+fn view_carries_media_content(view: &OpaqueJson) -> bool {
+    serde_json::from_str::<MediaView>(view.as_json_text()).is_ok_and(|view| {
+        view.ranges.iter().any(|range| match range {
+            MediaViewRange::Keep { edits } => edits.iter().any(|edit| {
+                edit.bytes.as_ref().is_some_and(|bytes| {
+                    serde_json::from_str::<MediaBlock>(bytes)
+                        .is_ok_and(|block| block.carries_media())
+                })
+            }),
+            MediaViewRange::Replace { bytes } => serde_json::from_str::<Vec<MediaMessage>>(bytes)
+                .is_ok_and(|messages| messages.iter().any(MediaMessage::carries_media)),
+            MediaViewRange::Other => false,
         })
+    })
 }
 
 /// Cancellation points recorded in the WAL. The run.cancel endpoint rejects all other strings

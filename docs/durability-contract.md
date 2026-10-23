@@ -99,14 +99,17 @@ refuses the WAL as `NewerWriter` naming `media-content/v1` before decoding conte
 | `steered` | Input contains a media block or Parts output, or a hook subject carries either |
 | `queued` | Request input contains a media block or Parts output, or a hook subject carries either |
 | `model_step_finished` | Assistant content contains a media block or Parts output, or a hook subject carries either |
-| `tool_result` | Result uses Parts, or a hook subject carries a media block or Parts output |
+| `tool_result` | Result uses Parts, or a post-tool hook subject uses Parts; pre-tool refusal subjects are arguments, not native content |
 | `late_result` | Result uses Parts |
 | `approval_recorded` | Closing result uses Parts |
 | `send_delivered` | Carried input contains a media block or Parts output |
-| `tool_no_dispatch` | A hook subject carries a media block or Parts output |
-| `tool_dispatch_intent` | A hook subject carries a media block or Parts output (not arbitrary tool arguments) |
 | `compaction_message` | Replacement contains a media block or Parts output |
 | `compaction_view_applied` | The opaque view's native edit or replacement content carries a media block or Parts output |
+
+Hook subjects are interpreted by phase: pre-user subjects are message arrays, post-assistant
+subjects are assistant messages, and post-tool subjects are tool results. Pre-tool subjects on
+dispatch intents, no-dispatch records and intentless refusal results are opaque arguments;
+media-looking data inside them or inside tool JSON never adds `media-content/v1`.
 
 OpenRouter's `redacted_reasoning` blocks with `provider_format: "open_router"` and frozen
 `reasoning_echo.format: "open_router_details"` policies require **`openrouter-reasoning/v1`**.

@@ -77,11 +77,17 @@ fn carriers(content: Value, result: Value) -> Vec<(&'static str, Value)> {
     ]
 }
 
+fn hook_metadata(member: &str, subject: Value, hook: &str) -> Value {
+    json!({member:subject,"ops":[{"module":"transform","hook":hook,"phase":if hook == "pre_tool" { Some("mutate") } else { None },"op":"replace"}]})
+}
+
 fn media_records() -> Vec<(&'static str, Value)> {
     let mut records = carriers(block(), result(false));
     let plain_result =
         json!({"tool_call_id":"call","output":{"kind":"text","text":"old"},"is_error":false});
     let plain = carriers(json!({"type":"text","text":"old"}), plain_result);
+    let message = json!({"role":"user","content":[block()]});
+    let assistant = json!({"message_id":"m","content":[block()]});
     for (name, template) in plain {
         if [
             "RunStarted.input",
@@ -94,7 +100,15 @@ fn media_records() -> Vec<(&'static str, Value)> {
         {
             for subject in ["original", "final"] {
                 let mut value = template.clone();
-                value["hooks"] = json!({subject:result(true),"ops":[]});
+                let (native, hook) = match name {
+                    "RunStarted.input" | "Steered.input" | "Queued.request" => {
+                        (json!([message.clone()]), "pre_user")
+                    }
+                    "ModelStepFinished.assistant_message" => (assistant.clone(), "post_assistant"),
+                    "ToolResult.result" => (result(true), "post_tool"),
+                    _ => unreachable!(),
+                };
+                value["hooks"] = hook_metadata(subject, native, hook);
                 let slot = match name {
                     "RunStarted.input" => "RunStarted.hooks",
                     "ModelStepFinished.assistant_message" => "ModelStepFinished.hooks",
@@ -106,20 +120,6 @@ fn media_records() -> Vec<(&'static str, Value)> {
                 records.push((slot, value));
             }
         }
-    }
-    for (name, value) in [
-        (
-            "ToolNoDispatch.hooks",
-            json!({"type":"tool_no_dispatch","batch_id":"b","tool_call_id":"call","reason":{"kind":"denied","reason":"no"}}),
-        ),
-        (
-            "ToolDispatchIntent.hooks",
-            json!({"type":"tool_dispatch_intent","batch_id":"b","tool_call_id":"call","tool_name":"read","args":{}}),
-        ),
-    ] {
-        let mut value = value;
-        value["hooks"] = json!({"final":result(true),"ops":[]});
-        records.push((name, value));
     }
     records
 }
@@ -153,6 +153,122 @@ fn media_content_is_must_understand_in_every_carrier() {
         assert_eq!(consumed, bytes.len());
         assert_eq!(framed.record, record);
     }
+}
+
+#[test]
+fn hook_native_media_subjects_require_the_feature() {
+    let records: Vec<_> = media_records()
+        .into_iter()
+        .filter(|(slot, _)| slot.ends_with(".hooks"))
+        .collect();
+    assert_eq!(
+        records.len(),
+        10,
+        "both subjects of each native-content hook phase are exercised"
+    );
+    for (slot, value) in records {
+        let record: WalRecord = serde_json::from_value(value).unwrap();
+        assert!(
+            record.required_features().contains(&MEDIA_CONTENT_FEATURE),
+            "ungated native hook subject: {slot}"
+        );
+    }
+}
+
+#[test]
+fn hook_tool_arguments_never_require_media_content() {
+    let plain =
+        json!({"tool_call_id":"call","output":{"kind":"text","text":"old"},"is_error":false});
+    for arguments in [block(), json!({"nested":[block()]}), result(true)] {
+        for member in ["original", "final"] {
+            let records = [
+                json!({"type":"tool_dispatch_intent","batch_id":"b","tool_call_id":"call","tool_name":"read","args":arguments}),
+                json!({"type":"tool_no_dispatch","batch_id":"b","tool_call_id":"call","reason":{"kind":"denied","reason":"no"}}),
+                json!({"type":"tool_result","batch_id":"b","result":plain,"outcome":"completed","reason":"pre_tool_denied"}),
+                json!({"type":"tool_result","batch_id":"b","result":plain,"outcome":"completed","reason":"pre_tool_unavailable"}),
+            ];
+            for mut value in records {
+                value["hooks"] = hook_metadata(member, arguments.clone(), "pre_tool");
+                for operations in [value["hooks"]["ops"].clone(), json!([])] {
+                    value["hooks"]["ops"] = operations;
+                    let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
+                    assert!(
+                        !record.required_features().contains(&MEDIA_CONTENT_FEATURE),
+                        "tool arguments are not native content: {record:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn post_tool_unavailable_keeps_media_gate_without_operations() {
+    let record: WalRecord = serde_json::from_value(json!({
+        "type":"tool_result","batch_id":"b","outcome":"completed","reason":"post_tool_unavailable",
+        "result":{"tool_call_id":"call","output":{"kind":"error","message":"result withheld"},"is_error":true},
+        "hooks":{"original":result(true),"ops":[],"unavailable":["transform"]}
+    })).unwrap();
+    assert!(record.required_features().contains(&MEDIA_CONTENT_FEATURE));
+}
+
+#[test]
+fn hook_and_view_native_content_do_not_inspect_tool_payloads() {
+    for block in [
+        json!({"type":"tool_call","tool_call_id":"call","tool_name":"read","input":{"nested":[block()]}}),
+        json!({"type":"tool_result","tool_call_id":"call","output":{"kind":"json","value":{"nested":[block()]}},"is_error":false}),
+    ] {
+        let message = json!({"role":"user","content":[block]});
+        for replace in [false, true] {
+            let record: WalRecord = serde_json::from_value(view_record(&message, replace)).unwrap();
+            assert!(
+                !record.required_features().contains(&MEDIA_CONTENT_FEATURE),
+                "view contains only tool payload data"
+            );
+        }
+        for (slot, mut value) in carriers(
+            json!({"type":"text","text":"old"}),
+            json!({"tool_call_id":"call","output":{"kind":"text","text":"old"},"is_error":false}),
+        ) {
+            let subject = match slot {
+                "RunStarted.input" | "Queued.request" | "Steered.input" => {
+                    Some((json!([message.clone()]), "pre_user"))
+                }
+                "ModelStepFinished.assistant_message" => Some((
+                    json!({"message_id":"m","content":message["content"]}),
+                    "post_assistant",
+                )),
+                "ToolResult.result" if block["type"] == "tool_result" => {
+                    Some((block.clone(), "post_tool"))
+                }
+                _ => None,
+            };
+            if let Some((subject, hook)) = subject {
+                for member in ["original", "final"] {
+                    value["hooks"] = hook_metadata(member, subject.clone(), hook);
+                    let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
+                    assert!(
+                        !record.required_features().contains(&MEDIA_CONTENT_FEATURE),
+                        "false media gate in {slot}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn typed_view_scan_keeps_media_gate_beside_dropped_edits() {
+    let message = json!({"role":"user","content":[block()]});
+    let mut record = view_record(&message, false);
+    let mut view: Value = serde_json::from_str(record["view"].as_str().unwrap()).unwrap();
+    view["ranges"][0]["edits"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, json!({"ordinal":0,"mid":"m","part":"m#1"}));
+    record["view"] = view.to_string().into();
+    let record: WalRecord = serde_json::from_value(record).unwrap();
+    assert!(record.required_features().contains(&MEDIA_CONTENT_FEATURE));
 }
 
 #[test]
@@ -203,11 +319,13 @@ fn media_carrier_inventory_covers_every_content_field() {
         .into_iter()
         .map(|(slot, _)| slot.to_owned())
         .collect();
-    // These JSON fields are configuration, conditions or tool arguments, never native content.
+    // These JSON fields are configuration, conditions or pre-tool arguments, never native content.
     covered.extend(
         [
             "RunConfigRefrozen.frozen_render_config",
             "ToolDispatchIntent.args",
+            "ToolDispatchIntent.hooks",
+            "ToolNoDispatch.hooks",
             "CompactionMessage.call_when",
             "CompactionMessage.ceiling",
         ]
