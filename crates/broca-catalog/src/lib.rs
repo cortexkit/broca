@@ -37,8 +37,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use broca_provider::policy::{Quirks, TokenLimitField, UsagePolicy};
 use broca_provider::spec::{
-    AuthKind, Capabilities, CapabilityFlag, CostSchedule, CostTier, Limits, ModelSpec, Overlay,
-    ProviderSpec, ReasoningOptions, WireFamilyId,
+    AuthKind, Capabilities, CapabilityFlag, CostSchedule, CostTier, InputModalities, Limits,
+    ModelSpec, Overlay, ProviderSpec, ReasoningOptions, WireFamilyId,
 };
 use family::{resolve_provider_family, FamilyResolution, ResolutionSource};
 use serde::Deserialize;
@@ -712,6 +712,11 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
             // the other snapshot capability keys.
             structured_output: capability_flag(entry, "structured_output"),
         },
+        input_modalities: entry
+            .get("modalities")
+            .and_then(|modalities| modalities.get("input"))
+            .map(InputModalities::from_value)
+            .unwrap_or_default(),
         limits: map_limits(entry.get("limit")),
         cost: map_cost(entry.get("cost")),
         // models.dev `reasoning_options`, the snapshot spelling of fusiform's
@@ -876,6 +881,82 @@ mod tests {
                 "models": { "mistral-large": { "id": "mistral-large", "name": "Mistral Large" } }
             }
         })
+    }
+
+    #[test]
+    fn snapshot_input_modalities_use_only_the_snapshot_source() {
+        let mut base = base();
+        let row = &mut base["anthropic"]["models"]["claude-x"];
+        row["attachment"] = json!(false);
+        row["capability.input_modalities"] = json!(["audio", "video"]);
+        row["modalities"] =
+            json!({"input": ["text", "image", "pdf", "future"], "output": ["audio", "video"]});
+        let catalog = Catalog::from_json_str(&base.to_string(), "{}").unwrap();
+        let expected = InputModalities {
+            text: Some(true),
+            image: Some(true),
+            pdf: Some(true),
+            audio: Some(false),
+            video: Some(false),
+        };
+        assert_eq!(
+            catalog
+                .model("anthropic", "claude-x")
+                .unwrap()
+                .1
+                .input_modalities,
+            expected
+        );
+        let cache = CatalogCache::empty();
+        cache.install_parsed_for_test(&catalog, 100, CatalogSource::LastKnownGood);
+        assert_eq!(
+            cache
+                .snapshot()
+                .unwrap()
+                .model_for_serving("anthropic", "claude-x")
+                .unwrap()
+                .1
+                .input_modalities,
+            expected
+        );
+    }
+
+    #[test]
+    fn snapshot_input_modalities_preserve_empty_and_unknown() {
+        for (value, expected) in [
+            (None, InputModalities::default()),
+            (Some(Value::Null), InputModalities::default()),
+            (
+                Some(json!({"output": ["image"]})),
+                InputModalities::default(),
+            ),
+            (Some(json!({"input": "image"})), InputModalities::default()),
+            (
+                Some(json!({"input": ["image", false]})),
+                InputModalities::default(),
+            ),
+            (
+                Some(json!({"input": []})),
+                InputModalities {
+                    text: Some(false),
+                    image: Some(false),
+                    pdf: Some(false),
+                    audio: Some(false),
+                    video: Some(false),
+                },
+            ),
+        ] {
+            let mut entry =
+                json!({"attachment": true, "capability.input_modalities": ["image", "pdf"]});
+            if let Some(value) = value.clone() {
+                entry["modalities"] = value;
+            }
+            assert_eq!(
+                map_model("model", &entry, RawPolicy::Skip).input_modalities,
+                expected,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
@@ -1222,6 +1303,7 @@ mod tests {
             "id",
             "interleaved",
             "limit",
+            "modalities",
             "name",
             "reasoning",
             // Typed as `ModelSpec::reasoning_options`: a caller's reasoning variant is resolved
@@ -1246,15 +1328,12 @@ mod tests {
         //    RENDERER decisions and the renderer is ours: a caller's `service_tier` is
         //    rendered by broca's own family table (broca-provider's `service_tier`), never
         //    from this field. Mapping it would let an upstream edit change our request bytes;
-        //  - modalities: capability metadata — NOT byte-affecting until multimodal
-        //    rendering exists; promote it then;
         //  - provider: NOT a provider id — see the note at its entry below;
         const MODEL_IGNORED: &[&str] = &[
             "description",
             "experimental",
             "knowledge",
             "last_updated",
-            "modalities",
             "open_weights",
             // NOT a redundant provider id, which an earlier comment here claimed and a
             // reader could act on. Measured on the snapshot: it is always an OBJECT, on 228
