@@ -1440,6 +1440,9 @@ pub struct LineageActor<W: WalStore> {
     /// Idle admission view loaded at actor open or after the previous run's terminal barrier.
     prior_snapshot: Option<PriorWalSnapshot>,
     ceiling_drain_held: bool,
+    /// Whether this actor has logged its compaction session passing the stored-message watch
+    /// threshold; see `crate::compaction_watch`.
+    compaction_watch: crate::compaction_watch::CompactionSessionWatch,
     pending_fifo: Vec<PendingSubmission>,
     /// Observed only during input hooks: dropping the RPC reply cancels this send, not its run.
     send_reply: Option<oneshot::Sender<SendOutcome>>,
@@ -1698,6 +1701,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             startup_recovery_pending: false,
             prior_snapshot: None,
             ceiling_drain_held: false,
+            compaction_watch: Default::default(),
             pending_fifo: Vec::new(),
             send_reply: None,
             skip_materialization_submissions: HashSet::new(),
@@ -3403,6 +3407,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .get()
             .and_then(|first| first.manifest.as_ref())
             .is_some_and(|manifest| broca_core::compaction::has_compaction(manifest));
+        if has_compaction && self.compaction_watch.pending() {
+            self.watch_compaction_session_size().await;
+        }
         if !resume_indexed_run
             && has_compaction
             && (matches!(self.state, RunState::Idle) || delivery != broca_protocol::Delivery::Queue)
@@ -7409,6 +7416,34 @@ impl<W: WalStore + 'static> LineageActor<W> {
         self.recover_durable_work().await?;
         self.startup_recovery_pending = false;
         Ok(())
+    }
+
+    /// Log once, on the lifecycle target, when this compaction session's stored transcript has
+    /// passed `COMPACTION_SESSION_WATCH_MESSAGES`. Compaction carries on either way. The count
+    /// is the store's materialized prefix, read from its metadata without decoding any message
+    /// or WAL record, so it can trail the WAL by the turns not yet projected. Without a store,
+    /// or when the read fails, nothing is logged and the next send checks again.
+    async fn watch_compaction_session_size(&mut self) {
+        let Some(store) = self.materialized_store.clone() else {
+            return;
+        };
+        let key = self.key.clone();
+        let counted = spawn_blocking(JobKind::StoreRead, move || {
+            broca_core::MaterializedStore::materialized_message_count(store.as_ref(), &key)
+        })
+        .await;
+        let Ok(Ok(Some(stored_messages))) = counted else {
+            return;
+        };
+        if self.compaction_watch.observe(stored_messages) {
+            tracing::info!(
+                target: "lifecycle",
+                session_ref = %broca_core::agent_session_ref(&self.key),
+                stored_messages,
+                threshold = crate::compaction_watch::COMPACTION_SESSION_WATCH_MESSAGES,
+                "compaction session passed the stored-message watch threshold"
+            );
+        }
     }
 
     /// Who has driven the session, over its whole history up to the durable head, without

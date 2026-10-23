@@ -348,6 +348,7 @@ impl Fixture {
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
         let mut actor = LineageActor {
             ceiling_drain_held: false,
+            compaction_watch: Default::default(),
             admitting_session_class: None,
             agent_run_scope: None,
             #[cfg(all(test, feature = "test-clock"))]

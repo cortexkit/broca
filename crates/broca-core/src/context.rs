@@ -234,6 +234,12 @@ pub trait MaterializedStore: Send + Sync {
     ) -> Result<Option<TagLocation>, String> {
         Ok(None)
     }
+    /// How many transcript messages the store holds for the session (its materialized prefix),
+    /// read from metadata without reading any message. `None` when this store keeps no such
+    /// count. Messages recorded in the WAL past the store's watermark are not included.
+    fn materialized_message_count(&self, _session: &BindIdentity) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
     /// Claim-check events are session-owned data, even though the broker carries only routing metadata.
     fn read_run_event(&self, _event_key: &str) -> Result<Option<(BindIdentity, Vec<u8>)>, String> {
         Ok(None)
