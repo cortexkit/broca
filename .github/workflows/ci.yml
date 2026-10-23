@@ -278,8 +278,10 @@ jobs:
           SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc
           BROCA_DEPLOY_TEST_BIN: ${{ github.workspace }}/broca/target/release/ck-broca
           BROCA_REQUIRE_LINUX_DEPLOY: '1'
+        # Build the same three binaries stage-release.sh builds: its publication sequence stages
+        # broca-session and broca-run from target/release beside the module.
         run: |
-          cargo build --release --locked -p broca-module-serve
+          cargo build --release --locked -p broca-module-serve -p broca-run --bin ck-broca --bin broca-session --bin broca-run
           python3 -B scripts/test-place-release-gate.py LinuxDeployTests.test_real_linux_subc_stage_place_restart_verify -v
       - name: Verify clean worktree
         run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
