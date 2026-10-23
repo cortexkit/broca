@@ -320,7 +320,6 @@ impl ToolPlane for Tools {
         call: &ToolCall,
         bytes: &str,
         key: &str,
-        _: &str,
         _: &broca_core::tool_plane::DispatchSignals,
     ) -> DispatchResult {
         assert_eq!(bytes, r#"{"n":0.000001}"#);

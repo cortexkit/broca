@@ -431,6 +431,7 @@ const STORE_BUSY_ERROR_MARKERS: [&str; 4] = [
     "store busy",
     "sqlite_busy",
 ];
+const LIVE_WRITER_ERROR_MARKER: &str = "held by a live writer";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnrollmentFailureKind {
@@ -439,6 +440,7 @@ enum EnrollmentFailureKind {
     UnreadableFile,
     StoreBusy,
     MigrationInProgress,
+    LiveWriter,
 }
 
 impl EnrollmentFailureKind {
@@ -449,13 +451,14 @@ impl EnrollmentFailureKind {
             Self::UnreadableFile => "unreadable_file",
             Self::StoreBusy => "store_busy",
             Self::MigrationInProgress => "migration_in_progress",
+            Self::LiveWriter => "live_writer",
         }
     }
 
     fn is_benign_race(self) -> bool {
         matches!(
             self,
-            Self::VanishedFile | Self::StoreBusy | Self::MigrationInProgress
+            Self::VanishedFile | Self::StoreBusy | Self::MigrationInProgress | Self::LiveWriter
         )
     }
 }
@@ -493,7 +496,9 @@ impl EnrollmentFailure {
 
     fn store(error: String) -> Self {
         let lower = error.to_ascii_lowercase();
-        let kind = if STORE_BUSY_ERROR_MARKERS
+        let kind = if lower.contains(LIVE_WRITER_ERROR_MARKER) {
+            EnrollmentFailureKind::LiveWriter
+        } else if STORE_BUSY_ERROR_MARKERS
             .iter()
             .any(|marker| lower.contains(marker))
         {
@@ -1067,7 +1072,10 @@ impl RetentionService {
                             kind = failure.kind.as_str(), error = %failure.error,
                             "enrollment deferred");
                     }
-                    if failure.kind != EnrollmentFailureKind::VanishedFile {
+                    if !matches!(
+                        failure.kind,
+                        EnrollmentFailureKind::VanishedFile | EnrollmentFailureKind::LiveWriter
+                    ) {
                         state.retry.insert(path);
                     }
                 }

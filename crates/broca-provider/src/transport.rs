@@ -184,7 +184,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     websocket: Arc<responses_websocket::Session>,
     #[cfg(test)]
     escape_client_builds: std::sync::Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     retry_clock: RetryClock,
 }
 
@@ -644,7 +644,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             websocket: Arc::new(responses_websocket::Session::default()),
             #[cfg(test)]
             escape_client_builds: std::sync::Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-harness"))]
             retry_clock: RetryClock::default(),
         }
     }
@@ -652,6 +652,12 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
     /// Use the module's shared clock for relative provider reset deadlines.
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    #[cfg(feature = "test-harness")]
+    pub fn with_virtual_retry_waits(mut self, waits: Arc<std::sync::Mutex<Vec<Duration>>>) -> Self {
+        self.retry_clock.virtual_waits = Some(waits);
         self
     }
 
@@ -736,9 +742,9 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             opts,
             step_id,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-harness"))]
         let retry_clock = self.retry_clock.clone();
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-harness")))]
         let retry_clock = RetryClock::default();
         let recovery = self.refresher.as_ref().map(|refresher| AuthRecovery {
             refresher: Arc::clone(refresher),
@@ -1337,7 +1343,7 @@ struct RetryClock {
     // Tests can measure a long attempt without advancing socket or retry deadlines.
     #[cfg(test)]
     virtual_attempt_elapsed: Option<Duration>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     virtual_waits: Option<Arc<std::sync::Mutex<Vec<Duration>>>>,
     #[cfg(test)]
     virtual_retry_attempts: Option<Arc<std::sync::Mutex<std::collections::VecDeque<Duration>>>>,
@@ -1347,7 +1353,7 @@ struct RetryClock {
 #[derive(Clone, Copy)]
 struct RetryMark {
     at: Instant,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     virtual_waits_before: usize,
 }
 
@@ -1366,7 +1372,7 @@ impl RetryClock {
     fn mark(&self) -> RetryMark {
         RetryMark {
             at: Instant::now(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-harness"))]
             virtual_waits_before: self
                 .virtual_waits
                 .as_ref()
@@ -1376,7 +1382,7 @@ impl RetryClock {
 
     fn elapsed_since(&self, mark: RetryMark) -> Duration {
         let elapsed = mark.at.elapsed();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-harness"))]
         if let Some(waits) = &self.virtual_waits {
             let waited: Duration = waits.lock().unwrap()[mark.virtual_waits_before..]
                 .iter()
@@ -1387,7 +1393,7 @@ impl RetryClock {
     }
 
     async fn sleep(&self, delay: Duration) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-harness"))]
         if let Some(waits) = &self.virtual_waits {
             waits.lock().unwrap().push(delay);
             tokio::task::yield_now().await;

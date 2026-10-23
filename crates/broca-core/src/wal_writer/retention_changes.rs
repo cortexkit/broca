@@ -47,6 +47,16 @@ pub(super) struct ObservedWal {
     pub durable_observer: Option<Arc<DurableWalObserver>>,
 }
 
+impl Drop for ObservedWal {
+    fn drop(&mut self) {
+        // The next sweep consumes this hint after the actor releases its lease, so deferred
+        // enrollment does not have to reopen a live session on every pass.
+        if self.retained {
+            self.changes.changed(&self.address);
+        }
+    }
+}
+
 impl ObservedWal {
     fn durable(&self) {
         if let Some(observer) = &self.durable_observer {

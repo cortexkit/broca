@@ -8,6 +8,8 @@ repository.workspace = true
 description = "broca provider module: owns one provider's SSE transport + auth, normalizes wire->canonical stream-parts, emits the two lanes over the direct runner<->provider socket."
 
 [features]
+# E2E-only virtual retry waits; keeps transport retry decisions real without waiting out backoff.
+test-harness = []
 # The (A) cross-process bench fixture (arm3 producer). OFF by default so the
 # production provider binary carries neither the bench code nor broca-replay.
 bench = ["dep:broca-replay", "dep:subc-protocol", "dep:subc-transport"]

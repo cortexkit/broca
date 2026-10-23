@@ -15016,11 +15016,21 @@ target = "--lib"
 test_file = "crates/broca-subc/src/subc_plane.rs"
 expect_red = ["subc_plane::approval_digest_contract_tests::approved_connection_omits_approval_digest_and_preserves_saved_bytes"]
 select = "expected"
-file = "crates/broca-subc/src/subc_plane.rs"
-old = '''            Some(&args.key),
-            None,'''
-new = '''            Some(&args.key),
-            Some(""), // NON-VACUITY BREAK: send the retired digest field again'''
+file = "crates/broca-subc/src/connection.rs"
+old = '''        let body = body.replacen(
+            "\"arguments\":null",
+            &format!("\"arguments\":{args_jcs}"),
+            1,
+        );
+        Ok(body.into_bytes())'''
+new = '''        let mut body = body.replacen(
+            "\"arguments\":null",
+            &format!("\"arguments\":{args_jcs}"),
+            1,
+        );
+        body.pop();
+        body.push_str(",\"approval_digest\":\"legacy\"}"); // NON-VACUITY BREAK: restore the retired wire field
+        Ok(body.into_bytes())'''
 
 [[control]]
 id = "core-consent-filed-await-error-backoff"
@@ -24628,4 +24638,15 @@ file = "crates/broca-provider/src/transport.rs"
 old = '''        || body.pointer("/error/type").and_then(Value::as_str) != Some("GoUsageLimitError")'''
 new = '''        || body.pointer("/error/type").and_then(Value::as_str) == Some("GoUsageLimitError") // NON-VACUITY BREAK: decline Go quota classification.'''
 
-
+[[control]]
+id = "gated-commit-linux-attestation-crate-set"
+guards = "a Linux quickcheck for one crate set cannot authorize committing another"
+platforms = ["linux", "macos"]
+runner = "command"
+command = ["python3", "-B", "scripts/test-gated-commit.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/test-gated-commit.py"
+expect_red = ["GatedCommitPaths.test_tree_or_crate_mismatch_keeps_the_local_quickcheck"]
+file = "scripts/gated-commit.sh"
+old = '''      crates) attestation_crates="$value" ;;'''
+new = '''      crates) attestation_crates="$current_crates" ;; # NON-VACUITY BREAK: ignore the attested crate set'''

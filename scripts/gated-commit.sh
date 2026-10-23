@@ -22,6 +22,7 @@
 #
 # Usage:  scripts/gated-commit.sh <commit-message-file> [crate ...]   <- PREFER THIS
 #         scripts/gated-commit.sh -m "message" [crate ...]
+#         scripts/linux-quickcheck-attest.sh [--output FILE] [crate ...] on Linux
 #
 # PREFER THE FILE FORM FOR ANYTHING LONGER THAN A LINE. A commit message is prose about code, so
 # it naturally contains backticks, $, and quotes -- and inside `-m "..."` the shell evaluates all
@@ -112,25 +113,84 @@ if [ "$#" -eq 0 ]; then
 fi
 
 echo "gated-commit: running crate-scoped fmt, all-target clippy, lib/bin tests and doctests on: $*"
-# Capture the status DIRECTLY rather than inside `if ! ...`, where $? would hold the negated
-# test result and report a failing gate as "exit 0". Caught by reading this script's own first
-# refusal, which is the only reason it is right: the wrong version still refuses correctly and
-# only lies about why.
-./scripts/quickcheck.sh "$@"
-status=$?
-if [ "$status" -ne 0 ]; then
-  # BOTH lines name the outcome, because a caller piping this through `tail -1` sees only the
-  # second one. "the tree is untouched" meant "nothing was committed, your edits are as you
-  # left them" -- and read through a tail it looks like "you have no changes", which sends the
-  # reader hunting a lost edit instead of reading the gate output directly above. I misread my
-  # own message that way twice on 2026-09-06.
-  echo "gated-commit: GATE FAILED (exit $status) — NOT committing" >&2
-  echo "gated-commit: gate failed (see its output above); nothing was committed and your" >&2
-  echo "  working tree still holds your edits. Fix what the gate reported, then re-run." >&2
-  exit 1
+# A Linux quickcheck can be reused only for the exact index tree that will be committed, with
+# no unstaged or untracked inputs. The attestation is data, never shell code: every field
+# must match the wrapper's output before any local checks are skipped.
+attestation_path=$(git rev-parse --git-path broca-linux-quickcheck-attestation)
+if [[ "$attestation_path" != /* ]]; then
+  attestation_path="$root/$attestation_path"
+fi
+attestation_tree=""
+attestation_crates=""
+attestation_platform=""
+attestation_status=""
+attestation_format=""
+attestation_lines=0
+current_tree=""
+if [ -f "$attestation_path" ] && git diff --quiet \
+    && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+  current_tree=$(git write-tree) || exit 1
+  current_crates=$(printf '%s\n' "$@" | LC_ALL=C sort -u | paste -sd, -)
+  while IFS='=' read -r key value || [ -n "$key$value" ]; do
+    attestation_lines=$((attestation_lines + 1))
+    case "$key" in
+      format) attestation_format="$value" ;;
+      platform) attestation_platform="$value" ;;
+      tree) attestation_tree="$value" ;;
+      crates) attestation_crates="$value" ;;
+      status) attestation_status="$value" ;;
+      *) attestation_lines=99 ;;
+    esac
+  done < "$attestation_path"
+  if [ "$attestation_lines" -eq 5 ] \
+      && [ "$attestation_format" = "broca-linux-quickcheck-v1" ] \
+      && [ "$attestation_platform" = "linux" ] \
+      && [ "$attestation_tree" = "$current_tree" ] \
+      && [ "$attestation_crates" = "$current_crates" ] \
+      && [ "$attestation_status" = "pass" ]; then
+    echo "gated-commit: Linux quickcheck attestation matches tree $current_tree and crates $current_crates"
+    echo "gated-commit: keeping formatting and layout checks local"
+    cargo fmt --all -- --check || {
+      echo "gated-commit: local workspace formatting check failed — NOT committing" >&2
+      exit 1
+    }
+    scripts/check-cortexkit-layout.sh || {
+      echo "gated-commit: local CortexKit layout check failed — NOT committing" >&2
+      exit 1
+    }
+  else
+    current_tree=""
+  fi
+fi
+# A matching record is an opt-in to reuse; absent, malformed or stale records keep the
+# original local quickcheck path exactly intact.
+if [ -n "$current_tree" ] && [ "$attestation_tree" = "$current_tree" ]; then
+  attested_tree="$current_tree"
+  echo "gated-commit: reusing passing Linux quickcheck; local fmt and layout checks passed"
+else
+  # Capture the status directly: inside `if ! ...`, `$?` is the negation's status, so a failed
+  # quickcheck could be reported as `exit 0` and accidentally allow a commit.
+  ./scripts/quickcheck.sh "$@"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    # BOTH lines name the outcome, because a caller piping this through `tail -1` sees only the
+    # second one. "the tree is untouched" meant "nothing was committed, your edits are as you
+    # left them" -- and read through a tail it looks like "you have no changes", which sends the
+    # reader hunting a lost edit instead of reading the gate output directly above. I misread my
+    # own message that way twice on 2026-09-06.
+    echo "gated-commit: GATE FAILED (exit $status) — NOT committing" >&2
+    echo "gated-commit: gate failed (see its output above); nothing was committed and your" >&2
+    echo "  working tree still holds your edits. Fix what the gate reported, then re-run." >&2
+    exit 1
+  fi
+  attested_tree=""
 fi
 
 git add -A || exit 1
+if [ -n "$attested_tree" ] && [ "$(git write-tree)" != "$attested_tree" ]; then
+  echo "gated-commit: attested tree changed before commit — NOT committing" >&2
+  exit 1
+fi
 if [ -n "$message_file" ]; then
   git commit -q -F "$message_file" || exit 1
 else

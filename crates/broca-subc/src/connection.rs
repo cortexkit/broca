@@ -1640,7 +1640,7 @@ impl SubcConnection {
             preset: preset.map(str::to_owned),
         })
         .map_err(|e| ConnError::Transport(e.to_string()))?;
-        self.send_tool_call_body(route, deadline, body).await
+        self.send_tool_call_body(route, deadline, name, body).await
     }
 
     /// Preserve the exact argument bytes rather than parsing and reserializing them.
@@ -1654,17 +1654,9 @@ impl SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         call_key: Option<&str>,
-        approval_digest: Option<&str>,
     ) -> ConnResult<serde_json::Value> {
-        let body = Self::raw_tool_call_body(
-            name,
-            args_jcs,
-            tool_call_id,
-            preset,
-            call_key,
-            approval_digest,
-        )?;
-        self.send_tool_call_body(route, deadline, body).await
+        let body = Self::raw_tool_call_body(name, args_jcs, tool_call_id, preset, call_key)?;
+        self.send_tool_call_body(route, deadline, name, body).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1677,20 +1669,12 @@ impl SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         call_key: Option<&str>,
-        approval_digest: Option<&str>,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, ApprovedCallError> {
         // All fallible setup belongs to one pre-push stage. There is no fallible
         // work after enqueue inside this block, so its errors can never mean sent.
         let before_push = async {
-            let body = Self::raw_tool_call_body(
-                name,
-                args_jcs,
-                tool_call_id,
-                preset,
-                call_key,
-                approval_digest,
-            )?;
+            let body = Self::raw_tool_call_body(name, args_jcs, tool_call_id, preset, call_key)?;
             let corr = self.next_corr();
             let (runtime, registration, rx) =
                 self.register_route(route, (route.channel, route.epoch, corr))?;
@@ -1704,6 +1688,7 @@ impl SubcConnection {
             )
             .map_err(|error| ConnError::Transport(error.to_string()))?;
             self.enqueue_approved(&runtime, frame, signals).await?;
+            log_tool_dispatch(route.channel, corr, name);
             Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr))
         };
         let (runtime, _registration, mut rx, corr) =
@@ -1719,7 +1704,6 @@ impl SubcConnection {
         tool_call_id: Option<&str>,
         preset: Option<&str>,
         call_key: Option<&str>,
-        approval_digest: Option<&str>,
     ) -> ConnResult<Vec<u8>> {
         serde_json::from_str::<&serde_json::value::RawValue>(args_jcs)
             .map_err(|error| ConnError::Protocol(format!("invalid approved arguments: {error}")))?;
@@ -1735,20 +1719,11 @@ impl SubcConnection {
         };
         let body = serde_json::to_string(&envelope)
             .map_err(|error| ConnError::Protocol(error.to_string()))?;
-        let mut body = body.replacen(
+        let body = body.replacen(
             "\"arguments\":null",
             &format!("\"arguments\":{args_jcs}"),
             1,
         );
-        if let Some(digest) = approval_digest {
-            body.pop();
-            body.push_str(",\"approval_digest\":");
-            body.push_str(
-                &serde_json::to_string(digest)
-                    .map_err(|error| ConnError::Protocol(error.to_string()))?,
-            );
-            body.push('}');
-        }
         Ok(body.into_bytes())
     }
 
@@ -1756,6 +1731,7 @@ impl SubcConnection {
         &self,
         route: &RouteHandle,
         deadline: Duration,
+        operation: &str,
         body: Vec<u8>,
     ) -> ConnResult<serde_json::Value> {
         let corr = self.next_corr();
@@ -1771,6 +1747,7 @@ impl SubcConnection {
         )
         .map_err(|error| ConnError::Transport(error.to_string()))?;
         self.send(&runtime, frame).await?;
+        log_tool_dispatch(route.channel, corr, operation);
         self.receive_tool_call(runtime, route, corr, &mut rx, deadline)
             .await
     }
@@ -2792,6 +2769,18 @@ async fn writer_task<W: AsyncWrite + Unpin>(
             break;
         }
     }
+}
+
+// Put request identity on the opt-in wire target; tool arguments are deliberately not logged.
+fn log_tool_dispatch(route_channel: u16, correlation_id: u64, operation: &str) {
+    tracing::debug!(
+        target: "subc.wire",
+        stage = "tool_dispatch",
+        route_channel,
+        correlation_id,
+        operation,
+        "tool call dispatched"
+    );
 }
 
 /// Channel-0 control-plane flags: PASSIVE priority, non-binary (JSON body) —
@@ -4251,6 +4240,55 @@ mod tests {
                 .unwrap();
             task.await.unwrap().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn tool_dispatch_log_identifies_route_request_and_operation_without_arguments() {
+        let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+        let capture = broca_test_support::LogCapture::new();
+        let signals = broca_core::tool_plane::DispatchSignals::default();
+        let dispatch = capture.scope_future(conn.tool_call_raw_guarded(
+            &route,
+            "lookup",
+            r#"{"secret":"argument content"}"#,
+            Some("provider-call"),
+            Duration::from_secs(1),
+            None,
+            None,
+            &signals,
+        ));
+        let receive = async {
+            let request = module.next_request().await;
+            assert!(module.reply(&request, br#"{"content":[]}"#.to_vec()));
+            request
+        };
+        let (result, request) = tokio::join!(dispatch, receive);
+        assert!(result.is_ok(), "{result:?}");
+
+        let logs: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.target == "subc.wire"
+                    && event
+                        .fields
+                        .get("stage")
+                        .is_some_and(|stage| stage == "tool_dispatch")
+            })
+            .collect();
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        let event = &logs[0];
+        assert_eq!(event.level, tracing::Level::DEBUG);
+        assert_eq!(event.fields["stage"], "tool_dispatch");
+        assert_eq!(event.fields["route_channel"], "5");
+        assert_eq!(
+            event.fields["correlation_id"],
+            request.header.corr.to_string()
+        );
+        assert_eq!(event.fields["operation"], "lookup");
+        let fields = format!("{:?}", event.fields);
+        assert!(!fields.contains("secret"));
+        assert!(!fields.contains("argument content"));
     }
 
     #[tokio::test]
@@ -6004,7 +6042,6 @@ mod approval_raw_tests {
                 Some("c"),
                 Duration::from_secs(1),
                 Some("head"),
-                None,
                 None
             ),
             async {
@@ -6032,7 +6069,6 @@ mod approval_raw_tests {
                 Duration::from_secs(1),
                 Some("head"),
                 Some("lineage:7"),
-                None
             ),
             async {
                 let request = module.next_request().await;
@@ -6064,7 +6100,6 @@ mod approval_raw_tests {
                     Duration::from_secs(1),
                     None,
                     None,
-                    None
                 )
                 .await,
                 Err(ConnError::Protocol(_))

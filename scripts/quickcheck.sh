@@ -43,7 +43,9 @@ for c in "$@"; do PKGS+=("-p" "$c"); done
 FEATURES=()
 for c in "$@"; do
   case "$c" in
-    broca-provider) FEATURES+=("-F" "broca-provider/live") ;;
+    broca-provider)
+      FEATURES+=("-F" "broca-provider/live" "-F" "broca-provider/test-harness")
+      ;;
     broca-catalog) FEATURES+=("-F" "broca-catalog/live") ;;
     broca-core|broca-module|broca-module-serve) FEATURES+=("-F" "$c/test-clock") ;;
   esac

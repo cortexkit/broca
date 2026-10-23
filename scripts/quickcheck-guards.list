@@ -28,7 +28,7 @@ broca-module-serve|it|log_levels_are_deliberate::|broca-module-serve/test-clock|
 # Prevents the removed whole-array transform route from returning to workspace code.
 broca-module-serve|it|transform_route_removed::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/transform_route_removed.rs|no_code_names_the_removed_transform_route|Scans source, scripts, and workflow files for removed route names.
 # Keeps test fixtures referenced by provider integration-test sources.
-broca-provider|it|fixture_coverage::|broca-provider/live|crates/broca-provider/tests/it/fixture_coverage.rs|every_fixture_is_read_by_some_test|Inventories provider fixtures without starting a provider or daemon.
+broca-provider|it|fixture_coverage::|broca-provider/live,broca-provider/test-harness|crates/broca-provider/tests/it/fixture_coverage.rs|every_fixture_is_read_by_some_test|Inventories provider fixtures without starting a provider or daemon.
 # Pins the embedded served-payload fixture's wire shape.
 broca-catalog|it|fusiform_wire_fixture::|broca-catalog/live|crates/broca-catalog/tests/it/fusiform_wire_fixture.rs|the_served_shape_carries_the_facts_broca_consumes|Checks local catalog payload fixture data without network access.
 # Pins catalog endpoint values and their origin in embedded snapshot and overlay data.

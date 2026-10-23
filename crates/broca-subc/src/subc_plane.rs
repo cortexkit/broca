@@ -450,7 +450,6 @@ impl ToolPlaneConnection for SubcConnection {
             deadline,
             preset,
             None,
-            None,
             &broca_core::tool_plane::DispatchSignals::default(),
         )
         .await
@@ -487,7 +486,6 @@ impl ToolPlaneConnection for SubcConnection {
             deadline,
             preset,
             Some(&args.key),
-            None,
             &args.signals,
         )
         .await
@@ -2258,7 +2256,6 @@ impl ToolPlane for SubcToolPlane {
         call: &ToolCall,
         args_jcs: &str,
         call_key: &str,
-        _approval_digest: &str,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> DispatchResult {
         // Preserve a completed result even if the route or approved input has
@@ -3035,7 +3032,7 @@ mod tests {
             )]),
         );
         let result = plane
-            .dispatch_approved(&ctx, &call, "{}", "key", "", &Default::default())
+            .dispatch_approved(&ctx, &call, "{}", "key", &Default::default())
             .await;
         assert!(
             matches!(result, DispatchResult::NotSent { reason } if reason == "route_unresolved")
@@ -3060,7 +3057,7 @@ mod tests {
         let ctx = batch_ctx("approved-repeat");
         let call = call("edit");
         let DispatchResult::Completed(prior) = plane
-            .dispatch_approved(&ctx, &call, "{}", "key", "", &Default::default())
+            .dispatch_approved(&ctx, &call, "{}", "key", &Default::default())
             .await
         else {
             panic!("first approved dispatch must complete")
@@ -3073,7 +3070,7 @@ mod tests {
             )]),
         );
         let result = plane
-            .dispatch_approved(&ctx, &call, "not json", "key", "", &Default::default())
+            .dispatch_approved(&ctx, &call, "not json", "key", &Default::default())
             .await;
         let DispatchResult::Completed(repeated) = result else {
             panic!("fenced call must return its prior result")
@@ -3097,14 +3094,7 @@ mod tests {
         let (route, _) = plane.ensure_route(&ctx.bind, None, "aft").await.unwrap();
         *conn.approved_setup_error.lock().unwrap() = Some(ConnError::StaleRouteHandle(route));
         let result = plane
-            .dispatch_approved(
-                &ctx,
-                &call("edit"),
-                "{}",
-                "call-key",
-                "digest",
-                &Default::default(),
-            )
+            .dispatch_approved(&ctx, &call("edit"), "{}", "call-key", &Default::default())
             .await;
         assert!(matches!(result, DispatchResult::Completed(_)));
         assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 2);
@@ -3127,8 +3117,7 @@ mod tests {
                 if cancel { Some(&token) } else { None },
                 if cancel { None } else { Some(&token) },
             );
-            let dispatch =
-                plane.dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &signals);
+            let dispatch = plane.dispatch_approved(&ctx, &call, "{}", "call-key", &signals);
             let interrupt = async {
                 gate.entered.notified().await;
                 token.cancel();
@@ -3170,9 +3159,8 @@ mod tests {
                 if cancel { Some(&token) } else { None },
                 if cancel { None } else { Some(&token) },
             );
-            let mut dispatch = Box::pin(
-                plane.dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &signals),
-            );
+            let mut dispatch =
+                Box::pin(plane.dispatch_approved(&ctx, &call, "{}", "call-key", &signals));
             assert!(
                 dispatch.as_mut().now_or_never().is_none(),
                 "cached route is ready and the only wait is flow-control credit"
@@ -3210,7 +3198,6 @@ mod tests {
                     &call("edit"),
                     "{}",
                     "key",
-                    "digest",
                     &broca_core::tool_plane::DispatchSignals::default()
                 )
                 .await,
@@ -3235,7 +3222,6 @@ mod tests {
                     &call,
                     "{}",
                     "key",
-                    "digest",
                     &broca_core::tool_plane::DispatchSignals::default()
                 )
                 .await,
@@ -3250,7 +3236,6 @@ mod tests {
                     &call,
                     "{}",
                     "key",
-                    "digest",
                     &broca_core::tool_plane::DispatchSignals::new(Some(&cancel), None)
                 )
                 .await,
@@ -6467,7 +6452,6 @@ mod approved_queue_contract_tests {
                     Duration::from_millis(20),
                     None,
                     Some("call-key"),
-                    None,
                     &Default::default(),
                 )
                 .await;
@@ -6511,7 +6495,7 @@ mod approved_queue_contract_tests {
         };
         let signals = Default::default();
         let (result, ()) = tokio::join!(
-            plane.dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &signals),
+            plane.dispatch_approved(&ctx, &call, "{}", "call-key", &signals),
             async {
                 let request = module.next_request().await;
                 assert!(module.reply(&request, b"invalid-json".to_vec()));
@@ -6550,7 +6534,7 @@ mod approved_queue_contract_tests {
             thought_signature: None,
         };
         let result = plane
-            .dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &Default::default())
+            .dispatch_approved(&ctx, &call, "{}", "call-key", &Default::default())
             .await;
         assert!(
             matches!(result, DispatchResult::NotSent { ref reason } if reason == "subc transport: writer task closed before enqueue"),
@@ -6590,9 +6574,8 @@ mod approved_queue_contract_tests {
                 if cancel { Some(&token) } else { None },
                 if cancel { None } else { Some(&token) },
             );
-            let mut dispatch = Box::pin(
-                plane.dispatch_approved(&ctx, &call, "{}", "call-key", "digest", &signals),
-            );
+            let mut dispatch =
+                Box::pin(plane.dispatch_approved(&ctx, &call, "{}", "call-key", &signals));
             assert!(dispatch.as_mut().now_or_never().is_none());
             assert_eq!(
                 module.pending_count_for_test(),

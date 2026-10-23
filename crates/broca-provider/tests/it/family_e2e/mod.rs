@@ -16,6 +16,8 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+#[cfg(feature = "test-harness")]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use broca_core::{
@@ -184,6 +186,9 @@ pub struct RunSpec {
     pub tool_results: Vec<(String, String)>,
     /// Max model steps (a structural stop so a misbehaving script can't loop).
     pub max_steps: u64,
+    #[cfg(feature = "test-harness")]
+    /// Replace real retry sleeps with elapsed virtual waits for retry-path e2e cases.
+    pub virtual_retry_waits: bool,
 }
 
 impl RunSpec {
@@ -195,6 +200,8 @@ impl RunSpec {
             tools: Vec::new(),
             tool_results: Vec::new(),
             max_steps: 4,
+            #[cfg(feature = "test-harness")]
+            virtual_retry_waits: false,
         }
     }
 
@@ -217,12 +224,20 @@ impl RunSpec {
             .push((name.to_string(), result.to_string()));
         self
     }
+
+    #[cfg(feature = "test-harness")]
+    pub fn with_virtual_retry_waits(mut self) -> Self {
+        self.virtual_retry_waits = true;
+        self
+    }
 }
 
 /// The result of a family e2e run: the run summary + the full ordered event stream.
 pub struct RunOutcome {
     pub summary: RunSummary,
     pub events: Vec<OutputEvent>,
+    #[cfg(feature = "test-harness")]
+    pub retry_waits: Vec<Duration>,
 }
 
 impl RunOutcome {
@@ -348,6 +363,18 @@ pub async fn run_family_e2e<F: WireFamily + 'static>(
         WireFamilyId::Gemini => format!("{}/v1beta", mock.base_url),
         _ => mock.base_url.clone(),
     });
+    #[cfg(feature = "test-harness")]
+    let (provider, retry_waits) = if spec.virtual_retry_waits {
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        (
+            LiveProvider::new(family, frozen, AuthHandle::None)
+                .with_virtual_retry_waits(Arc::clone(&waits)),
+            Some(waits),
+        )
+    } else {
+        (LiveProvider::new(family, frozen, AuthHandle::None), None)
+    };
+    #[cfg(not(feature = "test-harness"))]
     let provider = LiveProvider::new(family, frozen, AuthHandle::None);
 
     let mut plane = StubToolPlane::new();
@@ -423,5 +450,12 @@ pub async fn run_family_e2e<F: WireFamily + 'static>(
     drop(tx);
     let events = collector.await.unwrap();
 
-    Some(RunOutcome { summary, events })
+    Some(RunOutcome {
+        summary,
+        events,
+        #[cfg(feature = "test-harness")]
+        retry_waits: retry_waits
+            .map(|waits| waits.lock().unwrap().clone())
+            .unwrap_or_default(),
+    })
 }

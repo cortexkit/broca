@@ -405,7 +405,8 @@ def _portable_filter(root: Path) -> str:
 def _nextest_inventory(root: Path, expression: str) -> dict:
     command = [
         "cargo", "nextest", "list", "--locked", "--workspace",
-        "-F", "broca-provider/live", "-F", "broca-catalog/live",
+        "-F", "broca-provider/live", "-F", "broca-provider/test-harness",
+        "-F", "broca-catalog/live",
         "-F", "broca-module-serve/test-clock", "-E", expression, "-T", "json",
     ]
     result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
