@@ -1,24 +1,6 @@
 #!/usr/bin/env bash
-# Verify a PLACED ck-broca is the artifact you think it is, and is serving.
-#
-# SCOPE, stated because reading it wider is how a real gap hid for 31 releases: this answers
-# "is THE DAEMON current", NOT "is the deployment current". It takes one binary path and knows
-# nothing about anything else in bin/.
-#
-# broca-session sat there at 0.3.33 while the daemon ran 0.3.64 -- eleven commits behind on
-# that binary alone, including a json-events page that carried neither head nor lineage_id.
-# No check failed, because no check covered it. That was not a missed step; it was A STEP THAT
-# DOES NOT EXIST, and a green ladder here reads exactly the same either way.
-#
-# The placed copy turned out to be VESTIGIAL and was deleted rather than refreshed: nothing
-# invoked it (verified with a positive control -- the same search finds ck-broca in subc
-# config), cortexkit-e2e builds its own from BROCA_TARGET, and alfonso-tui consumes captured
-# fixtures rather than the binary. Maintaining a binary for nobody is worse than not having it.
-#
-# So if a second placed binary is ever genuinely needed, it gets its own verify ladder wired
-# AT THE SAME TIME as its first consumer -- not added here speculatively, and not left to a
-# ritual someone remembers. Until then the single-binary scope is correct and this note is
-# what stops it being mistaken for completeness.
+# Verify the placed module and its clients. Only ck-broca is a running process: clients
+# prove identity through --version and the staged post-sign digest, not process inodes.
 #
 # This existed only as commands typed fresh after every release, which is why a defect in it
 # survived for weeks: the pid resolver matched the LAST field of the ps line against the binary
@@ -43,10 +25,11 @@ BIN="${BROCA_BIN:-$HOME/.local/share/cortexkit/bin/ck-broca}"
 STATE_ROOT="${BROCA_STATE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/broca}"
 MARKER=""
 CONTROL=""
+STAGED=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --marker|--control|--bin|--sha)
+    --marker|--control|--bin|--sha|--staged)
       if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
         echo "verify-deploy: usage error: $1 requires an argument" >&2
         exit 64
@@ -58,6 +41,7 @@ while [ $# -gt 0 ]; do
     --control) CONTROL="${2:-}"; shift 2 ;;
     --bin)     BIN="${2:-}"; shift 2 ;;
     --sha)     EXPECT_SHA="${2:-}"; shift 2 ;;
+    --staged)  STAGED="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 64 ;;
   esac
 done
@@ -148,7 +132,19 @@ else
   echo "  signing  not applicable on Linux; no macOS debugger-attachment protection claimed"
 fi
 
-printf "  version  %s\n" "$("$BIN" --version 2>&1 | head -1)"
+if ! MODULE_VERSION_LINE="$("$BIN" --version)" || ! [[ "$MODULE_VERSION_LINE" =~ ^ck-broca\ [0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "REFUSED: invalid deployed --version at $BIN: '$MODULE_VERSION_LINE'" >&2
+  exit 2
+fi
+printf "  version  %s\n" "$MODULE_VERSION_LINE"
+source "$(dirname "${BASH_SOURCE[0]}")/release-clients.sh"
+if [ -z "$STAGED" ]; then
+  STAGED="$HOME/.local/share/cortexkit/staging/ck-broca.$(git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse --short=8 HEAD)"
+fi
+for client in broca-session broca-run; do
+  broca_verify_client "$(dirname "$BIN")/$client" "${MODULE_VERSION_LINE#ck-broca }" \
+    "$(broca_release_client_path "$STAGED" "$client")" || fail=1
+done
 
 # SUBC's rule, banked after they placed a new ck-models into the cortexkit bin dir while the
 # one an operator actually runs resolved from ~/.local/bin: reporting a version read from a

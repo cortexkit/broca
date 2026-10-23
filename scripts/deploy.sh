@@ -56,7 +56,19 @@ rollback_command() {
     backup="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["backup"])' "$report")"
     if [ -n "$backup" ]; then
       printf 'Rollback: '
-      printf '%q ' "$ROOT/scripts/place-release.sh" --staged "$backup" --dest "$dest" --restart --live-approved
+      printf '%q ' "$ROOT/scripts/place-release.sh" --staged "$backup"
+      for client in broca-session broca-run; do
+        client_backup="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["client_backups"][sys.argv[2]])' "$report" "$client")"
+        if [ -n "$client_backup" ]; then
+          case "$client" in broca-session) option=--session-staged ;; broca-run) option=--run-staged ;; esac
+          printf '%q ' "$option" "$client_backup"
+        else
+          # Rolling back a first installation restores absence, not an incompatible new client.
+          case "$client" in broca-session) option=--remove-session ;; broca-run) option=--remove-run ;; esac
+          printf '%q ' "$option"
+        fi
+      done
+      printf '%q ' --dest "$dest" --restart --live-approved
       printf '\n'
       return
     fi
@@ -70,7 +82,7 @@ if ! bash scripts/place-release.sh --staged "$staged" --restart --report "$repor
   exit 1
 fi
 expected_sha="$(shasum -a 256 "$staged" | awk '{print $1}')"
-if ! bash scripts/verify-deploy.sh --sha "$expected_sha" --marker "$MARKER" --control "$CONTROL" \
+if ! bash scripts/verify-deploy.sh --staged "$staged" --sha "$expected_sha" --marker "$MARKER" --control "$CONTROL" \
     2>&1 | tee "$logdir/verify.log"; then
   echo "deploy: LIVE VERIFICATION FAILED" >&2
   rollback_command >&2

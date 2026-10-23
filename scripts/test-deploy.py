@@ -77,6 +77,7 @@ if name == "place" and "--report" in args:
     backup.write_bytes(b"previous release")
     pathlib.Path(args[args.index("--report")+1]).write_text(json.dumps({
         "backup": str(backup), "pid": "4321", "sessions_at_restart": ["session.wal"],
+        "client_backups": {client: str(home / (client + ".rollback")) for client in ("broca-session", "broca-run")},
         "sessions_sealed": ["session.wal"], "sessions_unconfirmed": [], "seal_error": ""}))
 if name == "publish":
     pathlib.Path(os.environ["TAG_WHEN_GREEN_LOG"]).write_text("background CI\n")
@@ -138,6 +139,8 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
                                   text=True, capture_output=True, timeout=10)
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertEqual(self.records()[0][1], ["--staged", str(self.home / "rollback copy"),
+                         "--session-staged", str(self.home / "broca-session.rollback"),
+                         "--run-staged", str(self.home / "broca-run.rollback"),
                          "--dest", str(self.home / ".local/share/cortexkit/bin/ck-broca"),
                          "--restart", "--live-approved"])
 

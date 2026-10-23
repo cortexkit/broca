@@ -390,7 +390,7 @@ if [[ $(uname -s) == Darwin ]]; then
     export CARGO_PROFILE_RELEASE_STRIP=none
 fi
 
-if ! python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve --quiet; then
+if ! python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve -p broca-run --bin ck-broca --bin broca-session --bin broca-run --quiet; then
     cat >&2 <<'DRIFT'
 stage-release: build refused under --locked.
 
@@ -700,6 +700,33 @@ if [[ $(uname -s) == Darwin ]] && ! broca_dsym_matches_binary "$STAGED" "$STAGED
     echo "  the staged binary $STAGED and its dSYM $STAGED_DSYM." >&2
     exit 2
 fi
+
+# Clients are signed in private scratch too: publishing a build-tree copy would bypass both
+# the hardened signature and the sidecar-first hand-off used for the module.
+for client in broca-session broca-run; do
+    client_built="target/release/$client"
+    client_tmp="$BUILD_SCRATCH/$client.$COMMIT.incoming"
+    client_staged="$SEAM/$client.$COMMIT"
+    [[ -f $client_built ]] || { echo "stage-release: $client_built missing after build" >&2; exit 2; }
+    install -m 700 "$client_built" "$client_tmp"
+    if [[ $(uname -s) == Darwin ]]; then
+        codesign --force --sign - -o runtime --identifier "$client" "$client_tmp"
+        source "$ROOT/scripts/signing-posture.sh"
+        client_flags=$(broca_codesign_flags "$client_tmp")
+        client_entitlements=$(broca_codesign_entitlements "$client_tmp")
+        if ! broca_flags_have_runtime "$client_flags" || broca_entitlements_allow_debugger "$client_entitlements"; then
+            echo "stage-release: REFUSING -- client signature must be hardened with no get-task-allow: $client_tmp" >&2
+            exit 2
+        fi
+    fi
+    client_sha=$(shasum -a 256 "$client_tmp" | cut -d' ' -f1)
+    printf '%s  %s\n' "$client_sha" "$(basename "$client_staged")" > "$client_tmp.sha256.postsign"
+    chmod 600 "$client_tmp.sha256.postsign"
+    publish_verified "$client_tmp.sha256.postsign" "$client_staged.sha256.postsign"
+    publish_verified "$client_tmp" "$client_staged"
+    ( cd "$SEAM" && shasum -c "$(basename "$client_staged").sha256.postsign" )
+    echo "   client  $client_staged"
+done
 
 # THE CURRENT-ARTIFACT MANIFEST. "Newest by mtime" is a fact about the directory; "current" is a
 # fact about the hand-off, and only the hand-off side knows it. The seam holds every previous

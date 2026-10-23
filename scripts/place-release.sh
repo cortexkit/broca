@@ -22,6 +22,9 @@
 # --live-approved permits a restart with known live runs, logging the invoking OS user.
 # It never bypasses an unreadable gate or the new-pid/placed-inode wait.
 # --report FILE writes the rollback path, restart pid and pre-restart live WAL names as JSON.
+# Clients default to broca-session and broca-run with the staged module's suffix. Rollback
+# commands use --session-staged/--run-staged, or --remove-session/--remove-run to restore
+# an installation that had no placed client.
 # On Darwin the staged binary needs an adjacent .dSYM; placement renames that bundle beside the
 # destination and saves an existing bundle beside its matching rollback binary.
 #
@@ -64,6 +67,10 @@ set -euo pipefail
 
 DEST="${HOME}/.local/share/cortexkit/bin/ck-broca"
 STAGED=""
+SESSION_STAGED=""
+RUN_STAGED=""
+REMOVE_SESSION=0
+REMOVE_RUN=0
 SKIP_GATE=0
 RESTART=0
 RESTART_ONLY=0
@@ -73,7 +80,7 @@ REPORT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --staged|--dest|--report)
+    --staged|--session-staged|--run-staged|--dest|--report)
       if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
         echo "place-release: usage error: $1 requires an argument" >&2
         exit 2
@@ -82,6 +89,10 @@ while [ $# -gt 0 ]; do
   esac
   case "$1" in
     --staged) STAGED="${2:-}"; STAGED_PROVIDED=1; shift 2 ;;
+    --session-staged) SESSION_STAGED="$2"; shift 2 ;;
+    --run-staged) RUN_STAGED="$2"; shift 2 ;;
+    --remove-session) REMOVE_SESSION=1; shift ;;
+    --remove-run) REMOVE_RUN=1; shift ;;
     --dest)   DEST="${2:-}"; shift 2 ;;
     --skip-gate) SKIP_GATE=1; shift ;;
     --restart) RESTART=1; shift ;;
@@ -91,6 +102,12 @@ while [ $# -gt 0 ]; do
     *) echo "place-release: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if { [ "$REMOVE_SESSION" -eq 1 ] && [ -n "$SESSION_STAGED" ]; } ||
+   { [ "$REMOVE_RUN" -eq 1 ] && [ -n "$RUN_STAGED" ]; }; then
+  echo "place-release: a client cannot be both staged and removed" >&2
+  exit 2
+fi
 
 if [ "$LIVE_APPROVED" -eq 1 ]; then
   if { [ "$RESTART" -eq 0 ] && [ "$RESTART_ONLY" -eq 0 ]; } || [ "$SKIP_GATE" -eq 1 ]; then
@@ -102,7 +119,7 @@ if [ "$LIVE_APPROVED" -eq 1 ]; then
 fi
 
 if [ "$RESTART_ONLY" -eq 1 ]; then
-  if [ "$STAGED_PROVIDED" -eq 1 ] || [ "$RESTART" -eq 1 ] || [ "$SKIP_GATE" -eq 1 ]; then
+  if [ "$STAGED_PROVIDED" -eq 1 ] || [ "$RESTART" -eq 1 ] || [ "$SKIP_GATE" -eq 1 ] || [ -n "$SESSION_STAGED$RUN_STAGED" ] || [ "$REMOVE_SESSION$REMOVE_RUN" != 00 ]; then
     echo "place-release: --restart-only cannot be combined with --staged, --restart or --skip-gate" >&2
     exit 2
   fi
@@ -117,6 +134,7 @@ source "$REPO_ROOT/scripts/signing-posture.sh"
 source "$REPO_ROOT/scripts/wal-floor.sh"
 source "$REPO_ROOT/scripts/running-image.sh"
 source "$REPO_ROOT/scripts/dsym.sh"
+source "$REPO_ROOT/scripts/release-clients.sh"
 GATE_LOG="$(mktemp "${TMPDIR:-/tmp}/place-gate.XXXXXX")"
 ACTIVE_RUNS_FILE="$(mktemp "${TMPDIR:-/tmp}/place-runs.XXXXXX")"
 TMP=""
@@ -125,8 +143,11 @@ TMP_DSYM_PARENT=""
 OLD_DSYM_TEMP=""
 DSYM_SWAP_STARTED=0
 PLACEMENT_COMMITTED=0
+CLIENT_TEMPS=()
+CLIENT_BACKUPS=("" "")
 cleanup_place() {
   rm -f "${TMP:-}"
+  for client_tmp in ${CLIENT_TEMPS[@]+"${CLIENT_TEMPS[@]}"}; do rm -f "$client_tmp"; done
   [ -z "$TMP_DSYM_PARENT" ] || rm -rf "$TMP_DSYM_PARENT"
   if [ "$DSYM_SWAP_STARTED" -eq 1 ] && [ "$PLACEMENT_COMMITTED" -eq 0 ]; then
     rm -rf "${DEST}.dSYM"
@@ -155,9 +176,9 @@ run_gate() {
 
 write_report() {
   [ -n "$REPORT" ] || return 0
-  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" <<'PY'
+  python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" "${CLIENT_BACKUPS[0]}" "${CLIENT_BACKUPS[1]}" <<'PY'
 import json, pathlib, sys
-path, backup, pid, gate, scripts, active_runs_file = sys.argv[1:]
+path, backup, pid, gate, scripts, active_runs_file, session_backup, run_backup = sys.argv[1:]
 snapshot = pathlib.Path(gate).read_text() if pathlib.Path(gate).exists() else ""
 sessions = [line.split()[1] for line in snapshot.splitlines() if line.startswith("  live  ")]
 sys.path.insert(0, scripts)
@@ -239,6 +260,7 @@ for run in runs_cancelled:
         file=sys.stderr,
     )
 pathlib.Path(path).write_text(json.dumps({"backup": backup, "pid": pid or None,
+                                        "client_backups": {"broca-session": session_backup, "broca-run": run_backup},
                                        "sessions_at_restart": sessions,
                                        "active_runs_at_restart": active_runs,
                                        "runs_sealed": runs_sealed,
@@ -322,7 +344,9 @@ restart_and_wait() {
   done
   echo "== restarted at $(date -u +%H:%M:%SZ) (pid $new_pid)"
   write_report "$new_pid"
-  echo "   Verify:  scripts/verify-deploy.sh --sha $expected_sha --marker <new> --control <known>"
+  printf '   Verify:  scripts/verify-deploy.sh '
+  if [ -n "$STAGED" ]; then printf '%q ' --staged "$STAGED"; fi
+  printf -- '--sha %s --marker <new> --control <known>\n' "$expected_sha"
 }
 
 if [ "$RESTART_ONLY" -eq 1 ]; then
@@ -551,6 +575,48 @@ else
   FLOOR_VERDICT="empty, not checked (the copy predates --wal-known-features)"
 fi
 
+# Prepare both clients before publishing any binary. A missing, wrong-version or unsignable
+# client must stop placement before the module can be restarted with an incompatible client.
+SESSION_STAGED="${SESSION_STAGED:-$(broca_release_client_path "$STAGED" broca-session)}"
+RUN_STAGED="${RUN_STAGED:-$(broca_release_client_path "$STAGED" broca-run)}"
+CLIENT_NAMES=(broca-session broca-run)
+CLIENT_SOURCES=("$SESSION_STAGED" "$RUN_STAGED")
+CLIENT_REMOVALS=("$REMOVE_SESSION" "$REMOVE_RUN")
+CLIENT_SHAS=()
+for i in 0 1; do
+  if [ "${CLIENT_REMOVALS[$i]}" -eq 1 ]; then
+    CLIENT_TEMPS+=("")
+    CLIENT_SHAS+=("")
+    continue
+  fi
+  client="${CLIENT_NAMES[$i]}"
+  client_source="${CLIENT_SOURCES[$i]}"
+  client_dest="$(dirname "$DEST")/$client"
+  [ -f "$client_source" ] || gate_refuse client-missing "$client_source" "the staged client is missing."
+  client_kind="$(broca_release_kind "$client_source" || true)"
+  [ "$client_kind" = "$staged_kind" ] || gate_refuse client-kind "$client_source" "expected $staged_kind; got $client_kind."
+  client_tmp="$(mktemp "${client_dest}.place.XXXXXX")"
+  CLIENT_TEMPS+=("$client_tmp")
+  cat "$client_source" > "$client_tmp"
+  chmod 755 "$client_tmp"
+  if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
+    codesign -f -s - -o runtime --identifier "$client" "$client_tmp" \
+      || gate_refuse client-signing "$client_tmp" "codesign failed for $client."
+    client_flags="$(broca_codesign_flags "$client_tmp" || true)"
+    broca_flags_have_runtime "$client_flags" || gate_refuse client-signing "$client_tmp" "the client lacks hardened runtime."
+    client_entitlements="$(broca_codesign_entitlements "$client_tmp")" \
+      || gate_refuse client-signing "$client_tmp" "the client's entitlements are unreadable."
+    if broca_entitlements_allow_debugger "$client_entitlements"; then
+      gate_refuse client-signing "$client_tmp" "the client has get-task-allow."
+    fi
+  fi
+  client_version="$(run_candidate "$client_tmp" --version)" \
+    || gate_refuse client-version "$client_tmp" "the client's --version failed."
+  [ "$client_version" = "$client ${SMOKE_LINE#ck-broca }" ] \
+    || gate_refuse client-version "$client_tmp" "got '$client_version'; expected '$client ${SMOKE_LINE#ck-broca }'."
+  CLIENT_SHAS+=("$(shasum -a 256 "$client_tmp" | awk '{print $1}')")
+done
+
 # ROLLBACK SNAPSHOT, in SUBC's naming rather than ours. Both seats place broca, and a
 # rollback sweep that greps one prefix cannot see the other's snapshots -- SUBC read this
 # tree and concluded no 0.3.85 rollback existed when it was sitting in the bin dir under
@@ -605,9 +671,44 @@ if ! ( cd "$ROLLBACK_DIR" && shasum -c "$(basename "$BACKUP").sha256" >/dev/null
   exit 2
 fi
 
+# Client snapshots are independent because older installations may have no placed clients.
+# Keep an empty report entry in that case rather than inventing bytes to restore.
+for i in 0 1; do
+  client_dest="$(dirname "$DEST")/${CLIENT_NAMES[$i]}"
+  [ -e "$client_dest" ] || continue
+  client_backup="$ROLLBACK_DIR/${CLIENT_NAMES[$i]}.rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+  client_backup_base="$client_backup"
+  attempt=0
+  until ( set -C; : > "$client_backup" ) 2>/dev/null; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -le 50 ] || { echo "place-release: cannot claim client rollback under $client_backup_base" >&2; exit 2; }
+    client_backup="$client_backup_base.$attempt"
+  done
+  cp "$client_dest" "$client_backup"
+  chmod 700 "$client_backup"
+  ( cd "$ROLLBACK_DIR" && shasum -a 256 "$(basename "$client_backup")" > "$(basename "$client_backup").sha256" )
+  ( cd "$ROLLBACK_DIR" && shasum -c "$(basename "$client_backup").sha256" )
+  CLIENT_BACKUPS[$i]="$client_backup"
+done
+
 write_report
 
 BEFORE_INODE="$(broca_file_inode "$DEST")"
+
+# These renames are on the destination filesystem, just like the module rename below.
+# Any copy, signing, rename or readback failure exits before restart_and_wait is reachable.
+for i in 0 1; do
+  client_dest="$(dirname "$DEST")/${CLIENT_NAMES[$i]}"
+  if [ "${CLIENT_REMOVALS[$i]}" -eq 1 ]; then
+    rm -f "$client_dest"
+    echo "== restored absent client: $client_dest"
+    continue
+  fi
+  mv -f "${CLIENT_TEMPS[$i]}" "$client_dest"
+  client_sha="$(shasum -a 256 "$client_dest" | awk '{print $1}')"
+  [ "$client_sha" = "${CLIENT_SHAS[$i]}" ] || { echo "place-release: placed client bytes mismatch at $client_dest" >&2; exit 1; }
+  echo "== placed client atomically: $client_dest (backup ${CLIENT_BACKUPS[$i]:-none})"
+done
 
 if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
   if [ -e "$DEST_DSYM" ]; then
@@ -682,7 +783,7 @@ if [ "$RESTART" -eq 0 ]; then
   echo
   echo "   NOT YET RUNNING. Load it with --restart next time, or by hand ONLY after re-checking"
   echo "   that no run is live:  ck module restart broca"
-  echo "   Then verify:  scripts/verify-deploy.sh --sha $AFTER_SHA --marker <new> --control <known>"
+  echo "   Then verify:  scripts/verify-deploy.sh --staged '$STAGED' --sha $AFTER_SHA --marker <new> --control <known>"
   exit 0
 fi
 
