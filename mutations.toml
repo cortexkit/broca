@@ -25035,6 +25035,21 @@ old = '''    if status != 402 || !is_opencode_gateway_url(request_url) {'''
 new = '''    if status != 402 || !is_opencode_gateway_url(request_url) || true { // NON-VACUITY BREAK: never map OpenCode's 402 to billing_exhausted.'''
 
 [[control]]
+id = "inception-402-is-billing-exhausted"
+guards = "Inception's HTTP 402 ends the run as permanent billing_exhausted with the frozen credential named rather than an unscoped account_error"
+runner = "cargo"
+select = "expected"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+test_file = "crates/broca-provider/src/transport_inception_tests.rs"
+expect_red = ["transport::tests::inception::inception_402_ends_the_run_with_the_frozen_credential"]
+expect_message = "billing_exhausted"
+file = "crates/broca-provider/src/transport.rs"
+old = '''            .is_ok_and(|url| url.host_str() == Some("api.inceptionlabs.ai"))'''
+new = '''            .is_ok_and(|url| url.host_str() == Some("api.inceptionlabs.ai") && false) // NON-VACUITY BREAK: never recognize Inception's billing refusal.'''
+
+[[control]]
 id = "media-marker-fixed-vocabulary"
 guards = "Media omission markers keep their fixed spelling and remain distinct from legacy image placeholders"
 runner = "cargo"

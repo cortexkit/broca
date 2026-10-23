@@ -1050,6 +1050,7 @@ async fn send_warm(
                 error,
             );
             let error = opencode_payment_required(&request.url, code, error);
+            let error = inception_payment_required(&request.url, code, error);
             return Err(broca_core::WarmFailure::Provider(error));
         }
         let usage = match family {
@@ -2880,6 +2881,7 @@ async fn drive_attempt(
             None => error,
         };
         let error = opencode_payment_required(&request.url, code, error);
+        let error = inception_payment_required(&request.url, code, error);
         if code == 429
             && matches!(
                 request.family,
@@ -4210,6 +4212,38 @@ fn is_opencode_gateway_url(request_url: &str) -> bool {
         && (url.path().starts_with("/zen/") || url.path().starts_with("/inference/go/"))
 }
 
+/// Inception documents HTTP 402 as "billing inactive or quota exceeded"
+/// (https://docs.inceptionlabs.ai/resources/error-codes), with the generic `account_error` body
+/// "Account is inactive" (https://docs.inceptionlabs.ai/api-reference/chat/create-a-chat-completion).
+/// The 100M free tokens are a one-time credit (https://docs.inceptionlabs.ai/resources/faq), not a
+/// resetting allowance: retrying cannot replenish them. Use the status on the exact API host, not
+/// the body wording, so routing fences the exhausted credential while other OpenAI-compatible
+/// providers keep their own 402 semantics. Preserve the provider's message.
+fn inception_payment_required(
+    request_url: &str,
+    status: u16,
+    error: ProviderError,
+) -> ProviderError {
+    if status != 402
+        || !reqwest::Url::parse(request_url)
+            .is_ok_and(|url| url.host_str() == Some("api.inceptionlabs.ai"))
+    {
+        return error;
+    }
+    ProviderError {
+        refusal: None,
+        class: ErrorClass::Permanent,
+        provider_code: Some(BILLING_EXHAUSTED.to_string()),
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+        ..error
+    }
+}
+
 /// Kimi's weekly allowance refusal has no reset timestamp, so preserve the unknown reset rather
 /// than inventing a retry time from the wording of its message.
 fn kimi_weekly_usage_limit_reached(body: &str, error: ProviderError) -> ProviderError {
@@ -4698,6 +4732,10 @@ mod tests {
 
     mod schema_fallback {
         include!("transport_schema_fallback_tests.rs");
+    }
+
+    mod inception {
+        include!("transport_inception_tests.rs");
     }
 
     async fn assert_offloaded_render_matches_direct<F>(
@@ -7871,7 +7909,62 @@ mod tests {
             super::classify_http_error_in_family(status, body, None, None, Some(family), None);
         let error =
             classify_account_limit_exhausted(family, status, &headers, body, UNIX_EPOCH, error);
-        super::opencode_payment_required(url, status, error)
+        let error = super::opencode_payment_required(url, status, error);
+        super::inception_payment_required(url, status, error)
+    }
+
+    const INCEPTION_ACCOUNT_INACTIVE_BODY: &str = r#"{"error":{"message":"Account is inactive","type":"account_error","param":null,"code":"account_error"}}"#;
+
+    #[test]
+    fn inception_402_is_billing_exhausted_regardless_of_body_wording() {
+        for body in [
+            INCEPTION_ACCOUNT_INACTIVE_BODY,
+            r#"{"error":{"message":"Quota exceeded","type":"account_error"}}"#,
+            "Payment Required",
+        ] {
+            let error = classify_at_url(
+                "https://api.inceptionlabs.ai/v1/chat/completions",
+                402,
+                body,
+            );
+            assert_eq!(error.class, ErrorClass::Permanent);
+            assert_eq!(error.provider_code.as_deref(), Some(BILLING_EXHAUSTED));
+            assert_eq!(error.status, Some(402));
+            assert!(error.message.contains(body));
+            assert!(error.is_credential_scoped());
+            assert_eq!(error.resets_at_ms, None);
+            assert_eq!(error.resets_at_source, None);
+            assert_eq!(error.limit_window, None);
+            assert_eq!(error.credential_id, None);
+        }
+    }
+
+    #[test]
+    fn inception_billing_mapping_requires_402_and_the_exact_api_host() {
+        for (url, status) in [
+            ("https://api.example.com/v1/chat/completions", 402),
+            (
+                "https://api.inceptionlabs.ai.example.com/v1/chat/completions",
+                402,
+            ),
+            (
+                "https://example.com/api.inceptionlabs.ai/v1/chat/completions",
+                402,
+            ),
+            (
+                "https://api.inceptionlabs.ai@example.com/v1/chat/completions",
+                402,
+            ),
+            ("https://inceptionlabs.ai/v1/chat/completions", 402),
+            ("not a URL", 402),
+            ("https://api.inceptionlabs.ai/v1/chat/completions", 403),
+            ("https://api.inceptionlabs.ai/v1/chat/completions", 429),
+        ] {
+            let error = classify_at_url(url, status, INCEPTION_ACCOUNT_INACTIVE_BODY);
+            let unchanged =
+                classify_http_error(status, INCEPTION_ACCOUNT_INACTIVE_BODY, None, None);
+            assert_eq!(error, unchanged, "{url} {status}");
+        }
     }
 
     fn assert_opencode_billing_exhausted(error: &ProviderError) {
