@@ -890,7 +890,7 @@ new = 'let output = Vec::new(); let _ = (render_output, assistant); // NON-VACUI
 
 [[control]]
 id = "chatgpt-continuation-age-reset"
-guards = "An aged socket is retired before sending a suffix"
+guards = "A socket at the 40-minute retirement age is replaced before sending full input"
 runner = "cargo"
 select = "expected"
 package = "broca-provider"
@@ -899,8 +899,8 @@ target = "--lib"
 test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
 expect_red = ["transport::websocket_tests::codex_continuation_age_reset_is_full"]
 file = "crates/broca-provider/src/transport_websocket.rs"
-old = '&& now.saturating_duration_since(socket.established_at) < MAX_SOCKET_AGE'
-new = '&& now.saturating_duration_since(socket.established_at) < Duration::MAX // NON-VACUITY BREAK: ignore socket age.'
+old = '&& age < MAX_SOCKET_AGE'
+new = '&& true // NON-VACUITY BREAK: ignore socket age.'
 
 [[control]]
 id = "chatgpt-continuation-header-reset"
@@ -6230,8 +6230,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-provider/src/transport_websocket_tests.rs"
 expect_red = ["transport::websocket_tests::websocket_over_age_socket_is_retired_before_the_next_send"]
 file = "crates/broca-provider/src/transport_websocket.rs"
-old = "&& now.saturating_duration_since(socket.established_at) < MAX_SOCKET_AGE"
-new = "&& now.saturating_duration_since(socket.established_at) < MAX_SOCKET_AGE * 2 // NON-VACUITY BREAK: reuse over-age sockets."
+old = "&& age < MAX_SOCKET_AGE"
+new = "&& age < MAX_SOCKET_AGE * 2 // NON-VACUITY BREAK: reuse over-age sockets."
 
 [[control]]
 id = "provider-socket-attempt-diagnostics"
