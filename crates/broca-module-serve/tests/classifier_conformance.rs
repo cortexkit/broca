@@ -253,6 +253,7 @@ struct Rig {
     egress_host: String,
     state: Arc<StandIn>,
     state_root: PathBuf,
+    owner_nonce: PathBuf,
 }
 
 async fn start_rig(name: &str, served: Served) -> Option<Rig> {
@@ -303,9 +304,34 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
     )
     .unwrap();
     let connection_file = runtime_dir.join("subc-connection.json");
+    let stub = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
+    assert!(
+        stub.exists(),
+        "classifier scoped rig needs fake-aft-stub: {}",
+        stub.display()
+    );
+    let owner_nonce = root.join("owner.nonce");
+    let owner_events = root.join("owner-events.jsonl");
+    let scopes = root.join("scopes.json");
+    std::fs::write(
+        &scopes,
+        serde_json::to_vec(&json!([{
+            "ref": "classifier-run", "scope_epoch": 1, "kind": "head",
+            "attributes": {"agent_id": "classifier-agent", "run_id": "classifier-run"}
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
     let config = json!({
         "version": 1,
+        "scope_authority_owners": ["classifier-owner"],
         "modules": {
+            "classifier-owner": {
+                "program": broca_test_support::ckdev_binary(&stub, broca_test_support::scratch_root()),
+                "args": [], "reserved": true, "enabled": true,
+                "env": {"FAKE_AFT_MODULE_ID": "classifier-owner", "FAKE_AFT_SCOPE_SYNC_PATH": scopes,
+                    "FAKE_AFT_EVENTS_PATH": owner_events, "FAKE_AFT_LAUNCH_NONCE_PATH": owner_nonce}
+            },
             "broca": {
                 "program": broca_test_support::ckdev_binary(
                     Path::new(env!("CARGO_BIN_EXE_ck-broca")),
@@ -359,6 +385,19 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
         }
     })
     .await;
+    broca_test_support::wait_until("classifier scope sync", || async {
+        let text = std::fs::read_to_string(&owner_events).unwrap_or_default();
+        if text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| event["kind"] == "scope_sync_response")
+        {
+            Ok(())
+        } else {
+            Err("scope not synced".to_owned())
+        }
+    })
+    .await;
     Some(Rig {
         daemon,
         served,
@@ -367,6 +406,7 @@ async fn start_rig(name: &str, served: Served) -> Option<Rig> {
         egress_host,
         state,
         state_root,
+        owner_nonce,
     })
 }
 
@@ -379,16 +419,32 @@ struct BrocaClassifierRoute {
 impl Rig {
     async fn open(&self) -> Result<BrocaClassifierRoute, String> {
         let connection = Arc::new(
-            SubcConnection::connect(&self.connection_file)
-                .await
-                .map_err(|e| format!("connect: {e}"))?,
+            SubcConnection::connect_with_consumer_identity(
+                &self.connection_file,
+                Some(subc_control::ConsumerIdentity {
+                    module_id: "classifier-owner".into(),
+                    launch_nonce: std::fs::read_to_string(&self.owner_nonce)
+                        .map_err(|e| e.to_string())?
+                        .trim()
+                        .into(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("connect: {e}"))?,
         );
         let identity =
             broca_protocol::BindIdentity::new(self.project_root.clone(), "core", "classifier");
         let route = connection
-            .route_open_classifier_within(
+            .route_open_classifier_scoped_within(
                 "broca",
                 &identity,
+                subc_protocol::scope::ScopeSelector::new(
+                    subc_protocol::Principal::Reserved {
+                        module_id: "classifier-owner".into(),
+                    },
+                    "classifier-run",
+                    Some(1),
+                ),
                 RouteOpenRetry::within(Duration::from_secs(60), Duration::from_millis(200)),
             )
             .await

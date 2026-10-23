@@ -144,6 +144,8 @@ struct Rig {
     daemon: tokio::io::DuplexStream,
     handler: Arc<InstantSessions>,
     provider: Arc<HeldProvider>,
+    store: Arc<broca_store::SystemOneStore>,
+    system_one: Arc<SystemOne>,
     serve: tokio::task::JoinHandle<Result<ServeEnd, ServeIoError>>,
 }
 
@@ -156,8 +158,9 @@ async fn start() -> Rig {
         entered: Notify::new(),
         held: AtomicUsize::new(0),
     });
+    let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
     let system_one = Arc::new(SystemOne::new(
-        Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+        store.clone(),
         "test",
         Arc::new(JevOnly),
         vec![ModelPin::jev(provider.clone())],
@@ -178,7 +181,7 @@ async fn start() -> Rig {
         None,
         None,
         None,
-        Some(system_one),
+        Some(system_one.clone()),
     ));
     let hello = read_frame(&mut daemon).await.unwrap().unwrap();
     write_frame(
@@ -206,6 +209,8 @@ async fn start() -> Rig {
         daemon,
         handler,
         provider,
+        store,
+        system_one,
         serve,
     }
 }
@@ -213,6 +218,17 @@ async fn start() -> Rig {
 impl Rig {
     /// Bind `channel` declaring `roles`; return the bind's answer frame.
     async fn bind(&mut self, channel: u16, roles: &[(&str, &str)]) -> Frame {
+        self.bind_with_scope(channel, roles, None, Some(run_stamp("run")))
+            .await
+    }
+
+    async fn bind_with_scope(
+        &mut self,
+        channel: u16,
+        roles: &[(&str, &str)],
+        principal: Option<subc_protocol::Principal>,
+        scope: Option<subc_protocol::scope::ScopeStamp>,
+    ) -> Frame {
         let role_versions: BTreeMap<String, String> = roles
             .iter()
             .map(|(role, version)| (role.to_string(), version.to_string()))
@@ -224,10 +240,10 @@ impl Rig {
                 module_id: "broca".into(),
             },
             identity: SubcBindIdentity::new("/tmp/project-a", "runner", "classifier-test"),
-            principal: None,
+            principal,
             consumer_capabilities: None,
             admission_facts: None,
-            scope: None,
+            scope,
             role_versions: (!role_versions.is_empty()).then_some(role_versions),
             call_mode: None,
         };
@@ -285,6 +301,97 @@ impl Rig {
         .unwrap();
         assert_eq!(self.serve.await.unwrap().unwrap(), ServeEnd::Goodbye);
     }
+}
+
+fn run_stamp(run: &str) -> subc_protocol::scope::ScopeStamp {
+    serde_json::from_value(json!({
+        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "ref": run, "scope_epoch": 1, "kind": "head", "owner_authorized": true,
+        "attributes": {"agent_id": "agent", "run_id": run}
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn unscoped_classifier_call_writes_and_sends_nothing() {
+    let mut rig = start().await;
+    rig.provider.gate.add_permits(1);
+    assert_eq!(
+        rig.bind_with_scope(9, &[broca_subc::CLASSIFIER_ROLE_VERSIONS], None, None)
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let mut params = classify_params("unscoped");
+    params["scope"] = json!({"agent_id": "forged", "run_id": "forged"});
+    rig.request(9, 1, "classify.run", params).await;
+    assert_eq!(code(&rig.reply().await), "scope_required");
+    assert_eq!(rig.store.ledger("classifier", "unscoped").unwrap(), None);
+    assert!(rig
+        .store
+        .outcomes("classifier", "unscoped")
+        .unwrap()
+        .is_empty());
+    assert_eq!(rig.provider.held.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.system_one.health()["batches_failed"], 1);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn basal_classifier_requires_a_flow_even_with_a_run_stamp() {
+    let mut rig = start().await;
+    rig.provider.gate.add_permits(2);
+    for (channel, scope) in [(9, None), (10, Some(run_stamp("run")))] {
+        let principal = Some(subc_protocol::Principal::Reserved {
+            module_id: "basal".into(),
+        });
+        assert_eq!(
+            rig.bind_with_scope(
+                channel,
+                &[broca_subc::CLASSIFIER_ROLE_VERSIONS],
+                principal,
+                scope
+            )
+            .await
+            .header
+            .ty,
+            FrameType::Response
+        );
+        rig.request(channel, 1, "classify.run", classify_params("basal"))
+            .await;
+        assert_eq!(code(&rig.reply().await), "flow_scope_required");
+        assert_eq!(rig.store.ledger("classifier", "basal").unwrap(), None);
+    }
+    assert_eq!(rig.provider.held.load(Ordering::SeqCst), 0);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn classifier_retry_cannot_move_its_original_scope() {
+    let mut rig = start().await;
+    rig.bind(9, &[broca_subc::CLASSIFIER_ROLE_VERSIONS]).await;
+    rig.provider.gate.add_permits(1);
+    rig.request(9, 1, "classify.run", classify_params("frozen"))
+        .await;
+    assert_eq!(rig.reply().await.header.ty, FrameType::Response);
+    rig.bind_with_scope(
+        10,
+        &[broca_subc::CLASSIFIER_ROLE_VERSIONS],
+        None,
+        Some(run_stamp("other")),
+    )
+    .await;
+    rig.request(10, 2, "classify.run", classify_params("frozen"))
+        .await;
+    assert_eq!(code(&rig.reply().await), "batch_scope_mismatch");
+    assert_eq!(rig.provider.held.load(Ordering::SeqCst), 1);
+    rig.request(9, 3, "classify.run", classify_params("frozen"))
+        .await;
+    assert_eq!(rig.reply().await.header.ty, FrameType::Response);
+    assert_eq!(rig.provider.held.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.system_one.health()["items_answered"], 1);
+    rig.finish().await;
 }
 
 fn code(frame: &Frame) -> String {

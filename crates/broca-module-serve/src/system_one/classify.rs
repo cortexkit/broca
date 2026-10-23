@@ -395,6 +395,26 @@ async fn call_provider(
             let _permit = slot.acquire().await;
             pin.provider.call(body.clone()).await
         };
+        let code = match &reply {
+            ProviderReply::Answered(_) => None,
+            ProviderReply::Status { status, .. } => Some(status.to_string()),
+            ProviderReply::WorkersAiError { status, code, .. } => {
+                Some(code.map_or_else(|| status.to_string(), |code| code.to_string()))
+            }
+            ProviderReply::Transport(_) => Some("transport_error".into()),
+            ProviderReply::Credential(_) => Some("auth_failed".into()),
+        };
+        if let Some(code) = code {
+            service
+                .metrics
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .last_provider_error
+                .insert(
+                    pin.catalog_id.split('/').next().unwrap_or_default().into(),
+                    code,
+                );
+        }
         match retry_wait(&reply, service) {
             Some(wait) if attempt < service.config.max_attempts => {
                 tokio::time::sleep(wait).await;
@@ -405,7 +425,11 @@ async fn call_provider(
 }
 
 /// Serve one `classify.run`.
-pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<RawValue>, Refusal> {
+pub(crate) async fn run(
+    service: &Arc<SystemOne>,
+    params: &str,
+    scope: &broca_store::system_one::BatchScope,
+) -> Result<Box<RawValue>, Refusal> {
     let limits = cortexkit_role_classifier::describe::Limits::new(
         service.config.max_items,
         service.config.max_request_bytes,
@@ -465,6 +489,7 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
         );
         let (identity_json, digest) = (identity_json.clone(), digest.clone());
         let frozen = serde_json::to_string(&live_frozen).expect("frozen facts encode");
+        let scope = scope.clone();
         blocking(move || {
             store.claim(&BatchClaim {
                 role: STORE_ROLE,
@@ -473,6 +498,7 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
                 identity: &identity_json,
                 body_digest: &digest,
                 frozen_row: &frozen,
+                scope: &scope,
                 ceiling_nanos: sent_ceiling,
                 owner: &owner,
                 now_ms: now,
@@ -481,6 +507,12 @@ pub(crate) async fn run(service: &Arc<SystemOne>, params: &str) -> Result<Box<Ra
         .await?
     };
     let (fresh, frozen, ceiling, mut spent, stored) = match claimed {
+        Claimed::ScopeMismatch => {
+            return Err(Refusal::new(
+                "batch_scope_mismatch",
+                "batch_id belongs to a different scope; a retry cannot change its attribution",
+            ))
+        }
         // §2: a different body under a recorded id names the first part that differs.
         Claimed::Reuse { recorded_identity } => {
             let recorded: BatchIdentity = serde_json::from_str(&recorded_identity)
@@ -675,11 +707,17 @@ async fn record(
 ) -> Result<(), Refusal> {
     let store = Arc::clone(&service.store);
     let (batch_id, owner, outcome) = (batch_id.to_owned(), service.owner.clone(), outcome.clone());
+    let outcome_for_metrics = outcome.clone();
     let now = (service.clock)();
     let held =
         blocking(move || store.record(STORE_ROLE, &batch_id, &owner, &outcome, spend_nanos, now))
             .await?;
     if held {
+        let mut metrics = service.metrics.lock().unwrap_or_else(|p| p.into_inner());
+        match &outcome_for_metrics.outcome {
+            Outcome::Answered(_) => metrics.items_answered += 1,
+            Outcome::Failed(_) => metrics.items_failed += 1,
+        }
         Ok(())
     } else {
         Err(internal_refusal(

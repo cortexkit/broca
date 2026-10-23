@@ -25093,3 +25093,45 @@ expect_red = ["framing::media_content_tests::hook_tool_arguments_never_require_m
 file = "crates/broca-wal/src/record.rs"
 old = '        MediaHookSubject::ToolInput => false,'
 new = '        MediaHookSubject::ToolInput => MediaBlock::deserialize(value).is_ok_and(|block| block.carries_media()), // NON-VACUITY BREAK: treat opaque tool arguments as native content.'
+
+[[control]]
+id = "system-one-scope-required"
+guards = "A classifier route without a daemon work stamp refuses before sending or persisting a batch, even if its body supplies scope fields"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::unscoped_classifier_call_writes_and_sends_nothing"]
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = '''    Err(Refusal::new(
+        "scope_required",
+        "classifier calls require a daemon-stamped agent/run or flow scope",
+    ))'''
+new = '''    Ok(BatchScope::Run { agent_id: "forged".into(), run_id: "forged".into() }) // NON-VACUITY BREAK: admit unscoped work.'''
+
+[[control]]
+id = "system-one-basal-flow-required"
+guards = "Basal classifier calls require a flow stamp, not merely an agent-run stamp"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::basal_classifier_requires_a_flow_even_with_a_run_stamp"]
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = "    if broca_core::scope_admission::is_flow_only(principal)"
+new = "    if broca_core::scope_admission::is_flow_only(principal) && false // NON-VACUITY BREAK: admit Basal without a flow."
+
+[[control]]
+id = "system-one-retry-scope-frozen"
+guards = "A resend cannot serve or reattribute a batch admitted under another scope"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve_classifier_tests.rs"
+expect_red = ["serve::classifier_route_tests::classifier_retry_cannot_move_its_original_scope"]
+file = "crates/broca-store/src/system_one.rs"
+old = "        if scope.as_deref() != Some(scope_json.as_str()) {"
+new = "        if scope.as_deref() != Some(scope_json.as_str()) && false { // NON-VACUITY BREAK: ignore attribution mismatch."

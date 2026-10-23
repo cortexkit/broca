@@ -51,6 +51,15 @@ impl From<rusqlite::Error> for SystemOneStoreError {
 
 type Result<T> = std::result::Result<T, SystemOneStoreError>;
 
+/// Attribution supplied by a daemon-stamped route, never by the batch body. A flow is
+/// deliberately a separate identity: its owner's agent must not receive its spend.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum BatchScope {
+    Flow { flow_id: String },
+    Run { agent_id: String, run_id: String },
+}
+
 /// What a call presents when it asks to hold a batch.
 #[derive(Clone, Debug)]
 pub struct BatchClaim<'a> {
@@ -65,6 +74,7 @@ pub struct BatchClaim<'a> {
     pub body_digest: &'a str,
     /// The catalog facts the batch is priced and checked by, frozen at first admission.
     pub frozen_row: &'a str,
+    pub scope: &'a BatchScope,
     /// The ceiling this call sent, in nanodollars (rounded down). `None` sends no ceiling.
     pub ceiling_nanos: Option<u64>,
     /// The process holding the batch while this call runs.
@@ -99,6 +109,9 @@ pub enum Claimed {
     /// The id names a batch with a different body. Nothing was written; the recorded identity
     /// is returned so the caller can name the first field that differs.
     Reuse { recorded_identity: String },
+    /// A retry keeps its first scope so stored outcomes and spend cannot be assigned to
+    /// a different caller, even when the request body matches.
+    ScopeMismatch,
 }
 
 /// One item's stored outcome.
@@ -192,6 +205,10 @@ impl SystemOneStore {
                  PRIMARY KEY (role, batch_id, item_index)
              );",
         )?;
+        let has_scope = conn.prepare("SELECT scope_json FROM batch").is_ok();
+        if !has_scope {
+            conn.execute("ALTER TABLE batch ADD COLUMN scope_json TEXT", [])?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -224,7 +241,7 @@ impl SystemOneStore {
         let existing = tx
             .query_row(
                 "SELECT model, identity, body_digest, frozen_row, ceiling_nanos, spent_nanos,
-                        state, admitted_at_ms
+                        state, admitted_at_ms, scope_json
                    FROM batch WHERE role = ?1 AND batch_id = ?2",
                 rusqlite::params![claim.role, claim.batch_id],
                 |row| {
@@ -237,17 +254,21 @@ impl SystemOneStore {
                         row.get::<_, i64>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((model, identity, digest, frozen_row, ceiling, spent, state, admitted)) = existing
+        let scope_json = serde_json::to_string(claim.scope)
+            .map_err(|error| SystemOneStoreError(error.to_string()))?;
+        let Some((model, identity, digest, frozen_row, ceiling, spent, state, admitted, scope)) =
+            existing
         else {
             tx.execute(
                 "INSERT INTO batch (role, batch_id, model, identity, body_digest, frozen_row,
                                     ceiling_nanos, spent_nanos, state, owner, started_at_ms,
-                                    admitted_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'running', ?8, ?9, ?9)",
+                                     admitted_at_ms, scope_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'running', ?8, ?9, ?9, ?10)",
                 rusqlite::params![
                     claim.role,
                     claim.batch_id,
@@ -258,11 +279,17 @@ impl SystemOneStore {
                     claim.ceiling_nanos.map(to_i64),
                     claim.owner,
                     claim.now_ms,
+                    scope_json,
                 ],
             )?;
             tx.commit()?;
             return Ok(Claimed::Fresh);
         };
+        // Legacy unscoped rows are refused too; adopting them would silently assign old work
+        // to a new caller. Retention eventually removes them under the ordinary batch rules.
+        if scope.as_deref() != Some(scope_json.as_str()) {
+            return Ok(Claimed::ScopeMismatch);
+        }
         if digest != claim.body_digest {
             return Ok(Claimed::Reuse {
                 recorded_identity: identity,

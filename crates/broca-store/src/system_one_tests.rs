@@ -31,6 +31,7 @@ fn claim<'a>(
         identity: digest,
         body_digest: digest,
         frozen_row: "{}",
+        scope: test_scope(),
         ceiling_nanos: ceiling,
         owner,
         now_ms: now,
@@ -304,4 +305,12 @@ fn the_store_is_owner_only_and_keeps_no_wal_sidecar() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(siblings, vec!["system-one.db".to_string()], "{siblings:?}");
+}
+
+fn test_scope() -> &'static BatchScope {
+    static SCOPE: std::sync::OnceLock<BatchScope> = std::sync::OnceLock::new();
+    SCOPE.get_or_init(|| BatchScope::Run {
+        agent_id: "agent".into(),
+        run_id: "run".into(),
+    })
 }

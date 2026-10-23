@@ -2824,6 +2824,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // daemon's restart drain waits on, so an idle daemon must read 0 here or every restart
         // would wait out its drain ceiling.
         "system_one_batches_in_flight",
+        "system_one",
     ]
     .into_iter()
     .collect();

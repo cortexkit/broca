@@ -312,14 +312,20 @@ fn params(batch: &str, model: &str, states: &[&str]) -> String {
 }
 
 async fn admitted(rig: &Rig, params: String) -> String {
-    match Arc::clone(&rig.service).spawn_call(params).await {
+    match Arc::clone(&rig.service)
+        .spawn_call(params, test_scope())
+        .await
+    {
         Ok(reply) => reply.get().to_owned(),
         Err(body) => panic!("refused: {}", String::from_utf8_lossy(&body)),
     }
 }
 
 async fn refused(rig: &Rig, params: String) -> Value {
-    match Arc::clone(&rig.service).spawn_call(params).await {
+    match Arc::clone(&rig.service)
+        .spawn_call(params, test_scope())
+        .await
+    {
         Ok(reply) => panic!("admitted: {}", reply.get()),
         Err(body) => serde_json::from_slice(&body).unwrap(),
     }
@@ -740,4 +746,11 @@ async fn describe_lists_clef_and_clef_flash_from_their_rows() {
             ),
         ]
     );
+}
+
+fn test_scope() -> broca_store::system_one::BatchScope {
+    broca_store::system_one::BatchScope::Run {
+        agent_id: "agent".into(),
+        run_id: "run".into(),
+    }
 }
