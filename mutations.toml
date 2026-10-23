@@ -13197,9 +13197,15 @@ features = ["test-clock"]
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::sweep_handles_listed_wal_disappearance_and_enrolls_later_keys"]
 file = "crates/broca-module/src/retention.rs"
-old = 'if failure.kind != EnrollmentFailureKind::VanishedFile {'
-new = '''if failure.kind == EnrollmentFailureKind::VanishedFile { return Err(failure.error); } // NON-VACUITY BREAK: stop after a vanished WAL.
-                    if failure.kind != EnrollmentFailureKind::VanishedFile {'''
+old = '''                    if !matches!(
+                        failure.kind,
+                        EnrollmentFailureKind::VanishedFile | EnrollmentFailureKind::LiveWriter
+                    ) {'''
+new = '''                    if failure.kind == EnrollmentFailureKind::VanishedFile { return Err(failure.error); } // NON-VACUITY BREAK: stop after a vanished WAL.
+                    if !matches!(
+                        failure.kind,
+                        EnrollmentFailureKind::VanishedFile | EnrollmentFailureKind::LiveWriter
+                    ) {'''
 
 [[control]]
 id = "retention-recovery-isolates-bad-key"
@@ -15163,11 +15169,21 @@ target = "--test it"
 test_file = "crates/broca-subc/tests/it/consent_ops.rs"
 expect_red = ["consent_ops::approved_raw_dispatch_reaches_a_real_provider_without_reserializing_saved_bytes"]
 select = "expected"
-file = "crates/broca-subc/src/subc_plane.rs"
-old = '''            Some(&args.key),
-            None,'''
-new = '''            Some(&args.key),
-            Some(""), // NON-VACUITY BREAK: reintroduce the retired field on the real provider envelope'''
+file = "crates/broca-subc/src/connection.rs"
+old = '''        let body = body.replacen(
+            "\"arguments\":null",
+            &format!("\"arguments\":{args_jcs}"),
+            1,
+        );
+        Ok(body.into_bytes())'''
+new = '''        let mut body = body.replacen(
+            "\"arguments\":null",
+            &format!("\"arguments\":{args_jcs}"),
+            1,
+        );
+        body.pop();
+        body.push_str(",\"approval_digest\":\"legacy\"}"); // NON-VACUITY BREAK: put the retired field back on the real provider envelope
+        Ok(body.into_bytes())'''
 
 [[control]]
 id = "subc-approved-closed-writer-is-not-sent"
