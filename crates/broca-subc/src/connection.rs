@@ -191,7 +191,7 @@ impl std::fmt::Display for RejectedMessage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ConnError {
     /// subc returned a typed Error frame (route reject, tool/route failure).
     Rejected(RejectedMessage),
@@ -641,6 +641,9 @@ impl Drop for ConnectionShared {
 /// generation; recovery swaps the shared generation pointer without moving an in-flight request.
 pub struct SubcConnection {
     shared: Arc<ConnectionShared>,
+    /// Each target module's availability gate; every route open on this connection passes
+    /// its module's gate (see [`ModuleGate`]).
+    module_gates: ModuleGates,
 }
 
 impl SubcConnection {
@@ -745,7 +748,10 @@ impl SubcConnection {
                 tracing::error!(target: "transport", %error, "subc reconnect supervisor terminated");
             }
         });
-        Ok(Self { shared })
+        Ok(Self {
+            shared,
+            module_gates: ModuleGates::default(),
+        })
     }
 
     fn next_corr(&self) -> u64 {
@@ -1070,18 +1076,17 @@ impl SubcConnection {
         identity: &BindIdentity,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
-        retry_route_open(retry, None, || {
+        self.retry_open_through_gate(module_id, retry, || {
             self.route_open_single_attempt(module_id, identity, None)
         })
         .await
-        .map_err(RouteOpenError::into_conn)
     }
 
     /// ONE `route.open` attempt to a tool provider, with no retry of a temporary refusal.
     ///
     /// Crate-visible for exactly one reason: the tool plane's connection trait is the seam its
     /// unit tests fake, and they script individual attempts beneath the shared retry loop
-    /// ([`retry_route_open`]), so that seam has to carry one attempt. Every other consumer
+    /// ([`RouteOpenFlights`]), so that seam has to carry one attempt. Every other consumer
     /// must use a retrying form; a refusal during a module restart is otherwise a hard error.
     pub(crate) async fn route_open_single_attempt(
         &self,
@@ -1112,15 +1117,30 @@ impl SubcConnection {
     ) -> ConnResult<RouteHandle> {
         let mut role_versions = std::collections::BTreeMap::new();
         role_versions.insert("tool-provider".to_owned(), "v1".to_owned());
-        self.route_open_target(
-            RouteTarget::ToolProvider {
-                module_id: module_id.to_string(),
-            },
-            identity,
-            scope,
-            Some(role_versions),
-        )
-        .await
+        // One attempt, so it does not wait at the module's gate: while the module is known to
+        // be unavailable this answers with the module's latest refusal at once, unless it is
+        // this open's turn to probe. Fetch-plan admission's own retries are then paced by the
+        // gate instead of each reaching the daemon.
+        let gate = self.module_gate(module_id);
+        let ticket = match gate.admit(None, None).await {
+            GateAdmission::Admitted(ticket) => ticket,
+            GateAdmission::Refused(refusal) => return Err(ConnError::Rejected(refusal)),
+            GateAdmission::Cancelled => {
+                return Err(ConnError::Transport("route open cancelled".into()))
+            }
+        };
+        let outcome = self
+            .route_open_target(
+                RouteTarget::ToolProvider {
+                    module_id: module_id.to_string(),
+                },
+                identity,
+                scope,
+                Some(role_versions),
+            )
+            .await;
+        ticket.report(&outcome);
+        outcome
     }
 
     /// Open an unscoped module-level role using the same bind translation and retry machinery
@@ -1133,7 +1153,7 @@ impl SubcConnection {
         version: &str,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
-        retry_route_open(retry, None, || {
+        self.retry_open_through_gate(module_id, retry, || {
             self.route_open_target(
                 RouteTarget::ToolProvider {
                     module_id: module_id.to_string(),
@@ -1147,7 +1167,38 @@ impl SubcConnection {
             )
         })
         .await
-        .map_err(RouteOpenError::into_conn)
+    }
+
+    /// Which socket generation the connection is on now. It changes on every reconnect, so a
+    /// caller can tell routes opened before a reconnect from routes opened after it.
+    pub(crate) fn connection_generation(&self) -> u64 {
+        self.shared.current.lock().unwrap().runtime.conn.0
+    }
+
+    /// `module_id`'s availability gate on the current socket generation.
+    pub(crate) fn module_gate(&self, module_id: &str) -> Arc<ModuleGate> {
+        self.module_gates
+            .get(self.connection_generation(), module_id)
+    }
+
+    /// The retry loop of every retrying open form on this type: [`retry_route_open`], with each
+    /// attempt passing `module_id`'s availability gate. Each caller here owns the route it gets,
+    /// so opens are NOT shared per route (see [`RouteOpenFlights`] for why); only the gate is.
+    /// The tool plane, whose routes are shared, uses [`RouteOpenFlights`] with the same gate.
+    async fn retry_open_through_gate<F, Fut>(
+        &self,
+        module_id: &str,
+        retry: RouteOpenRetry,
+        attempt: F,
+    ) -> ConnResult<RouteHandle>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ConnResult<RouteHandle>>,
+    {
+        let gate = self.module_gate(module_id);
+        retry_route_open(retry, None, Some(&gate), attempt)
+            .await
+            .map_err(RouteOpenError::into_conn)
     }
 
     /// Whether `route` is still open: the connection that opened it is the live one and the
@@ -1187,7 +1238,7 @@ impl SubcConnection {
         identity: &BindIdentity,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
-        retry_route_open(retry, None, || {
+        self.retry_open_through_gate(module_id, retry, || {
             self.route_open_target(
                 RouteTarget::ManagementSurface {
                     module_id: module_id.to_string(),
@@ -1198,7 +1249,6 @@ impl SubcConnection {
             )
         })
         .await
-        .map_err(RouteOpenError::into_conn)
     }
 
     /// `route.open` to a module's management surface declaring the `classifier/v1` role
@@ -1231,7 +1281,7 @@ impl SubcConnection {
         role_versions: std::collections::BTreeMap<String, String>,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
-        retry_route_open(retry, None, || {
+        self.retry_open_through_gate(module_id, retry, || {
             self.route_open_target(
                 RouteTarget::ManagementSurface {
                     module_id: module_id.to_string(),
@@ -1242,7 +1292,6 @@ impl SubcConnection {
             )
         })
         .await
-        .map_err(RouteOpenError::into_conn)
     }
 
     /// `route.open` to a management surface under a scope the daemon holds, retrying a
@@ -1259,7 +1308,7 @@ impl SubcConnection {
         scope: subc_protocol::scope::ScopeSelector,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
-        retry_route_open(retry, None, || {
+        self.retry_open_through_gate(module_id, retry, || {
             self.route_open_target(
                 RouteTarget::ManagementSurface {
                     module_id: module_id.to_string(),
@@ -1270,7 +1319,6 @@ impl SubcConnection {
             )
         })
         .await
-        .map_err(RouteOpenError::into_conn)
     }
 
     /// Open a named module's internal service, not its management or tool surface. The daemon
@@ -1283,7 +1331,7 @@ impl SubcConnection {
         identity: &BindIdentity,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
-        retry_route_open(retry, None, || {
+        self.retry_open_through_gate(module_id, retry, || {
             self.route_open_target(
                 RouteTarget::InternalService {
                     module_id: module_id.to_string(),
@@ -1295,7 +1343,6 @@ impl SubcConnection {
             )
         })
         .await
-        .map_err(RouteOpenError::into_conn)
     }
 
     /// One `route.open` RPC. Private so that no consumer can reach a single attempt by
@@ -2886,31 +2933,37 @@ pub(crate) fn rejection_code(rejection: &str) -> &str {
 /// to this budget.
 pub const ROUTE_OPEN_RETRY_DEADLINE: Duration = Duration::from_secs(3);
 
-/// The first wait between route-open attempts; later waits double up to the policy's cap.
+/// The first backoff envelope between route-open attempts; later envelopes double up to the
+/// policy's cap, and each wait is a random part of its envelope (see [`RouteOpenRetry`]).
 pub const ROUTE_OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The widest backoff envelope under [`RouteOpenRetry::default_patience`]: once the doubling
+/// reaches it, a refused open waits at most this long before trying again.
+pub const ROUTE_OPEN_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long a route open keeps retrying a temporary refusal, and how widely it spaces the
 /// attempts.
 ///
 /// A refusal is retried only while its code is one of the daemon's temporary route-open
 /// refusals (`module_warming`, `module_reloading`, `target_unavailable`, `module_timeout`).
-/// The first wait is [`ROUTE_OPEN_RETRY_INTERVAL`], each later wait doubles up to
-/// `max_interval`, and no wait extends past the open's deadline. Each open starts a fresh
-/// `budget`, so keeping this policy does not consume the patience of future opens. Once that
-/// deadline has passed, the next refusal is returned unchanged; a terminal refusal is returned
-/// unchanged at once.
+/// The waits follow an envelope that starts at [`ROUTE_OPEN_RETRY_INTERVAL`] and doubles up to
+/// `max_interval`; each wait is drawn uniformly from zero to its envelope ("full jitter"), so
+/// callers refused together do not all come back together. No wait extends past the open's
+/// deadline. Each open starts a fresh `budget`, so keeping this policy does not consume the
+/// patience of future opens. Once that deadline has passed, the next refusal is returned
+/// unchanged; a terminal refusal is returned unchanged at once.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteOpenRetry {
     /// How long to keep retrying, measured from the start of each open. A zero budget still
     /// makes one attempt. It does NOT cut short an attempt already in flight: each attempt
     /// waits up to [`ROUTE_OPEN_ATTEMPT_TIMEOUT`] for its reply regardless of this budget.
     pub budget: Duration,
-    /// The upper bound for the doubling wait between attempts.
+    /// The upper bound for the doubling backoff envelope between attempts.
     pub max_interval: Duration,
 }
 
 impl RouteOpenRetry {
-    /// Retry for `budget` per open, with waits capped at `max_interval`.
+    /// Retry for `budget` per open, with the backoff envelope capped at `max_interval`.
     pub fn within(budget: Duration, max_interval: Duration) -> Self {
         Self {
             budget,
@@ -2918,10 +2971,31 @@ impl RouteOpenRetry {
         }
     }
 
-    /// [`ROUTE_OPEN_RETRY_DEADLINE`] per open, at a flat [`ROUTE_OPEN_RETRY_INTERVAL`].
+    /// [`ROUTE_OPEN_RETRY_DEADLINE`] per open, with an envelope that starts at
+    /// [`ROUTE_OPEN_RETRY_INTERVAL`] and doubles up to [`ROUTE_OPEN_RETRY_MAX_INTERVAL`].
+    ///
+    /// The envelope grows, rather than staying at a flat 100 ms, because a module that is down
+    /// for longer than a swap turned the flat interval into a storm: during a one-minute module
+    /// stop, one broca connection sent about 80 `route.open` a second to the stopped module,
+    /// against about 5 a second from other clients. A swap that ends within the first few
+    /// hundred milliseconds is still noticed almost as quickly as before.
     pub fn default_patience() -> Self {
-        Self::within(ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL)
+        Self::within(ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_MAX_INTERVAL)
     }
+}
+
+/// A uniformly random wait between zero and `envelope` ("full jitter"), so that callers refused
+/// at the same moment spread their next attempts out instead of arriving together.
+pub(crate) fn full_jitter(envelope: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    static DRAWS: AtomicU64 = AtomicU64::new(0);
+    // Each `RandomState` is seeded with fresh random keys, so hashing a counter with one gives
+    // an unpredictable value without pulling in a random-number crate for this one use.
+    let draw = std::collections::hash_map::RandomState::new()
+        .hash_one(DRAWS.fetch_add(1, Ordering::Relaxed));
+    // The top 53 bits make an exact f64 fraction in [0, 1).
+    let fraction = (draw >> 11) as f64 / (1u64 << 53) as f64;
+    envelope.mul_f64(fraction)
 }
 
 /// Why [`retry_route_open`] gave up.
@@ -2957,16 +3031,21 @@ impl RouteOpenError {
 /// Two clocks meet here. `retry.budget` bounds STARTING a new attempt; each attempt, once
 /// started, is bounded by its own reply deadline, [`ROUTE_OPEN_ATTEMPT_TIMEOUT`], inside
 /// `attempt`. So the longest this can take is the retry deadline plus one attempt timeout.
+///
+/// `gate` is the target module's availability gate (see [`ModuleGate`]); every attempt passes
+/// it, so while the module is known to be down the wait happens there, shared with every other
+/// open to that module.
 pub(crate) async fn retry_route_open<F, Fut>(
     retry: RouteOpenRetry,
     cancel: Option<&CancellationToken>,
+    gate: Option<&ModuleGate>,
     attempt: F,
 ) -> Result<RouteHandle, RouteOpenError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = ConnResult<RouteHandle>>,
 {
-    retry_route_open_with_scope_hold(retry, None, cancel, attempt).await
+    retry_route_open_with_scope_hold(retry, None, cancel, gate, attempt).await
 }
 
 /// How long a scoped route open holds on the daemon's two retryable scope refusals, and how
@@ -2996,61 +3075,619 @@ pub(crate) async fn retry_route_open_with_scope_hold<F, Fut>(
     retry: RouteOpenRetry,
     scope_hold: Option<ScopeHold>,
     cancel: Option<&CancellationToken>,
-    mut attempt: F,
+    gate: Option<&ModuleGate>,
+    attempt: F,
 ) -> Result<RouteHandle, RouteOpenError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = ConnResult<RouteHandle>>,
 {
-    use subc_protocol::error_codes::{SCOPE_CHANGED, SCOPE_NOT_SYNCED};
-    let retry_deadline = time::Instant::now() + retry.budget;
-    let mut interval = ROUTE_OPEN_RETRY_INTERVAL.min(retry.max_interval);
-    let mut scope_interval =
-        ROUTE_OPEN_RETRY_INTERVAL.min(scope_hold.map_or(retry.max_interval, |h| h.max_interval));
-    let mut previous_was_scope_changed = false;
-    loop {
-        // Deliberately not wrapped in a timeout against `retry_deadline`: an attempt that
-        // started before the deadline runs to its own reply deadline, because the daemon may
-        // still be relaying its bind and abandoning it would report a successful open as failed.
-        match attempt().await {
-            Ok(handle) => return Ok(handle),
-            Err(ConnError::Rejected(message))
-                if subc_protocol::error_codes::is_retryable_route_open(message.code()) =>
-            {
-                let code = message.code();
-                let held = scope_hold.filter(|_| matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED));
-                let deadline = held.map_or(retry_deadline, |hold| hold.deadline);
-                let remaining = deadline.saturating_duration_since(time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(RouteOpenError::Conn(ConnError::Rejected(message)));
-                }
-                let changed = code == SCOPE_CHANGED;
-                let at_once = held.is_some() && changed && !previous_was_scope_changed;
-                previous_was_scope_changed = changed;
-                if at_once {
-                    continue;
-                }
-                let wait = if held.is_some() {
-                    scope_interval
-                } else {
-                    interval
-                };
-                match cancel {
-                    Some(token) => {
-                        tokio::select! {
-                            _ = token.cancelled() => return Err(RouteOpenError::Cancelled),
-                            _ = time::sleep(wait.min(remaining)) => {}
-                        }
-                    }
-                    None => time::sleep(wait.min(remaining)).await,
-                }
-                match held {
-                    Some(hold) => scope_interval = (scope_interval * 2).min(hold.max_interval),
-                    None => interval = (interval * 2).min(retry.max_interval),
+    // A flight nobody else can find: this open is not shared, so it behaves as one caller
+    // retrying on its own.
+    RouteOpenFlight::new()
+        .join(retry, scope_hold, cancel, &full_jitter, gate, attempt)
+        .await
+}
+
+/// Route opens in progress that later callers for the same route may join instead of starting
+/// their own, keyed by whatever identifies "the same route" for the owner (it must include the
+/// connection generation, the target module and everything that makes two routes differ).
+///
+/// Without this, every concurrent caller that needs a route to a module that is down runs its
+/// own retry loop, so N callers make N times the attempts. That once sent about 80
+/// `route.open` a second from one broca connection to a module stopped for a minute.
+///
+/// Joined callers share the attempts and the backoff, and each still keeps its own budget,
+/// deadline and cancellation (see [`RouteOpenFlight::join`]). An opened route is handed to
+/// EVERY joined caller, so this is only for owners that already treat one route per key as
+/// shared, such as the tool plane's route cache; a caller that owns and later closes its route
+/// must not share it this way, or its close would cut off the other callers' route.
+pub(crate) struct RouteOpenFlights<K> {
+    /// Weak, so a flight ends when its last caller leaves; the next caller starts afresh.
+    flights: Mutex<HashMap<K, Weak<RouteOpenFlight>>>,
+    jitter: Box<dyn Fn(Duration) -> Duration + Send + Sync>,
+}
+
+impl<K: std::hash::Hash + Eq> RouteOpenFlights<K> {
+    pub(crate) fn new() -> Self {
+        Self::with_jitter(full_jitter)
+    }
+
+    /// Draw each backoff wait with `jitter` instead of [`full_jitter`], so a test can make the
+    /// schedule exact.
+    pub(crate) fn with_jitter(
+        jitter: impl Fn(Duration) -> Duration + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            flights: Mutex::new(HashMap::new()),
+            jitter: Box::new(jitter),
+        }
+    }
+
+    /// Open the route `key` names, joining an open already in progress for it if there is one.
+    /// `attempt` performs one `route.open` for exactly that route; whichever joined caller's
+    /// turn it is runs its own `attempt`, which is why every caller must pass an equivalent one.
+    /// `gate` is the target module's availability gate, when the connection has one.
+    pub(crate) async fn open<F, Fut>(
+        &self,
+        key: K,
+        retry: RouteOpenRetry,
+        scope_hold: Option<ScopeHold>,
+        cancel: Option<&CancellationToken>,
+        gate: Option<&ModuleGate>,
+        attempt: F,
+    ) -> Result<RouteHandle, RouteOpenError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ConnResult<RouteHandle>>,
+    {
+        let flight = {
+            let mut flights = self.flights.lock().unwrap();
+            flights.retain(|_, flight| flight.strong_count() > 0);
+            match flights.get(&key).and_then(Weak::upgrade) {
+                Some(flight) => flight,
+                None => {
+                    let flight = Arc::new(RouteOpenFlight::new());
+                    flights.insert(key, Arc::downgrade(&flight));
+                    flight
                 }
             }
-            Err(error) => return Err(RouteOpenError::Conn(error)),
+        };
+        flight
+            .join(retry, scope_hold, cancel, &*self.jitter, gate, attempt)
+            .await
+    }
+
+    /// How many flights are in progress (for tests that check a finished flight is let go).
+    #[cfg(test)]
+    pub(crate) fn live_flights(&self) -> usize {
+        let flights = self.flights.lock().unwrap();
+        flights.values().filter(|f| f.strong_count() > 0).count()
+    }
+}
+
+/// One route open that one or more callers wait on together. The state lives in a watch
+/// channel so that every change (an attempt starting, an attempt's outcome, an abandoned
+/// attempt) wakes every waiting caller to look again.
+struct RouteOpenFlight {
+    state: tokio::sync::watch::Sender<FlightState>,
+}
+
+struct FlightState {
+    /// How many attempts have started. An attempt's number is this count just before it began.
+    started: u64,
+    /// Whether one of the callers is running an attempt now.
+    in_flight: bool,
+    /// The most recently finished attempt: its number and its outcome.
+    last: Option<(u64, ConnResult<RouteHandle>)>,
+    /// No attempt starts before this, unless a caller's own deadline comes first.
+    next_at: time::Instant,
+    /// The backoff envelope for the next wait after an ordinary temporary refusal.
+    envelope: Duration,
+    /// The next wait after a scope-hold refusal. The hold keeps its own plain doubling.
+    scope_interval: Duration,
+    /// Whether the last refusal was `scope_changed`, which re-opens at once only the first time.
+    previous_was_scope_changed: bool,
+}
+
+/// Marks an attempt as no longer running if the caller running it is dropped mid-attempt (an
+/// outer timeout, a cancelled task), so another joined caller takes the next turn instead of
+/// waiting for an outcome that will never be recorded.
+struct AbandonedAttempt<'a> {
+    flight: &'a RouteOpenFlight,
+    armed: bool,
+}
+
+impl Drop for AbandonedAttempt<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flight
+                .state
+                .send_modify(|state| state.in_flight = false);
         }
+    }
+}
+
+async fn cancelled_or_never(cancel: Option<&CancellationToken>) {
+    match cancel {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+impl RouteOpenFlight {
+    fn new() -> Self {
+        let (state, _) = tokio::sync::watch::channel(FlightState {
+            started: 0,
+            in_flight: false,
+            last: None,
+            next_at: time::Instant::now(),
+            envelope: ROUTE_OPEN_RETRY_INTERVAL,
+            scope_interval: ROUTE_OPEN_RETRY_INTERVAL,
+            previous_was_scope_changed: false,
+        });
+        Self { state }
+    }
+
+    /// Wait for this flight to open the route, as one caller with its own `retry` budget,
+    /// `scope_hold` and `cancel`. Alone, this is exactly the retry loop [`RouteOpenRetry`]
+    /// describes. Joined with others:
+    /// - attempts are shared: the next one starts when the shared backoff says so, or when the
+    ///   earliest joined caller's deadline arrives, whichever is first, and one caller runs it;
+    /// - each caller judges each outcome by its own deadline, so an opened route or a terminal
+    ///   refusal reaches every caller at once, and a temporary refusal ends only the callers
+    ///   whose deadline has passed;
+    /// - a scoped caller (one with a scope hold) counts only attempts that STARTED after it
+    ///   joined. A scoped open brackets its attempt with two `scope.describe` calls to learn the
+    ///   route's stamp, which is sound only if the route was bound between them; an attempt
+    ///   already running when the caller joined may have been bound before its first describe.
+    ///   An unscoped caller also counts the attempt running when it joined;
+    /// - cancelling one caller only takes that caller out. Its cancellation is honoured while it
+    ///   waits, never during an attempt it is running, so that attempt still completes and is
+    ///   recorded for the others;
+    /// - with a `gate`, every attempt first passes the target module's [`ModuleGate`], which
+    ///   then also does the waiting after a module-availability refusal.
+    async fn join<F, Fut>(
+        &self,
+        retry: RouteOpenRetry,
+        scope_hold: Option<ScopeHold>,
+        cancel: Option<&CancellationToken>,
+        jitter: &(dyn Fn(Duration) -> Duration + Send + Sync),
+        gate: Option<&ModuleGate>,
+        mut attempt: F,
+    ) -> Result<RouteHandle, RouteOpenError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ConnResult<RouteHandle>>,
+    {
+        use subc_protocol::error_codes::{SCOPE_CHANGED, SCOPE_NOT_SYNCED};
+        let retry_deadline = time::Instant::now() + retry.budget;
+        // The deadline that governs a temporary refusal with `code`: the scope hold's for the
+        // two scope refusals when this open holds on them, the ordinary budget's otherwise.
+        let deadline_for = |code: &str| match scope_hold {
+            Some(hold) if matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED) => hold.deadline,
+            _ => retry_deadline,
+        };
+        let mut rx = self.state.subscribe();
+        let first_counted = {
+            let state = rx.borrow_and_update();
+            // An unscoped caller may take the outcome of an attempt already running when it
+            // joined. A scoped one (the only kind with a scope hold) may not; see above.
+            if scope_hold.is_none() && state.in_flight {
+                state.started - 1
+            } else {
+                state.started
+            }
+        };
+        let mut judged: Option<u64> = None;
+        loop {
+            enum Next {
+                Return(Result<RouteHandle, RouteOpenError>),
+                AwaitAttempt,
+                AttemptAt(time::Instant, u64),
+            }
+            let next = {
+                let state = rx.borrow_and_update();
+                let now = time::Instant::now();
+                let mut decided = None;
+                if let Some((number, outcome)) = &state.last {
+                    if *number >= first_counted && judged != Some(*number) {
+                        judged = Some(*number);
+                        decided = match outcome {
+                            Ok(handle) => Some(Ok(*handle)),
+                            Err(ConnError::Rejected(message))
+                                if subc_protocol::error_codes::is_retryable_route_open(
+                                    message.code(),
+                                ) =>
+                            {
+                                (now >= deadline_for(message.code())).then(|| {
+                                    Err(RouteOpenError::Conn(ConnError::Rejected(message.clone())))
+                                })
+                            }
+                            Err(error) => Some(Err(RouteOpenError::Conn(error.clone()))),
+                        };
+                    }
+                }
+                match decided {
+                    Some(result) => Next::Return(result),
+                    None if state.in_flight => Next::AwaitAttempt,
+                    None => {
+                        let deadline = match &state.last {
+                            Some((_, Err(ConnError::Rejected(message)))) => {
+                                deadline_for(message.code())
+                            }
+                            _ => retry_deadline,
+                        };
+                        Next::AttemptAt(state.next_at.min(deadline), state.started)
+                    }
+                }
+            };
+            match next {
+                Next::Return(result) => return result,
+                Next::AwaitAttempt => {
+                    tokio::select! {
+                        _ = cancelled_or_never(cancel) => return Err(RouteOpenError::Cancelled),
+                        _ = rx.changed() => {}
+                    }
+                }
+                Next::AttemptAt(due, started) if due <= time::Instant::now() => {
+                    // The target module's gate comes first: while the module is known to be
+                    // unavailable, this caller waits there with every other caller of that
+                    // module, for any route, until a probe finds it back or this caller's own
+                    // budget runs out.
+                    let ticket = match gate {
+                        Some(gate) => match gate.admit(Some(retry_deadline), cancel).await {
+                            GateAdmission::Admitted(ticket) => Some(ticket),
+                            GateAdmission::Refused(refusal) => {
+                                return Err(RouteOpenError::Conn(ConnError::Rejected(refusal)))
+                            }
+                            GateAdmission::Cancelled => return Err(RouteOpenError::Cancelled),
+                        },
+                        None => None,
+                    };
+                    // If another caller of this flight took the attempt meanwhile, the ticket
+                    // is dropped unused, which hands a probe turn back to the gate.
+                    let claimed = self.state.send_if_modified(|state| {
+                        let free = !state.in_flight && state.started == started;
+                        if free {
+                            state.in_flight = true;
+                            state.started += 1;
+                        }
+                        free
+                    });
+                    if claimed {
+                        let mut abandoned = AbandonedAttempt {
+                            flight: self,
+                            armed: true,
+                        };
+                        // Deliberately not wrapped in a timeout against any deadline: an
+                        // attempt that started before the deadline runs to its own reply
+                        // deadline, because the daemon may still be relaying its bind and
+                        // abandoning it would report a successful open as failed.
+                        let outcome = attempt().await;
+                        abandoned.armed = false;
+                        if let Some(ticket) = ticket {
+                            ticket.report(&outcome);
+                        }
+                        self.record(
+                            started,
+                            outcome,
+                            retry.max_interval,
+                            scope_hold,
+                            jitter,
+                            gate.is_some(),
+                        );
+                    }
+                }
+                Next::AttemptAt(due, _) => {
+                    tokio::select! {
+                        _ = cancelled_or_never(cancel) => return Err(RouteOpenError::Cancelled),
+                        _ = time::sleep_until(due) => {}
+                        _ = rx.changed() => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record attempt `number`'s outcome and schedule the next attempt from it. `gated` says
+    /// the attempts pass a [`ModuleGate`], which then paces the module-availability refusals
+    /// itself, so this flight goes straight back to the gate instead of adding its own wait.
+    fn record(
+        &self,
+        number: u64,
+        outcome: ConnResult<RouteHandle>,
+        max_interval: Duration,
+        scope_hold: Option<ScopeHold>,
+        jitter: &(dyn Fn(Duration) -> Duration + Send + Sync),
+        gated: bool,
+    ) {
+        use subc_protocol::error_codes::{SCOPE_CHANGED, SCOPE_NOT_SYNCED};
+        self.state.send_modify(|state| {
+            state.in_flight = false;
+            let now = time::Instant::now();
+            match &outcome {
+                Err(ConnError::Rejected(message))
+                    if subc_protocol::error_codes::is_retryable_route_open(message.code()) =>
+                {
+                    let code = message.code();
+                    let held =
+                        scope_hold.filter(|_| matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED));
+                    let changed = code == SCOPE_CHANGED;
+                    let at_once = held.is_some() && changed && !state.previous_was_scope_changed;
+                    state.previous_was_scope_changed = changed;
+                    state.next_at = match held {
+                        _ if at_once => now,
+                        None if gated && is_module_availability_refusal(code) => now,
+                        Some(hold) => {
+                            let wait = state.scope_interval.min(hold.max_interval);
+                            state.scope_interval = (wait * 2).min(hold.max_interval);
+                            now + wait
+                        }
+                        None => {
+                            let envelope = state.envelope.min(max_interval);
+                            state.envelope = (envelope * 2).min(max_interval);
+                            now + jitter(envelope).min(envelope)
+                        }
+                    };
+                }
+                // The module answered for real (a route, or a refusal that will not change by
+                // waiting): a caller that still needs an attempt, having joined while this one
+                // ran, gets one at once, and any later trouble starts the backoff afresh.
+                _ => {
+                    state.next_at = now;
+                    state.envelope = ROUTE_OPEN_RETRY_INTERVAL;
+                    state.scope_interval = ROUTE_OPEN_RETRY_INTERVAL;
+                    state.previous_was_scope_changed = false;
+                }
+            }
+            state.last = Some((number, outcome));
+        });
+    }
+}
+
+/// Whether a route.open refusal says the target MODULE is unavailable (stopped, starting,
+/// restarting, or not answering), as opposed to anything about the route asked for. These are
+/// the refusals that are the same for every caller of that module, so one caller's refusal is
+/// news for all of them; see [`ModuleGate`].
+fn is_module_availability_refusal(code: &str) -> bool {
+    use subc_protocol::error_codes::{
+        MODULE_RELOADING, MODULE_TIMEOUT, MODULE_WARMING, TARGET_UNAVAILABLE,
+    };
+    matches!(
+        code,
+        TARGET_UNAVAILABLE | MODULE_WARMING | MODULE_RELOADING | MODULE_TIMEOUT
+    )
+}
+
+/// One target module's availability, shared by every route open to that module on one
+/// connection generation, whatever route each open is for.
+///
+/// Sharing opens per route is not enough: during one storm a stopped module refused about 200
+/// opens a second from broca, spread across 52 worker scopes, each scope a different route with
+/// its own retry loop. So once any open to the module is refused for availability
+/// ([`is_module_availability_refusal`]), the gate CLOSES: every open to the module waits here,
+/// and one probe per backoff tick (an envelope from [`ROUTE_OPEN_RETRY_INTERVAL`] doubling to
+/// [`ROUTE_OPEN_RETRY_MAX_INTERVAL`], with full jitter) is let through, as an ordinary open by
+/// one of the waiting callers. The gate OPENS again when any open succeeds or gets any answer
+/// other than an availability refusal or a scope refusal (a transport failure included, which
+/// lets callers find out about the connection for themselves); each waiting caller then goes on
+/// with its own open, still shared per route where its owner shares them. Scope refusals
+/// (`scope_*`) are about one caller's scope, not the module, so they neither close nor open
+/// the gate. A waiting caller still leaves at its own deadline or cancellation.
+pub(crate) struct ModuleGate {
+    /// `None` while the module is presumed available; the closed state otherwise.
+    state: tokio::sync::watch::Sender<Option<GateClosed>>,
+    jitter: Box<dyn Fn(Duration) -> Duration + Send + Sync>,
+}
+
+struct GateClosed {
+    /// The availability refusal that closed the gate, or the latest one since. A caller that
+    /// cannot wait for the next probe is given this: the gate's latest evidence that the module
+    /// was unavailable.
+    refusal: RejectedMessage,
+    /// When the next probe may go through.
+    next_probe_at: time::Instant,
+    /// The envelope the wait after the next failed probe is drawn from.
+    envelope: Duration,
+    /// Whether a probe is running now.
+    probing: bool,
+}
+
+pub(crate) enum GateAdmission<'a> {
+    /// Make the open, and report its outcome on the ticket.
+    Admitted(GateTicket<'a>),
+    /// The caller cannot wait for a probe (its deadline has passed, or it asked not to wait):
+    /// here is the gate's latest availability refusal, to be treated as this open's outcome.
+    Refused(RejectedMessage),
+    Cancelled,
+}
+
+/// Permission to make one open through a [`ModuleGate`]. A ticket for a probe that is dropped
+/// without a report (the open was abandoned) hands the probe turn back to the gate.
+pub(crate) struct GateTicket<'a> {
+    gate: &'a ModuleGate,
+    probe: bool,
+    reported: bool,
+}
+
+impl GateTicket<'_> {
+    pub(crate) fn report(mut self, outcome: &ConnResult<RouteHandle>) {
+        self.reported = true;
+        self.gate.observe(outcome, self.probe);
+    }
+}
+
+impl Drop for GateTicket<'_> {
+    fn drop(&mut self) {
+        if self.probe && !self.reported {
+            self.gate.state.send_if_modified(|state| match state {
+                Some(closed) if closed.probing => {
+                    closed.probing = false;
+                    true
+                }
+                _ => false,
+            });
+        }
+    }
+}
+
+impl ModuleGate {
+    pub(crate) fn new() -> Self {
+        Self::with_jitter(full_jitter)
+    }
+
+    /// Draw each probe wait with `jitter` instead of [`full_jitter`], so a test can make the
+    /// probe schedule exact.
+    pub(crate) fn with_jitter(
+        jitter: impl Fn(Duration) -> Duration + Send + Sync + 'static,
+    ) -> Self {
+        let (state, _) = tokio::sync::watch::channel(None);
+        Self {
+            state,
+            jitter: Box::new(jitter),
+        }
+    }
+
+    /// Whether the gate is closed (for tests).
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state.borrow().is_some()
+    }
+
+    /// Wait for permission to make one open to this module. Open gate: at once. Closed gate:
+    /// when this caller gets the next probe turn, when the gate opens, or, at `wait_until`
+    /// (`None` meaning do not wait at all), with the module's latest refusal instead.
+    pub(crate) async fn admit(
+        &self,
+        wait_until: Option<time::Instant>,
+        cancel: Option<&CancellationToken>,
+    ) -> GateAdmission<'_> {
+        let mut rx = self.state.subscribe();
+        loop {
+            enum Step {
+                Go,
+                TryProbe,
+                /// Wait for a change, or until the given probe time when no probe is running.
+                Wait(Option<time::Instant>, RejectedMessage),
+            }
+            let now = time::Instant::now();
+            let step = match &*rx.borrow_and_update() {
+                None => Step::Go,
+                Some(closed) if !closed.probing && now >= closed.next_probe_at => Step::TryProbe,
+                Some(closed) => Step::Wait(
+                    (!closed.probing).then_some(closed.next_probe_at),
+                    closed.refusal.clone(),
+                ),
+            };
+            match step {
+                Step::Go => return GateAdmission::Admitted(self.ticket(false)),
+                Step::TryProbe => {
+                    let claimed = self.state.send_if_modified(|state| match state {
+                        Some(closed) if !closed.probing && now >= closed.next_probe_at => {
+                            closed.probing = true;
+                            true
+                        }
+                        _ => false,
+                    });
+                    if claimed {
+                        return GateAdmission::Admitted(self.ticket(true));
+                    }
+                }
+                Step::Wait(next_probe_at, refusal) => {
+                    let until = match wait_until {
+                        Some(until) if until > now => until,
+                        _ => return GateAdmission::Refused(refusal),
+                    };
+                    let probe_turn = async {
+                        match next_probe_at {
+                            Some(at) => time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        _ = cancelled_or_never(cancel) => return GateAdmission::Cancelled,
+                        _ = rx.changed() => {}
+                        _ = probe_turn => {}
+                        _ = time::sleep_until(until) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn ticket(&self, probe: bool) -> GateTicket<'_> {
+        GateTicket {
+            gate: self,
+            probe,
+            reported: false,
+        }
+    }
+
+    /// Learn from one open's outcome; `probe` says it was the gate's probe.
+    fn observe(&self, outcome: &ConnResult<RouteHandle>, probe: bool) {
+        let now = time::Instant::now();
+        let jitter = |envelope: Duration| (self.jitter)(envelope).min(envelope);
+        self.state.send_if_modified(|state| match outcome {
+            Err(ConnError::Rejected(message)) if is_module_availability_refusal(message.code()) => {
+                match state {
+                    None => {
+                        let first = ROUTE_OPEN_RETRY_INTERVAL;
+                        *state = Some(GateClosed {
+                            refusal: message.clone(),
+                            next_probe_at: now + jitter(first),
+                            envelope: (first * 2).min(ROUTE_OPEN_RETRY_MAX_INTERVAL),
+                            probing: false,
+                        });
+                    }
+                    Some(closed) => {
+                        closed.refusal = message.clone();
+                        if probe {
+                            closed.probing = false;
+                            closed.next_probe_at = now + jitter(closed.envelope);
+                            closed.envelope =
+                                (closed.envelope * 2).min(ROUTE_OPEN_RETRY_MAX_INTERVAL);
+                        }
+                    }
+                }
+                true
+            }
+            // About the caller's scope, not the module: the gate stays as it is, but a probe
+            // that ended this way gives up its turn until the next tick.
+            Err(ConnError::Rejected(message)) if message.code().starts_with("scope_") => {
+                match state {
+                    Some(closed) if probe => {
+                        closed.probing = false;
+                        closed.next_probe_at = now + jitter(closed.envelope);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            // A route, any other refusal (the module is there to answer), or a transport or
+            // protocol failure (not the module's doing): open the gate and let each caller
+            // find out for itself.
+            _ => state.take().is_some(),
+        });
+    }
+}
+
+/// The availability gates of one connection, one per target module and socket generation.
+#[derive(Default)]
+struct ModuleGates {
+    gates: Mutex<HashMap<(u64, String), Arc<ModuleGate>>>,
+}
+
+impl ModuleGates {
+    fn get(&self, generation: u64, module_id: &str) -> Arc<ModuleGate> {
+        let mut gates = self.gates.lock().unwrap();
+        // A reconnect starts every module afresh; earlier generations' gates are let go.
+        gates.retain(|(gate_generation, _), _| *gate_generation == generation);
+        Arc::clone(
+            gates
+                .entry((generation, module_id.to_owned()))
+                .or_insert_with(|| Arc::new(ModuleGate::new())),
+        )
     }
 }
 
@@ -3325,6 +3962,7 @@ impl SubcConnection {
                 reconnect_attempts: AtomicU64::new(0),
                 probe_windows_started: AtomicU64::new(0),
             }),
+            module_gates: ModuleGates::default(),
         };
         (
             conn,
@@ -3916,6 +4554,7 @@ mod tests {
                 reconnect_attempts: AtomicU64::new(0),
                 probe_windows_started: AtomicU64::new(0),
             }),
+            module_gates: ModuleGates::default(),
         }
     }
 
@@ -5811,6 +6450,7 @@ mod tests {
                     ..hold
                 }),
                 None,
+                None,
                 || {
                     attempts.fetch_add(1, Ordering::SeqCst);
                     async move {
@@ -6239,5 +6879,365 @@ mod approved_enqueue_tests {
             ));
             assert!(rx.try_recv().is_err());
         }
+    }
+}
+
+/// Route opens to a module that is down: how attempts are spaced, shared per route, and gated
+/// per module. Paused clock throughout, so every wait is virtual and every count exact.
+#[cfg(test)]
+mod route_open_sharing_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+    use subc_protocol::error_codes::TARGET_UNAVAILABLE;
+
+    fn refused(code: &str) -> ConnError {
+        ConnError::Rejected(RejectedMessage::structured(code.into(), "not now".into()))
+    }
+
+    /// No jitter: each wait is its whole envelope, so the schedule is exact.
+    fn whole_envelope(envelope: Duration) -> Duration {
+        envelope
+    }
+
+    fn patient(budget: Duration) -> RouteOpenRetry {
+        RouteOpenRetry::within(budget, ROUTE_OPEN_RETRY_MAX_INTERVAL)
+    }
+
+    #[test]
+    fn the_default_patience_backs_off_to_five_seconds_within_three() {
+        let retry = RouteOpenRetry::default_patience();
+        assert_eq!(retry.budget, Duration::from_secs(3));
+        assert_eq!(retry.max_interval, Duration::from_secs(5));
+    }
+
+    /// Full jitter stays inside its envelope and actually varies: a wait never exceeds the
+    /// envelope, and draws spread over it rather than sitting at one value.
+    #[test]
+    fn full_jitter_draws_spread_over_the_envelope_and_never_exceed_it() {
+        let envelope = Duration::from_secs(5);
+        let draws: Vec<Duration> = (0..1000).map(|_| full_jitter(envelope)).collect();
+        assert!(draws.iter().all(|wait| *wait <= envelope));
+        assert!(draws.iter().any(|wait| *wait < Duration::from_secs(1)));
+        assert!(draws.iter().any(|wait| *wait > Duration::from_secs(4)));
+    }
+
+    /// One caller against a module that stays down: the waits between attempts double from
+    /// 100 ms and then hold at 5 s. They never shrink, except the last, which is cut short so
+    /// that no wait runs past the open's deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_between_refused_attempts_doubles_to_five_seconds() {
+        let start = time::Instant::now();
+        let started_at = Mutex::new(Vec::new());
+        let result = RouteOpenFlight::new()
+            .join(
+                patient(Duration::from_secs(30)),
+                None,
+                None,
+                &whole_envelope,
+                None,
+                || {
+                    started_at.lock().unwrap().push(start.elapsed());
+                    async { Err(refused(TARGET_UNAVAILABLE)) }
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(RouteOpenError::Conn(ConnError::Rejected(_)))
+        ));
+        let started_at = started_at.into_inner().unwrap();
+        let waits: Vec<Duration> = started_at
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect();
+        let ms = Duration::from_millis;
+        assert_eq!(
+            waits[..7],
+            [
+                ms(100),
+                ms(200),
+                ms(400),
+                ms(800),
+                ms(1600),
+                ms(3200),
+                ms(5000)
+            ],
+            "the waits must double from 100 ms up to the 5 s cap: {waits:?}"
+        );
+        assert!(waits
+            .iter()
+            .all(|wait| *wait <= ROUTE_OPEN_RETRY_MAX_INTERVAL));
+        let (last, before_last) = waits.split_last().unwrap();
+        assert!(
+            before_last.windows(2).all(|pair| pair[1] >= pair[0]),
+            "{waits:?}"
+        );
+        assert_eq!(
+            *started_at.last().unwrap(),
+            Duration::from_secs(30),
+            "the last attempt is made at the deadline, not after it (last wait {last:?})"
+        );
+    }
+
+    /// Fifty callers needing the same route while its module is down for ten seconds make one
+    /// series of attempts between them, spaced by one backoff, and every one of them gets the
+    /// route the module opens once it is back.
+    #[tokio::test(start_paused = true)]
+    async fn fifty_callers_for_one_route_share_one_series_of_attempts() {
+        let start = time::Instant::now();
+        let up_at = start + Duration::from_secs(10);
+        let attempts = AtomicUsize::new(0);
+        let attempt = || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let opened = time::Instant::now() >= up_at;
+            async move {
+                time::sleep(Duration::from_millis(5)).await;
+                if opened {
+                    Ok(RouteHandle::synthetic(7))
+                } else {
+                    Err(refused(TARGET_UNAVAILABLE))
+                }
+            }
+        };
+        let flights = RouteOpenFlights::with_jitter(whole_envelope);
+        let results = futures::future::join_all((0..50).map(|_| {
+            flights.open(
+                "aft",
+                patient(Duration::from_secs(30)),
+                None,
+                None,
+                None,
+                attempt,
+            )
+        }))
+        .await;
+        let attempts = attempts.load(Ordering::SeqCst);
+        assert!(
+            attempts <= 12,
+            "50 callers must share one series of attempts, not run 50: {attempts} attempts"
+        );
+        for result in results {
+            let handle = result.expect("every joined caller gets the opened route");
+            assert_eq!(handle.channel, 7);
+        }
+        assert_eq!(flights.live_flights(), 0, "a finished flight is let go");
+    }
+
+    /// A caller that cancels leaves on its own; the attempts go on for the callers still
+    /// waiting, and they get the route when the module is back.
+    #[tokio::test(start_paused = true)]
+    async fn one_caller_cancelling_does_not_stop_the_shared_attempts() {
+        let start = time::Instant::now();
+        let up_at = start + Duration::from_secs(3);
+        let attempts = AtomicUsize::new(0);
+        let attempt = || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let opened = time::Instant::now() >= up_at;
+            async move {
+                if opened {
+                    Ok(RouteHandle::synthetic(7))
+                } else {
+                    Err(refused(TARGET_UNAVAILABLE))
+                }
+            }
+        };
+        let flights = RouteOpenFlights::with_jitter(whole_envelope);
+        let token = CancellationToken::new();
+        let retry = patient(Duration::from_secs(30));
+        // Polled first, so the cancelled caller is the one that ran the first attempts.
+        let cancelled = flights.open("aft", retry, None, Some(&token), None, attempt);
+        let others = futures::future::join_all(
+            (0..2).map(|_| flights.open("aft", retry, None, None, None, attempt)),
+        );
+        let cancel_soon = async {
+            time::sleep(Duration::from_millis(500)).await;
+            token.cancel();
+            attempts.load(Ordering::SeqCst)
+        };
+        let (cancelled, others, attempts_at_cancel) = tokio::join!(cancelled, others, cancel_soon);
+        assert!(matches!(cancelled, Err(RouteOpenError::Cancelled)));
+        for other in others {
+            assert_eq!(other.expect("the others still get the route").channel, 7);
+        }
+        assert!(
+            attempts.load(Ordering::SeqCst) > attempts_at_cancel,
+            "the attempts must go on after one caller cancels"
+        );
+    }
+
+    /// Callers for different routes never share: each route's attempts are its own, and each
+    /// caller gets its own route's handle.
+    #[tokio::test(start_paused = true)]
+    async fn callers_for_different_routes_never_share_an_open() {
+        let calls = [AtomicUsize::new(0), AtomicUsize::new(0)];
+        let attempt_for = |route: usize| {
+            let calls = &calls;
+            move || {
+                calls[route].fetch_add(1, Ordering::SeqCst);
+                async move {
+                    time::sleep(Duration::from_millis(100)).await;
+                    Ok(RouteHandle::synthetic(route as u16 + 1))
+                }
+            }
+        };
+        let flights = RouteOpenFlights::with_jitter(whole_envelope);
+        let retry = patient(Duration::from_secs(3));
+        let (a1, a2, b1, b2) = tokio::join!(
+            flights.open("route-a", retry, None, None, None, attempt_for(0)),
+            flights.open("route-a", retry, None, None, None, attempt_for(0)),
+            flights.open("route-b", retry, None, None, None, attempt_for(1)),
+            flights.open("route-b", retry, None, None, None, attempt_for(1)),
+        );
+        let channels = [a1, a2, b1, b2].map(|result| result.unwrap().channel);
+        assert_eq!(channels, [1, 1, 2, 2]);
+        assert_eq!(
+            calls[0].load(Ordering::SeqCst),
+            1,
+            "route-a callers share one open"
+        );
+        assert_eq!(
+            calls[1].load(Ordering::SeqCst),
+            1,
+            "route-b callers share one open"
+        );
+    }
+
+    /// A terminal refusal reaches every joined caller at once, from the one attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_refusal_reaches_every_joined_caller_at_once() {
+        let calls = AtomicUsize::new(0);
+        let attempt = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                time::sleep(Duration::from_millis(100)).await;
+                Err(refused("unknown_module"))
+            }
+        };
+        let flights = RouteOpenFlights::with_jitter(whole_envelope);
+        let start = time::Instant::now();
+        let results = futures::future::join_all((0..3).map(|_| {
+            flights.open(
+                "aft",
+                patient(Duration::from_secs(30)),
+                None,
+                None,
+                None,
+                attempt,
+            )
+        }))
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_millis(100));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for result in results {
+            assert!(matches!(
+                result,
+                Err(RouteOpenError::Conn(ConnError::Rejected(message))) if message.code() == "unknown_module"
+            ));
+        }
+    }
+
+    /// A module's gate closes on an availability refusal and opens on any other answer, but a
+    /// scope refusal is about one caller's scope, so it neither closes nor opens it.
+    #[test]
+    fn only_module_availability_closes_the_gate_and_scope_refusals_leave_it_alone() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let gate = ModuleGate::with_jitter(whole_envelope);
+            gate.observe(&Err(refused("scope_not_synced")), false);
+            assert!(!gate.is_closed(), "a scope refusal must not close the gate");
+            gate.observe(&Err(refused(TARGET_UNAVAILABLE)), false);
+            assert!(gate.is_closed());
+            gate.observe(&Err(refused("scope_changed")), true);
+            assert!(gate.is_closed(), "a scope refusal must not open the gate");
+            gate.observe(&Err(refused("unknown_module")), false);
+            assert!(
+                !gate.is_closed(),
+                "any other answer means the module is there"
+            );
+            gate.observe(&Err(refused("module_warming")), false);
+            gate.observe(&Ok(RouteHandle::synthetic(1)), false);
+            assert!(!gate.is_closed());
+        });
+    }
+
+    /// A caller waiting at a closed gate leaves at its own deadline with the module's refusal,
+    /// without an attempt of its own reaching the daemon.
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_waiting_at_a_closed_gate_leaves_at_its_own_deadline() {
+        let gate = ModuleGate::with_jitter(whole_envelope);
+        gate.observe(&Err(refused(TARGET_UNAVAILABLE)), false);
+        time::sleep(Duration::from_secs(1)).await;
+        // Someone else's probe is running and never ends during this test.
+        let probe = match gate.admit(None, None).await {
+            GateAdmission::Admitted(ticket) => ticket,
+            _ => panic!("the probe turn was due"),
+        };
+        let calls = AtomicUsize::new(0);
+        let start = time::Instant::now();
+        let result = retry_route_open(patient(Duration::from_secs(2)), None, Some(&gate), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(RouteHandle::synthetic(1)) }
+        })
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            result,
+            Err(RouteOpenError::Conn(ConnError::Rejected(message))) if message.code() == TARGET_UNAVAILABLE
+        ));
+        drop(probe);
+    }
+
+    /// Fifty opens for fifty DIFFERENT routes to one stopped module: past the first round, the
+    /// module sees one probe per backoff tick in total, not one per route, and every route
+    /// opens once the module is back.
+    #[tokio::test(start_paused = true)]
+    async fn fifty_routes_to_a_stopped_module_make_one_probe_per_tick_between_them() {
+        let start = time::Instant::now();
+        let up_at = start + Duration::from_secs(10);
+        let started_at = Mutex::new(Vec::new());
+        let attempt = || {
+            let now = time::Instant::now();
+            started_at.lock().unwrap().push(now - start);
+            async move {
+                time::sleep(Duration::from_millis(5)).await;
+                if now >= up_at {
+                    Ok(RouteHandle::synthetic(7))
+                } else {
+                    Err(refused(TARGET_UNAVAILABLE))
+                }
+            }
+        };
+        let gate = ModuleGate::with_jitter(whole_envelope);
+        // Unshared opens, as fifty different routes (or fifty owned routes) make.
+        let results = futures::future::join_all((0..50).map(|_| {
+            retry_route_open(patient(Duration::from_secs(30)), None, Some(&gate), attempt)
+        }))
+        .await;
+        let started_at = started_at.into_inner().unwrap();
+        let first_round = started_at.iter().filter(|at| at.is_zero()).count();
+        let while_down = started_at
+            .iter()
+            .filter(|at| !at.is_zero() && **at < Duration::from_secs(10))
+            .count();
+        assert!(first_round <= 50, "{first_round}");
+        assert!(
+            while_down <= 8,
+            "while the module is down, the gate lets one probe through per tick in total \
+             (100 ms doubling to 5 s gives 6 in ten seconds), got {while_down}"
+        );
+        for result in results {
+            assert_eq!(
+                result
+                    .expect("every route opens once the module is back")
+                    .channel,
+                7
+            );
+        }
+        assert!(!gate.is_closed());
     }
 }

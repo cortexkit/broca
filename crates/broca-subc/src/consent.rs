@@ -750,9 +750,11 @@ mod tests {
             .expect("consent route open must finish");
             let client = client.expect("temporary refusal must recover after idle");
             assert_eq!(client.route, route);
-            assert_eq!(
-                tokio::time::Instant::now() - started,
-                crate::connection::ROUTE_OPEN_RETRY_INTERVAL,
+            // The retry waits a random part of the first backoff envelope (full jitter), so
+            // the bound is the envelope, not an exact interval.
+            assert!(
+                tokio::time::Instant::now() - started
+                    <= crate::connection::ROUTE_OPEN_RETRY_INTERVAL,
             );
             assert!(module.take_written_for_test().is_empty());
         }
