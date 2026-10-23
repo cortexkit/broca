@@ -956,9 +956,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-model-batch"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4968e1a75d01f22d0354a3e3ea58d04c04ffa2134a8a6734deb861e2b3c94734"
+checksum = "5ba8a82cd36445c06658fc3383334fc9cdc45c936bf68b7b6d0f13b07b154571"
 dependencies = [
  "base64",
  "serde",
@@ -979,9 +979,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a62afea9a8e4a6a9416f79ae9f353f75dfb508ef4ce5e32c75e1f6133162bdfc"
+checksum = "467485f78be3828e2ebf5694016fb1454d18f0ba388d8f1235279087a16e441c"
 dependencies = [
  "cortexkit-model-batch",
  "indexmap",
@@ -991,9 +991,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier-conformance"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c982795aa2aff1e461da189e0d925670b9c82eaef71414979c58bd5c50fd1f2"
+checksum = "ea68d608cb119118be7b83205b8f107248dd6defb2c5644c1fa974d1737a7d2a"
 dependencies = [
  "async-trait",
  "cortexkit-role-classifier",

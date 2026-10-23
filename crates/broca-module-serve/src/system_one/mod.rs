@@ -172,10 +172,10 @@ pub struct ModelPin {
     pub provider: Arc<dyn ClassifierProvider>,
 }
 
-/// The `model` value broca sends for the `typesafe/jev-1.13.0` row. TypeSafe accepts versioned
-/// ids in that field (https://docs.typesafe.ai/models); its `jev-latest` alias moves to newer
-/// versions, so sending the alias would let a newer model answer, and be billed, as 1.13.0.
-const JEV_1_13_0_WIRE: &str = "jev-1.13.0";
+/// The `model` value broca sends for the `typesafe/jev-1.13.0` row: the pinned version, never
+/// TypeSafe's moving `jev-latest` alias, which already names a newer model and would let it
+/// answer, and be billed, as 1.13.0.
+const JEV_1_13_0_WIRE: &str = cortexkit_role_classifier::provider::models::JEV_1_13_0;
 
 impl ModelPin {
     /// TypeSafe's Jev 1.13.0, text only. Its question limit is the role's own question-id
