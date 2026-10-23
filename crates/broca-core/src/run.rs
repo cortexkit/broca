@@ -4512,7 +4512,11 @@ where
                     provider.reasoning_is_prefix_bound(),
                     // The run's first step, where a view deferred over an open turn ends.
                     completed_steps == 0,
-                    step_id,
+                    crate::compaction::runtime::StepAt {
+                        run_id: &resolved_run_id.0,
+                        step: step_id.0,
+                        superseded: &[],
+                    },
                 ))
                 .await?
             };

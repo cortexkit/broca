@@ -1613,6 +1613,132 @@ async fn a_model_change_rides_for_a_view_and_applies_it() {
     assert_eq!(last_notice["model"], "other");
 }
 
+/// Serves views 1 and 2 of one session. The `view.get` for version 1 signals `fetching_first`
+/// and waits for `release` before it answers, so a test can announce version 2 while the
+/// decision for version 1 is in flight.
+struct RacingViews {
+    fetching_first: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    fetches: Mutex<Vec<u64>>,
+}
+impl RacingViews {
+    fn view(session_ref: &str, version: u64) -> crate::compaction_provider::view::CompactionView {
+        use crate::compaction_provider::{lineage::MessageRef, view::*};
+        let fold = vec![text(Role::User, &format!("summary {version}"))];
+        CompactionView::new(
+            session_ref,
+            version,
+            fixture_lineage_id().to_string(),
+            MessageRef {
+                ordinal: 0,
+                mid: "m0".into(),
+            },
+            vec![ViewRange::replace(
+                0,
+                1,
+                serde_json::to_string(&fold).unwrap(),
+            )],
+        )
+    }
+}
+#[async_trait::async_trait]
+impl CompactionPlane for RacingViews {
+    async fn setup(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        _: SetupRequest,
+    ) -> Result<SetupAnswer, CompactionUnavailable> {
+        Err(CompactionUnavailable)
+    }
+    async fn view_get(
+        &self,
+        _: &str,
+        _: &BindIdentity,
+        request: crate::compaction_provider::view::ViewGetRequest,
+    ) -> Result<crate::compaction_provider::view::ViewGetAnswer, CompactionUnavailable> {
+        self.fetches.lock().unwrap().push(request.view_version);
+        if request.view_version == 1 {
+            self.fetching_first.notify_one();
+            self.release.notified().await;
+        }
+        Ok(crate::compaction_provider::view::ViewGetAnswer::view(
+            Self::view(&request.session_ref, request.view_version),
+        ))
+    }
+}
+
+/// Two views announced close together are applied once, as the newest. The idle boundary
+/// starts deciding version 1; version 2 is receipted and announced while version 1 is being
+/// fetched; the boundary then discards version 1 as superseded and applies version 2 alone, so
+/// the session's prefix is rewritten once rather than twice.
+#[tokio::test]
+async fn idle_boundary_applies_only_the_newest_view_announced_during_its_fetch() {
+    use crate::compaction_provider::notice::ViewReady;
+    let mut raw = vec![
+        text(Role::User, &"large history ".repeat(2000)),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "next"),
+    ];
+    broca_protocol::content::stamp_ordinals(&mut raw);
+    let options = CallOptions::new(raw.clone());
+    let shared = Shared::with_records(vec![setup_record(Some("{}"))]);
+    let writer = shared.writer();
+    writer.sync().await.unwrap();
+    let session_ref = crate::agent_session_ref(&bind());
+    let first = ViewReady::for_view(&RacingViews::view(&session_ref, 1));
+    let second = ViewReady::for_view(&RacingViews::view(&session_ref, 2));
+    let inbox = Arc::new(crate::ViewReadyInbox::default());
+    inbox.announce(first.clone());
+    let racing = Arc::new(RacingViews {
+        fetching_first: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        fetches: Mutex::new(Vec::new()),
+    });
+    let plane: Arc<dyn CompactionPlane> = racing.clone();
+    let mut state = CompactionState::default();
+    for record in shared.records() {
+        state.fold(&record);
+    }
+    let views: Arc<dyn CompactionViews> = inbox.clone();
+    let session = bind();
+    let (applied, ()) = tokio::join!(
+        runtime::apply_idle_view(
+            &session,
+            &writer,
+            &plane,
+            Some(views),
+            &first,
+            &mut state,
+            &raw,
+            &raw,
+            false,
+            "model",
+            Some(100_000),
+            |state| Ok(
+                serde_json::to_vec(&model_options(&options, state).unwrap().prompt)
+                    .unwrap()
+                    .len()
+            ),
+        ),
+        async {
+            // Hold the decision for version 1 at its fetch and announce version 2 to the inbox,
+            // as the bus intake does once version 2's receipt is durable.
+            racing.fetching_first.notified().await;
+            assert!(inbox.announce(second.clone()));
+            racing.release.notify_one();
+        }
+    );
+    assert!(applied.unwrap(), "the newest view was not applied");
+    assert_eq!(
+        views_applied(&shared.records()),
+        vec![2],
+        "exactly one applied view, the newest"
+    );
+    assert_eq!(*racing.fetches.lock().unwrap(), vec![1, 2]);
+    let _ = writer.shutdown().await;
+}
+
 #[tokio::test]
 async fn idle_view_records_lower_estimate_and_repairs_every_cut_before_wake() {
     let mut raw = vec![
@@ -1655,6 +1781,7 @@ async fn idle_view_records_lower_estimate_and_repairs_every_cut_before_wake() {
             &bind(),
             &writer,
             &plane,
+            None,
             &ready,
             &mut state,
             &raw,

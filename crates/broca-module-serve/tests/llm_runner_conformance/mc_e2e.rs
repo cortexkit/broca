@@ -50,8 +50,13 @@ impl McConfig {
         std::fs::write(
             root.join("config/cortexkit/magic-context.jsonc"),
             serde_json::to_vec_pretty(
-                &json!({"historian":{"broca":{"model":"scripted/historian"}},
-                "execute_threshold_percentage":20}),
+                // Both historian limits are read from this user-tier file only. `maxTokens` is
+                // the summarizer's output cap and `context_limit_tokens` its own window, which
+                // sizes each chunk. The session's own window is what broca reports for the
+                // session: `context_window` in the rig's test-compaction `config` file.
+                &json!({"historian":{"broca":{"model":"scripted/historian"},
+                    "maxTokens":4000,"context_limit_tokens":128000},
+                "execute_threshold_percentage":50}),
             )
             .unwrap(),
         )
@@ -204,6 +209,46 @@ fn historian_matches_mc_reference_pairs() {
     assert!(historian_response("ordinary conversation").is_none());
 }
 
+#[test]
+fn compaction_log_reads_fleet_logger_lines() {
+    let root =
+        broca_test_support::scratch_root().join(format!("mc-log-parse-{}", std::process::id()));
+    let logs = root.join("data-home/cortexkit/broca/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    // Lines as broca wrote them in a real run against Magic Context.
+    std::fs::write(logs.join("broca.2026-10-22.log"), concat!(
+        "2026-10-22T15:47:27.640Z INFO  broca.compaction: compaction consumer attached account=box_compaction_test durable=m_broca\n",
+        "2026-10-22T15:47:32.497Z INFO  broca.compaction: compaction view_ready handled session_ref=d22579b49da13fb908f3c244f73c6776 view_version=1 outcome=receipted\n",
+        "2026-10-22T15:47:32.545Z INFO  broca.compaction: compaction view_ready handled session_ref=d22579b49da13fb908f3c244f73c6776 view_version=2 outcome=receipted\n",
+        "2026-10-22T15:47:32.600Z INFO  broca.compaction: compaction view_ready handled session_ref=00000000000000000000000000000000 view_version=9 outcome=receipted\n",
+        "2026-10-22T15:47:32.649Z INFO  broca.compaction: compaction view decided at the idle boundary session_ref=d22579b49da13fb908f3c244f73c6776 view_version=2 choice=applied reason=\"\"\n",
+    )).unwrap();
+    let log = compaction_log(&root, "d22579b49da13fb908f3c244f73c6776");
+    let summary: Vec<_> = log
+        .iter()
+        .map(|f| {
+            (
+                f["message"].as_str(),
+                f["view_version"].as_str(),
+                f.get("outcome").or(f.get("choice")).unwrap().as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("compaction view_ready handled", "1", "receipted"),
+            ("compaction view_ready handled", "2", "receipted"),
+            (
+                "compaction view decided at the idle boundary",
+                "2",
+                "applied"
+            ),
+        ]
+    );
+    assert_eq!(log[2]["reason"], "");
+}
+
 fn note(root: &Path, text: impl AsRef<str>) {
     use std::io::Write;
     let text = text.as_ref();
@@ -325,6 +370,58 @@ async fn finished(subject: &BrocaSubject, live: &Live, expected: usize) {
     .await;
 }
 
+/// Holds the next send until Magic Context can have read everything the previous run wrote:
+/// that run's last advance notice is durable in the WAL and the rig's bus subscriber has seen
+/// it published. Back-to-back turns otherwise outrun MC, which publishes its view while later
+/// runs are already going. No `view_ready` is awaited: MC publishes one only when it decides
+/// to compact.
+async fn previous_notice_published(subject: &BrocaSubject, live: &Live, events: &Events) {
+    broca_test_support::wait_until(
+        "the previous run's last advance notice on the bus",
+        || async {
+            let records = subject.records(live, SESSION);
+            let run_start = records
+                .iter()
+                .rposition(|r| matches!(r, WalRecord::RunStarted { .. }))
+                .ok_or("no run has started")?;
+            let Some(headers) = records[run_start..].iter().rev().find_map(|r| match r {
+                WalRecord::CompactionNotice { headers, .. } => Some(headers),
+                _ => None,
+            }) else {
+                return Err(format!(
+                    "the last run recorded no advance notice; records={records:?}"
+                ));
+            };
+            if events
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| published_with(m, headers))
+            {
+                Ok(())
+            } else {
+                Err(format!("advance notice not yet published: {headers:?}"))
+            }
+        },
+    )
+    .await;
+}
+
+/// Whether a published bus message carries every one of `headers`.
+fn published_with(
+    message: &async_nats::Message,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    message.headers.as_ref().is_some_and(|actual| {
+        headers.iter().all(|(key, value)| {
+            actual
+                .get(key.as_str())
+                .is_some_and(|v| v.as_str() == value)
+        })
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_mc_async_compaction_end_to_end() {
     let Some(binary) = std::env::var_os("BROCA_MC_E2E_BIN").filter(|v| !v.is_empty()) else {
@@ -408,7 +505,7 @@ async fn real_mc_async_compaction_end_to_end() {
     std::fs::write(
         controls.join("config"),
         serde_json::to_vec(&json!({
-        "context_window":32000,"output_limit":4096,"call_timeout_ms":30000}))
+        "context_window":128000,"output_limit":4096,"call_timeout_ms":30000}))
         .unwrap(),
     )
     .unwrap();
@@ -468,6 +565,9 @@ async fn real_mc_async_compaction_end_to_end() {
             index < 40,
             "MC produced no view_ready after 40 turns; STOP and inspect MC logs"
         );
+        if index > 0 {
+            previous_notice_published(&subject, &live, &events).await;
+        }
         send(&route, fields(&subject, index == 0, index), &root).await;
         finished(&subject, &live, index + 1).await;
         note(
@@ -502,7 +602,6 @@ async fn real_mc_async_compaction_end_to_end() {
         1,
         "view_ready must have a durable receipt before ACK"
     );
-    let ready = receipts[0].ready.clone();
     note(
         &root,
         format!("Durable receipt before ACK: {:?}", receipts[0]),
@@ -531,6 +630,7 @@ async fn real_mc_async_compaction_end_to_end() {
     })
     .await;
     let before = requests(&subject).last().unwrap().len();
+    previous_notice_published(&subject, &live, &events).await;
     send(&route, fields(&subject, false, sent), &root).await;
     sent += 1;
     finished(&subject, &live, sent).await;
@@ -556,20 +656,19 @@ async fn real_mc_async_compaction_end_to_end() {
         .position(|r| matches!(r, WalRecord::CompactionViewApplied { .. }))
         .expect("MC never produced an applicable async view; STOP and inspect MC logs");
     let view = records[view_at].clone();
-    assert!(
-        matches!(&view, WalRecord::CompactionViewApplied { provider, view_version, .. }
-        if provider == "magic-context" && *view_version == ready.view_version),
-        "applied view does not match the real bus announcement"
-    );
-    let WalRecord::CompactionViewApplied { view: raw, .. } = &view else {
+    let WalRecord::CompactionViewApplied {
+        provider,
+        view_version: applied_version,
+        view: raw,
+        ..
+    } = &view
+    else {
         unreachable!();
     };
+    assert_eq!(provider, "magic-context");
     let decoded: broca_core::compaction_provider::view::CompactionView =
         serde_json::from_str(raw.as_json_text()).unwrap();
-    assert_eq!(
-        broca_core::compaction_provider::notice::ViewReady::for_view(&decoded),
-        ready
-    );
+    let ready = applied_announcement(&root, &bus, &events, &decoded, *applied_version).await;
     assert_bus_notices(&root, &bus, &events, &records, &ready).await;
     let after = requests(&subject).last().unwrap().len();
     note(&root, format!("Setup recorded once; view at WAL index {view_at}: {view:?}; request bytes before={before}, after={after}"));
@@ -587,6 +686,7 @@ async fn real_mc_async_compaction_end_to_end() {
 
     subject.hold_next_model_step(SESSION).await.unwrap();
     let resume_fields = fields(&subject, false, sent);
+    previous_notice_published(&subject, &live, &events).await;
     send(&route, resume_fields.clone(), &root).await;
     subject.await_model_step(SESSION).await.unwrap();
     let before_kill = requests(&subject).last().unwrap().clone();
@@ -683,6 +783,166 @@ async fn observe_events(bus: &bus::BusRig) -> Events {
     });
     Events { messages, task }
 }
+/// The `view_ready` announcements of the rig's session seen on the bus, in arrival order.
+fn announcements(
+    bus: &bus::BusRig,
+    events: &Events,
+    session_ref: &str,
+) -> Vec<broca_core::compaction_provider::notice::ViewReady> {
+    use broca_core::compaction_provider::notice::{event_subject, ViewReady, VIEW_READY_EVENT};
+    let subject = event_subject(bus.names.account(), "magic-context", VIEW_READY_EVENT);
+    events
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.subject.as_str() == subject)
+        .filter_map(|m| {
+            let headers: std::collections::BTreeMap<String, String> = m
+                .headers
+                .as_ref()?
+                .iter()
+                .filter_map(|(name, values)| {
+                    let name: &str = name.as_ref();
+                    Some((name.to_owned(), values.last()?.as_str().to_owned()))
+                })
+                .collect();
+            ViewReady::from_headers(&headers).ok()
+        })
+        .filter(|ready| ready.session_ref == session_ref)
+        .collect()
+}
+
+/// The `broca.compaction` lines of broca's log for `session_ref`, in the order written, each
+/// as its `key=value` fields. The fleet logger quotes a value only when it holds a space or a
+/// quote, which none of the fields read here do.
+fn compaction_log(
+    root: &Path,
+    session_ref: &str,
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    let mut files: Vec<_> = std::fs::read_dir(root.join("data-home/cortexkit/broca/logs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|line| line.split_once(" broca.compaction: "))
+                .map(|(_, rest)| {
+                    let mut fields: std::collections::BTreeMap<String, String> = rest
+                        .split(' ')
+                        .filter_map(|token| token.split_once('='))
+                        .map(|(k, v)| (k.to_owned(), v.trim_matches('"').to_owned()))
+                        .collect();
+                    let message = rest.split(" session_ref=").next().unwrap_or(rest);
+                    fields.insert("message".into(), message.to_owned());
+                    fields
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|fields| fields.get("session_ref").map(String::as_str) == Some(session_ref))
+        .collect()
+}
+
+/// The bus announcement of the view broca applied, after checking that broca applied the
+/// newest view it had. Magic Context may publish several views before broca reaches an idle
+/// or step boundary (in one real run, versions 1 and 2 arrived 48 ms apart), and broca then
+/// applies only the newest, so the applied view is matched to its own announcement, not to
+/// the first one seen. Checks:
+/// - an announcement of the applied version is on the bus, with the applied view's digest;
+/// - broca's log receipted no version above it before it logged applying it;
+/// - every announcement seen on the bus was receipted.
+async fn applied_announcement(
+    root: &Path,
+    bus: &bus::BusRig,
+    events: &Events,
+    view: &broca_core::compaction_provider::view::CompactionView,
+    applied_version: u64,
+) -> broca_core::compaction_provider::notice::ViewReady {
+    let expected = broca_core::compaction_provider::notice::ViewReady::for_view(view);
+    assert_eq!(expected.view_version, applied_version);
+    let session_ref = expected.session_ref.clone();
+    let version = |fields: &std::collections::BTreeMap<String, String>| {
+        fields
+            .get("view_version")
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let (announced, receipted, before_apply) = broca_test_support::wait_until(
+        "broca's log of receipting every announced view and applying the newest",
+        || async {
+            let announced = announcements(bus, events, &session_ref);
+            let log = compaction_log(root, &session_ref);
+            let receipted: Vec<u64> = log
+                .iter()
+                .filter(|f| f.get("outcome").map(String::as_str) == Some("receipted"))
+                .filter_map(version)
+                .collect();
+            let Some(applied_at) = log.iter().position(|f| {
+                f["message"].starts_with("compaction view decided at ")
+                    && f.get("choice").map(String::as_str) == Some("applied")
+                    && version(f) == Some(applied_version)
+            }) else {
+                return Err(format!(
+                    "no log line applying view {applied_version}; log={log:?}"
+                ));
+            };
+            let unreceipted: Vec<u64> = announced
+                .iter()
+                .map(|a| a.view_version)
+                .filter(|v| !receipted.contains(v))
+                .collect();
+            if !unreceipted.is_empty() {
+                return Err(format!(
+                    "announced but not yet receipted: {unreceipted:?}; log={log:?}"
+                ));
+            }
+            let before_apply: Vec<u64> = log[..applied_at]
+                .iter()
+                .filter(|f| f.get("outcome").map(String::as_str) == Some("receipted"))
+                .filter_map(version)
+                .collect();
+            Ok((announced, receipted, before_apply))
+        },
+    )
+    .await;
+    let ready = announced
+        .iter()
+        .find(|a| a.view_version == applied_version)
+        .unwrap_or_else(|| {
+            panic!("broca applied view {applied_version}, which MC never announced: {announced:?}")
+        })
+        .clone();
+    assert_eq!(
+        ready.digest, expected.digest,
+        "applied view's digest differs from its bus announcement"
+    );
+    assert_eq!(
+        ready, expected,
+        "applied view does not match its announcement"
+    );
+    assert!(
+        before_apply.contains(&applied_version),
+        "broca applied view {applied_version} before receipting it: receipted first {before_apply:?}"
+    );
+    assert!(
+        before_apply.iter().all(|v| *v <= applied_version),
+        "broca applied view {applied_version} while it held a newer one: receipted first {before_apply:?}"
+    );
+    note(
+        root,
+        format!(
+            "Announced view versions on the bus: {:?}; receipted: {receipted:?}; receipted before applying: {before_apply:?}; applied: {applied_version}",
+            announced.iter().map(|a| a.view_version).collect::<Vec<_>>()
+        ),
+    );
+    ready
+}
+
 async fn wait_for_ack(bus: &bus::BusRig) {
     broca_test_support::wait_until("broker ACK for real MC view_ready", || async {
         let consumer = async_nats::jetstream::new(bus.connection.client())
@@ -709,18 +969,7 @@ async fn assert_bus_notices(
     ready: &broca_core::compaction_provider::notice::ViewReady,
 ) {
     use broca_core::compaction_provider::notice::{event_subject, VIEW_READY_EVENT};
-    fn matches(
-        message: &async_nats::Message,
-        headers: &std::collections::BTreeMap<String, String>,
-    ) -> bool {
-        message.headers.as_ref().is_some_and(|actual| {
-            headers.iter().all(|(key, value)| {
-                actual
-                    .get(key.as_str())
-                    .is_some_and(|v| v.as_str() == value)
-            })
-        })
-    }
+    let matches = published_with;
     let notices: Vec<_> = records
         .iter()
         .filter_map(|r| match r {

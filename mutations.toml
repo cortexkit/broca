@@ -20068,8 +20068,8 @@ test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::an_applied_view_resumes_through_replay_and_the_run_loop_byte_identically", "compaction::tests::an_announced_view_is_fetched_at_the_step_boundary_and_applied"]
 only = false
 file = "crates/broca-core/src/compaction/runtime.rs"
-old = ".newest_ready(session_ref, lineage_id, current)\n            .filter(|ready| views.declined != Some(ready.view_version))"
-new = ".newest_ready(session_ref, lineage_id, current)\n            .filter(|_ready| false) // NON-VACUITY BREAK: never fetch an announced view"
+old = ".newest_ready(session_ref, lineage_id, after)\n                .filter(|ready| views.declined != Some(ready.view_version))"
+new = ".newest_ready(session_ref, lineage_id, after)\n                .filter(|_ready| false) // NON-VACUITY BREAK: never fetch an announced view"
 
 [[control]]
 id = "compaction-run-loop-records-the-boundary-notice"
@@ -20210,10 +20210,12 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::a_fetched_view_that_differs_from_its_announcement_is_never_applied"]
 file = "crates/broca-core/src/compaction/runtime.rs"
-old = '''            &fetched,
-            &ready,'''
-new = '''            &fetched,
-            &ViewReady::for_view(&fetched), // NON-VACUITY BREAK: judge the view against itself'''
+old = '''                &fetched,
+                &ready,
+                lineage_id,'''
+new = '''                &fetched,
+                &ViewReady::for_view(&fetched), // NON-VACUITY BREAK: judge the view against itself
+                lineage_id,'''
 
 [[control]]
 id = "compaction-refused-fetch-not-asked-again"
@@ -20224,9 +20226,9 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-core/src/compaction/tests.rs"
 expect_red = ["compaction::tests::a_refused_fetch_keeps_the_current_view"]
 file = "crates/broca-core/src/compaction/runtime.rs"
-old = '''                    views.declined = Some(ready.view_version);
-                    return Ok(events);'''
-new = '                    return Ok(events); // NON-VACUITY BREAK: ask for the refused version again'
+old = '''                        views.declined = Some(ready.view_version);
+                        return Ok(events);'''
+new = '                        return Ok(events); // NON-VACUITY BREAK: ask for the refused version again'
 
 [[control]]
 id = "compaction-unapplied-view-held-not-refetched"
@@ -21184,6 +21186,34 @@ expect_red = ["real_bus_compaction_receipt_survives_ack_and_rebuilds_inbox"]
 file = "crates/broca-module-serve/src/compaction_bus.rs"
 old = "self.metrics.acked.fetch_add(1, Ordering::Relaxed);"
 new = "self.metrics.acked.fetch_add(0, Ordering::Relaxed); // NON-VACUITY BREAK"
+
+[[control]]
+id = "compaction-bus-backlog-drains-without-retry-wait"
+guards = "queued view_ready deliveries are read back to back; the one-second retry wait follows only a failed or timed-out pass"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/compaction_bus/tests.rs"
+expect_red = ["compaction_bus::tests::queued_view_ready_backlog_is_receipted_and_acked_without_retry_waits"]
+expect_message = "the consumer waited between deliveries"
+file = "crates/broca-module-serve/src/compaction_bus.rs"
+old = "        loop {\n            let pass = async {"
+new = "        loop {\n            tokio::select! { _ = self.stop.cancelled() => break, _ = idle.tick() => {} } // NON-VACUITY BREAK: wait before every pass\n            let pass = async {"
+
+[[control]]
+id = "compaction-newest-receipt-supersedes-the-fetched-view"
+guards = "a view announced while an older one is fetched supersedes it, so only the newest is recorded as applied"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::idle_boundary_applies_only_the_newest_view_announced_during_its_fetch"]
+expect_message = "exactly one applied view, the newest"
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "let decision = if newer_announced || fetched.view_version > ready.view_version {"
+new = "let decision = if false && (newer_announced || fetched.view_version > ready.view_version) { // NON-VACUITY BREAK: decide the fetched version even when a newer one is known"
 
 [[control]]
 id = "compaction-receipt-newest-version-wins"

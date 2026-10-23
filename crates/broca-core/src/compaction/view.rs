@@ -338,9 +338,27 @@ pub enum Decision {
     /// Not the view asked for, malformed, or not in broca's message schema. Not recorded and
     /// not reported; the current view stays.
     Rejected(ViewProblem),
+    /// A newer version is known: announced and receipted while this one was fetched, or
+    /// answered by the provider in its place. Not recorded and not reported; the caller
+    /// decides the newest version instead, so one boundary rewrites the prefix only once.
+    Superseded,
 }
 
 impl Decision {
+    /// The decision's name and reason as log fields: `("deferred", "open_turn")` and the
+    /// like. Apply and Stale carry no reason, so their reason is empty.
+    pub fn choice(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Apply(_) => ("applied", ""),
+            Self::Defer(reason) => ("deferred", reason),
+            Self::Refuse(reason) => ("refused", reason),
+            Self::Discard => ("discarded", "not_a_prefix"),
+            Self::Stale => ("stale", ""),
+            Self::Rejected(problem) => ("rejected", problem.name()),
+            Self::Superseded => ("superseded", "newer_version"),
+        }
+    }
+
     /// The event this decision reports on the next notice. An applied view is reported by
     /// `applied_view_version` itself, and its companion edit by the fold of its record.
     pub fn event(&self, view_version: u64) -> Option<Event> {
@@ -353,7 +371,9 @@ impl Decision {
                 view_version,
                 reason: (*reason).into(),
             }),
-            Self::Apply(_) | Self::Discard | Self::Stale | Self::Rejected(_) => None,
+            Self::Apply(_) | Self::Discard | Self::Stale | Self::Rejected(_) | Self::Superseded => {
+                None
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Bounded, durable intake of compaction claim checks. Broker failure never gates a run.
 use crate::bus_events::{now_ms, BusConnector};
 use broca_core::compaction_provider::notice::{event_subject, ViewReady, VIEW_READY_EVENT};
+use broca_core::CompactionViews;
 use broca_diagnostics::{spawn_blocking, JobKind};
 use broca_module::LineageRegistry;
 use broca_store::compaction_facts::CompactionFacts;
@@ -14,6 +15,15 @@ use std::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+
+/// The tracing target of this module's compaction lines; the fleet logger prints it as the
+/// `broca.compaction` logger.
+const LOG: &str = "compaction";
+/// The name of the durable JetStream consumer this module reads compaction events from, as
+/// the log lines report it.
+const DURABLE: &str = "m_broca";
+/// How long the consumer waits before it tries again after a failed or timed-out pass.
+const RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub struct Metrics {
@@ -100,20 +110,32 @@ impl Service {
             return Ok(());
         }
         if message.wire_size() > 8192 {
+            tracing::info!(target: LOG, message_id = %message.id, bytes = message.wire_size(),
+                outcome = "refused", reason = "oversize", "compaction view_ready handled");
             return Err("oversize compaction view_ready".into());
         }
-        let ready = ViewReady::from_headers(&message.headers)
-            .map_err(|_| "malformed compaction view_ready")?;
+        let Ok(ready) = ViewReady::from_headers(&message.headers) else {
+            tracing::info!(target: LOG, message_id = %message.id, outcome = "refused",
+                reason = "malformed", "compaction view_ready handled");
+            return Err("malformed compaction view_ready".into());
+        };
+        let handled = |outcome: &str| {
+            tracing::info!(target: LOG, session_ref = %ready.session_ref,
+                view_version = ready.view_version, outcome, "compaction view_ready handled");
+        };
         if message.id != ready.message_id() || message.digest.to_string() != ready.digest {
+            handled("identity_mismatch");
             return Err("compaction view_ready identity mismatch".into());
         }
         let Some((_, facts)) = self.session(&ready.session_ref).await? else {
             self.metrics
                 .dropped_unknown_session
                 .fetch_add(1, Ordering::Relaxed);
+            handled("dropped_unknown_session");
             return Ok(());
         };
         if facts.resolved(ready.view_version) {
+            handled("already_resolved");
             return Ok(());
         }
         let receipt = ViewReceipt {
@@ -123,7 +145,7 @@ impl Service {
         };
         let store = self.store.clone();
         let durable = receipt.clone();
-        spawn_blocking(JobKind::StoreWrite, move || {
+        let recorded = spawn_blocking(JobKind::StoreWrite, move || {
             store.receive_compaction_view(&durable)
         })
         .await
@@ -132,6 +154,13 @@ impl Service {
         // A redelivery after receipt commit must still refill an inbox lost in a restart.
         #[cfg(feature = "test-clock")]
         receipt_barrier("ViewReceiptRecorded").await?;
+        // `receipt_held`: a receipt for this view or a newer one was already durable, as on a
+        // redelivery; the inbox is refilled all the same.
+        handled(if recorded {
+            "receipted"
+        } else {
+            "receipt_held"
+        });
         self.inbox.announce(ready);
         Ok(())
     }
@@ -183,16 +212,25 @@ impl Service {
 
     async fn reconcile_one(&self, receipt: ViewReceipt) -> Result<(), String> {
         let current = self.session(&receipt.ready.session_ref).await?;
-        let clear = match current {
-            None => true,
-            Some((_, facts)) if facts.lineage_id != receipt.lineage_id => true,
+        let version = receipt.ready.view_version;
+        let reason = match current {
+            None => "session_gone",
+            Some((_, facts)) if facts.lineage_id != receipt.lineage_id => "lineage_changed",
             Some((session, facts)) => {
-                if facts.resolved(receipt.ready.view_version) {
+                if facts.resolved(version) {
                     self.registry
                         .route_compaction_changed(&session)
                         .await
                         .map_err(|e| e.to_string())?;
-                    true
+                    // A durable notice settled this version: applied or refused by name, or
+                    // passed over because a newer version was applied or refused first.
+                    if facts.refused == version {
+                        "refused"
+                    } else if facts.noticed == version {
+                        "applied"
+                    } else {
+                        "superseded"
+                    }
                 } else {
                     self.inbox.announce(receipt.ready.clone());
                     if self
@@ -206,19 +244,29 @@ impl Service {
                             .route_compaction_changed(&session)
                             .await
                             .map_err(|e| e.to_string())?;
-                        return self.clear(receipt).await;
+                        // The idle boundary applies the newest announced version, which may
+                        // be newer than this receipt's; that one's receipt clears on its own.
+                        if self
+                            .inbox
+                            .newest_ready(&receipt.ready.session_ref, "", Some(version))
+                            .is_some()
+                        {
+                            "superseded"
+                        } else {
+                            "applied"
+                        }
+                    } else {
+                        // Not applied at the idle boundary (a run owns the session, or the
+                        // view was deferred): the receipt stays for a later pass.
+                        return Ok(());
                     }
-                    false
                 }
             }
         };
-        if clear {
-            self.clear(receipt).await?;
-        }
-        Ok(())
+        self.clear(receipt, reason).await
     }
 
-    async fn clear(&self, receipt: ViewReceipt) -> Result<(), String> {
+    async fn clear(&self, receipt: ViewReceipt, reason: &str) -> Result<(), String> {
         let ready = receipt.ready.clone();
         let store = self.store.clone();
         spawn_blocking(JobKind::StoreWrite, move || {
@@ -228,6 +276,8 @@ impl Service {
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
         self.inbox.forget_ready(&ready);
+        tracing::info!(target: LOG, session_ref = %ready.session_ref,
+            view_version = ready.view_version, reason, "compaction view receipt cleared");
         Ok(())
     }
 
@@ -237,34 +287,62 @@ impl Service {
         })
     }
 
+    /// Reads `view_ready` announcements one delivery per pass. A pass that settled a delivery
+    /// goes straight on to the next, so a backlog drains without waiting between messages;
+    /// only a failed or timed-out pass waits [`RETRY`] before attaching again.
     async fn consume(&self) {
         let mut cursor: Option<Box<dyn StreamCursor>> = None;
         let mut account = String::new();
-        let mut retry = tokio::time::interval(Duration::from_secs(1));
+        // Paces passes that found nothing waiting. The NATS cursor's `next()` itself blocks for
+        // its pull window (two seconds) before it answers "nothing waiting", so by then this tick
+        // is already due and costs nothing; it only stops a cursor that answers at once from
+        // spinning, holding it to one empty pass a second. An empty pass is not an error and
+        // keeps the cursor.
+        let mut idle = tokio::time::interval(RETRY);
+        idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::select! { _ = self.stop.cancelled() => break, _ = retry.tick() => {} }
             let pass = async {
                 if cursor.is_none() {
                     let connection = self.connector.connect().await?;
                     account = connection.account.account().to_owned();
                     cursor = Some(self.connector.compaction_consumer().await?);
                     self.metrics.attached.store(true, Ordering::Relaxed);
+                    tracing::info!(target: LOG, account = %account, durable = DURABLE,
+                        "compaction consumer attached");
                 }
                 let reader = cursor.as_mut().ok_or("compaction cursor absent")?;
-                if let Some(delivery) = reader.next().await.map_err(|e| e.to_string())? {
-                    self.settle_delivery(&delivery.message, &account, reader.as_mut())
-                        .await?;
-                }
-                Ok::<_, String>(())
+                let Some(delivery) = reader.next().await.map_err(|e| e.to_string())? else {
+                    return Ok(false);
+                };
+                self.settle_delivery(&delivery.message, &account, reader.as_mut())
+                    .await?;
+                Ok::<_, String>(true)
             };
-            tokio::select! {
+            let outcome = tokio::select! {
                 _ = self.stop.cancelled() => break,
-                outcome = tokio::time::timeout(Duration::from_secs(15), pass) => match outcome {
-                    Ok(Ok(())) => {},
-                    outcome => {
-                        self.metrics.error(match outcome { Ok(Err(e)) => e, _ => "compaction bus operation timed out".into() });
-                        self.metrics.attached.store(false, Ordering::Relaxed);
-                        cursor = None;
+                outcome = tokio::time::timeout(Duration::from_secs(15), pass) => outcome,
+            };
+            match outcome {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    tokio::select! { _ = self.stop.cancelled() => break, _ = idle.tick() => {} }
+                }
+                outcome => {
+                    let error = match outcome {
+                        Ok(Err(e)) => e,
+                        _ => "compaction bus operation timed out".into(),
+                    };
+                    // Logged once per attachment: a broker that stays down fails before a
+                    // cursor exists, and those retries only update the health snapshot.
+                    if cursor.take().is_some() {
+                        tracing::info!(target: LOG, account = %account, durable = DURABLE,
+                            error = %error, "compaction consumer detached; attaching again");
+                    }
+                    self.metrics.error(error);
+                    self.metrics.attached.store(false, Ordering::Relaxed);
+                    tokio::select! {
+                        _ = self.stop.cancelled() => break,
+                        _ = tokio::time::sleep(RETRY) => {}
                     }
                 }
             }
@@ -387,25 +465,33 @@ pub async fn apply_idle(
     records: &[broca_wal::WalRecord],
     ready: &ViewReady,
     plane: &Arc<dyn broca_core::CompactionPlane>,
+    views: Option<Arc<dyn broca_core::CompactionViews>>,
 ) -> Result<bool, String> {
+    // The view is not offered at all; `apply_idle_view` logs the decision when it is.
+    let deferred = |reason: &str| -> Result<bool, String> {
+        tracing::info!(target: LOG, session_ref = %ready.session_ref,
+            view_version = ready.view_version, choice = "deferred", reason,
+            "compaction view decided at the idle boundary");
+        Ok(false)
+    };
     let Some((config, run_id)) = records.iter().rev().find_map(|record| match record {
         broca_wal::WalRecord::RunStarted { config, run_id, .. } => Some((config.as_ref(), run_id)),
         _ => None,
     }) else {
-        return Ok(false);
+        return deferred("no_run");
     };
     let prior = broca_core::replay::replay(records).map_err(|e| e.to_string())?;
     // A parked or crash-interrupted episode must first replay its recorded boundary.
     // Actor idleness alone does not make its in-flight request safe to rewrite.
     if !prior.run_finished_durable {
-        return Ok(false);
+        return deferred("run_unfinished");
     }
     let mut raw = prior.prompt;
     broca_protocol::content::stamp_ordinals(&mut raw);
     let (frozen, opts, checkpoint) =
         crate::wal_render::boundary_options(records, config, &run_id.0, 0)?;
     let broca_core::compaction::CompactionCheckpoint::State(mut state) = checkpoint else {
-        return Ok(false);
+        return deferred("no_compaction_state");
     };
     let family = broca_provider::registry::wire_family(frozen.family_id)
         .ok_or("compaction wire renderer absent")?;
@@ -413,6 +499,7 @@ pub async fn apply_idle(
         session,
         writer,
         plane,
+        views,
         ready,
         &mut state,
         &opts.prompt,

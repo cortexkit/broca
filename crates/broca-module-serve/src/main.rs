@@ -3548,6 +3548,7 @@ mod executor {
                 &self
                     .compaction_plane()
                     .ok_or("compaction provider unavailable")?,
+                self.compaction_views(),
             )
             .await
         }
