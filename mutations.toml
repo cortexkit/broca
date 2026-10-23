@@ -18785,15 +18785,27 @@ new = "self.enroll_work(true, false) // NON-VACUITY BREAK"
 
 [[control]]
 id = "retention-raw-writer-enrollment"
-guards = "raw writers enqueue changed retained addresses without requiring a directory walk"
+guards = "a closing retained-session writer enqueues its address so the next sweep enrolls it without a directory walk"
 runner = "command"
 command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
 test_count_pattern = "running {count} test"
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::raw_writer_enrolls_without_walk_and_expires_on_deadline"]
 file = "crates/broca-core/src/wal_writer/retention_changes.rs"
-old = "let result = self.inner.append(fence, record, sync);\n        self.observe(record);"
-new = "let result = self.inner.append(fence, record, sync);\n        // NON-VACUITY BREAK: omit the raw writer hint."
+old = "lease is released.\n        if self.retained.load(Ordering::Acquire) {\n            self.changes.changed(&self.address);\n        }"
+new = "lease is released.\n        let _ = (&self.retained, &self.changes, &self.address); // NON-VACUITY BREAK: omit the writer close hint."
+
+[[control]]
+id = "retention-lease-release-enrollment"
+guards = "releasing a retained session's writer lease re-enqueues its address, so a sweep that found the lease held does not strand enrollment until a recovery walk"
+runner = "command"
+command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; cargo test --locked -p broca-module --features test-clock --lib \"$1\" -- --exact", "--", "{test}"]
+test_count_pattern = "running {count} test"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::sweep_between_writer_close_and_lease_release_still_enrolls_after_release"]
+file = "crates/broca-core/src/wal_writer/retention_changes.rs"
+old = "drop(self.inner.take());\n        if self.retained.load(Ordering::Acquire) {\n            self.changes.changed(&self.address);\n        }"
+new = "drop(self.inner.take());\n        let _ = (&self.retained, &self.changes, &self.address); // NON-VACUITY BREAK: omit the lease release hint."
 
 [[control]]
 id = "retention-index-deadline-on-time"
