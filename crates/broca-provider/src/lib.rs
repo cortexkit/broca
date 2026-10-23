@@ -20,6 +20,7 @@ pub mod conformance;
 pub mod credential_refresh;
 pub mod families;
 pub mod hash;
+pub mod media_profile;
 pub mod normalize;
 mod opencode_go;
 pub mod policy;

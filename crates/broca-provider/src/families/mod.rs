@@ -496,6 +496,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             token_limit_field: TokenLimitField::MaxTokens,
             reasoning_echo: None,
             tool_call_content_empty_string: false,
+            media: None,
         },
         WireFamilyId::OpenAiChat => Quirks {
             reasoning: ReasoningPolicy::None,
@@ -505,6 +506,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             token_limit_field: TokenLimitField::MaxTokens,
             reasoning_echo: None,
             tool_call_content_empty_string: false,
+            media: None,
         },
         WireFamilyId::OpenAiResponses => Quirks {
             reasoning: ReasoningPolicy::None,
@@ -514,6 +516,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             token_limit_field: TokenLimitField::MaxOutputTokens,
             reasoning_echo: None,
             tool_call_content_empty_string: false,
+            media: None,
         },
         WireFamilyId::Gemini => Quirks {
             reasoning: ReasoningPolicy::None,
@@ -523,6 +526,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             token_limit_field: TokenLimitField::GeminiMaxOutputTokens,
             reasoning_echo: None,
             tool_call_content_empty_string: false,
+            media: None,
         },
         WireFamilyId::BedrockConverse => Quirks {
             reasoning: ReasoningPolicy::None,
@@ -532,6 +536,7 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             token_limit_field: TokenLimitField::MaxTokens,
             reasoning_echo: None,
             tool_call_content_empty_string: false,
+            media: None,
         },
         // The inner body is the Gemini generateContent body, so the render quirks are
         // Gemini's; the family differs only in the envelope wrap + endpoint + OAuth auth.
@@ -622,6 +627,9 @@ pub fn resolve_frozen(
         opencode_go_qwen_thinking: false,
         opencode_go_deepseek_thinking: false,
         opencode_go_long_cache_retention_unsupported: false,
+        // Admission adds the profile with `media_profile::freeze_media_profile` once the
+        // config's family and wire model are final; until then the config renders as before.
+        media: None,
     })
 }
 
@@ -689,6 +697,7 @@ fn frozen_from_family_defaults(
         opencode_go_qwen_thinking: false,
         opencode_go_deepseek_thinking: false,
         opencode_go_long_cache_retention_unsupported: false,
+        media: None,
     }
 }
 

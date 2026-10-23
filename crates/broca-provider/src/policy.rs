@@ -39,6 +39,11 @@ pub struct Quirks {
     /// OpenAI convention (`null`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tool_call_content_empty_string: bool,
+    /// Which provider's media profile applies on a wire family several providers share (see
+    /// `crate::media_profile`). Unset falls back to the catalog provider id's entry, and a
+    /// provider with neither gets the conservative profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<crate::media_profile::MediaQuirk>,
 }
 
 /// Which assistant turns carry continuation state. Neither scope trims history at a user turn.

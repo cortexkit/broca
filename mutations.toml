@@ -25179,3 +25179,135 @@ old = '''                    || response_carries_input_modalities(&response)
                         != current.carries_input_modalities'''
 new = '''                    || false && response_carries_input_modalities(&response)
                         != current.carries_input_modalities // NON-VACUITY BREAK: reuse an index fetched without modalities.'''
+
+[[control]]
+id = "media-profile-gemini-3-wire-model-split"
+guards = "Gemini wire models of major version 3 select the Gemini 3 profile, whose tool results carry images and PDFs"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::profile_selection_follows_family_quirk_and_wire_model", "media_profile::tests::gemini_3_carries_tool_images_and_earlier_gemini_does_not"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '            Self::GeminiMajorAtLeast(min) => gemini_major(wire_model_id).is_some_and(|m| m >= min),'
+new = '            Self::GeminiMajorAtLeast(min) => gemini_major(wire_model_id).is_some_and(|m| m > min), // NON-VACUITY BREAK: treat Gemini 3 as an earlier generation.'
+
+[[control]]
+id = "media-profile-gemini-3-tool-parts"
+guards = "The Gemini 3 profile carries tool images and PDFs natively instead of as markers"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::gemini_3_carries_tool_images_and_earlier_gemini_does_not"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '        let tool = if tool_parts { Native } else { follow_up };'
+new = '        let tool = if tool_parts { follow_up } else { follow_up }; // NON-VACUITY BREAK: drop functionResponse.parts.'
+
+[[control]]
+id = "media-profile-chatgpt-input-audio-unset"
+guards = "The ChatGPT backend's input_audio carrier stays off until its live-gated flag is set"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::chatgpt_input_audio_defaults_to_unset"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '            let audio = if gates.chatgpt_input_audio {'
+new = '            let audio = if true { // NON-VACUITY BREAK: enable input_audio without a live check.'
+
+[[control]]
+id = "media-profile-conservative-fallback"
+guards = "A provider or model with no profile entry gets the conservative profile, not a family default"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::profile_selection_follows_family_quirk_and_wire_model", "media_profile::tests::providers_without_a_profile_get_the_conservative_profile", "media_profile::tests::profile_values_match_the_family_facts_table"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '        _ => P::Conservative,'
+new = '        _ => P::OpenaiChat, // NON-VACUITY BREAK: give unknown providers OpenAI Chat media carriers.'
+
+[[control]]
+id = "media-profile-anthropic-count-dependent-dimension"
+guards = "Anthropic's 2000 px side limit applies once a request holds more than 20 images"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::profile_values_match_the_family_facts_table"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '    DimensionLimit::new(20, 2_000),'
+new = '    DimensionLimit::new(21, 2_000), // NON-VACUITY BREAK: allow 21 large images.'
+
+[[control]]
+id = "media-profile-aging-byte-target-rule"
+guards = "Aging threshold validation refuses a byte target above half the byte trigger"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::aging_thresholds_reject_each_rule_violation"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '        if self.byte_target > self.byte_trigger / 2 {'
+new = '        if false { // NON-VACUITY BREAK: accept Lb above Cb/2.'
+
+[[control]]
+id = "media-profile-aging-token-context-rule"
+guards = "Aging threshold validation refuses a token trigger above half the model context"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::aging_thresholds_reject_each_rule_violation"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '        if self.token_trigger > context_tokens / 2 {'
+new = '        if false { // NON-VACUITY BREAK: accept Ct above half the context.'
+
+[[control]]
+id = "media-profile-derived-token-trigger"
+guards = "Every frozen profile's derived aging thresholds satisfy the threshold rules"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::every_frozen_profile_satisfies_the_aging_rules"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '        let token_trigger = context_tokens / 4;'
+new = '        let token_trigger = context_tokens; // NON-VACUITY BREAK: let media fill the whole context.'
+
+[[control]]
+id = "media-profile-freeze-uses-final-family"
+guards = "Freezing reads the config's final wire family, so an auth method's family override selects that family's profile"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::freeze_uses_the_spec_quirk_before_the_catalog_id_and_the_final_family"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '        frozen.family_id,'
+new = '        provider.wire_family, // NON-VACUITY BREAK: ignore the auth-method family override.'
+
+[[control]]
+id = "frozen-render-config-media-omitted-when-absent"
+guards = "An absent media profile is omitted from the frozen render config, keeping pre-media blobs byte-identical"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/media_profile_frozen.rs"
+expect_red = ["media_profile_frozen::a_config_without_media_omits_the_field_and_reads_back_as_absent"]
+file = "crates/broca-provider/src/wire.rs"
+old = '''    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<crate::media_profile::MediaProfile>,'''
+new = '''    #[serde(default)] // NON-VACUITY BREAK: write media: null on every frozen config.
+    pub media: Option<crate::media_profile::MediaProfile>,'''

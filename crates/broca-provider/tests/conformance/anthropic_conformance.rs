@@ -107,6 +107,7 @@ fn anthropic_spec() -> (ProviderSpec, ModelSpec) {
             token_limit_field: Default::default(),
             reasoning_echo: None,
             tool_call_content_empty_string: false,
+            media: None,
         },
         raw: serde_json::Value::Null,
     };
