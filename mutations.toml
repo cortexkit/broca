@@ -6131,9 +6131,134 @@ command = ["python3", "-B", "scripts/mutation-bash.py", "-c", "git diff --stat; 
 test_count_pattern = "Ran {count} test"
 test_file = "scripts/tests/test_clock_safety.py"
 expect_red = ["TestClockStaging.test_test_clock_marker_refuses_artifact"]
-file = "scripts/stage-release.sh"
+file = "scripts/nonshipping-markers.sh"
 old = "if [[ $(( artifact_s + artifact_n )) -gt 0 ]]; then"
 new = "if false && [[ $(( artifact_s + artifact_n )) -gt 0 ]]; then # NON-VACUITY BREAK"
+
+[[control]]
+id = "catalog-install-response-test-support-fence"
+platforms = ["linux", "macos"]
+guards = "catalog response replacement is absent from ordinary library builds"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["CatalogApiFence.test_snapshot_installers_require_test_support"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = '''    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_for_test('''
+new = '''    // NON-VACUITY BREAK: expose snapshot replacement to shipping callers.
+    pub fn install_for_test('''
+
+[[control]]
+id = "catalog-install-parsed-test-support-fence"
+platforms = ["linux", "macos"]
+guards = "parsed catalog replacement is absent from ordinary library builds"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["CatalogApiFence.test_snapshot_installers_require_test_support"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = '''    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_parsed_for_test('''
+new = '''    // NON-VACUITY BREAK: expose snapshot replacement to shipping callers.
+    pub fn install_parsed_for_test('''
+
+[[control]]
+id = "catalog-test-support-release-prohibition"
+platforms = ["linux", "macos"]
+guards = "optimized shipping builds cannot enable catalog snapshot replacement"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["CatalogApiFence.test_catalog_test_support_is_forbidden_without_debug_assertions"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = '''#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!("catalog test-support cannot be enabled in a release build");'''
+new = '// NON-VACUITY BREAK: permit optimized catalog test support.'
+
+[[control]]
+id = "provider-test-harness-retry-marker"
+platforms = ["linux", "macos"]
+guards = "the test-harness retry path carries a marker that release admission rejects"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["RetryMarkerStaging.test_retry_path_carries_the_marker"]
+file = "crates/broca-provider/src/transport.rs"
+old = 'tracing::info!("BROCA_TEST_HARNESS_VIRTUAL_RETRY_WAITS_V1");'
+new = 'tracing::info!("unmarked virtual retry waits"); // NON-VACUITY BREAK'
+
+[[control]]
+id = "provider-test-harness-staging-fence"
+platforms = ["linux", "macos"]
+guards = "release staging refuses the virtual retry wait marker"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["RetryMarkerStaging.test_test_harness_marker_refuses_artifact"]
+file = "scripts/nonshipping-markers.sh"
+old = "if [[ $(( artifact_s + artifact_n )) -gt 0 ]]; then"
+new = "if false && [[ $(( artifact_s + artifact_n )) -gt 0 ]]; then # NON-VACUITY BREAK"
+
+[[control]]
+id = "release-placement-nonshipping-marker-fence"
+platforms = ["linux", "macos"]
+guards = "direct placement checks the final signed copy for non-shipping markers"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["ReleaseMarkerPlacement.test_direct_placement_refuses_nonshipping_markers"]
+file = "scripts/place-release.sh"
+old = '''broca_refuse_nonshipping_markers "$TMP" place-release || \
+  gate_refuse nonshipping-marker "$TMP" "the copy contains test-only code, or its marker could not be checked."'''
+new = ': # NON-VACUITY BREAK: bypass final artifact admission.'
+
+[[control]]
+id = "release-placement-checks-signed-marker-copy"
+platforms = ["linux", "macos"]
+guards = "a marker introduced by re-signing cannot bypass final placement admission"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["ReleaseMarkerPlacement.test_marker_added_by_signing_is_refused"]
+file = "scripts/place-release.sh"
+old = 'broca_refuse_nonshipping_markers "$TMP" place-release ||'
+new = '''# NON-VACUITY BREAK: inspect bytes from before signing.
+broca_refuse_nonshipping_markers "$STAGED" place-release ||'''
+
+[[control]]
+id = "release-staging-client-marker-fence"
+platforms = ["linux", "macos"]
+guards = "release staging rejects non-shipping retry code in shipped clients"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["ClientMarkerStaging.test_staging_refuses_test_harness_client"]
+file = "scripts/stage-release.sh"
+old = '    broca_refuse_nonshipping_markers "$client_tmp" stage-release'
+new = '    : # NON-VACUITY BREAK: publish a client with test-only code.'
+
+[[control]]
+id = "release-placement-client-marker-fence"
+platforms = ["linux", "macos"]
+guards = "placement rejects non-shipping retry code in the final signed client copy"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["ReleaseMarkerPlacement.test_client_marker_refuses_before_any_binary_is_placed"]
+file = "scripts/place-release.sh"
+old = '''  broca_refuse_nonshipping_markers "$client_tmp" place-release || \
+    gate_refuse nonshipping-marker "$client_tmp" "the client contains test-only code, or its marker could not be checked."'''
+new = '  : # NON-VACUITY BREAK: publish a client with test-only code.'
 
 [[control]]
 id = "retention-test-clock-execution-sentinel"
