@@ -2151,7 +2151,9 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(&arguments.to_string())
             .cloned();
         match gate {
-            Some(gate) if gate.arrived.load(std::sync::atomic::Ordering::SeqCst) => {
+            Some(gate) => {
+                // Release is a permit for an installed script, not a claim that it arrived.
+                // A later held turn must observe this permit when it reaches the provider.
                 HoldGate::set(&gate.released, &gate.released_wake);
                 Ok(())
             }
@@ -4122,4 +4124,67 @@ async fn pending_delivery_order_send_is_retracted_before_tool_result() {
         !serde_json::to_string(&page).unwrap().contains(marker),
         "retracted send reached the transcript: {page}"
     );
+}
+
+#[cfg(test)]
+mod held_call_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn subject(shared: Arc<Shared>) -> BrocaSubject {
+        BrocaSubject {
+            shared,
+            model_url: String::new(),
+            project_root: PathBuf::new(),
+            dump_dir: None,
+            binary: None,
+            backup_classes: None,
+            bus_events_enabled: false,
+            process_kills_disabled: true,
+            reserved_reader: false,
+            #[cfg(feature = "test-clock")]
+            bus: None,
+            #[cfg(feature = "test-clock")]
+            mc: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn release_registered_future_call_keeps_release_until_arrival() {
+        let shared = Arc::new(Shared::default());
+        let arguments = json!({"nonce":"future-held-call"});
+        let gate = Arc::new(HoldGate::default());
+        shared
+            .holds
+            .lock()
+            .unwrap()
+            .insert(arguments.to_string(), gate.clone());
+        let subject = subject(shared);
+        subject
+            .release_tool_call(&arguments)
+            .await
+            .expect("a registered future hold can be released");
+        assert!(
+            !gate.arrived.load(Ordering::SeqCst),
+            "release must not fabricate provider arrival"
+        );
+        assert!(gate.released.load(Ordering::SeqCst));
+        HoldGate::set(&gate.arrived, &gate.arrived_wake);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            HoldGate::wait(&gate.released, &gate.released_wake),
+        )
+        .await
+        .expect("a later arriving provider must see the earlier release");
+    }
+
+    #[tokio::test]
+    async fn unregistered_call_release_is_rejected() {
+        let subject = subject(Arc::new(Shared::default()));
+        let error = subject
+            .release_tool_call(&json!({"nonce":"unknown-call"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("the call is not held"));
+    }
 }

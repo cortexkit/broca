@@ -25050,3 +25050,18 @@ expect_red = ["llm_runner_role::unsupported_output_refs_precedes_plan_overrides_
 file = "crates/broca-fetch-plan/src/plan.rs"
 old = "    if in_lists || in_compaction {"
 new = "    if in_lists && in_compaction { // NON-VACUITY BREAK: require two unsupported flags before refusing either."
+
+[[control]]
+id = "conformance-release-future-held-call"
+platforms = ["linux", "macos"]
+guards = "A registered scripted hold can be released before provider arrival without fabricating arrival or losing the release"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["held_call_tests::release_registered_future_call_keeps_release_until_arrival"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = "            Some(gate) => {\n                // Release is a permit for an installed script, not a claim that it arrived."
+new = "            Some(gate) if gate.arrived.load(std::sync::atomic::Ordering::SeqCst) => { // NON-VACUITY BREAK: reject release before provider arrival.\n                // Release is a permit for an installed script, not a claim that it arrived."
