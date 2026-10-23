@@ -760,6 +760,7 @@ impl SessionReadReason {
             }
             SessionReadReason::Pause(PauseReason::AuthRequired) => "auth_required",
             SessionReadReason::Pause(PauseReason::Restart) => "restart",
+            SessionReadReason::Pause(PauseReason::ToolHeld) => "tool_held",
         }
     }
 }

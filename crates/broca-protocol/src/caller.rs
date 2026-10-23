@@ -358,6 +358,16 @@ pub enum PauseReason {
     AuthRequired,
     /// A graceful process stop at a clean boundary; the same episode can resume after boot.
     Restart,
+    /// The run waits for the late result of a tool call its provider answered with a `held`
+    /// marker (tool-provider contract §4.1, `held-reply/v1`). The caller does not resume it:
+    /// the intended design is that broca resumes the same run itself when the provider
+    /// publishes the call's late result. The reason is informational; which calls the run
+    /// waits on is reported separately.
+    ///
+    /// In the WAL this value is must-understand (feature `provider-held/v1`): a build without
+    /// that feature refuses the frame instead of misreading the pause. No production path
+    /// writes it yet, and this build's WAL reader does not list the feature.
+    ToolHeld,
 }
 
 impl PauseReason {
@@ -366,6 +376,7 @@ impl PauseReason {
         match self {
             PauseReason::AuthRequired => "auth_required",
             PauseReason::Restart => "restart",
+            PauseReason::ToolHeld => "tool_held",
         }
     }
 }
@@ -781,7 +792,11 @@ mod tests {
                 OpenState::Known(reason)
             );
         }
-        for reason in [PauseReason::AuthRequired, PauseReason::Restart] {
+        for reason in [
+            PauseReason::AuthRequired,
+            PauseReason::Restart,
+            PauseReason::ToolHeld,
+        ] {
             let closed = serde_json::to_string(&reason).unwrap();
             assert_eq!(closed, format!("\"{}\"", reason.as_str()));
             let open = OpenPauseReason::from(reason);
@@ -807,6 +822,20 @@ mod tests {
         assert!(
             paused.is_err(),
             "a paused unit has no unknown reason to carry; the subscribe reader handles it"
+        );
+    }
+
+    #[test]
+    fn tool_held_pause_reason_is_spelled_tool_held() {
+        // The WAL, the control stream and run status all carry this exact spelling.
+        assert_eq!(PauseReason::ToolHeld.as_str(), "tool_held");
+        assert_eq!(
+            serde_json::to_string(&PauseReason::ToolHeld).unwrap(),
+            "\"tool_held\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PauseReason>("\"tool_held\"").unwrap(),
+            PauseReason::ToolHeld
         );
     }
 }

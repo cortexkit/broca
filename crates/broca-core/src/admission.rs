@@ -1012,6 +1012,9 @@ impl AdmissionCheckpointV1 {
             | WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
+            // A provider-held call admits nothing and owns nothing: admission ownership and
+            // episode/queue membership come from the call's batch and run records, not this one.
+            WalRecord::ToolCallProviderHeld { .. } => {}
             // An informational record, skipped exactly like `Unknown`.
             WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::InputTokenBudgetExhausted { .. }

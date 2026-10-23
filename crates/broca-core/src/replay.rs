@@ -2092,6 +2092,11 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
+            // Unreachable in this build: `provider-held/v1` is not in `broca_wal::KNOWN_FEATURES`,
+            // so a WAL carrying this record is refused before replay reads it. The release that
+            // lists the feature makes replay class the call as open and provider-held, never
+            // indeterminate; until then this arm must not be read as that behaviour.
+            WalRecord::ToolCallProviderHeld { .. } => {}
             // These metadata records are omitted from prompt construction: they contain no messages.
             WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::InputTokenBudgetExhausted { .. }

@@ -25337,3 +25337,55 @@ expect_red = ["subc_plane::tests::release_builds_exclude_test_only_hooks"]
 file = "crates/broca-subc/src/subc_plane.rs"
 old = "#[cfg(debug_assertions)]\n    #[doc(hidden)]\n    pub fn with_scope_sync_hold_for_test("
 new = "// NON-VACUITY BREAK: ship the scope hold test override\n    #[doc(hidden)]\n    pub fn with_scope_sync_hold_for_test("
+
+[[control]]
+id = "wal-provider-held-record-is-must-understand"
+guards = "A provider-held record is written only in a frame gated on provider-held/v1, so an older reader refuses it instead of skipping it and sealing the held call indeterminate"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::provider_held_records_are_gated_and_an_older_reader_refuses_them", "framing::provider_held_tests::a_held_run_gates_only_the_held_record_and_its_pause", "framing::provider_held_tests::the_floor_is_raised_before_the_first_provider_held_frame", "record::pinned_bytes_tests::provider_held_records_keep_their_bytes_and_require_only_provider_held"]
+file = "crates/broca-wal/src/record.rs"
+old = "            | WalRecord::ToolCallProviderHeld { .. } => &[crate::framing::PROVIDER_HELD_FEATURE],"
+new = " => &[crate::framing::PROVIDER_HELD_FEATURE],\n            WalRecord::ToolCallProviderHeld { .. } => &[], // NON-VACUITY BREAK: write the held record in an ungated frame."
+
+[[control]]
+id = "wal-tool-held-pause-is-must-understand"
+guards = "A tool_held pause is written only in a frame gated on provider-held/v1, so an older reader refuses it instead of failing on the closed pause enum"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::provider_held_records_are_gated_and_an_older_reader_refuses_them", "framing::provider_held_tests::a_held_run_gates_only_the_held_record_and_its_pause", "record::pinned_bytes_tests::provider_held_records_keep_their_bytes_and_require_only_provider_held"]
+file = "crates/broca-wal/src/record.rs"
+old = "            WalRecord::RunPaused {\n                reason: PauseReason::ToolHeld,\n                ..\n            }\n            | WalRecord::ToolCallProviderHeld"
+new = "            WalRecord::RunPaused {\n                reason: PauseReason::ToolHeld,\n                ..\n            } => &[], // NON-VACUITY BREAK: write a tool_held pause in an ungated frame.\n            WalRecord::ToolCallProviderHeld"
+
+[[control]]
+id = "wal-never-held-run-keeps-todays-frames"
+guards = "Only a tool_held pause needs provider-held/v1: a never-held run's auth pause keeps its ordinary frame and raises no feature floor"
+runner = "cargo"
+select = "expected"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing/provider_held_tests.rs"
+expect_red = ["framing::provider_held_tests::a_never_held_run_writes_todays_frames_and_never_raises_the_floor", "framing::tests::older_pause_reasons_do_not_require_provider_held"]
+file = "crates/broca-wal/src/record.rs"
+old = "                reason: PauseReason::ToolHeld,\n                ..\n            }\n            | WalRecord::ToolCallProviderHeld"
+new = "                ..\n            } // NON-VACUITY BREAK: gate every pause other than a restart pause.\n            | WalRecord::ToolCallProviderHeld"
+
+[[control]]
+id = "protocol-tool-held-pause-spelling"
+guards = "The tool_held pause reason keeps the one spelling the WAL, the control stream and run status share"
+runner = "cargo"
+select = "expected"
+package = "broca-protocol"
+target = "--lib"
+test_file = "crates/broca-protocol/src/caller.rs"
+expect_red = ["caller::tests::tool_held_pause_reason_is_spelled_tool_held", "caller::tests::known_open_states_keep_the_closed_wire_spelling"]
+file = "crates/broca-protocol/src/caller.rs"
+old = 'PauseReason::ToolHeld => "tool_held",'
+new = 'PauseReason::ToolHeld => "held", // NON-VACUITY BREAK: respell the tool_held pause reason.'

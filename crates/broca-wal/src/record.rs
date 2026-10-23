@@ -511,6 +511,10 @@ pub enum WalRecord {
         /// flight, or a `decision_pending` result naming the question it filed. Replay renders
         /// `result` unchanged. Must-understand (feature `deferred-call/v1`): a reader that
         /// skipped it would lose the obligation to withdraw the call from the provider.
+        ///
+        /// Superseded by [`WalRecord::ToolCallProviderHeld`] and never written: a provider-held
+        /// call is to be recorded with that record instead, whose interim reply never reaches the
+        /// model. Always `None` on every record broca writes; kept so the reader still decodes it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_held: Option<ProviderHeld>,
         /// Runner tags (feature `runner-tags/v1`): the per-part tags of the message(s)
@@ -1078,6 +1082,45 @@ pub enum WalRecord {
         reason: Option<String>,
     },
 
+    // ── calls a tool provider holds past its reply (feature `provider-held/v1`) ──
+    //
+    // Must-understand: written only in a gated frame requiring
+    // `crate::framing::PROVIDER_HELD_FEATURE`, as is a `RunPaused` with `PauseReason::ToolHeld`.
+    // An older build that skipped this record would see a dispatched call without a result,
+    // class it indeterminate and seal the run Interrupted, losing a result the provider still
+    // owes.
+    /// A tool provider accepted the call and answered with a `held` marker (tool-provider
+    /// contract §4.1, `held-reply/v1`): the real result arrives later as a `late_results` entry
+    /// for `call_key` (§7). The writer must append and sync it before acting on anything else
+    /// in the reply. No production path writes it yet (see `framing::PROVIDER_HELD_FEATURE`).
+    ///
+    /// The call's `ToolDispatchIntent` precedes this record, and no terminal does: the call is
+    /// open but not indeterminate, because the provider confirmed it holds the call. Its later
+    /// terminal is an ordinary `ToolResult` under the same `batch_id`. The held reply's interim
+    /// content is never stored and never enters a prompt; this record adds nothing to the
+    /// transcript.
+    ToolCallProviderHeld {
+        batch_id: BatchId,
+        tool_call_id: ToolCallId,
+        /// The key the call was sent with, which the provider's late entry names.
+        call_key: String,
+        /// The tool provider module the call was dispatched to; its feed delivers the result.
+        module: String,
+        /// The `held.reason` the provider gave, verbatim. An open snake_case string: reasons a
+        /// later contract adds are kept as sent. Informational only, never a decision input.
+        reason: String,
+        /// Lowercase hex SHA-256 of the held marker's `detail` object as serialized JSON, when
+        /// the provider sent one. The detail itself is provider-owned and not stored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail_digest: Option<String>,
+        /// Wall-clock time the held reply was accepted, in milliseconds.
+        held_at_ms: u64,
+        /// True when the batch dispatches its calls one after another
+        /// (`ExecutionMode::Sequential`): calls planned after this one have their intents but
+        /// are not sent before this call has its terminal.
+        sequential: bool,
+    },
+
     // ── sends with an ordered `delivery` list (feature `delivery-order/v1`) ──
     //
     // Every record in this group is must-understand and is only ever written in a gated frame
@@ -1541,6 +1584,7 @@ impl WalRecord {
             | Self::LateApprovalRecorded { .. }
             | Self::LateDispatchIntent { .. }
             | Self::QuestionWithdrawalAcknowledged { .. }
+            | Self::ToolCallProviderHeld { .. }
             | Self::DeliveryOrdered { .. }
             | Self::SendEnded { .. }
             | Self::Unknown => false,
@@ -1761,6 +1805,11 @@ impl WalRecord {
                 reason: PauseReason::Restart,
                 ..
             } => &[RESTART_PAUSE_FEATURE],
+            WalRecord::RunPaused {
+                reason: PauseReason::ToolHeld,
+                ..
+            }
+            | WalRecord::ToolCallProviderHeld { .. } => &[crate::framing::PROVIDER_HELD_FEATURE],
             WalRecord::RunStarted {
                 scope,
                 manifest,
@@ -2444,6 +2493,9 @@ pub struct WithdrawElicitation {
 }
 
 /// A call a tool provider holds past its reply ([`WalRecord::ToolResult`]).
+///
+/// Superseded by [`WalRecord::ToolCallProviderHeld`] and never written; the reader still
+/// decodes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderHeld {
     pub call_key: String,
