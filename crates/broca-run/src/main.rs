@@ -54,7 +54,8 @@ struct Args {
     /// The model to run. With `--base-url`, this is the wire model id sent verbatim.
     /// Without `--base-url`, this is a catalog id `<provider>/<model>` (e.g.
     /// `anthropic/claude-opus-5` or `deepseek/deepseek-v4-flash`) that resolves the wire
-    /// family, base URL, and auth kind from the bundled catalog.
+    /// family, base URL, and auth kind from Fusiform, with a stored last-known-good
+    /// catalog as fallback.
     #[arg(long)]
     model: String,
 
@@ -231,13 +232,10 @@ async fn run(args: Args) -> Result<i32, String> {
 
     // 1b. Fill the catalog before resolving a model.
     //
-    // Resolution reads the process-global cache and no longer falls back to a compile-time
-    // snapshot, so without this every model id fails with "model catalog unavailable". The
-    // daemon fills it from a detached 30-minute poll and can serve from the last-known-good
-    // meanwhile; a one-shot CLI has neither a loop nor a prior LKG to fall back on, so it polls
-    // once and waits. That makes fusiform a hard startup dependency HERE and only here -- the
-    // opposite of the daemon's posture, and correct for a foreground command that would
-    // otherwise fail with a confusing error a few lines later.
+    // Resolution reads the process-global cache, not a compile-time snapshot. Open and
+    // install the LKG shared with the daemon, then wait for one Fusiform poll to refresh it.
+    // A failed poll can use the installed LKG; startup refuses only if neither is available.
+    // This setup runs even with --base-url, which bypasses catalog-based model resolution.
     let lkg_path = catalog_lkg_path(&args)?;
     let catalog_cache = std::sync::Arc::new(broca_catalog::CatalogCache::open(lkg_path.clone()));
     broca_catalog::install_global_catalog_cache(std::sync::Arc::clone(&catalog_cache));

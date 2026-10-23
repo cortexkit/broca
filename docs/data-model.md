@@ -362,7 +362,7 @@ call of that batch that never left the process), commits the batch, then seals t
 |---|---|
 | `queued` | `submission_id`, `request` (the caller's full `SubmissionRequest`), `request_identity_digest` (absent), `principal` (absent), `send_id` (absent), `title` (absent; the send's title, carried onto the `run_started` that drains it, informational like `run_started.title`), `delivery` (absent; `"interrupt"` for the message an interrupting send queued before cancelling the run it interrupted). A prompt queued while a run was active. |
 | `retracted` | `submission_id`, `failure` (absent, `{run_id, error: ProviderError}` when the queued head could never be admitted). |
-| `steered` | `send_id` (absent), `request_identity_digest` (absent), `delivery` (absent; `"steer"`), `title` (absent; the steering send's title, informational like `run_started.title`), `input` (the user message(s)), `hooks` (absent; reserved, never written yet). **Must-understand, feature `steer-queue/v1`**: always a `ver = 3` frame. A message a caller added to the running turn. |
+| `steered` | `send_id` (absent), `request_identity_digest` (absent), `delivery` (absent; `"steer"`), `title` (absent; the steering send's title, informational like `run_started.title`), `input` (the user message(s), after any pre-user transformations), `hooks` (absent; optional pre-user hook metadata, written alongside the prepared `input`). **Must-understand, feature `steer-queue/v1`**: always a `ver = 3` frame. A message a caller added to the running turn. |
 | `delivery_ordered` | `submission_id`, `order` (`{modes, dedupe_key?, expires_at_ms?}`). **Must-understand, feature `delivery-order/v1`**. The ordered `delivery` list of the `queued` record for the same submission that follows it in the same barrier (a running turn's own records may lie between them). Written only for a send using the `delivery_order` group. |
 | `send_ended` | `submission_id`, `reason` (`{kind: "superseded", by}` or `{kind: "expired"}`). **Must-understand, feature `delivery-order/v1`**. A queued ordered send that will never be delivered; removes it from the pending queue like `retracted`. |
 | `send_delivered` | `submission_id`, `run_id`, `mode` (`"steer"` or `"tool_result"`), `input` (with `steer`: placed like a `steered` record's input), `tool_call_id` and `appended_text` (with `tool_result`: rendered after that result's stored output, which is never changed; written between the batch's `tool_batch_finished` and `turn_finished`). **Must-understand, feature `delivery-order/v1`**. Consumes the queued send; an `idle_start` delivery is the `run_started` naming its `submission_id`. |
@@ -379,7 +379,8 @@ A `steered` message is placed in the conversation at the first step boundary aft
 the episode's next `step_started` (that step renders it, as a user message appended after
 everything before it), or the episode's `run_finished` when no further step comes. It is never
 placed between a tool call and its result. `session.read` shows it at that position, and not
-before it is placed. Replay renders `input` exactly as written.
+before it is placed. A missing `hooks` field decodes as absent. Replay renders `input`
+exactly as written and never re-runs hooks.
 
 #### Informational
 

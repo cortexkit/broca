@@ -1208,9 +1208,10 @@ start and names both paths.
 Additive WAL changes must retain the existing compatibility rules:
 1. **Episode-aware replay state machine**: per-`RunStarted` episode reset; prior
    episodes → prefix; last-unfinished resumable; explicit append-new-episode path.
-   **`recover_run_config` MUST return the LAST active/resumable episode's
-   config/run_id/counters, not the first `RunStarted`** (today it returns the first —
-   correct for a single-run WAL, wrong for a lineage). Replay classification: last
+   **Resume uses the LAST active/resumable episode's config/run_id/counters,
+   not the first `RunStarted`**. The `recover_run_config` test helper likewise returns
+   the last started episode's effective config, including subsequent render-config
+   and auth refreezes. Replay classification: last
    episode `RunPaused` → `AuthRequired`; last episode `RunFinished` → idle/appendable;
    last episode open → resume it.
 2. **WAL enrichment** (§18): `origin`+`submission_id` on `RunStarted`; `StepStarted`;
@@ -1220,9 +1221,10 @@ Additive WAL changes must retain the existing compatibility rules:
    durable cursor. **The durable head MUST be the last FSYNCED WAL seq, NOT
    `FileWal::last_seq()`** — `append(sync=false)` advances `next_seq` before fsync, so a
    client cursor must only advance past the fsync barrier (the live tail backpatches its
-   events with assigned seqs once fsynced; `WalHandle::record`/`sync` must surface the
-   assigned seq, which they discard today). Cursor state does NOT reset at episode
-   boundaries (WAL seq is monotonic per lineage file across episodes).
+   events with assigned seqs once fsynced). `WalHandle::record` returns `RecordOutcome`
+   (`Accepted(seq)` or `Refused(error)`); `sync` returns the last fsynced head on success.
+   An accepted append's seq is not durable until sync succeeds. Cursor state does NOT
+   reset at episode boundaries (WAL seq is monotonic per lineage file across episodes).
 4. **Durable queue + identity**: wire the queue records, replay = queued − retracted
    − consumed.
 5. **AuthRequired = RunPaused**: non-terminal record + `ReplayResolution::AuthRequired`

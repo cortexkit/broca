@@ -31,12 +31,13 @@ members = [
 # - crates/broca-protocol : canonical types ONLY (no IO). The provider<->runner
 #   stream-part schema, the runner<->caller control-unit schema, the framed
 #   two-lane OutputStream envelope, the error taxonomy, Usage, cache-tier
-#   markers. This crate is where the Phase-0 wire contract is frozen.
-# - crates/broca-provider  : a provider module binary. Owns one provider's WAN
-#   SSE transport + auth, normalizes wire->canonical stream-parts, emits the two
-#   lanes over the direct runner<->provider socket (reusing subc-transport).
-# - crates/broca-core      : the runner. Direct client of provider modules
-#   (Phase 0); the agentic loop lands in Phase 1.
+#   markers. This crate defines the shared wire contract.
+# - crates/broca-provider  : wire-family renderers, normalizers, and live provider
+#   transports. Its producer binary also serves the process-separated benchmark.
+# - crates/broca-core      : the agentic run loop, model steps, tool dispatch, and
+#   WAL-backed resume.
+# - crates/broca-subc      : daemon connections and adapters for tool routing,
+#   compaction, and hooks.
 # - crates/broca-bench     : the (A) latency/jitter test bench — in-process vs
 #   process-separated, deterministic SSE replay, CLOCK_MONOTONIC one-way timing.
 #
