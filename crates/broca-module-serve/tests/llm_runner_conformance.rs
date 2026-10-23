@@ -162,8 +162,11 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    /// Turns served so far for each session whose scripted model counts its own turns. The
+    /// real Magic Context rig needs this: an applied view can drop messages, so the number of
+    /// assistant messages in a request no longer says which turn comes next.
     #[cfg(feature = "test-clock")]
-    mc_historian: std::sync::atomic::AtomicBool,
+    counted_turns: Mutex<HashMap<String, usize>>,
     /// The `mid` of every message a `session.read` answered, keyed by the message's JSON: broca
     /// keys a part `<mid>#<index>`, so naming a message's parts needs the message's `mid`.
     read_mids: Mutex<HashMap<String, String>>,
@@ -414,14 +417,6 @@ async fn serve_model_request(
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
     let model = request["model"].as_str().unwrap_or_default();
     let model = model.strip_prefix("mock/").unwrap_or(model);
-    #[cfg(feature = "test-clock")]
-    if shared
-        .mc_historian
-        .load(std::sync::atomic::Ordering::SeqCst)
-        && matches!(model, "historian" | "scripted/historian")
-    {
-        return mc_e2e::serve_historian(stream, &request).await;
-    }
     let session = if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
         shared
             .plan_sessions
@@ -465,6 +460,12 @@ async fn serve_model_request(
     // Legacy sessions are matched to their scripted turn by the number of assistant messages
     // already in the request. A step cut at StepRecorded stays in the transcript (the seal keeps
     // it with a never-executed result), so this count is the number of turns already served.
+    #[cfg(feature = "test-clock")]
+    let counted = session
+        .as_ref()
+        .and_then(|session| shared.counted_turns.lock().unwrap().get(session).copied());
+    #[cfg(not(feature = "test-clock"))]
+    let counted: Option<usize> = None;
     let turn_index = session
         .as_ref()
         .and_then(|session| {
@@ -475,6 +476,7 @@ async fn serve_model_request(
                 .get(session)
                 .map(|state| state.emitted)
         })
+        .or(counted)
         .unwrap_or_else(|| {
             messages
                 .iter()
@@ -514,6 +516,10 @@ async fn serve_model_request(
         return Ok(());
     };
     let session = session.expect("a turn was found for it");
+    #[cfg(feature = "test-clock")]
+    if let Some(served) = shared.counted_turns.lock().unwrap().get_mut(&session) {
+        *served += 1;
+    }
     shared
         .requests
         .lock()
@@ -986,6 +992,7 @@ impl BrocaSubject {
         #[cfg(feature = "test-clock")]
         if let Some(mc) = &self.mc {
             config["modules"]["magic-context"] = mc.module();
+            mc_e2e::scope_config(&mut config, root);
         }
         let broca_config = config_home.join("cortexkit/broca.jsonc");
         std::fs::write(
