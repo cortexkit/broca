@@ -139,6 +139,9 @@ pub struct StorePageSnapshot {
     /// Captured at the watermark on model-view reads only. Absent forces a complete read
     /// for a compaction session; the raw page path never decodes or consumes this state.
     pub compaction: Option<crate::compaction::CompactionCheckpoint>,
+    /// A durable Setup is already covered by this prefix. Only the lineage's first Setup
+    /// may renumber tags, so raw reads need this fact even without its replacement payload.
+    pub compaction_setup_seen: bool,
     /// Where tag numbering continues after the materialized prefix: read from its last row,
     /// whose stored tags carry the number before it and its run's computed rules.
     pub tag_seed: crate::tags::TagSeed,
@@ -161,6 +164,7 @@ impl StorePageSnapshot {
             last_run_id: None,
             last_episode_usage: None,
             compaction: None,
+            compaction_setup_seen: false,
             tag_seed: crate::tags::TagSeed::default(),
         }
     }
@@ -1012,7 +1016,7 @@ fn read_session_page_from_rows(
             deferred_calls: deferred_calls.filter(|view| !view.calls.is_empty()),
             late_approvals,
             withdrawals_owed,
-            tags_await_setup: tail_state.tags_await_setup,
+            tags_await_setup: tail_state.tags_await_setup && !snapshot.compaction_setup_seen,
         },
         dispatches,
     ))
@@ -2464,6 +2468,7 @@ mod tests {
             deferred_calls: None,
             compaction: None,
             watermark_seq: prefix.watermark_seq,
+            compaction_setup_seen: false,
             lineage_id: None,
             control_head: crate::project_control(
                 &framed

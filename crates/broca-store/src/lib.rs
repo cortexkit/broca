@@ -353,6 +353,7 @@ struct PreparedProjection {
     last_run_id: Option<String>,
     last_title: Option<String>,
     last_episode_usage_json: String,
+    compaction_setup_seen: bool,
     checkpoint_json: String,
     anchor_file_id: Option<String>,
     anchor_seq: Option<i64>,
@@ -1099,6 +1100,7 @@ impl SqliteStore {
             // `Steered`. NULL when no projected send carried one, and on rows not reprojected
             // since the column existed.
             ("last_title", "TEXT"),
+            ("compaction_setup_seen", "INTEGER"),
             ("deferred_calls_json", "TEXT"),
             ("run_attribution_version", "INTEGER NOT NULL DEFAULT 0"),
             ("episode_spans_complete", "INTEGER NOT NULL DEFAULT 0"),
@@ -1160,6 +1162,10 @@ impl SqliteStore {
         // index for the same reason: `session.head` reads it on every call.
         conn.execute(
             "CREATE INDEX IF NOT EXISTS meta_last_title_idx ON meta(session, last_title)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS meta_compaction_setup_idx ON meta(session, compaction_setup_seen)",
             [],
         )?;
         let run_index_columns = {
@@ -1496,6 +1502,7 @@ impl SqliteStore {
                         last_run_id: prepared.last_run_id,
                         last_title: prepared.last_title,
                         last_episode_usage_json: prepared.last_episode_usage_json,
+                        compaction_setup_seen: prepared.compaction_setup_seen,
                         checkpoint_json: prepared.checkpoint_json,
                         anchor_file_id: prepared
                             .anchor
@@ -1669,8 +1676,8 @@ impl SqliteStore {
                  retries_used, last_step_usage_json, last_step_finish_reason_json, last_run_id,
                  last_episode_usage_json, prefix_len, admission_checkpoint_json, wal_anchor_file_id,
                  wal_anchor_seq, wal_anchor_byte_end, control_head_wal_seq, control_head_sub_index,
-                 last_title
-              ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                 last_title, compaction_setup_seen
+              ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
               ON CONFLICT(session) DO UPDATE SET
                  watermark_seq=?2, lineage_id=?3, completed_steps=?4, usage_json=?5,
                  retries_used=?6, last_step_usage_json=?7, last_step_finish_reason_json=?8,
@@ -1678,7 +1685,7 @@ impl SqliteStore {
                  admission_checkpoint_json=?12, wal_anchor_file_id=?13, wal_anchor_seq=?14,
                  wal_anchor_byte_end=?15, control_head_wal_seq=?16,
                  control_head_sub_index=?17,
-                 last_title=COALESCE(?18, meta.last_title)",
+                 last_title=COALESCE(?18, meta.last_title), compaction_setup_seen=?19",
             rusqlite::params![
                 key,
                 prepared.new_watermark as i64,
@@ -1704,6 +1711,7 @@ impl SqliteStore {
                 // session's meta row above before reprojecting from sequence one, so this insert
                 // starts from no title and nothing stale survives.
                 prepared.last_title,
+                prepared.compaction_setup_seen,
             ],
         )?;
         tx.execute(
@@ -2093,6 +2101,48 @@ impl MaterializedStore for SqliteStore {
         } else {
             None
         };
+        // Only the lineage's first Setup may anchor tag numbers. Keep that durable fact
+        // beside the page watermark, without loading replacement text on every raw read.
+        let compaction_setup_seen = tx
+            .query_row(
+                "SELECT compaction_setup_seen FROM meta INDEXED BY meta_compaction_setup_idx WHERE session=?1",
+                [&key],
+                |row| row.get::<_, Option<bool>>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+        let compaction_setup_seen = match compaction_setup_seen {
+            Some(seen) => seen,
+            None if watermark_seq > 0 => {
+                // Legacy rows have no scalar yet. Decode their captured checkpoint once,
+                // then cache the summary in this same transaction; no WAL scan is needed.
+                let checkpoint_json: Option<String> = tx
+                    .query_row(
+                        "SELECT admission_checkpoint_json FROM meta WHERE session=?1",
+                        [&key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .flatten();
+                let seen = checkpoint_json
+                    .as_deref()
+                    .and_then(decode_admission_checkpoint)
+                    .filter(|checkpoint| checkpoint.at_seq == watermark_seq)
+                    .and_then(|checkpoint| checkpoint.compaction)
+                    .map(|checkpoint| checkpoint.state().is_some());
+                if let Some(seen) = seen {
+                    tx.execute(
+                        "UPDATE meta SET compaction_setup_seen=?2 WHERE session=?1",
+                        rusqlite::params![key, seen],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                seen.unwrap_or(false)
+            }
+            None => false,
+        };
         let hidden_through = compaction
             .as_ref()
             .and_then(|checkpoint| checkpoint.state())
@@ -2235,6 +2285,7 @@ impl MaterializedStore for SqliteStore {
             .flatten();
         tx.commit().map_err(|e| e.to_string())?;
         Ok(StorePageSnapshot {
+            compaction_setup_seen,
             model_history,
             deferred_calls,
             compaction,

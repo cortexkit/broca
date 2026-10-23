@@ -23433,7 +23433,7 @@ new = "    if view.apply.is_some() && false { // NON-VACUITY BREAK: honour any a
 
 [[control]]
 id = "read-refused-while-tags-await-setup"
-guards = "While a tag-rendering run waits for its compaction Setup answer, session.read and session.resolve refuse transient, so no number shown is later renumbered by a Setup checkpoint"
+guards = "While a lineage waits for its first compaction Setup answer, session.read and session.resolve refuse transient, so no number shown is later renumbered by a Setup checkpoint"
 runner = "cargo"
 package = "broca-module"
 target = "--test it"
@@ -23443,6 +23443,19 @@ expect_red = ["compaction::reads_wait_out_the_setup_answer_and_never_show_a_numb
 file = "crates/broca-module/src/serve.rs"
 old = "        if page.tags_await_setup {"
 new = "        if page.tags_await_setup && false { // NON-VACUITY BREAK: serve numbers a Setup checkpoint may change."
+
+[[control]]
+id = "read-remembers-setup-in-materialized-prefix"
+guards = "A later computed-tag run must not wait for Setup again when the durable Setup has moved into the materialized prefix and is absent from the WAL tail"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/compaction.rs"
+expect_red = ["compaction::reads_after_projected_setup_do_not_wait_again_in_a_later_run"]
+file = "crates/broca-core/src/context.rs"
+old = "            tags_await_setup: tail_state.tags_await_setup && !snapshot.compaction_setup_seen,"
+new = "            tags_await_setup: tail_state.tags_await_setup, // NON-VACUITY BREAK: forget Setup below the page watermark."
 
 [[control]]
 id = "replay-flags-a-run-awaiting-its-setup-answer"

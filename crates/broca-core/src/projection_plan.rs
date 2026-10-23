@@ -170,6 +170,7 @@ pub struct PreparedProjection {
     /// there means the lineage has none.
     pub last_title: Option<String>,
     pub last_episode_usage_json: String,
+    pub compaction_setup_seen: bool,
     pub checkpoint_json: String,
     pub anchor: Option<WalByteAnchor>,
     pub control_head: Option<Cursor>,
@@ -547,6 +548,10 @@ pub fn plan_projection(
         last_run_id: last_run_id.map(|run_id| run_id.0),
         last_title,
         last_episode_usage_json,
+        compaction_setup_seen: admission_checkpoint
+            .compaction
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.state().is_some()),
         checkpoint_json,
         anchor,
         control_head,
