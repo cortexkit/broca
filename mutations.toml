@@ -24666,3 +24666,94 @@ expect_red = ["GatedCommitPaths.test_tree_or_crate_mismatch_keeps_the_local_quic
 file = "scripts/gated-commit.sh"
 old = '''      crates) attestation_crates="$value" ;;'''
 new = '''      crates) attestation_crates="$current_crates" ;; # NON-VACUITY BREAK: ignore the attested crate set'''
+
+[[control]]
+id = "subc-unstructured-refusal-has-no-code"
+guards = "diagnostic prose is never promoted to a daemon refusal code"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::unstructured_rejections_never_supply_a_refusal_code"]
+file = "crates/broca-subc/src/connection.rs"
+old = 'self.code.as_deref().unwrap_or("")'
+new = 'self.code.as_deref().unwrap_or_else(|| rejection_code(&self.text)) // NON-VACUITY BREAK: infer a refusal code from prose'
+
+[[control]]
+id = "subc-module-reloading-resend-structured-only"
+guards = "only a structured pre-send module_reloading code permits transparent resend"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::module_reloading_prose_and_other_codes_do_not_trigger_resend"]
+file = "crates/broca-subc/src/connection.rs"
+old = 'Self::Rejected(message) => message.code.as_deref(),'
+new = 'Self::Rejected(message) => Some(rejection_code(&message.text)), // NON-VACUITY BREAK: resend from unstructured prose'
+
+[[control]]
+id = "subc-admission-route-open-allowlist"
+guards = "role and tool-provider admission classify unfamiliar route refusals as terminal"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/role_route.rs"
+expect_red = ["role_route::tests::admission_opens_use_the_protocol_retry_allowlist"]
+file = "crates/broca-subc/src/role_route.rs"
+old = 'retryable: subc_protocol::error_codes::is_retryable_route_open(code),'
+new = 'retryable: code != "permission_denied", // NON-VACUITY BREAK: retry unfamiliar route-open refusals'
+
+[[control]]
+id = "subc-capability-discovery-single-flight"
+guards = "one successful capability discovery is shared by all readers of a connection generation"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::capabilities_are_single_flight_and_reset_on_reconnect"]
+file = "crates/broca-subc/src/connection.rs"
+old = "runtime\n            .capabilities\n            .get_or_try_init"
+new = "tokio::sync::OnceCell::new() // NON-VACUITY BREAK: query capabilities for each selector\n            .get_or_try_init"
+
+[[control]]
+id = "subc-fetch-scope-capability-fail-closed"
+guards = "catalog admission never opens an unscoped route when the daemon lacks scopes/v1"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/plan_fetch.rs"
+expect_red = ["plan_fetch::preset_tests::fetch_and_consent_without_scopes_fail_closed_on_the_same_cached_capabilities"]
+file = "crates/broca-subc/src/plan_fetch.rs"
+old = 'Ok(capabilities) if capabilities.iter().any(|c| c == CAP_SCOPES_V1) => {}'
+new = 'Ok(capabilities) if capabilities.iter().any(|c| c == CAP_SCOPES_V1) || capabilities.is_empty() => {} // NON-VACUITY BREAK: ignore missing scopes support'
+
+[[control]]
+id = "subc-wrapped-catalog-warns"
+guards = "wrapped catalog compatibility emits a warning naming the provider"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/plan_fetch.rs"
+expect_red = ["plan_fetch::preset_tests::wrapped_catalog_warns_once_with_provider_while_bare_catalog_is_quiet"]
+file = "crates/broca-subc/src/plan_fetch.rs"
+old = 'tracing::warn!(target: "subc.plan_fetch", provider_module = provider,'
+new = 'tracing::debug!(target: "subc.plan_fetch", provider_module = provider, // NON-VACUITY BREAK: hide the compatibility warning'
+
+[[control]]
+id = "subc-release-excludes-test-hooks"
+guards = "scope hold and lifecycle inspection test hooks cannot be compiled into release builds"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane.rs"
+expect_red = ["subc_plane::tests::release_builds_exclude_test_only_hooks"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "#[cfg(debug_assertions)]\n    #[doc(hidden)]\n    pub fn with_scope_sync_hold_for_test("
+new = "// NON-VACUITY BREAK: ship the scope hold test override\n    #[doc(hidden)]\n    pub fn with_scope_sync_hold_for_test("

@@ -151,9 +151,7 @@ impl RejectedMessage {
     }
 
     pub(crate) fn code(&self) -> &str {
-        self.code
-            .as_deref()
-            .unwrap_or_else(|| rejection_code(&self.text))
+        self.code.as_deref().unwrap_or("")
     }
 }
 
@@ -222,6 +220,16 @@ impl std::fmt::Display for ConnError {
                 "stale subc route handle (channel {}, epoch {})",
                 handle.channel, handle.epoch
             ),
+        }
+    }
+}
+
+impl ConnError {
+    /// The daemon's structured refusal code, never inferred from its diagnostic message.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Rejected(message) => message.code.as_deref(),
+            _ => None,
         }
     }
 }
@@ -571,6 +579,7 @@ impl Drop for PendingRegistration {
 type WriteConfirmations = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Instant, String>>>>>;
 
 struct ConnectionRuntime {
+    capabilities: tokio::sync::OnceCell<Vec<String>>,
     write_tx: mpsc::Sender<Frame>,
     pending: PendingMap,
     route_epochs: RouteEpochs,
@@ -910,19 +919,48 @@ impl SubcConnection {
         result.map(|frame| (frame, runtime.conn))
     }
 
-    /// `server.describe` — the capability names the daemon advertises (for example
-    /// `scopes/v1`, when it admits routes under scopes and stamps them on the bind).
+    /// The daemon's fixed capability list, read once per authenticated socket generation.
+    /// Direct clients do not receive HELLO_ACK, so they learn the same list from
+    /// `server.describe`. Concurrent readers share the request; failures are not cached.
     pub async fn server_capabilities(&self) -> ConnResult<Vec<String>> {
-        let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {})
-            .map_err(|e| ConnError::Transport(e.to_string()))?;
-        let frame = self.control_rpc(body).await?;
-        match serde_json::from_slice::<ClientControlResponse>(&frame.body) {
-            Ok(ClientControlResponse::ServerDescribe { capabilities, .. }) => Ok(capabilities),
-            Ok(other) => Err(ConnError::Protocol(format!(
-                "unexpected server.describe reply: {other:?}"
-            ))),
-            Err(e) => Err(ConnError::Protocol(format!("decode server.describe: {e}"))),
-        }
+        let runtime = {
+            let state = self.shared.current.lock().unwrap();
+            if !state.active {
+                return Err(ConnError::Transport("connection is recovering".into()));
+            }
+            Arc::clone(&state.runtime)
+        };
+        runtime
+            .capabilities
+            .get_or_try_init(|| async {
+                let corr = self.next_corr();
+                let (registered, _registration, mut rx) =
+                    self.register_control((0, 0, corr), false)?;
+                if registered.conn != runtime.conn {
+                    return Err(ConnError::Transport(
+                        "connection changed during capability discovery".into(),
+                    ));
+                }
+                let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {})
+                    .map_err(|e| ConnError::Transport(e.to_string()))?;
+                let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body)
+                    .map_err(|e| ConnError::Transport(e.to_string()))?;
+                self.send(&runtime, frame).await?;
+                let frame = self
+                    .await_terminal_deadline(&runtime, &mut rx, RESPONSE_TIMEOUT)
+                    .await?;
+                match serde_json::from_slice::<ClientControlResponse>(&frame.body) {
+                    Ok(ClientControlResponse::ServerDescribe { capabilities, .. }) => {
+                        Ok(capabilities)
+                    }
+                    Ok(other) => Err(ConnError::Protocol(format!(
+                        "unexpected server.describe reply: {other:?}"
+                    ))),
+                    Err(e) => Err(ConnError::Protocol(format!("decode server.describe: {e}"))),
+                }
+            })
+            .await
+            .cloned()
     }
 
     /// `catalog.list` — registered providers + their tools.
@@ -2042,6 +2080,7 @@ fn new_runtime() -> (Arc<ConnectionRuntime>, mpsc::Receiver<Frame>) {
             write_confirmations: Arc::new(Mutex::new(HashMap::new())),
             conn: ConnToken(NEXT_CONNECTION_TOKEN.fetch_add(1, Ordering::Relaxed)),
             shutdown: CancellationToken::new(),
+            capabilities: tokio::sync::OnceCell::new(),
         }),
         write_rx,
     )
@@ -3049,21 +3088,6 @@ pub(crate) fn classify_tool_route_refusal(rejection: &RejectedMessage) -> ToolRo
     }
 }
 
-/// Whether a call-level `Rejected` message is the router's `module_reloading` refusal.
-///
-/// PRE-SEND BY CONTRACT, not by reading: subc-protocol documents
-/// [`subc_protocol::error_codes::MODULE_RELOADING`] as returned only before the frame is
-/// forwarded to the module, and pins it with a test asserting the module's journal never
-/// records the refused request. That is what makes a re-dispatch at-most-once safe. Before
-/// the pin existed this was a reading of their current router, and a retry resting on a
-/// reading would duplicate a non-idempotent tool the day the router changed.
-///
-/// Unlike `unknown_channel`, the route is NOT freed: it is still bound on an endpoint that is
-/// draining. So callers retire it with a best-effort close rather than forgetting it.
-pub fn rejection_is_module_reloading(rejection: &str) -> bool {
-    rejection_code(rejection) == subc_protocol::error_codes::MODULE_RELOADING
-}
-
 /// Whether a route failure proves the daemon has already released that route generation.
 /// Callers may discard these handles; other failures can leave a live daemon route that must
 /// receive a best-effort GOODBYE before its local handle is forgotten.
@@ -3286,6 +3310,7 @@ impl SubcConnection {
             write_confirmations: Arc::new(Mutex::new(HashMap::new())),
             conn: conn_token,
             shutdown: CancellationToken::new(),
+            capabilities: tokio::sync::OnceCell::new(),
         });
         let (reconnect_tx, _reconnect_rx) = mpsc::unbounded_channel();
         let conn = SubcConnection {
@@ -3399,6 +3424,67 @@ mod tests {
 
     use super::*;
     use tokio::net::TcpStream;
+
+    async fn read_capabilities_concurrently(
+        conn: &SubcConnection,
+        module: &mut InProcessModuleEnd,
+        capabilities: &[&str],
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let reads = async { tokio::join!(conn.server_capabilities(), conn.server_capabilities(), conn.server_capabilities()) };
+            tokio::pin!(reads);
+            let mut requests = 0;
+            let results = loop {
+                tokio::select! {
+                    results = &mut reads => break results,
+                    request = module.next_request() => {
+                        requests += 1;
+                        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                        assert_eq!(body["op"], "server.describe");
+                        let reply = ClientControlResponse::ServerDescribe {
+                            protocol_ver: 1, subc_ops: vec![],
+                            capabilities: capabilities.iter().map(|item| (*item).into()).collect(),
+                            connected_clients: 1, counters: None,
+                            build_git_sha: None, build_lock_digest: None,
+                            capability_requirements: vec![], machine_id: None,
+                        };
+                        assert!(module.reply(&request, serde_json::to_vec(&reply).unwrap()));
+                    }
+                }
+            };
+            let expected: Vec<String> = capabilities.iter().map(|item| (*item).into()).collect();
+            assert_eq!(results.0.unwrap(), expected);
+            assert_eq!(results.1.unwrap(), expected);
+            assert_eq!(results.2.unwrap(), expected);
+            assert_eq!(requests, 1, "capability discovery must be single-flight");
+            assert_eq!(conn.server_capabilities().await.unwrap(), expected);
+            assert!(module.write_rx.try_recv().is_err(), "cached reads must not send RPCs");
+        }).await.expect("capability readers must terminate");
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_single_flight_and_reset_on_reconnect() {
+        let (conn, _, mut module) = SubcConnection::in_process_for_test(1, 1);
+        read_capabilities_concurrently(&conn, &mut module, &["scopes/v1"]).await;
+        let (replacement, write_rx) = new_runtime();
+        let mut new_module = InProcessModuleEnd {
+            write_rx,
+            pending: replacement.pending.clone(),
+        };
+        *conn.shared.current.lock().unwrap() = GenerationState::new(replacement);
+        read_capabilities_concurrently(&conn, &mut new_module, &[]).await;
+    }
+
+    #[tokio::test]
+    async fn failed_capability_discovery_is_not_cached() {
+        let (conn, _, mut module) = SubcConnection::in_process_for_test(1, 1);
+        let (failed, ()) = tokio::join!(conn.server_capabilities(), async {
+            let request = module.next_request().await;
+            assert!(module.reply(&request, b"invalid describe".to_vec()));
+        });
+        assert!(matches!(failed, Err(ConnError::Protocol(_))));
+        read_capabilities_concurrently(&conn, &mut module, &["scopes/v1"]).await;
+    }
 
     /// The behavioural grace tests inject their own window to compress timeouts, so they prove
     /// the MECHANISM and are blind to the shipped VALUE. Found by mutation: setting the constant
@@ -3611,6 +3697,13 @@ mod tests {
     }
 
     #[test]
+    fn unstructured_rejections_never_supply_a_refusal_code() {
+        let message = decode_error_body("module_reloading — diagnostic text".as_bytes());
+        assert_eq!(message.code(), "");
+        assert_eq!(ConnError::Rejected(message).code(), None);
+    }
+
+    #[test]
     fn unknown_channel_rejection_uses_the_structured_code() {
         let decode = |code: &str, message: &str| {
             let body = serde_json::to_vec(&subc_protocol::ErrorBody::new(code, message)).unwrap();
@@ -3808,6 +3901,7 @@ mod tests {
             write_confirmations: Arc::new(Mutex::new(HashMap::new())),
             conn,
             shutdown: CancellationToken::new(),
+            capabilities: tokio::sync::OnceCell::new(),
         });
         let (reconnect_tx, _reconnect_rx) = mpsc::unbounded_channel();
         SubcConnection {
@@ -4436,6 +4530,7 @@ mod tests {
             write_confirmations: Arc::new(Mutex::new(HashMap::new())),
             conn: ConnToken(2),
             shutdown: CancellationToken::new(),
+            capabilities: tokio::sync::OnceCell::new(),
         });
         let anchor = Instant::now() - Duration::from_secs(60);
         let mut replacement_state = GenerationState::new(replacement);
@@ -5550,6 +5645,7 @@ mod tests {
             write_confirmations: Arc::new(Mutex::new(HashMap::new())),
             conn: ConnToken(2),
             shutdown: CancellationToken::new(),
+            capabilities: tokio::sync::OnceCell::new(),
         });
         let mut replacement_state = GenerationState::new(Arc::clone(&replacement));
         replacement_state.last_inbound = Instant::now() - Duration::from_secs(1);
@@ -5602,6 +5698,7 @@ mod tests {
             write_confirmations: Arc::new(Mutex::new(HashMap::new())),
             conn: ConnToken(2),
             shutdown: CancellationToken::new(),
+            capabilities: tokio::sync::OnceCell::new(),
         });
         {
             let mut state = conn.shared.current.lock().unwrap();
@@ -5652,6 +5749,7 @@ mod tests {
             write_confirmations: Arc::new(Mutex::new(HashMap::new())),
             conn: ConnToken(77),
             shutdown: CancellationToken::new(),
+            capabilities: tokio::sync::OnceCell::new(),
         });
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
@@ -5715,7 +5813,12 @@ mod tests {
                 None,
                 || {
                     attempts.fetch_add(1, Ordering::SeqCst);
-                    async move { Err(ConnError::Rejected(format!("{code} — not yet").into())) }
+                    async move {
+                        Err(ConnError::Rejected(RejectedMessage::structured(
+                            code.into(),
+                            "not yet".into(),
+                        )))
+                    }
                 },
             )
             .await;

@@ -697,6 +697,7 @@ impl SubcToolPlane {
 
     /// Whether the route cached for `bind` under `scope` to `module_id` is still open; `None`
     /// when none is cached. Lets a test wait until the connection has seen the daemon close it.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn test_cached_route_is_open(
         &self,
@@ -710,6 +711,7 @@ impl SubcToolPlane {
     }
 
     /// Shorten the scope hold, so a test can run a hold past its bound in seconds.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn with_scope_sync_hold_for_test(mut self, hold: Duration) -> Self {
         self.scope_sync_hold = hold;
@@ -729,6 +731,7 @@ impl SubcToolPlane {
             .clone()
     }
 
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn test_mint_lifecycle_token_uncancelled(&self, bind: &BindIdentity) -> bool {
         !self.capture_session_lifecycle_token(bind).is_cancelled()
@@ -1442,19 +1445,12 @@ impl SubcToolPlane {
                 }))
             }
         }
-        let owner = owner_principal(scope).map_err(|detail| {
+        frozen_scope_selector(scope).map_err(|detail| {
             RouteEnsureError::Plane(ToolPlaneError::ScopeRefused {
                 code: SCOPE_UNVERIFIABLE.into(),
                 detail,
             })
-        })?;
-        // Always the frozen epoch, so a call can never be carried into a newer session that
-        // reused the ref.
-        Ok(ScopeSelector::new(
-            owner,
-            scope.scope_ref.clone(),
-            Some(scope.scope_epoch),
-        ))
+        })
     }
 
     fn remove_batch_call_route(&self, ctx: &BatchCtx, tool_call_id: &ToolCallId) {
@@ -2130,10 +2126,10 @@ impl ToolPlane for SubcToolPlane {
         //    bounced;
         //  - a `module_reloading` rejection occurs while the module is still draining for
         //    restart. The protocol guarantees this rejection happens before the request is
-        //    sent to the tool, so re-dispatching cannot execute it twice (see also
-        //    `rejection_is_module_reloading`). Without this retry, an ordinary tool-module
-        //    restart returns a `tool/route rejected` error to the model. Re-opening waits
-        //    for the drain with RELOAD_REOPEN_PATIENCE rather than the default 3s: that
+        //    sent to the tool, so re-dispatching cannot execute it twice. Without this
+        //    retry, an ordinary tool-module restart returns a `tool/route rejected` error to
+        //    the model. Re-opening waits for the drain with RELOAD_REOPEN_PATIENCE rather
+        //    than the default 3s: that
         //    default ends most real restarts in NotSent, returning the same error three
         //    seconds later;
         //  - provider route_not_bound / route_reclaimed refusals share the stale-route retry;
@@ -2156,10 +2152,8 @@ impl ToolPlane for SubcToolPlane {
         };
         let route_is_known_stale = matches!(&first, Err(ConnError::StaleRouteHandle(_)))
             || matches!(&first, Err(ConnError::Rejected(msg)) if crate::connection::classify_tool_route_refusal(msg) == crate::connection::ToolRouteRefusal::Reopen);
-        let endpoint_is_reloading = matches!(
-            &first,
-            Err(ConnError::Rejected(msg)) if crate::rejection_is_module_reloading(msg)
-        );
+        let endpoint_is_reloading = first.as_ref().err().and_then(ConnError::code)
+            == Some(subc_protocol::error_codes::MODULE_RELOADING);
         // A scoped call caught before send is never re-sent blindly. The scope's current state
         // decides, and so does whether a fresh route would carry the same epoch and agent as
         // the route the call was composed under (see `resend_or_drain`).
@@ -2324,16 +2318,16 @@ impl ToolPlane for SubcToolPlane {
                 code: "approve_requires_scope".into(),
                 detail: "approval requires a frozen scope".into(),
             })?;
-        let owner = owner_principal(scope).map_err(|detail| ToolPlaneError::ScopeRefused {
-            code: "scope_unverifiable".into(),
-            detail,
-        })?;
+        let selector =
+            frozen_scope_selector(scope).map_err(|detail| ToolPlaneError::ScopeRefused {
+                code: "scope_unverifiable".into(),
+                detail,
+            })?;
         let module = module
             .map(str::to_owned)
             .or_else(|| self.dispatch_target(ctx, &call.tool_call_id))
             .ok_or_else(|| ToolPlaneError::Unavailable("approval_target_unavailable".into()))?;
         let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
-        let selector = ScopeSelector::new(owner, scope.scope_ref.clone(), Some(scope.scope_epoch));
         let route = retry_route_open_with_scope_hold(
             RouteOpenRetry::within(
                 DEFAULT_ROUTE_OPEN_PATIENCE.deadline,
@@ -2527,6 +2521,15 @@ pub(crate) fn owner_principal(scope: &SessionScope) -> Result<Principal, String>
         })
 }
 
+/// Always select the frozen epoch: reusing a scope ref must not carry a call into a new session.
+pub(crate) fn frozen_scope_selector(scope: &SessionScope) -> Result<ScopeSelector, String> {
+    Ok(ScopeSelector::new(
+        owner_principal(scope)?,
+        scope.scope_ref.clone(),
+        Some(scope.scope_epoch),
+    ))
+}
+
 /// Classify a scoped `route.open` refusal that the retry loop returned.
 ///
 /// The two retryable scope refusals only come back here once the hold has run out, so they
@@ -2718,6 +2721,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn release_builds_exclude_test_only_hooks() {
+        let source = include_str!("subc_plane.rs");
+        for name in [
+            "with_scope_sync_hold_for_test",
+            "test_cached_route_is_open",
+            "test_mint_lifecycle_token_uncancelled",
+        ] {
+            let declaration =
+                format!("#[cfg(debug_assertions)]\n    #[doc(hidden)]\n    pub fn {name}(");
+            assert!(
+                source.contains(&declaration),
+                "{name} must be compiled out of release builds"
+            );
+        }
+    }
+
     #[derive(Clone, Default)]
     struct RouteOpenScript {
         delay: Duration,
@@ -2727,7 +2747,6 @@ mod tests {
 
     #[derive(Clone)]
     enum ScriptedRouteOpenError {
-        Rejected(String),
         /// A daemon Error frame body, decoded the way a live route open decodes it.
         RejectedBody(Vec<u8>),
         Transport(String),
@@ -2735,10 +2754,9 @@ mod tests {
 
     impl RouteOpenScript {
         fn rejected(message: impl Into<String>) -> Self {
-            Self {
-                error: Some(ScriptedRouteOpenError::Rejected(message.into())),
-                ..Self::default()
-            }
+            let message = message.into();
+            let (code, detail) = message.split_once(" — ").unwrap_or((&message, ""));
+            Self::rejected_body(&subc_protocol::ErrorBody::new(code, detail))
         }
 
         fn rejected_body(body: &subc_protocol::ErrorBody) -> Self {
@@ -2925,9 +2943,6 @@ mod tests {
                 .push(module_id.to_string());
             if let Some(error) = script.error {
                 return Err(match error {
-                    ScriptedRouteOpenError::Rejected(message) => {
-                        ConnError::Rejected(message.into())
-                    }
                     ScriptedRouteOpenError::RejectedBody(body) => {
                         ConnError::Rejected(crate::connection::decode_error_body(&body))
                     }
@@ -4593,8 +4608,8 @@ mod tests {
     ///  - the call completes, so the model never sees the restart;
     ///  - the wire saw the same id twice, which is the evidence the retry is a re-send of a
     ///    call the module never received rather than a second call;
-    ///  - the evicted route is CLOSED, because unlike a freed `unknown_channel` it is still
-    ///    bound on a draining endpoint and forgetting it silently would leak it.
+    ///  - the evicted route is not closed, since closing a draining endpoint could cut off
+    ///    an in-flight sibling's reply.
     ///
     /// Bounded by a timeout because an earlier retry test here HUNG: re-opening after an
     /// eviction can wait on a lifecycle cancel a unit test never delivers. If this ever
@@ -4604,9 +4619,9 @@ mod tests {
         let conn = ScriptedToolPlaneConnection::new(
             vec![Vec::new(), Vec::new(), Vec::new()],
             vec![
-                Err(ConnError::Rejected(
-                    "module_reloading — module endpoint for route channel 1 is reloading".into(),
-                )),
+                Err(ConnError::Rejected(crate::connection::decode_error_body(
+                    br#"{"code":"module_reloading","message":"draining endpoint"}"#,
+                ))),
                 successful_tool_reply("served after the restart"),
             ],
         );
@@ -4646,6 +4661,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn module_reloading_prose_and_other_codes_do_not_trigger_resend() {
+        let mut refusals = vec![ConnError::Rejected(
+            "module_reloading — legacy prose".into(),
+        )];
+        for code in ["target_unavailable", "module_warming", "permission_denied"] {
+            let body = subc_protocol::ErrorBody::new(code, "module_reloading — misleading prose");
+            refusals.push(ConnError::Rejected(crate::connection::decode_error_body(
+                &serde_json::to_vec(&body).unwrap(),
+            )));
+        }
+        for refusal in refusals {
+            let conn = ScriptedToolPlaneConnection::new(
+                vec![Vec::new(), Vec::new(), Vec::new()],
+                vec![Err(refusal), successful_tool_reply("unsafe resend")],
+            );
+            let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+            let ctx = batch_ctx("no-prose-resend");
+            let tool_call = call("read");
+            plane
+                .batch_started(
+                    &ctx,
+                    std::slice::from_ref(&tool_call),
+                    &ToolManifest::from_tools(vec![request_tool("read", Some("aft"))]),
+                )
+                .await
+                .unwrap();
+            match plane.dispatch(&ctx, &tool_call).await {
+                DispatchResult::Completed(result) => assert!(result.is_error),
+                other => panic!("expected a terminal refusal, got {other:?}"),
+            }
+            assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
     /// A RESTART LONGER THAN THE DEFAULT 3s STILL RETRIES THROUGH.
     ///
     /// This is the arm the first version of the fix did not have, and why that version was
@@ -4661,10 +4711,9 @@ mod tests {
         let conn = ScriptedToolPlaneConnection::new(
             vec![Vec::new(), Vec::new(), Vec::new()],
             vec![
-                Err(ConnError::Rejected(
-                    "module_reloading \u{2014} module endpoint for route channel 1 is reloading"
-                        .into(),
-                )),
+                Err(ConnError::Rejected(crate::connection::decode_error_body(
+                    br#"{"code":"module_reloading","message":"draining endpoint"}"#,
+                ))),
                 successful_tool_reply("served after a long drain"),
             ],
         );
