@@ -5,14 +5,21 @@
 //!
 //! A fresh run whose credential method is a subscription account (`oauth`, `chatgpt`) and whose
 //! provider has more than one candidate account in broca's latest vault listing asks routing
-//! (`route.account_for`) which account to use, before `RunStarted` is written. The answer, or
-//! the reason there was none, is frozen on the run's auth selection as an
+//! (`route.account_for`) which account to use, before `RunStarted` is written. A candidate is
+//! a listed credential whose vault metadata names this provider in `provider_ids` and this
+//! method as its `auth_method`; a credential id is an opaque record name and is never parsed
+//! for either. A listed credential missing either field is unmapped: it is never offered, is
+//! warned about once while it stays unmapped, and is counted in `health.check`. The answer,
+//! or the reason there was none, is frozen on the run's auth selection as an
 //! [`broca_wal::AccountDecision`], so a resume never asks again. What happens on each answer:
 //!
 //! * an account: the run reads and uses exactly that credential;
-//! * `account_selection_disabled`, `account_selection_unsupported`, or no answer at all within
-//!   [`ADMISSION_BUDGET`]: the run takes today's static pick (the caller's pin, else the
-//!   configured default). Routing being down never fails an admission;
+//! * `account_selection_disabled` or `account_selection_unsupported`: routing's own answer that
+//!   it chooses nothing here, so the run takes today's static pick (the caller's pin, else the
+//!   configured default);
+//! * no usable answer (routing unreachable, no decision within [`ADMISSION_BUDGET`], or a pick
+//!   of a credential broca did not offer): the send is refused `routing_unavailable`, class
+//!   transient, and nothing is written. broca never picks an account on routing's behalf;
 //! * `auth_required`: the run admits on the static pick and pauses for a fresh login, the same
 //!   path a credential the vault reports as needing re-login takes;
 //! * any other refusal: the send is refused with `account_selection_refused`, transient or
@@ -23,7 +30,7 @@
 //!
 //! # Reports
 //!
-//! Every run that has an admission id (every decision path except `legacy_static`) is reported
+//! Every run that has an admission id (every decision path broca writes) is reported
 //! through `route.account_observe`: `admission_started` once `RunStarted` is durable, one report
 //! per provider attempt once its record is durable, and `run_finished` once the terminal is.
 //! Reports are sent once, in order, from a task of their own: they never block a run and are
@@ -35,9 +42,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use broca_core::{AccountDecision, AccountSelectionRefusal};
+use broca_core::{AccountDecision, AccountSelectionRefusal, RoutingUnavailable};
 use broca_protocol::{BindIdentity, ErrorClass, ModelAttempt, RunFinishReason};
-use broca_subc::vault::ScopedList;
+use broca_subc::vault::{ScopedCredential, ScopedList};
 use broca_wal::WalLineageId;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -64,12 +71,15 @@ pub const ACCOUNT_NOT_AUTHORIZED: &str = "account_not_authorized";
 ///
 /// Routing's `route.account_for` is one local store transaction around a pure allocator, so a
 /// healthy answer takes milliseconds and this budget only matters when routing is slow or gone.
-/// The bound it has to fit is the caller's: a `session.send` reply waits for the admission
-/// barrier, callers give that reply 10 s, and the vault read the admission makes next may itself
-/// take up to its 5 s readiness budget. 1.5 s keeps the worst case under the caller's deadline
-/// with 3.5 s to spare, while being long enough that a briefly busy routing module still answers.
-/// A route to routing that is still opening when the budget runs out keeps opening in the
-/// background, so the next admission finds it ready.
+/// A send routing does not answer within it is refused `routing_unavailable` (transient), so
+/// the caller retries rather than run on an account routing never chose. The bound it has to
+/// fit is the caller's: a `session.send` reply waits for the admission barrier, callers give
+/// that reply 10 s, and the vault read the admission makes next may itself take up to its 5 s
+/// readiness budget. 1.5 s keeps the worst case under the caller's deadline with 3.5 s to
+/// spare, while being long enough that a briefly busy routing module still answers. A longer
+/// budget would also hold the session's actor longer: it serves no other command of the session
+/// until the admission answers. A route to routing that is still opening when the budget runs
+/// out keeps opening in the background, so the next admission finds it ready.
 pub const ADMISSION_BUDGET: Duration = Duration::from_millis(1500);
 /// The most one report waits for routing's reply. Reports are sent from a task of their own,
 /// so this bounds how far a stuck routing module can delay the NEXT report, never a run.
@@ -91,11 +101,12 @@ const RUNNER: &str = "broca";
 // ------------------------------------------------------------------------------------------
 
 /// The `account_selection` section of `broca.jsonc`.
+///
+/// Which account serves a send is routing's decision alone, so there is no switch that
+/// bypasses routing: the former `legacy_static` key is refused as unknown by the strict loader
+/// below, so a leftover setting fails the load instead of silently doing nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSelectionConfig {
-    /// Break-glass: never ask routing and never report to it; every run takes the static pick
-    /// and records the `legacy_static` path. Off by default.
-    pub legacy_static: bool,
     /// The routing module's id.
     pub routing_module: String,
 }
@@ -103,19 +114,16 @@ pub struct AccountSelectionConfig {
 impl Default for AccountSelectionConfig {
     fn default() -> Self {
         Self {
-            legacy_static: false,
             routing_module: DEFAULT_ROUTING_MODULE.to_string(),
         }
     }
 }
 
-// Strict, like the vault section beside it: a misspelt `legacy_static` would otherwise leave
-// the break-glass silently off while an operator believes it is on.
+// Strict, like the vault section beside it: an unknown key (a misspelling, or the removed
+// `legacy_static`) is refused rather than ignored.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AccountSelectionSection {
-    #[serde(default)]
-    legacy_static: bool,
     #[serde(default)]
     routing_module: Option<String>,
 }
@@ -165,10 +173,7 @@ impl AccountSelectionConfig {
             Some(module) => module,
             None => DEFAULT_ROUTING_MODULE.to_string(),
         };
-        Ok(Self {
-            legacy_static: section.legacy_static,
-            routing_module,
-        })
+        Ok(Self { routing_module })
     }
 }
 
@@ -189,12 +194,13 @@ const REPORTED_COUNTERS: &[&str] = &[
     "disabled",
     "unsupported",
     "unreachable",
+    "no_decision_within_budget",
+    "invalid_pick",
     "auth_required",
     "refused",
     "pinned",
     "single_candidate",
     "candidates_unknown",
-    "legacy_static",
     "scoped_not_found",
     "scoped_not_found_still_listed",
     "observe_sent",
@@ -239,6 +245,7 @@ impl Counters {
 }
 
 static PUBLISHED: OnceLock<Arc<Counters>> = OnceLock::new();
+static PUBLISHED_UNMAPPED: OnceLock<Arc<UnmappedCredentials>> = OnceLock::new();
 
 /// Make `counters` the ones `health.check` reports. The serve binary calls this once, for its
 /// one routing client.
@@ -246,12 +253,25 @@ pub fn publish_counters(counters: Arc<Counters>) {
     let _ = PUBLISHED.set(counters);
 }
 
-/// The published counters as `health.check` reports them; `null` when this process asks no
-/// routing module (no vault credential source).
+/// Make `unmapped` the unmapped-credential record `health.check` reports. The serve binary
+/// calls this once, for the listing cache its admissions read.
+pub fn publish_unmapped(unmapped: Arc<UnmappedCredentials>) {
+    let _ = PUBLISHED_UNMAPPED.set(unmapped);
+}
+
+/// The published counters as `health.check` reports them, with `unmapped_credentials`: how
+/// many credentials in broca's latest vault listing lack the `provider_ids` or `auth_method`
+/// metadata account selection needs, and so are never offered to routing. `null` when this
+/// process asks no routing module (no vault credential source).
 pub fn published_metrics() -> Value {
-    PUBLISHED
+    let Some(counters) = PUBLISHED.get() else {
+        return Value::Null;
+    };
+    let mut metrics = counters.snapshot();
+    metrics["unmapped_credentials"] = json!(PUBLISHED_UNMAPPED
         .get()
-        .map_or(Value::Null, |counters| counters.snapshot())
+        .map_or(0, |unmapped| unmapped.count()));
+    metrics
 }
 
 // ------------------------------------------------------------------------------------------
@@ -518,13 +538,20 @@ pub struct Candidate {
 impl Candidates {
     /// The rows of `listing` that are credentials of `method` for `provider` and name a
     /// provider account, sorted by credential id so identical listings give identical requests.
+    ///
+    /// Provider and method come only from the vault's metadata on each row: `provider_ids`
+    /// must name `provider` and `auth_method` must be `method`. The credential id is an opaque
+    /// record name and is never read for either, so `oauth:openai:x` whose metadata says
+    /// anthropic/oauth is an anthropic candidate. A row missing either field is unmapped and
+    /// never a candidate (see [`unmapped_field`]).
     pub fn from_listing(listing: &ScopedList, method: AuthMethod, provider: &str) -> Self {
         let mut accounts: Vec<Candidate> = listing
             .credentials
             .iter()
             .filter(|row| {
-                CredentialId::parse(&row.id)
-                    .is_some_and(|id| id.method == method && id.provider == provider)
+                unmapped_field(row).is_none()
+                    && row.auth_method.as_deref() == Some(method.as_token())
+                    && row.provider_ids.iter().any(|id| id == provider)
             })
             .filter_map(|row| {
                 row.account_id.as_ref().map(|account_id| Candidate {
@@ -540,6 +567,13 @@ impl Candidates {
         }
     }
 
+    /// Whether routing's pick is one of these candidates, account and credential together.
+    pub fn offers(&self, account_id: &str, credential_id: &str) -> bool {
+        self.accounts.iter().any(|candidate| {
+            candidate.credential_id == credential_id && candidate.account_id == account_id
+        })
+    }
+
     /// Distinct provider accounts; one account may have several credential records.
     pub fn distinct_accounts(&self) -> usize {
         self.accounts
@@ -547,6 +581,55 @@ impl Candidates {
             .map(|candidate| candidate.account_id.as_str())
             .collect::<std::collections::BTreeSet<_>>()
             .len()
+    }
+}
+
+/// Which account-selection metadata a listed credential lacks, or `None` when it has both.
+/// `auth_method` is derived by the vault for every LLM credential; `provider_ids` is set by the
+/// operator. A credential without either cannot be matched to a provider and method without
+/// guessing from its id, so it is not routed at all.
+pub fn unmapped_field(row: &ScopedCredential) -> Option<&'static str> {
+    match (row.provider_ids.is_empty(), row.auth_method.is_none()) {
+        (false, false) => None,
+        (true, false) => Some("provider_ids"),
+        (false, true) => Some("auth_method"),
+        (true, true) => Some("provider_ids and auth_method"),
+    }
+}
+
+/// The credentials of the latest vault listing that are unmapped (see [`unmapped_field`]),
+/// with the field each lacks. Each id is warned about once when it becomes unmapped, never per
+/// admission; one that gains its metadata leaves the set and is warned about again only if it
+/// loses it again.
+#[derive(Debug, Default)]
+pub struct UnmappedCredentials {
+    ids: Mutex<BTreeMap<String, &'static str>>,
+}
+
+impl UnmappedCredentials {
+    /// Replace the record with what `listing` shows, warning once for each id newly unmapped.
+    pub fn observe(&self, listing: &ScopedList) {
+        let current: BTreeMap<String, &'static str> = listing
+            .credentials
+            .iter()
+            .filter_map(|row| unmapped_field(row).map(|missing| (row.id.clone(), missing)))
+            .collect();
+        let mut known = self.ids.lock().unwrap();
+        for (id, missing) in &current {
+            if !known.contains_key(id) {
+                tracing::warn!(
+                    target: "accounts",
+                    "vault credential {id} has no {missing} metadata, so it is never offered \
+                     for account selection until the vault lists it with both"
+                );
+            }
+        }
+        *known = current;
+    }
+
+    /// How many credentials of the latest listing are unmapped.
+    pub fn count(&self) -> usize {
+        self.ids.lock().unwrap().len()
     }
 }
 
@@ -754,7 +837,12 @@ pub enum AccountChoice {
     /// Use the credential routing chose; record `decision`.
     Routed {
         account_id: String,
+        /// The vault's own credential id, verbatim: read as is, frozen as is, never parsed.
         credential_id: String,
+        /// How the credential authenticates, from the vault metadata it was offered under (its
+        /// `auth_method` matched this run's method). Frozen with the selection so a resume
+        /// takes the method from here rather than from the id.
+        method: AuthMethod,
         decision: AccountDecision,
         /// The digest of the listing the candidates were sent from.
         view_digest: String,
@@ -806,16 +894,40 @@ fn decision(
     }
 }
 
+/// Why a fresh send gets no account: routing's own refusal, or no usable answer from routing.
+/// Either way the send is refused before anything is written.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChoiceRefusal {
+    /// Routing refused; answered as `account_selection_refused`.
+    Refused(AccountSelectionRefusal),
+    /// Routing gave no usable answer; answered as `routing_unavailable`, class transient.
+    Unavailable(RoutingUnavailable),
+}
+
+impl From<ChoiceRefusal> for broca_core::RunError {
+    fn from(refusal: ChoiceRefusal) -> Self {
+        match refusal {
+            ChoiceRefusal::Refused(refusal) => {
+                broca_core::RunError::AccountSelectionRefused(refusal)
+            }
+            ChoiceRefusal::Unavailable(unavailable) => {
+                broca_core::RunError::RoutingUnavailable(unavailable)
+            }
+        }
+    }
+}
+
 /// Decide how a fresh run's account is chosen, asking routing when there is a choice to make.
 /// `listing` yields broca's latest vault listing; it is awaited under the same `deadline` as
-/// routing's answer. `Err` carries routing's refusal: the send is answered with it as an
-/// `account_selection_refused` error and nothing is written.
+/// routing's answer. `Err` refuses the send and nothing is written: routing's refusal is
+/// answered as `account_selection_refused`, and no usable answer from routing (unreachable, no
+/// decision by `deadline`, or a pick broca did not offer) as `routing_unavailable`.
 pub async fn choose_account<L>(
     client: &RoutingClient,
     inputs: ChoiceInputs<'_>,
     listing: L,
     deadline: tokio::time::Instant,
-) -> Result<AccountChoice, AccountSelectionRefusal>
+) -> Result<AccountChoice, ChoiceRefusal>
 where
     L: std::future::Future<Output = Option<Arc<ScopedList>>>,
 {
@@ -840,14 +952,6 @@ where
     let provider = inputs.static_credential.provider.as_str();
     if !selects_accounts(method) {
         return Ok(AccountChoice::NotApplicable);
-    }
-    if client.config.legacy_static {
-        client.counters.bump("legacy_static");
-        return Ok(AccountChoice::Static(decision(
-            broca_wal::ACCOUNT_DECISION_LEGACY_STATIC,
-            None,
-            None,
-        )));
     }
     let admission = admission_id(inputs.run_id);
     if inputs.caller_named_account {
@@ -902,26 +1006,30 @@ where
             credential_id,
             decision_id,
         } => {
-            // Routing returns the vault credential id verbatim. It must be a credential of the
-            // method and provider this run resolved, or the frozen wire family and the token
-            // would disagree; anything else is a reply broca cannot use.
-            let usable = CredentialId::parse(&credential_id)
-                .is_some_and(|id| id.method == method && id.provider == provider);
-            if !usable {
-                client.counters.bump("unreachable");
-                tracing::warn!(
+            // Routing returns the vault credential id verbatim, and it must be one broca offered:
+            // those, and only those, are credentials whose vault metadata names this run's
+            // provider and method, so the frozen wire family and the token agree. Anything else
+            // is a defect in routing, and the send is refused rather than run on it.
+            if !candidates.offers(&account_id, &credential_id) {
+                client.counters.bump("invalid_pick");
+                tracing::error!(
                     target: "accounts",
-                    "routing chose credential {credential_id}, which is not a {} credential for \
-                     {provider}; run {} takes the static account",
+                    "routing picked credential {credential_id} (account {account_id}), which is \
+                     not one of the {} candidates broca offered for {provider} {}; run {} is \
+                     refused routing_unavailable",
+                    candidates.accounts.len(),
                     method.as_token(),
                     inputs.run_id
                 );
-                return static_fallback(broca_wal::ACCOUNT_DECISION_UNREACHABLE);
+                return Err(ChoiceRefusal::Unavailable(
+                    RoutingUnavailable::invalid_pick(),
+                ));
             }
             client.counters.bump("routed");
             Ok(AccountChoice::Routed {
                 account_id,
                 credential_id,
+                method,
                 decision: decision(
                     broca_wal::ACCOUNT_DECISION_ROUTED,
                     Some(admission),
@@ -950,24 +1058,27 @@ where
             client.counters.bump("unreachable");
             tracing::warn!(
                 target: "accounts",
-                "routing gave no account for run {} ({cause}); it takes the static account",
+                "routing gave no account for run {} ({cause}); the send is refused \
+                 routing_unavailable",
                 inputs.run_id
             );
-            static_fallback(broca_wal::ACCOUNT_DECISION_UNREACHABLE)
+            Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()))
         }
         AccountForOutcome::NoDecisionWithinBudget => {
-            client.counters.bump("unreachable");
-            tracing::info!(
+            client.counters.bump("no_decision_within_budget");
+            let budget_ms = ADMISSION_BUDGET.as_millis() as u64;
+            tracing::warn!(
                 target: "routing",
                 session = %broca_core::session_addr(inputs.session),
                 send_id = inputs.send_id.unwrap_or("<none>"),
                 provider = %provider,
                 auth_method = method.as_token(),
-                "routing did not provide an account decision within the {} ms admission budget; run {} takes the static account",
-                ADMISSION_BUDGET.as_millis(),
+                "routing did not provide an account decision within the {budget_ms} ms admission budget; run {} is refused routing_unavailable",
                 inputs.run_id
             );
-            static_fallback(broca_wal::ACCOUNT_DECISION_UNREACHABLE)
+            Err(ChoiceRefusal::Unavailable(
+                RoutingUnavailable::no_decision_within_budget(budget_ms),
+            ))
         }
         AccountForOutcome::AuthRequired { decision_id } => {
             client.counters.bump("auth_required");
@@ -1008,7 +1119,7 @@ where
                     refusal.decision_id
                 );
             }
-            Err(refusal)
+            Err(ChoiceRefusal::Refused(refusal))
         }
     }
 }
@@ -1369,6 +1480,8 @@ pub struct ListingCache {
     latest: Mutex<Option<(Arc<ScopedList>, std::time::Instant)>>,
     /// Set while a background refresh is in flight, so a burst of admissions starts one.
     refreshing: std::sync::atomic::AtomicBool,
+    /// The credentials of the latest listing that lack account-selection metadata.
+    unmapped: Arc<UnmappedCredentials>,
 }
 
 impl ListingCache {
@@ -1381,10 +1494,18 @@ impl ListingCache {
         self.refreshing.store(false, Ordering::Release);
     }
 
+    /// Keep `listing` as the latest, and record (warning once per newly unmapped id) which of
+    /// its credentials lack account-selection metadata.
     pub fn store(&self, listing: ScopedList) -> Arc<ScopedList> {
+        self.unmapped.observe(&listing);
         let listing = Arc::new(listing);
         *self.latest.lock().unwrap() = Some((Arc::clone(&listing), std::time::Instant::now()));
         listing
+    }
+
+    /// The unmapped credentials of the latest listing, for `health.check`.
+    pub fn unmapped(&self) -> Arc<UnmappedCredentials> {
+        Arc::clone(&self.unmapped)
     }
 
     /// The cached listing and whether it is due for a refresh.

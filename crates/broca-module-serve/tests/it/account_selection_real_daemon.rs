@@ -44,6 +44,8 @@ enum RoutingMode {
         retry_after_s: Option<u64>,
     },
     AuthRequired,
+    /// Never answer `route.account_for`, as a stuck routing module would.
+    Hang,
 }
 
 struct Routing {
@@ -152,7 +154,10 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
             return disabled();
         }
         let admission = request["params"]["admission_id"].clone();
-        match self.mode.lock().unwrap().clone() {
+        // Read the mode before matching, so no lock is held while a hung request waits.
+        let mode = self.mode.lock().unwrap().clone();
+        match mode {
+            RoutingMode::Hang => std::future::pending::<subc_client_rs::HandlerOutcome>().await,
             RoutingMode::Disabled => disabled(),
             RoutingMode::Choose {
                 account_id,
@@ -227,6 +232,8 @@ struct Vault {
     requests: Mutex<Vec<(String, Value)>>,
     /// Credential ids whose scoped reads answer `not_found`.
     not_found: Mutex<HashSet<String>>,
+    /// Credential ids whose scoped reads answer `needs_reauth`.
+    needs_reauth: Mutex<HashSet<String>>,
     /// Optional account identities returned by scoped reads, enabled only by each owning rig.
     account_ids: Mutex<std::collections::HashMap<String, String>>,
     /// Once set, the listing has dropped `oauth:anthropic:work` and carries a new digest.
@@ -271,6 +278,8 @@ fn listed(id: &str, account_id: &str) -> Value {
         "categories": ["anthropic-native"],
         "type": "oauth",
         "serves": ["anthropic"],
+        "provider_ids": ["anthropic"],
+        "auth_method": "oauth",
         "refresh_adapter": "anthropic",
         "state": "active",
         "record_version": 1,
@@ -309,11 +318,16 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                     listed("oauth:anthropic", "acct-a"),
                     listed("oauth:anthropic:acct-b", "acct-b"),
                     listed("oauth:anthropic:spare", "acct-s"),
+                    // A record name that says nothing about its provider or method: the vault
+                    // metadata alone makes it an anthropic subscription login.
+                    listed("work-claude", "acct-o"),
                     json!({
                         "id": "oauth:meta",
                         "categories": ["llm-provider"],
                         "type": "oauth",
                         "serves": ["meta"],
+                        "provider_ids": ["meta"],
+                        "auth_method": "oauth",
                         "state": "active",
                         "record_version": 1,
                         "operations": ["read"],
@@ -323,6 +337,8 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "categories": ["llm-provider"],
                         "type": "apikey",
                         "serves": ["xai"],
+                        "provider_ids": ["xai"],
+                        "auth_method": "apikey",
                         "state": "active",
                         "record_version": 1,
                         "operations": ["read"],
@@ -333,6 +349,7 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "categories": ["llm-provider"],
                         "type": "oauth",
                         "serves": ["google"],
+                        "provider_ids": ["google"],
                         "auth_method": "antigravity",
                         "state": "active",
                         "record_version": 1,
@@ -349,6 +366,8 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "categories": ["llm-provider"],
                         "type": "apikey",
                         "serves": ["openai"],
+                        "provider_ids": ["openai"],
+                        "auth_method": "apikey",
                         "state": "active",
                         "record_version": 1,
                         "operations": ["read"],
@@ -363,6 +382,8 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "categories": ["llm-provider"],
                         "type": "apikey",
                         "serves": ["anthropic"],
+                        "provider_ids": ["anthropic"],
+                        "auth_method": "apikey",
                         "state": "active",
                         "record_version": 1,
                         "operations": ["read"],
@@ -378,6 +399,8 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "categories": ["llm-provider"],
                         "type": "apikey",
                         "serves": ["openrouter"],
+                        "provider_ids": ["openrouter"],
+                        "auth_method": "apikey",
                         "state": "active",
                         "record_version": 1,
                         "operations": ["read"],
@@ -397,6 +420,8 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                 let id = params["credential_id"].as_str().unwrap_or_default();
                 if self.not_found.lock().unwrap().contains(id) {
                     json!({ "error": { "class": "permanent", "code": "not_found" } })
+                } else if self.needs_reauth.lock().unwrap().contains(id) {
+                    json!({ "error": { "class": "auth", "code": "needs_reauth" } })
                 } else {
                     let mut reply = json!({
                         "payload": format!("token-{id}").into_bytes(),
@@ -553,6 +578,7 @@ const CREDENTIALS: &[&str] = &[
     "oauth:meta",
     "oauth:anthropic:work",
     "oauth:anthropic:spare",
+    "work-claude",
     "apikey:xai",
     "antigravity:google",
     "apikey:anthropic:work",
@@ -1030,6 +1056,7 @@ impl Rig {
         let vault = Arc::new(Vault {
             requests: Mutex::new(Vec::new()),
             not_found: Mutex::new(HashSet::new()),
+            needs_reauth: Mutex::new(HashSet::new()),
             account_ids: Mutex::new(std::collections::HashMap::new()),
             relisted: Default::default(),
             anthropic_apikey_listed: Default::default(),
@@ -1086,6 +1113,63 @@ impl Rig {
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
         Self::request_on(&conn, &route, "session.send", params).await
+    }
+
+    /// A `session.send` to the fresh session `name` that must be refused before anything is
+    /// written: its error body parsed and as the exact bytes the serve path sent. Fails when
+    /// any WAL file appears or changes while the send is answered.
+    async fn refused_send(&self, name: &str, send_id: &str) -> (Value, Vec<u8>) {
+        let wal_files = || -> Vec<(std::path::PathBuf, u64)> {
+            let mut files: Vec<_> = std::fs::read_dir(self.state_root.join("wal"))
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|entry| Some((entry.path(), entry.metadata().ok()?.len())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            files.sort();
+            files
+        };
+        let conn = SubcConnection::connect(&self.connection_file)
+            .await
+            .unwrap();
+        let route = conn
+            .route_open_management_within(
+                "broca",
+                &self.session(name),
+                broca_subc::RouteOpenRetry::within(
+                    Duration::from_secs(10),
+                    Duration::from_millis(200),
+                ),
+            )
+            .await
+            .unwrap();
+        let before = wal_files();
+        let reply = conn
+            .route_request_terminal(
+                &route,
+                serde_json::to_vec(&json!({ "method": "session.send", "params": {
+                    "prompt": "hello",
+                    "model": { "provider": "anthropic", "model": MODEL },
+                    "tools": [],
+                    "send_id": send_id,
+                }}))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = reply.expect_err("the send is refused");
+        // Long enough for a run that had been admitted to write its RunStarted.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(wal_files(), before, "a refused send writes nothing");
+        assert!(
+            self.frames(name)
+                .iter()
+                .all(|frame| !matches!(frame.record, WalRecord::RunStarted { .. })),
+            "a refused send writes no RunStarted"
+        );
+        (serde_json::from_slice(&bytes).unwrap(), bytes)
     }
 
     /// One request on a fresh management route to session `name`: the result, or the whole
@@ -1887,29 +1971,218 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
     assert_eq!(not_found[0].2["credential_id"], "oauth:anthropic:spare");
     assert_eq!(not_found[0].2["view_digest"], "vault-view-e2e");
 
-    // 7. Routing gone: the run is admitted on the configured default account, without waiting
-    // past the admission budget, and the unreachable counter is raised.
+    // 7. Routing gone: the send is refused routing_unavailable, transient, within the admission
+    // budget, and nothing is written. broca does not take the configured default account.
     rig.routing_task.take().unwrap().abort();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let client = rig.client("unreachable").await;
     let started = Instant::now();
-    let run_id = send(&client, "send-unreachable", None).await;
+    let (error, _) = rig.refused_send("unreachable", "send-unreachable").await;
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "the admission waited {:?}",
         started.elapsed()
     );
-    let frames = rig.finished("unreachable").await;
-    let chosen = selection(&frames);
-    assert_eq!(chosen["credential_id"], "oauth:anthropic");
-    assert_eq!(
-        chosen["account_decision"],
-        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "unreachable", "admission_id": run_id })
+    assert_eq!(error["code"], "routing_unavailable", "{error}");
+    assert_eq!(error["detail"]["class"], "transient", "{error}");
+    let reason = error["detail"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        matches!(reason, "unreachable" | "no_decision_within_budget"),
+        "{error}"
     );
     let metrics = rig.broca_metrics().await;
     assert!(
-        metrics["account_selection"]["unreachable"].as_u64() >= Some(1),
-        "the unreachable counter: {metrics}"
+        metrics["account_selection"][reason].as_u64() >= Some(1),
+        "the {reason} counter: {metrics}"
+    );
+
+    let root = rig.root.clone();
+    drop(rig);
+    broca_test_support::remove_rig_dir(root);
+}
+
+/// Each way routing can fail to give a usable decision refuses the send as
+/// `routing_unavailable`, class transient, with nothing written: the reply is compared byte
+/// for byte with broca-wire's reference file for that reason, so the reference is what the
+/// real serve path sends. broca never falls back to an account of its own choosing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routing_unavailable_refuses_the_send_with_its_reference_reply() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    let golden = |file: &str| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../broca-wire/tests/golden")
+            .join(file);
+        std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    };
+    for (mode, name, file, counter) in [
+        (
+            // A code outside routing's account-selection vocabulary: routing could not serve.
+            RoutingMode::Refuse {
+                code: "route_state_unavailable",
+                retry_after_s: None,
+            },
+            "unavailable-unreachable",
+            "routing_unavailable.unreachable.json",
+            "unreachable",
+        ),
+        (
+            RoutingMode::Hang,
+            "unavailable-budget",
+            "routing_unavailable.no_decision_within_budget.json",
+            "no_decision_within_budget",
+        ),
+        (
+            // A credential broca never offers for an anthropic oauth send.
+            RoutingMode::Choose {
+                account_id: "acct-x",
+                credential_id: "apikey:xai",
+            },
+            "unavailable-invalid-pick",
+            "routing_unavailable.invalid_pick.json",
+            "invalid_pick",
+        ),
+    ] {
+        rig.routing.set(mode);
+        let asked_before = rig.routing.requests.lock().unwrap().len();
+        let (error, bytes) = rig.refused_send(name, &format!("send-{name}")).await;
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            String::from_utf8(golden(file)).unwrap(),
+            "{name}: the serve path's reply is the reference reply"
+        );
+        assert_eq!(error["detail"]["class"], "transient");
+        let asked: Vec<Value> = rig.routing.requests.lock().unwrap()[asked_before..]
+            .iter()
+            .filter(|request| request["method"] == "route.account_for")
+            .cloned()
+            .collect();
+        assert_eq!(asked.len(), 1, "{name}: routing was asked once");
+        let metrics = rig.broca_metrics().await;
+        assert!(
+            metrics["account_selection"][counter].as_u64() >= Some(1),
+            "the {counter} counter: {metrics}"
+        );
+    }
+    rig.routing.set(RoutingMode::Disabled);
+
+    let root = rig.root.clone();
+    drop(rig);
+    broca_test_support::remove_rig_dir(root);
+}
+
+/// A routed run is admitted and stops before its first model step (its credential needs a
+/// fresh login), broca is killed, and the resend of the same send resumes that run on exactly
+/// the selection it froze: the vault's opaque credential id `work-claude`, read verbatim, and
+/// the `oauth` method from the vault metadata, frozen beside it. The resume asks routing
+/// nothing even though routing would now pick another account. Unix only, like the crash
+/// subcase above: the kill is a SIGKILL of the daemon's broca child.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_routed_run_killed_before_its_first_step_resumes_on_its_frozen_selection() {
+    let Some(rig) = Rig::start().await else {
+        return;
+    };
+    rig.routing.set(RoutingMode::Choose {
+        account_id: "acct-o",
+        credential_id: "work-claude",
+    });
+    rig.vault
+        .account_ids
+        .lock()
+        .unwrap()
+        .insert("work-claude".into(), "acct-o".into());
+    rig.vault
+        .needs_reauth
+        .lock()
+        .unwrap()
+        .insert("work-claude".into());
+    let client = rig.client("frozen").await;
+    let run_id = send(&client, "send-frozen", None).await;
+    let frames = rig
+        .wait_for("frozen", "pause", |record| {
+            matches!(record, WalRecord::RunPaused { .. })
+        })
+        .await;
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame.record, WalRecord::StepStarted { .. })),
+        "the run stopped before its first model step"
+    );
+    let frozen = selection(&frames);
+    assert_eq!(frozen["credential_id"], "work-claude");
+    assert_eq!(frozen["auth_method"], "oauth");
+    assert_eq!(frozen["account_decision"]["path"], "routed");
+    assert_eq!(rig.vault.scoped_reads(), ["work-claude"]);
+    broca_test_support::wait_until("paused session becomes idle", || async {
+        let status = client.status().await;
+        if matches!(status, Ok(broca_module::serve::StatusResponse::Idle)) {
+            Ok(())
+        } else {
+            Err(format!("{status:?}"))
+        }
+    })
+    .await;
+    drop(client);
+
+    let broca_pids = children(rig.daemon.id().unwrap());
+    assert!(!broca_pids.is_empty(), "broca is supervised by the daemon");
+    for pid in &broca_pids {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+    // The login is repaired, and routing would now choose another account for a new admission.
+    rig.vault.needs_reauth.lock().unwrap().clear();
+    rig.routing.set(RoutingMode::Choose {
+        account_id: "acct-b",
+        credential_id: "oauth:anthropic:acct-b",
+    });
+
+    let reopened = rig.client("frozen").await;
+    let resumed = send(&reopened, "send-frozen", None).await;
+    assert_eq!(resumed, run_id, "the resend resumes the admitted run");
+    let frames = rig.finished("frozen").await;
+    assert_eq!(
+        seq_of(&frames, |record| matches!(
+            record,
+            WalRecord::RunStarted { .. }
+        ))
+        .len(),
+        1,
+        "one admission"
+    );
+    assert_eq!(
+        selection(&frames),
+        frozen,
+        "the frozen selection is unchanged"
+    );
+    for frame in &frames {
+        if let WalRecord::RunAuthRefrozen { auth_selection, .. } = &frame.record {
+            assert_eq!(auth_selection.credential_id, "work-claude");
+            assert_eq!(auth_selection.auth_method.as_deref(), Some("oauth"));
+        }
+    }
+    assert_eq!(
+        rig.vault.scoped_reads(),
+        ["work-claude", "work-claude"],
+        "the resume read the frozen vault id verbatim, and nothing else"
+    );
+    assert_eq!(
+        rig.upstream
+            .authorized_as
+            .lock()
+            .unwrap()
+            .last()
+            .map(String::as_str),
+        Some("work-claude"),
+        "the provider was called with the frozen credential's token"
+    );
+    assert_eq!(
+        rig.routing.account_for_count(&run_id),
+        1,
+        "a resume never asks routing again"
     );
 
     let root = rig.root.clone();

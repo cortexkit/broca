@@ -1411,6 +1411,11 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_auth_selection_method() {
+            with_feature(base, crate::framing::AUTH_SELECTION_METHOD_FEATURE)
+        } else {
+            base
+        };
         if self.carries_google_rpc_error_details() {
             with_feature(base, crate::framing::GOOGLE_RPC_ERROR_DETAILS_FEATURE)
         } else {
@@ -1427,6 +1432,18 @@ impl WalRecord {
             WalRecord::Queued { request, .. } => request.tools.as_deref().is_some_and(declares),
             _ => false,
         }
+    }
+
+    /// Whether a credential selection this record freezes names its auth method. Its
+    /// `credential_id` is then the vault's opaque id, which an older reader would parse for a
+    /// method, so the record is must-understand.
+    fn carries_auth_selection_method(&self) -> bool {
+        let selection = match self {
+            WalRecord::RunStarted { config, .. } => config.auth_selection.as_ref(),
+            WalRecord::RunAuthRefrozen { auth_selection, .. } => Some(auth_selection),
+            _ => None,
+        };
+        selection.is_some_and(|selection| selection.auth_method.is_some())
     }
 
     fn carries_google_rpc_error_details(&self) -> bool {
@@ -2369,8 +2386,9 @@ pub struct SetupTagCheckpoint {
 /// it maps to lives only in the 0600 handle map, never in the WAL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthSelection {
-    /// The credential id (`<method>:<provider>[:<account>]`) to re-`get` on resume. Method,
-    /// provider, and account all parse back out of this one string, so no separate fields.
+    /// The credential id to re-`get` on resume. Without [`AuthSelection::auth_method`] it is a
+    /// broca key (`<method>:<provider>[:<account>]`) whose method, provider and account parse
+    /// back out of it; with it, it is the vault's opaque credential id (see that field).
     pub credential_id: String,
     /// The vault-served account id (a provider-side account UUID) the credential resolved to
     /// at admission, frozen verbatim so usage export can label spend with the SAME account the
@@ -2399,7 +2417,9 @@ pub struct AuthSelection {
     /// concluded their credential pin never reached broca.
     ///
     /// Key on `credential_id` instead: it is always present, it is the caller's pin verbatim, and
-    /// method, provider and account all parse back out of it. Use `account_ref` only when you
+    /// on a selection without `auth_method` method, provider and account parse back out of it
+    /// (with `auth_method`, it is the vault's opaque id and the method is that field). Use
+    /// `account_ref` only when you
     /// specifically need the provider-side account UUID, and expect it on chatgpt and oauth only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_ref: Option<String>,
@@ -2436,6 +2456,21 @@ pub struct AuthSelection {
     /// (the OpenCode and mock paths), so those keep their bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_decision: Option<AccountDecision>,
+    /// How the credential authenticates (`oauth`, `chatgpt`, `apikey`, `antigravity`), frozen
+    /// at admission from the vault's own metadata for a credential routing chose.
+    ///
+    /// PRESENT CHANGES WHAT `credential_id` IS. With it, `credential_id` is the vault's own
+    /// credential id, an opaque record name: a resume reads that credential verbatim and takes
+    /// the method from here, never from the id's spelling and never through a
+    /// `vault.credential_ids` alias. Without it (every record written before this field, and
+    /// every selection broca resolved from its own configuration) `credential_id` is a broca
+    /// key `<method>:<provider>[:<account>]`, read as before.
+    ///
+    /// Kept as the written string so a method a later build adds still decodes. A record
+    /// carrying it requires the must-understand feature `auth-selection-method/v1`: an older
+    /// build would parse the id for its method, so it must refuse such a log instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
 }
 
 /// Which path decided a run's provider account, with the admission and decision ids routing
@@ -2454,7 +2489,8 @@ pub struct AccountDecision {
     /// re-serializes to its stored bytes.
     pub path: String,
     /// The id broca asked routing about this run under, and names it by in its account reports
-    /// to routing. Absent when broca reports nothing for the run (the `legacy_static` path).
+    /// to routing. Absent when broca reports nothing for the run (the `legacy_static` path older
+    /// builds wrote).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_id: Option<String>,
     /// Routing's id for the decision that chose the account, when routing chose it.
@@ -2499,7 +2535,8 @@ pub const ACCOUNT_DECISION_ROUTED: &str = "routed";
 /// Routing answered that account selection is switched off; the static pick was used.
 pub const ACCOUNT_DECISION_DISABLED: &str = "disabled";
 /// Routing gave no answer in time (route refused, timeout, malformed reply); the static pick
-/// was used.
+/// was used. Written only by builds that admitted such a send: a send routing cannot answer
+/// is now refused before anything is written. Kept so those older runs still read and resume.
 pub const ACCOUNT_DECISION_UNREACHABLE: &str = "unreachable";
 /// Routing does not select accounts for this provider; the static pick was used.
 pub const ACCOUNT_DECISION_UNSUPPORTED: &str = "unsupported";
@@ -2507,8 +2544,9 @@ pub const ACCOUNT_DECISION_UNSUPPORTED: &str = "unsupported";
 pub const ACCOUNT_DECISION_PINNED: &str = "pinned";
 /// The provider had at most one candidate account, so there was nothing to ask.
 pub const ACCOUNT_DECISION_SINGLE_CANDIDATE: &str = "single_candidate";
-/// The operator's `account_selection.legacy_static` setting in `broca.jsonc`, an emergency
-/// switch, bypassed routing entirely.
+/// The operator's former `account_selection.legacy_static` setting in `broca.jsonc`, an
+/// emergency switch, bypassed routing entirely. The setting no longer exists, so this path is
+/// no longer written; it is kept so runs recorded under it still read and resume.
 pub const ACCOUNT_DECISION_LEGACY_STATIC: &str = "legacy_static";
 /// broca had no vault listing to ask routing with in time; the static pick was used.
 pub const ACCOUNT_DECISION_CANDIDATES_UNKNOWN: &str = "candidates_unknown";
@@ -2900,6 +2938,7 @@ mod schema_tests {
     fn pre_resolved_credential_run_config_bytes_are_unchanged() {
         let mut config = min_config();
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "apikey:kimi-code-plan-global".into(),
             account_ref: None,
             resolved_credential_id: None,
@@ -2917,6 +2956,7 @@ mod schema_tests {
     fn pre_vault_request_run_started_bytes_are_unchanged() {
         let mut config = min_config();
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic:work".into(),
             account_ref: Some("acct-1".into()),
             resolved_credential_id: Some("oauth:anthropic:shared".into()),
@@ -2967,6 +3007,7 @@ mod schema_tests {
     fn pre_account_decision_run_started_bytes_are_unchanged() {
         let mut config = min_config();
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic:work".into(),
             account_ref: Some("acct-1".into()),
             resolved_credential_id: Some("oauth:anthropic:work".into()),
@@ -3017,6 +3058,7 @@ mod schema_tests {
     fn an_account_decision_adds_one_key_and_keeps_its_bytes() {
         const STORED: &str = r#"{"credential_id":"oauth:anthropic:work","account_ref":"acct-1","vault_request":{"min_ttl_ms":600000,"op":"get_scoped"},"account_decision":{"path":"routed","admission_id":"run-1","decision_id":"acd-1"}}"#;
         let selection = AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic:work".into(),
             account_ref: Some("acct-1".into()),
             resolved_credential_id: None,
@@ -3692,6 +3734,7 @@ mod schema_tests {
             WalRecord::RunAuthRefrozen {
                 ts_ms: Some(123),
                 auth_selection: AuthSelection {
+                    auth_method: None,
                     credential_id: "chatgpt:openai".into(),
                     account_ref: Some("account-1".into()),
                     resolved_credential_id: None,
@@ -4165,6 +4208,7 @@ mod schema_tests {
     fn run_config_freezes_only_the_resolved_auth_pin_effect() {
         let mut config = *min_config();
         config.auth_selection = Some(AuthSelection {
+            auth_method: None,
             credential_id: "apikey:openai:astro".into(),
             account_ref: None,
             resolved_credential_id: None,

@@ -1072,6 +1072,7 @@ mod gated {
         let lease = FileLeaseStore::new(dir.join("lease"));
         let wal = FileWalStore::new(dir.join("wal"));
         let selection = AuthSelection {
+            auth_method: None,
             credential_id: "oauth:anthropic:resume".into(),
             account_ref: Some("account-a".into()),
             resolved_credential_id: None,

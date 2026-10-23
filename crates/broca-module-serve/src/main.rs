@@ -517,13 +517,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
-        if account_selection.legacy_static {
-            tracing::warn!(
-                target: "accounts",
-                "account_selection.legacy_static is on: every run takes the statically \
-                 configured provider account, and routing is neither asked nor told"
-            );
-        }
         // Routing is reached over the vault's consumer connection rather than one of its own:
         // like the vault route it is one route for the whole process, and routing authorizes
         // a request by the module identity that connection presents, as the vault does.
@@ -588,13 +581,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "nobody (no supervised consumer identity)".to_string()),
             addressing.aliases()
         );
+        let listing_cache = broca_module_serve::account_routing::ListingCache::default();
+        broca_module_serve::account_routing::publish_unmapped(listing_cache.unmapped());
         executor_impl = executor_impl.with_vault(executor::VaultAuth {
             client,
             addressing,
             methods: auth_methods,
             gauge: vault_gauge.clone(),
             cache: executor::VaultLkgCache::default(),
-            listing: Default::default(),
+            listing: listing_cache,
         });
         executor_impl = executor_impl.with_routing(routing);
         executor_impl.prime_account_listing();
@@ -1347,7 +1342,7 @@ mod executor {
 
     use broca_catalog::live::WireFamilyId;
     use broca_module_serve::account_routing::{AccountChoice, RoutingClient};
-    use broca_module_serve::{AuthMethod, CacheTtlTable, CredentialId};
+    use broca_module_serve::{AuthMethod, CacheTtlTable};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum EpisodeAuthContext {
@@ -1431,6 +1426,7 @@ mod executor {
                 .or_else(|| methods.method_for(provider_id))
                 .or(discovered_method);
             let selection = method.map(|method| broca_core::AuthSelection {
+                auth_method: None,
                 credential_id: broca_module_serve::CredentialId::new(method, provider_id, None)
                     .to_id_string(),
                 // OpenCode auth entries carry no vault account id.
@@ -1444,6 +1440,7 @@ mod executor {
             OpencodeEpisodeAuth { selection, method }
         } else {
             let selection = frozen_credential_id.map(|id| broca_core::AuthSelection {
+                auth_method: None,
                 credential_id: id.to_string(),
                 // A resumed OpenCode run keeps no vault account id.
                 account_ref: None,
@@ -2160,12 +2157,12 @@ mod executor {
         pause: &Option<ProviderError>,
         selection: Option<broca_core::AuthSelection>,
         record_version: Option<u64>,
-    ) -> Option<(String, u64)> {
+    ) -> Option<(broca_core::AuthSelection, u64)> {
         if pause.is_some() {
             return None;
         }
         match (selection, record_version) {
-            (Some(s), Some(version)) => Some((s.credential_id, version)),
+            (Some(s), Some(version)) => Some((s, version)),
             _ => None,
         }
     }
@@ -2526,18 +2523,17 @@ mod executor {
     }
 
     /// Report a provider's rejection of a served token to the vault, by the same credential id
-    /// the read used, under the same grant. A key that does not parse was never read, so there
-    /// is nothing to report.
+    /// the read used, under the same grant. A selection whose vault id cannot be named was
+    /// never read, so there is nothing to report.
     async fn report_wire_auth_failure(
         vault: &VaultAuth,
-        credential_key: &str,
+        selection: &broca_core::AuthSelection,
         status: u16,
         record_version: u64,
     ) -> Result<(), VaultError> {
-        let Some(key) = broca_module_serve::CredentialId::parse(credential_key) else {
+        let Some(vault_id) = vault.addressing.vault_id_for_selection(selection) else {
             return Ok(());
         };
-        let vault_id = vault.addressing.vault_id_for(&key);
         vault
             .client
             .report_auth_failure_at(
@@ -2598,7 +2594,7 @@ mod executor {
     /// in-step refresh already did (see [`run_end_report_target`]).
     async fn report_rejection_after_run(
         vault: &VaultAuth,
-        credential_key: &str,
+        selection: &broca_core::AuthSelection,
         admitted_version: u64,
         in_run: Option<&InRunRefresh>,
         terminal_status: u16,
@@ -2609,19 +2605,16 @@ mod executor {
         };
         // Provider rejection is authoritative even if the best-effort vault report cannot be
         // delivered; never let this process serve the rejected token again.
+        // The cache is keyed by the selection's credential id, exactly as the read stored it.
         evict_for_provider_rejection(
             &vault.cache,
-            credential_key,
+            &selection.credential_id,
             rejection.status,
             rejection.record_version,
         );
-        let _ = report_wire_auth_failure(
-            vault,
-            credential_key,
-            rejection.status,
-            rejection.record_version,
-        )
-        .await;
+        let _ =
+            report_wire_auth_failure(vault, selection, rejection.status, rejection.record_version)
+                .await;
     }
 
     /// The auth method for a provider with no configured default — the openai-compatible
@@ -3007,12 +3000,9 @@ mod executor {
         /// List the vault's credentials once at boot, in the background, so the first
         /// admission finds its candidates ready instead of listing inside its budget.
         pub fn prime_account_listing(&self) {
-            let (Some(vault), Some(routing)) = (self.vault.clone(), self.routing.as_ref()) else {
+            let (Some(vault), Some(_)) = (self.vault.clone(), self.routing.as_ref()) else {
                 return;
             };
-            if routing.config().legacy_static {
-                return;
-            }
             tokio::spawn(async move {
                 refresh_listing(&vault).await;
             });
@@ -3028,7 +3018,7 @@ mod executor {
             pinned_account: Option<&str>,
             conversation_key: Option<&str>,
             inherited_conversation_key: Option<&str>,
-        ) -> Result<AccountChoice, broca_core::AccountSelectionRefusal> {
+        ) -> Result<AccountChoice, broca_module_serve::account_routing::ChoiceRefusal> {
             if !fresh_episode || self.provider_base_url.is_some() {
                 return Ok(AccountChoice::NotApplicable);
             }
@@ -3218,6 +3208,7 @@ mod executor {
             self.decide_auth_with_account(
                 provider_id,
                 frozen_credential_id,
+                None,
                 fresh_episode,
                 pinned_method,
                 pinned_account,
@@ -3237,6 +3228,7 @@ mod executor {
             &self,
             provider_id: &str,
             frozen_credential_id: Option<&str>,
+            frozen_auth_method: Option<&str>,
             fresh_episode: bool,
             pinned_method: Option<AuthMethod>,
             pinned_account: Option<&str>,
@@ -3301,40 +3293,61 @@ mod executor {
                     in_run_refresh: None,
                 });
             };
-            // Resume re-uses the frozen credential id verbatim; a fresh run resolves the caller
-            // pin before config (api-key fallback for the long tail). `select_credential_id`
-            // owns that branch so the resume invariant is unit-tested in isolation.
-            // A credential routing chose is read by the vault id routing returned, verbatim;
-            // `choose_account` has already checked it parses as this run's method and provider.
+            // Which credential this run reads, under which broca key, and how it authenticates:
+            //  * a credential routing chose: the vault id routing returned, verbatim, with the
+            //    method from the vault metadata it was offered under. The id is never parsed;
+            //  * a resume of a selection frozen with its method: the frozen vault id verbatim,
+            //    with the frozen method, no parse and no `vault.credential_ids` alias lookup;
+            //  * anything else: a broca key, which a resume re-uses verbatim and a fresh run
+            //    resolves from the caller pin before config (api-key fallback for the long
+            //    tail). `select_credential_id` owns that branch so the resume invariant is
+            //    unit-tested in isolation.
             let routed = match account {
                 AccountChoice::Routed {
                     credential_id,
                     account_id,
+                    method,
                     decision,
                     view_digest,
-                } => CredentialId::parse(credential_id)
-                    .map(|parsed| (parsed, credential_id, account_id, decision, view_digest)),
+                } => Some((credential_id, account_id, decision, view_digest, *method)),
                 _ => None,
             };
-            let credential_id = match &routed {
-                Some((parsed, ..)) => parsed.clone(),
-                None => broca_module_serve::auth_routing::select_credential_id(
-                    frozen_credential_id,
-                    provider_id,
-                    pinned_method,
-                    pinned_account,
-                    &vault.methods,
-                    FALLBACK_METHOD,
-                ),
+            let frozen_method = match (frozen_credential_id, frozen_auth_method) {
+                (Some(id), Some(token)) => Some((
+                    id,
+                    AuthMethod::from_token(token).ok_or_else(|| {
+                        RunError::Config(format!(
+                            "the run's frozen credential selection names auth method '{token}', \
+                             which this build does not know"
+                        ))
+                    })?,
+                )),
+                _ => None,
             };
-            let credential_key = credential_id.to_id_string();
-            // Every credential is read by grant, by its vault credential id. A scoped not_found
-            // is final: nothing retries it another way, which would hide the misconfiguration
-            // the operator needs to see.
-            let vault_id = match &routed {
-                Some((_, vault_id, ..)) => (*vault_id).clone(),
-                None => vault.addressing.vault_id_for(&credential_id).into_owned(),
-            };
+            let (credential_key, vault_id, credential_method, freezes_method) =
+                match (&routed, frozen_method) {
+                    (Some((vault_id, _, _, _, method)), _) => {
+                        ((*vault_id).clone(), (*vault_id).clone(), *method, true)
+                    }
+                    (None, Some((vault_id, method))) => {
+                        (vault_id.to_string(), vault_id.to_string(), method, true)
+                    }
+                    (None, None) => {
+                        let key = broca_module_serve::auth_routing::select_credential_id(
+                            frozen_credential_id,
+                            provider_id,
+                            pinned_method,
+                            pinned_account,
+                            &vault.methods,
+                            FALLBACK_METHOD,
+                        );
+                        // Every credential is read by grant, by its vault credential id. A
+                        // scoped not_found is final: nothing retries it another way, which
+                        // would hide the misconfiguration the operator needs to see.
+                        let vault_id = vault.addressing.vault_id_for(&key).into_owned();
+                        (key.to_id_string(), vault_id, key.method, false)
+                    }
+                };
             // The request is built once and the call reads its arguments from it, so what the
             // selection records below is exactly what the vault was sent. get_scoped has no
             // force_refresh parameter, so none is recorded.
@@ -3359,7 +3372,7 @@ mod executor {
                 let recorded_request = recorded_vault_request(&got, vault_request);
                 // Reject a different account before it can enter the shared cache: static
                 // admissions using the same credential key do not have a routed-account check.
-                if let (Some((_, routed_vault_id, routed_account, ..)), Ok(token)) =
+                if let (Some((routed_vault_id, routed_account, ..)), Ok(token)) =
                     (&routed, &got.result)
                 {
                     vault.gauge.stamp_ok();
@@ -3375,7 +3388,7 @@ mod executor {
                 );
                 (recorded_request, outcome)
             };
-            if let Some((_, routed_vault_id, routed_account, decision, view_digest)) = &routed {
+            if let Some((routed_vault_id, routed_account, decision, view_digest, _)) = &routed {
                 match &outcome {
                     // The vault does not serve the account routing chose to this principal. That
                     // excludes the account for this admission only: routing is told, broca
@@ -3420,7 +3433,7 @@ mod executor {
             // one keeps None rather than retro-stamping its WAL.
             let selection = (fresh_episode || frozen_credential_id.is_some()).then(|| {
                 broca_core::AuthSelection {
-                    credential_id: credential_id.to_id_string(),
+                    credential_id: credential_key.clone(),
                     // Freeze the vault-served account id verbatim alongside the credential id so
                     // usage export labels spend with the account this run authenticated with.
                     account_ref: account_id.clone(),
@@ -3436,9 +3449,12 @@ mod executor {
                         AccountChoice::NotApplicable => frozen_decision.cloned(),
                         chosen => chosen.decision().cloned(),
                     },
+                    // Frozen only when `credential_id` is the vault's own id, so that a resume
+                    // takes the method from here and reads that id verbatim.
+                    auth_method: freezes_method.then(|| credential_method.as_token().to_owned()),
                 }
             });
-            let method = Some(credential_id.method);
+            let method = Some(credential_method);
             let in_run_refresh = record_version.map(|version| {
                 let served_version = Arc::new(AtomicU64::new(version));
                 let served_expires_at_ms = Arc::new(std::sync::Mutex::new(expires_at_ms));
@@ -3578,12 +3594,17 @@ mod executor {
             config: &broca_wal::RunConfig,
             headers: &std::collections::BTreeMap<String, String>,
         ) -> Result<(), String> {
-            let credential = config
+            let (method, _) = config
                 .auth_selection
                 .as_ref()
-                .and_then(|selection| CredentialId::parse(&selection.credential_id))
+                .and_then(|selection| {
+                    broca_module_serve::auth_routing::frozen_selection_credential(
+                        selection,
+                        config.model.provider_module_id.as_str(),
+                    )
+                })
                 .ok_or("account_unknown")?;
-            if !matches!(credential.method, AuthMethod::Oauth | AuthMethod::Chatgpt) {
+            if !matches!(method, AuthMethod::Oauth | AuthMethod::Chatgpt) {
                 return Ok(());
             }
             let routing = self.routing.as_deref().unwrap_or_else(|| {
@@ -3618,6 +3639,7 @@ mod executor {
                 .decide_auth_with_account(
                     provider_id,
                     selection.map(|selection| selection.credential_id.as_str()),
+                    selection.and_then(|selection| selection.auth_method.as_deref()),
                     false,
                     None,
                     None,
@@ -3717,6 +3739,16 @@ mod executor {
                     .and_then(|prior| prior.config.auth_selection.clone())
                     .map(|s| s.credential_id)
             };
+            // Present when the frozen credential id is the vault's own id (see
+            // `AuthSelection::auth_method`): the resume then reads it verbatim with this method.
+            let frozen_auth_method: Option<String> = if fresh_episode {
+                None
+            } else {
+                prior_run
+                    .as_ref()
+                    .and_then(|prior| prior.config.auth_selection.as_ref())
+                    .and_then(|selection| selection.auth_method.clone())
+            };
 
             // Authentication comes from no credential for mock, a fresh vault token, or the
             // opencode default. If the vault says the credential needs re-authentication, we
@@ -3750,7 +3782,7 @@ mod executor {
             {
                 Ok(choice) => choice,
                 Err(refusal) => {
-                    let error = RunError::AccountSelectionRefused(refusal);
+                    let error = RunError::from(refusal);
                     if let Some(ack) = job.on_admitted {
                         let _ = ack.send(Err(error.clone()));
                     }
@@ -3769,6 +3801,7 @@ mod executor {
                 .decide_auth_with_account(
                     job.req.model.provider_module_id.as_str(),
                     frozen_credential_id.as_deref(),
+                    frozen_auth_method.as_deref(),
                     fresh_episode,
                     pinned_method,
                     pinned_account,
@@ -4267,8 +4300,8 @@ mod executor {
             control.pause_for_auth_at_start = resolution.pause.clone();
             control.auth_selection = resolution.selection.clone();
             // Report this run's account evidence to routing when it has an admission id there:
-            // every decision path except `legacy_static` (the operator's switch that bypasses
-            // routing), fresh or resumed alike.
+            // every decision path except the `legacy_static` one older builds wrote (the removed
+            // operator switch that bypassed routing), fresh or resumed alike.
             let account_reporter = match (
                 self.routing.as_ref(),
                 resolution
@@ -4371,7 +4404,7 @@ mod executor {
             // Worth stating because nothing failed when that reclassification landed: the guard
             // kept compiling and kept passing its tests while the condition it named moved
             // elsewhere. An arm whose description outlives its trigger reads as coverage.
-            if let (Some(vault), Some((cred_id, admitted_version))) =
+            if let (Some(vault), Some((used_selection, admitted_version))) =
                 (self.vault.as_ref(), used_credential)
             {
                 if let Some(status) =
@@ -4380,7 +4413,7 @@ mod executor {
                 {
                     report_rejection_after_run(
                         vault,
-                        &cred_id,
+                        &used_selection,
                         admitted_version,
                         in_run_refresh.as_ref(),
                         status,
@@ -5099,6 +5132,7 @@ mod executor {
                     affordable_max_tokens: None,
                 }),
                 selection: Some(broca_core::AuthSelection {
+                    auth_method: None,
                     credential_id: "chatgpt:openai".into(),
                     account_ref: None,
                     resolved_credential_id: None,
@@ -5239,6 +5273,7 @@ mod executor {
         fn report_identity_pairs_served_version_and_requires_a_served_token() {
             let selection = || {
                 Some(broca_core::AuthSelection {
+                    auth_method: None,
                     credential_id: "oauth:anthropic".into(),
                     account_ref: None,
                     resolved_credential_id: None,
@@ -5248,7 +5283,8 @@ mod executor {
             };
             // Served token at version 7 → report identity carries exactly that version.
             assert_eq!(
-                used_credential_for_report(&None, selection(), Some(7)),
+                used_credential_for_report(&None, selection(), Some(7))
+                    .map(|(selection, version)| (selection.credential_id, version)),
                 Some(("oauth:anthropic".to_string(), 7))
             );
             // A pre-loop pause means no provider call — no report identity.
@@ -5941,6 +5977,7 @@ mod executor {
             if let broca_wal::WalRecord::RunStarted { config, .. } = &mut started.record {
                 config.model = broca_protocol::request::ModelHandle::new("deepseek", "chat");
                 config.auth_selection = Some(broca_core::AuthSelection {
+                    auth_method: None,
                     credential_id: "apikey:deepseek".into(),
                     account_ref: None,
                     resolved_credential_id: None,

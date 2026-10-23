@@ -325,6 +325,7 @@ async fn joining_steer_same_settings_and_omissions_are_accepted() {
 async fn joining_steer_auth_pin_is_refused_unless_it_names_the_frozen_credential() {
     let mut rig = Rig::start("steer-auth-pin").await;
     *rig.script.auth_selection.lock().unwrap() = Some(broca_wal::AuthSelection {
+        auth_method: None,
         credential_id: "oauth:anthropic:work".into(),
         account_ref: None,
         resolved_credential_id: None,

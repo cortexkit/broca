@@ -867,6 +867,7 @@ mod tests {
             renderer_version: 1,
             frozen_render_config: serde_json::Value::Null,
             auth_selection: credential_id.map(|credential_id| AuthSelection {
+                auth_method: None,
                 credential_id: credential_id.into(),
                 account_ref: None,
                 resolved_credential_id: None,
@@ -1309,6 +1310,7 @@ mod tests {
                     WalRecord::RunAuthRefrozen {
                         ts_ms: Some(3),
                         auth_selection: AuthSelection {
+                            auth_method: None,
                             credential_id: "chatgpt:openai".into(),
                             account_ref: Some("account".into()),
                             resolved_credential_id: None,
@@ -2142,6 +2144,7 @@ mod tests {
                 WalRecord::RunAuthRefrozen {
                     ts_ms: Some(150),
                     auth_selection: AuthSelection {
+                        auth_method: None,
                         credential_id: "chatgpt:openai".into(),
                         account_ref: Some("acct-resolved".into()),
                         resolved_credential_id: None,

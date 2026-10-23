@@ -688,6 +688,7 @@ mod tests {
                 "token_limit_field": "max_tokens"
             }),
             auth_selection: Some(AuthSelection {
+                auth_method: None,
                 credential_id: "apikey:xai:work".into(),
                 account_ref: None,
                 resolved_credential_id: None,

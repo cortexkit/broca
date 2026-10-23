@@ -24666,3 +24666,31 @@ expect_red = ["GatedCommitPaths.test_tree_or_crate_mismatch_keeps_the_local_quic
 file = "scripts/gated-commit.sh"
 old = '''      crates) attestation_crates="$value" ;;'''
 new = '''      crates) attestation_crates="$current_crates" ;; # NON-VACUITY BREAK: ignore the attested crate set'''
+
+[[control]]
+id = "account-candidates-from-vault-metadata"
+guards = "account candidates take provider and method from the vault's provider_ids and auth_method, never from parsing the opaque credential id"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/account_routing_tests.rs"
+expect_red = ["account_routing::tests::candidates_and_the_routed_pick_come_from_vault_metadata_not_the_id", "account_routing::tests::an_unmapped_credential_is_never_offered_warned_once_and_counted"]
+file = "crates/broca-module-serve/src/account_routing.rs"
+old = '''                unmapped_field(row).is_none()
+                    && row.auth_method.as_deref() == Some(method.as_token())
+                    && row.provider_ids.iter().any(|id| id == provider)'''
+new = '''                // NON-VACUITY BREAK: read provider and method from the credential id again.
+                CredentialId::parse(&row.id)
+                    .is_some_and(|id| id.method == method && id.provider == provider)'''
+
+[[control]]
+id = "routing-unreachable-refuses-the-send"
+guards = "a send routing cannot answer is refused routing_unavailable and never admitted on a static account"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+test_file = "crates/broca-module-serve/src/account_routing_tests.rs"
+expect_red = ["account_routing::tests::routing_unreachable_refuses_the_send_routing_unavailable", "account_routing::tests::a_malformed_routing_reply_is_refused_as_unreachable"]
+file = "crates/broca-module-serve/src/account_routing.rs"
+old = "            Err(ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable()))"
+new = "            static_fallback(broca_wal::ACCOUNT_DECISION_UNREACHABLE) // NON-VACUITY BREAK: admit on the static account"
