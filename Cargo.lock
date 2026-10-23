@@ -968,6 +968,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-rich-ui-syntax"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edd8791533849a0a58badb9024b33565a6f7e65ebc86bd76f031481ebb61a0d5"
+dependencies = [
+ "pulldown-cmark",
+]
+
+[[package]]
 name = "cortexkit-role-agent-data"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1006,9 +1015,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-compaction-provider"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6e0c9a769074da098ea6b89a7e9dee249623c1a6b3cd42d859f76726e0eb797"
+checksum = "add1d999b995a96cf8735545974d3ec4da751b1f8fe2c7819c8034a6cf0d5cde"
 dependencies = [
  "cortexkit-role-llm-runner",
  "serde",
@@ -1028,10 +1037,11 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.5.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e42ceb4aa0d4e755b062b1198834fbbdce042d11eeaafade40b902c49927a7a"
+checksum = "19ed484436a39f48ec3bc8112e7cb4ae4f5f87049709dab9e3c9080d23960cab"
 dependencies = [
+ "cortexkit-rich-ui-syntax",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -1040,12 +1050,13 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner-conformance"
-version = "0.10.2"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce8c2e1bd5f1a9fc9d4fd80002b936f8f7bb3dd618683396bc486ce1dd84045a"
+checksum = "1079fd1e2ae24ea322ee5009cd6c055303d5d7925cbbfa6e8105dd4b5963d512"
 dependencies = [
  "async-trait",
  "base64",
+ "cortexkit-rich-ui-syntax",
  "cortexkit-role-compaction-provider",
  "cortexkit-role-harness",
  "cortexkit-role-llm-runner",
@@ -1058,9 +1069,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-step-transform-provider"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a55ebf2c9197b9ebe03e67d8bf4995b925083bd1caf813c364d14646d74f74be"
+checksum = "bd480be8ecabe5bf1a33eeda9d8af66b8a366cdd32fbf63f4fe839df67720aa3"
 dependencies = [
  "cortexkit-role-llm-runner",
  "serde",
@@ -2448,6 +2459,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e8bbe1a966bd2f362681a44f6edce3c2310ac21e4d5067a6e7ec396297a6ea0"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3615,6 +3637,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-general-category"

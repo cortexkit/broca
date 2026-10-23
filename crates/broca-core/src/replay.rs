@@ -1390,6 +1390,7 @@ fn replay_seeded_with_compaction<'a>(
         seed_run_id.clone(),
         seed_budget.clone(),
         seed_budget_state.clone().unwrap_or_default(),
+        0,
     );
     // Tag numbers under the computed rules, given in the order the transcript renders: each
     // message as it is placed in the prompt, a run's rules from its `RunStarted` on.

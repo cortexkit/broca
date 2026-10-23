@@ -1579,3 +1579,148 @@ fn keyed(send_id: &str, extra: serde_json::Value) -> serde_json::Value {
     }
     params
 }
+
+async fn assert_projected_control_mids_match_read(rig: &mut Rig) {
+    use broca_protocol::caller::ControlUnit;
+    use broca_wal::WalRecord;
+    let page = read(rig, serde_json::json!({})).await;
+    let stored: Vec<_> = page
+        .messages
+        .iter()
+        .map(|entry| {
+            (
+                entry,
+                serde_json::from_value::<Message>(entry.message.clone()).unwrap(),
+            )
+        })
+        .collect();
+    let records = rig.records();
+    let frames: Vec<_> = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| broca_wal::FramedRecord {
+            seq: index as u64 + 1,
+            fence: 1,
+            record: record.clone(),
+        })
+        .collect();
+    let units = broca_core::project_control_with_mids(&frames, &mut Default::default()).unwrap();
+    let mut checked = 0;
+    for frame in units {
+        let matches = |message: &Message| {
+            match &frame.unit {
+            ControlUnit::AssistantMessage { message: assistant } => message.role == Role::Assistant && message.content == assistant.content,
+            ControlUnit::ToolCall { call } => message.role == Role::Assistant && message.content.iter().any(|block| matches!(block, ContentBlock::ToolCall(stored) if stored.tool_call_id == call.tool_call_id)),
+            ControlUnit::ToolResult { result } => message.role == Role::Tool && message.content.iter().any(|block| matches!(block, ContentBlock::ToolResult(stored) if stored.tool_call_id == result.tool_call_id)),
+            ControlUnit::StepStarted { step_id } | ControlUnit::StepFinished { step_id, .. } => records.iter().any(|record| matches!(record, WalRecord::ModelStepFinished { step_id: finished, assistant_message, .. } if finished == step_id && message.role == Role::Assistant && message.content == assistant_message.content)),
+            ControlUnit::BudgetFired { ordinal, .. } => records.iter().any(|record| matches!(record, WalRecord::BudgetFired { ordinal: stored_ordinal, caller_text: Some(text), .. } if stored_ordinal == ordinal && message.role == Role::User && message.content == vec![ContentBlock::Text { text: text.clone() }])),
+            _ => false,
+        }
+        };
+        if let Some(ordinal) = frame.message_ordinal {
+            let (entry, _) = stored
+                .iter()
+                .find(|(_, message)| matches(message))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "control payload has no session.read message: {:?}",
+                        frame.unit
+                    )
+                });
+            assert_eq!(ordinal, entry.ordinal, "{:?}", frame.unit);
+            assert_eq!(
+                frame.mid().as_deref(),
+                Some(entry.mid.as_str()),
+                "{:?}",
+                frame.unit
+            );
+            checked += 1;
+        } else {
+            assert!(
+                !matches!(
+                    frame.unit,
+                    ControlUnit::AssistantMessage { .. }
+                        | ControlUnit::ToolCall { .. }
+                        | ControlUnit::ToolResult { .. }
+                        | ControlUnit::StepStarted { .. }
+                        | ControlUnit::StepFinished { .. }
+                        | ControlUnit::BudgetFired { .. }
+                ),
+                "message control has no placement: {:?}",
+                frame.unit
+            );
+        }
+    }
+    assert!(
+        checked >= 8,
+        "the comparison must reach the complete tool turn"
+    );
+}
+
+#[tokio::test]
+async fn projected_control_mids_match_session_read_tool_steer_budget_and_resume() {
+    let (mut tool, _) = one_tool_turn("placed-tool").await;
+    assert_projected_control_mids_match_read(&mut tool).await;
+    tool.finish().await;
+
+    let mut steer = Rig::start("placed-steer").await;
+    steer
+        .script
+        .push(&[Step::Call("steer-call"), Step::Text("steered answer")]);
+    steer.script.hold_tool(true);
+    steer.send("steer-turn", "task", None).await;
+    steer.wait_entered().await;
+    steer.send("steer-input", "new steer", Some("steer")).await;
+    steer.script.hold_tool(false);
+    steer.wait_for_finished(1).await;
+    steer.wait_idle().await;
+    assert_projected_control_mids_match_read(&mut steer).await;
+    steer.finish().await;
+
+    let mut budget = Rig::start("placed-budget").await;
+    budget
+        .script
+        .push(&[Step::Call("budget-call"), Step::Text("budget answer")]);
+    budget.send_with("budget-turn", "task", None, serde_json::json!({"budget":{"nudges":[{"at_tool_calls":1,"text":"budget coordinate"}],"finalize_at_tool_calls":5,"finalize_text":"finish"}})).await;
+    budget.wait_for_finished(1).await;
+    budget.wait_idle().await;
+    assert!(budget
+        .records()
+        .iter()
+        .any(|record| matches!(record, broca_wal::WalRecord::BudgetFired { .. })));
+    assert_projected_control_mids_match_read(&mut budget).await;
+    budget.finish().await;
+
+    let mut resumed = Rig::start("placed-resume").await;
+    resumed.script.push(&[Step::Call("resume-call")]);
+    resumed.script.hold_tool(true);
+    let reply = resumed
+        .send_with(
+            "resume-turn",
+            "task",
+            None,
+            serde_json::json!({"on_restart":"resume"}),
+        )
+        .await;
+    let run_id = result(&reply)["run_id"].as_str().unwrap().to_owned();
+    resumed.wait_entered().await;
+    resumed = resumed.restart_at_tool_boundary().await;
+    resumed
+        .send("resumed-steer", "restart steer", Some("steer"))
+        .await;
+    resumed.script.push(&[Step::Text("resumed answer")]);
+    assert_eq!(
+        resumed
+            .registry()
+            .resume_restart_pauses(
+                std::sync::Arc::new(broca_core::FileWalStore::new(resumed.dir.join("wal"))),
+                vec![(run_id, resumed.session.clone())],
+            )
+            .await,
+        (1, 0)
+    );
+    resumed.wait_for_finished(2).await;
+    resumed.wait_idle().await;
+    assert_projected_control_mids_match_read(&mut resumed).await;
+    resumed.finish().await;
+}

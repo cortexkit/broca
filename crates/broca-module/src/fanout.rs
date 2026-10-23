@@ -306,7 +306,7 @@ struct ProjectionSeed {
 }
 
 enum ProjectionSeedMessage {
-    State(ProjectionSeed),
+    State(Box<ProjectionSeed>),
     /// The gate-owning attach could not replay the WAL. A concurrent attach's deferred seed may
     /// take ownership so one failed subscriber cannot stall every other subscriber in the tenure.
     GateOwnerFailed {
@@ -680,6 +680,7 @@ async fn projector_loop(
                 }
                 let seed = match message {
                     ProjectionSeedMessage::State(seed) => {
+                        let seed = *seed;
                         if seed.gate_tenure != gate_tenure.load(Ordering::Acquire) {
                             // A prior 0 -> 1 transition finished replay after a newer tenure began.
                             // Its state cannot cover records written while the gate was empty.
@@ -800,16 +801,10 @@ async fn projector_loop(
 fn control_projection_state_from_seed(
     seed: &broca_core::ProjectionSeed,
 ) -> Option<ControlProjectionState> {
-    (seed.completed_steps == 0 || seed.last_step_finish_reason.is_some()).then(|| {
-        ControlProjectionState::from_completed_steps_and_final_step_finish_reason(
-            seed.completed_steps,
-            seed.last_step_finish_reason,
-            // The seed knows which run the watermark sits inside. Without it a
-            // live-attached subscriber sees a terminal naming NO run while a
-            // replaying one sees the same terminal naming it.
-            seed.last_run_id.clone(),
-        )
-    })
+    if seed.completed_steps > 0 && seed.last_step_finish_reason.is_none() {
+        return None;
+    }
+    ControlProjectionState::from_projection_seed(seed)
 }
 
 /// Restore the control projection at `h` without decoding the materialized WAL prefix.
@@ -892,12 +887,12 @@ async fn subscriber_task<W: WalStore + 'static>(
         // The store seed and validated suffix cover exactly H. Register that state before awaiting
         // any sink operation; records appended after H are already buffered in the live receiver.
         if projection_seed
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: h,
                 state,
                 gate_reopen,
                 gate_tenure,
-            }))
+            })))
             .is_ok()
         {
             slot.as_mut()
@@ -974,12 +969,12 @@ async fn subscriber_task<W: WalStore + 'static>(
         // Hand the projector the exact state this replay produced. Send before awaiting the subscriber
         // sink so live projection cannot remain unseeded behind a slow replay consumer.
         if projection_seed
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: seeded_h,
                 state: replay_state,
                 gate_reopen,
                 gate_tenure,
-            }))
+            })))
             .is_ok()
         {
             slot.as_mut()
@@ -1580,12 +1575,39 @@ mod tests {
 
         writer.record(run_started(&session));
         writer.record(tool_step());
+        writer.record(WalRecord::ToolBatchStarted {
+            batch_id: broca_protocol::BatchId("b1".into()),
+            step_id: StepId(1),
+            planned_calls: vec![ToolCallId("c1".into())],
+        });
+        writer.record(WalRecord::ToolResult {
+            finished_at_ms: None,
+            tags: None,
+            hooks: None,
+            batch_id: broca_protocol::BatchId("b1".into()),
+            result: broca_protocol::ToolResult {
+                tool_call_id: ToolCallId("c1".into()),
+                output: broca_protocol::ToolOutput::Text {
+                    text: "done".into(),
+                },
+                is_error: false,
+            }
+            .into(),
+            outcome: broca_wal::DispatchOutcome::Completed,
+            reason: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+        });
+        writer.record(WalRecord::ToolBatchFinished {
+            batch_id: broca_protocol::BatchId("b1".into()),
+        });
+        writer.record(WalRecord::TurnFinished { step_id: StepId(1) });
         writer.sync().await.expect("sync projected prefix");
         let prefix = wal_store
-            .read_records_range(&session, 0, Some(2), None)
+            .read_records_range(&session, 0, Some(6), None)
             .expect("read prefix anchor");
         let anchor = prefix
-            .anchor_at(2)
+            .anchor_at(6)
             .expect("file WAL returns an exact anchor");
 
         writer.record(WalRecord::RunConfigRefrozen {
@@ -1595,16 +1617,23 @@ mod tests {
         });
         writer.record(text_step(2));
         let h = writer.sync().await.expect("sync attach head");
-        assert_eq!(h, 4);
+        assert_eq!(h, 8);
 
-        let seed_store = Arc::new(FixedProjectionSeedStore {
-            seed: Some(fixed_projection_seed(
-                2,
-                anchor,
-                1,
-                Some(FinishReason::ToolCalls),
-            )),
+        let mut seed = fixed_projection_seed(6, anchor, 2, Some(FinishReason::ToolCalls));
+        let broca_wal::WalRangeRecords::Complete(prefix_records) = prefix.records() else {
+            panic!("the materialized boundary has a complete prefix");
+        };
+        seed.admission_checkpoint =
+            broca_core::AdmissionCheckpointV1::from_frames(prefix_records).unwrap();
+        seed.admission_checkpoint
+            .last_episode
+            .as_mut()
+            .unwrap()
+            .budget_replay_state = Some(broca_core::BudgetReplayStateV1 {
+            tool_call_count: 1,
+            ..Default::default()
         });
+        let seed_store = Arc::new(FixedProjectionSeedStore { seed: Some(seed) });
         let fast_state = try_live_projection_seed(
             wal_store.clone(),
             session.clone(),
@@ -1620,7 +1649,7 @@ mod tests {
             "seed plus suffix must equal full replay at H"
         );
 
-        let next = [framed(5, run_finished())];
+        let next = [framed(9, run_finished())];
         let mut expected_state = full_state.clone();
         let expected = project_control_with_state(&next, &mut expected_state);
         let mut continued_state = fast_state;
@@ -1665,7 +1694,7 @@ mod tests {
         assert!(matches!(
             delivery,
             Delivery::Control(event)
-                if event.0 == Cursor::new(5, 0)
+                if event.0 == Cursor::new(9, 0)
                     && matches!(
                         &event.1,
                         ControlUnit::RunFinished {
@@ -2402,7 +2431,7 @@ mod tests {
         // first tenure's delayed seed must not clear the pending handshake or project this record.
         observer_tx.send(framed(3, run_finished()).into()).unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 2,
                 state: ControlProjectionState::from_completed_steps_and_final_step_finish_reason(
                     1,
@@ -2412,10 +2441,10 @@ mod tests {
                 ),
                 gate_reopen: true,
                 gate_tenure: first_tenure,
-            }))
+            })))
             .unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 2,
                 state: ControlProjectionState::from_completed_steps_and_final_step_finish_reason(
                     1,
@@ -2425,7 +2454,7 @@ mod tests {
                 ),
                 gate_reopen: true,
                 gate_tenure: second_tenure,
-            }))
+            })))
             .unwrap();
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), ring_rx.recv())
@@ -2481,12 +2510,12 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty)
         ));
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 2,
                 state: state_through(&prefix),
                 gate_reopen: true,
                 gate_tenure: 1,
-            }))
+            })))
             .unwrap();
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), ring_rx.recv())
@@ -2567,20 +2596,20 @@ mod tests {
         // not skip seq 3 for the older attach; seq 3 stays buffered until the owner installs.
         observer_tx.send(records[2].clone().into()).unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 3,
                 state: state_through(&records[..3]),
                 gate_reopen: later.gate_reopen,
                 gate_tenure: later.gate_tenure,
-            }))
+            })))
             .unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: 2,
                 state: state_through(&records[..2]),
                 gate_reopen: owner.gate_reopen,
                 gate_tenure: owner.gate_tenure,
-            }))
+            })))
             .unwrap();
         observer_tx.send(records[3].clone().into()).unwrap();
 
@@ -2916,12 +2945,12 @@ mod tests {
 
         observer_tx.send(records[split].clone().into()).unwrap();
         seed_tx
-            .send(ProjectionSeedMessage::State(ProjectionSeed {
+            .send(ProjectionSeedMessage::State(Box::new(ProjectionSeed {
                 head: records[split - 1].seq,
                 state: replay_state,
                 gate_reopen: true,
                 gate_tenure: 1,
-            }))
+            })))
             .unwrap();
 
         let mut continued = replay;

@@ -25011,3 +25011,29 @@ expect_red = ["wal_writer::tool_times_tests::declined_deferred_call_retains_its_
 file = "crates/broca-core/src/wal_writer.rs"
 old = "                *closed_at_ms = crate::run::epoch_millis();"
 new = "                *closed_at_ms = None; // NON-VACUITY BREAK: discard the approval closing observation."
+
+[[control]]
+id = "placement-next-ordinal-replay"
+guards = "Replay validates budget placement against the same absolute next ordinal used by live projection"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::projection_boundary_tests::budgeted_seeded_tail_uses_full_lineage_ordinal_and_fire_time_text"]
+file = "crates/broca-core/src/placement.rs"
+old = "            next,\n            steers: 0,"
+new = "            next: next.saturating_add(1), // NON-VACUITY BREAK: shift every message placement.\n            steers: 0,"
+
+[[control]]
+id = "placement-next-ordinal-live-control"
+guards = "Tool, steer, budget and resumed control coordinates equal the messages returned by real session.read"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::projected_control_mids_match_session_read_tool_steer_budget_and_resume"]
+file = "crates/broca-core/src/placement.rs"
+old = "            next,\n            steers: 0,"
+new = "            next: next.saturating_add(1), // NON-VACUITY BREAK: shift every message placement.\n            steers: 0,"

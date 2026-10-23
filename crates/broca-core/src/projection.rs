@@ -172,22 +172,19 @@ impl IndeterminateToolCalls {
     }
 }
 
-/// Episode-local context needed when records are projected incrementally.
+/// Context needed when records are projected incrementally. Placement keeps absolute
+/// lineage ordinals across episodes; the other fields describe the current episode.
 ///
 /// Batch replay can construct this state internally, while the live projector keeps one instance
 /// across observed records so a later `RunFinished` can describe its last model step and dispatches.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ControlProjectionState {
-    /// The run this episode's records belong to, so the TERMINAL can name it.
-    ///
-    /// `RunFinished` is the only run-lifecycle control unit that did not carry its run,
-    /// which left a subscriber attaching mid-stream unable to attribute it. The WAL
-    /// record does not carry one either, so it is tracked here from `RunStarted`.
-    ///
-    /// Stays `None` when the state is restored from a persisted watermark: the
-    /// `RunStarted` may sit before the watermark, and this projector does not read back
-    /// to find it. `None` therefore means "this producer does not know", which is exactly
-    /// what the optional wire field expresses -- not "the terminal has no run".
+    placement: crate::placement::Placement,
+    placement_error: Option<String>,
+    assistant_ordinal: Option<u64>,
+    tool_result_ordinal: Option<u64>,
+    /// The recorded episode identity, including when restored from a store seed.
+    /// `RunFinished` carries no run id in the WAL, so its control unit needs this context.
     run_id: Option<RunId>,
     final_step_finish_reason: Option<FinishReason>,
     has_completed_step: bool,
@@ -195,8 +192,8 @@ pub struct ControlProjectionState {
 }
 
 impl ControlProjectionState {
-    /// Restore the episode-local fields needed to continue control projection from a persisted
-    /// materialization watermark.
+    /// Restore legacy control attributes without a message-position seed. Use
+    /// `from_projection_seed` when projecting stored-message coordinates after a watermark.
     pub fn from_completed_steps_and_final_step_finish_reason(
         completed_steps: u64,
         final_step_finish_reason: Option<FinishReason>,
@@ -212,7 +209,39 @@ impl ControlProjectionState {
             final_step_finish_reason,
             has_completed_step: completed_steps > 0,
             indeterminate_tool_calls: IndeterminateToolCalls::default(),
+            placement: Default::default(),
+            placement_error: None,
+            assistant_ordinal: None,
+            tool_result_ordinal: None,
         }
+    }
+
+    /// A materialization boundary has no pending steer or open tool batch. Restore the
+    /// absolute next ordinal and frozen budget facts rather than inferring them from a tail.
+    pub fn from_projection_seed(seed: &crate::ProjectionSeed) -> Option<Self> {
+        if !crate::budget_replay_seed_is_valid(seed) {
+            return None;
+        }
+        let episode = seed.admission_checkpoint.last_episode.as_ref()?;
+        let mut state = Self::from_completed_steps_and_final_step_finish_reason(
+            seed.completed_steps,
+            seed.last_step_finish_reason,
+            seed.last_run_id.clone(),
+        );
+        // Budgeted seeds supplied validated firing facts above. Without a budget, missing
+        // firing facts cannot change placement and need no full-prefix reconstruction.
+        state.placement = crate::placement::Placement::seeded(
+            seed.prefix_len,
+            seed.last_run_id.clone(),
+            episode.config.budget.clone(),
+            episode.budget_replay_state.clone().unwrap_or_default(),
+            seed.completed_steps,
+        );
+        Some(state)
+    }
+
+    pub fn placement(&self) -> &crate::placement::Placement {
+        &self.placement
     }
 
     fn reset_episode(&mut self) {
@@ -220,7 +249,37 @@ impl ControlProjectionState {
         self.final_step_finish_reason = None;
         self.has_completed_step = false;
         self.indeterminate_tool_calls.reset_episode();
+        self.assistant_ordinal = None;
+        self.tool_result_ordinal = None;
     }
+}
+
+/// A control payload's stored-message coordinate, from the same placement walk as replay.
+#[derive(Debug, Clone)]
+pub struct PlacedControlUnit {
+    pub cursor: Cursor,
+    pub unit: ControlUnit,
+    pub message_ordinal: Option<u64>,
+}
+
+impl PlacedControlUnit {
+    pub fn mid(&self) -> Option<String> {
+        self.message_ordinal.map(|ordinal| format!("m{ordinal}"))
+    }
+}
+
+pub fn project_control_with_mids(
+    records: &[FramedRecord],
+    state: &mut ControlProjectionState,
+) -> Result<Vec<PlacedControlUnit>, String> {
+    let mut sink = PlacedUnitSink::default();
+    for framed in records {
+        project_control_record(framed, state, &mut sink);
+        if let Some(error) = &state.placement_error {
+            return Err(error.clone());
+        }
+    }
+    Ok(sink.units)
 }
 
 /// Project records while retaining episode context across calls.
@@ -268,7 +327,7 @@ pub fn last_control_cursor_through(
 }
 
 trait ControlProjectionSink {
-    fn push<F>(&mut self, cursor: Cursor, make_unit: F)
+    fn push<F>(&mut self, cursor: Cursor, ordinal: Option<u64>, make_unit: F)
     where
         F: FnOnce() -> ControlUnit;
 }
@@ -277,6 +336,7 @@ struct RecordSink<'a, S> {
     sink: &'a mut S,
     seq: u64,
     next_sub_index: u32,
+    ordinal: Option<u64>,
 }
 
 impl<'a, S: ControlProjectionSink> RecordSink<'a, S> {
@@ -285,6 +345,7 @@ impl<'a, S: ControlProjectionSink> RecordSink<'a, S> {
             sink,
             seq,
             next_sub_index: 0,
+            ordinal: None,
         }
     }
 
@@ -294,7 +355,7 @@ impl<'a, S: ControlProjectionSink> RecordSink<'a, S> {
     {
         let cursor = Cursor::new(self.seq, self.next_sub_index);
         self.next_sub_index += 1;
-        self.sink.push(cursor, make_unit);
+        self.sink.push(cursor, self.ordinal, make_unit);
     }
 }
 
@@ -304,11 +365,29 @@ struct UnitSink {
 }
 
 impl ControlProjectionSink for UnitSink {
-    fn push<F>(&mut self, cursor: Cursor, make_unit: F)
+    fn push<F>(&mut self, cursor: Cursor, _ordinal: Option<u64>, make_unit: F)
     where
         F: FnOnce() -> ControlUnit,
     {
         self.units.push((cursor, make_unit()));
+    }
+}
+
+#[derive(Default)]
+struct PlacedUnitSink {
+    units: Vec<PlacedControlUnit>,
+}
+
+impl ControlProjectionSink for PlacedUnitSink {
+    fn push<F>(&mut self, cursor: Cursor, ordinal: Option<u64>, make_unit: F)
+    where
+        F: FnOnce() -> ControlUnit,
+    {
+        self.units.push(PlacedControlUnit {
+            cursor,
+            unit: make_unit(),
+            message_ordinal: ordinal,
+        });
     }
 }
 
@@ -318,7 +397,7 @@ struct LastCursorSink {
 }
 
 impl ControlProjectionSink for LastCursorSink {
-    fn push<F>(&mut self, cursor: Cursor, _make_unit: F)
+    fn push<F>(&mut self, cursor: Cursor, _ordinal: Option<u64>, _make_unit: F)
     where
         F: FnOnce() -> ControlUnit,
     {
@@ -334,6 +413,14 @@ fn project_control_record<S: ControlProjectionSink>(
     state: &mut ControlProjectionState,
     sink: &mut S,
 ) {
+    use crate::placement::{AppendKind, PlacementAction};
+    let actions = match state.placement.observe(&framed.record) {
+        Ok(actions) => actions,
+        Err(error) => {
+            state.placement_error = Some(error);
+            Vec::new()
+        }
+    };
     let mut record_sink = RecordSink::new(sink, framed.seq);
     macro_rules! push {
         ($unit:expr) => {
@@ -357,6 +444,8 @@ fn project_control_record<S: ControlProjectionSink>(
             });
         }
         WalRecord::StepStarted { step_id } => {
+            state.assistant_ordinal = Some(state.placement.next_ordinal());
+            record_sink.ordinal = state.assistant_ordinal;
             push!(ControlUnit::StepStarted { step_id: *step_id });
         }
         WalRecord::BudgetFired {
@@ -366,6 +455,14 @@ fn project_control_record<S: ControlProjectionSink>(
             ordinal,
             ..
         } => {
+            record_sink.ordinal = actions.iter().find_map(|action| match action {
+                PlacementAction::Append {
+                    first,
+                    kind: AppendKind::Budget,
+                    ..
+                } => Some(*first),
+                _ => None,
+            });
             push!(ControlUnit::BudgetFired {
                 run_id: run_id.clone(),
                 kind: *kind,
@@ -380,6 +477,19 @@ fn project_control_record<S: ControlProjectionSink>(
             finish_reason,
             ..
         } => {
+            state.assistant_ordinal = actions
+                .iter()
+                .find_map(|action| match action {
+                    PlacementAction::Append {
+                        first,
+                        kind: AppendKind::Assistant | AppendKind::Finalize,
+                        ..
+                    } => Some(*first),
+                    _ => None,
+                })
+                .or_else(|| state.placement.held_assistant_ordinal());
+            state.tool_result_ordinal = state.placement.held_tool_result_ordinal();
+            record_sink.ordinal = state.assistant_ordinal;
             state.final_step_finish_reason = *finish_reason;
             state.has_completed_step = true;
             // Fixed order, matching the live loop's emission: the assembled assistant message,
@@ -400,6 +510,7 @@ fn project_control_record<S: ControlProjectionSink>(
         WalRecord::ToolResult {
             result, outcome, ..
         } => {
+            record_sink.ordinal = state.tool_result_ordinal;
             state
                 .indeterminate_tool_calls
                 .record_dispatch_terminal(&result.tool_call_id, outcome.is_indeterminate());
@@ -412,6 +523,7 @@ fn project_control_record<S: ControlProjectionSink>(
             reason,
             ..
         } => {
+            record_sink.ordinal = state.tool_result_ordinal;
             state
                 .indeterminate_tool_calls
                 .record_dispatch_terminal(tool_call_id, false);
@@ -443,6 +555,8 @@ fn project_control_record<S: ControlProjectionSink>(
                     .then(|| state.indeterminate_tool_calls.snapshot()),
                 retries_used: *retries_used,
             });
+            state.assistant_ordinal = None;
+            state.tool_result_ordinal = None;
         }
         WalRecord::RunPaused {
             run_id,
@@ -555,6 +669,7 @@ fn project_control_record<S: ControlProjectionSink>(
         WalRecord::CacheWarmed { .. } => {}
         WalRecord::ApprovalRecorded { closing_result, .. } => {
             if let Some(result) = closing_result {
+                record_sink.ordinal = state.tool_result_ordinal;
                 state
                     .indeterminate_tool_calls
                     .record_dispatch_terminal(&result.tool_call_id, false);
@@ -596,3 +711,6 @@ fn message_shape_finish_reason(
         FinishReason::Stop
     }
 }
+
+#[cfg(test)]
+mod placement_tests;

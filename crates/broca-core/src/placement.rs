@@ -41,7 +41,7 @@ pub enum PlacementAction {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Batch {
     id: Option<BatchId>,
     planned: Vec<ToolCallId>,
@@ -51,7 +51,7 @@ struct Batch {
 
 /// The next ordinal is absolute, including a materialized prefix not held in memory.
 /// A projection watermark never splits a held steer or an open tool batch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     next: u64,
     steers: u64,
@@ -64,9 +64,15 @@ pub struct Placement {
     completed_steps: u64,
 }
 
+impl Default for Placement {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 impl Placement {
     pub fn new(next: u64) -> Self {
-        Self::seeded(next, None, None, BudgetReplayStateV1::default())
+        Self::seeded(next, None, None, BudgetReplayStateV1::default(), 0)
     }
 
     pub fn seeded(
@@ -74,6 +80,7 @@ impl Placement {
         run_id: Option<RunId>,
         budget_config: Option<BudgetConfig>,
         budget: BudgetReplayStateV1,
+        completed_steps: u64,
     ) -> Self {
         Self {
             next,
@@ -84,12 +91,20 @@ impl Placement {
             budget_config,
             budget,
             import_start: None,
-            completed_steps: 0,
+            completed_steps,
         }
     }
 
     pub fn next_ordinal(&self) -> u64 {
         self.next
+    }
+
+    pub fn held_assistant_ordinal(&self) -> Option<u64> {
+        self.assistant_held.then_some(self.next)
+    }
+
+    pub fn held_tool_result_ordinal(&self) -> Option<u64> {
+        self.assistant_held.then_some(self.next.saturating_add(1))
     }
 
     pub fn budget(&self) -> &BudgetReplayStateV1 {
@@ -462,6 +477,7 @@ mod tests {
             Some(RunId("r".into())),
             Some(budget),
             BudgetReplayStateV1::default(),
+            0,
         );
         let firing = WalRecord::BudgetFired {
             tags: None,
