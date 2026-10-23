@@ -22,8 +22,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 // Codex's default stream budget is five retries after the initial request. Retain its
 // six-failure threshold across this run, including upgrades that fell back before sending.
 const FAILURE_LIMIT: usize = 6;
-// Retire before the backend's 60-minute connection lifetime, not in the middle of a response.
-const MAX_SOCKET_AGE: Duration = Duration::from_secs(55 * 60);
+// OpenAI limits connections to 60 minutes. Retire at 40 minutes to leave headroom
+// above the longest healthy request we have measured (about 14 minutes).
+const MAX_SOCKET_AGE: Duration = Duration::from_secs(40 * 60);
 const BETA: &str = "responses_websockets=2026-02-06";
 // Only the first 512 bytes of a refused upgrade's body are read, and only to recognise a ChatGPT
 // usage-limit refusal (whose body is about 200 bytes). The body is never logged or stored.
@@ -413,13 +414,17 @@ impl Session {
         {
             let mut state = self.state.lock().unwrap();
             if let Some(socket) = &state.socket {
+                let age = now.saturating_duration_since(socket.established_at);
                 if !socket.closed.load(Ordering::Acquire)
                     && socket.headers == request.headers
                     && (!request.codex_wire || socket.auth_revision == request.auth_revision)
                     && (!request.codex_wire || socket.url == request.url)
-                    && now.saturating_duration_since(socket.established_at) < MAX_SOCKET_AGE
+                    && age < MAX_SOCKET_AGE
                 {
                     return Ok((Arc::clone(socket), true));
+                }
+                if age >= MAX_SOCKET_AGE {
+                    tracing::info!(target: "provider", transport = "websocket", socket_generation = socket.generation, socket_age_ms = age.as_millis() as u64, "Retiring Responses websocket before its connection lifetime limit");
                 }
                 socket.shutdown.cancel();
                 let auth_changed = socket.headers != request.headers

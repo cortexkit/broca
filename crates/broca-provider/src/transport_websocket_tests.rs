@@ -576,6 +576,40 @@ async fn codex_continuation_large_canonical_request_has_small_suffix_and_real_st
 }
 
 #[tokio::test]
+async fn codex_continuation_under_retirement_age_reuses_socket() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
+    let provider = codex_provider(&mock);
+    let first = step(&provider, 1, &opts()).await;
+    let next = follow_up(opts(), &first, "Next");
+    let canonical = provider.render_request(&next);
+    provider
+        .websocket
+        .advance_clock(Duration::from_secs(40 * 60 - 1));
+    let second = step(&provider, 2, &next).await;
+    assert_eq!(attempts(&second).len(), 1);
+    assert_eq!(attempts(&second)[0].outcome, AttemptOutcome::Complete);
+    assert_canonical(attempts(&second)[0], &canonical);
+    let codex = codex_trace(&second, 0);
+    assert!(codex.continuation);
+    assert_eq!(codex.suffix_item_count, 1);
+    assert!(codex.previous_response_id_present);
+    assert_eq!(
+        codex.connection_generation,
+        codex_trace(&first, 0).connection_generation
+    );
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 1);
+    assert_eq!(seen.closes, 0);
+    assert_eq!(seen.requests.len(), 2);
+    let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+    assert_eq!(frame["previous_response_id"], "r");
+    assert_eq!(
+        frame["input"],
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"Next"}]}])
+    );
+}
+
+#[tokio::test]
 async fn codex_continuation_equal_input_sends_empty_suffix() {
     let mock = Mock::start(vec![text_events(), text_events()], false, false).await;
     let provider = codex_provider(&mock);
@@ -599,9 +633,6 @@ async fn codex_reset_case(case: &str) {
     let next = follow_up(opts(), &first, "Next");
     let canonical = provider.render_request(&next);
     match case {
-        "age" => provider
-            .websocket
-            .advance_clock(Duration::from_secs(56 * 60)),
         "headers" => {
             let mut current = provider.auth.write().unwrap();
             let AuthHandle::Headers(headers) = Arc::make_mut(&mut current.auth) else {
@@ -644,7 +675,92 @@ async fn codex_reset_case(case: &str) {
 }
 #[tokio::test]
 async fn codex_continuation_age_reset_is_full() {
-    codex_reset_case("age").await;
+    for age_secs in [40 * 60, 40 * 60 + 1] {
+        let mock = Mock::start(vec![text_events(); 3], false, false).await;
+        let provider = codex_provider(&mock);
+        let first = step(&provider, 1, &opts()).await;
+        let next = follow_up(opts(), &first, "Next");
+        let canonical = provider.render_request(&next);
+        provider
+            .websocket
+            .advance_clock(Duration::from_secs(age_secs));
+        let second = step(&provider, 2, &next).await;
+        assert_eq!(attempts(&second).len(), 1);
+        assert_eq!(attempts(&second)[0].outcome, AttemptOutcome::Complete);
+        assert_canonical(attempts(&second)[0], &canonical);
+        let codex = codex_trace(&second, 0);
+        assert!(!codex.continuation);
+        assert_eq!(codex.suffix_item_count, 0);
+        assert!(!codex.previous_response_id_present);
+        assert_eq!(
+            codex.connection_generation,
+            codex_trace(&first, 0).connection_generation + 1
+        );
+        mock.wait_closes(1).await;
+        {
+            let seen = mock.observed.lock().unwrap();
+            assert_eq!(seen.handshakes, 2);
+            assert_eq!(seen.requests.len(), 2);
+            let frame: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
+            let full: Value = serde_json::from_slice(&canonical).unwrap();
+            assert_eq!(frame["input"], full["input"]);
+            assert!(frame.get("previous_response_id").is_none());
+        }
+        provider.close_run_transport();
+        let reconnected_events = step(&provider, 3, &next).await;
+        assert_canonical(attempts(&reconnected_events)[0], &canonical);
+        assert_eq!(provider.render_request(&next), canonical);
+        let seen = mock.observed.lock().unwrap();
+        assert_eq!(seen.handshakes, 3);
+        let mut retired_headers = seen.headers[1].clone();
+        let mut reconnected_headers = seen.headers[2].clone();
+        // The websocket handshake nonce must change, but the frozen wire identity must not.
+        retired_headers.remove("sec-websocket-key");
+        reconnected_headers.remove("sec-websocket-key");
+        assert_eq!(retired_headers, reconnected_headers);
+        let retired = std::str::from_utf8(&seen.requests[1]).unwrap();
+        let reconnected = std::str::from_utf8(&seen.requests[2]).unwrap();
+        // Only the per-send timestamp may differ from a full-input reconnect frame.
+        let stamp = "x-codex-ws-stream-request-start-ms";
+        assert_eq!(
+            retired,
+            reconnected.replacen(
+                &format!(
+                    "\"{stamp}\":\"{}\"",
+                    attempts(&reconnected_events)[0].sent_at_ms.unwrap()
+                ),
+                &format!(
+                    "\"{stamp}\":\"{}\"",
+                    attempts(&second)[0].sent_at_ms.unwrap()
+                ),
+                1,
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_age_retirement_does_not_pin_https() {
+    let mock = Mock::start(vec![text_events(); 8], false, false).await;
+    let provider = codex_provider(&mock);
+    for id in 1..=8 {
+        if id > 1 {
+            provider
+                .websocket
+                .advance_clock(Duration::from_secs(40 * 60));
+        }
+        let events = step(&provider, id, &opts()).await;
+        assert_eq!(attempts(&events).len(), 1);
+        let attempt = attempts(&events)[0];
+        assert_eq!(attempt.outcome, AttemptOutcome::Complete);
+        assert_eq!(attempt.transport.as_deref(), Some("websocket"));
+        assert_eq!(codex_trace(&events, 0).connection_generation, id);
+    }
+    mock.wait_closes(7).await;
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 8);
+    assert_eq!(seen.requests.len(), 8);
+    assert!(seen.http_bodies.is_empty());
 }
 #[tokio::test]
 async fn codex_continuation_header_reset_is_full() {
@@ -2723,7 +2839,7 @@ async fn websocket_over_age_socket_is_retired_before_the_next_send() {
     assert_eq!(mock.observed.lock().unwrap().handshakes, 1);
     provider
         .websocket
-        .advance_clock(Duration::from_secs(55 * 60 + 1));
+        .advance_clock(Duration::from_secs(40 * 60 + 1));
     assert_eq!(
         attempts(&step(&provider, 3, &opts()).await)[0].outcome,
         AttemptOutcome::Complete
