@@ -28,7 +28,7 @@ pub mod credential;
 pub mod typesafe;
 pub mod workers_ai;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -125,6 +125,12 @@ impl BatchCatalog for LiveCatalog {
 pub enum ProviderReply {
     /// HTTP 200, with the body as received.
     Answered(Vec<u8>),
+    /// An answer tied to the credential resolved for this attempt, not a later lookup.
+    AttributedAnswer {
+        body: Vec<u8>,
+        auth_selection: Option<String>,
+        account_ref: Option<String>,
+    },
     /// Any other HTTP status, with the wait the provider asked for, if it asked.
     Status {
         status: u16,
@@ -235,12 +241,14 @@ pub struct SystemOne {
     pins: Vec<ModelPin>,
     config: Config,
     /// Batch ids a call in this process holds now: the in-process half of single flight.
-    claims: Mutex<HashSet<String>>,
+    claims: Mutex<HashMap<String, broca_store::system_one::BatchScope>>,
     call_slots: Arc<Semaphore>,
     model_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
     in_flight: Arc<AtomicUsize>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     metrics: Mutex<Metrics>,
+    export: Option<Arc<broca_store::SqliteStore>>,
+    charge_basis: Arc<crate::billing_routing::ChargeBasisTable>,
 }
 
 /// Process-lifetime observations only. No batch ids, questions, states or answers enter health.
@@ -279,12 +287,48 @@ impl SystemOne {
             pins,
             call_slots: Arc::new(Semaphore::new(config.process_calls.max(1))),
             config,
-            claims: Mutex::new(HashSet::new()),
+            claims: Mutex::new(HashMap::new()),
             model_slots: Mutex::new(HashMap::new()),
             in_flight,
             clock: Arc::new(now_ms),
             metrics: Mutex::new(Metrics::default()),
+            export: None,
+            charge_basis: Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
         }
+    }
+
+    /// Reuse the daemon-wide immutable export stream, without opening any session projection.
+    pub fn with_export(
+        mut self,
+        export: Arc<broca_store::SqliteStore>,
+        charge_basis: Arc<crate::billing_routing::ChargeBasisTable>,
+    ) -> Self {
+        self.export = Some(export);
+        self.charge_basis = charge_basis;
+        self
+    }
+
+    fn flush_facts(&self) -> Result<(), String> {
+        let Some(export) = &self.export else {
+            return Ok(());
+        };
+        for pending in self.store.pending_facts().map_err(|e| e.to_string())? {
+            if export
+                .emit_system_one_fact(&pending.fact)
+                .map_err(|e| e.to_string())?
+            {
+                let mut metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
+                let spend = metrics
+                    .spend_nanos_by_model
+                    .entry(pending.fact.model.clone())
+                    .or_default();
+                *spend = spend.saturating_add(pending.spend_nanos);
+            }
+            self.store
+                .acknowledge_fact(&pending.fact.fact_id)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn health(&self) -> serde_json::Value {
@@ -302,6 +346,7 @@ impl SystemOne {
 
     /// Release every batch a previous process left running. Call once, before serving.
     pub fn release_abandoned(&self) -> Result<usize, String> {
+        self.flush_facts()?;
         self.store.release_abandoned().map_err(|e| e.to_string())
     }
 

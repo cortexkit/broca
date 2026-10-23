@@ -643,13 +643,33 @@ The manifest lists `classifier/v1` in `capabilities.provides`.
   and `llm-runner`, or a `classifier` version other than `v1`, is refused at bind
   with `role_versions_unsupported`.
 - **No session.** A classifier route names no session: nothing opens a session,
-  takes a lease, or touches a WAL or `run-index.db`. Each call runs on its own task,
+  takes a lease, touches a WAL, or writes session projections. Each call runs on its own task,
   capped per process and per model, and holds none of the connection's request slots.
+- **Work scope.** `classify.run` requires a daemon-stamped run scope (`agent_id` and
+  `run_id`) or flow scope (`flow_id`), otherwise `scope_required` before any write or
+  provider call. `reserved:basal` requires a flow, even when it presents a run stamp,
+  otherwise `flow_scope_required`. A batch freezes its first attribution; a retry
+  under another scope gets `batch_scope_mismatch`, without changing its ceiling or
+  stored outcomes. A flow is never attributed to its owner agent. `role.describe`
+  remains available without a work scope.
 - **Durable batches.** `system-one.db` under the state root records each admitted
   batch and every item outcome before the reply, and is the authority for them.
   Batches a dead process left `running` are released at startup. A batch and its
   outcomes are deleted seven days after first admission. The file is excluded from
   Engram backups.
+- **Metering.** Each paid item commits an immutable measurement intent alongside its
+  outcome, then publishes it to `run-index.db`'s `export_facts` before replying. Startup
+  republishes pending intents idempotently. These sessionless facts carry
+  `kind: "system_one"`; existing session facts keep their bytes and ids. Only reported
+  tokens enter `usage`; estimates and prices stay inside batch ceiling accounting.
+  Consumers must deploy kind-aware decoding before these facts are produced.
+- **Health.** Channel-0 `health.check` metrics include `system_one`, with the in-flight
+  batch gauge, answered/refused batch calls, newly recorded answered/failed items,
+  nanodollars of batch-accounted spend newly exported per model since process start,
+  and the last provider error code per provider. This spend uses frozen ceiling rates
+  (and input estimates when unreported), not Astrocyte's pricing of measurements.
+  It contains no item content. Replayed facts and
+  served cached outcomes do not increase item or spend counters.
 - **Catalog.** A row whose `model.kind` is `decision` is a classifier; another
   stated kind, or no kind, is refused `model_not_classifier`; a model the catalog
   does not list is `model_unknown`.

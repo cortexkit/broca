@@ -3388,7 +3388,7 @@ async fn renderer_drift_reaches_subscriber_and_run_status() {
                 if let Some(fact) = page
                     .facts
                     .into_iter()
-                    .find(|fact| fact.segment.run_id.0 == "r-drift")
+                    .find(|fact| fact.segment.as_session().unwrap().run_id.0 == "r-drift")
                 {
                     return fact;
                 }
@@ -3406,7 +3406,7 @@ async fn renderer_drift_reaches_subscriber_and_run_status() {
     .await
     .expect("renderer-drift terminal eventually emits an immutable usage fact");
     assert_eq!(
-        fact.segment.occurred_at_ms,
+        fact.segment.as_session().unwrap().occurred_at_ms,
         Some(terminal_ts_ms),
         "billing preserves the durable terminal timestamp for period attribution"
     );

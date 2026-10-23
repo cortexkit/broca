@@ -104,7 +104,7 @@ where
         .unwrap()
         .facts
         .iter()
-        .all(|fact| fact.segment.session != session));
+        .all(|fact| fact.segment.as_session().unwrap().session != session));
 }
 
 /// Catch-up enumerates terminal runs with no local facts and exports their WAL
@@ -141,7 +141,10 @@ where
     );
     let page = store.read_page(None, u64::MAX).unwrap();
     assert_eq!(page.facts.len(), 1);
-    assert_eq!(page.facts[0].segment.run_id.0, "backfill-local");
+    assert_eq!(
+        page.facts[0].segment.as_session().unwrap().run_id.0,
+        "backfill-local"
+    );
 }
 
 /// Recording the imported-run suppression set before a failed WAL installation
@@ -184,7 +187,7 @@ where
     let mut ids: Vec<_> = page
         .facts
         .iter()
-        .map(|fact| fact.segment.run_id.0.as_str())
+        .map(|fact| fact.segment.as_session().unwrap().run_id.0.as_str())
         .collect();
     ids.sort();
     assert_eq!(ids, vec!["fresh-after-activation", "z-local-resumed"]);

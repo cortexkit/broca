@@ -120,9 +120,10 @@ impl ClassifierProvider for HeldProvider {
         self.held.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_waiters();
         let _permit = self.gate.acquire().await.unwrap();
-        ProviderReply::Answered(
-            br#"{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":0.5}}}"#.to_vec(),
-        )
+        ProviderReply::AttributedAnswer {
+            body: br#"{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":0.5}},"usage":{"input_tokens":100}}"#.to_vec(),
+            auth_selection: Some("apikey:typesafe:primary".into()), account_ref: Some("primary".into()),
+        }
     }
 }
 
@@ -146,10 +147,15 @@ struct Rig {
     provider: Arc<HeldProvider>,
     store: Arc<broca_store::SystemOneStore>,
     system_one: Arc<SystemOne>,
+    export: Arc<broca_store::SqliteStore>,
     serve: tokio::task::JoinHandle<Result<ServeEnd, ServeIoError>>,
 }
 
 async fn start() -> Rig {
+    start_with_basis(crate::billing_routing::ChargeBasisTable::shipped_defaults()).await
+}
+
+async fn start_with_basis(table: crate::billing_routing::ChargeBasisTable) -> Rig {
     let (mut daemon, module) = tokio::io::duplex(1 << 20);
     let (reader, writer) = tokio::io::split(module);
     let handler = Arc::new(InstantSessions::default());
@@ -159,14 +165,37 @@ async fn start() -> Rig {
         held: AtomicUsize::new(0),
     });
     let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
-    let system_one = Arc::new(SystemOne::new(
-        store.clone(),
-        "test",
-        Arc::new(JevOnly),
-        vec![ModelPin::jev(provider.clone())],
-        Config::default(),
-        Arc::new(AtomicUsize::new(0)),
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = broca_test_support::scratch_root().join(format!(
+        "classifier-export-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
     ));
+    std::fs::create_dir_all(&root).unwrap();
+    let export_path = root.join("run-index.db");
+    drop(broca_store::SqliteStore::open(&export_path).unwrap());
+    // Fix only the source identity and clock so the real producer's complete bytes, including
+    // fact ids, can be compared with the downstream decoder's golden fixtures.
+    rusqlite::Connection::open(&export_path)
+        .unwrap()
+        .execute(
+            "UPDATE export_meta SET source_instance_id='system-one-golden-source'",
+            [],
+        )
+        .unwrap();
+    let export = Arc::new(broca_store::SqliteStore::open(&export_path).unwrap());
+    let system_one = Arc::new(
+        SystemOne::new(
+            store.clone(),
+            "test",
+            Arc::new(JevOnly),
+            vec![ModelPin::jev(provider.clone())],
+            Config::default(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_export(export.clone(), Arc::new(table))
+        .with_clock(Arc::new(|| 1792772000000)),
+    );
     let serve = tokio::spawn(serve_connection_with_services(
         reader,
         writer,
@@ -211,6 +240,7 @@ async fn start() -> Rig {
         provider,
         store,
         system_one,
+        export,
         serve,
     }
 }
@@ -334,7 +364,102 @@ async fn unscoped_classifier_call_writes_and_sends_nothing() {
         .unwrap()
         .is_empty());
     assert_eq!(rig.provider.held.load(Ordering::SeqCst), 0);
+    assert!(rig
+        .export
+        .read_export_page(None, 100)
+        .unwrap()
+        .facts
+        .is_empty());
     assert_eq!(rig.system_one.health()["batches_failed"], 1);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn scoped_classifier_exports_one_measurement_per_paid_item_and_none_on_resend() {
+    let mut rig = start().await;
+    rig.bind(9, &[broca_subc::CLASSIFIER_ROLE_VERSIONS]).await;
+    rig.provider.gate.add_permits(2);
+    let mut params = classify_params("paid-run");
+    params["items"] = json!([{"state": "a"}, {"state": "b"}]);
+    for corr in [1, 2] {
+        rig.request(9, corr, "classify.run", params.clone()).await;
+        assert_eq!(rig.reply().await.header.ty, FrameType::Response);
+        let page = rig.export.read_export_page(None, 100).unwrap();
+        assert_eq!(page.facts.len(), 2);
+        assert_eq!(
+            serde_json::to_string(&page.facts[0].segment).unwrap(),
+            include_str!("../tests/golden/system_one_run_fact.json").trim()
+        );
+        for (index, fact) in page.facts.iter().enumerate() {
+            let broca_core::system_one_fact::UsageExportSegment::SystemOne(fact) = &fact.segment
+            else {
+                panic!("not a System One fact")
+            };
+            assert_eq!(fact.item_index, index as u64);
+            assert_eq!(fact.run_id.as_deref(), Some("run"));
+            assert_eq!(fact.flow_id, None);
+            assert_eq!(
+                fact.auth_selection.as_deref(),
+                Some("apikey:typesafe:primary")
+            );
+            assert_eq!(fact.account_ref.as_deref(), Some("primary"));
+            assert_eq!(fact.usage.input_tokens, Some(100));
+            assert_eq!(fact.usage.output_tokens, None);
+            assert_eq!(fact.charge_basis, broca_core::ChargeBasis::MeteredApi);
+            assert_eq!(fact.model, JEV_1_13_0);
+        }
+    }
+    assert_eq!(rig.provider.held.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        rig.system_one.health()["spend_nanos_by_model"][JEV_1_13_0],
+        8400
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn flow_classifier_measurement_never_inherits_its_owner_agent_or_run() {
+    let mut rig = start().await;
+    let stamp = serde_json::from_value(json!({
+        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "ref": "owners-run", "scope_epoch": 1, "kind": "head", "owner_authorized": true,
+        "attributes": {"flow_id": "flow-1", "agent_id": "agent", "run_id": "owners-run"}
+    }))
+    .unwrap();
+    let basal = Some(subc_protocol::Principal::Reserved {
+        module_id: "basal".into(),
+    });
+    rig.bind_with_scope(
+        9,
+        &[broca_subc::CLASSIFIER_ROLE_VERSIONS],
+        basal,
+        Some(stamp),
+    )
+    .await;
+    rig.provider.gate.add_permits(1);
+    rig.request(9, 1, "classify.run", classify_params("paid-flow"))
+        .await;
+    assert_eq!(rig.reply().await.header.ty, FrameType::Response);
+    let page = rig.export.read_export_page(None, 100).unwrap();
+    assert_eq!(page.facts.len(), 1);
+    let value = serde_json::to_value(&page.facts[0].segment).unwrap();
+    assert_eq!(
+        serde_json::to_string(&page.facts[0].segment).unwrap(),
+        include_str!("../tests/golden/system_one_flow_fact.json").trim()
+    );
+    assert_eq!(value["flow_id"], "flow-1");
+    for absent in [
+        "run_id",
+        "agent_id",
+        "session",
+        "resolved_credential_id",
+        "cost_nanos",
+        "input_rate_nanos",
+        "output_rate_nanos",
+        "cost_basis",
+    ] {
+        assert!(value.get(absent).is_none(), "{absent}: {value}");
+    }
     rig.finish().await;
 }
 
@@ -342,7 +467,7 @@ async fn unscoped_classifier_call_writes_and_sends_nothing() {
 async fn basal_classifier_requires_a_flow_even_with_a_run_stamp() {
     let mut rig = start().await;
     rig.provider.gate.add_permits(2);
-    for (channel, scope) in [(9, None), (10, Some(run_stamp("run")))] {
+    for (channel, scope) in [(9, Some(run_stamp("run"))), (10, None)] {
         let principal = Some(subc_protocol::Principal::Reserved {
             module_id: "basal".into(),
         });
@@ -545,5 +670,109 @@ async fn a_hung_classifier_provider_never_delays_session_work() {
         assert_eq!(frame.header.ty, FrameType::Response, "{frame:?}");
         classified.insert(frame.header.corr);
     }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn startup_replays_committed_measurement_intents_before_serving() {
+    use broca_store::system_one::{
+        BatchClaim, BatchScope, Claimed, FactContext, Outcome, PaidRecord, StoredOutcome,
+    };
+    let rig = start().await;
+    let scope = BatchScope::Run {
+        agent_id: "agent".into(),
+        run_id: "run".into(),
+    };
+    assert_eq!(
+        rig.store
+            .claim(&BatchClaim {
+                role: "classifier",
+                batch_id: "crash",
+                model: JEV_1_13_0,
+                identity: "{}",
+                body_digest: "digest",
+                frozen_row: "{}",
+                scope: &scope,
+                ceiling_nanos: None,
+                owner: "dead-process",
+                now_ms: 1,
+            })
+            .unwrap(),
+        Claimed::Fresh
+    );
+    let context = FactContext {
+        source_instance_id: rig.export.source_instance_id().into(),
+        provider: "typesafe".into(),
+        model: JEV_1_13_0.into(),
+        auth_selection: Some("apikey:typesafe:primary".into()),
+        account_ref: Some("primary".into()),
+        charge_basis: broca_core::ChargeBasis::MeteredApi,
+        charge_basis_mapping_version: 5,
+        charge_basis_overrides: "none".into(),
+    };
+    rig.store
+        .record_paid(
+            "classifier",
+            "crash",
+            "dead-process",
+            &StoredOutcome {
+                index: 0,
+                outcome: Outcome::Answered("{}".into()),
+                input_tokens: Some(100),
+                output_tokens: None,
+            },
+            &PaidRecord {
+                spend_nanos: 4200,
+                now_ms: 2,
+                fact: Some(&context),
+            },
+        )
+        .unwrap();
+    assert!(rig
+        .export
+        .read_export_page(None, 100)
+        .unwrap()
+        .facts
+        .is_empty());
+    let restarted = SystemOne::new(
+        rig.store.clone(),
+        "new-process",
+        Arc::new(JevOnly),
+        vec![ModelPin::jev(rig.provider.clone())],
+        Config::default(),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .with_export(
+        rig.export.clone(),
+        Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
+    );
+    assert_eq!(restarted.release_abandoned().unwrap(), 1);
+    assert_eq!(
+        rig.export.read_export_page(None, 100).unwrap().facts.len(),
+        1
+    );
+    assert!(rig.store.pending_facts().unwrap().is_empty());
+    assert_eq!(restarted.health()["spend_nanos_by_model"][JEV_1_13_0], 4200);
+    restarted.release_abandoned().unwrap();
+    assert_eq!(
+        rig.export.read_export_page(None, 100).unwrap().facts.len(),
+        1
+    );
+    assert_eq!(rig.provider.held.load(Ordering::SeqCst), 0);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn classifier_fact_resolves_charge_basis_from_its_configured_table() {
+    let mut rig = start_with_basis(crate::billing_routing::ChargeBasisTable::empty()).await;
+    rig.bind(9, &[broca_subc::CLASSIFIER_ROLE_VERSIONS]).await;
+    rig.provider.gate.add_permits(1);
+    rig.request(9, 1, "classify.run", classify_params("basis"))
+        .await;
+    assert_eq!(rig.reply().await.header.ty, FrameType::Response);
+    let page = rig.export.read_export_page(None, 100).unwrap();
+    assert_eq!(page.facts.len(), 1);
+    let value = serde_json::to_value(&page.facts[0].segment).unwrap();
+    assert_eq!(value["charge_basis"], "unknown");
     rig.finish().await;
 }

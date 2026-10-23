@@ -1845,8 +1845,11 @@ async fn retired_usage_export_is_unknown_and_terminal_facts_remain() {
     .await;
     let page = page.expect("terminal emission should publish one usage fact");
     assert_eq!(page.facts.len(), 1);
-    assert_eq!(page.facts[0].segment.charge_basis, ChargeBasis::Unknown);
-    assert_eq!(page.facts[0].segment.session, session);
+    assert_eq!(
+        page.facts[0].segment.as_session().unwrap().charge_basis,
+        ChargeBasis::Unknown
+    );
+    assert_eq!(page.facts[0].segment.as_session().unwrap().session, session);
     drop(cwriter);
     drop(creader);
     let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;

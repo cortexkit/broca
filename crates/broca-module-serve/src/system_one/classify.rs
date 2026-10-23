@@ -288,6 +288,9 @@ fn first_call_refusal(error: &ItemError, model: &str, pin: &ModelPin) -> Refusal
 /// TypeSafe's errors by status).
 fn map_reply(reply: ProviderReply, pin: &ModelPin) -> Result<(String, Option<Usage>), ItemError> {
     match reply {
+        ProviderReply::AttributedAnswer { body, .. } => {
+            map_reply(ProviderReply::Answered(body), pin)
+        }
         ProviderReply::Answered(body) => {
             let decoded: ProviderAnswer<'_> = serde_json::from_slice(&body).map_err(|e| {
                 ItemError::for_code(
@@ -386,7 +389,7 @@ async fn call_provider(
     service: &SystemOne,
     pin: &ModelPin,
     body: String,
-) -> Result<(String, Option<Usage>), ItemError> {
+) -> Result<PaidAnswer, ItemError> {
     let slot = service.model_slot(&pin.catalog_id);
     let mut attempt = 0;
     loop {
@@ -396,7 +399,7 @@ async fn call_provider(
             pin.provider.call(body.clone()).await
         };
         let code = match &reply {
-            ProviderReply::Answered(_) => None,
+            ProviderReply::Answered(_) | ProviderReply::AttributedAnswer { .. } => None,
             ProviderReply::Status { status, .. } => Some(status.to_string()),
             ProviderReply::WorkersAiError { status, code, .. } => {
                 Some(code.map_or_else(|| status.to_string(), |code| code.to_string()))
@@ -419,9 +422,31 @@ async fn call_provider(
             Some(wait) if attempt < service.config.max_attempts => {
                 tokio::time::sleep(wait).await;
             }
-            _ => return map_reply(reply, pin),
+            _ => {
+                let (auth_selection, account_ref) = match &reply {
+                    ProviderReply::AttributedAnswer {
+                        auth_selection,
+                        account_ref,
+                        ..
+                    } => (auth_selection.clone(), account_ref.clone()),
+                    _ => (pin.provider.credential_id(), None),
+                };
+                return map_reply(reply, pin).map(|(answers, usage)| PaidAnswer {
+                    answers,
+                    usage,
+                    auth_selection,
+                    account_ref,
+                });
+            }
         }
     }
+}
+
+struct PaidAnswer {
+    answers: String,
+    usage: Option<Usage>,
+    auth_selection: Option<String>,
+    account_ref: Option<String>,
 }
 
 /// Serve one `classify.run`.
@@ -430,6 +455,11 @@ pub(crate) async fn run(
     params: &str,
     scope: &broca_store::system_one::BatchScope,
 ) -> Result<Box<RawValue>, Refusal> {
+    let flush = Arc::clone(service);
+    tokio::task::spawn_blocking(move || flush.flush_facts())
+        .await
+        .map_err(|_| internal_refusal("usage export recovery task failed"))?
+        .map_err(|_| internal_refusal("usage export is unavailable; re-send the batch"))?;
     let limits = cortexkit_role_classifier::describe::Limits::new(
         service.config.max_items,
         service.config.max_request_bytes,
@@ -463,11 +493,18 @@ pub(crate) async fn run(
     // §3, in process: a second call for a batch this process holds is refused at once.
     {
         let mut claims = service.claims.lock().unwrap_or_else(|p| p.into_inner());
-        if !claims.insert(request.batch_id.clone()) {
+        if let Some(recorded) = claims.get(&request.batch_id) {
+            if recorded != scope {
+                return Err(Refusal::new(
+                    "batch_scope_mismatch",
+                    "batch_id is running under a different scope",
+                ));
+            }
             return Err(Refusal::batch_in_progress(
                 super::BATCH_IN_PROGRESS_RETRY_AFTER_MS,
             ));
         }
+        claims.insert(request.batch_id.clone(), scope.clone());
     }
     let mut hold = Hold {
         service,
@@ -661,7 +698,12 @@ pub(crate) async fn run(
             }
         }
         match answer {
-            Ok((answers, usage)) => {
+            Ok(PaidAnswer {
+                answers,
+                usage,
+                auth_selection,
+                account_ref,
+            }) => {
                 let cost = spend_of(&frozen, usage.as_ref(), &estimates[index]);
                 let outcome = StoredOutcome {
                     index: index as u64,
@@ -669,7 +711,32 @@ pub(crate) async fn run(
                     input_tokens: usage.and_then(|u| u.input_tokens),
                     output_tokens: usage.and_then(|u| u.output_tokens),
                 };
-                record(service, &request.batch_id, &outcome, cost).await?;
+                let fact = service.export.as_ref().map(|export| {
+                    use broca_core::ChargeBasisResolver;
+                    let provider = request
+                        .model
+                        .split('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    let method = auth_selection
+                        .as_deref()
+                        .and_then(|id| id.split(':').next())
+                        .unwrap_or("apikey");
+                    let (charge_basis, charge_basis_mapping_version) =
+                        service.charge_basis.resolve_charge_basis(&provider, method);
+                    broca_store::system_one::FactContext {
+                        source_instance_id: export.source_instance_id().into(),
+                        provider,
+                        model: request.model.clone(),
+                        auth_selection,
+                        account_ref,
+                        charge_basis,
+                        charge_basis_mapping_version,
+                        charge_basis_overrides: service.charge_basis.charge_basis_overrides(),
+                    }
+                });
+                record_paid(service, &request.batch_id, &outcome, cost, fact).await?;
                 spent = spent.saturating_add(cost);
                 slots[index] = Some(Slot::Stored(outcome));
             }
@@ -705,14 +772,40 @@ async fn record(
     outcome: &StoredOutcome,
     spend_nanos: u64,
 ) -> Result<(), Refusal> {
+    record_paid(service, batch_id, outcome, spend_nanos, None).await
+}
+
+async fn record_paid(
+    service: &Arc<SystemOne>,
+    batch_id: &str,
+    outcome: &StoredOutcome,
+    spend_nanos: u64,
+    fact: Option<broca_store::system_one::FactContext>,
+) -> Result<(), Refusal> {
     let store = Arc::clone(&service.store);
     let (batch_id, owner, outcome) = (batch_id.to_owned(), service.owner.clone(), outcome.clone());
     let outcome_for_metrics = outcome.clone();
     let now = (service.clock)();
-    let held =
-        blocking(move || store.record(STORE_ROLE, &batch_id, &owner, &outcome, spend_nanos, now))
-            .await?;
+    let held = blocking(move || {
+        store.record_paid(
+            STORE_ROLE,
+            &batch_id,
+            &owner,
+            &outcome,
+            &broca_store::system_one::PaidRecord {
+                spend_nanos,
+                now_ms: now,
+                fact: fact.as_ref(),
+            },
+        )
+    })
+    .await?;
     if held {
+        let service_for_flush = Arc::clone(service);
+        tokio::task::spawn_blocking(move || service_for_flush.flush_facts())
+            .await
+            .map_err(|_| internal_refusal("usage export task failed"))?
+            .map_err(|_| internal_refusal("usage export is unavailable; re-send the batch"))?;
         let mut metrics = service.metrics.lock().unwrap_or_else(|p| p.into_inner());
         match &outcome_for_metrics.outcome {
             Outcome::Answered(_) => metrics.items_answered += 1,

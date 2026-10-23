@@ -334,7 +334,7 @@ async fn a_resend_after_an_interrupted_call_asks_only_unanswered_items() {
     let _ = call.await;
     // The dropped call's hold is released on its own; wait for the blocking release.
     for _ in 0..1000 {
-        if !rig.service.claims.lock().unwrap().contains("crash") {
+        if !rig.service.claims.lock().unwrap().contains_key("crash") {
             break;
         }
         tokio::task::yield_now().await;
@@ -882,4 +882,22 @@ fn test_scope() -> broca_store::system_one::BatchScope {
         agent_id: "agent".into(),
         run_id: "run".into(),
     }
+}
+
+#[tokio::test]
+async fn health_counts_new_outcomes_and_provider_codes_without_item_content() {
+    let rig = rig();
+    rig.stand_in
+        .script("private-state", vec![Script::Status(400, None)]);
+    admitted(&rig, params("private-batch", JEV, &["private-state"], None)).await;
+    let before = rig.service.health();
+    assert_eq!(before["batches_answered"], 1);
+    assert_eq!(before["items_failed"], 1);
+    assert_eq!(before["last_provider_error"]["typesafe"], "400");
+    assert!(!before.to_string().contains("private"));
+    admitted(&rig, params("private-batch", JEV, &["private-state"], None)).await;
+    let after = rig.service.health();
+    assert_eq!(after["batches_answered"], 2);
+    assert_eq!(after["items_failed"], 1);
+    assert_eq!(after["batches_in_flight"], 0);
 }

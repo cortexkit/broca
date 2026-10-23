@@ -81,8 +81,8 @@ impl ClassifierProvider for TypeSafe {
     }
 
     async fn call(&self, body: String) -> ProviderReply {
-        let token = match self.credential.bearer().await {
-            Ok(token) => token,
+        let secret = match self.credential.secret().await {
+            Ok(secret) => secret,
             Err(message) => return ProviderReply::Credential(message),
         };
         let mut request = self
@@ -90,8 +90,8 @@ impl ClassifierProvider for TypeSafe {
             .post(self.endpoint.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
+        if let Some(secret) = &secret {
+            request = request.bearer_auth(&secret.token);
         }
         let attempt = async {
             let response = request.send().await?;
@@ -114,7 +114,11 @@ impl ClassifierProvider for TypeSafe {
             } else {
                 "the request failed in transport".to_owned()
             }),
-            Ok(Ok((200, _, body))) => ProviderReply::Answered(body.to_vec()),
+            Ok(Ok((200, _, body))) => ProviderReply::AttributedAnswer {
+                body: body.to_vec(),
+                auth_selection: secret.as_ref().and_then(|s| s.auth_selection.clone()),
+                account_ref: secret.and_then(|s| s.account_id),
+            },
             Ok(Ok((status, retry_after_ms, _))) => ProviderReply::Status {
                 status,
                 retry_after_ms,

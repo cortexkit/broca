@@ -10512,8 +10512,11 @@ mod tests {
             .expect("opening the finished lineage succeeds");
         let page = export_store.read_page(None, 10).unwrap();
         assert_eq!(page.facts.len(), 1, "reopen emits exactly one export fact");
-        assert_eq!(page.facts[0].segment.run_id, run_id);
-        assert_eq!(page.facts[0].segment.occurred_at_ms, Some(200));
+        assert_eq!(page.facts[0].segment.as_session().unwrap().run_id, run_id);
+        assert_eq!(
+            page.facts[0].segment.as_session().unwrap().occurred_at_ms,
+            Some(200)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

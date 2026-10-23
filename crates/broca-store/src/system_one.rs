@@ -123,6 +123,30 @@ pub struct StoredOutcome {
     pub output_tokens: Option<u64>,
 }
 
+/// Credential and billing identity resolved for the attempt that actually answered, not a
+/// later vault lookup that might select another account during outbox recovery.
+pub struct FactContext {
+    pub source_instance_id: String,
+    pub provider: String,
+    pub model: String,
+    pub auth_selection: Option<String>,
+    pub account_ref: Option<String>,
+    pub charge_basis: broca_core::ChargeBasis,
+    pub charge_basis_mapping_version: u32,
+    pub charge_basis_overrides: String,
+}
+
+pub struct PaidRecord<'a> {
+    pub spend_nanos: u64,
+    pub now_ms: i64,
+    pub fact: Option<&'a FactContext>,
+}
+
+pub struct PendingFact {
+    pub fact: broca_core::system_one_fact::SystemOneFact,
+    pub spend_nanos: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// The provider's answers, as the exact JSON text it sent.
@@ -203,7 +227,12 @@ impl SystemOneStore {
                  output_tokens INTEGER,
                  recorded_at_ms INTEGER NOT NULL,
                  PRIMARY KEY (role, batch_id, item_index)
-             );",
+              );
+              CREATE TABLE IF NOT EXISTS usage_outbox (
+                  fact_id TEXT PRIMARY KEY,
+                  fact_json TEXT NOT NULL,
+                  spend_nanos INTEGER NOT NULL
+              );",
         )?;
         let has_scope = conn.prepare("SELECT scope_json FROM batch").is_ok();
         if !has_scope {
@@ -342,12 +371,40 @@ impl SystemOneStore {
         spend_nanos: u64,
         now_ms: i64,
     ) -> Result<bool> {
+        self.record_paid(
+            role,
+            batch_id,
+            owner,
+            outcome,
+            &PaidRecord {
+                spend_nanos,
+                now_ms,
+                fact: None,
+            },
+        )
+    }
+
+    /// Commit the outcome and its export intent together. Publishing to run-index.db happens
+    /// later, but a restart can never observe a paid outcome without its measurement.
+    pub fn record_paid(
+        &self,
+        role: &str,
+        batch_id: &str,
+        owner: &str,
+        outcome: &StoredOutcome,
+        paid: &PaidRecord<'_>,
+    ) -> Result<bool> {
+        let PaidRecord {
+            spend_nanos,
+            now_ms,
+            fact,
+        } = paid;
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let held = tx.execute(
             "UPDATE batch SET spent_nanos = MIN(spent_nanos + ?4, 9223372036854775807)
               WHERE role = ?1 AND batch_id = ?2 AND state = 'running' AND owner = ?3",
-            rusqlite::params![role, batch_id, owner, to_i64(spend_nanos)],
+            rusqlite::params![role, batch_id, owner, to_i64(*spend_nanos)],
         )?;
         if held == 0 {
             return Ok(false);
@@ -375,8 +432,84 @@ impl SystemOneStore {
                 now_ms,
             ],
         )?;
+        if let Some(context) = fact {
+            use broca_core::system_one_fact::{SystemOneFact, SystemOneUsage};
+            use sha2::{Digest, Sha256};
+            let (scope, admitted): (String, i64) = tx.query_row(
+                "SELECT scope_json, admitted_at_ms FROM batch WHERE role=?1 AND batch_id=?2",
+                rusqlite::params![role, batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let scope: BatchScope =
+                serde_json::from_str(&scope).map_err(|e| SystemOneStoreError(e.to_string()))?;
+            let mut identity = Sha256::new();
+            for value in [
+                "system_one/v1",
+                &context.source_instance_id,
+                role,
+                batch_id,
+                &admitted.to_string(),
+                &outcome.index.to_string(),
+            ] {
+                identity.update((value.len() as u64).to_le_bytes());
+                identity.update(value.as_bytes());
+            }
+            let (run_id, flow_id) = match scope {
+                BatchScope::Run { run_id, .. } => (Some(run_id), None),
+                BatchScope::Flow { flow_id } => (None, Some(flow_id)),
+            };
+            let fact = SystemOneFact {
+                fact_id: format!("{:x}", identity.finalize()),
+                batch_id: batch_id.into(),
+                item_index: outcome.index,
+                provider: context.provider.clone(),
+                model: context.model.clone(),
+                auth_selection: context.auth_selection.clone(),
+                account_ref: context.account_ref.clone(),
+                run_id,
+                flow_id,
+                charge_basis: context.charge_basis,
+                charge_basis_mapping_version: context.charge_basis_mapping_version,
+                charge_basis_overrides: context.charge_basis_overrides.clone(),
+                usage: SystemOneUsage {
+                    input_tokens: outcome.input_tokens,
+                    output_tokens: outcome.output_tokens,
+                },
+                occurred_at_ms: u64::try_from(*now_ms).unwrap_or(0),
+            };
+            let json =
+                serde_json::to_string(&fact).map_err(|e| SystemOneStoreError(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO usage_outbox (fact_id, fact_json, spend_nanos) VALUES (?1, ?2, ?3)",
+                rusqlite::params![fact.fact_id, json, to_i64(*spend_nanos)],
+            )?;
+        }
         tx.commit()?;
         Ok(true)
+    }
+
+    pub fn pending_facts(&self) -> Result<Vec<PendingFact>> {
+        let conn = self.lock();
+        let mut statement =
+            conn.prepare("SELECT fact_json, spend_nanos FROM usage_outbox ORDER BY rowid")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            let (json, spend) = row?;
+            Ok(PendingFact {
+                fact: serde_json::from_str(&json)
+                    .map_err(|e| SystemOneStoreError(e.to_string()))?,
+                spend_nanos: to_u64(Some(spend)).unwrap_or(0),
+            })
+        })
+        .collect()
+    }
+
+    pub fn acknowledge_fact(&self, fact_id: &str) -> Result<()> {
+        self.lock()
+            .execute("DELETE FROM usage_outbox WHERE fact_id=?1", [fact_id])?;
+        Ok(())
     }
 
     /// End `owner`'s hold on a batch; its record stays.
