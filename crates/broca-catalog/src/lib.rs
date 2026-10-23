@@ -486,27 +486,38 @@ impl Catalog {
         let entry = self.providers.get(provider_id)?;
         let model_entry = entry.get("models").and_then(|m| m.get(model_id))?;
 
-        // A model may override the provider's family (Chat vs Responses, etc.).
-        let model_family = model_entry
-            .get("wire_family")
-            .and_then(parse_family)
-            .or_else(|| {
-                model_entry
-                    .get("provider")
-                    .and_then(|provider| provider.get("npm"))
-                    .and_then(Value::as_str)
-                    .and_then(|npm| {
-                        family::wire_family(npm, model_entry.get("api").and_then(Value::as_str))
-                    })
-            })
-            .unwrap_or(provider_family);
+        // The snapshot's per-model provider object carries the same package/shape override
+        // that Fusiform publishes as wire facts. An unsupported shape cannot borrow a default.
+        let model_family = if let Some(family) =
+            model_entry.get("wire_family").and_then(parse_family)
+        {
+            family
+        } else if let Some(overrides) = model_entry.get("provider").filter(|value| !value.is_null())
+        {
+            let overrides = overrides.as_object()?;
+            let npm = overrides.get("npm").filter(|value| !value.is_null());
+            let shape = overrides.get("shape").filter(|value| !value.is_null());
+            if npm.is_some() || shape.is_some() {
+                let npm = match npm {
+                    Some(value) => value.as_str()?,
+                    None => entry.get("npm")?.as_str()?,
+                };
+                let shape = match shape {
+                    Some(value) => Some(value.as_str()?),
+                    None => None,
+                };
+                family::wire_family(npm, shape)?
+            } else {
+                provider_family
+            }
+        } else {
+            provider_family
+        };
 
         let mut provider_spec = map_provider(provider_id, entry, model_family, raw_policy);
         // The serving spec speaks for THIS model: carry the per-model family.
         provider_spec.wire_family = model_family;
-        // Mixed-protocol providers can pin a model to its own endpoint root. OpenCode Go's
-        // roots intentionally follow Pi 1.4.0 (`/inference/go/v1` and `/inference/go`); its
-        // current docs list `/openai/v1`, `/google/v1beta`, and `/anthropic` alternatives.
+        // Model-level endpoint facts take precedence over the provider's root.
         if let Some(base_url) = model_entry.get("base_url").and_then(Value::as_str) {
             provider_spec.base_url = base_url.to_string();
         } else if let Some(api) = model_entry
@@ -704,7 +715,8 @@ fn map_provider(
         // override from the catalog bridge. This keeps the OpenAI provider fix out of the shared
         // OpenAI-Chat family default while leaving the hand-built family helpers unchanged.
         quirks: provider_quirks(provider_id, family, &base_url),
-        // The overlay owns provider endpoints; absent/empty means the family default.
+        // Prefer an explicit native hold, then the published API. Empty is metadata-only;
+        // migrated live admission requires the row's wire.api rather than a family default.
         base_url,
         raw: raw_policy.map(entry),
     }
@@ -942,6 +954,37 @@ mod tests {
             c.provider("deepseek").unwrap().base_url.is_empty(),
             "metadata must not invent an endpoint; live admission requires wire.api"
         );
+    }
+
+    #[test]
+    fn snapshot_model_provider_shape_is_consumed_without_guessing() {
+        let mut base = base();
+        base["deepseek"]["models"]["shape-test"] = json!({
+            "provider":{"npm":"@ai-sdk/openai","api":"https://row.example/v1","shape":"completions"}
+        });
+        let catalog = Catalog::from_json_str(&base.to_string(), "{}").unwrap();
+        let (provider, _) = catalog.model_for_serving("deepseek", "shape-test").unwrap();
+        assert_eq!(provider.wire_family, WireFamilyId::OpenAiChat);
+        assert_eq!(provider.base_url, "https://row.example/v1");
+        base["deepseek"]["models"]["shape-test"]["provider"]
+            .as_object_mut()
+            .unwrap()
+            .remove("npm");
+        base["deepseek"]["models"]["shape-test"]["provider"]["shape"] = json!("responses");
+        let catalog = Catalog::from_json_str(&base.to_string(), "{}").unwrap();
+        assert_eq!(
+            catalog
+                .model_for_serving("deepseek", "shape-test")
+                .unwrap()
+                .0
+                .wire_family,
+            WireFamilyId::OpenAiResponses
+        );
+        base["deepseek"]["models"]["shape-test"]["provider"]["shape"] = json!("unsupported-shape");
+        let catalog = Catalog::from_json_str(&base.to_string(), "{}").unwrap();
+        assert!(catalog
+            .model_for_serving("deepseek", "shape-test")
+            .is_none());
     }
 
     #[test]
@@ -1249,16 +1292,13 @@ mod tests {
     #[test]
     fn every_snapshot_key_is_classified() {
         // Keys mapped into typed ProviderSpec fields.
-        const PROVIDER_MAPPED: &[&str] = &["id", "models"];
+        const PROVIDER_MAPPED: &[&str] = &["id", "models", "api", "npm"];
         // Keys intentionally NOT mapped — none can change request BODY bytes:
-        //  - api: an upstream endpoint copied into the harness-owned overlay as `base_url`;
-        //    serving never reads the document field directly;
         //  - doc: a documentation URL;
         //  - env: the NAMES of auth env vars (auth is attached after render, off the
         //    hash domain; the auth KIND comes from the family, not this);
         //  - name: provider display name;
-        //  - npm: leftover catalog packaging; family resolution no longer reads it.
-        const PROVIDER_IGNORED: &[&str] = &["api", "doc", "env", "name", "npm"];
+        const PROVIDER_IGNORED: &[&str] = &["doc", "env", "name"];
 
         // Keys mapped into typed ModelSpec fields.
         const MODEL_MAPPED: &[&str] = &[
@@ -1278,6 +1318,8 @@ mod tests {
             "structured_output",
             "temperature",
             "tool_call",
+            // Per-model package, endpoint and shape become bounded serving fields.
+            "provider",
         ];
         // Keys intentionally NOT mapped. None is consumed by the renderer today:
         //  - description: human-readable model prose for display only; never read by any
@@ -1294,7 +1336,6 @@ mod tests {
         //    from this field. Mapping it would let an upstream edit change our request bytes;
         //  - modalities: capability metadata — NOT byte-affecting until multimodal
         //    rendering exists; promote it then;
-        //  - provider: NOT a provider id — see the note at its entry below;
         const MODEL_IGNORED: &[&str] = &[
             "description",
             "experimental",
@@ -1302,24 +1343,6 @@ mod tests {
             "last_updated",
             "modalities",
             "open_weights",
-            // NOT a redundant provider id, which an earlier comment here claimed and a
-            // reader could act on. Measured on the snapshot: it is always an OBJECT, on 228
-            // models, carrying `npm` (224), `api` (122) and `shape` (33, `responses` or
-            // `completions`). That is a per-model transport override triple -- renderer,
-            // endpoint, and request shape.
-            //
-            // So it is ignored because renderer selection belongs to this code, not
-            // because the catalog data duplicates another field. Family resolution never
-            // reads `npm`: an overlay pin or the provider-id hand-table chooses the
-            // renderer. Upstream has been observed deleting an `npm` override without
-            // changing `last_updated`, which can silently reroute a model to a different
-            // wire family within an hour.
-            //
-            // Mapping it "for completeness" would hand renderer choice to a field that
-            // changes without notice. The providers carrying overrides are aggregators whose
-            // models span several families, which is why per-provider resolution leaves them
-            // Pending; every provider we serve is family-homogeneous and carries none.
-            "provider",
         ];
 
         let snapshot: Value =
@@ -1365,7 +1388,7 @@ mod tests {
         let cases = [
             ("deepseek", "deepseek-v4-flash", "https://api.deepseek.com"),
             ("xai", "grok-4.20-0309-non-reasoning", "https://api.x.ai/v1"),
-            // OpenRouter's base_url pin was generated from the snapshot's api value.
+            // OpenRouter's root comes directly from its published API field.
             (
                 "openrouter",
                 "aion-labs/aion-2.0",
