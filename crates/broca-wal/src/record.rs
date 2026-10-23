@@ -440,9 +440,10 @@ pub enum WalRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hooks: Option<Box<Hooks>>,
         /// The approval this dispatch spends, for a call a human approved first: the
-        /// `approval_digest` of its `approval_recorded {approved}`, passed to the tool provider so
-        /// it can refuse a second use or changed arguments. Must-understand (feature
-        /// `deferred-call/v1`): a reader that skipped it would not know the approval was spent.
+        /// `approval_digest` of its `approval_recorded {approved}`. It remains durable history;
+        /// consent-based provider requests carry the saved arguments and deferred call key, not
+        /// this digest. Must-understand (feature `deferred-call/v1`): a reader that skipped it
+        /// would not know the approval was spent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approval_digest: Option<String>,
         /// The key of the approved call's `tool_call_deferred` record (`<lineage_id>:<wal_seq>` of

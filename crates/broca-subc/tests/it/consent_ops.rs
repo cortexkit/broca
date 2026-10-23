@@ -365,7 +365,6 @@ async fn approved_raw_dispatch_reaches_a_real_provider_without_reserializing_sav
                 &call,
                 bytes,
                 "lineage:7",
-                "digest",
                 &broca_core::tool_plane::DispatchSignals::default()
             )
             .await,

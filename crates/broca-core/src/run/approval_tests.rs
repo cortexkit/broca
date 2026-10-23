@@ -529,7 +529,6 @@ impl ToolPlane for Tools {
         call: &ToolCall,
         bytes: &str,
         key: &str,
-        _: &str,
         signals: &DispatchSignals,
     ) -> DispatchResult {
         if matches!(self.dispatch_signal_policy, DispatchSignalPolicy::Enforce)

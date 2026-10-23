@@ -187,10 +187,9 @@ pub trait ToolPlane: Send + Sync {
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult;
 
     /// Dispatch approved arguments without parsing and reserializing them. Adapters must
-    /// preserve `args_jcs` verbatim and forward the deferred call's `call_key`. Core
-    /// verifies that the answer binds to these arguments; consent issues no tool token.
-    /// The legacy digest argument is empty, and adapters must omit `approval_digest`
-    /// from the tool request even when reading a WAL with an older digest.
+    /// preserve `args_jcs` verbatim and forward the deferred call's `call_key`. Core verifies
+    /// that the answer binds to these arguments; consent issues no tool token. The approval
+    /// digest remains durable history, not provider request data.
     /// Check `signals` after all pre-send waits, immediately before the physical
     /// request. An interrupted unsent request returns `NotSent`, never Unknown.
     /// Until the daemon installs an approval-capable adapter, approval fails closed.
@@ -200,7 +199,6 @@ pub trait ToolPlane: Send + Sync {
         _call: &ToolCall,
         _args_jcs: &str,
         _call_key: &str,
-        _approval_digest: &str,
         _signals: &DispatchSignals,
     ) -> DispatchResult {
         DispatchResult::NotSent {

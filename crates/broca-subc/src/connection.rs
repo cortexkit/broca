@@ -1654,16 +1654,8 @@ impl SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         call_key: Option<&str>,
-        approval_digest: Option<&str>,
     ) -> ConnResult<serde_json::Value> {
-        let body = Self::raw_tool_call_body(
-            name,
-            args_jcs,
-            tool_call_id,
-            preset,
-            call_key,
-            approval_digest,
-        )?;
+        let body = Self::raw_tool_call_body(name, args_jcs, tool_call_id, preset, call_key)?;
         self.send_tool_call_body(route, deadline, name, body).await
     }
 
@@ -1677,20 +1669,12 @@ impl SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         call_key: Option<&str>,
-        approval_digest: Option<&str>,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, ApprovedCallError> {
         // All fallible setup belongs to one pre-push stage. There is no fallible
         // work after enqueue inside this block, so its errors can never mean sent.
         let before_push = async {
-            let body = Self::raw_tool_call_body(
-                name,
-                args_jcs,
-                tool_call_id,
-                preset,
-                call_key,
-                approval_digest,
-            )?;
+            let body = Self::raw_tool_call_body(name, args_jcs, tool_call_id, preset, call_key)?;
             let corr = self.next_corr();
             let (runtime, registration, rx) =
                 self.register_route(route, (route.channel, route.epoch, corr))?;
@@ -1720,7 +1704,6 @@ impl SubcConnection {
         tool_call_id: Option<&str>,
         preset: Option<&str>,
         call_key: Option<&str>,
-        approval_digest: Option<&str>,
     ) -> ConnResult<Vec<u8>> {
         serde_json::from_str::<&serde_json::value::RawValue>(args_jcs)
             .map_err(|error| ConnError::Protocol(format!("invalid approved arguments: {error}")))?;
@@ -1736,20 +1719,11 @@ impl SubcConnection {
         };
         let body = serde_json::to_string(&envelope)
             .map_err(|error| ConnError::Protocol(error.to_string()))?;
-        let mut body = body.replacen(
+        let body = body.replacen(
             "\"arguments\":null",
             &format!("\"arguments\":{args_jcs}"),
             1,
         );
-        if let Some(digest) = approval_digest {
-            body.pop();
-            body.push_str(",\"approval_digest\":");
-            body.push_str(
-                &serde_json::to_string(digest)
-                    .map_err(|error| ConnError::Protocol(error.to_string()))?,
-            );
-            body.push('}');
-        }
         Ok(body.into_bytes())
     }
 
@@ -4281,7 +4255,6 @@ mod tests {
             Duration::from_secs(1),
             None,
             None,
-            None,
             &signals,
         ));
         let receive = async {
@@ -6069,7 +6042,6 @@ mod approval_raw_tests {
                 Some("c"),
                 Duration::from_secs(1),
                 Some("head"),
-                None,
                 None
             ),
             async {
@@ -6097,7 +6069,6 @@ mod approval_raw_tests {
                 Duration::from_secs(1),
                 Some("head"),
                 Some("lineage:7"),
-                None
             ),
             async {
                 let request = module.next_request().await;
@@ -6129,7 +6100,6 @@ mod approval_raw_tests {
                     Duration::from_secs(1),
                     None,
                     None,
-                    None
                 )
                 .await,
                 Err(ConnError::Protocol(_))

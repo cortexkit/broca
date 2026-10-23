@@ -15016,11 +15016,21 @@ target = "--lib"
 test_file = "crates/broca-subc/src/subc_plane.rs"
 expect_red = ["subc_plane::approval_digest_contract_tests::approved_connection_omits_approval_digest_and_preserves_saved_bytes"]
 select = "expected"
-file = "crates/broca-subc/src/subc_plane.rs"
-old = '''            Some(&args.key),
-            None,'''
-new = '''            Some(&args.key),
-            Some(""), // NON-VACUITY BREAK: send the retired digest field again'''
+file = "crates/broca-subc/src/connection.rs"
+old = '''        let body = body.replacen(
+            "\"arguments\":null",
+            &format!("\"arguments\":{args_jcs}"),
+            1,
+        );
+        Ok(body.into_bytes())'''
+new = '''        let mut body = body.replacen(
+            "\"arguments\":null",
+            &format!("\"arguments\":{args_jcs}"),
+            1,
+        );
+        body.pop();
+        body.push_str(",\"approval_digest\":\"legacy\"}"); // NON-VACUITY BREAK: restore the retired wire field
+        Ok(body.into_bytes())'''
 
 [[control]]
 id = "core-consent-filed-await-error-backoff"

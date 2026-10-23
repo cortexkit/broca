@@ -6772,7 +6772,7 @@ struct PlannedDispatch {
     thought_signature: Option<String>,
     hooks: Option<Box<broca_wal::Hooks>>,
     call_key: Option<String>,
-    approved: Option<(String, String)>,
+    approved: Option<String>,
 }
 
 impl From<ToolCall> for PlannedDispatch {
@@ -7743,14 +7743,13 @@ async fn resolve<T: ToolPlane>(
             let key = call.call_key.clone();
             let call = call.into_tool_call();
             let result = match approved {
-                Some((bytes, digest)) => {
+                Some(bytes) => {
                     tool_plane
                         .dispatch_approved(
                             ctx,
                             &call,
                             &bytes,
                             key.as_deref().expect("approved call has Prepared key"),
-                            &digest,
                             &crate::tool_plane::DispatchSignals::new(cancel, stop),
                         )
                         .await
@@ -11859,7 +11858,7 @@ mod approval_gate {
                                 slots[index] = Slot::Running; active.insert(index); dispatched.insert(index);
                                 let mut dispatch = PlannedDispatch::from(call);
                                 dispatch.call_key = Some(held.key.clone());
-                                dispatch.approved = Some((bytes, String::new()));
+                                dispatch.approved = Some(bytes);
                                 let plan = if stopped_after_intent { CallPlan::Stopped(dispatch.tool_call_id.clone()) } else { CallPlan::Dispatch(dispatch) };
                                 jobs.push(Box::pin(async move {
                                     let resolution = resolve_hooked(plan, index, step, &held.ctx(ctx), plane, before_send_cancel, control.stop_requested.as_ref(), hooks).await;
@@ -12863,7 +12862,6 @@ mod approval_gate {
                 call,
                 args_jcs,
                 key,
-                "",
                 &crate::tool_plane::DispatchSignals::new(
                     control.cancel.as_ref(),
                     control.stop_requested.as_ref(),
