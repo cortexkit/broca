@@ -1030,7 +1030,7 @@ async fn real_mc_async_compaction_end_to_end() {
     subject.release_model_step(SESSION).await.unwrap();
     finished(&subject, &live, runs + 1).await;
     note(&root, mc.assert_private_databases(&live));
-    note(&root, "Not asserted here: rides, reminders and the ceiling. No historian is configured, so no summarizer child run can be made.");
+    note(&root, "Not checked: ride views, reminder text, and the ceiling beyond Setup recording one. No historian is configured, so no summarizer child run can be made.");
 }
 
 async fn provision_consumers(bus: &bus::BusRig) {
@@ -1421,8 +1421,8 @@ async fn replay_preserved_mc_read() {
 
 /// What a worker view does: it drops or replaces parts of the transcript, never summarizes it
 /// into a fold of its own. Checks that the view changes something, that every replacement text
-/// it carries reaches the model, and that the outputs the model stamped with ctx_reduce are no
-/// longer sent.
+/// it carries reaches the model, and that the tool outputs the model's ctx_reduce call named by
+/// tag are no longer sent.
 fn assert_worker_view(
     root: &Path,
     body: &[u8],
@@ -1486,7 +1486,7 @@ fn assert_worker_view(
         .collect();
     assert!(
         still_sent.is_empty(),
-        "outputs stamped with ctx_reduce are still sent after MC's view: reads {still_sent:?}"
+        "tool outputs named in the ctx_reduce call are still sent after MC's view: reads {still_sent:?}"
     );
     note(
         root,

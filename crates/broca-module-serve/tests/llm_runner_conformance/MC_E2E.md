@@ -13,8 +13,9 @@ and no summarizer child run can be made. The worker tool preset needs a
 daemon-attested scope, so the conformance owner syncs one (listing `broca` as
 its carrier) and the conversation's route opens under it.
 
-The lane expects MC's staged 0.5 build, the one that serves the worker
-catalog for `params: {"compacting": true}` (staged as `f6da7169`). The
+The lane expects a Magic Context 0.5 build whose worker catalog accepts
+`params: {"compacting": true}`; the first one MC staged for it is commit
+`f6da7169` of the cortexkit/magic-context repository. The
 operator names the binary and its store fixture, with the sha256 MC published
 for each. The test checks both checksums and copies both inputs before
 launching anything.
@@ -60,7 +61,9 @@ The run checks, in order:
   the next model request is smaller than the one before it;
 - a real process kill mid-step is followed by identical request bytes on resume.
 
-Rides, reminders and the ceiling are not asserted.
+Not checked: views Magic Context hands over during a ride (a rewrite broca asks
+for when the request prefix changes anyway), its reminder text, and the context
+ceiling beyond Setup recording one.
 
 Without `BROCA_MC_E2E_BIN` this test prints a loud skip, even in the usual
 required-daemon lane. Once the binary is named, missing inputs, bad checksums,
