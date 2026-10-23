@@ -477,14 +477,16 @@ async fn scoped_session_route(subject: &BrocaSubject, live: &Live) -> BrocaRoute
 /// name outputs by their `§N§` tag.
 fn worker_plan() -> Value {
     let item = json!({"provider":"magic-context","preset":"worker","params":{"compacting":true}});
+    // broca refuses a composition that is not in canonical order: providers sorted bytewise by
+    // id, and each provider's tools by name.
     let composition = json!({
         "providers":[
+            {"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]},
             {"provider":"magic-context","tools":[
-                {"name":"ctx_reduce","capabilities":["magic-context:context.reduce/v1"]},
                 {"name":"ctx_expand","capabilities":["magic-context:history.expand/v1"]},
+                {"name":"ctx_reduce","capabilities":["magic-context:context.reduce/v1"]},
                 {"name":"ctx_search","capabilities":["magic-context:archive.search/v1"]},
             ]},
-            {"provider":TOOL_MODULE,"tools":[{"name":SCRIPTED_TOOL,"capabilities":[]}]},
         ],
         "compaction":{"provider":"magic-context"},
         "step_transform_items":[],
