@@ -1,7 +1,5 @@
 //! Message placement over durable records, independent of message content and storage.
 
-use std::collections::HashSet;
-
 use broca_protocol::{caller::RunFinishReason, request::BudgetConfig, BatchId, RunId, ToolCallId};
 use broca_wal::{RunOrigin, SeedOriginKind, WalRecord};
 
@@ -47,8 +45,8 @@ pub enum PlacementAction {
 struct Batch {
     id: Option<BatchId>,
     planned: Vec<ToolCallId>,
-    prepared: HashSet<ToolCallId>,
-    terminals: HashSet<ToolCallId>,
+    prepared: Vec<bool>,
+    terminals: Vec<bool>,
 }
 
 /// The next ordinal is absolute, including a materialized prefix not held in memory.
@@ -98,6 +96,10 @@ impl Placement {
         &self.budget
     }
 
+    pub fn completed_steps(&self) -> u64 {
+        self.completed_steps
+    }
+
     fn append(&mut self, count: u64, kind: AppendKind) -> PlacementAction {
         let first = self.next;
         self.next = self.next.saturating_add(count);
@@ -115,8 +117,16 @@ impl Placement {
 
     fn terminal(&mut self, id: &ToolCallId) {
         if let Some(batch) = &mut self.batch {
-            if batch.planned.contains(id) {
-                batch.terminals.insert(id.clone());
+            if let Some(position) =
+                batch
+                    .planned
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, planned)| {
+                        (planned == id && !batch.terminals[position]).then_some(position)
+                    })
+            {
+                batch.terminals[position] = true;
             }
         }
     }
@@ -193,15 +203,18 @@ impl Placement {
                 self.batch = Some(Batch {
                     id: Some(batch_id.clone()),
                     planned: planned_calls.clone(),
-                    ..Batch::default()
+                    prepared: vec![false; planned_calls.len()],
+                    terminals: vec![false; planned_calls.len()],
                 });
             }
             WalRecord::ToolCallDeferred {
                 batch_id, call_id, ..
             } => {
                 if let Some(batch) = &mut self.batch {
-                    if batch.id.as_ref() == Some(batch_id) && batch.planned.contains(call_id) {
-                        batch.prepared.insert(call_id.clone());
+                    if batch.id.as_ref() == Some(batch_id) {
+                        if let Some(position) = batch.planned.iter().position(|id| id == call_id) {
+                            batch.prepared[position] = true;
+                        }
                     }
                 }
             }
@@ -210,11 +223,12 @@ impl Placement {
                 closing_result: Some(_),
                 ..
             } => {
-                if self
-                    .batch
-                    .as_ref()
-                    .is_some_and(|b| b.prepared.contains(call_id))
-                {
+                if self.batch.as_ref().is_some_and(|b| {
+                    b.planned
+                        .iter()
+                        .position(|id| id == call_id)
+                        .is_some_and(|position| b.prepared[position])
+                }) {
                     self.terminal(call_id);
                 }
             }
@@ -224,7 +238,7 @@ impl Placement {
                 if self
                     .batch
                     .as_ref()
-                    .is_some_and(|b| b.planned.iter().all(|id| b.terminals.contains(id)))
+                    .is_some_and(|b| b.terminals.iter().all(|terminal| *terminal))
                 {
                     let count = if std::mem::take(&mut self.assistant_held) {
                         2
@@ -379,6 +393,30 @@ mod tests {
             }]
         );
         assert!(placement.observe(&finish).unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_call_ids_need_a_terminal_for_each_planned_position() {
+        let mut placement = Placement::new(0);
+        for record in deferred_tests::batch(&["a", "a"]) {
+            placement.observe(&record).unwrap();
+        }
+        let finish = deferred_tests::finished().remove(0);
+        placement
+            .observe(&deferred_tests::terminal("a", None))
+            .unwrap();
+        assert!(placement.observe(&finish).unwrap().is_empty());
+        placement
+            .observe(&deferred_tests::terminal("a", None))
+            .unwrap();
+        assert_eq!(
+            placement.observe(&finish).unwrap(),
+            vec![PlacementAction::Append {
+                first: 0,
+                count: 2,
+                kind: AppendKind::ToolTurn,
+            }]
+        );
     }
 
     #[test]

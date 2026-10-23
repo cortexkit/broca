@@ -757,10 +757,6 @@ impl OpenBatch {
         }
     }
 
-    fn all_terminated(&self) -> bool {
-        self.terminals.iter().all(Option::is_some)
-    }
-
     /// Whether any record after the batch start says something about one of its calls: a
     /// dispatch intent, a Prepared call, or a terminal. Replacing such a batch would forget
     /// that a call may have run, or already ran, and let a resume send it again.
@@ -931,8 +927,6 @@ struct Episode {
     open_step_record: Option<usize>,
     /// Provider-free SeededFrom episodes are imports/forks, not resumable model runs.
     seeded_from: bool,
-    /// Prompt length before an import's input, used to discard a torn import during repair.
-    seeded_prompt_start: Option<usize>,
     /// The model that produced THIS episode's assistant turns — the episode's frozen
     /// `RunConfig.model`. Stamped onto each assistant `Message` this episode commits, so a
     /// later episode under a DIFFERENT model can detect the cross-model boundary at render
@@ -947,7 +941,6 @@ struct Episode {
     first_step_message: Option<usize>,
     /// Durable model steps in THIS episode (each billed). Resets per episode.
     completed_steps: u64,
-    budget: crate::BudgetReplayStateV1,
     /// Whether this episode has already replaced its pre-call render config.
     config_refrozen: bool,
     /// Usage accumulated across THIS episode's steps. Resets per episode.
@@ -1436,7 +1429,6 @@ fn replay_seeded_with_compaction<'a>(
         attributable: run_id.as_ref().is_some_and(|id| !id.0.is_empty()),
         seeded_last_ordinal: ordinal_base.checked_sub(1),
         origin: seed_origin,
-        budget: seed_budget_state.unwrap_or_default(),
         ..Episode::default()
     };
     let mut episode_step_spans: Vec<std::ops::Range<usize>> = Vec::new();
@@ -1471,6 +1463,19 @@ fn replay_seeded_with_compaction<'a>(
                 state.history = compaction_history.clone();
             }
         }
+        let expected_budget_text = matches!(rec, WalRecord::BudgetFired { .. })
+            .then(|| {
+                run_config
+                    .as_ref()
+                    .and_then(|config| config.budget.as_ref())
+                    .or(seeded_budget.as_ref())
+            })
+            .flatten()
+            .and_then(|budget| {
+                crate::budget_kernel::decide(placement.budget(), budget)
+                    .first()
+                    .map(|due| due.text.clone())
+            });
         let actions = placement
             .observe(rec)
             .map_err(|reason| ReplayError::CorruptLineage {
@@ -1529,14 +1534,6 @@ fn replay_seeded_with_compaction<'a>(
                 // Import/fork inputs describe historical messages, not messages produced by the
                 // synthetic seed run. A missing or empty producer id is never invented.
                 ep.attributable = !ep.seeded_from && !rid.0.is_empty();
-                ep.seeded_prompt_start = matches!(
-                    origin,
-                    broca_wal::RunOrigin::SeededFrom {
-                        origin_kind: broca_wal::SeedOriginKind::Import,
-                        ..
-                    }
-                )
-                .then_some(prompt.len());
                 // Stamp this episode's assistant turns with the model that produced them,
                 // so a later episode under a different model can strip a cross-model
                 // signature at render. From the durable per-episode config → reproduces on
@@ -1602,18 +1599,17 @@ fn replay_seeded_with_compaction<'a>(
                 ep.retries_used = ep.retries_used.saturating_add(*retries_used);
                 ep.last_step_usage = Some(*u);
                 ep.last_step_finish_reason = *finish_reason;
-                ep.completed_steps += 1;
+                ep.completed_steps = placement.completed_steps();
                 ep.natural_stop_reason = None;
-                let was_finalize_turn = ep.budget.finalize_pending;
-                crate::budget_kernel::apply(
-                    crate::budget_kernel::State {
-                        facts: &mut ep.budget,
-                        config: None,
-                        run_id: run_id.as_ref(),
-                    },
-                    rec,
-                )
-                .expect("model steps cannot invalidate budget facts");
+                let was_finalize_turn = actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Append {
+                            kind: AppendKind::Finalize,
+                            ..
+                        }
+                    )
+                });
                 if was_finalize_turn {
                     // A finalize turn is terminal even if a provider emits undeclared calls.
                     // Preserve its answer text in future history, but omit tool calls because
@@ -1655,7 +1651,15 @@ fn replay_seeded_with_compaction<'a>(
                     ep.open_batch = None;
                     ep.natural_end = true;
                     ep.natural_end_extendable = false;
-                } else if assistant_message.tool_calls().next().is_some() {
+                } else if actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Hold {
+                            kind: HoldKind::Assistant,
+                            ..
+                        }
+                    )
+                }) {
                     // Each tool turn opens and commits its own batch. A batch still open from an
                     // earlier turn cannot belong to this one: fail closed if it holds call
                     // evidence, and otherwise drop it so this turn is never paired with another
@@ -1836,7 +1840,15 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::ToolBatchFinished { .. } => {
                 // Commit the tool turn IFF complete (every planned call terminated).
                 if let Some(b) = &ep.open_batch {
-                    if b.all_terminated() {
+                    if actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            PlacementAction::Append {
+                                kind: AppendKind::ToolTurn,
+                                ..
+                            }
+                        )
+                    }) {
                         // A committed all-synthetic-stop batch means the run hit its stop
                         // limit before dispatching → finish the lineage here even if the
                         // trailing RunFinished was lost in a crash (else replay would see a
@@ -1963,45 +1975,23 @@ fn replay_seeded_with_compaction<'a>(
             }
             WalRecord::BudgetFired {
                 run_id: fired_run_id,
-                ordinal,
                 caller_text,
                 ..
             } => {
-                let budget = run_config
-                    .as_ref()
-                    .and_then(|config| config.budget.as_ref())
-                    .or(seeded_budget.as_ref());
-                let Some(budget) = budget else {
+                if !actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Append {
+                            kind: AppendKind::Budget,
+                            ..
+                        }
+                    )
+                }) {
                     // Read-only transcript assembly has no checkpoint budget seed. Preserve its
                     // established best-effort behavior; admission and projection fail closed.
                     continue;
-                };
-                let expected_ordinal = ordinal_base.saturating_add(prompt.len() as u64);
-                if *ordinal != expected_ordinal {
-                    return Err(ReplayError::CorruptLineage {
-                        episode_run_id: fired_run_id.clone(),
-                        reason: format!(
-                            "budget message ordinal {ordinal} does not match prompt position {expected_ordinal}"
-                        ),
-                    });
                 }
-
-                let expected_text = crate::budget_kernel::decide(&ep.budget, budget)
-                    .first()
-                    .map(|due| due.text.clone());
-                crate::budget_kernel::apply(
-                    crate::budget_kernel::State {
-                        facts: &mut ep.budget,
-                        config: Some(budget),
-                        run_id: run_id.as_ref(),
-                    },
-                    rec,
-                )
-                .map_err(|reason| ReplayError::CorruptLineage {
-                    episode_run_id: fired_run_id.clone(),
-                    reason,
-                })?;
-                let expected_text = expected_text.expect("accepted firing was due");
+                let expected_text = expected_budget_text.expect("accepted firing was due");
                 let text = match caller_text {
                     Some(text) if text == &expected_text => text.clone(),
                     Some(_) => {
@@ -2029,9 +2019,9 @@ fn replay_seeded_with_compaction<'a>(
                 retries_used,
                 ..
             } => {
-                if ep.completed_steps == 0 && *reason == RunFinishReason::Interrupted {
-                    if let Some(start) = ep.seeded_prompt_start {
-                        prompt.truncate(start);
+                for action in &actions {
+                    if let PlacementAction::Truncate { to } = action {
+                        prompt.truncate(to.saturating_sub(ordinal_base) as usize);
                     }
                 }
                 // A steer no later step rendered stays in the transcript exactly once, at the
@@ -2237,11 +2227,11 @@ fn replay_seeded_with_compaction<'a>(
     let run_finished_durable = ep.finished.is_some();
     let provider_call_started = ep.provider_call_started;
     let completed_steps = ep.completed_steps;
-    let tool_call_count = ep.budget.tool_call_count;
+    let tool_call_count = placement.budget().tool_call_count;
     // Checkpoints encode sorted indexes; the replay API retains its seed prefix followed
     // by new firings in threshold order. This is an output representation, not budget state.
-    let mut tail_nudge_indices: Vec<_> = ep
-        .budget
+    let mut tail_nudge_indices: Vec<_> = placement
+        .budget()
         .fired_nudge_indices
         .iter()
         .copied()
@@ -2258,8 +2248,8 @@ fn replay_seeded_with_compaction<'a>(
         .into_iter()
         .chain(tail_nudge_indices)
         .collect();
-    let budget_finalize_fired = ep.budget.finalize_fired;
-    let budget_finalize_pending = ep.budget.finalize_pending;
+    let budget_finalize_fired = placement.budget().finalize_fired;
+    let budget_finalize_pending = placement.budget().finalize_pending;
     let usage = ep.usage;
     let retries_used = ep.retries_used;
     let last_step_usage = ep.last_step_usage;
