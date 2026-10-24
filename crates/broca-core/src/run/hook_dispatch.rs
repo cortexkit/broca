@@ -24,25 +24,33 @@ pub(super) async fn record_model_hook(
 
 pub(super) async fn restream_message(message: &AssistantMessage, out: &mpsc::Sender<OutputEvent>) {
     let _ = send(out, OutputEvent::Display(DisplayEvent::DisplayReset)).await;
-    for part in &message.content {
+    for (index, part) in message.content.iter().enumerate() {
         let event = match part {
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
                 DisplayEvent::TextDelta {
+                    mid: None,
+                    part: None,
                     message_id: message.message_id.clone(),
                     tool_call_id: None,
                     delta: text.clone(),
                 }
             }
             ContentBlock::Reasoning { text, .. } => DisplayEvent::ReasoningDelta {
+                mid: None,
+                part: None,
                 message_id: message.message_id.clone(),
                 delta: text.clone(),
             },
             ContentBlock::ToolCall(call) => DisplayEvent::ToolInputDelta {
+                mid: None,
+                part: None,
                 tool_call_id: call.tool_call_id.clone(),
                 delta: call.input.to_string(),
             },
             _ => continue,
         };
+        let mut event = event;
+        event.set_part(index as u64);
         let _ = send(out, OutputEvent::Display(event)).await;
     }
 }

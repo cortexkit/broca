@@ -14159,8 +14159,8 @@ test_file = "crates/broca-module-serve/src/serve.rs"
 expect_red = ["serve::tests::authorized_invalid_subscribe_preserves_original_stream_correlation"]
 select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
-old = "                let from = match subscribe_from(&params) {"
-new = "                slot.replace(); // NON-VACUITY BREAK: replace before validation\n                let from = match subscribe_from(&params) {"
+old = "                    let (from, limits) = match subscribe_from(&params) {"
+new = "                    slot.replace(); // NON-VACUITY BREAK: replace before validation\n                    let (from, limits) = match subscribe_from(&params) {"
 
 [[control]]
 id = "core-consent-recorded-id-get-await"
@@ -19915,8 +19915,30 @@ features = ["live"]
 test_file = "crates/broca-provider/src/families/openai_responses.rs"
 expect_red = ["families::openai_responses::tests::reasoning_summary_deltas_reach_the_display_lane_before_the_answer"]
 file = "crates/broca-provider/src/families/openai_responses.rs"
-old = "                    out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {\n                        message_id: mid,\n                        delta: text,"
-new = "                    let _ = (NormalizedEvent::Display(DisplayEvent::ReasoningDelta { // NON-VACUITY BREAK: drop the summary display delta\n                        message_id: mid,\n                        delta: text,"
+old = '''                    self.display_parts.delta(
+                        (part.0, 0),
+                        DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            delta: text,
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );'''
+new = '''                    self.display_parts.delta(
+                        (part.0, 0),
+                        DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            delta: text,
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        &mut Vec::new(), // NON-VACUITY BREAK: discard the summary's display events.
+                    );'''
 
 [[control]]
 id = "mode3-ordered-retry-terminal-state"
@@ -25156,3 +25178,202 @@ expect_red = ["serve::tests::subscribe_transport_terminals_keep_stream_sequence_
 file = "crates/broca-module-serve/src/serve.rs"
 old = "                seq: next_seq,"
 new = "                seq: next_seq + 1, // NON-VACUITY BREAK: skip the terminal stream position."
+
+[[control]]
+id = "live-parts-anthropic-hidden-prefix"
+guards = "Anthropic display parts count signature-only stored blocks before streamed text"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::anthropic_delta_less_prefix_keeps_stored_indices_without_reset"]
+file = "crates/broca-provider/src/normalize.rs"
+old = "                let part = self.blocks.range(..idx).count() as u64;"
+new = "                let part = 0; // NON-VACUITY BREAK: ignore delta-less stored prefix blocks."
+
+[[control]]
+id = "live-chat-index-shift-reset"
+guards = "Late Chat reasoning resets and re-streams corrected stored indices but prefix-ordered streams do not reset"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::chat_late_reasoning_resets_only_shifted_indices"]
+file = "crates/broca-provider/src/display_parts.rs"
+old = "        if shifts_emitted {"
+new = "        if shifts_emitted && family != \"openai_chat\" { // NON-VACUITY BREAK: leave already-sent Chat indices stale."
+
+[[control]]
+id = "live-responses-index-shift-reset"
+guards = "Reordered Responses output items correct already-sent stored indices"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::responses_reordered_items_correct_live_indices"]
+file = "crates/broca-provider/src/display_parts.rs"
+old = "        if shifts_emitted {"
+new = "        if shifts_emitted && family != \"openai_responses\" { // NON-VACUITY BREAK: leave already-sent Responses indices stale."
+
+[[control]]
+id = "live-index-shift-health-count"
+guards = "Index-shift corrections increment their own process health counter"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::chat_late_reasoning_resets_only_shifted_indices"]
+file = "crates/broca-provider/src/display_parts.rs"
+old = "        INDEX_RESETS.fetch_add(1, Ordering::Relaxed);"
+new = "        let _ = &INDEX_RESETS; // NON-VACUITY BREAK: hide index-shift corrections from health."
+
+[[control]]
+id = "live-attach-coalesced-snapshot"
+guards = "Attach resets and replays each buffered part exactly once before subsequent live deltas"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/display_replay.rs"
+expect_red = ["fanout::display_replay::tests::attach_coalesces_parts_then_delivers_each_live_delta_once"]
+file = "crates/broca-module/src/display_replay.rs"
+old = "        for value in state.parts.values() {"
+new = "        for value in state.parts.values().take(0) { // NON-VACUITY BREAK: attach forgets the step's accumulated parts."
+
+[[control]]
+id = "live-attach-buffer-byte-cap"
+guards = "An over-cap display part is discarded until reset and an attach reports a gap without losing other parts"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/display_replay.rs"
+expect_red = ["fanout::display_replay::tests::capped_part_is_dropped_until_reset_without_losing_other_parts"]
+file = "crates/broca-module/src/display_replay.rs"
+old = "                if state.bytes.saturating_add(added) > MAX_BYTES {"
+new = "                if state.bytes.saturating_add(added) > usize::MAX { // NON-VACUITY BREAK: disable the per-step replay byte cap."
+
+[[control]]
+id = "live-mid-queued-placement"
+guards = "Real-serve display frames use the assistant ordinal captured at the queued step boundary"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_display_samples_match_stored_parts_and_attach_replays_current_step"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "            .map(|p| p.next_ordinal())"
+new = "            .map(|p| p.next_ordinal() + 1) // NON-VACUITY BREAK: misattribute queued display to the following message."
+
+[[control]]
+id = "live-finalize-filter-corrected-parts"
+guards = "Budget finalize filtering wipes omitted live tool rows and re-streams the stored block indices"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_finalize_filter_restreams_the_stored_block_indices"]
+file = "crates/broca-core/src/run.rs"
+old = "                let message_changed = message.content.len() != unfiltered_blocks"
+new = "                let message_changed = { let _ = unfiltered_blocks; false } // NON-VACUITY BREAK: omit correction after finalize filtering."
+
+[[control]]
+id = "live-subscribe-typed-argument-limits"
+guards = "Subscribe limits clip typed tool arguments without changing the existing authoritative unit"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_subscribe_limits_cut_only_typed_arguments_not_existing_units"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            let delivery = limit_live_arguments(delivery, limits.as_ref());"
+new = "            let _ = &limits; // NON-VACUITY BREAK: bypass requested typed argument limits."
+
+[[control]]
+id = "placement-next-ordinal-live-display"
+guards = "Actual live display mids agree with stored ordinals and expected transcript positions"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_display_samples_match_stored_parts_and_attach_replays_current_step"]
+file = "crates/broca-core/src/placement.rs"
+old = "            next,\n            steers: 0,"
+new = "            next: next.saturating_add(1), // NON-VACUITY BREAK: shift every message placement.\n            steers: 0,"
+
+[[control]]
+id = "live-hook-restream-stored-part-index"
+guards = "Hook re-streams enumerate stored blocks rather than only blocks with visible deltas"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/hook_tests.rs"
+expect_red = ["run::hook_tests::post_hook_restream_counts_delta_less_stored_blocks"]
+file = "crates/broca-core/src/run/hook_dispatch.rs"
+old = "        event.set_part(index as u64);"
+new = "        let _ = index; event.set_part(0); // NON-VACUITY BREAK: erase stored block positions in a hook re-stream."
+
+[[control]]
+id = "live-display-diagnostics-exact-target"
+guards = "Display index corrections are debug-only opt-in diagnostics under one exact target, never a blanket log-level exemption"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/log_levels_are_deliberate.rs"
+expect_red = ["log_levels_are_deliberate::no_operator_log_site_sits_below_the_unconfigured_default"]
+file = "crates/broca-provider/src/display_parts.rs"
+old = '''        INDEX_RESETS.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            target: "provider.display.indices",'''
+new = '''        INDEX_RESETS.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            target: "provider.display.indices.extra", // NON-VACUITY BREAK: an unapproved target must remain refused.'''
+
+[[control]]
+id = "live-responses-empty-text-has-no-part"
+guards = "An empty Responses text item omitted by assembly reserves no phantom display part and causes no false reset"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::responses_empty_items_reserve_no_phantom_parts_or_resets"]
+file = "crates/broca-provider/src/families/openai_responses.rs"
+old = "                            .any(|(_, text)| !text.is_empty())"
+new = "                            .any(|_| true) // NON-VACUITY BREAK: count empty text parts that assembly omits."
+
+[[control]]
+id = "live-responses-empty-refusal-has-no-part"
+guards = "An empty Responses refusal omitted by assembly reserves no phantom display part and causes no false reset"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::responses_empty_items_reserve_no_phantom_parts_or_resets"]
+file = "crates/broca-provider/src/families/openai_responses.rs"
+old = "                                if !self.refusal.is_empty() {"
+new = "                                if true { // NON-VACUITY BREAK: count an empty refusal that assembly omits."
+
+[[control]]
+id = "live-attach-ended-step-cleared"
+guards = "A cancelled or ended run cannot replay an uncommitted old model prefix as a current step"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_attach_after_cancel_discards_the_uncommitted_step"]
+file = "crates/broca-module/src/display_replay.rs"
+old = "        *self.state.lock().unwrap() = State::default();"
+new = "        let _ = &self.state; // NON-VACUITY BREAK: keep ended-step replay state alive."

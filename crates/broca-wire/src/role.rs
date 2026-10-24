@@ -340,6 +340,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::RETRACT,
         "dispatch_attribution",
         "streaming",
+        cortexkit_role_llm_runner::capabilities::LIVE_EVENTS,
         "steer",
         "queue",
         "interrupt",
@@ -979,7 +980,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "245a861126f8c6fecc7dfce4567d106d3537ff1088257b5af8bca7ec43b3707c",
+            "9c23fbd2139eff95d5c433b4e441c83245cbb0655de197e9a758f679ad6b6c2c",
         );
     }
 
@@ -1136,7 +1137,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "72cd44fef6005652813490465cda57da1f777100143e802da5a8687c0e8f7ffc";
+        "5b6671997aa5b44ee646f96fba6ad7416f8707aa4c36c5dc4bacb0058d62328c";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

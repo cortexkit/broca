@@ -772,6 +772,8 @@ impl Provider for Messages {
         }
         let (tx, rx) = mpsc::channel(8);
         tx.send(NormalizedEvent::Display(DisplayEvent::TextDelta {
+            mid: None,
+            part: None,
             message_id: broca_protocol::MessageId(format!("m{}", step.0)),
             tool_call_id: None,
             delta: "answer".into(),
@@ -2554,3 +2556,36 @@ async fn cut_step_shutdown_fallback_keeps_exact_rejection_counts() {
 
 #[path = "dispatch_cancel_tests.rs"]
 mod dispatch_cancel_tests;
+
+#[tokio::test]
+async fn post_hook_restream_counts_delta_less_stored_blocks() {
+    let message = AssistantMessage {
+        message_id: broca_protocol::MessageId("hooked".into()),
+        content: vec![
+            ContentBlock::RedactedReasoning {
+                data: "opaque".into(),
+                provider_format: None,
+            },
+            ContentBlock::Reasoning {
+                text: "thinking".into(),
+                signature: None,
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
+        ],
+    };
+    let (out, mut events) = mpsc::channel(8);
+    restream_message(&message, &out).await;
+    assert_eq!(
+        events.try_recv().unwrap(),
+        OutputEvent::Display(DisplayEvent::DisplayReset)
+    );
+    let parts: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|e| match e {
+            OutputEvent::Display(e) => e.coordinates().map(|(_, part)| part),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parts, vec![1, 2]);
+}

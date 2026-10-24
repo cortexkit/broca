@@ -107,16 +107,33 @@ impl Step {
             .into(),
         );
         if matches!(self, Step::Stream(_) | Step::StreamEmpty(_)) {
-            for block in &content {
-                if let ContentBlock::Text { text } = block {
-                    events.push(NormalizedEvent::Display(
-                        broca_protocol::DisplayEvent::TextDelta {
+            for (part, block) in content.iter().enumerate() {
+                let mut event = match block {
+                    ContentBlock::Text { text } => broca_protocol::DisplayEvent::TextDelta {
+                        mid: None,
+                        part: None,
+                        message_id: message_id.clone(),
+                        tool_call_id: None,
+                        delta: text.clone(),
+                    },
+                    ContentBlock::Reasoning { text, .. } => {
+                        broca_protocol::DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: None,
                             message_id: message_id.clone(),
-                            tool_call_id: None,
                             delta: text.clone(),
-                        },
-                    ));
-                }
+                        }
+                    }
+                    ContentBlock::ToolCall(call) => broca_protocol::DisplayEvent::ToolInputDelta {
+                        mid: None,
+                        part: None,
+                        tool_call_id: call.tool_call_id.clone(),
+                        delta: call.input.to_string(),
+                    },
+                    _ => continue,
+                };
+                event.set_part(part as u64);
+                events.push(NormalizedEvent::Display(event));
             }
         }
         events.extend([
@@ -142,6 +159,8 @@ impl Step {
 /// What the provider and tool plane of the rig do, shared with the test.
 #[derive(Default)]
 pub struct Script {
+    pub hold_stream: Mutex<bool>,
+    pub stream_gate: Notify,
     /// Model steps, consumed in order across every run. An exhausted script answers text.
     pub steps: Mutex<VecDeque<Step>>,
     /// The prompt each model step was called with, in call order.
@@ -187,6 +206,12 @@ pub struct Script {
 }
 
 impl Script {
+    pub fn hold_stream(&self, hold: bool) {
+        *self.hold_stream.lock().unwrap() = hold;
+        if !hold {
+            self.stream_gate.notify_waiters();
+        }
+    }
     pub fn push(&self, steps: &[Step]) {
         self.steps.lock().unwrap().extend(steps.iter().cloned());
     }
@@ -264,14 +289,32 @@ impl Provider for ScriptedProvider {
             .pop_front()
             .unwrap_or(Step::Text("done"));
         let (tx, rx) = mpsc::channel(8);
-        for event in step.events() {
-            self.0
-                .provider_output
-                .lock()
-                .unwrap()
-                .push(format!("step {} output: {event:?}", step_id.0));
-            tx.send(event).await.unwrap();
-        }
+        let script = self.0.clone();
+        tokio::spawn(async move {
+            for event in step.events() {
+                if matches!(
+                    event,
+                    NormalizedEvent::Control(ProviderControl::AssistantMessage { .. })
+                ) {
+                    loop {
+                        let gate = script.stream_gate.notified();
+                        if !*script.hold_stream.lock().unwrap() {
+                            break;
+                        }
+                        script.entered.notify_one();
+                        gate.await;
+                    }
+                }
+                script
+                    .provider_output
+                    .lock()
+                    .unwrap()
+                    .push(format!("step {} output: {event:?}", step_id.0));
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
         rx
     }
 }
@@ -698,9 +741,9 @@ impl Rig {
     /// Subscribed with `{"from": "start"}`, the control lane replays the lineage's durable
     /// records at attach, so for a run that has started, that first frame proves the subscriber
     /// is attached. A live subscription (`{}`) sends nothing until something new happens, so its
-    /// first frame proves nothing and `on_attach` would wait for an event it gates. A test that
-    /// releases a held model from `on_attach` cannot stream display deltas before anyone
-    /// listens; the display lane is lossy and never replayed.
+    /// first frame may only be the advisory display reset, rather than durable replay. Tests
+    /// that require a particular part use `subscribe_release_after_part` instead of treating
+    /// a control replay as evidence that a display snapshot already crossed serve.
     /// Attachment uses the shared hang guard; `quiet` applies only after replay arrives.
     pub async fn subscribe_collect_after_attach(
         &mut self,
@@ -737,6 +780,62 @@ impl Rig {
         .unwrap();
         write_frame(&mut self.writer, &frame).await.unwrap();
         collect_subscription_frames(&mut self.reader, corr, quiet, on_attach).await
+    }
+
+    /// Release a held provider only after the requested display part actually crossed serve.
+    pub async fn subscribe_release_after_part(&mut self, channel: u16, part: u64) -> Vec<Frame> {
+        self.bind(channel).await;
+        self.corr += 1;
+        let corr = self.corr;
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            u32::from(channel != 0),
+            corr,
+            serde_json::to_vec(
+                &serde_json::json!({"method":"session.subscribe","params":{"from":"start"}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut self.writer, &frame).await.unwrap();
+        let expected_part = part.to_string();
+        let mut frames = broca_test_support::wait_for(
+            "held display snapshot",
+            async {
+                let mut frames = Vec::new();
+                loop {
+                    let frame = read_frame(&mut self.reader)
+                        .await
+                        .unwrap()
+                        .expect("stream stays open");
+                    if frame.header.corr != corr {
+                        continue;
+                    }
+                    let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+                    let reached = body["kind"] == "display"
+                        && body["event"]["part"].as_str() == Some(expected_part.as_str());
+                    frames.push(frame);
+                    if reached {
+                        break frames;
+                    }
+                }
+            },
+            || "waiting for the coalesced snapshot part before releasing its provider".into(),
+        )
+        .await;
+        self.script.hold_stream(false);
+        frames.extend(
+            collect_subscription_frames(
+                &mut self.reader,
+                corr,
+                Duration::from_millis(300),
+                None::<fn()>,
+            )
+            .await,
+        );
+        frames
     }
 
     pub async fn bind(&mut self, channel: u16) {
@@ -1078,6 +1177,7 @@ impl Rig {
         } = self;
         script.hold_model(false);
         script.hold_tool(false);
+        script.hold_stream(false);
         drop(writer);
         drop(reader);
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;

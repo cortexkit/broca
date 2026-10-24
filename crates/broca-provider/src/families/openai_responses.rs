@@ -684,6 +684,7 @@ struct ResponsesOutputTokenDetails {
 }
 
 pub struct OpenAiResponsesNormalizer {
+    display_parts: crate::display_parts::DisplayParts,
     arguments_guard: crate::wire::ToolArgsGuard,
     completed_items: std::collections::HashSet<u64>,
     completed_text_parts: std::collections::HashSet<(u64, u64)>,
@@ -736,6 +737,7 @@ impl OpenAiResponsesNormalizer {
         reasoning_format: EncryptedReasoningFormat,
     ) -> Self {
         Self {
+            display_parts: Default::default(),
             arguments_guard: Default::default(),
             completed_items: Default::default(),
             completed_text_parts: Default::default(),
@@ -867,11 +869,19 @@ impl OpenAiResponsesNormalizer {
                         .response_id
                         .clone()
                         .unwrap_or_else(|| MessageId(String::new()));
-                    out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
-                        message_id: mid,
-                        tool_call_id: None,
-                        delta: delta.to_owned(),
-                    }));
+                    self.display_parts.delta(
+                        (index, 1),
+                        DisplayEvent::TextDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            tool_call_id: None,
+                            delta: delta.to_owned(),
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );
                 }
             }
             // The finalized text is authoritative over streamed fragments. Do not re-emit it
@@ -882,6 +892,14 @@ impl OpenAiResponsesNormalizer {
                 self.completed_text_parts.insert((index, part));
                 if let Some(text) = v.get("text").and_then(Value::as_str) {
                     self.text_items.insert((index, part), text.to_owned());
+                    if !text.is_empty() {
+                        self.display_parts.reserve(
+                            (index, 1),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                 }
             }
             // Reasoning summaries are shown live as reasoning text, the way Anthropic thinking
@@ -906,10 +924,18 @@ impl OpenAiResponsesNormalizer {
                         .response_id
                         .clone()
                         .unwrap_or_else(|| MessageId(String::new()));
-                    out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
-                        message_id: mid,
-                        delta: text,
-                    }));
+                    self.display_parts.delta(
+                        (part.0, 0),
+                        DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            delta: text,
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );
                 }
             }
             "response.refusal.delta" => {
@@ -924,11 +950,19 @@ impl OpenAiResponsesNormalizer {
                         .response_id
                         .clone()
                         .unwrap_or_else(|| MessageId(String::new()));
-                    out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
-                        message_id: mid,
-                        tool_call_id: None,
-                        delta: delta.to_owned(),
-                    }));
+                    self.display_parts.delta(
+                        (self.refusal_output_index.unwrap_or(0), 2),
+                        DisplayEvent::TextDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            tool_call_id: None,
+                            delta: delta.to_owned(),
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );
                 }
             }
             // Refusal deltas are display progress; the done event is the authoritative reply.
@@ -941,14 +975,44 @@ impl OpenAiResponsesNormalizer {
                 }
                 if let Some(refusal) = v.get("refusal").and_then(Value::as_str) {
                     self.refusal = refusal.to_owned();
+                    if !refusal.is_empty() {
+                        self.display_parts.reserve(
+                            (self.refusal_output_index.unwrap_or(0), 2),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                 }
             }
             "response.output_item.added" => {
                 if let Some(item) = v.get("item") {
+                    if let Some(kind) = match item.get("type").and_then(Value::as_str) {
+                        Some("reasoning") => Some(0),
+                        Some("function_call") => Some(3),
+                        _ => None,
+                    } {
+                        let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                        self.display_parts.reserve(
+                            (index, kind),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                     self.capture_text_state(
                         v.get("output_index").and_then(Value::as_u64).unwrap_or(0),
                         item,
                     );
+                    let index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                    if self.text_states.contains_key(&index) {
+                        self.display_parts.reserve(
+                            (index, 1),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         let idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
                         let buf = self.tool_calls.entry(idx).or_default();
@@ -978,10 +1042,18 @@ impl OpenAiResponsesNormalizer {
                 self.arguments_guard
                     .stream(idx, &buf.call_id, &buf.name, &buf.arguments, delta);
                 if !buf.call_id.is_empty() && !delta.is_empty() {
-                    out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
-                        tool_call_id: ToolCallId(buf.call_id.clone()),
-                        delta: delta.to_owned(),
-                    }));
+                    self.display_parts.delta(
+                        (idx, 3),
+                        DisplayEvent::ToolInputDelta {
+                            mid: None,
+                            part: None,
+                            tool_call_id: ToolCallId(buf.call_id.clone()),
+                            delta: delta.to_owned(),
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );
                 }
             }
             // The authoritative complete-arguments event. Some backends/models (observed
@@ -1007,6 +1079,26 @@ impl OpenAiResponsesNormalizer {
                     let idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
                     self.completed_items.insert(idx);
                     self.capture_text_state(idx, item);
+                    let kind = match item.get("type").and_then(Value::as_str) {
+                        Some("reasoning") => Some(0),
+                        Some("function_call") => Some(3),
+                        _ if message_item_output_text_parts(item)
+                            .iter()
+                            .any(|(_, text)| !text.is_empty())
+                            || self.text_states.contains_key(&idx) =>
+                        {
+                            Some(1)
+                        }
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        self.display_parts.reserve(
+                            (idx, kind),
+                            "openai_responses",
+                            self.step_id,
+                            out,
+                        );
+                    }
                     match item.get("type").and_then(Value::as_str) {
                         Some("function_call") => {
                             let buf = self.tool_calls.entry(idx).or_default();
@@ -1056,6 +1148,14 @@ impl OpenAiResponsesNormalizer {
                                 self.saw_refusal = true;
                                 self.refusal_output_index = Some(idx);
                                 self.refusal = refusal;
+                                if !self.refusal.is_empty() {
+                                    self.display_parts.reserve(
+                                        (idx, 2),
+                                        "openai_responses",
+                                        self.step_id,
+                                        out,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1148,7 +1248,7 @@ impl OpenAiResponsesNormalizer {
         }
         if !self.completed {
             self.completed = true;
-            let message = self.assemble_message()?;
+            let message = self.assemble_message(out)?;
             out.extend(self.arguments_guard.event());
             out.push(NormalizedEvent::Control(
                 ProviderControl::AssistantMessage { message },
@@ -1199,7 +1299,10 @@ impl OpenAiResponsesNormalizer {
         }
     }
 
-    fn assemble_message(&mut self) -> Result<AssistantMessage, NormalizeError> {
+    fn assemble_message(
+        &mut self,
+        out: &mut Vec<NormalizedEvent>,
+    ) -> Result<AssistantMessage, NormalizeError> {
         for buf in self.tool_calls.values() {
             self.arguments_guard
                 .terminal(&buf.call_id, &buf.name, &buf.arguments);
@@ -1301,6 +1404,12 @@ impl OpenAiResponsesNormalizer {
             ));
         }
         ordered.sort_by_key(|(index, kind_order, _)| (*index, *kind_order));
+        let keys: Vec<_> = ordered
+            .iter()
+            .map(|(index, kind, _)| (*index, u64::from(*kind)))
+            .collect();
+        self.display_parts
+            .retain(&keys, "openai_responses", self.step_id, out);
         Ok(AssistantMessage {
             message_id: self.response_id.clone().unwrap_or(MessageId(String::new())),
             content: ordered.into_iter().map(|(_, _, block)| block).collect(),
@@ -1667,7 +1776,11 @@ mod tests {
         let display: Vec<(&str, &str)> = events
             .iter()
             .filter_map(|event| match event {
-                NormalizedEvent::Display(DisplayEvent::ReasoningDelta { message_id, delta }) => {
+                NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
+                    message_id,
+                    delta,
+                    ..
+                }) => {
                     assert_eq!(message_id.0, "resp_1");
                     Some(("reasoning", delta.as_str()))
                 }

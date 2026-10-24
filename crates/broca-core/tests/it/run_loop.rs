@@ -58,6 +58,8 @@ fn text_step_with_usage(text: &str, step_usage: Usage) -> Vec<NormalizedEvent> {
     vec![
         ctrl(ProviderControl::StreamStart { warnings: vec![] }),
         NormalizedEvent::Display(DisplayEvent::TextDelta {
+            mid: None,
+            part: Some(0),
             message_id: MessageId("m".into()),
             tool_call_id: None,
             delta: text.into(),

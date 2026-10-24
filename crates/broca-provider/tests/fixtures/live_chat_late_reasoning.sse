@@ -1,0 +1,7 @@
+data: {"id":"chat","choices":[{"delta":{"content":"answer"}}]}
+
+data: {"id":"chat","choices":[{"delta":{"reasoning_content":"thought"}}]}
+
+data: {"id":"chat","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]

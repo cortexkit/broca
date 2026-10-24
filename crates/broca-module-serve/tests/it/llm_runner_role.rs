@@ -99,7 +99,7 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
         .iter()
         .filter_map(|body| {
             let value: serde_json::Value = serde_json::from_str(body).unwrap();
-            if value["unit"]["type"] == "message_boundary" {
+            if value["kind"] != "control" || value["unit"]["type"] == "message_boundary" {
                 return None;
             }
             let split = body
@@ -364,6 +364,7 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
         "input_token_cap",
         "dispatch_attribution",
         "streaming",
+        "live_events",
         "steer",
         "queue",
         "interrupt",
@@ -1964,5 +1965,329 @@ async fn live_tool_observations_and_control_bytes_survive_a_real_serve_restart()
         before.iter().map(|frame| &frame.body).collect::<Vec<_>>(),
         after.iter().map(|frame| &frame.body).collect::<Vec<_>>()
     );
+    rig.finish().await;
+}
+
+async fn pin_live_sample(rig: &mut Rig, frames: &[Frame], run_id: &str, file: &str) {
+    let page = read(rig, serde_json::json!({})).await;
+    let lineage = page.lineage_id.as_ref().unwrap();
+    let values = assert_stream_sequences(frames);
+    let mut lines = Vec::new();
+    for (frame, value) in frames.iter().zip(&values) {
+        let event = &value["event"];
+        cortexkit_role_llm_runner::live::LiveEvent::decode_strict(event).unwrap();
+        if let (Some(mid), Some(part)) = (event["mid"].as_str(), event["part"].as_str()) {
+            let entry = page
+                .messages
+                .iter()
+                .find(|m| m.mid == mid)
+                .expect("live mid is stored");
+            let stored: Message = serde_json::from_value(entry.message.clone()).unwrap();
+            let index: usize = part.parse().unwrap();
+            assert!(
+                index < stored.content.len(),
+                "display part lies in the stored message"
+            );
+            match (&stored.content[index], event["type"].as_str().unwrap()) {
+                (ContentBlock::Text { .. }, "text_delta")
+                | (ContentBlock::Reasoning { .. }, "reasoning_delta")
+                | (ContentBlock::ToolCall(_), "tool_input_delta") => {}
+                pair => panic!("delta addresses a different block: {pair:?}"),
+            }
+        }
+        let mut body = normalized(&frame.body, run_id, lineage);
+        for field in ["started_at", "finished_at"] {
+            if let Some(at) = event[field].as_u64() {
+                body = body.replace(
+                    &format!("\"{field}\":{at}"),
+                    &format!("\"{field}\":1700000000000"),
+                );
+            }
+        }
+        lines.push(body);
+    }
+    let sample = lines.join("\n") + "\n";
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(golden_path(file), &sample).unwrap();
+    }
+    assert_eq!(sample.trim_end(), pinned(file));
+}
+
+#[tokio::test]
+async fn live_display_samples_match_stored_parts_and_attach_replays_current_step() {
+    use broca_protocol::{ToolCall, ToolCallId};
+    let tool = ContentBlock::ToolCall(ToolCall {
+        thought_signature: None,
+        tool_call_id: ToolCallId("sample-call".into()),
+        tool_name: "work".into(),
+        input: serde_json::json!({}),
+    });
+    for name in ["text", "tool", "reasoning", "steer", "attach"] {
+        let mut rig = Rig::start(&format!("live-sample-{name}")).await;
+        let content = match name {
+            "tool" | "steer" => vec![tool.clone()],
+            "reasoning" => vec![
+                ContentBlock::Reasoning {
+                    text: "thinking".into(),
+                    signature: Some("opaque".into()),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            _ => vec![ContentBlock::Text {
+                text: "answer".into(),
+            }],
+        };
+        let last_part = content.len() as u64 - 1;
+        rig.script
+            .push(&[Step::Stream(content), Step::Text("done")]);
+        rig.script.hold_stream(true);
+        let reply = rig.send("sample", "hi", None).await;
+        let run_id = result(&reply)["run_id"].as_str().unwrap().to_owned();
+        rig.wait_entered().await;
+        if name == "steer" {
+            rig.send("sample-steer", "steered", Some("steer")).await;
+        }
+        let frames = if name == "attach" {
+            let mut frames = Vec::new();
+            for channel in 20..28 {
+                frames = rig
+                    .subscribe_collect(channel, serde_json::json!({}), Duration::from_millis(100))
+                    .await;
+                if frames.iter().any(|f| {
+                    serde_json::from_slice::<serde_json::Value>(&f.body).unwrap()["event"]["part"]
+                        == "0"
+                }) {
+                    break;
+                }
+            }
+            let display: Vec<_> = frames
+                .iter()
+                .map(|f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap())
+                .filter(|v| v["kind"] == "display")
+                .collect();
+            assert_eq!(display.len(), 2, "reset then one coalesced part");
+            assert_eq!(display[0]["event"]["type"], "display_reset");
+            rig.script.hold_stream(false);
+            frames
+        } else {
+            rig.subscribe_release_after_part(20, last_part).await
+        };
+        rig.wait_for_finished(1).await;
+        rig.wait_idle().await;
+        assert!(frames
+            .iter()
+            .any(
+                |f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap()["event"]["mid"]
+                    == "m1"
+            ));
+        pin_live_sample(
+            &mut rig,
+            &frames,
+            &run_id,
+            &format!("session_subscribe.live_{name}.jsonl"),
+        )
+        .await;
+        rig.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn live_display_mid_after_reopen_comes_from_seeded_placement() {
+    let mut rig = Rig::start("display-reopen").await;
+    rig.script.push(&[Step::Text("first")]);
+    rig.send("first", "first prompt", None).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.wait_closed().await;
+    let mut rig = rig.restart().await;
+    rig.script.push(&[Step::Stream(vec![ContentBlock::Text {
+        text: "second".into(),
+    }])]);
+    rig.script.hold_stream(true);
+    let admitted = rig.send("second", "second prompt", None).await;
+    assert_eq!(
+        admitted.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&admitted.body)
+    );
+    rig.wait_entered().await;
+    let frames = rig.subscribe_release_after_part(20, 0).await;
+    rig.wait_for_finished(2).await;
+    rig.wait_idle().await;
+    let page = read(&mut rig, serde_json::json!({})).await;
+    let stored = page.messages.last().unwrap();
+    let message: Message = serde_json::from_value(stored.message.clone()).unwrap();
+    assert_eq!(message.role, Role::Assistant);
+    assert_eq!(
+        message.content,
+        vec![ContentBlock::Text {
+            text: "second".into()
+        }]
+    );
+    let delta = frames
+        .iter()
+        .map(|f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap())
+        .find(|v| v["event"]["type"] == "text_delta")
+        .unwrap();
+    assert_eq!(delta["event"]["mid"], stored.mid);
+    assert_eq!(delta["event"]["mid"], "m3");
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn live_finalize_filter_restreams_the_stored_block_indices() {
+    let mut rig = Rig::start("display-finalize").await;
+    rig.script.push(&[
+        Step::Call("first-call"),
+        Step::Stream(vec![
+            ContentBlock::ToolCall(broca_protocol::ToolCall {
+                thought_signature: None,
+                tool_call_id: broca_protocol::ToolCallId("omitted-call".into()),
+                tool_name: "work".into(),
+                input: serde_json::json!({}),
+            }),
+            ContentBlock::Text {
+                text: "final answer".into(),
+            },
+        ]),
+    ]);
+    rig.script.hold_tool(true);
+    rig.send_with(
+        "finalize",
+        "task",
+        None,
+        serde_json::json!({"budget":{"finalize_at_tool_calls":1,"finalize_text":"finish"}}),
+    )
+    .await;
+    rig.wait_entered().await;
+    rig.script.hold_stream(true);
+    rig.script.hold_tool(false);
+    rig.wait_entered().await;
+    let frames = rig.subscribe_release_after_part(20, 1).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let values = assert_stream_sequences(&frames);
+    let last_reset = values
+        .iter()
+        .rposition(|v| v["kind"] == "display" && v["event"]["type"] == "display_reset")
+        .unwrap();
+    let final_deltas: Vec<_> = values[last_reset + 1..]
+        .iter()
+        .filter(|v| v["kind"] == "display")
+        .collect();
+    assert_eq!(
+        final_deltas.len(),
+        1,
+        "the omitted tool's live row is wiped"
+    );
+    assert_eq!(final_deltas[0]["event"]["type"], "text_delta");
+    assert_eq!(final_deltas[0]["event"]["part"], "0");
+    let page = read(&mut rig, serde_json::json!({})).await;
+    let stored = page.messages.last().unwrap();
+    assert_eq!(final_deltas[0]["event"]["mid"], stored.mid);
+    let message: Message = serde_json::from_value(stored.message.clone()).unwrap();
+    assert_eq!(
+        message.content,
+        vec![ContentBlock::Text {
+            text: "final answer".into()
+        }]
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn live_subscribe_limits_cut_only_typed_arguments_not_existing_units() {
+    let (mut rig, _) = one_tool_turn("live-limits").await;
+    let frames = rig.subscribe_collect(20, serde_json::json!({"from":"start","limits":{"arguments_bytes":1,"result_bytes":1,"error_result_bytes":1}}), Duration::from_millis(100)).await;
+    let values = assert_stream_sequences(&frames);
+    let started = values
+        .iter()
+        .find(|v| v["event"]["type"] == "tool_started")
+        .expect("tool lifecycle replays");
+    assert_eq!(started["event"]["arguments"], "{");
+    assert_eq!(started["event"]["arguments_truncated"], true);
+    let call = values
+        .iter()
+        .find(|v| v["unit"]["type"] == "tool_call")
+        .expect("the existing authoritative call unit replays separately");
+    assert_eq!(call["unit"]["call"]["input"], serde_json::json!({}));
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn live_display_after_steer_uses_the_next_step_placement() {
+    let mut rig = Rig::start("display-steer-next").await;
+    rig.script.push(&[
+        Step::Stream(vec![ContentBlock::ToolCall(broca_protocol::ToolCall {
+            thought_signature: None,
+            tool_call_id: broca_protocol::ToolCallId("steer-call".into()),
+            tool_name: "work".into(),
+            input: serde_json::json!({}),
+        })]),
+        Step::Stream(vec![ContentBlock::Text {
+            text: "after steer".into(),
+        }]),
+    ]);
+    rig.script.hold_stream(true);
+    rig.send("first", "task", None).await;
+    rig.wait_entered().await;
+    rig.send("steer", "new direction", Some("steer")).await;
+    let frames = rig.subscribe_release_after_part(20, 0).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let values = assert_stream_sequences(&frames);
+    let delta = values
+        .iter()
+        .find(|v| v["event"]["type"] == "text_delta" && v["event"]["delta"] == "after steer")
+        .unwrap();
+    let page = read(&mut rig, serde_json::json!({})).await;
+    assert_eq!(page.messages.last().unwrap().mid, "m4");
+    assert_eq!(delta["event"]["mid"], page.messages.last().unwrap().mid);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn live_attach_after_cancel_discards_the_uncommitted_step() {
+    let mut rig = Rig::start("display-cancelled-step").await;
+    rig.script.push(&[Step::Stream(vec![ContentBlock::Text {
+        text: "discarded partial".into(),
+    }])]);
+    rig.script.hold_stream(true);
+    let reply = rig.send("partial", "task", None).await;
+    let run_id = result(&reply)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_entered().await;
+    let before = rig
+        .subscribe_collect(20, serde_json::json!({}), Duration::from_millis(100))
+        .await;
+    assert!(before.iter().any(
+        |f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap()["event"]["delta"]
+            == "discarded partial"
+    ));
+    rig.cancel(&run_id).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let page = read(&mut rig, serde_json::json!({})).await;
+    assert!(page
+        .messages
+        .iter()
+        .all(
+            |entry| serde_json::from_value::<Message>(entry.message.clone())
+                .unwrap()
+                .role
+                != Role::Assistant
+        ));
+    let frames = rig
+        .subscribe_collect(21, serde_json::json!({}), Duration::from_millis(100))
+        .await;
+    let values = assert_stream_sequences(&frames);
+    assert_eq!(
+        values.len(),
+        1,
+        "an ended run has no current-step display prefix to replay"
+    );
+    assert_eq!(values[0]["event"]["type"], "display_reset");
     rig.finish().await;
 }

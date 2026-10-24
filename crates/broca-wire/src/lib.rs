@@ -899,6 +899,8 @@ pub struct CursorWire {
 pub struct SubscribeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<FromWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<cortexkit_role_llm_runner::display::Limits>,
 }
 
 /// `session.read` params. The session comes from the bound route identity.
@@ -4572,6 +4574,8 @@ mod tests {
 
     fn display_delta() -> DisplayEvent {
         DisplayEvent::TextDelta {
+            mid: None,
+            part: None,
             message_id: MessageId("message-1".into()),
             tool_call_id: None,
             delta: "streamed text".into(),

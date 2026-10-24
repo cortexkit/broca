@@ -80,7 +80,7 @@ fn project_control(records: &[broca_wal::FramedRecord]) -> Vec<ControlEvent> {
 ///
 /// `Control` is a cursor-tagged control unit (reliable; replayed on attach, deduped).
 /// Both event variants share their owned payload so fan-out only clones an [`Arc`] per subscriber.
-/// `Display` is a live display event (lossy; live-only, never replayed).
+/// `Display` is advisory current-step replay followed by live display (both lossy).
 /// `Detached` means the subscriber fell behind the bounded control broadcast channel and must
 /// resubscribe from its last cursor. A client never consumes a post-gap control event as contiguous.
 /// Display lag is signalled in-band by a `DisplayGap` event, not a detach.
@@ -286,7 +286,9 @@ impl<T> From<broadcast::Sender<T>> for LazyRing<T> {
 }
 
 /// The live display stream's sender, handed to a run's output drain.
-pub type DisplaySender = LazyRing<Arc<broca_protocol::display::DisplayEvent>>;
+#[path = "display_replay.rs"]
+mod display_replay;
+pub use display_replay::DisplaySender;
 
 /// The fan-out: a control ring (fed by the projector from the writer's record observer)
 /// and a display ring (fed by the run's live `out` display events). Owned by the actor;
@@ -299,8 +301,8 @@ pub struct Fanout<W: WalStore> {
     detach_ring: broadcast::Sender<()>,
     /// The LOSSY display ring. The actor forwards the run's live display events here; it is
     /// NEVER fed control (control is sourced only from the WAL projection, so it can't
-    /// double-publish). Live-only, never replayed — a fresh display subscriber gets events
-    /// from attach onward, with a `DisplayGap` on lag.
+    /// double-publish). A bounded current-step snapshot precedes live events on attach;
+    /// overflow and receiver lag are marked by `DisplayGap` rather than a false full prefix.
     display_ring: DisplaySender,
     wal_store: Arc<W>,
     session: BindIdentity,
@@ -480,7 +482,7 @@ impl<W: WalStore + 'static> Fanout<W> {
     pub fn new(wal_store: Arc<W>, session: BindIdentity) -> (Self, broca_core::RecordObserver) {
         let approvals = Arc::new(crate::approval_state::ApprovalState::default());
         let ring = LazyRing::new(RING_CAPACITY);
-        let display_ring = LazyRing::new(DISPLAY_RING_CAPACITY);
+        let display_ring = DisplaySender::new(DISPLAY_RING_CAPACITY);
         let (detach_ring, _) = broadcast::channel(1);
         let (obs_tx, obs_rx) = broadcast::channel(OBSERVER_RING_CAPACITY);
         let (projection_seed, seed_rx) = mpsc::unbounded_channel();
@@ -563,8 +565,8 @@ impl<W: WalStore + 'static> Fanout<W> {
 
     /// Spawn a subscriber task with an already-registered CONTROL ring receiver, the attach
     /// reservation that kept the gate enabled through `writer.sync()`, and the durable head
-    /// `H` returned by that sync. The task also subscribes the DISPLAY ring (live-only, no
-    /// barrier because display has no durable replay) and forwards both on the unified
+    /// `H` returned by that sync. After durable replay the task atomically snapshots and
+    /// subscribes the advisory DISPLAY state, and forwards both lanes on the unified
     /// `sink`. The actor only performed the small receiver-registration + sync step; the
     /// slower WAL replay happens in this task so a subscriber's catch-up work never blocks
     /// the actor.
@@ -580,7 +582,7 @@ impl<W: WalStore + 'static> Fanout<W> {
         materialized_store: Option<Arc<dyn SessionStore>>,
     ) {
         self.reap_finished();
-        let display_rx = self.display_ring.subscribe();
+        let display = self.display_ring.clone();
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(subscriber_task(
             slot,
@@ -588,7 +590,7 @@ impl<W: WalStore + 'static> Fanout<W> {
             h,
             rx,
             detach_rx,
-            display_rx,
+            display,
             sink.clone(),
             self.wal_store.clone(),
             self.session.clone(),
@@ -918,7 +920,7 @@ async fn subscriber_task<W: WalStore + 'static>(
     h: u64,
     mut rx: broadcast::Receiver<Arc<ControlEvent>>,
     mut detach_rx: broadcast::Receiver<()>,
-    mut display_rx: broadcast::Receiver<Arc<broca_protocol::display::DisplayEvent>>,
+    display: DisplaySender,
     sink: mpsc::Sender<Delivery>,
     wal_store: Arc<W>,
     session: BindIdentity,
@@ -956,8 +958,7 @@ async fn subscriber_task<W: WalStore + 'static>(
         // STEP 1 — replay the durable CONTROL projection for records seq <= H. read_records
         // returns committed (fsynced) records; HARD-FILTER seq <= H so a concurrent append of
         // seq > H during the read is excluded, keeping the read prefix-consistent at H.
-        // (Display is live-only, so there's no display replay — a fresh subscriber sees display
-        // from attach onward.)
+        // Advisory display replay is snapshotted separately after durable control replay.
         let records = match spawn_blocking(JobKind::WalRead, {
             let wal_store = wal_store.clone();
             let session = session.clone();
@@ -1056,7 +1057,16 @@ async fn subscriber_task<W: WalStore + 'static>(
         from
     };
 
-    // STEP 2 — forward the live streams: CONTROL (deduped past H) + DISPLAY (live, lossy).
+    let (mut display_rx, snapshot) = display.subscribe_snapshot();
+    for event in snapshot {
+        if deliver(&sink, &cancel, Delivery::Display(Arc::new(event)))
+            .await
+            .is_break()
+        {
+            return;
+        }
+    }
+    // STEP 2 — forward the live streams after the atomic current-step display snapshot.
     // `display_open` guards the display arm so a CLOSED display ring (returns Closed on
     // every poll) doesn't busy-loop the select — once display closes we stop polling it but
     // keep serving control until the control ring closes.
@@ -1223,6 +1233,15 @@ async fn deliver(
 
 #[cfg(test)]
 mod tests {
+    async fn assert_attach_reset(deliveries: &mut tokio::sync::mpsc::Receiver<super::Delivery>) {
+        let delivery = tokio::time::timeout(std::time::Duration::from_secs(5), deliveries.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(delivery, super::Delivery::Display(event) if matches!(*event, broca_protocol::DisplayEvent::DisplayReset))
+        );
+    }
     use super::*;
 
     /// THE DELIVERY COUNTERS MOVE ON A REAL DELIVERY, AND ONLY ON ONE.
@@ -1243,6 +1262,8 @@ mod tests {
 
         let before = display_deliveries();
         let event = Arc::new(broca_protocol::display::DisplayEvent::TextDelta {
+            mid: None,
+            part: Some(0),
             message_id: broca_protocol::MessageId("m1".to_string()),
             tool_call_id: None,
             delta: "hi".to_string(),
@@ -1752,6 +1773,7 @@ mod tests {
         // handshake must buffer it and deliver it exactly once after installing state at H.
         writer.record(run_finished());
         writer.sync().await.expect("sync post-barrier record");
+        assert_attach_reset(&mut deliveries).await;
 
         let delivery = broca_test_support::event_timeout(
             "live_seed_matches_full_projection_and_buffers_the_first_post_barrier_record",
@@ -2025,6 +2047,7 @@ mod tests {
         );
         writer.record(run_finished());
         writer.sync().await.expect("sync post-barrier terminal");
+        assert_attach_reset(&mut deliveries).await;
 
         let delivery = broca_test_support::event_timeout(
             "live_attach_without_a_persisted_seed_falls_back_to_full_replay",
@@ -2202,6 +2225,8 @@ mod tests {
 
         writer.record(run_started(&session));
         writer.sync().await.expect("sync run start");
+        assert_attach_reset(&mut deliveries_a).await;
+        assert_attach_reset(&mut deliveries_b).await;
         let control_a = broca_test_support::event_timeout(
             "multiple_subscribers_receive_identical_shared_live_payloads",
             deliveries_a.recv(),
@@ -2241,6 +2266,8 @@ mod tests {
         }
 
         let display = Arc::new(broca_protocol::display::DisplayEvent::TextDelta {
+            mid: None,
+            part: Some(0),
             message_id: MessageId("m1".into()),
             tool_call_id: None,
             delta: "shared delta".into(),
@@ -2323,6 +2350,7 @@ mod tests {
         );
         writer.record(run_started(&session));
         writer.sync().await.expect("sync run start");
+        assert_attach_reset(&mut deliveries_a).await;
         let delivery = broca_test_support::event_timeout(
             "gate_reopen_reseeds_state_before_live_terminal",
             deliveries_a.recv(),
@@ -3167,9 +3195,10 @@ mod tests {
             sink,
             None,
         );
+        assert_attach_reset(&mut deliveries).await;
         assert!(
             fanout.display_ring.is_allocated(),
-            "the first subscriber creates the display ring"
+            "the first subscriber creates the display ring after durable replay"
         );
         let unit = Arc::new((
             Cursor::new(2, 0),

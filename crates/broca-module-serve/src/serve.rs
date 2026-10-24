@@ -1768,6 +1768,7 @@ async fn handle_control_request(
                     // fleet totals; consumers derive rates by diffing two readings from one launch.
                     // Always emit zero so a quiet process cannot be confused with an unwired counter.
                     "stream_chunks": broca_provider::sse::stream_chunks(),
+                    "display_index_resets": broca_provider::display_index_resets(),
                     // Entries providers listed in input_transformations: for Anthropic, signed
                     // thinking blocks dropped because an earlier part of the conversation changed
                     // between requests. Zero is healthy only over measured attempts; anything
@@ -2077,12 +2078,23 @@ fn prepare_route_request(
     }
 }
 
-fn subscribe_from(params: &serde_json::Value) -> Result<SubscribeFrom, (Option<String>, String)> {
+fn subscribe_from(
+    params: &serde_json::Value,
+) -> Result<
+    (
+        SubscribeFrom,
+        Option<cortexkit_role_llm_runner::display::Limits>,
+    ),
+    (Option<String>, String),
+> {
     let params: SubscribeParams = decode_params(params)?;
-    match params.from {
-        None => Ok(SubscribeFrom::Live),
-        Some(w) => w.to_subscribe_from().map_err(|e| (Some("from".into()), e)),
-    }
+    let from = match params.from {
+        None => SubscribeFrom::Live,
+        Some(w) => w
+            .to_subscribe_from()
+            .map_err(|e| (Some("from".into()), e))?,
+    };
+    Ok((from, params.limits))
 }
 
 /// Dispatch `vault.audit` without acquiring an actor lease or touching the bound session.
@@ -2232,7 +2244,7 @@ where
                     }
                 }
                 PreparedRouteRequest::Subscribe { params, slot } => {
-                    let from = match subscribe_from(&params) {
+                    let (from, limits) = match subscribe_from(&params) {
                         Ok(from) => from,
                         Err((field, message)) => {
                             let refusal = send_invalid_params(
@@ -2266,6 +2278,7 @@ where
                             corr,
                             session,
                             from,
+                            limits,
                             handler,
                             cancel.clone(),
                         ) => result,
@@ -3355,6 +3368,7 @@ async fn start_subscribe_stream<H>(
     corr: u64,
     session: BrocaBindIdentity,
     from: SubscribeFrom,
+    limits: Option<cortexkit_role_llm_runner::display::Limits>,
     handler: Arc<H>,
     cancel: CancellationToken,
 ) -> Result<(), ServeIoError>
@@ -3428,6 +3442,7 @@ where
                 .await;
                 return;
             }
+            let delivery = limit_live_arguments(delivery, limits.as_ref());
             let (priority, body) = match encode_delivery(&delivery, next_seq) {
                 EncodedDelivery::Data(priority, body) => (priority, body),
                 // A Detached marker: end the stream cleanly; the client resubscribes.
@@ -3533,6 +3548,32 @@ enum EncodedDelivery {
     /// A unit that cannot be serialized. It must end the stream with a typed error: a clean end
     /// would send the client back to the same unit forever.
     Unencodable(serde_json::Error),
+}
+
+fn limit_live_arguments(
+    delivery: Delivery,
+    limits: Option<&cortexkit_role_llm_runner::display::Limits>,
+) -> Delivery {
+    if let (Delivery::Control(frame), Some(limits)) = (&delivery, limits) {
+        if let cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event) = &frame.2 {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&event.arguments).expect("projected arguments are JSON");
+            let limited = cortexkit_role_llm_runner::live::ToolStarted::new(
+                &event.mid,
+                &event.tool_call_id,
+                &event.name,
+                &arguments,
+                Some(limits),
+                event.started_at,
+            );
+            return Delivery::Control(Arc::new((
+                frame.0,
+                frame.1.clone(),
+                cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(limited),
+            )));
+        }
+    }
+    delivery
 }
 
 fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
@@ -6017,6 +6058,7 @@ mod tests {
                 1,
                 BrocaBindIdentity::new("/tmp/project-a", "runner", "terminal-sequence"),
                 SubscribeFrom::Start,
+                None,
                 handler,
                 CancellationToken::new(),
             )
@@ -6080,6 +6122,7 @@ mod tests {
             1, // corr
             session,
             SubscribeFrom::Start,
+            None,
             handler,
             cancel.clone(),
         )

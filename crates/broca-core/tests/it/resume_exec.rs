@@ -650,7 +650,7 @@ async fn renderer_drift_resume_seals_and_next_invocation_opens_a_new_episode() {
         .iter()
         .filter_map(|event| match event {
             OutputEvent::Control(control) => Some(control),
-            OutputEvent::Display(_) => None,
+            OutputEvent::Display(_) | OutputEvent::DisplayContext { .. } => None,
         })
         .collect();
     assert!(matches!(

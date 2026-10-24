@@ -169,6 +169,7 @@ struct Shared {
     read_mids: Mutex<HashMap<String, String>>,
     plan_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
+    stream_holds: Mutex<HashMap<String, usize>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
     compaction: Mutex<HashMap<String, compaction::Session>>,
     session_roots: Mutex<HashMap<String, PathBuf>>,
@@ -529,7 +530,8 @@ async fn serve_model_request(
         .or_default()
         .push(request.clone());
     let model_gate = shared.model_holds.lock().unwrap().get(&session).cloned();
-    if let Some(gate) = model_gate {
+    let stream_parts = shared.stream_holds.lock().unwrap().remove(&session);
+    if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_none()) {
         HoldGate::set(&gate.arrived, &gate.arrived_wake);
         tokio::select! {
             () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
@@ -615,15 +617,31 @@ async fn serve_model_request(
                 "prompt_tokens_details": {"cached_tokens": usage.cache_read_tokens, "cache_write_tokens": usage.cache_write_tokens}}}));
     }
     let mut body = String::new();
-    for event in events {
+    let mut prefix_bytes = 0;
+    for (index, event) in events.into_iter().enumerate() {
         body.push_str(&format!("data: {event}\n\n"));
+        if stream_parts.is_some_and(|parts| index == parts) {
+            prefix_bytes = body.len();
+        }
     }
     body.push_str("data: [DONE]\n\n");
-    let reply = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(reply.as_bytes()).await?;
+    stream.write_all(headers.as_bytes()).await?;
+    if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_some()) {
+        stream.write_all(&body.as_bytes()[..prefix_bytes]).await?;
+        stream.flush().await?;
+        HoldGate::set(&gate.arrived, &gate.arrived_wake);
+        tokio::select! {
+            () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
+            () = shared.released.notified() => return Ok(()),
+        }
+        stream.write_all(&body.as_bytes()[prefix_bytes..]).await?;
+    } else {
+        stream.write_all(body.as_bytes()).await?;
+    }
     if let Some(state) = shared.compaction.lock().unwrap().get_mut(&session) {
         state.emitted += 1;
     }
@@ -1675,6 +1693,107 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn seed_untimed_tool_call(
+        &self,
+        handle: &Live,
+        session: &str,
+        call: &cortexkit_role_llm_runner_conformance::ScriptedToolCall,
+    ) -> Result<(), HarnessError> {
+        use broca_core::{FileLeaseStore, FileWalStore, LeaseStore, WalHandle, WalStore};
+        use broca_protocol::{
+            ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
+        };
+        let fail = |e: String| HarnessError::new(e);
+        let identity = self.bind_identity(session);
+        let seed_root = handle.state_root.join(format!("untimed-fixture-{session}"));
+        let source = FileWalStore::new(&seed_root);
+        let writer = WalHandle::spawn(source.open(&identity).map_err(|e| fail(e.to_string()))?, 1)
+            .map_err(|e| fail(e.to_string()))?;
+        broca_core::run_import(
+            broca_core::ImportRequest {
+                project_id: None,
+                principal: None,
+                run_id: broca_protocol::RunId(format!("untimed-import-{session}")),
+                session: identity.clone(),
+                messages: vec![
+                    Message::new(
+                        Role::Assistant,
+                        vec![ContentBlock::ToolCall(ToolCall {
+                            thought_signature: None,
+                            tool_call_id: ToolCallId(call.tool_call_id.clone()),
+                            tool_name: call.tool.clone(),
+                            input: call.arguments.clone(),
+                        })],
+                    ),
+                    Message::new(
+                        Role::Tool,
+                        vec![ContentBlock::ToolResult(ToolResult {
+                            tool_call_id: ToolCallId(call.tool_call_id.clone()),
+                            output: ToolOutput::Text {
+                                text: "historical result".into(),
+                            },
+                            is_error: false,
+                        })],
+                    ),
+                ],
+                origin: broca_core::ImportOrigin {
+                    source_ref: "fixture:untimed-history".into(),
+                },
+            },
+            &writer,
+            &source,
+        )
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+        writer.shutdown().await.map_err(|e| fail(e.to_string()))?;
+        let records = source
+            .read_records(&identity)
+            .map_err(|e| fail(e.to_string()))?;
+        let leases = FileLeaseStore::new(handle.state_root.join("leases"));
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let lease = loop {
+            match leases.acquire(&broca_core::lease_key_for(&identity)) {
+                Ok(lease) => break lease,
+                Err(broca_core::LeaseError::Held { .. }) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(25)).await
+                }
+                Err(error) => {
+                    return Err(fail(format!(
+                        "untimed fixture could not obtain idle lease: {error}"
+                    )))
+                }
+            }
+        };
+        let target = FileWalStore::new(handle.state_root.join("wal"));
+        let mut wal = target.open(&identity).map_err(|e| fail(e.to_string()))?;
+        for frame in records {
+            wal.append(lease.epoch(), &frame.record, false)
+                .map_err(|e| fail(e.to_string()))?;
+        }
+        wal.sync().map_err(|e| fail(e.to_string()))?;
+        drop(wal);
+        drop(lease);
+        std::fs::remove_dir_all(seed_root).map_err(|e| fail(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn hold_next_model_stream(
+        &self,
+        session: &str,
+        parts: usize,
+    ) -> Result<(), HarnessError> {
+        self.shared
+            .model_holds
+            .lock()
+            .unwrap()
+            .insert(session.into(), Arc::default());
+        self.shared
+            .stream_holds
+            .lock()
+            .unwrap()
+            .insert(session.into(), parts);
+        Ok(())
+    }
     async fn hold_next_model_step(&self, session: &str) -> Result<(), HarnessError> {
         self.shared
             .model_holds
@@ -1738,6 +1857,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::Retract,
             Capability::DispatchAttribution,
             Capability::Streaming,
+            Capability::LiveEvents,
             Capability::Steer,
             Capability::Queue,
             Capability::Interrupt,

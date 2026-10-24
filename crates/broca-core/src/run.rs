@@ -83,6 +83,10 @@ pub fn epoch_millis() -> Option<u64> {
 /// Control = the reliable assembled units.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputEvent {
+    /// Queue-ordered transcript position for the following step's advisory display output.
+    DisplayContext {
+        ordinal: Option<u64>,
+    },
     Display(DisplayEvent),
     Control(ControlUnit),
 }
@@ -297,6 +301,46 @@ impl PriorWalSnapshot {
         );
         Arc::try_unwrap(pending).expect("a freshly loaded admission queue is uniquely owned")
     }
+}
+
+/// Initialize advisory placement from the same validated prefix used for admission.
+/// The actor calls this before exposing an inherited writer to concurrent run/steer work.
+pub fn seed_display_placement<W: WalStore + ?Sized>(
+    writer: &WalHandle,
+    snapshot: &PriorWalSnapshot,
+    wal_store: &W,
+    store: Option<&dyn SessionStore>,
+    session: &BindIdentity,
+) {
+    if !writer.needs_display_placement_seed() {
+        return;
+    }
+    let seed = store
+        .and_then(|s| s.projection_seed(session).ok().flatten())
+        .filter(|s| s.watermark_seq == snapshot.base_watermark)
+        .and_then(|s| crate::projection::ControlProjectionState::from_projection_seed(&s))
+        .map(|s| s.placement().clone());
+    let full;
+    let (mut placement, records) = if snapshot.base_watermark == 0 {
+        (
+            crate::placement::Placement::default(),
+            snapshot.tail.as_ref(),
+        )
+    } else if let Some(seed) = seed {
+        (seed, snapshot.tail.as_ref())
+    } else {
+        let Ok(records) = wal_store.read_records(session) else {
+            return;
+        };
+        full = records;
+        (crate::placement::Placement::default(), &full)
+    };
+    for frame in records.iter().filter(|f| f.seq <= snapshot.head_seq) {
+        if placement.observe(&frame.record).is_err() {
+            return;
+        }
+    }
+    writer.seed_display_placement(snapshot.head_seq, placement);
 }
 
 /// Load an admission snapshot bounded by `safe_head`. Valid materialized metadata reads only its
@@ -1568,6 +1612,7 @@ where
         other => other,
     };
     writer.seed_lineage_tags(lineage_tags);
+    seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
     let episode = snapshot.checkpoint_at_head.last_episode.as_ref();
     let is_resume = episode.is_some();
     let last_input = episode.map(|episode| episode.input.clone());
@@ -4384,6 +4429,13 @@ where
                 Vec::new()
             }
         };
+        let _ = send(
+            out,
+            OutputEvent::DisplayContext {
+                ordinal: writer.display_ordinal(),
+            },
+        )
+        .await;
         steer_backlog.append(&mut steered);
         if !steer_backlog.is_empty() {
             mutable_call_options(&mut opts)
@@ -4814,6 +4866,7 @@ where
                 if let Some(seal) = &control.shutdown_seal {
                     seal.note_usage(step_id, usage);
                 }
+                let unfiltered_blocks = message.content.len();
                 if finalize_turn {
                     message.content.retain(|block| match block {
                         ContentBlock::ToolCall(call) => rejected_tool_calls
@@ -4896,9 +4949,10 @@ where
                     crate::hooks::apply_message_ops(&mut message.content, &output.operations)
                         .expect("checked ops");
                 }
-                let message_changed = original_message
-                    .as_ref()
-                    .is_some_and(|original| &message != original);
+                let message_changed = message.content.len() != unfiltered_blocks
+                    || original_message
+                        .as_ref()
+                        .is_some_and(|original| &message != original);
                 let message_hooks = hook_output.as_ref().and_then(|output| {
                     output.trace.metadata(
                         serde_json::to_value(original_message.as_ref().unwrap()).unwrap(),
