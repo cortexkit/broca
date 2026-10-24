@@ -2005,57 +2005,26 @@ impl Provider for HistoryProvider {
 /// Drive one run over the session's WAL: a fresh episode 1, or a resume of the episode encoded by
 /// the request's run id. Returns the render history the run loop handed to its first provider
 /// call.
+/// Drive one run over `dir` and return the render history its first provider call received.
 async fn run_history(
     dir: &std::path::Path,
     store: Arc<SqliteStore>,
-    resume: bool,
 ) -> Arc<broca_protocol::request::RenderHistory> {
     let provider = HistoryProvider {
         rendered: Mutex::new(Vec::new()),
     };
-    let mut req = request(dir);
-    if resume {
-        // Write the durable run first, without a store, then project it. The store's watermark
-        // then sits at the durable turn boundary and the run below resumes from a materialized
-        // prefix instead of replaying its own fresh history.
-        req.run_id = RunId("r".into());
-        let lease = FileLeaseStore::new(dir.join("lease"));
-        let wal_store = FileWalStore::new(dir.join("wal"));
-        let (tx, mut rx) = mpsc::channel(64);
-        let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let replayed = broca_core::run_loop_with_control(
-            req.clone(),
-            &provider,
-            &StubToolPlane::new(),
-            &lease,
-            &AllowAll,
-            &wal_store,
-            Some(store.clone()),
-            Default::default(),
-            &tx,
-        )
-        .await
-        .unwrap_or_else(|error| panic!("the first run completes: {error:?}"));
-        drop(tx);
-        collector.await.unwrap();
-        assert_eq!(replayed.reason, RunFinishReason::Completed);
-        // Re-drive the completed run as it stands: with no new input the loop resumes the
-        // durable episode over the store instead of appending a new one.
-        req.input = vec![];
-        provider.rendered.lock().unwrap().clear();
-    }
     let lease = FileLeaseStore::new(dir.join("lease"));
     let wal = FileWalStore::new(dir.join("wal"));
     let (tx, mut rx) = mpsc::channel(64);
     let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let summary = run_loop_with_store(
-        req,
+        request(dir),
         &provider,
         &StubToolPlane::new(),
         &lease,
         &AllowAll,
         &wal,
-        Some(store.clone() as Arc<dyn broca_core::SessionStore>),
+        Some(store as Arc<dyn broca_core::SessionStore>),
         &tx,
     )
     .await;
@@ -2064,18 +2033,11 @@ async fn run_history(
     let rendered = provider.rendered.lock().unwrap();
     assert!(
         !rendered.is_empty(),
-        "the run made no provider call: {summary:?} dir={}",
-        dir.display()
+        "the run made no provider call: {summary:?}"
     );
     rendered[0].clone()
 }
 
-/// A resumed run renders the same episode coordinates a full WAL replay derives.
-///
-/// The store's episode projection exists so a resumed prompt that lost its episode boundaries
-/// does not force a whole-WAL read. These comparisons read the projection through the public
-/// seam and check it against replay, for a store this build projected and for a store written
-/// before the projection existed once it has filled the values.
 #[tokio::test]
 async fn projected_episode_render_inputs_equal_a_full_wal_replay() {
     let base = broca_test_support::scratch_root()
@@ -2086,7 +2048,7 @@ async fn projected_episode_render_inputs_equal_a_full_wal_replay() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let store = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
-    let rendered = run_history(&dir, store.clone(), false).await;
+    let rendered = run_history(&dir, store.clone()).await;
     let frames = wal_frames(&dir);
     let history = replay(
         &frames

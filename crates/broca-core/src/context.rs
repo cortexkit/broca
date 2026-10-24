@@ -151,6 +151,16 @@ impl EpisodeRenderProjection {
     }
 }
 
+/// A boxed future of an episode projection read, shared by the store seams that serve a
+/// running loop without blocking its runtime thread.
+pub type EpisodeProjectionRead<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Option<Vec<EpisodeRenderProjection>>, String>>
+            + Send
+            + 'a,
+    >,
+>;
+
 /// Rebuildable model-guidance coordinates captured with a page's rows and watermark.
 /// Missing metadata means replay, not an episode without repeated calls.
 #[derive(Debug, Clone, PartialEq)]
@@ -344,16 +354,7 @@ pub trait MaterializedStore: Send + Sync {
     /// store lock. `Ok(None)` means the store cannot supply the values: it keeps no projection,
     /// the projection is stale or absent, or it belongs to another lineage. The caller then uses
     /// its WAL replay, and the projection fills the values on its next write.
-    fn read_episode_projection_async(
-        &self,
-        _session: &BindIdentity,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<Vec<EpisodeRenderProjection>>, String>>
-                + Send
-                + '_,
-        >,
-    > {
+    fn read_episode_projection_async(&self, _session: &BindIdentity) -> EpisodeProjectionRead<'_> {
         Box::pin(async { Ok(None) })
     }
 

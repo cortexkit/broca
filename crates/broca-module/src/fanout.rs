@@ -1611,8 +1611,6 @@ mod tests {
             open_episode: None,
             earlier_episodes: Vec::new(),
             projection_episodes: None,
-            projection_episodes: None,
-            projection_episodes: None,
             deferred_calls: None,
             watermark_seq,
             anchor: Some(anchor),
