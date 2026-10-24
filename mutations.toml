@@ -27253,3 +27253,29 @@ expect_red = ["media_store::lifecycle::tests::sweep_reads_each_manifest_candidat
 file = "crates/broca-core/src/media_store/lifecycle.rs"
 old = "    for address in candidates {"
 new = "    for address in &wal.addresses().map_err(io::Error::other)? { // NON-VACUITY BREAK: decode the unrelated WAL corpus."
+
+[[control]]
+id = "episode-projection-keeps-a-known-absent-first-user"
+guards = "An episode admitted without a user message records that absence instead of inventing a first user"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/conformance/model_history.rs"
+expect_red = ["conformance::model_history::projected_episode_metadata_equals_a_full_wal_replay"]
+file = "crates/broca-core/src/replay.rs"
+old = "            first_user: Some(episode.first_user.map(|first| first as u64)),"
+new = "            first_user: Some(episode.first_user.or(Some(episode.prompt_start)).map(|first| first as u64)), // NON-VACUITY BREAK: invent a first user"
+
+[[control]]
+id = "episode-projection-reads-back-what-it-wrote"
+guards = "The stored episode projection survives the commit and reads back for a resumed run"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/conformance/model_history.rs"
+expect_red = ["conformance::model_history::projected_episode_metadata_equals_a_full_wal_replay"]
+file = "crates/broca-store/src/lib.rs"
+old = "             episode_metadata_json=?4, episode_metadata_seq=?5 WHERE session=?1"
+new = "             episode_metadata_json=NULL, episode_metadata_seq=?5 WHERE session=?1"

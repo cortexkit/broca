@@ -1466,6 +1466,21 @@ where
             return Err(e);
         }
     };
+    // An applied view can leave the resumed prompt without the episode coordinates of earlier
+    // episodes, which ChatGPT effort updates and per-episode repetition guidance render from.
+    // The store projects them, so take them from there instead of replaying the whole WAL.
+    if is_resume && !append_episode && prior.render_episodes.is_none() {
+        if let Some(store) = store.as_ref() {
+            match store_episode_render_history(Arc::clone(store), req.session.clone()).await {
+                Ok(Some(episodes)) => prior.render_episodes = Some(episodes),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    target: "store",
+                    "episode projection read failed; the admission replay decides: {error}"
+                ),
+            }
+        }
+    }
     // Compaction notices are numbered per session, not per lineage: the provider and the bus
     // both key them on the session. A compaction session's lineage that has recorded no notice
     // yet numbers its first one past every notice of this session's earlier lineages that
@@ -1800,6 +1815,69 @@ fn replay_complete_snapshot_or_wal<W: WalStore>(
             .collect()
     };
     replay(&records).map_err(|error| RunError::Wal(error.to_string()))
+}
+
+/// The resumed run's per-episode render inputs, from the store's episode projection.
+///
+/// A resumed prompt rebuilt from a materialized store prefix carries no episode boundaries, and
+/// an applied view can hide most of the messages that would show them. The projection holds each
+/// episode's start ordinal, its original admitted first user, its first model-step ordinal and its
+/// frozen render config: the same coordinates a full WAL replay derives, which is what the test
+/// beside this reads them against.
+///
+/// `Ok(None)` means the store cannot supply them, and the caller's WAL replay decides instead:
+/// the session has no projection (a store written before the column existed), its projection is
+/// older than the store's watermark (a write that advanced the transcript without recomputing
+/// it), or a value in it was never computed. The stored render config is the episode's whole
+/// frozen run config, from which replay renders the config blob it puts on the episode.
+async fn store_episode_render_history(
+    store: Arc<dyn SessionStore>,
+    session: BindIdentity,
+) -> Result<Option<Vec<broca_protocol::request::EpisodeRenderInput>>, String> {
+    let stored = store
+        .read_episode_projection_async(&session)
+        .await
+        .map_err(|error| format!("store episode projection read failed: {error}"))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    if stored.is_empty()
+        || !stored
+            .iter()
+            .all(crate::context::EpisodeRenderProjection::is_complete)
+        || stored
+            .iter()
+            .skip(1)
+            .any(|episode| episode.start() == Some(0))
+        || stored
+            .windows(2)
+            .any(|pair| pair[0].start() >= pair[1].start())
+    {
+        return Ok(None);
+    }
+    let mut episodes = Vec::with_capacity(stored.len());
+    for episode in &stored {
+        if episode.first_step().is_none() {
+            return Ok(None);
+        }
+        let (Some(start), Some(first_user)) = (episode.start(), episode.first_user()) else {
+            return Ok(None);
+        };
+        let usize_of = |ordinal: u64| usize::try_from(ordinal).map_err(|e| e.to_string());
+        episodes.push(broca_protocol::request::EpisodeRenderInput {
+            prompt_start: usize_of(start)?,
+            first_user: first_user.map(usize_of).transpose()?,
+            frozen_config: episode
+                .render_config()
+                .and_then(|config| {
+                    serde_json::from_value::<crate::RunConfig>(config.clone())
+                        .ok()
+                        .map(|config| config.frozen_render_config)
+                })
+                .unwrap_or_else(|| episode.render_config().cloned().unwrap_or_default()),
+        });
+    }
+    Ok(Some(episodes))
 }
 
 async fn read_store_prefix_blocking(
@@ -11081,6 +11159,9 @@ mod tests {
         };
         let seed = crate::ProjectionSeed {
             open_episode_span: Some(1),
+            open_episode: None,
+            earlier_episodes: Vec::new(),
+            projection_episodes: None,
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,
