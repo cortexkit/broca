@@ -27384,3 +27384,29 @@ expect_red = ["run::repetition_guidance::tests::whole_episode_hands_the_raw_obse
 file = "crates/broca-core/src/run.rs"
 old = "    fold.into_observer()"
 new = "    let _ = fold; RepetitionObserver::new() // NON-VACUITY BREAK: discard restored observer before live calls"
+
+[[control]]
+id = "session-read-no-media-inline-bytes"
+guards = "A no-media inline read retains the pinned page bytes without descriptor identities"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read.rs"
+expect_red = ["session_read::no_media_inline_and_descriptors_response_bytes_are_pinned"]
+file = "crates/broca-module/src/serve.rs"
+old = "        if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {"
+new = "        if true { // NON-VACUITY BREAK: add descriptors to inline reads too."
+
+[[control]]
+id = "session-read-no-media-descriptors-bytes"
+guards = "A no-media descriptors read retains the pinned page bytes and stored content identities"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read.rs"
+expect_red = ["session_read::no_media_inline_and_descriptors_response_bytes_are_pinned"]
+file = "crates/broca-module/src/serve.rs"
+old = "        if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {"
+new = "        if false { // NON-VACUITY BREAK: omit descriptors from opted-in reads."
