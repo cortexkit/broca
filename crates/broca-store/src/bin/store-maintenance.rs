@@ -73,6 +73,28 @@ fn main() -> ExitCode {
     if operation == "wal-fold" {
         return wal_fold(&PathBuf::from(state_root), &args[3..]);
     }
+    if operation == "media-sweep" {
+        if args.len() != 4 || args[3] != "--write" || !std::path::Path::new(state_root).is_dir() {
+            eprintln!("usage: store-maintenance media-sweep <existing-state-root> --write");
+            return ExitCode::from(2);
+        }
+        return match broca_core::media_store::sweep(std::path::Path::new(state_root)) {
+            Ok(report) => {
+                println!(
+                    "leased {}\nreconciled {}\nmanifests_removed {}\nobjects_removed {}",
+                    report.leased,
+                    report.reconciled,
+                    report.manifests_removed,
+                    report.objects_removed
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("store-maintenance: media-sweep failed: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let (dry_run, manifest_write) = match (operation.as_str(), args.get(3).map(String::as_str)) {
         ("wal-manifest", None) => (true, false),
         ("wal-manifest", Some("--write")) => (false, true),
@@ -244,6 +266,7 @@ fn print_usage() {
     eprintln!(
         "usage: store-maintenance page-usage|control-head|reconcile-active|private-mode <state-root> [--dry-run]\n\
                  store-maintenance wal-manifest <state-root> [--write]\n\
+                 store-maintenance media-sweep <state-root> --write\n\
                  store-maintenance wal-fold <state-root> [--write] [--resume fold-<unix-ms>.journal] [--abandon|--unfold]"
     );
 }

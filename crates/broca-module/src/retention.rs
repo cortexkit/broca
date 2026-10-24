@@ -1485,6 +1485,20 @@ impl RetentionService {
                 }
             }
             sync_dir(&self.wal.ephemeral_root())?;
+            let state_root = self
+                .wal
+                .root()
+                .parent()
+                .ok_or("WAL tree has no state root")?;
+            let media = state_root.join("media-ephemeral");
+            if media.try_exists().map_err(|error| error.to_string())? {
+                broca_core::media_store::MediaStore::open(
+                    state_root,
+                    broca_core::media_store::MediaStoreClass::Ephemeral,
+                )
+                .and_then(|store| store.remove_session_after_wal_removal(key))
+                .map_err(|error| error.to_string())?;
+            }
         }
         // Completion is durable only after identity sidecars are removed and the directory is synced.
         // A crash or removal failure before this point leaves an incomplete tombstone to retry.

@@ -474,8 +474,42 @@ impl FileWalStore {
         }
     }
 
+    pub(crate) fn media_store_class(
+        &self,
+        address: &str,
+    ) -> Result<Option<crate::media_store::MediaStoreClass>, WalError> {
+        use crate::media_store::MediaStoreClass;
+        if let Some(path) = self.resolve_live_address(address)? {
+            return Ok(Some(
+                if path.parent() == Some(self.durable_root().as_path()) {
+                    MediaStoreClass::Durable
+                } else if path.parent() == Some(self.ephemeral_root().as_path()) {
+                    MediaStoreClass::Ephemeral
+                } else {
+                    MediaStoreClass::NonDurable
+                },
+            ));
+        }
+        let archived = self.archived_member_at_address(address)?;
+        Ok(archived.member.map(|_| {
+            if archived.durable {
+                MediaStoreClass::Durable
+            } else {
+                MediaStoreClass::NonDurable
+            }
+        }))
+    }
+
     pub fn addresses(&self) -> Result<std::collections::BTreeSet<String>, WalError> {
         self.address_inventory(false, &|| false)
+            .map(|(addresses, _)| addresses)
+    }
+
+    pub(crate) fn media_addresses(
+        &self,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<std::collections::BTreeSet<String>, WalError> {
+        self.address_inventory(false, cancelled)
             .map(|(addresses, _)| addresses)
     }
 
