@@ -3,14 +3,16 @@ use broca_core::tool_plane::{
     DispatchKey, DispatchRegistration, LateResultRegistration, LateResultsIntake,
     ProviderHeldLifecycle, ProviderHeldRecorder, ProviderHeldReply,
 };
-use cortexkit_role_tool_provider::catalog::{CatalogAnswer, CatalogTool};
+use broca_wal::{
+    FetchOutcome, FrozenProviderDeclarations, FrozenResultFormat, OpaqueJson, PlanManifest,
+    ProviderFetch,
+};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct Rig {
     identity: bool,
     declared_route: bool,
-    catalog: Mutex<CatalogAnswer>,
     reply: Mutex<serde_json::Value>,
     sent: Mutex<Vec<(Option<String>, Option<String>)>>,
     groups: Mutex<Vec<Vec<LateResultRegistration>>>,
@@ -23,23 +25,12 @@ struct Rig {
 }
 
 impl Rig {
-    fn new(identity: bool, declared_route: bool, opt_in: bool, late_results: bool) -> Arc<Self> {
-        let tool = CatalogTool::new("tool", "digest", 1, json!({"type":"object"}));
-        let tool = if opt_in {
-            tool.with_result_format(cortexkit_role_tool_provider::result::ResultFormat::ContentV1)
-        } else {
-            tool
-        };
-        let mut catalog = CatalogAnswer::new("generation", "digest").with_tools(vec![tool]);
-        if late_results {
-            catalog
-                .capabilities
-                .insert("late_results".into(), json!(true));
-        }
+    /// The declarations each test needs come with its batch's frozen plan
+    /// (`manifest_declaring`), so the fixture keeps no catalog of its own.
+    fn new(identity: bool, declared_route: bool, _opt_in: bool, _late_results: bool) -> Arc<Self> {
         Arc::new(Self {
             identity,
             declared_route,
-            catalog: Mutex::new(catalog),
             reply: Mutex::new(json!({"content":[{"type":"text","text":"terminal"}]})),
             sent: Mutex::new(Vec::new()),
             groups: Mutex::new(Vec::new()),
@@ -54,7 +45,7 @@ impl Rig {
     fn plane(self: &Arc<Self>, installed: bool) -> SubcToolPlane {
         let plane = SubcToolPlane::with_connection(self.clone(), "provider");
         if installed {
-            plane.with_provider_held_support(self.clone(), self.clone(), self.clone())
+            plane.with_provider_held_support(self.clone(), self.clone())
         } else {
             plane
         }
@@ -142,15 +133,6 @@ impl ToolPlaneConnection for Rig {
 }
 
 #[async_trait]
-impl ProviderHeldCatalog for Rig {
-    async fn for_batch(&self, _: &BatchCtx) -> Result<HashMap<String, CatalogAnswer>, String> {
-        Ok(HashMap::from([(
-            "provider".into(),
-            self.catalog.lock().unwrap().clone(),
-        )]))
-    }
-}
-#[async_trait]
 impl LateResultsIntake for Rig {
     async fn register_group(&self, calls: &[LateResultRegistration]) -> Result<(), String> {
         self.groups.lock().unwrap().push(calls.to_vec());
@@ -213,8 +195,50 @@ fn call(id: &str) -> ToolCall {
         thought_signature: None,
     }
 }
-fn manifest() -> ToolManifest {
+/// The batch's frozen plan as the run freezes it: a module in the plan, the tool it offers,
+/// and whatever declarations the provider answered at admission.
+fn manifest_declaring(opt_in: bool, late_results: bool) -> ToolManifest {
+    let declarations = FrozenProviderDeclarations {
+        result_formats: opt_in.then(|| {
+            std::collections::BTreeMap::from([(
+                "tool".to_owned(),
+                FrozenResultFormat("content/v1".to_owned()),
+            )])
+        }),
+        late_results: late_results.then_some(true),
+    };
+    let plan = PlanManifest {
+        declarations: Vec::new(),
+        plan: OpaqueJson::from_json_text(
+            json!({"tool_items":[{"provider":"provider"}]}).to_string(),
+        )
+        .unwrap(),
+        plan_identity: String::new(),
+        composition_digest: String::new(),
+        fetches: vec![ProviderFetch {
+            provider: "provider".into(),
+            outcome: FetchOutcome::Answered {
+                catalog_digest: "digest".into(),
+                tools: Vec::new().into(),
+                text: None,
+                result_ops: None,
+                reply: None,
+                declarations_frozen: Some(declarations),
+            },
+        }],
+        tools: Vec::new().into(),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+        role_versions: Default::default(),
+    };
     ToolManifest::from_tools(vec![serde_json::from_value(json!({"name":"tool","description":"","input_schema":{},"module":"provider","execution_mode":"parallel"})).unwrap()])
+        .with_plan_manifest(&plan)
+        .unwrap()
+}
+
+fn manifest() -> ToolManifest {
+    manifest_declaring(false, false)
 }
 fn registration(call: &ToolCall, key: &str, approved: bool) -> DispatchRegistration {
     DispatchRegistration {
@@ -240,7 +264,11 @@ async fn plain_keys_require_late_results_identity_and_installed_seams() {
                 let ctx = ctx();
                 let call = call("call");
                 plane
-                    .batch_started(&ctx, std::slice::from_ref(&call), &manifest())
+                    .batch_started(
+                        &ctx,
+                        std::slice::from_ref(&call),
+                        &manifest_declaring(true, late),
+                    )
                     .await
                     .unwrap();
                 plane
@@ -283,7 +311,7 @@ async fn no_key_is_sent_until_the_whole_dispatch_group_registration_syncs() {
     let ctx = ctx();
     let calls = [call("first"), call("second")];
     plane
-        .batch_started(&ctx, &calls, &manifest())
+        .batch_started(&ctx, &calls, &manifest_declaring(true, true))
         .await
         .unwrap();
     let registrations = vec![
@@ -404,7 +432,11 @@ async fn held_reply_requires_every_prerequisite_and_never_exposes_interim_conten
         let ctx = ctx();
         let call = call("call");
         plane
-            .batch_started(&ctx, std::slice::from_ref(&call), &manifest())
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&call),
+                &manifest_declaring(missing != "opt_in", missing != "late_results"),
+            )
             .await
             .unwrap();
         plane
@@ -456,7 +488,11 @@ async fn undeclared_held_reply_is_a_protocol_refusal_not_a_final_answer() {
     let ctx = ctx();
     let call = call("call");
     plane
-        .batch_started(&ctx, std::slice::from_ref(&call), &manifest())
+        .batch_started(
+            &ctx,
+            std::slice::from_ref(&call),
+            &manifest_declaring(true, true),
+        )
         .await
         .unwrap();
     let result = completed(plane.dispatch(&ctx, &call).await);
@@ -480,7 +516,11 @@ async fn held_record_sync_failure_cannot_join_a_waiting_slot() {
     let ctx = ctx();
     let call = call("call");
     plane
-        .batch_started(&ctx, std::slice::from_ref(&call), &manifest())
+        .batch_started(
+            &ctx,
+            std::slice::from_ref(&call),
+            &manifest_declaring(true, true),
+        )
         .await
         .unwrap();
     plane
@@ -505,16 +545,21 @@ async fn held_record_sync_failure_cannot_join_a_waiting_slot() {
 
 #[tokio::test]
 async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
+    // A live catalog that no longer lists the opt-in cannot change how this batch reads a
+    // reply: the session froze the tool's format when it was admitted.
     let rig = Rig::new(true, true, true, true);
     *rig.reply.lock().unwrap() = json!({"content":[{"type":"text","text":"model text"}],"structuredContent":{"private":"program data"}});
     let plane = rig.plane(true);
     let ctx = ctx();
     let call = call("call");
     plane
-        .batch_started(&ctx, std::slice::from_ref(&call), &manifest())
+        .batch_started(
+            &ctx,
+            std::slice::from_ref(&call),
+            &manifest_declaring(true, true),
+        )
         .await
         .unwrap();
-    rig.catalog.lock().unwrap().tools[0].result_format = None;
     let result = completed(plane.dispatch(&ctx, &call).await);
     assert_eq!(
         result.output,
@@ -530,7 +575,11 @@ async fn negotiated_final_content_uses_only_the_frozen_opt_in() {
         ..ctx
     };
     plane
-        .batch_started(&ctx, std::slice::from_ref(&call), &manifest())
+        .batch_started(
+            &ctx,
+            std::slice::from_ref(&call),
+            &manifest_declaring(false, false),
+        )
         .await
         .unwrap();
     let result = completed(plane.dispatch(&ctx, &call).await);
@@ -578,7 +627,11 @@ async fn approved_provider_held_reply_keeps_its_deferred_anchor() {
     let ctx = ctx();
     let call = call("call");
     plane
-        .batch_started(&ctx, std::slice::from_ref(&call), &manifest())
+        .batch_started(
+            &ctx,
+            std::slice::from_ref(&call),
+            &manifest_declaring(true, true),
+        )
         .await
         .unwrap();
     plane

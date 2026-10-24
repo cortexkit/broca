@@ -631,12 +631,10 @@ pub struct SubcToolPlane {
     batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
     approved_args: Mutex<HashMap<BatchRouteKey, HashMap<ToolCallId, ApprovedArgs>>>,
     provider_held: Option<ProviderHeldSupport>,
-    provider_catalogs: Mutex<
-        HashMap<
-            BatchRouteKey,
-            HashMap<String, cortexkit_role_tool_provider::catalog::CatalogAnswer>,
-        >,
-    >,
+    /// The frozen tool manifest of each batch in progress. It is the only source of a
+    /// provider's declarations: what its result format and `late_results` capability were when
+    /// the session was admitted.
+    batch_manifests: Mutex<HashMap<BatchRouteKey, broca_core::capability::ToolManifest>>,
     registered_keys: Mutex<RegisteredKeys>,
     #[cfg(debug_assertions)]
     reply_fallback_ms: u64,
@@ -675,61 +673,69 @@ pub struct SubcToolPlane {
     describer: Mutex<Option<Arc<dyn ScopeDescriber>>>,
 }
 
-/// Supplies declarations from the run's frozen provider catalogs, never a live/global
-/// catalog or caller-declared tools. Missing declarations must fail closed.
-#[async_trait]
-pub trait ProviderHeldCatalog: Send + Sync {
-    async fn for_batch(
-        &self,
-        ctx: &BatchCtx,
-    ) -> Result<HashMap<String, cortexkit_role_tool_provider::catalog::CatalogAnswer>, String>;
+/// What the batch's frozen plan declared about one provider: whether it serves the `content/v1`
+/// result body, and whether it may settle a call after its reply. Read from the session's
+/// admitted plan alone, never from a live catalog or caller-declared tools, so a provider whose
+/// catalog changed after admission cannot change how a resumed run reads a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrozenContract {
+    pub content_v1: bool,
+    pub late_results: bool,
 }
 
 struct ProviderHeldSupport {
     intake: Arc<dyn broca_core::tool_plane::LateResultsIntake>,
     lifecycle: Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>,
-    catalogs: Arc<dyn ProviderHeldCatalog>,
 }
 
 impl SubcToolPlane {
-    /// Install before warming any route. Production must not install these seams until the
-    /// frozen manifest carries the provider declarations and replay understands held WALs.
+    /// Install the intake and the waiting lifecycle. The declarations a batch routes and
+    /// decodes by come from that batch's frozen plan manifest (`ToolManifest`), so installing
+    /// this pair is all a tool plane needs: it never consults a live catalog.
     pub fn with_provider_held_support(
         mut self,
         intake: Arc<dyn broca_core::tool_plane::LateResultsIntake>,
         lifecycle: Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>,
-        catalogs: Arc<dyn ProviderHeldCatalog>,
     ) -> Self {
-        self.provider_held = Some(ProviderHeldSupport {
-            intake,
-            lifecycle,
-            catalogs,
-        });
+        self.provider_held = Some(ProviderHeldSupport { intake, lifecycle });
         self
     }
 
-    fn provider_contract(&self, ctx: &BatchCtx, module: &str, tool: &str) -> (bool, bool) {
-        let catalogs = self.provider_catalogs.lock().unwrap();
-        let Some(catalog) = catalogs
-            .get(&Self::batch_route_key(ctx))
-            .and_then(|catalogs| catalogs.get(module))
-        else {
-            return (false, false);
+    fn frozen_contract(&self, ctx: &BatchCtx, module: &str) -> FrozenContract {
+        let manifests = self.batch_manifests.lock().unwrap();
+        let Some(manifest) = manifests.get(&Self::batch_route_key(ctx)) else {
+            return FrozenContract::default();
         };
-        let content = catalog
-            .tools
-            .iter()
-            .find(|entry| entry.name == tool)
-            .is_some_and(|entry| {
-                entry.result_format
-                    == Some(cortexkit_role_tool_provider::result::ResultFormat::ContentV1)
-            });
-        (
-            content,
-            catalog.declares(
-                cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS,
-            ),
-        )
+        let declarations = manifest.provider_declarations(module);
+        FrozenContract {
+            late_results: declarations
+                .and_then(|declarations| declarations.late_results)
+                .unwrap_or(false),
+            content_v1: declarations
+                .and_then(|declarations| declarations.result_formats.as_ref())
+                .is_some_and(|formats| {
+                    formats.values().any(|format| {
+                        format.0
+                            == cortexkit_role_tool_provider::result::ResultFormat::ContentV1
+                                .as_str()
+                    })
+                }),
+        }
+    }
+
+    /// Whether `tool` itself opted into the `content/v1` result body in the batch's plan.
+    fn frozen_tool_is_content_v1(&self, ctx: &BatchCtx, module: &str, tool: &str) -> bool {
+        let manifests = self.batch_manifests.lock().unwrap();
+        let Some(manifest) = manifests.get(&Self::batch_route_key(ctx)) else {
+            return false;
+        };
+        manifest
+            .provider_declarations(module)
+            .and_then(|declarations| declarations.result_formats.as_ref())
+            .and_then(|formats| formats.get(tool))
+            .is_some_and(|format| {
+                format.0 == cortexkit_role_tool_provider::result::ResultFormat::ContentV1.as_str()
+            })
     }
 
     async fn send_call(
@@ -749,19 +755,7 @@ impl SubcToolPlane {
             .and_then(|calls| calls.get(&call.tool_call_id))
             .cloned();
         let preset = self.frozen_preset(ctx, module);
-        if self.provider_held.is_some()
-            && !self
-                .provider_catalogs
-                .lock()
-                .unwrap()
-                .get(&Self::batch_route_key(ctx))
-                .is_some_and(|catalogs| catalogs.contains_key(module))
-        {
-            return SendAttempt::NotSent {
-                reason: "frozen provider catalog declarations missing".into(),
-            };
-        }
-        let (_, late_results) = self.provider_contract(ctx, module, &call.tool_name);
+        let late_results = self.frozen_contract(ctx, module).late_results;
         let plain_key = key.filter(|_| {
             self.provider_held.is_some() && late_results && self.conn.consumer_module_id().is_some()
         });
@@ -829,7 +823,7 @@ impl SubcToolPlane {
             batch_presets: Mutex::new(HashMap::new()),
             approved_args: Mutex::new(HashMap::new()),
             provider_held: None,
-            provider_catalogs: Mutex::new(HashMap::new()),
+            batch_manifests: Mutex::new(HashMap::new()),
             registered_keys: Mutex::new(HashMap::new()),
             #[cfg(debug_assertions)]
             reply_fallback_ms: 120_000,
@@ -1448,8 +1442,8 @@ impl SubcToolPlane {
         let scope = ctx.scope.as_ref();
         match outcome {
             Ok(raw) => {
-                let (content_v1, late_results) =
-                    self.provider_contract(ctx, module_id, &call.tool_name);
+                let content_v1 = self.frozen_tool_is_content_v1(ctx, module_id, &call.tool_name);
+                let late_results = self.frozen_contract(ctx, module_id).late_results;
                 let has_held = raw.get("held").is_some();
                 let decoded = (sent_on.reads_held_reply && content_v1)
                     .then(|| {
@@ -2116,7 +2110,7 @@ impl SubcToolPlane {
             .lock()
             .unwrap()
             .retain(|(owner, _), _| owner != &session);
-        self.provider_catalogs
+        self.batch_manifests
             .lock()
             .unwrap()
             .retain(|(owner, _), _| owner != &session);
@@ -2201,22 +2195,10 @@ impl SubcToolPlane {
             .map(ToOwned::to_owned)
             .collect::<BTreeSet<_>>();
 
-        if let Some(support) = &self.provider_held {
-            let catalogs = support
-                .catalogs
-                .for_batch(ctx)
-                .await
-                .map_err(ToolPlaneError::Unavailable)?;
-            if modules.iter().any(|module| !catalogs.contains_key(module)) {
-                return Err(ToolPlaneError::Unavailable(
-                    "frozen provider catalog declarations missing".into(),
-                ));
-            }
-            self.provider_catalogs
-                .lock()
-                .unwrap()
-                .insert(Self::batch_route_key(ctx), catalogs);
-        }
+        self.batch_manifests
+            .lock()
+            .unwrap()
+            .insert(Self::batch_route_key(ctx), manifest.clone());
 
         self.batch_presets
             .lock()
@@ -2667,7 +2649,7 @@ impl SubcToolPlane {
         // within a batch's life (the WAL is the cross-batch durability), so without eviction
         // the fence would grow unbounded over thousands of batches.
         self.fence.lock().unwrap().evict_batch(&ctx.batch_id);
-        self.provider_catalogs
+        self.batch_manifests
             .lock()
             .unwrap()
             .remove(&Self::batch_route_key(ctx));
@@ -2775,17 +2757,7 @@ impl ToolPlane for SubcToolPlane {
             let Some(module) = self.dispatch_target(ctx, &call.tool_call_id) else {
                 continue;
             };
-            let late_results = self
-                .provider_catalogs
-                .lock()
-                .unwrap()
-                .get(&Self::batch_route_key(ctx))
-                .and_then(|catalogs| catalogs.get(&module))
-                .is_some_and(|catalog| {
-                    catalog.declares(
-                        cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS,
-                    )
-                });
+            let late_results = self.frozen_contract(ctx, &module).late_results;
             if !late_results || (!call.approved && self.conn.consumer_module_id().is_none()) {
                 continue;
             }

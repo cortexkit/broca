@@ -162,6 +162,13 @@ pub const COMPACTION_RIDE_WAIT_FEATURE: &str = "compaction-ride-wait/v1";
 /// Media references and ordered tool parts extend closed content enums.
 pub const MEDIA_CONTENT_FEATURE: &str = "media-content/v1";
 
+/// Tool-provider declarations frozen into a session's plan manifest (a provider's per-tool
+/// result format and its `late_results` session capability). A build without the feature would
+/// skip the fields and then read a reply by the global catalog instead of by what the provider
+/// declared when the session was admitted, so the declared shapes are must-understand. Nothing
+/// requires it unless a provider declared something.
+pub const PROVIDER_DECLARATIONS_FEATURE: &str = "provider-declarations/v1";
+
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
 /// THIS IS THE ONLY TABLE. Every reader path (replay, the anchored range read behind
@@ -194,6 +201,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     MEDIA_CONTENT_FEATURE,
     OPENROUTER_REASONING_FEATURE,
     PLAN_MANIFEST_FEATURE,
+    PROVIDER_DECLARATIONS_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
@@ -993,6 +1001,7 @@ mod tests {
                 MEDIA_CONTENT_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
                 PLAN_MANIFEST_FEATURE,
+                PROVIDER_DECLARATIONS_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
@@ -1019,6 +1028,7 @@ mod tests {
         assert_eq!(DEFERRED_CALL_FEATURE, "deferred-call/v1");
         assert_eq!(DISPATCH_MODULE_FEATURE, "dispatch-module/v1");
         assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
+        assert_eq!(PROVIDER_DECLARATIONS_FEATURE, "provider-declarations/v1");
         assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
         assert_eq!(CHATGPT_CODEX_WIRE_FEATURE, "chatgpt-codex-wire/v1");
         assert_eq!(OPENROUTER_REASONING_FEATURE, "openrouter-reasoning/v1");

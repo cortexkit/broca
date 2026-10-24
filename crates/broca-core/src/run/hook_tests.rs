@@ -138,6 +138,7 @@ pub(super) fn frozen(
                         .into_iter()
                         .collect()
                 }),
+                declarations_frozen: None,
             },
         }],
         declarations: subscriptions

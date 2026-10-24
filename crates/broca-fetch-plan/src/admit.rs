@@ -13,7 +13,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_protocol::request::{ExecutionMode, Tool};
-use broca_wal::{FetchOutcome, FrozenDeclaration, OpaqueJson, PlanManifest, ProviderFetch};
+use broca_wal::{
+    FetchOutcome, FrozenDeclaration, FrozenProviderDeclarations, FrozenResultFormat, OpaqueJson,
+    PlanManifest, ProviderFetch,
+};
 use cortexkit_role_llm_runner::baseline::{AbsentItem, BaselineItem};
 use cortexkit_role_step_transform_provider::subscription::{
     check_item, Declaration, DeclareRequest, ItemRefusal,
@@ -709,6 +712,71 @@ fn freeze_reply(reply: &cortexkit_role_tool_provider::catalog::Reply) -> broca_w
     }
 }
 
+/// The provider declarations a fetched answer carries, frozen so a later step reads a reply by
+/// what the provider declared at admission. `None` when it declared nothing, which keeps the
+/// manifest bytes of every provider that never opted in or never serves late results.
+fn frozen_provider_declarations(
+    answer: &cortexkit_role_tool_provider::catalog::CatalogAnswer,
+) -> Option<FrozenProviderDeclarations> {
+    let result_formats: BTreeMap<String, FrozenResultFormat> = answer
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            tool.result_format.as_ref().map(|format| {
+                (
+                    tool.name.clone(),
+                    FrozenResultFormat(format.as_str().to_owned()),
+                )
+            })
+        })
+        .collect();
+    let declarations = FrozenProviderDeclarations {
+        result_formats: (!result_formats.is_empty()).then_some(result_formats),
+        late_results: answer
+            .declares(cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS)
+            .then_some(true),
+    };
+    (!declarations.is_empty()).then_some(declarations)
+}
+
+/// The declarations one provider froze into `manifest`. These are the only declarations a run
+/// may route or decode by: a later catalog answer can differ from what the session admitted.
+pub fn frozen_provider_declarations_of<'a>(
+    manifest: &'a PlanManifest,
+    provider: &str,
+) -> Option<&'a FrozenProviderDeclarations> {
+    manifest
+        .fetches
+        .iter()
+        .find(|fetch| fetch.provider == provider)
+        .and_then(|fetch| match &fetch.outcome {
+            FetchOutcome::Answered {
+                declarations_frozen,
+                ..
+            } => declarations_frozen.as_ref(),
+            _ => None,
+        })
+}
+
+/// Whether `provider` froze the `late_results` session capability into `manifest`.
+pub fn frozen_declares_late_results(manifest: &PlanManifest, provider: &str) -> bool {
+    frozen_provider_declarations_of(manifest, provider)
+        .and_then(|declarations| declarations.late_results)
+        .unwrap_or(false)
+}
+
+/// The result format `provider` froze for `tool` into `manifest`, if it opted in.
+pub fn frozen_result_format<'a>(
+    manifest: &'a PlanManifest,
+    provider: &str,
+    tool: &str,
+) -> Option<&'a FrozenResultFormat> {
+    frozen_provider_declarations_of(manifest, provider)?
+        .result_formats
+        .as_ref()?
+        .get(tool)
+}
+
 fn names_missing<'a>(from: &'a [String], against: &[String]) -> Vec<&'a str> {
     from.iter()
         .filter(|name| !against.contains(name))
@@ -1299,6 +1367,7 @@ pub async fn admit(
                             })
                             .collect(),
                     ),
+                    declarations_frozen: frozen_provider_declarations(&fetched.answer),
                 },
                 Err(missed) => FetchOutcome::Absent {
                     reason: missed.unanswered.absence(),
