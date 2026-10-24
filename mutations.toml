@@ -27293,3 +27293,31 @@ platforms = ["windows"]
 file = "crates/broca-core/src/media_store.rs"
 old = "        let repair = broca_owner_only::OpenOptions::new()\n            .write(true)\n            .open(path)?;"
 new = "        let repair = broca_owner_only::OpenOptions::new()\n            .append(true) // NON-VACUITY BREAK: append access cannot truncate on Windows.\n            .open(path)?;"
+
+[[control]]
+id = "compaction-step-decision-session-correlation"
+guards = "a step boundary logs applied and superseded views with the session ref, including the newest view that passed over another version"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::step_boundary_logs_applied_and_superseded_views_with_session_ref"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "session_ref = %ready.session_ref, view_version = version, choice, reason,\n                        superseded = %version_list(at.superseded),"
+new = "session_ref = \"missing\", view_version = version, choice, reason, // NON-VACUITY BREAK: lose session correlation\n                        superseded = %version_list(at.superseded),"
+
+[[control]]
+id = "mc-gated-view-allows-recorded-supersession"
+platforms = ["linux", "macos"]
+guards = "the receipt-gated MC wait accepts a newer applied view only with an explicit superseded receipt, not an exact-version-only wait"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance/mc_e2e.rs"
+expect_red = ["mc_e2e::gated_view_wait_accepts_only_applied_or_explicitly_superseded"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance/mc_e2e.rs"
+old = "newest > gated\n                && applied(newest)"
+new = "newest == gated /* NON-VACUITY BREAK: require the gated version itself */\n                && applied(newest)"

@@ -1434,12 +1434,32 @@ fn views_applied(records: &[WalRecord]) -> Vec<u64> {
 #[tokio::test]
 async fn an_announced_view_is_fetched_at_the_step_boundary_and_applied() {
     let shared = Shared::default();
-    let (model, views) = run_history(&shared).await;
+    let ((model, views), logs) = broca_test_support::capture_logs(run_history(&shared)).await;
     assert_eq!(*views.fetches.lock().unwrap(), vec![(2, true)]);
     assert_eq!(views_applied(&shared.records()), vec![2]);
     let sent =
         String::from_utf8_lossy(&crate::canonical_request_bytes(&model.0.calls()[0])).into_owned();
     assert!(sent.contains("summary"), "{sent}");
+    assert_step_decisions(&logs, &[(2, "applied", "")]);
+}
+
+fn assert_step_decisions(logs: &[broca_test_support::LogEvent], expected: &[(u64, &str, &str)]) {
+    let session_ref = crate::agent_session_ref(&bind());
+    let decisions: Vec<_> = logs
+        .iter()
+        .filter(|event| event.message() == "compaction view decided at a step boundary")
+        .map(|event| {
+            assert_eq!(event.target, "compaction");
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_eq!(event.fields.get("session_ref"), Some(&session_ref));
+            (
+                event.fields["view_version"].parse::<u64>().unwrap(),
+                event.fields["choice"].as_str(),
+                event.fields.get("superseded").map_or("", String::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(decisions, expected, "one correlated INFO decision per view");
 }
 
 /// A fetched view whose bytes are not the ones its `view_ready` announced (its digest differs
@@ -1743,6 +1763,85 @@ async fn idle_boundary_applies_only_the_newest_view_announced_during_its_fetch()
         "exactly one applied view, the newest"
     );
     assert_eq!(*racing.fetches.lock().unwrap(), vec![1, 2]);
+    let _ = writer.shutdown().await;
+}
+
+#[tokio::test]
+async fn step_boundary_logs_applied_and_superseded_views_with_session_ref() {
+    use crate::compaction_provider::notice::ViewReady;
+    let mut raw = vec![
+        text(Role::User, &"large history ".repeat(2000)),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "next"),
+    ];
+    broca_protocol::content::stamp_ordinals(&mut raw);
+    let shared = Shared::with_records(vec![setup_record(Some("{}"))]);
+    let writer = shared.writer();
+    let session = bind();
+    let session_ref = crate::agent_session_ref(&session);
+    let inbox = Arc::new(crate::ViewReadyInbox::default());
+    inbox.announce(ViewReady::for_view(&RacingViews::view(&session_ref, 1)));
+    let racing = Arc::new(RacingViews {
+        fetching_first: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        fetches: Mutex::new(Vec::new()),
+    });
+    let plane: Arc<dyn CompactionPlane> = racing.clone();
+    let control = crate::RunControl {
+        compaction_views: Some(inbox.clone()),
+        ..Default::default()
+    };
+    let runtime = runtime::Runtime {
+        provider: "provider",
+        bind: &session,
+        plane: Some(&plane),
+        writer: &writer,
+        control: &control,
+    };
+    let mut state = CompactionState::default();
+    for record in shared.records() {
+        state.fold(&record);
+    }
+    let mut boundary = runtime::BoundaryViews::default();
+    let lineage = fixture_lineage_id().to_string();
+    let ((), logs) = broca_test_support::capture_logs(async {
+        broca_test_support::wait_for(
+            "step boundary deciding the newest view",
+            async {
+                let (result, ()) = tokio::join!(
+                    runtime.views_at_boundary(
+                        &mut boundary,
+                        &mut state,
+                        Some(inbox.as_ref()),
+                        &session_ref,
+                        &lineage,
+                        "model",
+                        &raw,
+                        super::StoredTranscript::plain(&raw),
+                        false,
+                        true,
+                        runtime::StepAt {
+                            run_id: "run",
+                            step: 1,
+                            superseded: &[]
+                        }
+                    ),
+                    async {
+                        racing.fetching_first.notified().await;
+                        inbox.announce(ViewReady::for_view(&RacingViews::view(&session_ref, 2)));
+                        racing.release.notify_one();
+                    }
+                );
+                result.unwrap();
+            },
+            || format!("fetches={:?}", racing.fetches.lock().unwrap()),
+        )
+        .await;
+    })
+    .await;
+    assert_eq!(views_applied(&shared.records()), vec![2]);
+    assert_eq!(*racing.fetches.lock().unwrap(), vec![1, 2]);
+    assert_step_decisions(&logs, &[(1, "superseded", ""), (2, "applied", "1")]);
     let _ = writer.shutdown().await;
 }
 
