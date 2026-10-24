@@ -48,6 +48,13 @@ pub fn create_media_directories(state_root: &Path) -> io::Result<()> {
             })?;
         }
     }
+    let lock = broca_owner_only::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(state_root.join("media-uploads/uploads.lock"))?;
+    lock.sync_all()?;
+    broca_wal::migration::sync_dir(&state_root.join("media-uploads"))?;
     Ok(())
 }
 

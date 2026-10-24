@@ -27410,3 +27410,94 @@ expect_red = ["session_read::no_media_inline_and_descriptors_response_bytes_are_
 file = "crates/broca-module/src/serve.rs"
 old = "        if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {"
 new = "        if false { // NON-VACUITY BREAK: omit descriptors from opted-in reads."
+
+[[control]]
+id = "upload-send-standing-before-staging"
+guards = "Only the session owner or a plan-named sender may write upload staging"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::upload_requires_send_standing_before_any_staging_write"]
+file = "crates/broca-module/src/uploads.rs"
+old = "    if !named {"
+new = "    if false && !named { // NON-VACUITY BREAK: allow callers without send standing."
+
+[[control]]
+id = "upload-decoded-chunk-cap-before-write"
+guards = "The real serve path refuses a decoded chunk above 2 MiB without writing"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::upload_raw_chunk_cap_is_enforced_on_real_serve_path"]
+file = "crates/broca-core/src/media_uploads.rs"
+old = "        wire::check_chunk_size(bytes.len()).map_err(|code| UploadError::new(code, id))?;"
+new = "        wire::check_chunk_size(0).map_err(|code| UploadError::new(code, id))?; // NON-VACUITY BREAK: ignore decoded chunk size."
+
+[[control]]
+id = "upload-global-staging-reservation"
+guards = "Global staging reserves at most 4 GiB across every session before begin writes"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_uploads/tests.rs"
+expect_red = ["media_uploads::tests::reservation_limits_include_global_capacity"]
+file = "crates/broca-core/src/media_uploads.rs"
+old = "    if global.saturating_add(bytes) > GLOBAL_MAX {"
+new = "    if false && global.saturating_add(bytes) > GLOBAL_MAX { // NON-VACUITY BREAK: drop global staging reservation."
+
+[[control]]
+id = "upload-full-identity-ownership"
+guards = "An upload cannot be read or mutated through another project, harness or session"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_uploads/tests.rs"
+expect_red = ["media_uploads::tests::foreign_unknown_and_expired_uploads_write_nothing"]
+file = "crates/broca-core/src/media_uploads.rs"
+old = "        if &meta.identity != identity {"
+new = "        if false && &meta.identity != identity { // NON-VACUITY BREAK: accept another identity's upload."
+
+[[control]]
+id = "upload-conflicting-retry-refused"
+guards = "A retry at a written offset is accepted only if the held bytes match"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_uploads/tests.rs"
+expect_red = ["media_uploads::tests::identical_chunk_and_commit_retries_survive_reopen"]
+file = "crates/broca-core/src/media_uploads.rs"
+old = "            if previous == bytes {"
+new = "            if true { // NON-VACUITY BREAK: accept a conflicting retry."
+
+[[control]]
+id = "upload-committed-hour-retention"
+guards = "A committed upload remains usable for a full hour after commit, not just after begin"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_uploads/tests.rs"
+expect_red = ["media_uploads::tests::commit_checks_size_and_hash_and_retains_for_one_hour"]
+file = "crates/broca-core/src/media_uploads.rs"
+old = "            meta.expires = now.saturating_add(RETENTION_SECONDS);"
+new = "            meta.expires = now; // NON-VACUITY BREAK: expire a committed upload immediately."
+
+[[control]]
+id = "upload-send-reference-not-silently-dropped"
+guards = "Until send admission supports attachments, uploads are refused by name instead of silently omitted"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::upload_roundtrip_is_staged_but_not_advertised_or_admitted"]
+file = "crates/broca-wire/src/lib.rs"
+old = "        if let Some(part) = parts.first() {"
+new = "        if let Some(part) = parts.first().filter(|_| false) { // NON-VACUITY BREAK: silently omit upload content."

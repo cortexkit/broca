@@ -2321,3 +2321,227 @@ async fn late_subscriber_gets_context_captured_before_the_step_streamed() {
     assert_eq!(delta["event"]["mid"], page.messages.last().unwrap().mid);
     rig.finish().await;
 }
+
+fn upload_staging_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut entries = Vec::new();
+    for dir in ["objects", "refs"] {
+        for entry in std::fs::read_dir(root.join("media-uploads").join(dir)).unwrap() {
+            let path = entry.unwrap().path();
+            entries.push((path.clone(), std::fs::read(path).unwrap()));
+        }
+    }
+    entries.sort();
+    entries
+}
+
+#[tokio::test]
+async fn upload_roundtrip_is_staged_but_not_advertised_or_admitted() {
+    let mut rig = Rig::start("upload-roundtrip").await;
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    let begin = serde_json::json!({"mime":"application/pdf","bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"});
+    let missing = call(&mut rig, "session.upload_begin", begin.clone()).await;
+    assert_eq!(refusal(&missing)["code"], "unknown_session");
+    rig.script.push(&[Step::Text("ready")]);
+    rig.send("turn-1", "hi", None).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let wal_before = rig.wal_bytes();
+    let created = call(&mut rig, "session.upload_begin", begin).await;
+    let id = result(&created)["upload_id"].as_str().unwrap().to_owned();
+    let append = serde_json::json!({"upload_id":id,"offset":0,"data":"YWJj"});
+    let first = call(&mut rig, "session.upload_append", append.clone()).await;
+    assert_eq!(result(&first)["received"], 3);
+    let before = upload_staging_snapshot(&rig.dir);
+    let retry = call(&mut rig, "session.upload_append", append).await;
+    assert_eq!(result(&retry), result(&first));
+    assert_eq!(upload_staging_snapshot(&rig.dir), before);
+    let conflict = call(
+        &mut rig,
+        "session.upload_append",
+        serde_json::json!({"upload_id":id,"offset":0,"data":"YWJk"}),
+    )
+    .await;
+    assert_eq!(refusal(&conflict)["code"], "upload_offset_mismatch");
+    assert_eq!(refusal(&conflict)["detail"]["received"], 3);
+    assert_eq!(upload_staging_snapshot(&rig.dir), before);
+    let commit = serde_json::json!({"upload_id":id});
+    let first = call(&mut rig, "session.upload_commit", commit.clone()).await;
+    assert_eq!(
+        result(&first),
+        serde_json::json!({"state":"committed","sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","mime":"application/pdf","bytes":3})
+    );
+    let before = upload_staging_snapshot(&rig.dir);
+    assert_eq!(
+        result(&call(&mut rig, "session.upload_commit", commit).await),
+        result(&first)
+    );
+    let refused = rig
+        .send_with(
+            "turn-2",
+            "file",
+            None,
+            serde_json::json!({"content":[{"type":"upload","upload_id":id}]}),
+        )
+        .await;
+    assert_eq!(refusal(&refused)["code"], "invalid_params");
+    assert!(refusal(&refused)["message"].as_str().unwrap().contains(&id));
+    assert_eq!(upload_staging_snapshot(&rig.dir), before);
+    assert_eq!(rig.wal_bytes(), wal_before);
+    let describe = call(&mut rig, "role.describe", serde_json::json!({})).await;
+    let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
+    assert!(!checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn upload_requires_send_standing_before_any_staging_write() {
+    let mut rig = Rig::start("upload-standing").await;
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "owner".into(),
+        }),
+    )
+    .await;
+    rig.script.push(&[Step::Text("ready")]);
+    rig.send("turn-1", "hi", None).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let begin = serde_json::json!({"mime":"application/pdf","bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"});
+    let created = call(&mut rig, "session.upload_begin", begin.clone()).await;
+    let id = result(&created)["upload_id"].as_str().unwrap().to_owned();
+    rig.bind_as(
+        13,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "stranger".into(),
+        }),
+    )
+    .await;
+    let before = upload_staging_snapshot(&rig.dir);
+    let wal_before = rig.wal_bytes();
+    for (method, params) in [
+        ("session.upload_begin", begin),
+        (
+            "session.upload_append",
+            serde_json::json!({"upload_id":id,"offset":0,"data":"YWJj"}),
+        ),
+        ("session.upload_commit", serde_json::json!({"upload_id":id})),
+        ("session.upload_status", serde_json::json!({"upload_id":id})),
+    ] {
+        let refused = rig
+            .request(13, serde_json::json!({"method":method,"params":params}))
+            .await;
+        assert_eq!(
+            refusal(&refused)["code"],
+            "scope_owner_mismatch",
+            "{method}"
+        );
+        assert_eq!(upload_staging_snapshot(&rig.dir), before, "{method}");
+        assert_eq!(rig.wal_bytes(), wal_before);
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn upload_raw_chunk_cap_is_enforced_on_real_serve_path() {
+    use base64::Engine;
+    let mut rig = Rig::start("upload-cap").await;
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    rig.script.push(&[Step::Text("ready")]);
+    rig.send("turn-1", "hi", None).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let size = cortexkit_role_llm_runner::attachments::CHUNK_MAX;
+    let created = call(&mut rig, "session.upload_begin", serde_json::json!({"mime":"application/pdf","bytes":size+1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"})).await;
+    let id = result(&created)["upload_id"].as_str().unwrap().to_owned();
+    let before = upload_staging_snapshot(&rig.dir);
+    let data = base64::engine::general_purpose::STANDARD.encode(vec![1; size + 1]);
+    let refused = call(
+        &mut rig,
+        "session.upload_append",
+        serde_json::json!({"upload_id":id,"offset":0,"data":data}),
+    )
+    .await;
+    assert_eq!(refusal(&refused)["code"], "upload_chunk_too_large");
+    assert!(refusal(&refused)["message"].as_str().unwrap().contains(&id));
+    assert_eq!(upload_staging_snapshot(&rig.dir), before);
+    let data = base64::engine::general_purpose::STANDARD.encode(vec![1; size]);
+    let accepted = call(
+        &mut rig,
+        "session.upload_append",
+        serde_json::json!({"upload_id":id,"offset":0,"data":data}),
+    )
+    .await;
+    assert_eq!(result(&accepted)["received"], size);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn upload_plan_named_sender_has_standing_on_the_frozen_session() {
+    struct SenderPlanAdmitter;
+    #[async_trait::async_trait]
+    impl broca_fetch_plan::PlanAdmitter for SenderPlanAdmitter {
+        async fn admit(
+            &self,
+            plan: &broca_fetch_plan::Plan,
+            _session: &broca_protocol::BindIdentity,
+            _scope: Option<&broca_protocol::SessionScope>,
+        ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
+            Ok(broca_fetch_plan::Admitted {
+                manifest: broca_wal::PlanManifest {
+                    plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                    plan_identity: plan.identity.clone(),
+                    composition_digest: plan.composition_digest.clone(),
+                    fetches: vec![],
+                    tools: std::sync::Arc::new(vec![]),
+                    system_text: String::new(),
+                    system_digest: String::new(),
+                    join_version: 1,
+                    role_versions: Default::default(),
+                    declarations: vec![],
+                },
+            })
+        }
+    }
+    let mut rig = Rig::start("upload-plan-sender").await;
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    rig.registry()
+        .set_plan_admitter(std::sync::Arc::new(SenderPlanAdmitter));
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "owner".into(),
+        }),
+    )
+    .await;
+    let composition = serde_json::json!({"providers":[]});
+    let digest = cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap();
+    let plan = serde_json::json!({"tool_items":[],"system_text_items":[],"step_transform_items":[],"composition":composition,"composition_digest":digest,"senders":[{"module":"ck-mc","idle_start":true}]});
+    rig.script.push(&[Step::Text("ready")]);
+    let started = call(&mut rig, "session.send", serde_json::json!({"prompt":"hi","send_id":"turn-1","model":{"provider":"fake","model":"fake"},"plan":plan})).await;
+    assert_eq!(result(&started)["state"], "active");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.bind_as(
+        13,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "ck-mc".into(),
+        }),
+    )
+    .await;
+    let before = rig.wal_bytes();
+    let created = rig.request(13, serde_json::json!({"method":"session.upload_begin","params":{"mime":"application/pdf","bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}})).await;
+    let id = result(&created)["upload_id"].as_str().unwrap().to_owned();
+    let appended = rig.request(13, serde_json::json!({"method":"session.upload_append","params":{"upload_id":id,"offset":0,"data":"YWJj"}})).await;
+    assert_eq!(result(&appended)["received"], 3);
+    let committed = rig
+        .request(
+            13,
+            serde_json::json!({"method":"session.upload_commit","params":{"upload_id":id}}),
+        )
+        .await;
+    assert_eq!(result(&committed)["state"], "committed");
+    assert_eq!(rig.wal_bytes(), before);
+    rig.finish().await;
+}

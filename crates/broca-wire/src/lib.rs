@@ -291,6 +291,24 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Staging alone is not attachment admission. Refuse upload-bearing sends rather
+/// than silently dropping content: staged bytes are not connected to the send's
+/// model checks or to publication into its session's media store.
+pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String> {
+    if let Some(content) = params.get("content").filter(|value| !value.is_null()) {
+        let parts: Vec<cortexkit_role_llm_runner::attachments::ContentPart> =
+            serde_json::from_value(content.clone())
+                .map_err(|error| format!("invalid content: {error}"))?;
+        if let Some(part) = parts.first() {
+            return Err(format!(
+                "upload {} cannot be sent: attachment admission is unavailable",
+                part.upload_id()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check every `tools[i].reply` of a `session.send` before anything else reads the send, so a
 /// malformed deadline is refused `invalid_params` naming its exact member
 /// (`tools[0].reply.max_ms`, `tools[1].reply.timeout`, ...) rather than the whole `tools` field,
