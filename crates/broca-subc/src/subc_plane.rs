@@ -47,7 +47,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::{
     retry_route_open, retry_route_open_with_scope_hold, route_failure_is_known_dead, ConnError,
-    ModuleGate, RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
+    GateTarget, ModuleGate, RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
     ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
 };
 use crate::scope_describe::{DescribedScope, ScopeDescriber};
@@ -427,8 +427,9 @@ trait ToolPlaneConnection: Send + Sync {
     /// Whether `route` is still open (no GOODBYE has closed it and its connection is current).
     fn route_is_open(&self, route: &RouteHandle) -> bool;
 
-    /// `module_id`'s availability gate, shared by every open to that module on this
-    /// connection (see [`ModuleGate`]). Test fakes have none unless a test supplies one.
+    /// The availability gate of `module_id`'s tool routes, shared by every tool route open to
+    /// that module on this connection (see [`ModuleGate`]). Test fakes have none unless a test
+    /// supplies one.
     fn module_gate(&self, _module_id: &str) -> Option<Arc<ModuleGate>> {
         None
     }
@@ -506,7 +507,11 @@ impl ToolPlaneConnection for SubcConnection {
     }
 
     fn module_gate(&self, module_id: &str) -> Option<Arc<ModuleGate>> {
-        Some(SubcConnection::module_gate(self, module_id))
+        // The plane opens only tool routes.
+        Some(SubcConnection::module_gate(
+            self,
+            &GateTarget::tool_provider(module_id),
+        ))
     }
 
     async fn route_close(&self, route: &RouteHandle) -> Result<(), ConnError> {

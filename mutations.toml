@@ -3682,10 +3682,34 @@ runner = "cargo"
 package = "broca-subc"
 target = "--lib"
 test_file = "crates/broca-subc/src/connection.rs"
-expect_red = ["connection::module_gate_tests::a_reconnect_lets_waiters_on_the_old_gate_open_on_the_new_one"]
+expect_red = ["connection::module_gate_tests::a_reconnect_lets_waiters_on_the_old_gate_open_on_the_new_one", "connection::tests::a_generation_ending_before_its_replacement_releases_gate_waiters_at_once"]
 file = "crates/broca-subc/src/connection.rs"
 old = "                        _ = self.retired.cancelled() => {}"
 new = "                        // NON-VACUITY BREAK: waiters do not wake when their generation ends"
+
+[[control]]
+id = "route-open-attempt-bound-covers-enqueue"
+guards = "a route.open attempt's deadline covers queueing the request, so a writer queue that never drains cannot hold a module gate's probe turn"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::a_writer_queue_that_never_drains_releases_the_probe_turn_within_the_attempt_bound"]
+file = "crates/broca-subc/src/connection.rs"
+old = "        match time::timeout_at(attempt_deadline, self.send(&runtime, frame)).await {"
+new = "        match time::timeout_at(attempt_deadline + Duration::from_secs(3600), self.send(&runtime, frame)).await { // NON-VACUITY BREAK: enqueue outside the attempt deadline"
+
+[[control]]
+id = "route-open-gate-no-admission-after-deadline"
+guards = "a caller that waited at a module gate past its deadline is refused, not admitted, when the gate opens"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::module_gate_tests::a_waiter_past_its_deadline_makes_no_attempt_when_the_gate_reopens"]
+file = "crates/broca-subc/src/connection.rs"
+old = "            if let (Some(refusal), Some(until)) = (&waited, wait_until) {"
+new = "            if let (Some(refusal), Some(until)) = (&waited, wait_until.filter(|_| false)) { // NON-VACUITY BREAK: admit after the deadline"
 
 [[control]]
 id = "bash-watch-deadline-grace"
