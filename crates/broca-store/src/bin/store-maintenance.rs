@@ -74,18 +74,29 @@ fn main() -> ExitCode {
         return wal_fold(&PathBuf::from(state_root), &args[3..]);
     }
     if operation == "media-sweep" {
-        if args.len() != 4 || args[3] != "--write" || !std::path::Path::new(state_root).is_dir() {
-            eprintln!("usage: store-maintenance media-sweep <existing-state-root> --write");
+        if !(args.len() == 3 || args.len() == 4 && args[3] == "--write")
+            || !std::path::Path::new(state_root).is_dir()
+        {
+            eprintln!("usage: store-maintenance media-sweep <existing-state-root> [--write]");
             return ExitCode::from(2);
         }
-        return match broca_core::media_store::sweep(std::path::Path::new(state_root)) {
+        let write = args.len() == 4;
+        let result = if write {
+            broca_core::media_store::sweep(std::path::Path::new(state_root))
+        } else {
+            broca_core::media_store::preview_sweep(std::path::Path::new(state_root))
+        };
+        return match result {
             Ok(report) => {
                 println!(
-                    "leased {}\nreconciled {}\nmanifests_removed {}\nobjects_removed {}",
+                    "mode {}\nleased {}\nreconciled {}\nmanifests_removed {}\nobjects_removed {}\nwal_reads {}\nretained_classes {}",
+                    if write { "write" } else { "preview" },
                     report.leased,
                     report.reconciled,
                     report.manifests_removed,
-                    report.objects_removed
+                    report.objects_removed,
+                    report.wal_reads,
+                    report.retained_classes,
                 );
                 ExitCode::SUCCESS
             }
@@ -266,7 +277,7 @@ fn print_usage() {
     eprintln!(
         "usage: store-maintenance page-usage|control-head|reconcile-active|private-mode <state-root> [--dry-run]\n\
                  store-maintenance wal-manifest <state-root> [--write]\n\
-                 store-maintenance media-sweep <state-root> --write\n\
+                 store-maintenance media-sweep <state-root> [--write]\n\
                  store-maintenance wal-fold <state-root> [--write] [--resume fold-<unix-ms>.journal] [--abandon|--unfold]"
     );
 }

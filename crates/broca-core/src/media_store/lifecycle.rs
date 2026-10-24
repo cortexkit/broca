@@ -20,14 +20,19 @@ pub struct SweepReport {
     pub reconciled: usize,
     pub manifests_removed: usize,
     pub objects_removed: usize,
+    pub wal_reads: usize,
+    pub retained_classes: usize,
 }
 
 /// Run outside admission: startup neither waits for maintenance nor queues on a
 /// busy store lock. A deadline also bounds cooperative work on a large store.
 pub fn spawn_startup_sweep(state_root: PathBuf) -> io::Result<std::thread::JoinHandle<()>> {
     spawn_sweep(move || {
-        if let Err(error) = sweep_until(&state_root, Some(Instant::now() + Duration::from_secs(1)))
-        {
+        if let Err(error) = sweep_until(
+            &state_root,
+            Some(Instant::now() + Duration::from_secs(1)),
+            true,
+        ) {
             tracing::warn!(target: "media", "startup media sweep deferred: {error}");
         }
     })
@@ -42,7 +47,13 @@ fn spawn_sweep(action: impl FnOnce() + Send + 'static) -> io::Result<std::thread
 /// Call only from store-maintenance (or the detached startup task), never from
 /// the run loop. Busy stores are retried by a later maintenance invocation.
 pub fn sweep(state_root: &Path) -> io::Result<SweepReport> {
-    sweep_until(state_root, None)
+    sweep_until(state_root, None, true)
+}
+
+/// Compute the same collection plan without creating files, bumping lease epochs
+/// or changing manifests and objects. Locks protect the observed snapshot only.
+pub fn preview_sweep(state_root: &Path) -> io::Result<SweepReport> {
+    sweep_until(state_root, None, false)
 }
 
 fn budget(deadline: Option<Instant>) -> io::Result<()> {
@@ -55,25 +66,141 @@ fn budget(deadline: Option<Instant>) -> io::Result<()> {
     Ok(())
 }
 
-fn sweep_until(state_root: &Path, deadline: Option<Instant>) -> io::Result<SweepReport> {
+fn sweep_until(
+    state_root: &Path,
+    deadline: Option<Instant>,
+    write: bool,
+) -> io::Result<SweepReport> {
     budget(deadline)?;
-    // Archive publication and live-file removal must not straddle our inventory.
-    // Both this and session leases are nonblocking, avoiding lock-order cycles.
-    let _archive = crate::lease::acquire_archive_pass(state_root).map_err(io::Error::other)?;
-    let wal = FileWalStore::new(state_root.join("wal"));
-    let leases = FileLeaseStore::new(state_root.join("leases"));
-    let mut report = SweepReport::default();
+    let mut stores = Vec::new();
     for class in CLASSES {
-        budget(deadline)?;
-        if !state_root.join(class.directory()).try_exists()? {
+        let root = state_root.join(class.directory());
+        if !has_objects(&root.join("objects"))? {
             continue;
         }
-        let store = MediaStore::open(state_root, class)?;
-        let lock = store.lock()?;
-        lock.try_lock().map_err(io::Error::other)?;
-        reconcile(&store, class, &wal, &leases, deadline, &mut report)?;
+        stores.push((MediaStore { root }, class));
+    }
+    let mut report = SweepReport::default();
+    if stores.is_empty() {
+        return Ok(report);
+    }
+    // Archive publication and live-file removal must not straddle our inventory.
+    // Both this and session leases are nonblocking, avoiding lock-order cycles.
+    let _archive = if write {
+        Some(crate::lease::acquire_archive_pass(state_root).map_err(io::Error::other)?)
+    } else {
+        None
+    };
+    let _archive_preview = if write {
+        None
+    } else {
+        let path = crate::lease::archive_pass_lock_path(state_root);
+        let lock = existing_lock(&path)?;
+        if let Some(file) = &lock {
+            file.try_lock_shared().map_err(io::Error::other)?;
+        }
+        lock
+    };
+    let wal = FileWalStore::new(state_root.join("wal"));
+    let leases = FileLeaseStore::new(state_root.join("leases"));
+    let mut locks = Vec::new();
+    // Hold every participating store lock until the shared inventory and all
+    // collection decisions finish. Registrations cannot change its candidate set.
+    for (store, _) in &stores {
+        budget(deadline)?;
+        let lock = if write {
+            Some(store.lock()?)
+        } else {
+            existing_lock(&store.root.join("store.lock"))?
+        };
+        if let Some(lock) = lock {
+            lock.try_lock().map_err(io::Error::other)?;
+            locks.push(lock);
+        }
+    }
+    let mut candidates = BTreeSet::new();
+    let mut readable = Vec::new();
+    for (store, class) in stores {
+        match manifest_candidates(&store, deadline) {
+            Ok(addresses) => {
+                candidates.extend(addresses);
+                readable.push((store, class));
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => return Err(error),
+            Err(_) => report.retained_classes += 1,
+        }
+    }
+    let inventory = inventory(&wal, &candidates, deadline, &mut report)?;
+    for (store, class) in readable {
+        reconcile(
+            &store,
+            class,
+            &inventory,
+            &leases,
+            deadline,
+            write,
+            &mut report,
+        )?;
     }
     Ok(report)
+}
+
+fn existing_lock(path: &Path) -> io::Result<Option<File>> {
+    match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn has_objects(directory: &Path) -> io::Result<bool> {
+    match fs::read_dir(directory) {
+        Ok(mut entries) => entries.next().transpose().map(|entry| entry.is_some()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn manifest_candidates(
+    store: &MediaStore,
+    deadline: Option<Instant>,
+) -> io::Result<BTreeSet<String>> {
+    let mut candidates = BTreeSet::new();
+    for directory in ["refs", "identities"] {
+        let path = store.root.join(directory);
+        if directory == "identities" && !path.try_exists()? {
+            continue;
+        }
+        for entry in fs::read_dir(path)? {
+            budget(deadline)?;
+            let path = entry?.path();
+            let address = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| invalid("invalid media manifest address"))?;
+            if directory == "identities" && address.ends_with(".json.tmp") {
+                continue;
+            }
+            if address.len() != 16 || !address.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid("invalid media manifest address"));
+            }
+            if directory == "refs" {
+                let bytes = fs::read(&path)?;
+                if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                    return Err(invalid("incomplete media manifest digest"));
+                }
+                digests(&bytes)?;
+            } else {
+                let session: BindIdentity =
+                    serde_json::from_slice(&fs::read(&path)?).map_err(io::Error::other)?;
+                if session_addr(&session) != address {
+                    return Err(invalid("media manifest identity mismatch"));
+                }
+            }
+            candidates.insert(address.to_owned());
+        }
+    }
+    Ok(candidates)
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -185,22 +312,32 @@ type Inventory = BTreeMap<
     ),
 >;
 
-fn inventory(wal: &FileWalStore, deadline: Option<Instant>) -> io::Result<Inventory> {
+fn inventory(
+    wal: &FileWalStore,
+    candidates: &BTreeSet<String>,
+    deadline: Option<Instant>,
+    report: &mut SweepReport,
+) -> io::Result<Inventory> {
     let mut result = BTreeMap::new();
-    let addresses = wal
-        .media_addresses(&|| deadline.is_some_and(|end| Instant::now() >= end))
-        .map_err(io::Error::other)?;
-    for address in addresses {
+    if candidates.is_empty() {
+        return Ok(result);
+    }
+    for address in candidates {
         budget(deadline)?;
+        let class = wal.media_store_class(address).map_err(io::Error::other)?;
+        if class.is_none() {
+            continue;
+        }
         let records = wal
-            .read_address_records(&address)
+            .read_address_records(address)
             .map_err(io::Error::other)?;
+        report.wal_reads += 1;
         result.insert(
             address.clone(),
             (
                 wal_digests(&records, deadline)?,
-                identity(&records, &address),
-                wal.media_store_class(&address).map_err(io::Error::other)?,
+                identity(&records, address),
+                class,
             ),
         );
     }
@@ -225,8 +362,12 @@ fn inventory(wal: &FileWalStore, deadline: Option<Instant>) -> io::Result<Invent
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| invalid("invalid deleting WAL name"))?;
             let address = name.split('.').next().unwrap();
+            if !candidates.contains(address) {
+                continue;
+            }
             let records =
                 broca_wal::replay_file(&path, wal.max_read_bytes()).map_err(io::Error::other)?;
+            report.wal_reads += 1;
             let item = result.entry(address.to_owned()).or_insert_with(|| {
                 (
                     BTreeSet::new(),
@@ -288,14 +429,15 @@ fn replace_manifest(store: &MediaStore, path: &Path, bytes: &[u8]) -> io::Result
 fn reconcile(
     store: &MediaStore,
     class: MediaStoreClass,
-    wal: &FileWalStore,
+    inventory: &Inventory,
     leases: &FileLeaseStore,
     deadline: Option<Instant>,
+    write: bool,
     report: &mut SweepReport,
 ) -> io::Result<()> {
-    let inventory = inventory(wal, deadline)?;
-    // Even a damaged/missing manifest must not make a WAL-owned object garbage.
-    // Keep the WAL union independently of manifest reconciliation.
+    // Registration durably names the session before its WAL append. The shared
+    // candidate inventory also covers identities whose manifest was lost; no
+    // unrelated session WAL needs to be decoded to protect its objects.
     let mut retained: BTreeSet<_> = inventory
         .values()
         .filter(|(_, _, owner)| *owner == Some(class))
@@ -330,11 +472,7 @@ fn reconcile(
         if session_addr(&session) != address {
             return Err(invalid("media manifest identity mismatch"));
         }
-        let lease = match leases.acquire(&lease_key_for(&session)) {
-            Ok(lease) => Some(lease),
-            Err(LeaseError::Held { .. }) => None,
-            Err(error) => return Err(io::Error::other(error)),
-        };
+        let lease = session_lease(store.root.parent().unwrap(), leases, &session, write)?;
         if lease.is_none() {
             report.leased += 1;
             retained.extend(manifest);
@@ -342,6 +480,10 @@ fn reconcile(
         }
         let cache = store.root.join("swept").join(address);
         let Some((named, _, _)) = captured else {
+            if !write {
+                report.manifests_removed += 1;
+                continue;
+            }
             // Absence is not durability: repay even a previous process's failed
             // unlink barrier before dropping the last manifest reference.
             sync_wal_directories(store.root.parent().unwrap())?;
@@ -356,12 +498,14 @@ fn reconcile(
         if bytes != canonical.as_bytes()
             || migration::read_json::<String>(&cache)?.as_deref() != Some(&stamp)
         {
-            if bytes != canonical.as_bytes() {
+            if write && bytes != canonical.as_bytes() {
                 replace_manifest(store, &path, canonical.as_bytes())?;
             }
             // Cache only completed, unleased reconciliations. A refused steer
             // must be revisited on the first sweep after the lease is released.
-            migration::atomic_json(store.root.parent().unwrap(), &cache, &stamp)?;
+            if write {
+                migration::atomic_json(store.root.parent().unwrap(), &cache, &stamp)?;
+            }
             report.reconciled += 1;
         }
         retained.extend(named.iter().cloned());
@@ -376,11 +520,44 @@ fn reconcile(
             .and_then(|name| name.to_str())
             .ok_or_else(|| invalid("invalid media object name"))?;
         if !retained.contains(name) {
-            migration::unlink(&path)?;
+            if write {
+                migration::unlink(&path)?;
+            }
             report.objects_removed += 1;
         }
     }
     Ok(())
+}
+
+struct SessionLease {
+    _writer: Option<Box<dyn crate::lease::LeaseHandle>>,
+    _preview: Option<File>,
+}
+
+fn session_lease(
+    state_root: &Path,
+    leases: &FileLeaseStore,
+    session: &BindIdentity,
+    write: bool,
+) -> io::Result<Option<SessionLease>> {
+    if write {
+        match leases.acquire(&lease_key_for(session)) {
+            Ok(lease) => Ok(Some(SessionLease {
+                _writer: Some(lease),
+                _preview: None,
+            })),
+            Err(LeaseError::Held { .. }) => Ok(None),
+            Err(error) => Err(io::Error::other(error)),
+        }
+    } else {
+        match crate::lease::probe_writer(state_root, session)? {
+            crate::lease::LeaseProbe::Held => Ok(None),
+            crate::lease::LeaseProbe::Free(file) => Ok(Some(SessionLease {
+                _writer: None,
+                _preview: file,
+            })),
+        }
+    }
 }
 
 impl MediaStore {

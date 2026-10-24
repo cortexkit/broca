@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod lifecycle;
-pub use lifecycle::{session_media_digests, spawn_startup_sweep, sweep, SweepReport};
+pub use lifecycle::{
+    preview_sweep, session_media_digests, spawn_startup_sweep, sweep, SweepReport,
+};
 
 /// Stores deduplicate only within a WAL durability class, never across classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

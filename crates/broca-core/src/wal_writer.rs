@@ -505,14 +505,6 @@ impl FileWalStore {
             .map(|(addresses, _)| addresses)
     }
 
-    pub(crate) fn media_addresses(
-        &self,
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<std::collections::BTreeSet<String>, WalError> {
-        self.address_inventory(false, cancelled)
-            .map(|(addresses, _)| addresses)
-    }
-
     /// Participant discovery keeps unreadable locations separate from absence.
     /// Callers must not interpret a missing match as an unheld ref when this
     /// result contains unreadable addresses or containers.

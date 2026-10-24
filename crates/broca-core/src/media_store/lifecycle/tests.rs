@@ -273,7 +273,9 @@ fn sweep_lock_is_exclusive_and_deadline_prevents_unbounded_work() {
     );
     drop(lock);
     assert_eq!(
-        sweep_until(&root, Some(Instant::now())).unwrap_err().kind(),
+        sweep_until(&root, Some(Instant::now()), true)
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::TimedOut
     );
     assert_eq!(store.read_verified(&reference(BYTES)).unwrap(), BYTES);
@@ -346,4 +348,102 @@ fn changed_wal_cannot_reuse_a_previous_manifest_cache_stamp() {
         store.read_verified(&reference(BYTES)),
         Err(MediaReadError::Missing(_))
     ));
+}
+
+#[test]
+fn sweep_skips_empty_stores_without_touching_the_wal_corpus() {
+    let (root, store, session) = fixture();
+    let path = accepted(&root, &store, &session);
+    fs::remove_file(store.root.join("objects").join(&reference(BYTES).sha256)).unwrap();
+    fs::write(path, b"unrelated to an empty media store").unwrap();
+    let _archive = crate::lease::acquire_archive_pass(&root).unwrap();
+    let before = fs::read(manifest(&store, &session)).unwrap();
+    let report = sweep(&root).unwrap();
+    assert_eq!(report.wal_reads, 0);
+    assert_eq!(report.reconciled, 0);
+    assert_eq!(fs::read(manifest(&store, &session)).unwrap(), before);
+    assert!(!store.root.join("swept").exists());
+}
+
+#[test]
+fn sweep_reads_each_manifest_candidate_once_and_ignores_other_wals() {
+    let (root, store, session) = fixture();
+    accepted(&root, &store, &session);
+    for class in [MediaStoreClass::NonDurable, MediaStoreClass::Ephemeral] {
+        MediaStore::open(&root, class)
+            .unwrap()
+            .session(&session)
+            .unwrap()
+            .register_and_append(&reference(BYTES), BYTES, || Ok(()))
+            .unwrap();
+    }
+    broca_owner_only::create_dir_all(root.join("wal")).unwrap();
+    for n in 0..50 {
+        fs::write(
+            root.join("wal").join(format!("{n:016x}.wal")),
+            b"unreadable unrelated WAL",
+        )
+        .unwrap();
+    }
+    let report = sweep(&root).unwrap();
+    assert_eq!(
+        report.wal_reads, 1,
+        "all populated classes must share one candidate inventory"
+    );
+    assert_eq!(report.reconciled, 3);
+    assert_eq!(report.objects_removed, 0);
+    assert_eq!(store.read_verified(&reference(BYTES)).unwrap(), BYTES);
+}
+
+#[test]
+fn damaged_manifest_retains_every_object_in_its_class() {
+    let (root, store, session) = fixture();
+    accepted(&root, &store, &session);
+    fs::write(store.root.join("objects/orphan"), b"orphan").unwrap();
+    fs::write(manifest(&store, &session), b"incomplete digest").unwrap();
+    let report = sweep(&root).unwrap();
+    assert_eq!(report.retained_classes, 1);
+    assert_eq!(report.wal_reads, 0);
+    assert_eq!(report.objects_removed, 0);
+    assert_eq!(store.read_verified(&reference(BYTES)).unwrap(), BYTES);
+    assert_eq!(
+        fs::read(store.root.join("objects/orphan")).unwrap(),
+        b"orphan"
+    );
+}
+
+#[test]
+fn preview_preserves_all_files_and_lease_epochs_and_respects_live_writers() {
+    fn snapshot(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut result = BTreeMap::new();
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                result.extend(snapshot(&path));
+            } else {
+                result.insert(path.clone(), fs::read(path).unwrap());
+            }
+        }
+        result
+    }
+    let (root, store, session) = fixture();
+    let leases = FileLeaseStore::new(root.join("leases"));
+    let lease = leases.acquire(&lease_key_for(&session)).unwrap();
+    accepted(&root, &store, &session);
+    store
+        .session(&session)
+        .unwrap()
+        .register_and_append(&reference(REFUSED), REFUSED, || Ok(()))
+        .unwrap();
+    let before = snapshot(&root);
+    let report = preview_sweep(&root).unwrap();
+    assert_eq!(report.leased, 1);
+    assert_eq!(report.objects_removed, 0);
+    assert_eq!(snapshot(&root), before);
+    drop(lease);
+    let report = preview_sweep(&root).unwrap();
+    assert_eq!(report.leased, 0);
+    assert_eq!(report.objects_removed, 1);
+    assert_eq!(snapshot(&root), before);
+    assert_eq!(sweep(&root).unwrap().objects_removed, 1);
 }

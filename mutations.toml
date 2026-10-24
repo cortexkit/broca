@@ -27123,3 +27123,29 @@ expect_red = ["media_store::lifecycle::tests::startup_dispatch_returns_before_sl
 file = "crates/broca-core/src/media_store/lifecycle.rs"
 old = "        .spawn(action)"
 new = "        .spawn({ action(); || {} }) // NON-VACUITY BREAK: run maintenance synchronously before spawning."
+
+[[control]]
+id = "media-sweep-empty-store-skips-wal-inventory"
+guards = "An empty media store needs neither WAL inventory nor the archive pass lock"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::sweep_skips_empty_stores_without_touching_the_wal_corpus"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = '        if !has_objects(&root.join("objects"))? {'
+new = '        if false { // NON-VACUITY BREAK: inventory a class with no objects to reclaim.'
+
+[[control]]
+id = "media-sweep-inventories-only-manifest-candidates"
+guards = "One shared inventory reads only sessions named by manifests or identity sidecars"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::sweep_reads_each_manifest_candidate_once_and_ignores_other_wals"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = "    for address in candidates {"
+new = "    for address in &wal.addresses().map_err(io::Error::other)? { // NON-VACUITY BREAK: decode the unrelated WAL corpus."
