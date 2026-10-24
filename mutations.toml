@@ -27279,3 +27279,29 @@ expect_red = ["conformance::model_history::projected_episode_metadata_equals_a_f
 file = "crates/broca-store/src/lib.rs"
 old = "             episode_metadata_json=?4, episode_metadata_seq=?5 WHERE session=?1"
 new = "             episode_metadata_json=NULL, episode_metadata_seq=?5 WHERE session=?1"
+
+[[control]]
+id = "session-read-no-media-inline-bytes"
+guards = "A no-media inline read retains the pinned page bytes without descriptor identities"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read.rs"
+expect_red = ["session_read::no_media_inline_and_descriptors_response_bytes_are_pinned"]
+file = "crates/broca-module/src/serve.rs"
+old = "        if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {"
+new = "        if true { // NON-VACUITY BREAK: add descriptors to inline reads too."
+
+[[control]]
+id = "session-read-no-media-descriptors-bytes"
+guards = "A no-media descriptors read retains the pinned page bytes and stored content identities"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read.rs"
+expect_red = ["session_read::no_media_inline_and_descriptors_response_bytes_are_pinned"]
+file = "crates/broca-module/src/serve.rs"
+old = "        if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {"
+new = "        if false { // NON-VACUITY BREAK: omit descriptors from opted-in reads."
