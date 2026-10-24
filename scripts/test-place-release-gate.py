@@ -791,11 +791,28 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
 
     def test_live_approval_never_overrides_unknown_live_run_state(self):
         env = self.restart_fixture()
-        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD="exit 2", **env)
+        gate = 'echo "cannot compare: probe reason one" >&2; exit 2'
+        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD=gate, **env)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("gate could not determine live runs", result.stderr)
+        # The refusal names the gate's own reason, not only that it refused.
+        self.assertIn("cannot compare: probe reason one", result.stderr)
         self.assertEqual(self.dest.read_bytes(), self.deployed_bytes)
         self.assertFalse(self.rollback.exists())
+
+    def test_second_gate_that_cannot_tell_names_its_reason(self):
+        # The re-check right before the restart is where a 0.3.254 deploy refused with exit 2 and
+        # no reason, because only live-run lines were printed.
+        env = self.restart_fixture()
+        counter = self.tmp / "gate-called"
+        gate = (
+            f'if [ -f "{counter}" ]; then echo "cannot compare: probe reason two" >&2; exit 2; fi; '
+            f'touch "{counter}"; exit 0'
+        )
+        result = self.place("--restart", "--live-approved", PLACE_RELEASE_GATE_CMD=gate, **env)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("no longer clear (exit 2)", result.stderr)
+        self.assertIn("cannot compare: probe reason two", result.stderr)
 
     def test_live_approved_still_requires_a_new_pid(self):
         env = self.restart_fixture(new_pid=False)
