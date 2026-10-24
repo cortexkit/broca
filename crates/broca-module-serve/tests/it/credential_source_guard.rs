@@ -66,7 +66,13 @@ fn shipped_sources_never_name_another_apps_credential_store() {
             .windows(forbidden.len())
             .any(|window| window == forbidden.as_bytes())
         {
-            offenders.push(file.strip_prefix(&workspace).unwrap().display().to_string());
+            // Repository paths use `/` on every OS, so the message reads the same on Windows.
+            let relative = file.strip_prefix(&workspace).unwrap();
+            let parts: Vec<String> = relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            offenders.push(parts.join("/"));
         }
     }
     for expected in [
