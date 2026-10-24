@@ -21,7 +21,7 @@
 //! puller and the delivery hook that code is written against.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -29,10 +29,9 @@ use std::{
 
 use async_trait::async_trait;
 use broca_core::tool_plane::LateResultRegistration;
-use broca_core::wal_fold::HeldRanges;
 use broca_core::{FileWalStore, HeldCallFacts, WalStore};
-use broca_protocol::{BindIdentity, ToolCallId, ToolOutput, ToolResult};
-use broca_wal::{DispatchOutcome, FramedRecord, PauseReason, WalRangeRecords, WalRecord};
+use broca_protocol::{BindIdentity, ToolCallId};
+use broca_wal::{DispatchOutcome, FramedRecord, WalRangeRecords, WalRecord};
 use cortexkit_role_tool_provider::late_results::{Cursor, EntryKind, IntakeKey, LateEntry};
 
 use crate::late_results_store::{
@@ -103,13 +102,16 @@ impl Classified {
 }
 
 /// Delivers one settled entry to the call's run. The run's batch is the only writer of a held
-/// call's terminal.
+/// call's terminal, and the entry is that terminal's content: the held call is never sent to its
+/// provider again.
 #[async_trait]
 pub trait HeldDelivery: Send + Sync {
-    /// Hand the entry to the call's batch. `Ok(())` means the terminal is durable.
+    /// Hand the entry to the batch of the held call `tool_call_id`. `Ok(())` means the terminal
+    /// is durable.
     async fn deliver(
         &self,
         registration: &LateResultRegistration,
+        tool_call_id: &ToolCallId,
         entry: &LateEntry,
     ) -> Result<(), String>;
 }
@@ -188,7 +190,12 @@ pub struct LateResultsIntake {
     consumer_module: String,
     delivery: Arc<dyn HeldDelivery>,
     feed: Arc<dyn LateResultsFeed>,
+    /// The running pullers, one per provider module. The claim lives only in this process: a
+    /// puller never survives its process, so nothing durable may say one is running.
     pullers: Mutex<HashMap<String, Arc<Puller>>>,
+    /// Set while the store is being rebuilt from the WALs. Until the rebuild completes, no
+    /// registration can be trusted to be missing, so every entry is Blocked and nothing is acked.
+    rebuilding: std::sync::atomic::AtomicBool,
 }
 
 impl LateResultsIntake {
@@ -206,7 +213,18 @@ impl LateResultsIntake {
             delivery,
             feed,
             pullers: Mutex::new(HashMap::new()),
+            rebuilding: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Mark the store as being rebuilt (or done). See [`Self::rebuild_from_wals`].
+    pub fn set_rebuilding(&self, rebuilding: bool) {
+        self.rebuilding
+            .store(rebuilding, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_rebuilding(&self) -> bool {
+        self.rebuilding.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn store(&self) -> &Arc<LateResultsStore> {
@@ -285,46 +303,33 @@ impl LateResultsIntake {
     }
 
     /// Whether the module's feed is still needed, decided from the store's registrations and the
-    /// WALs they name.
+    /// WALs they name: an owed ack, a registered call whose WAL has an open held call or an owed
+    /// batch commit barrier, or a registered WAL that cannot be read (which may hide a hold).
+    ///
+    /// The same pass prunes the registrations that are settled for good, so a registration
+    /// never outlives the commit of the batch that settled its call.
     pub fn module_needs_feed(&self, module: &str) -> Result<bool, String> {
-        if self.store.feed(module)?.is_some_and(|feed| feed.ack_owed) {
-            return Ok(true);
-        }
-        for row in self.store.registrations_for(module)? {
-            if row.state != RegistrationState::Registered {
-                continue;
-            }
-            match self.readable(&row.call.bind) {
-                Some(records) => {
-                    let facts = broca_core::held_call_facts(&records, Some(&row.call.call_key));
-                    if facts.needs_intake() {
-                        return Ok(true);
-                    }
-                }
-                // An unreadable registered WAL may hide a hold, so the feed stays.
-                None => return Ok(true),
-            }
-        }
-        Ok(false)
+        let holds = self.module_holds_calls(module)?;
+        Ok(holds || self.store.feed(module)?.is_some_and(|feed| feed.ack_owed))
     }
 
-    /// Start the module's puller when its feed is still needed and none runs. The claim is one
-    /// synced write, so a second start in this process or after a restart cannot both win.
+    /// Start the module's puller when its feed is still needed and none runs. The claim lives in
+    /// this process only: a puller never outlives its process, so a crash leaves nothing that
+    /// could keep the next process from starting one.
     pub fn ensure_puller(self: &Arc<Self>, module: &str) -> Result<StartOutcome, String> {
-        if self.pullers.lock().expect("pullers").contains_key(module) {
-            return Ok(StartOutcome::Held);
-        }
         if !self.module_needs_feed(module)? {
             return Ok(StartOutcome::Idle);
         }
-        if !self.store.claim_puller(module)? {
-            return Ok(StartOutcome::Held);
-        }
         let puller = Arc::new(Puller::new());
-        self.pullers
-            .lock()
-            .expect("pullers")
-            .insert(module.to_owned(), Arc::clone(&puller));
+        {
+            // The claim is the insert itself, under the lock: two starts racing for one module
+            // cannot both win.
+            let mut pullers = self.pullers.lock().expect("pullers");
+            if pullers.contains_key(module) {
+                return Ok(StartOutcome::Held);
+            }
+            pullers.insert(module.to_owned(), Arc::clone(&puller));
+        }
         self.spawn(module.to_owned(), puller);
         Ok(StartOutcome::Started)
     }
@@ -358,7 +363,6 @@ impl LateResultsIntake {
             }
             let _ = intake.final_pull(&module).await;
             intake.pullers.lock().expect("pullers").remove(&module);
-            let _ = intake.store.release_puller(&module);
         });
     }
 
@@ -412,23 +416,28 @@ impl LateResultsIntake {
     }
 
     /// Whether the module still has a held call or an owed barrier: the condition that outranks
-    /// an abandoned ack.
+    /// an abandoned ack. Prunes every registration whose call is settled for good on the way.
     pub fn module_holds_calls(&self, module: &str) -> Result<bool, String> {
+        let mut holds = false;
         for row in self.store.registrations_for(module)? {
-            if row.state != RegistrationState::Registered {
-                continue;
-            }
             match self.readable(&row.call.bind) {
                 Some(records) => {
                     let facts = broca_core::held_call_facts(&records, Some(&row.call.call_key));
                     if facts.needs_intake() {
-                        return Ok(true);
+                        holds = true;
+                    } else if registration_settled(&row.call.call_key, &records, &facts) {
+                        self.store.remove(module, &row.call.call_key)?;
                     }
                 }
-                None => return Ok(true),
+                None if self.tombstoned(&row.call.bind, &row.call.lineage) => {
+                    // Retention deleted the session: nothing of it can be delivered any more.
+                    self.store.remove(module, &row.call.call_key)?;
+                }
+                // An unreadable registered WAL may hide a hold, so the feed stays.
+                None => holds = true,
             }
         }
-        Ok(false)
+        Ok(holds)
     }
 
     /// Settle the pinned entries again, then deliver everything newer. An entry the ack cannot
@@ -611,6 +620,10 @@ impl LateResultsIntake {
         rows: &[RegistrationRow],
         views: &mut HashMap<BindIdentity, LineageView>,
     ) -> Result<Classified, String> {
+        if self.is_rebuilding() {
+            // A registration missing from a store that is still being rebuilt proves nothing.
+            return Ok(Classified::Blocked("intake_rebuilding".into()));
+        }
         let custodian = self.custodian();
         if entry.custodian != custodian && entry.custodian != self.consumer_module {
             tracing::warn!(
@@ -638,9 +651,10 @@ impl LateResultsIntake {
             );
             return Ok(Classified::NoOp);
         }
-        if matches!(entry.kind(), EntryKind::Unknown(_)) {
-            // An unknown kind is recorded and acked, and leaves the call open: a later entry
-            // with another `event_id` is classified afresh.
+        if !settles_a_call(entry) {
+            // An unknown kind (or `progress`, which only user commands use) is recorded and
+            // acked, never retried, and leaves the call open: a later entry with another
+            // `event_id` is classified afresh.
             return Ok(Classified::NoOp);
         }
         if !views.contains_key(&row.call.bind) {
@@ -673,12 +687,11 @@ impl LateResultsIntake {
             );
             return Ok(Classified::NoOp);
         }
-        if let Some(outcome) = view.facts.terminal(&held.tool_call_id) {
-            return Ok(match outcome {
-                DispatchOutcome::Completed => Classified::Delivered,
-                // A close-out terminal (cancel, stop, mixed crash) means the entry is too late.
-                _ => Classified::NoOp,
-            });
+        if view.facts.terminal(&held.tool_call_id).is_some() {
+            // The call already has its terminal: this entry was delivered before (its ack was
+            // lost, or the provider restarted and re-served it), or the call was closed out. Either
+            // way it is acked as a no-op and never written a second time.
+            return Ok(Classified::NoOp);
         }
         if view.closing {
             return Ok(Classified::NoOp);
@@ -732,26 +745,14 @@ impl LateResultsIntake {
                     continue;
                 }
             };
-            match entry_result(&held_call_id, entry) {
-                Some(_) => {
-                    self.delivery.deliver(&row.call, entry).await?;
-                    // The batch wrote the call's terminal: a later entry for the same call is
-                    // then too late, and this memory keeps that decision across re-reads.
-                    self.store.remember_held_terminal(
-                        module,
-                        &row.call.call_key,
-                        &held_call_id,
-                        "completed",
-                    )?;
-                    self.store
-                        .record_receipt(&key, &entry.kind, Disposition::Delivered)?;
-                    self.store.mark_settled(module, &row.call.call_key)?;
-                }
-                None => {
-                    self.store
-                        .record_receipt(&key, &entry.kind, Disposition::NoOp)?;
-                }
-            }
+            self.delivery
+                .deliver(&row.call, &held_call_id, entry)
+                .await?;
+            // The batch synced the call's terminal before `deliver` returned, so the WAL now
+            // answers any re-read of this entry as already settled; the receipt only spares the
+            // re-read until the ack lands.
+            self.store
+                .record_receipt(&key, &entry.kind, Disposition::Delivered)?;
         }
         Ok(())
     }
@@ -913,39 +914,155 @@ fn scope_matches(registration: &LateResultRegistration, entry: &LateEntry) -> bo
     }
 }
 
-/// One scanned WAL: its session identity and its records.
-pub type ScanVisitor<'a> = dyn FnMut(&BindIdentity, &[FramedRecord]) -> Result<(), String> + 'a;
+/// Whether an entry of this kind settles its call: `result`, `not_started` and `expired` do.
+/// `progress` (user commands only) and kinds this build does not know settle nothing.
+fn settles_a_call(entry: &LateEntry) -> bool {
+    matches!(
+        entry.kind(),
+        EntryKind::Result | EntryKind::NotStarted | EntryKind::Expired
+    )
+}
 
-/// Scan every live WAL under the state root and hand each to `visit`. Used by the rebuild; a WAL
-/// that cannot be read aborts it, so a rebuilt store is never partial.
-pub fn scan_every_wal(wal: &FileWalStore, visit: &mut ScanVisitor<'_>) -> Result<(), String> {
+/// Whether a registered call is settled for good, so its registration may be pruned: the WAL
+/// holds a terminal for it and no batch in the WAL still owes its commit barrier.
+///
+/// The call is found by its key: a held record naming it, an approved call's intent carrying
+/// it, or a plain call's intent at the WAL sequence the key ends in (`<lineage>:<intent seq>`).
+/// A key that names nothing in the WAL is never pruned here: the registration is written right
+/// after the intent, and a read racing that write must not conclude the call is gone.
+fn registration_settled(call_key: &str, records: &[FramedRecord], facts: &HeldCallFacts) -> bool {
+    if facts.barrier_owed {
+        return false;
+    }
+    let held = facts
+        .held_call(call_key)
+        .map(|held| held.tool_call_id.clone());
+    let intent_seq = call_key
+        .rsplit_once(':')
+        .and_then(|(_, seq)| seq.parse::<u64>().ok());
+    let call = held.or_else(|| {
+        records.iter().find_map(|frame| match &frame.record {
+            WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                call_key: stored,
+                ..
+            } if stored.as_deref() == Some(call_key) || Some(frame.seq) == intent_seq => {
+                Some(tool_call_id.clone())
+            }
+            _ => None,
+        })
+    });
+    let Some(call) = call else {
+        return false;
+    };
+    records.iter().any(|frame| match &frame.record {
+        WalRecord::ToolResult { result, .. } => result.tool_call_id == call,
+        WalRecord::ToolNoDispatch { tool_call_id, .. } => *tool_call_id == call,
+        _ => false,
+    })
+}
+
+/// The bytes every frame carrying a `ToolCallProviderHeld` record (and every `tool_held` pause)
+/// holds verbatim: the feature its gated frame requires. A WAL without them has no held call,
+/// so the rebuild skips it without decoding a single frame.
+const HELD_FRAME_MARKER: &[u8] = b"provider-held/v1";
+
+/// How far the rebuild scanned, for the operator's log and for the measurement test.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RebuildReport {
+    /// WAL files looked at.
+    pub files: usize,
+    /// WAL files that held the marker and were decoded.
+    pub decoded: usize,
+    /// Registrations written.
+    pub registered: usize,
+    /// Marked WALs that could not be decoded; the rebuild is incomplete while any remain.
+    pub unreadable: Vec<std::path::PathBuf>,
+}
+
+/// Whether `path` holds `marker` anywhere, read in bounded chunks so a large WAL never sits in
+/// memory whole.
+fn file_contains(path: &Path, marker: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read;
+    const CHUNK: usize = 1 << 20;
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = vec![0u8; CHUNK + marker.len()];
+    let mut kept = 0usize;
+    loop {
+        let read = file.read(&mut buffer[kept..])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let filled = kept + read;
+        if buffer[..filled]
+            .windows(marker.len())
+            .any(|window| window == marker)
+        {
+            return Ok(true);
+        }
+        // Keep the tail that could start a marker split across two reads.
+        kept = (marker.len() - 1).min(filled);
+        buffer.copy_within(filled - kept..filled, 0);
+    }
+}
+
+/// Rebuild a missing or unreadable intake store from the live WALs, never from the run index.
+///
+/// Every live WAL under the state root's `wal`, `wal-ephemeral` and `wal-durable` trees is
+/// looked at, but only those holding a provider-held frame are decoded. Each `ToolCallProviderHeld` found, open or closed,
+/// is registered under the session its `RunStarted` names, and its module's feed is marked as
+/// owing an ack whose position is unknown, so an ack owed before the store was lost is still
+/// made. Archives are not scanned: the fold never takes a range holding a held call.
+///
+/// Calls that were dispatched but never held are not registered. After a restart such a call
+/// is closed by recovery (an unknown outcome, never re-sent), so any entry for it can only be a
+/// no-op, and acking it unregistered is safe.
+pub fn rebuild_store_from_wals(
+    store: &LateResultsStore,
+    state_root: &Path,
+) -> Result<RebuildReport, String> {
+    let mut report = RebuildReport::default();
     for tree in ["wal", "wal-ephemeral", "wal-durable"] {
-        let directory = wal.root().join(tree);
+        let directory = state_root.join(tree);
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(format!("list {}: {error}", directory.display())),
         };
-        let mut paths: Vec<std::path::PathBuf> = entries
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<_, _>>()
-            .map_err(|error| error.to_string())?;
-        paths.sort();
-        for path in paths {
+        for entry in entries {
+            let path = entry.map_err(|error| error.to_string())?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
                 continue;
             }
-            let range = broca_wal::file_wal::read_records_range(
+            report.files += 1;
+            match file_contains(&path, HELD_FRAME_MARKER) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(_) => {
+                    report.unreadable.push(path);
+                    continue;
+                }
+            }
+            report.decoded += 1;
+            let range = match broca_wal::file_wal::read_records_range(
                 &path,
                 broca_wal::file_wal::DEFAULT_MAX_READ_BYTES,
                 0,
                 None,
                 None,
-            )
-            .map_err(|error| error.to_string())?;
+            ) {
+                Ok(range) => range,
+                Err(_) => {
+                    report.unreadable.push(path);
+                    continue;
+                }
+            };
             let records = match range.records() {
                 WalRangeRecords::Complete(records) => records,
-                _ => return Err(format!("unreadable WAL {}", path.display())),
+                _ => {
+                    report.unreadable.push(path);
+                    continue;
+                }
             };
             let Some(session) = records.iter().find_map(|frame| match &frame.record {
                 WalRecord::RunStarted { session, .. } => Some(session.clone()),
@@ -953,198 +1070,52 @@ pub fn scan_every_wal(wal: &FileWalStore, visit: &mut ScanVisitor<'_>) -> Result
             }) else {
                 continue;
             };
-            visit(&session, records)?;
+            let calls = held_registrations(records, &session);
+            for call in &calls {
+                store.ensure_feed(&call.module, true)?;
+            }
+            match store.register_calls(&calls) {
+                Ok(()) => report.registered += calls.len(),
+                // Two WALs naming one key cannot both own it; keep the first and say so.
+                Err(error) => tracing::warn!(
+                    target: "late_results",
+                    wal = %path.display(),
+                    "late-results rebuild skipped a WAL's held calls: {error}"
+                ),
+            }
         }
     }
-    Ok(())
+    Ok(report)
 }
 
-/// The registrations a rebuilt store takes from one WAL: every `ToolCallProviderHeld`, open or
-/// closed, and every intent that has a module and no terminal. The intent group is a safe
-/// superset, because a plain intent stores no key and the capability at send time is not
-/// recorded; the run's own recovery settles the ones that were never held.
-pub fn rebuild_registrations(
+/// The registrations a rebuilt store takes from one WAL: one per `ToolCallProviderHeld`, open or
+/// closed.
+pub fn held_registrations(
     records: &[FramedRecord],
     session: &BindIdentity,
 ) -> Vec<LateResultRegistration> {
     let mut calls: Vec<LateResultRegistration> = Vec::new();
     for frame in records {
-        match &frame.record {
-            WalRecord::ToolCallProviderHeld {
-                call_key, module, ..
-            } => {
-                if let Some((lineage, _)) = call_key.rsplit_once(':') {
-                    push_registration(&mut calls, session, lineage, call_key, module);
-                }
+        if let WalRecord::ToolCallProviderHeld {
+            call_key, module, ..
+        } = &frame.record
+        {
+            let Some((lineage, _)) = call_key.rsplit_once(':') else {
+                continue;
+            };
+            if calls.iter().any(|call| &call.call_key == call_key) {
+                continue;
             }
-            WalRecord::ToolDispatchIntent {
-                tool_call_id,
-                call_key: Some(call_key),
-                module_id: Some(module),
-                ..
-            } => {
-                let terminal = records.iter().any(|frame| match &frame.record {
-                    WalRecord::ToolResult { result, .. } => &result.tool_call_id == tool_call_id,
-                    WalRecord::ToolNoDispatch {
-                        tool_call_id: id, ..
-                    } => id == tool_call_id,
-                    _ => false,
-                });
-                if terminal {
-                    continue;
-                }
-                if let Some((lineage, _)) = call_key.rsplit_once(':') {
-                    push_registration(&mut calls, session, lineage, call_key, module);
-                }
-            }
-            _ => {}
+            calls.push(LateResultRegistration {
+                lineage: lineage.to_owned(),
+                call_key: call_key.clone(),
+                module: module.clone(),
+                bind: session.clone(),
+                scope: None,
+            });
         }
     }
     calls
-}
-
-fn push_registration(
-    calls: &mut Vec<LateResultRegistration>,
-    session: &BindIdentity,
-    lineage: &str,
-    call_key: &str,
-    module: &str,
-) {
-    if calls.iter().any(|call| call.call_key == call_key) {
-        return;
-    }
-    calls.push(LateResultRegistration {
-        lineage: lineage.to_owned(),
-        call_key: call_key.to_owned(),
-        module: module.to_owned(),
-        bind: session.clone(),
-        scope: None,
-    });
-}
-
-/// The tool result a delivered entry becomes. A `progress` entry is not a settlement, so it has
-/// none and is never delivered.
-pub fn entry_result(tool_call_id: &ToolCallId, entry: &LateEntry) -> Option<ToolResult> {
-    let (output, is_error) = match entry.kind() {
-        EntryKind::Result => match &entry.result {
-            Some(result) => (
-                ToolOutput::Json {
-                    value: result.clone(),
-                },
-                result
-                    .get("isError")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false),
-            ),
-            None => (
-                ToolOutput::Error {
-                    message: "this call was held and the provider settled it without a result"
-                        .into(),
-                },
-                true,
-            ),
-        },
-        EntryKind::NotStarted => (
-            ToolOutput::Error {
-                message: format!(
-                    "this call never ran: the provider settled it as not started ({})",
-                    entry.reason.as_deref().unwrap_or("no reason given")
-                ),
-            },
-            true,
-        ),
-        EntryKind::Expired => (
-            ToolOutput::Error {
-                message: "the result of this call expired before it was collected".into(),
-            },
-            true,
-        ),
-        // `EntryKind` is open: a kind this build does not know settles nothing for the model.
-        EntryKind::Progress | EntryKind::Unknown(_) => return None,
-        _ => return None,
-    };
-    Some(ToolResult {
-        tool_call_id: tool_call_id.clone(),
-        output,
-        is_error,
-    })
-}
-
-/// The fold's view of the intake store. The fold itself never archives a range with an open held
-/// call; this only tells it whether the store is present, so a store-aware caller can keep the
-/// ranges a missing store cannot vouch for.
-pub fn fold_held_ranges(store: &LateResultsStore) -> HeldRanges {
-    HeldRanges::Store(broca_core::wal_fold::StoreHeld {
-        complete: store.path().is_file(),
-    })
-}
-
-/// The run's pause reasons that leave a provider-held call waiting.
-pub fn holding_pause(reason: PauseReason) -> bool {
-    matches!(reason, PauseReason::ToolHeld | PauseReason::Restart)
-}
-
-/// A feed that cannot answer, so the intake's puller backs off and never acks.
-pub struct UnavailableFeed {
-    reason: String,
-}
-
-impl UnavailableFeed {
-    pub fn new(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl LateResultsFeed for UnavailableFeed {
-    async fn pull(
-        &self,
-        _module: &str,
-        _since: Option<&Cursor>,
-        _limit: Option<u32>,
-    ) -> Result<FeedReply, FeedError> {
-        Err(FeedError::Retryable(self.reason.clone()))
-    }
-
-    async fn ack(&self, _module: &str, _through: &Cursor) -> Result<(), FeedError> {
-        Err(FeedError::Retryable(self.reason.clone()))
-    }
-}
-
-/// The staged build of the intake: a store plus the state it reads, before a feed exists.
-pub struct IntakeBuild {
-    pub store: Arc<LateResultsStore>,
-    pub wal: Arc<FileWalStore>,
-    pub consumer_module: String,
-}
-
-impl IntakeBuild {
-    /// Bind the intake once a feed and a delivery exist.
-    pub fn finish(
-        self,
-        delivery: Arc<dyn HeldDelivery>,
-        feed: Arc<dyn LateResultsFeed>,
-    ) -> Arc<LateResultsIntake> {
-        LateResultsIntake::new(self.store, self.wal, self.consumer_module, delivery, feed)
-    }
-}
-
-/// Names every puller that should run, drawn from the store alone.
-pub fn modules_needing_feed(store: &LateResultsStore) -> Result<BTreeSet<String>, String> {
-    let mut modules = BTreeSet::new();
-    for feed in store.feeds()? {
-        if feed.ack_owed || feed.puller {
-            modules.insert(feed.module);
-        }
-    }
-    for row in store.registration_rows()? {
-        if row.state == RegistrationState::Registered {
-            modules.insert(row.call.module);
-        }
-    }
-    Ok(modules)
 }
 
 #[cfg(test)]
@@ -1162,9 +1133,14 @@ mod tests {
         pulls: Mutex<Vec<(Option<Cursor>, Option<u32>)>>,
         acks: Mutex<Vec<Cursor>>,
         pull_error: Mutex<Option<FeedError>>,
+        /// The next ack is lost on its way, as a transport failure would lose it.
+        fail_ack: Mutex<bool>,
     }
 
     impl ScriptedFeed {
+        fn fail_ack_once(&self) {
+            *self.fail_ack.lock().unwrap() = true;
+        }
         fn replies(&self, replies: Vec<FeedReply>) {
             *self.replies.lock().unwrap() = replies;
         }
@@ -1199,6 +1175,9 @@ mod tests {
         }
 
         async fn ack(&self, _module: &str, through: &Cursor) -> Result<(), FeedError> {
+            if std::mem::take(&mut *self.fail_ack.lock().unwrap()) {
+                return Err(FeedError::Retryable("ack lost".into()));
+            }
             self.acks.lock().unwrap().push(through.clone());
             Ok(())
         }
@@ -1223,6 +1202,7 @@ mod tests {
         async fn deliver(
             &self,
             registration: &LateResultRegistration,
+            _tool_call_id: &ToolCallId,
             entry: &LateEntry,
         ) -> Result<(), String> {
             if let Some(reason) = self.refuse.lock().unwrap().clone() {
@@ -1663,16 +1643,10 @@ mod tests {
         rig.intake.tick("tools").await.unwrap();
         assert_eq!(rig.feed.acks(), vec![cursor(1)]);
         assert!(rig.delivery.delivered.lock().unwrap().is_empty());
-        assert_eq!(
-            rig.store
-                .registration("tools", call_key)
-                .unwrap()
-                .unwrap()
-                .state,
-            RegistrationState::Registered,
+        assert!(
+            rig.store.registration("tools", call_key).unwrap().is_some(),
             "an unknown kind does not settle the call"
         );
-        assert_eq!(rig.store.held_terminal("tools", call_key).unwrap(), None);
         rig.feed.replies(vec![reply(
             vec![entry(kinds::RESULT, call_key, "ev-2")],
             2,
@@ -1743,9 +1717,10 @@ mod tests {
     async fn an_entry_for_a_call_dispatched_to_another_module_is_a_no_op() {
         let call_key = "lineage:4";
         let bind = session("held");
+        // The WAL holds the call as held by `other`, while the entry arrives on `tools`' feed.
         let rig = Rig::new(
             "other-module",
-            Some((call_key, "tools", bind.clone())),
+            Some((call_key, "other", bind.clone())),
             vec![registration(call_key, "tools", &bind)],
         )
         .await;
@@ -1755,15 +1730,9 @@ mod tests {
             1,
             false,
         )]);
-        // The registered lineage records the call as dispatched to another module.
-        assert!(rig
-            .intake
-            .lineage_view(&registration(call_key, "tools", &bind))
-            .facts
-            .held_call(call_key)
-            .is_some());
         rig.intake.tick("tools").await.unwrap();
-        assert_eq!(rig.delivery.delivered.lock().unwrap().len(), 1);
+        assert!(rig.delivery.delivered.lock().unwrap().is_empty());
+        assert_eq!(rig.feed.acks(), vec![cursor(1)]);
     }
 
     #[tokio::test]
@@ -1861,17 +1830,10 @@ mod tests {
             StartOutcome::Held
         );
         assert_eq!(rig.intake.running(), vec!["tools".to_owned()]);
-        assert!(
-            !rig.store.claim_puller("tools").unwrap(),
-            "the module's slot is taken"
-        );
     }
 
-    #[test]
-    fn a_rebuild_registers_open_held_calls_from_their_wal() {
-        let bind = session("held");
-        let records = held_records("lineage:4", "tools", &bind);
-        let framed: Vec<FramedRecord> = records
+    fn framed(records: Vec<WalRecord>) -> Vec<FramedRecord> {
+        records
             .into_iter()
             .enumerate()
             .map(|(index, record)| FramedRecord {
@@ -1879,44 +1841,335 @@ mod tests {
                 fence: 1,
                 record,
             })
-            .collect();
-        let calls = rebuild_registrations(&framed, &bind);
+            .collect()
+    }
+
+    /// The held records of `held_records`, followed by the call's delivered terminal and the
+    /// batch's commit: the call was answered and its run went on.
+    fn delivered_records(call_key: &str, module: &str, bind: &BindIdentity) -> Vec<WalRecord> {
+        let mut records = held_records(call_key, module, bind);
+        records.push(WalRecord::ToolResult {
+            finished_at_ms: None,
+            tags: None,
+            hooks: None,
+            batch_id: BatchId("b".into()),
+            result: Arc::new(broca_protocol::ToolResult {
+                tool_call_id: ToolCallId("a".into()),
+                output: broca_protocol::ToolOutput::Text {
+                    text: "late".into(),
+                },
+                is_error: false,
+            }),
+            outcome: DispatchOutcome::Completed,
+            reason: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+        });
+        records.push(WalRecord::ToolBatchFinished {
+            batch_id: BatchId("b".into()),
+        });
+        records
+    }
+
+    #[test]
+    fn a_rebuild_registers_every_held_call_from_its_wal() {
+        let bind = session("held");
+        let calls = held_registrations(&framed(held_records("lineage:4", "tools", &bind)), &bind);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].call_key, "lineage:4");
         assert_eq!(calls[0].module, "tools");
         assert_eq!(calls[0].bind, bind);
     }
 
+    /// A store rebuilt from the WAL trees registers the held calls it finds (open or closed),
+    /// marks their feeds as owing an ack, and decodes only the WALs that hold a held frame.
     #[test]
-    fn a_held_entry_becomes_a_tool_result_and_progress_settles_nothing() {
-        let id = ToolCallId("a".into());
-        let not_started = LateEntry::new(
-            kinds::NOT_STARTED,
-            "reserved:broca",
-            "ref",
-            1,
-            "reserved:broca",
-            "lineage:4",
-            "ev-1",
-            1,
-        )
-        .with_reason("restart_before_dispatch");
-        let result = entry_result(&id, &not_started).unwrap();
-        assert!(result.is_error);
-        assert!(matches!(
-            &result.output,
-            ToolOutput::Error { message } if message.contains("restart_before_dispatch")
-        ));
-        let progress = LateEntry::new(
-            kinds::PROGRESS,
-            "reserved:broca",
-            "ref",
-            1,
-            "reserved:broca",
-            "lineage:4",
-            "ev-2",
-            1,
+    fn a_rebuilt_store_registers_held_calls_and_owes_their_feeds_an_ack() {
+        let root = rig_root("rebuild");
+        let _ = std::fs::remove_dir_all(&root);
+        let wal_root = root.join("wal-root");
+        let open = session("open-held");
+        let closed = session("closed-held");
+        let wal = FileWalStore::new(wal_root.join("wal"));
+        write_wal_gated(&wal, &open, &held_records("lineage:4", "tools", &open));
+        write_wal_gated(
+            &wal,
+            &closed,
+            &delivered_records("lineage:7", "core", &closed),
         );
-        assert!(entry_result(&id, &progress).is_none());
+        quiet_bind("never-held", &wal_root.join("wal"));
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let report = rebuild_store_from_wals(&store, &wal_root).unwrap();
+        assert_eq!(report.files, 3);
+        assert_eq!(
+            report.decoded, 2,
+            "only WALs holding a held frame are decoded"
+        );
+        assert!(report.unreadable.is_empty());
+        let mut keys: Vec<String> = store
+            .registrations()
+            .unwrap()
+            .into_iter()
+            .map(|call| call.call_key)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["lineage:4", "lineage:7"]);
+        assert!(store.feed("tools").unwrap().unwrap().ack_owed);
+        assert!(store.feed("core").unwrap().unwrap().ack_owed);
+    }
+
+    /// Write one session's records as a real writer frames them, gated frames included, so a
+    /// held frame carries the feature name the rebuild looks for.
+    fn write_wal_gated(wal: &FileWalStore, bind: &BindIdentity, records: &[WalRecord]) {
+        let path = wal.wal_path(bind);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes: Vec<u8> = records
+            .iter()
+            .enumerate()
+            .flat_map(|(index, record)| {
+                broca_wal::framing::encode(index as u64 + 1, 1, record).unwrap()
+            })
+            .collect();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// While the store is being rebuilt, no missing registration proves anything: every entry is
+    /// Blocked, nothing is delivered and nothing is acked.
+    #[tokio::test]
+    async fn while_the_store_is_rebuilding_nothing_is_delivered_or_acked() {
+        let call_key = "lineage:4";
+        let bind = session("held");
+        let rig = Rig::new(
+            "rebuilding",
+            Some((call_key, "tools", bind.clone())),
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        rig.intake.set_rebuilding(true);
+        let _puller = rig.puller("tools");
+        rig.feed.replies(vec![reply(
+            vec![
+                entry(kinds::RESULT, call_key, "ev-1"),
+                entry(kinds::RESULT, "lineage:9", "ev-2"),
+            ],
+            2,
+            false,
+        )]);
+        rig.intake.tick("tools").await.unwrap();
+        assert!(rig.delivery.delivered.lock().unwrap().is_empty());
+        assert!(rig.feed.acks().is_empty(), "{:?}", rig.feed.acks());
+    }
+
+    /// An entry whose held call already has its terminal (the entry was delivered and its ack
+    /// lost, or the provider re-served it after a restart) is acked as a no-op: the result is
+    /// never handed to the run a second time.
+    #[tokio::test]
+    async fn an_entry_for_a_call_that_already_has_its_terminal_is_acked_and_not_delivered() {
+        let call_key = "lineage:4";
+        let bind = session("answered");
+        let rig = Rig::new(
+            "answered",
+            None,
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        write_wal_root(
+            &rig.root.join("wal"),
+            &bind,
+            &delivered_records(call_key, "tools", &bind),
+        );
+        let _puller = rig.puller("tools");
+        rig.feed.replies(vec![reply(
+            vec![entry(kinds::RESULT, call_key, "ev-1")],
+            1,
+            false,
+        )]);
+        rig.intake.tick("tools").await.unwrap();
+        assert!(rig.delivery.delivered.lock().unwrap().is_empty());
+        assert_eq!(rig.feed.acks(), vec![cursor(1)]);
+    }
+
+    /// The same entry pulled twice before its ack lands is handed over once: the second read
+    /// finds the first delivery under its `(provider, custodian, call_key, event_id)` key.
+    #[tokio::test]
+    async fn the_same_entry_read_twice_is_delivered_once() {
+        let call_key = "lineage:4";
+        let bind = session("held");
+        let rig = Rig::new(
+            "dedupe",
+            Some((call_key, "tools", bind.clone())),
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        let _puller = rig.puller("tools");
+        // The ack of the first read is lost, so the provider serves the entry again.
+        rig.feed.fail_ack_once();
+        rig.feed.replies(vec![
+            reply(vec![entry(kinds::RESULT, call_key, "ev-1")], 1, false),
+            reply(vec![entry(kinds::RESULT, call_key, "ev-1")], 1, false),
+        ]);
+        let _ = rig.intake.tick("tools").await;
+        rig.intake.tick("tools").await.unwrap();
+        assert_eq!(
+            rig.delivery.delivered.lock().unwrap().clone(),
+            vec![(call_key.to_owned(), "ev-1".to_owned())]
+        );
+        assert_eq!(rig.feed.acks(), vec![cursor(1)]);
+    }
+
+    /// An `expired` entry is the call's terminal answer: it is handed to the run like a result,
+    /// never dropped as a no-op and never left pending.
+    #[tokio::test]
+    async fn an_expired_entry_is_delivered_as_the_calls_terminal() {
+        let call_key = "lineage:4";
+        let bind = session("held");
+        let rig = Rig::new(
+            "expired",
+            Some((call_key, "tools", bind.clone())),
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        let _puller = rig.puller("tools");
+        let mut expired = entry(kinds::EXPIRED, call_key, "ev-1");
+        expired.result = None;
+        rig.feed.replies(vec![reply(vec![expired], 1, false)]);
+        rig.intake.tick("tools").await.unwrap();
+        assert_eq!(
+            rig.delivery.delivered.lock().unwrap().clone(),
+            vec![(call_key.to_owned(), "ev-1".to_owned())]
+        );
+        assert_eq!(rig.feed.acks(), vec![cursor(1)]);
+    }
+
+    /// A `progress` entry settles nothing: it is acked and the call stays open.
+    #[tokio::test]
+    async fn a_progress_entry_is_acked_and_settles_nothing() {
+        let call_key = "lineage:4";
+        let bind = session("held");
+        let rig = Rig::new(
+            "progress",
+            Some((call_key, "tools", bind.clone())),
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        let _puller = rig.puller("tools");
+        rig.feed.replies(vec![reply(
+            vec![entry(kinds::PROGRESS, call_key, "ev-1")],
+            1,
+            false,
+        )]);
+        rig.intake.tick("tools").await.unwrap();
+        assert!(rig.delivery.delivered.lock().unwrap().is_empty());
+        assert_eq!(rig.feed.acks(), vec![cursor(1)]);
+        assert!(rig.store.registration("tools", call_key).unwrap().is_some());
+    }
+
+    /// A registration whose call has its terminal and whose batch committed is pruned by the
+    /// puller's pass; a call still held keeps its registration and its feed.
+    #[tokio::test]
+    async fn a_settled_registration_is_pruned_and_a_held_one_is_kept() {
+        let held_key = "lineage:4";
+        let done_key = "lineage:7";
+        let held = session("held");
+        let done = session("done");
+        let rig = Rig::new(
+            "prune",
+            Some((held_key, "tools", held.clone())),
+            vec![
+                registration(held_key, "tools", &held),
+                registration(done_key, "tools", &done),
+            ],
+        )
+        .await;
+        write_wal_root(
+            &rig.root.join("wal"),
+            &done,
+            &delivered_records(done_key, "tools", &done),
+        );
+        assert!(rig.intake.module_needs_feed("tools").unwrap());
+        let kept: Vec<String> = rig
+            .store
+            .registrations()
+            .unwrap()
+            .into_iter()
+            .map(|call| call.call_key)
+            .collect();
+        assert_eq!(kept, [held_key]);
+    }
+
+    fn peak_rss_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse().ok())
+    }
+
+    /// The rebuild's cost on a state root the size of production's (about 235,000 session WALs),
+    /// one in a thousand holding a held call. Run it on purpose:
+    /// `cargo test -p broca-module --lib -- --ignored rebuild_scan_cost --nocapture`.
+    /// `BROCA_REBUILD_BENCH_FILES` and `BROCA_REBUILD_BENCH_BYTES` (each WAL's size) change the
+    /// shape. It prints the time and the process's peak memory before and after the scan.
+    #[test]
+    #[ignore = "measurement on a production-sized synthetic state root; run on purpose"]
+    fn rebuild_scan_cost_on_a_production_sized_state_root() {
+        let files: usize = std::env::var("BROCA_REBUILD_BENCH_FILES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(235_000);
+        let bytes: usize = std::env::var("BROCA_REBUILD_BENCH_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4096);
+        const HELD_EVERY: usize = 1000;
+        let root = rig_root("rebuild-bench");
+        let _ = std::fs::remove_dir_all(&root);
+        let wal_root = root.join("wal-root");
+        let tree = wal_root.join("wal");
+        std::fs::create_dir_all(&tree).unwrap();
+        let frames = |records: &[WalRecord]| -> Vec<u8> {
+            records
+                .iter()
+                .enumerate()
+                .flat_map(|(index, record)| {
+                    broca_wal::framing::encode(index as u64 + 1, 1, record).unwrap()
+                })
+                .collect()
+        };
+        let step: WalRecord =
+            serde_json::from_str(r#"{"type":"step_started","step_id":1}"#).unwrap();
+        let started = std::time::Instant::now();
+        for index in 0..files {
+            let bind = session(&format!("bench-{index}"));
+            let mut records = if index % HELD_EVERY == 0 {
+                held_records(&format!("lineage-{index}:4"), "tools", &bind)
+            } else {
+                let mut records = held_records("unused:1", "tools", &bind);
+                records.truncate(1);
+                records
+            };
+            let mut encoded = frames(&records);
+            while encoded.len() < bytes {
+                records.push(step.clone());
+                encoded = frames(&records);
+            }
+            std::fs::write(tree.join(format!("{index:08}.wal")), encoded).unwrap();
+        }
+        let generated_ms = started.elapsed().as_millis();
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let rss_before = peak_rss_kb();
+        let started = std::time::Instant::now();
+        let report = rebuild_store_from_wals(&store, &wal_root).unwrap();
+        let elapsed_ms = started.elapsed().as_millis();
+        let rss_after = peak_rss_kb();
+        println!(
+            "REBUILD-BENCH files={} bytes_per_wal={bytes} decoded={} registered={} generate_ms={generated_ms} rebuild_ms={elapsed_ms} peak_rss_kb_before={rss_before:?} peak_rss_kb_after={rss_after:?}",
+            report.files, report.decoded, report.registered
+        );
+        assert_eq!(report.files, files);
+        assert_eq!(report.decoded, files.div_ceil(HELD_EVERY));
+        assert!(report.unreadable.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

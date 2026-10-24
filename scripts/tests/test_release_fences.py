@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 CLOCK_MARKER = "BROCA_TEST_CLOCK_RETENTION_CLOCK_OVERRIDE_V1"
 RETRY_MARKER = "BROCA_TEST_HARNESS_VIRTUAL_RETRY_WAITS_V1"
+HELD_REPLY_MARKER = "BROCA_TEST_DECLARE_HELD_REPLY_V1"
 
 spec = importlib.util.spec_from_file_location("placement_fixture", ROOT / "scripts/test-place-release-gate.py")
 placement = importlib.util.module_from_spec(spec)
@@ -56,6 +57,18 @@ class RetryMarkerStaging(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("test-clock absent (planted strings control reads 1)", result.stdout)
         self.assertIn("test-harness absent (planted strings control reads 1)", result.stdout)
+        self.assertIn("held-reply-declaration absent (planted strings control reads 1)", result.stdout)
+
+    def test_held_reply_declaration_marker_refuses_artifact(self):
+        result = self.probe(b"ordinary control\0" + HELD_REPLY_MARKER.encode() + b"\0")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("artifact contains the held-reply-declaration override marker", result.stderr)
+
+    def test_held_reply_declaration_exists_only_in_debug_builds(self):
+        source = (ROOT / "crates/broca-module-serve/src/held_runtime.rs").read_text()
+        constant = re.search(r"((?:\s*(?:#\[[^\n]+\]|///[^\n]*)\n)+)\s*pub const DECLARE_HELD_REPLY_ENV: &str = \"" + HELD_REPLY_MARKER + "\";", source)
+        self.assertIsNotNone(constant, "the marker names the debug-only environment variable")
+        self.assertIn("#[cfg(debug_assertions)]", constant[1])
 
     def test_retry_path_carries_the_marker(self):
         source = (ROOT / "crates/broca-provider/src/transport.rs").read_text()

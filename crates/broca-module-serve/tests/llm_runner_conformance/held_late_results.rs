@@ -1,0 +1,553 @@
+//! Provider-held calls end to end: a real `ck-subc`, a supervised `ck-broca` whose tool routes
+//! declare `content/v1` and `held-reply/v1` (a debug-only switch), and the scripted tool
+//! provider answering one call `held` and settling it later through its `late_results` feed.
+//!
+//! What these cases hold broca to:
+//! - the held reply parks the run durably (`ToolCallProviderHeld`, then `RunPaused {tool_held}`)
+//!   with nothing sent to the model and the interim text never in any prompt;
+//! - the late entry is pulled under broca's own principal, written as the held call's
+//!   `ToolResult` in its original batch, synced, acked through the provider's cursor, and the run
+//!   continues in the same turn;
+//! - the held call is sent to the provider exactly once, whatever is killed when: a kill between
+//!   the pause and the pull, or after the result is written and before its ack, neither writes the
+//!   result twice nor runs the call again.
+
+use super::*;
+use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
+use cortexkit_role_tool_provider::late_results::{kinds, LateEntry};
+
+/// The scripted provider's one incarnation: it lives in the test process, so a broca restart
+/// does not restart it.
+const INCARNATION: &str = "conformance-provider-1";
+/// The interim content of every held reply. It must never reach the model.
+const INTERIM: &str = "HELD INTERIM: the answer comes later";
+
+/// The scripted provider's held calls and its `late_results` feed.
+#[derive(Default)]
+pub(super) struct FeedState {
+    /// The catalog declares `late_results` and `content/v1`, and calls in `hold` are held.
+    enabled: bool,
+    /// Arguments (as JSON text) of the calls the provider holds.
+    hold: BTreeSet<String>,
+    /// Route channels whose bind declared both `content/v1` and `held-reply/v1`.
+    declared_routes: BTreeSet<(u16, u32)>,
+    /// The call key each held call carried, by its arguments' JSON text.
+    held_keys: HashMap<String, String>,
+    /// Every entry published, in order; an entry's position is its index plus one.
+    entries: Vec<LateEntry>,
+    /// The highest position acked.
+    acked: u64,
+    /// Every ack's position, in order.
+    acks: Vec<u64>,
+    /// How many acks arrived, including those held unanswered.
+    ack_attempts: usize,
+    /// Leave acks unanswered (and unrecorded), so the rig can kill broca while one is in flight.
+    hold_acks: bool,
+}
+
+/// Add the provider-held declarations to a catalog answer while the feed is enabled: the
+/// `late_results` session capability and the `content/v1` result format on every tool.
+pub(super) fn declare_in_catalog(shared: &Shared, answer: &mut Value) {
+    if !shared.held_feed.lock().unwrap().enabled {
+        return;
+    }
+    answer["capabilities"] = json!({"late_results": true});
+    if let Some(tools) = answer["tools"].as_array_mut() {
+        for tool in tools {
+            tool["result_format"] = json!("content/v1");
+        }
+    }
+}
+
+/// Remember whether a route's bind declared both held-reply capabilities: the provider holds a
+/// call only on such a route (contract §4.1).
+pub(super) fn note_bind(shared: &Shared, route: (u16, u32), capabilities: Option<&[String]>) {
+    let declared = capabilities.is_some_and(|capabilities| {
+        cortexkit_role_tool_provider::consumer_reads_held_reply_v1(Some(capabilities))
+    });
+    if declared {
+        shared
+            .held_feed
+            .lock()
+            .unwrap()
+            .declared_routes
+            .insert(route);
+    }
+}
+
+/// Answer a call the provider holds with a held reply, counting it as an invocation. `None`
+/// for every other call, which the scripted provider answers as usual.
+pub(super) fn answer_held(
+    shared: &Shared,
+    route: (u16, u32),
+    arguments: &str,
+    request: &Value,
+) -> Option<subc_client_rs::HandlerOutcome> {
+    let mut feed = shared.held_feed.lock().unwrap();
+    if !feed.enabled || !feed.hold.contains(arguments) || !feed.declared_routes.contains(&route) {
+        return None;
+    }
+    // A provider may hold only a call that carried a key (contract §4.1).
+    let key = request["call_key"].as_str()?.to_owned();
+    feed.held_keys.insert(arguments.to_owned(), key);
+    drop(feed);
+    *shared
+        .invocations
+        .lock()
+        .unwrap()
+        .entry(arguments.to_owned())
+        .or_default() += 1;
+    Some(subc_client_rs::HandlerOutcome::Response(
+        serde_json::to_vec(&json!({
+            "content": [{"type": "text", "text": INTERIM}],
+            "held": {"reason": "running", "detail": {"ticket": "t-1"}}
+        }))
+        .unwrap(),
+    ))
+}
+
+/// Serve `late_results` and `late_results.ack`; `None` for any other request.
+pub(super) async fn serve_feed(
+    shared: &Shared,
+    request: &Value,
+) -> Option<subc_client_rs::HandlerOutcome> {
+    match request["name"].as_str()? {
+        "late_results" => {
+            let feed = shared.held_feed.lock().unwrap();
+            let since = &request["arguments"]["since"];
+            let from = if since.is_null() {
+                0
+            } else {
+                let seq = since["seq"].as_u64().unwrap_or(u64::MAX);
+                if since["provider_incarnation"] != INCARNATION || seq > feed.entries.len() as u64 {
+                    return Some(subc_client_rs::HandlerOutcome::Error {
+                        code:
+                            cortexkit_role_tool_provider::late_results::CURSOR_INCARNATION_CHANGED
+                                .into(),
+                        message: "that cursor is not from this provider incarnation".into(),
+                    });
+                }
+                seq
+            };
+            let start = from.max(feed.acked) as usize;
+            let entries: Vec<&LateEntry> = feed.entries.iter().skip(start).collect();
+            let reply = json!({
+                "entries": entries,
+                "cursor": {"provider_incarnation": INCARNATION, "seq": feed.entries.len() as u64},
+                "more": false,
+            });
+            Some(subc_client_rs::HandlerOutcome::Response(
+                serde_json::to_vec(&reply).unwrap(),
+            ))
+        }
+        "late_results.ack" => {
+            let seq = request["arguments"]["through"]["seq"].as_u64().unwrap_or(0);
+            let held = {
+                let mut feed = shared.held_feed.lock().unwrap();
+                feed.ack_attempts += 1;
+                feed.hold_acks
+            };
+            if held {
+                shared.released.notified().await;
+                return Some(subc_client_rs::HandlerOutcome::Error {
+                    code: "conformance_killed".into(),
+                    message: "the runner was killed while this ack was held".into(),
+                });
+            }
+            let mut feed = shared.held_feed.lock().unwrap();
+            feed.acked = feed.acked.max(seq);
+            feed.acks.push(seq);
+            Some(subc_client_rs::HandlerOutcome::Response(b"{}".to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the real-daemon prerequisites are here; a missing one fails under
+/// `BROCA_REQUIRE_SUBC` and is a printed skip otherwise.
+fn rig_ready() -> bool {
+    if !sibling_bin("ck-subc", "SUBC_CORE_BIN").exists()
+        || !sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN").exists()
+    {
+        assert!(!require_subc(), "the subc rig binaries are missing");
+        println!("SKIP: the subc rig binaries are missing");
+        return false;
+    }
+    std::env::remove_var("SUBC_MODULE_ID");
+    std::env::remove_var("SUBC_LAUNCH_NONCE");
+    true
+}
+
+/// One case's rig: a subject whose broca declares the held-reply capabilities and whose provider
+/// holds `call`, and the session's script (one held call, then a closing text turn).
+struct HeldCase {
+    scratch: PathBuf,
+    root: PathBuf,
+    subject: BrocaSubject,
+    session: &'static str,
+    call: ScriptedToolCall,
+}
+
+impl HeldCase {
+    async fn new(session: &'static str) -> Self {
+        let scratch = broca_test_support::scratch_root()
+            .join(format!("broca-held-{session}-{}", std::process::id()));
+        broca_test_support::remove_rig_dir(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut held_subject = BrocaSubject::new(&scratch).await;
+        held_subject.declare_held_reply = true;
+        let root = scratch.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let call = ScriptedToolCall {
+            tool_call_id: "held_call".into(),
+            tool: SCRIPTED_TOOL.into(),
+            arguments: json!({"marker": format!("held-{session}")}),
+            result: json!({"marker": "never answered synchronously"}),
+            hold: false,
+        };
+        {
+            let mut feed = held_subject.shared.held_feed.lock().unwrap();
+            feed.enabled = true;
+            feed.hold.insert(call.arguments.to_string());
+        }
+        let turn = |parts| {
+            ScriptedTurn::new(parts).with_usage(
+                cortexkit_role_llm_runner_conformance::ScriptedUsage::new(1, 0, 0, 1),
+            )
+        };
+        held_subject
+            .install_script(
+                session,
+                Script {
+                    turns: vec![
+                        turn(vec![ScriptedPart::ToolCall(call.clone())]),
+                        turn(vec![ScriptedPart::Text(
+                            "done after the late result".into(),
+                        )]),
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        Self {
+            scratch,
+            root,
+            subject: held_subject,
+            session,
+            call,
+        }
+    }
+
+    /// Admit the session under a plan, so the provider's declarations freeze into its manifest,
+    /// and send the turn whose one call the provider holds.
+    async fn send(&self, live: &Live) -> BrocaRoute {
+        let route = self
+            .subject
+            .session_route(live, self.session, &self.subject.owner_stamp())
+            .await
+            .unwrap();
+        let mut fields = self
+            .subject
+            .send_fields_with_plan(self.session, true, &Map::new())
+            .expect("a plan send");
+        fields.insert("prompt".into(), json!("ask and wait"));
+        fields.insert("send_id".into(), json!("held-send"));
+        match route
+            .request("session.send", Value::Object(fields))
+            .await
+            .unwrap()
+        {
+            Reply::Response(_) => {}
+            Reply::Error(error) => panic!("send refused: {} {}", error.code, error.message),
+        }
+        route
+    }
+
+    /// Wait until the session's WAL satisfies `ready`, failing after a minute with `what`.
+    async fn wait_for(
+        &self,
+        live: &Live,
+        what: &str,
+        ready: impl Fn(&[broca_wal::WalRecord]) -> bool,
+    ) -> Vec<broca_wal::WalRecord> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let records = self.subject.records(live, self.session);
+            if ready(&records) {
+                return records;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}; the WAL holds {records:#?}"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Wait for the held reply's durable pause and return the key the held call carried.
+    async fn await_pause(&self, live: &Live) -> String {
+        let records = self
+            .wait_for(live, "the held pause", |records| {
+                records.iter().any(|record| {
+                    matches!(
+                        record,
+                        broca_wal::WalRecord::RunPaused {
+                            reason: broca_protocol::PauseReason::ToolHeld,
+                            ..
+                        }
+                    )
+                })
+            })
+            .await;
+        let held_at = records
+            .iter()
+            .position(|record| matches!(record, broca_wal::WalRecord::ToolCallProviderHeld { .. }))
+            .expect("the held record precedes the pause");
+        let paused_at = records
+            .iter()
+            .position(|record| matches!(record, broca_wal::WalRecord::RunPaused { .. }))
+            .unwrap();
+        assert!(
+            held_at < paused_at,
+            "the held record is durable before the pause"
+        );
+        assert_eq!(
+            self.model_requests(),
+            1,
+            "nothing goes to the model while the call is held"
+        );
+        self.subject
+            .shared
+            .held_feed
+            .lock()
+            .unwrap()
+            .held_keys
+            .get(&self.call.arguments.to_string())
+            .cloned()
+            .expect("the held call carried its key")
+    }
+
+    /// Publish the held call's answer on the provider's feed.
+    fn publish(&self, call_key: &str) {
+        let entry = LateEntry::new(
+            kinds::RESULT,
+            "reserved:broca",
+            "none",
+            0,
+            "reserved:broca",
+            call_key,
+            "event-1",
+            1_761_220_000_000,
+        )
+        .with_result(json!({"content": [{"type": "text", "text": self.late_text()}]}));
+        self.subject
+            .shared
+            .held_feed
+            .lock()
+            .unwrap()
+            .entries
+            .push(entry);
+    }
+
+    fn late_text(&self) -> String {
+        format!("LATE ANSWER for {}", self.session)
+    }
+
+    fn model_requests(&self) -> usize {
+        self.subject
+            .shared
+            .requests
+            .lock()
+            .unwrap()
+            .get(self.session)
+            .map_or(0, Vec::len)
+    }
+
+    /// Check the one outcome every case shares: the entry was acked through the provider's
+    /// cursor; the held call has exactly one terminal, the late result, written in its original
+    /// batch; the provider ran the call once; and no model request ever held the interim
+    /// content. With `completes`, the run also finished the turn: the result precedes its batch's
+    /// commit and the model's next request carries it.
+    async fn assert_delivered_once(&self, live: &Live, completes: bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let acks = self.subject.shared.held_feed.lock().unwrap().acks.clone();
+            if acks.contains(&1) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the entry was never acked: {acks:?}"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+        let records = if completes {
+            self.wait_for(live, "the resumed run to finish", |records| {
+                records
+                    .iter()
+                    .any(|record| matches!(record, broca_wal::WalRecord::RunFinished { .. }))
+            })
+            .await
+        } else {
+            self.subject.records(live, self.session)
+        };
+        let held_batch = records
+            .iter()
+            .find_map(|record| match record {
+                broca_wal::WalRecord::ToolCallProviderHeld { batch_id, .. } => {
+                    Some(batch_id.clone())
+                }
+                _ => None,
+            })
+            .expect("a held record");
+        let terminals: Vec<(usize, &broca_wal::WalRecord)> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                matches!(record, broca_wal::WalRecord::ToolResult { result, .. }
+                    if result.tool_call_id.0 == self.call.tool_call_id)
+            })
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "the held call has exactly one terminal: {records:#?}"
+        );
+        let (at, terminal) = terminals[0];
+        let broca_wal::WalRecord::ToolResult {
+            batch_id, result, ..
+        } = terminal
+        else {
+            unreachable!()
+        };
+        assert_eq!(batch_id, &held_batch, "written under the original batch");
+        assert!(
+            serde_json::to_string(result.as_ref())
+                .unwrap()
+                .contains(&self.late_text()),
+            "the terminal is the late result: {result:?}"
+        );
+        assert_eq!(
+            self.subject.tool_invocations(&self.call.arguments).await,
+            1,
+            "the held call is sent to its provider once and never again"
+        );
+        let requests = self
+            .subject
+            .shared
+            .requests
+            .lock()
+            .unwrap()
+            .get(self.session)
+            .cloned()
+            .unwrap_or_default();
+        let text = Value::Array(requests.iter().flatten().cloned().collect()).to_string();
+        assert!(
+            !text.contains(INTERIM),
+            "interim content reached the model: {text}"
+        );
+        if completes {
+            let committed_at = records
+                .iter()
+                .position(|record| {
+                    matches!(record, broca_wal::WalRecord::ToolBatchFinished { batch_id }
+                        if batch_id == &held_batch)
+                })
+                .expect("the held batch commits");
+            assert!(at < committed_at, "the result precedes its batch's commit");
+            assert_eq!(requests.len(), 2, "one request before the hold, one after");
+            assert!(text.contains(&self.late_text()), "{text}");
+        }
+    }
+
+    fn finish(self) {
+        broca_test_support::remove_rig_dir(&self.scratch);
+    }
+}
+
+/// The flagship: a held reply parks the run with nothing sent to the model; the provider then
+/// publishes the answer, broca pulls it, writes it as the call's result at the call's position,
+/// acks it, and the run completes in the same turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_call_pauses_then_its_late_result_completes_the_turn() {
+    if !rig_ready() {
+        return;
+    }
+    let case = HeldCase::new("held-flagship").await;
+    let live = case.subject.spawn(&case.root).await.unwrap();
+    let route = case.send(&live).await;
+    let call_key = case.await_pause(&live).await;
+    case.publish(&call_key);
+    case.assert_delivered_once(&live, true).await;
+    drop(route);
+    drop(live);
+    case.finish();
+}
+
+/// Killed after the run paused and before the late result was pulled: the restarted daemon
+/// keeps the run paused, pulls the entry, and delivers it once without re-sending the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_between_the_pause_and_the_pull_still_delivers_once() {
+    if !rig_ready() {
+        return;
+    }
+    let case = HeldCase::new("held-kill-paused").await;
+    let mut live = case.subject.spawn(&case.root).await.unwrap();
+    let route = case.send(&live).await;
+    let call_key = case.await_pause(&live).await;
+    drop(route);
+    assert!(live.kill_all(), "ck-broca was killed");
+    drop(live);
+
+    let live = case.subject.restart(&case.root).await.unwrap();
+    // The answer arrives only after the restart.
+    case.publish(&call_key);
+    case.assert_delivered_once(&live, true).await;
+    drop(live);
+    case.finish();
+}
+
+/// Killed after the late result was written as the call's terminal and before the provider saw
+/// the ack: the restarted daemon re-reads the entry, finds the call already answered, acks it as
+/// a no-op, and the result is never written twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kill_after_the_result_is_written_and_before_its_ack_never_writes_it_twice() {
+    if !rig_ready() {
+        return;
+    }
+    let case = HeldCase::new("held-kill-unacked").await;
+    let mut live = case.subject.spawn(&case.root).await.unwrap();
+    let route = case.send(&live).await;
+    let call_key = case.await_pause(&live).await;
+    case.subject.shared.held_feed.lock().unwrap().hold_acks = true;
+    case.publish(&call_key);
+    let tool_call_id = case.call.tool_call_id.clone();
+    case.wait_for(&live, "the delivered terminal", |records| {
+        records.iter().any(|record| {
+            matches!(record, broca_wal::WalRecord::ToolResult { result, .. }
+                if result.tool_call_id.0 == tool_call_id)
+        })
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while case.subject.shared.held_feed.lock().unwrap().ack_attempts == 0 {
+        assert!(Instant::now() < deadline, "broca never tried to ack");
+        sleep(Duration::from_millis(50)).await;
+    }
+    drop(route);
+    assert!(live.kill_all(), "ck-broca was killed");
+    drop(live);
+    {
+        let mut feed = case.subject.shared.held_feed.lock().unwrap();
+        assert!(feed.acks.is_empty(), "the ack was held, so none landed");
+        feed.hold_acks = false;
+    }
+
+    // The run may have gone on past its batch's commit before the kill, so how its turn ends
+    // after the restart depends on where the kill landed; what must hold is that the late
+    // result was written once and the call never ran again.
+    let live = case.subject.restart(&case.root).await.unwrap();
+    case.assert_delivered_once(&live, false).await;
+    drop(live);
+    case.finish();
+}

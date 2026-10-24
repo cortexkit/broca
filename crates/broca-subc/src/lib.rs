@@ -43,9 +43,9 @@ pub use consent::{
     ScopedConsentPlane, WithdrawalReply,
 };
 pub use hook_plane::SubcHookPlane;
-pub use late_results::{LateResultsError, LateResultsFeed};
+pub use late_results::{late_entry_tool_result, LateResultsError, LateResultsFeed};
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
 pub use scope_describe::{DescribedScope, ModuleScopeDescriber, ScopeDescriber};
 pub use session_door::{DoorCoverage, DoorRead, SessionDoorClient, SessionDoorError};
-pub use subc_plane::{principal_for, tool_result_from_provider_reply, SubcToolPlane};
+pub use subc_plane::SubcToolPlane;
 pub use vault::{VaultAddress, VaultClient, VaultError, VaultGet, VaultToken};

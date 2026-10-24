@@ -1899,19 +1899,6 @@ impl SubcConnection {
         Ok(body.into_bytes())
     }
 
-    /// Send one already-encoded tool-call body and await its terminal, for a caller that built
-    /// the body itself instead of using the `{name, arguments}` envelope.
-    pub(crate) async fn send_raw_tool_body(
-        &self,
-        route: &RouteHandle,
-        operation: &str,
-        body: Vec<u8>,
-        deadline: Duration,
-    ) -> ConnResult<serde_json::Value> {
-        self.send_tool_call_body(route, deadline, operation, body)
-            .await
-    }
-
     async fn send_tool_call_body(
         &self,
         route: &RouteHandle,

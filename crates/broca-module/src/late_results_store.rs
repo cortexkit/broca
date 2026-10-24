@@ -11,7 +11,6 @@ use std::{
 };
 
 use broca_core::tool_plane::{LateResultRegistration, LateResultsIntake};
-use broca_protocol::ToolCallId;
 use cortexkit_role_tool_provider::late_results::{Cursor, IntakeKey};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -40,8 +39,6 @@ pub struct FeedRow {
     pub position: Option<FeedPosition>,
     /// The module has entries to acknowledge on this feed.
     pub ack_owed: bool,
-    /// Set while the feed is being pulled, so a second puller does not start for the module.
-    pub puller: bool,
 }
 
 /// The most an entry's disposition says about it, for the receipt record.
@@ -141,8 +138,7 @@ impl LateResultsStore {
                  module TEXT PRIMARY KEY,
                  provider_incarnation TEXT,
                  seq INTEGER,
-                 ack_owed INTEGER NOT NULL DEFAULT 0,
-                 puller INTEGER NOT NULL DEFAULT 0
+                 ack_owed INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS receipts (
                  provider TEXT NOT NULL,
@@ -152,19 +148,6 @@ impl LateResultsStore {
                  kind TEXT NOT NULL,
                  disposition TEXT NOT NULL,
                  PRIMARY KEY (provider, custodian, call_key, event_id)
-             );
-             CREATE TABLE IF NOT EXISTS call_watermarks (
-                 module TEXT NOT NULL,
-                 call_key TEXT NOT NULL,
-                 last_held_ms INTEGER NOT NULL,
-                 PRIMARY KEY (module, call_key)
-             );
-             CREATE TABLE IF NOT EXISTS held_terminals (
-                 module TEXT NOT NULL,
-                 call_key TEXT NOT NULL,
-                 tool_call_id TEXT NOT NULL,
-                 outcome TEXT NOT NULL,
-                 PRIMARY KEY (module, call_key)
              );",
             )
             .map_err(|error| error.to_string())?;
@@ -247,45 +230,8 @@ impl LateResultsStore {
             .collect())
     }
 
-    /// Mark a registration settled, keeping it so a later entry for its key is still classed
-    /// from the lineage rather than read as unregistered.
-    pub fn mark_settled(&self, module: &str, call_key: &str) -> Result<bool, String> {
-        let connection = self.lock()?;
-        let changed = connection
-            .execute(
-                "UPDATE registrations SET state = 'settled'
-                 WHERE module = ?1 AND call_key = ?2 AND state != 'settled'",
-                params![module, call_key],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(changed == 1)
-    }
-
-    /// Mark several registrations settled in one synced transaction, returning how many were
-    /// still registered.
-    pub fn mark_group_settled(&self, calls: &[(String, String)]) -> Result<usize, String> {
-        if calls.is_empty() {
-            return Ok(0);
-        }
-        let mut connection = self.lock()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        let mut changed = 0;
-        for (module, call_key) in calls {
-            changed += transaction
-                .execute(
-                    "UPDATE registrations SET state = 'settled'
-                     WHERE module = ?1 AND call_key = ?2 AND state != 'settled'",
-                    params![module, call_key],
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        transaction.commit().map_err(|error| error.to_string())?;
-        Ok(changed)
-    }
-
-    /// Forget a registration whose lineage was deleted with its session.
+    /// Forget a registration: its call is settled for good (terminal and batch commit durable),
+    /// or its lineage was deleted with its session.
     pub fn remove(&self, module: &str, call_key: &str) -> Result<(), String> {
         let connection = self.lock()?;
         connection
@@ -302,7 +248,7 @@ impl LateResultsStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT module, provider_incarnation, seq, ack_owed, puller FROM feeds
+                "SELECT module, provider_incarnation, seq, ack_owed FROM feeds
                  ORDER BY module",
             )
             .map_err(|error| error.to_string())?;
@@ -313,13 +259,11 @@ impl LateResultsStore {
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
                 ))
             })
             .map_err(|error| error.to_string())?;
         rows.map(|row| {
-            let (module, incarnation, seq, ack_owed, puller) =
-                row.map_err(|error| error.to_string())?;
+            let (module, incarnation, seq, ack_owed) = row.map_err(|error| error.to_string())?;
             Ok(FeedRow {
                 module,
                 position: incarnation
@@ -329,7 +273,6 @@ impl LateResultsStore {
                         seq: seq as u64,
                     }),
                 ack_owed: ack_owed != 0,
-                puller: puller != 0,
             })
         })
         .collect()
@@ -389,31 +332,6 @@ impl LateResultsStore {
         connection
             .execute(
                 "UPDATE feeds SET provider_incarnation = NULL, seq = NULL WHERE module = ?1",
-                params![module],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    /// Claim the module's one puller slot. `false` means another puller already holds it.
-    pub fn claim_puller(&self, module: &str) -> Result<bool, String> {
-        let connection = self.lock()?;
-        connection
-            .execute(
-                "INSERT INTO feeds (module, puller) VALUES (?1, 1)
-                 ON CONFLICT (module) DO UPDATE SET puller = 1 WHERE feeds.puller = 0",
-                params![module],
-            )
-            .map_err(|error| error.to_string())
-            .map(|changed| changed == 1)
-    }
-
-    /// Release the module's puller slot.
-    pub fn release_puller(&self, module: &str) -> Result<(), String> {
-        let connection = self.lock()?;
-        connection
-            .execute(
-                "UPDATE feeds SET puller = 0 WHERE module = ?1",
                 params![module],
             )
             .map_err(|error| error.to_string())?;
@@ -497,90 +415,13 @@ impl LateResultsStore {
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
-
-    /// The held record's `held_at_ms` the intake last answered for this call, so a re-read WAL
-    /// does not re-answer a call it has already dealt with.
-    pub fn last_held_ms(&self, module: &str, call_key: &str) -> Result<Option<u64>, String> {
-        let connection = self.lock()?;
-        connection
-            .query_row(
-                "SELECT last_held_ms FROM call_watermarks WHERE module = ?1 AND call_key = ?2",
-                params![module, call_key],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())
-            .map(|value| value.map(|value| value as u64))
-    }
-
-    pub fn record_held_ms(
-        &self,
-        module: &str,
-        call_key: &str,
-        held_at_ms: u64,
-    ) -> Result<(), String> {
-        let connection = self.lock()?;
-        connection
-            .execute(
-                "INSERT INTO call_watermarks (module, call_key, last_held_ms) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (module, call_key) DO UPDATE SET last_held_ms = excluded.last_held_ms",
-                params![module, call_key, held_at_ms as i64],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    /// Remember the terminal the intake wrote for a held call, so a later pass over the same WAL
-    /// can tell its own delivery from a close-out.
-    pub fn remember_held_terminal(
-        &self,
-        module: &str,
-        call_key: &str,
-        tool_call_id: &ToolCallId,
-        outcome: &str,
-    ) -> Result<(), String> {
-        let connection = self.lock()?;
-        connection
-            .execute(
-                "INSERT INTO held_terminals (module, call_key, tool_call_id, outcome)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (module, call_key) DO UPDATE SET
-                     tool_call_id = excluded.tool_call_id, outcome = excluded.outcome",
-                params![module, call_key, tool_call_id.0, outcome],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    pub fn held_terminal(
-        &self,
-        module: &str,
-        call_key: &str,
-    ) -> Result<Option<(String, String)>, String> {
-        let connection = self.lock()?;
-        connection
-            .query_row(
-                "SELECT tool_call_id, outcome FROM held_terminals WHERE module = ?1 AND call_key = ?2",
-                params![module, call_key],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())
-    }
-
-    /// How many registrations still need their feed.
-    pub fn pending_registrations(&self) -> Result<usize, String> {
-        Ok(self
-            .registration_rows()?
-            .into_iter()
-            .filter(|row| row.state == RegistrationState::Registered)
-            .count())
-    }
 }
 
-#[async_trait::async_trait]
-impl LateResultsIntake for LateResultsStore {
-    async fn register_group(&self, calls: &[LateResultRegistration]) -> Result<(), String> {
+impl LateResultsStore {
+    /// Write every registration of one dispatch group in one synced transaction. A repeated
+    /// registration must name exactly the same lineage and scope: an issued key is never
+    /// retargeted to another session.
+    pub fn register_calls(&self, calls: &[LateResultRegistration]) -> Result<(), String> {
         if calls.is_empty() {
             return Ok(());
         }
@@ -612,6 +453,37 @@ impl LateResultsIntake for LateResultsStore {
                 .map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// Forget several registrations in one synced transaction. Each pair is `(module, call_key)`.
+    pub fn remove_calls(&self, calls: &[(String, String)]) -> Result<(), String> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        for (module, call_key) in calls {
+            transaction
+                .execute(
+                    "DELETE FROM registrations WHERE module = ?1 AND call_key = ?2",
+                    params![module, call_key],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl LateResultsIntake for LateResultsStore {
+    async fn register_group(&self, calls: &[LateResultRegistration]) -> Result<(), String> {
+        self.register_calls(calls)
+    }
+
+    async fn prune(&self, calls: &[(String, String)]) -> Result<(), String> {
+        self.remove_calls(calls)
     }
 }
 
@@ -657,14 +529,9 @@ mod tests {
             );
             store.register_group(&expected).await.unwrap();
             store.register_group(&expected).await.unwrap();
-            assert!(store.claim_puller("provider").unwrap());
-            assert!(!store.claim_puller("provider").unwrap(), "one puller");
         }
         let reopened = LateResultsStore::open(&path).unwrap();
         assert_eq!(reopened.registrations().unwrap(), expected);
-        assert!(reopened.feed("provider").unwrap().unwrap().puller);
-        reopened.release_puller("provider").unwrap();
-        assert!(!reopened.feed("provider").unwrap().unwrap().puller);
     }
 
     #[tokio::test]
@@ -681,20 +548,22 @@ mod tests {
         assert_eq!(store.registrations().unwrap(), vec![call("lineage:2")]);
     }
 
+    /// A batch commit prunes its calls' registrations in one transaction; a call not named is
+    /// kept.
     #[tokio::test]
-    async fn a_settled_registration_is_kept_so_a_later_entry_is_still_classed() {
-        let path = scratch("late-results-settle.db");
+    async fn a_prune_forgets_exactly_the_named_registrations() {
+        let path = scratch("late-results-prune.db");
+        let _ = std::fs::remove_file(&path);
         let store = LateResultsStore::open(&path).unwrap();
-        store.register_group(&[call("lineage:1")]).await.unwrap();
-        assert_eq!(store.pending_registrations().unwrap(), 1);
-        assert!(store.mark_settled("provider", "lineage:1").unwrap());
-        assert!(!store.mark_settled("provider", "lineage:1").unwrap());
-        assert_eq!(store.pending_registrations().unwrap(), 0);
-        let row = store
-            .registration("provider", "lineage:1")
-            .unwrap()
+        store
+            .register_group(&[call("lineage:1"), call("lineage:2")])
+            .await
             .unwrap();
-        assert_eq!(row.state, RegistrationState::Settled);
+        store
+            .prune(&[("provider".into(), "lineage:1".into())])
+            .await
+            .unwrap();
+        assert_eq!(store.registrations().unwrap(), vec![call("lineage:2")]);
     }
 
     #[test]

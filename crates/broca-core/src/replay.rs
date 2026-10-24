@@ -655,6 +655,9 @@ fn barrier_owed(records: &[FramedRecord]) -> bool {
             WalRecord::ToolBatchFinished { batch_id } => {
                 open.retain(|(existing, _)| existing != batch_id);
             }
+            // A finished run owes no barrier: a run sealed (interrupted, cancelled, stopped)
+            // with a batch whose calls all have terminals never commits that batch.
+            WalRecord::RunFinished { .. } => open.clear(),
             _ => {}
         }
     }
@@ -2518,8 +2521,8 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
-            // The framed reader still refuses provider-held/v1 until runtime intake is installed.
-            // Replay also serves the supplied in-memory lifecycle and must preserve its obligations.
+            // A held call stays open until its late result is written as its terminal; replay
+            // keeps it out of the indeterminate set so recovery never seals or re-sends it.
             WalRecord::ToolCallProviderHeld {
                 tool_call_id,
                 call_key,

@@ -156,6 +156,12 @@ pub enum LineageCmd {
     ResumeRestart {
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// A late result for one of this session's provider-held calls was deposited in its
+    /// waiting slot. A run paused on held calls is resumed into its original batch so it can
+    /// take it; a live run's batch takes it where it waits. Never re-sends the held call.
+    ResumeHeld {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Start a run now (idle) or durably queue it (active). The submission payload stays
     /// boxed because it is much larger than the other command variants.
     Send {
@@ -1428,6 +1434,9 @@ pub struct LineageActor<W: WalStore> {
     /// Set while startup restart recovery drives the admission, because that branch answers
     /// parked `restart_waiters` itself once it knows the episode's outcome.
     restart_recovery_owns_waiters: bool,
+    /// Set while recovery runs because a late result was deposited for one of this session's
+    /// held calls, so a run paused on them resumes instead of staying parked.
+    resuming_for_late_result: bool,
     /// A command dispatched inside a suspended restart admission asked this generation to
     /// exit. The admission ends early, and the enclosing command returns the exit request.
     nested_exit_requested: bool,
@@ -1602,6 +1611,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             restart_admitting: false,
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
+            resuming_for_late_result: false,
             nested_exit_requested: false,
             warm_in_flight: Default::default(),
         };
@@ -2011,6 +2021,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let _ = reply.send(result);
                 false
             }
+            LineageCmd::ResumeHeld { reply } => {
+                // A live run needs nothing: its batch waits in the held call's slot, or, if it
+                // is about to pause, the delivery times out and a later pull resumes it.
+                let result = if matches!(self.state, RunState::Idle) {
+                    self.resuming_for_late_result = true;
+                    let result = self.recover_durable_work().await;
+                    self.resuming_for_late_result = false;
+                    result
+                } else {
+                    Ok(())
+                };
+                let _ = reply.send(result);
+                false
+            }
             LineageCmd::Status { reply } => {
                 let _ = reply.send(self.status());
                 false
@@ -2154,7 +2178,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     RetractOutcome::Error(error)
                 });
             }
-            LineageCmd::ResumeRestart { reply } => {
+            LineageCmd::ResumeRestart { reply } | LineageCmd::ResumeHeld { reply } => {
                 let _ = reply.send(Err("session actor is closing".into()));
             }
             LineageCmd::Status { reply } => {
@@ -2457,7 +2481,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
             pending, open_held, ..
         } = &tail_resolution
         {
-            if !open_held.is_empty() && pending.deferred.is_empty() && pending.approved.is_empty() {
+            // A run paused on held calls stays parked, unless a late result for one of them
+            // was just deposited: then it resumes into its original batch, whose held call
+            // takes the result from its slot.
+            if !open_held.is_empty()
+                && pending.deferred.is_empty()
+                && pending.approved.is_empty()
+                && !self.resuming_for_late_result
+            {
                 self.park_provider_held(
                     &episode_run_id,
                     episode_pause_reason == Some(broca_protocol::PauseReason::ToolHeld),
@@ -4350,6 +4381,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             pre_user_error,
             hook_plane: self.executor.hook_plane(),
             elicitation_plane: self.executor.elicitation_plane(),
+            provider_held_lifecycle: self.executor.provider_held_lifecycle(),
             compaction_plane: self.executor.compaction_plane(),
             compaction_views: self.executor.compaction_views(),
             ..Default::default()
@@ -6521,7 +6553,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::Retract { reply, .. } => {
                     let _ = reply.send(RetractOutcome::Reopen);
                 }
-                LineageCmd::ResumeRestart { reply } => {
+                LineageCmd::ResumeRestart { reply } | LineageCmd::ResumeHeld { reply } => {
                     let _ = reply.send(Err("session actor is closing".into()));
                 }
                 LineageCmd::Status { reply } => {
@@ -7993,6 +8025,141 @@ mod tests {
                 final_step_finish_reason: None,
             })
         }
+    }
+
+    /// A run paused on a provider-held call stays parked when its session merely opens, and is
+    /// resumed into its original batch when a late result for the call was deposited: the
+    /// session's actor is the one place that resumes it.
+    #[tokio::test]
+    async fn a_late_result_resumes_a_held_run_that_opening_alone_leaves_parked() {
+        use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
+        let on_restart: Option<broca_protocol::request::OnRestart> = None;
+        let root = broca_test_support::scratch_root()
+            .join(format!("held-resume-{}-{on_restart:?}", std::process::id()));
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        let key = BindIdentity::new(root.join("project"), "broca", "held");
+        let mut held_request = text_req(&key, "held");
+        held_request.on_restart = on_restart;
+        let digest = broca_core::submission_identity_digest(&held_request.to_submission());
+        let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+        let mut records = vec![
+            WalRecord::RunStarted {
+                tags: None,
+                session_class: None,
+                retention: None,
+                hooks: None,
+                title: None,
+                on_restart,
+                keep_warm: None,
+                marker_order_version: None,
+                manifest: None,
+                scope: None,
+                send_id: None,
+                request_identity_digest: Some(digest),
+                project_id: None,
+                principal: None,
+                ts_ms: Some(1),
+                run_id: RunId("held".into()),
+                session: key.clone(),
+                config: Box::new(min_config()),
+                input: held_request.input.clone().into(),
+                origin: broca_wal::RunOrigin::Fresh,
+                submission_id: None,
+            },
+            WalRecord::ModelStepFinished {
+                tags: None,
+                hooks: None,
+                step_id: broca_protocol::StepId(1),
+                assistant_message: Arc::new(AssistantMessage {
+                    message_id: broca_protocol::MessageId("m".into()),
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: broca_protocol::ToolCallId("a".into()),
+                        tool_name: "ask".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    })],
+                }),
+                usage: Usage::default(),
+                retries_used: 0,
+                finish_reason: None,
+                service_tier_used: None,
+                speed_used: None,
+            },
+            WalRecord::ToolBatchStarted {
+                batch_id: broca_protocol::BatchId("held-b1".into()),
+                step_id: broca_protocol::StepId(1),
+                planned_calls: vec![broca_protocol::ToolCallId("a".into())],
+            },
+            WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                batch_id: broca_protocol::BatchId("held-b1".into()),
+                tool_call_id: broca_protocol::ToolCallId("a".into()),
+                tool_name: Some("ask".into()),
+                args: Arc::new(serde_json::json!({})),
+                module_id: Some("tools".into()),
+                schema_pin: None,
+                hooks: None,
+                approval_digest: None,
+                call_key: None,
+            },
+            WalRecord::ToolCallProviderHeld {
+                batch_id: broca_protocol::BatchId("held-b1".into()),
+                tool_call_id: broca_protocol::ToolCallId("a".into()),
+                call_key: "lineage:4".into(),
+                module: "tools".into(),
+                reason: "running".into(),
+                detail_digest: None,
+                held_at_ms: 42,
+                sequential: false,
+            },
+        ];
+        records.push(WalRecord::RunPaused {
+            run_id: RunId("held".into()),
+            reason: broca_protocol::PauseReason::ToolHeld,
+            error: None,
+            ts_ms: Some(43),
+        });
+        // Exercise actor policy with supplied records while the framed feature remains disabled.
+        // Production writers gate these values and the default reader refuses those frames.
+        let path = wal_store.wal_path(&key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes: Vec<_> = records
+            .iter()
+            .enumerate()
+            .flat_map(|(index, record)| {
+                broca_wal::framing::encode_payload(
+                    index as u64 + 1,
+                    1,
+                    &serde_json::to_vec(record).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        std::fs::write(path, bytes).unwrap();
+        let executor = Arc::new(RecoveryGate::new());
+        let registry = LineageRegistry::new(Arc::new(SeamOpener {
+            lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))),
+            wal_store: wal_store.clone(),
+            idle_ttl: Duration::from_secs(60),
+            executor: executor.clone(),
+        }));
+        let (opened, failed) = registry
+            .open_registered_sessions(vec![key.clone(), key.clone()], 4)
+            .await;
+        assert_eq!((opened, failed.len()), (1, 0));
+        assert!(
+            executor.started().is_empty(),
+            "opening a held session leaves its run parked"
+        );
+        registry.resume_held_run(&key).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), executor.wait_for_start())
+            .await
+            .expect("a deposited late result resumes the held run");
+        assert_eq!(executor.started(), ["held"]);
+        executor.release_first.notify_one();
+        executor.wait_for_finish().await;
+        assert!(registry.stop_and_seal().await);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

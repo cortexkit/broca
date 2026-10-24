@@ -22,6 +22,8 @@ struct Rig {
     block_registration: AtomicBool,
     registering: tokio::sync::Notify,
     release_registration: tokio::sync::Notify,
+    /// Whether each tool route this rig opened was asked to declare the held-reply capabilities.
+    opened_declaring: Mutex<Vec<bool>>,
 }
 
 impl Rig {
@@ -39,13 +41,16 @@ impl Rig {
             fail_sync: AtomicBool::new(false),
             block_registration: AtomicBool::new(false),
             registering: tokio::sync::Notify::new(),
+            opened_declaring: Mutex::new(Vec::new()),
             release_registration: tokio::sync::Notify::new(),
         })
     }
     fn plane(self: &Arc<Self>, installed: bool) -> SubcToolPlane {
         let plane = SubcToolPlane::with_connection(self.clone(), "provider");
         if installed {
-            plane.with_provider_held_support(self.clone(), self.clone())
+            plane
+                .with_provider_held_support(self.clone(), self.clone())
+                .declaring_held_reply_for_tests()
         } else {
             plane
         }
@@ -78,6 +83,7 @@ impl ToolPlaneConnection for Rig {
         _: Option<&ScopeSelector>,
         installed: bool,
     ) -> Result<RouteHandle, ConnError> {
+        self.opened_declaring.lock().unwrap().push(installed);
         let mut route = RouteHandle::synthetic(7);
         route.reads_held_reply = installed && self.declared_route;
         Ok(route)
@@ -300,6 +306,72 @@ async fn plain_keys_require_late_results_identity_and_installed_seams() {
                 );
             }
         }
+    }
+}
+
+/// Production installs the held runtime without the debug-only route declaration. Every call
+/// must then leave exactly as it did before the runtime existed, even to a provider whose frozen
+/// plan declares `late_results` and a `content/v1` tool: the route declares no capability, a
+/// plain call carries no key, nothing is registered with the intake, and the reply is read as
+/// the legacy body.
+#[tokio::test]
+async fn an_installed_runtime_without_the_route_declaration_leaves_every_call_unchanged() {
+    for installed in [false, true] {
+        let rig = Rig::new(true, true, true, true);
+        let plane = SubcToolPlane::with_connection(rig.clone(), "provider");
+        let plane = if installed {
+            plane.with_provider_held_support(rig.clone(), rig.clone())
+        } else {
+            plane
+        };
+        let ctx = ctx();
+        let call = call("call");
+        plane
+            .batch_started(
+                &ctx,
+                std::slice::from_ref(&call),
+                &manifest_declaring(true, true),
+            )
+            .await
+            .unwrap();
+        plane
+            .register_dispatch_group(&ctx, &[registration(&call, "lineage:1", false)])
+            .await
+            .unwrap();
+        let result = completed(
+            plane
+                .dispatch_keyed(
+                    &ctx,
+                    &call,
+                    DispatchKey {
+                        call_key: "lineage:1",
+                        held_recorder: Some(rig.as_ref()),
+                    },
+                )
+                .await,
+        );
+        assert_eq!(
+            *rig.opened_declaring.lock().unwrap(),
+            [false],
+            "installed={installed}: the route must declare no held-reply capability"
+        );
+        assert_eq!(
+            *rig.sent.lock().unwrap(),
+            [(None, None)],
+            "installed={installed}: a plain call must carry no key"
+        );
+        assert!(
+            rig.groups.lock().unwrap().is_empty(),
+            "installed={installed}: nothing may be registered"
+        );
+        assert_eq!(
+            result,
+            map_call_tool_result(
+                &call.tool_call_id,
+                &json!({"content":[{"type":"text","text":"terminal"}]})
+            ),
+            "installed={installed}: the reply is read as the legacy body"
+        );
     }
 }
 

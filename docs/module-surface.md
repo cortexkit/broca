@@ -1242,36 +1242,57 @@ and "no reverse-request handler is registered for <family>", the same reply the 
 consumer SDK sends. It never reaches a pending call, even one with the same corr, and each
 refusal is counted in `health.check` as `reverse_requests_refused`.
 
-**Provider-held dispatch is a fail-closed integration seam, not enabled runtime support.**
-`SubcToolPlane::with_provider_held_support` requires intake, lifecycle and per-batch typed
-catalog sources together, before any route is warmed. Until they are installed, tool route
-opens declare neither `content/v1` nor `held-reply/v1` and keep their previous bytes. Once
-installed, tool-dispatch routes declare both together; role and plan-fetch routes still
-declare neither. A reply carrying `held` on an undeclared route becomes a malformed-reply
-error result with reason `malformed_provider_held_reply`, without pausing or exposing its
-interim content to the model.
+**Provider-held calls: the runtime is installed, the route capabilities are not declared.**
+The daemon installs the provider-held runtime (`broca-module-serve/src/held_runtime.rs`) on
+its tool plane: the waiting slots a held call's batch waits in, a late-results intake store
+(`late-results.db` under the state root, a projection of the WAL kept out of the backup
+catalog), one puller per provider module, and boot recovery. Release builds still leave
+`content/v1` and `held-reply/v1` undeclared on every tool route, because a held call cannot be
+cancelled or stopped yet; with them undeclared no provider may hold a call, no plain call
+carries a key, nothing is registered, and every call keeps its exact wire bytes. Debug builds
+declare both when `BROCA_TEST_DECLARE_HELD_REPLY_V1=1`; that name is a non-shipping marker the
+release fence refuses. Role and plan-fetch routes declare neither. A reply carrying `held` on
+an undeclared route becomes a malformed-reply error result with reason
+`malformed_provider_held_reply`, without pausing or exposing its interim content to the model.
 
-The core batch passes durable intent keys through its keyed dispatch methods and registers
-each dispatch group before sending it. The adapter sends plain keys only to providers that
-declare `late_results`, on a consumer-identity connection. Approved calls keep their deferred
-key and exact argument bytes. With support installed, the adapter requires a synced intake
-registration before sending either kind of key to a late-results provider. The standalone
-registration backend is `broca_store::late_results_store::LateResultsStore`; it implements
-the core intake trait with one fully synced SQLite transaction per group. Registration alone
-does not start a puller. An accepted held reply first syncs the batch's
-`ToolCallProviderHeld` record, then enters the installed lifecycle's waiting slot. Only an
-eventual terminal can return as a model-facing result.
+With the capabilities declared, the core batch passes durable intent keys through its keyed
+dispatch methods and registers each dispatch group in one synced intake transaction before
+sending it. Plain keys (`<lineage_id>:<seq of the call's ToolDispatchIntent>`) go only to
+providers whose frozen plan manifest declares `late_results`, on a consumer-identity
+connection; approved calls keep their deferred key and exact argument bytes. Routing and
+decoding read only the provider declarations frozen into the session's plan manifest (on a
+fresh run the admitted manifest, on a resume the one its `RunStarted` recorded), never a live
+catalog. An accepted held reply first syncs `ToolCallProviderHeld`, then waits in its slot;
+when every remaining call is held the run pauses through `pause_run_impl` with
+`RunPaused {tool_held}` and sends nothing to the model. `provider-held/v1` is a known reader
+feature.
 
-The later held-lifecycle/runtime-wiring slice must install these seams, not this dispatch
-slice. Before enabling either capability, that slice must implement replay, pause/resume,
-delivery, registration pruning and module puller ownership, and make `provider-held/v1` a
-known reader feature. It must also freeze each provider's `result_format` and `late_results`
-declarations into the stored plan manifest at admission: the current stored manifest retains
-neither. First pin existing manifest bytes in a separate commit, then add optional fields,
-omitted when undeclared, behind a named must-understand feature required only when present.
-Fresh dispatch and resume must read only those frozen declarations, never a later global
-catalog or caller-declared tools. The per-batch catalog seam fails closed when a provider's
-catalog is absent; it is not permission to fetch mutable declarations at dispatch time.
+A late result IS the held call's result: broca never sends a held call to its provider again.
+The puller pulls `late_results` under broca's own principal on one unscoped route per module
+(the custodian is the carrier, tool-provider contract §7), every 3 s while the module needs
+its feed, backing off to 30 s after errors. Each entry is classed from the intake registrations
+and the registered session's own WAL, never from `run-index.db`: an entry for an open held call
+is mapped with the same `content/v1` mapper a synchronous reply uses (`not_started` and
+`expired` become error results whose text is pinned by golden), deposited in the call's slot,
+and the session's actor resumes a paused run into its original batch, which writes the result
+as the call's `ToolResult` at the call's position and syncs it. Only then is the entry acked,
+through exactly the cursor the provider returned. An entry whose call already has its terminal,
+an entry of an unknown kind, and an entry no registration names are acked as no-ops; an entry
+whose held record is not yet durable pins the ack. Entries are deduplicated on
+`(provider, custodian, call_key, event_id)`, and `cursor_incarnation_changed` re-reads from the
+start. A registration is pruned once its call's terminal and batch commit are durable.
+
+At boot every session with a registration is opened so its open-time recovery runs, then each
+module that still needs its feed gets its puller. A missing or unreadable `late-results.db` is
+rebuilt off the startup path by scanning the live WALs, decoding only those holding a
+provider-held frame; until that scan completes no entry is delivered or acked.
+
+Ack guarantee, narrowed: broca puts no bound of its own on a hold. A provider keeps at most
+1,000 unacked results per session and drops the oldest first; a held call whose entry was
+dropped that way never receives one and its run stays paused until it is cancelled or stopped,
+which arrives with cancel and stop support for held calls. A finished session that retention
+deletes while its ack is still owed keeps its feed row, and entries for its lineage are then
+no-ops.
 
 ## 20. Persistence + storage
 

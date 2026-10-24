@@ -80,10 +80,12 @@ impl From<ConnError> for LateResultsError {
     }
 }
 
+/// A role op on a tool route travels as a call-shaped body naming the op, exactly as the
+/// tool-provider conformance kit sends `late_results` and `late_results.ack`.
 #[derive(Serialize)]
 struct Request<'a, P> {
-    method: &'a str,
-    params: P,
+    name: &'a str,
+    arguments: P,
 }
 
 /// One provider module's feed on the consumer-identity connection.
@@ -180,8 +182,11 @@ impl LateResultsFeed {
         method: &str,
         params: &P,
     ) -> Result<Vec<u8>, LateResultsError> {
-        let body = serde_json::to_vec(&Request { method, params })
-            .map_err(|error| LateResultsError::Protocol(error.to_string()))?;
+        let body = serde_json::to_vec(&Request {
+            name: method,
+            arguments: params,
+        })
+        .map_err(|error| LateResultsError::Protocol(error.to_string()))?;
         let terminal = self
             .conn
             .route_request_terminal_with_deadline(&self.route, body, self.reply_timeout)
@@ -193,6 +198,67 @@ impl LateResultsFeed {
             )
             .into()),
         }
+    }
+}
+
+/// The tool result a late entry settles its held call with, or `None` for an entry that is not
+/// a settlement (`progress`, or a kind this build does not know).
+///
+/// The entry IS the call's answer: a held call is never dispatched again to obtain it.
+///
+/// - `result` is the reply the held call's synchronous answer would have been. The held call
+///   was sent on a route declaring `content/v1`, to a tool that opted into it, so the body is
+///   read with the same `content/v1` mapper a synchronous reply goes through. A body that does
+///   not validate, or that is itself held again, closes the call with an error naming the
+///   problem rather than letting interim content reach the model.
+/// - `reduced: true` means the provider kept only the call's outcome code (contract §7), so the
+///   model is told the call finished and that only its outcome survives.
+/// - `not_started` and `expired` are the contract's terminal answers: the call never ran, or its
+///   result was dropped before broca collected it. Both close the call as an error result;
+///   neither is guessed from the absence of an entry.
+pub fn late_entry_tool_result(
+    tool_call_id: &broca_protocol::ToolCallId,
+    entry: &cortexkit_role_tool_provider::late_results::LateEntry,
+) -> Option<broca_protocol::ToolResult> {
+    use cortexkit_role_tool_provider::late_results::EntryKind;
+    let error = |message: String| broca_protocol::ToolResult {
+        tool_call_id: tool_call_id.clone(),
+        output: broca_protocol::ToolOutput::Error { message },
+        is_error: true,
+    };
+    match entry.kind() {
+        EntryKind::Result if entry.reduced => Some(error(format!(
+            "This call finished, but its provider kept only its outcome ({}), not its result.",
+            entry.outcome.as_deref().unwrap_or("unknown")
+        ))),
+        EntryKind::Result => Some(match &entry.result {
+            None => error("Its provider settled this call without a result.".into()),
+            Some(body) => {
+                match serde_json::from_value::<cortexkit_role_tool_provider::result::ToolResult>(
+                    body.clone(),
+                ) {
+                    Ok(reply) => crate::content_v1::map_content_v1_result(tool_call_id, &reply)
+                        .unwrap_or_else(|problem| {
+                            error(format!(
+                                "Its provider settled this call with an unreadable result: {problem}"
+                            ))
+                        }),
+                    Err(problem) => error(format!(
+                        "Its provider settled this call with an unreadable result: {problem}"
+                    )),
+                }
+            }
+        }),
+        EntryKind::NotStarted => Some(error(format!(
+            "This call never ran: its provider settled it as not started ({}).",
+            entry.reason.as_deref().unwrap_or("no reason given")
+        ))),
+        EntryKind::Expired => Some(error(
+            "This call's result expired at its provider before it was collected, so the result \
+             is lost. The call may have run."
+                .into(),
+        )),
+        _ => None,
     }
 }
 
@@ -246,7 +312,7 @@ mod tests {
             let request = module.next_request().await;
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
-                json!({"method": "late_results", "params": {"since": null}})
+                json!({"name": "late_results", "arguments": {"since": null}})
             );
             module.reply(&request, reply(&[entry("lin_9:4", "ev-1")], 1, false));
             module
@@ -266,8 +332,8 @@ mod tests {
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
                 json!({
-                    "method": "late_results",
-                    "params": {"since": {"provider_incarnation": "inc-1", "seq": 1}, "limit": 1}
+                    "name": "late_results",
+                    "arguments": {"since": {"provider_incarnation": "inc-1", "seq": 1}, "limit": 1}
                 })
             );
             module.reply(&request, reply(&[entry("lin_9:4", "ev-1")], 2, false));
@@ -275,8 +341,8 @@ mod tests {
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
                 json!({
-                    "method": "late_results.ack",
-                    "params": {"through": {"provider_incarnation": "inc-1", "seq": 2}}
+                    "name": "late_results.ack",
+                    "arguments": {"through": {"provider_incarnation": "inc-1", "seq": 2}}
                 })
             );
             module.reply(&request, b"{}".to_vec());
@@ -349,5 +415,75 @@ mod tests {
         let error = feed.pull(None, None).await.unwrap_err();
         assert!(error.is_permanent(), "{error}");
         provider.await.unwrap();
+    }
+
+    fn settled(kind: &str) -> LateEntry {
+        LateEntry::new(
+            kind,
+            "owner",
+            "ref-1",
+            3,
+            "reserved:broca",
+            "lin_9:4",
+            "ev-1",
+            1_761_220_000_000,
+        )
+    }
+
+    /// The model-facing text of every terminal a late entry can write, pinned byte for byte:
+    /// the result body through the `content/v1` mapper, the reduced outcome, and the two
+    /// terminal kinds. Progress and unknown kinds settle nothing.
+    #[test]
+    fn a_late_entry_becomes_its_held_calls_result_with_pinned_text() {
+        let id = broca_protocol::ToolCallId("tc_1".into());
+        let render = |entry: &LateEntry| {
+            late_entry_tool_result(&id, entry).map(|result| serde_json::to_value(result).unwrap())
+        };
+        // A result body is read exactly as the synchronous reply would have been.
+        let body = json!({"content": [{"type": "text", "text": "the answer"}], "isError": true, "errorCode": "not_found"});
+        let synchronous = crate::content_v1::map_content_v1_result(
+            &id,
+            &serde_json::from_value(body.clone()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            render(&settled(kinds::RESULT).with_result(body)),
+            Some(serde_json::to_value(synchronous).unwrap())
+        );
+        assert_eq!(
+            render(
+                &settled(kinds::RESULT)
+                    .with_reduced(true)
+                    .with_outcome("completed")
+            ),
+            Some(
+                json!({"tool_call_id": "tc_1", "output": {"kind": "error", "message": "This call finished, but its provider kept only its outcome (completed), not its result."}, "is_error": true})
+            )
+        );
+        assert_eq!(
+            render(&settled(kinds::NOT_STARTED).with_reason("restart_before_dispatch")),
+            Some(
+                json!({"tool_call_id": "tc_1", "output": {"kind": "error", "message": "This call never ran: its provider settled it as not started (restart_before_dispatch)."}, "is_error": true})
+            )
+        );
+        assert_eq!(
+            render(&settled(kinds::EXPIRED)),
+            Some(
+                json!({"tool_call_id": "tc_1", "output": {"kind": "error", "message": "This call's result expired at its provider before it was collected, so the result is lost. The call may have run."}, "is_error": true})
+            )
+        );
+        // A late body that is itself held again never reaches the model as interim content.
+        let rehold = render(&settled(kinds::RESULT).with_result(json!({
+            "content": [{"type": "text", "text": "STILL WAITING"}],
+            "held": {"reason": "running"}
+        })))
+        .unwrap();
+        assert_eq!(rehold["is_error"], true);
+        assert!(!rehold.to_string().contains("STILL WAITING"), "{rehold}");
+        assert_eq!(
+            render(&settled(kinds::PROGRESS).with_text("half way")),
+            None
+        );
+        assert_eq!(render(&settled("later_kind")), None);
     }
 }

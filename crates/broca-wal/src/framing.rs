@@ -202,6 +202,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     OPENROUTER_REASONING_FEATURE,
     PLAN_MANIFEST_FEATURE,
     PROVIDER_DECLARATIONS_FEATURE,
+    PROVIDER_HELD_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
@@ -278,10 +279,10 @@ pub const RESTART_PAUSE_FEATURE: &str = "restart-pause/v1";
 /// seal the run Interrupted while the provider still owes its result, and `PauseReason` is a
 /// closed enum that has no other value to read `tool_held` as.
 ///
-/// Not yet in [`KNOWN_FEATURES`]: replay does not interpret a held call in this build, so a
-/// WAL carrying either value is refused here too, as a newer writer's. The name joins the
-/// table with the release whose replay classes a held call as open rather than
-/// indeterminate, and no production path writes these values before then.
+/// In [`KNOWN_FEATURES`] reader-first: this build's replay classes a held call as open rather
+/// than indeterminate, and its runtime resumes the run when the late result arrives. No
+/// production path writes either value yet, because release builds leave the `held-reply/v1`
+/// route capability undeclared, so no provider can hold a call.
 pub const PROVIDER_HELD_FEATURE: &str = "provider-held/v1";
 
 /// Retention policy and queued/steered activity times affect expiry and deletion. A reader
@@ -1002,6 +1003,7 @@ mod tests {
                 OPENROUTER_REASONING_FEATURE,
                 PLAN_MANIFEST_FEATURE,
                 PROVIDER_DECLARATIONS_FEATURE,
+                PROVIDER_HELD_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
@@ -1731,26 +1733,23 @@ mod tests {
         );
     }
 
-    /// The known-name table of the release whose replay interprets held calls: this build's
-    /// table plus `provider-held/v1`.
-    fn known_with_provider_held() -> Vec<&'static str> {
+    /// The known-name table of a release from before `provider-held/v1`: this build's table
+    /// without it.
+    fn known_without_provider_held() -> Vec<&'static str> {
         KNOWN_FEATURES
             .iter()
             .copied()
-            .chain([PROVIDER_HELD_FEATURE])
+            .filter(|name| *name != PROVIDER_HELD_FEATURE)
             .collect()
     }
 
     /// Both values `provider-held/v1` covers gate themselves through `required_features`, with
-    /// no caller-supplied names. A reader that knows the feature reads them back exactly; this
-    /// build, and every older one, refuses the frame as a newer writer's instead of skipping the
-    /// held record or failing on the unknown pause reason.
+    /// no caller-supplied names. This build knows the feature and reads them back exactly; a
+    /// build from before it refuses the frame as a newer writer's instead of skipping the held
+    /// record or failing on the unknown pause reason.
     #[test]
     fn provider_held_records_are_gated_and_an_older_reader_refuses_them() {
-        assert!(
-            !KNOWN_FEATURES.contains(&PROVIDER_HELD_FEATURE),
-            "provider-held/v1 joins the table only with the replay that interprets it"
-        );
+        assert!(KNOWN_FEATURES.contains(&PROVIDER_HELD_FEATURE));
         let held: WalRecord = serde_json::from_str(
             r#"{"type":"tool_call_provider_held","batch_id":"b","tool_call_id":"c","call_key":"lin_9:42","module":"core","reason":"parent_answer","held_at_ms":1761220000000,"sequential":false}"#,
         )
@@ -1758,26 +1757,21 @@ mod tests {
         let paused: WalRecord =
             serde_json::from_str(r#"{"type":"run_paused","run_id":"r","reason":"tool_held"}"#)
                 .unwrap();
-        let reader = known_with_provider_held();
+        let older = known_without_provider_held();
         for record in [held, paused] {
             assert_eq!(record.required_features(), &[PROVIDER_HELD_FEATURE]);
             let bytes = encode(7, 1, &record).unwrap();
             assert_eq!(bytes[4], GATED_FRAMING_VERSION);
-            let DecodeStep::Record { framed, consumed } = decode_next_with(&bytes, &reader) else {
-                panic!("a reader with provider-held/v1 must decode {record:?}");
+            let DecodeStep::Record { framed, consumed } = decode_next(&bytes) else {
+                panic!("this build must decode {record:?}");
             };
             assert_eq!(consumed, bytes.len());
             assert_eq!(framed.record, record);
-            for older in [
-                decode_next(&bytes),
-                decode_next_with(&bytes, KNOWN_FEATURES),
-            ] {
-                match older {
-                    DecodeStep::NewerWriter { missing, .. } => {
-                        assert_eq!(missing, ["provider-held/v1"], "{record:?}")
-                    }
-                    _ => panic!("a reader without provider-held/v1 must refuse {record:?}"),
+            match decode_next_with(&bytes, &older) {
+                DecodeStep::NewerWriter { missing, .. } => {
+                    assert_eq!(missing, ["provider-held/v1"], "{record:?}")
                 }
+                _ => panic!("a reader without provider-held/v1 must refuse {record:?}"),
             }
         }
     }

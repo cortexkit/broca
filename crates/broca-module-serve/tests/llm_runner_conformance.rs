@@ -79,6 +79,8 @@ mod attribution;
 mod boundary_cancel;
 #[path = "llm_runner_conformance/evidence.rs"]
 mod evidence;
+#[path = "llm_runner_conformance/held_late_results.rs"]
+mod held_late_results;
 #[path = "llm_runner_conformance/optional_tools.rs"]
 mod optional_tools;
 #[path = "llm_runner_conformance/reader_identity.rs"]
@@ -210,6 +212,8 @@ struct Shared {
     /// What each structured-output session's scripted route reports about schema-constrained
     /// output, as a catalog row would: `Some(true)`, `Some(false)` or `None` (not stated).
     structured_output_support: Mutex<HashMap<String, Option<bool>>>,
+    /// The scripted provider's held calls and its `late_results` feed (see `held_late_results`).
+    held_feed: Mutex<held_late_results::FeedState>,
 }
 
 /// One held call's two edges: the tool provider has received it, and the suite has released it.
@@ -749,13 +753,24 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
         body: Vec<u8>,
     ) -> subc_client_rs::HandlerOutcome {
         let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if let Some(outcome) = held_late_results::serve_feed(&self.shared, &request).await {
+            return outcome;
+        }
         if request["name"] == "tool.catalog" {
-            return subc_client_rs::HandlerOutcome::Response(
-                serde_json::to_vec(&compaction::catalog(&request)).unwrap(),
-            );
+            let mut answer = compaction::catalog(&request);
+            held_late_results::declare_in_catalog(&self.shared, &mut answer);
+            return subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap());
         }
         let arguments = request["arguments"].to_string();
         let handle = ctx.route_handle();
+        if let Some(outcome) = held_late_results::answer_held(
+            &self.shared,
+            (handle.channel, handle.epoch),
+            &arguments,
+            &request,
+        ) {
+            return outcome;
+        }
         let session = self
             .routes
             .lock()
@@ -829,6 +844,11 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
         self.routes.lock().unwrap().insert(
             (req.handle.channel, req.handle.epoch),
             req.identity.session.clone(),
+        );
+        held_late_results::note_bind(
+            &self.shared,
+            (req.handle.channel, req.handle.epoch),
+            req.consumer_capabilities.as_deref(),
         );
         subc_client_rs::BindDecision::accept()
     }
@@ -979,6 +999,9 @@ struct BrocaSubject {
     bus_events_enabled: bool,
     process_kills_disabled: bool,
     reserved_reader: bool,
+    /// Start `ck-broca` with its tool routes declaring `content/v1` and `held-reply/v1`, which
+    /// only a debug build honours (see `broca_module_serve::held_runtime`).
+    declare_held_reply: bool,
     #[cfg(feature = "test-clock")]
     bus: Option<Arc<bus::BusRig>>,
     #[cfg(feature = "test-clock")]
@@ -1002,6 +1025,7 @@ impl BrocaSubject {
             bus_events_enabled: true,
             process_kills_disabled: false,
             reserved_reader: false,
+            declare_held_reply: false,
             #[cfg(feature = "test-clock")]
             bus: None,
             #[cfg(feature = "test-clock")]
@@ -1107,6 +1131,9 @@ impl BrocaSubject {
         config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
         if let Some(dump_dir) = &self.dump_dir {
             config["modules"]["broca"]["env"]["BROCA_DUMP_REQUEST_DIR"] = json!(dump_dir);
+        }
+        if self.declare_held_reply {
+            config["modules"]["broca"]["env"]["BROCA_TEST_DECLARE_HELD_REPLY_V1"] = json!("1");
         }
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
             .map_err(|e| fail(e.to_string()))?;
@@ -4348,6 +4375,7 @@ mod held_call_tests {
             bus_events_enabled: false,
             process_kills_disabled: true,
             reserved_reader: false,
+            declare_held_reply: false,
             #[cfg(feature = "test-clock")]
             bus: None,
             #[cfg(feature = "test-clock")]

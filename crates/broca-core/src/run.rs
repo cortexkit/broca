@@ -8179,6 +8179,7 @@ async fn resolve_provider_held_batch<T: ToolPlane>(
                     // Even on resume, no successor may leave until the held terminal is durable.
                     sync_held_terminal(&mut result, ctx, plane.writer, hooks).await?;
                     plane.held.complete(&result.result.tool_call_id);
+                    plane.terminal_synced(&result.result.tool_call_id).await;
                 }
                 results.insert(index, result);
             }
@@ -8199,6 +8200,16 @@ struct ProviderHeldPlane<'a, T> {
     held: ProviderHeldBatch,
     lifecycle: Option<&'a dyn crate::tool_plane::ProviderHeldLifecycle>,
     clock: Option<&'a crate::Clock>,
+}
+
+impl<T> ProviderHeldPlane<'_, T> {
+    /// Tell the lifecycle a held call's terminal is now durable, so the late result that
+    /// produced it counts as delivered. Nothing to tell without a lifecycle.
+    async fn terminal_synced(&self, tool_call_id: &ToolCallId) {
+        if let Some(lifecycle) = self.lifecycle {
+            lifecycle.terminal_synced(self.ctx, tool_call_id).await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -10039,7 +10050,13 @@ mod tests {
         }
     }
 
-    struct DeliveredHeld;
+    /// A lifecycle whose held call is answered at once, recording each `terminal_synced` it is
+    /// told about and whether that call's `ToolResult` was durable when it was told.
+    struct DeliveredHeld {
+        records: Arc<std::sync::Mutex<Vec<WalRecord>>>,
+        head: Arc<std::sync::atomic::AtomicU64>,
+        synced: std::sync::Mutex<Vec<(ToolCallId, bool)>>,
+    }
     #[async_trait::async_trait]
     impl crate::tool_plane::ProviderHeldLifecycle for DeliveredHeld {
         async fn wait(
@@ -10055,6 +10072,18 @@ mod tests {
                     text: "answer".into(),
                 },
             })
+        }
+
+        async fn terminal_synced(&self, _: &BatchCtx, tool_call_id: &ToolCallId) {
+            let durable = self.head.load(Ordering::Acquire) as usize;
+            let records = self.records.lock().unwrap();
+            let terminal_durable = records[..durable.min(records.len())]
+                .iter()
+                .any(|record| matches!(record, WalRecord::ToolResult { result, .. } if &result.tool_call_id == tool_call_id));
+            self.synced
+                .lock()
+                .unwrap()
+                .push((tool_call_id.clone(), terminal_durable));
         }
     }
 
@@ -10181,8 +10210,13 @@ mod tests {
                 provider_held: pending.provider_held,
                 ..Default::default()
             };
+            let lifecycle = Arc::new(DeliveredHeld {
+                records: records.clone(),
+                head: writer.durable_head(),
+                synced: Default::default(),
+            });
             let control = RunControl {
-                provider_held_lifecycle: Some(Arc::new(DeliveredHeld)),
+                provider_held_lifecycle: Some(lifecycle.clone()),
                 ..Default::default()
             };
             let outcome = dispatch_batch(
@@ -10211,6 +10245,13 @@ mod tests {
             assert_eq!(
                 *plane.sent.lock().unwrap(),
                 [ToolCallId("a".into()), ToolCallId("b".into())]
+            );
+            // The late result counts as delivered only once its terminal is durable, and only
+            // the held call is reported: the sequential successor was an ordinary dispatch.
+            assert_eq!(
+                *lifecycle.synced.lock().unwrap(),
+                [(ToolCallId("a".into()), true)],
+                "the held terminal must be synced before its delivery is answered"
             );
             assert_eq!(
                 records
@@ -13242,8 +13283,12 @@ mod approval_gate {
                             if result.ambiguous { interruption = Some(BatchInterruption::Ambiguous); }
                             if result.stopped && interruption.is_none() { interruption = Some(BatchInterruption::StopRequested); }
                             let value = execution(&result);
+                            let was_held = plane.held.contains(&result.result.tool_call_id);
                             sync_result(&mut result, ctx, writer, hooks).await?;
                             plane.held.complete(&result.result.tool_call_id);
+                            if was_held {
+                                plane.terminal_synced(&result.result.tool_call_id).await;
+                            }
                             if let (Some(held), Some(elicitation)) = (approved_calls.remove(&index), control.elicitation_plane.as_ref()) {
                                 feedback.push(Box::pin(async move { if let Some(id) = &held.id { crate::consent::report(elicitation.as_ref(), &held.ctx(ctx), id, value, None).await; } Feedback::Reported }));
                             }
