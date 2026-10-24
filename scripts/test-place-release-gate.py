@@ -801,8 +801,8 @@ print(f"ck-broca 4243 user txt REG 1 1 {{inode}} {self.dest}")
         self.assertFalse(self.rollback.exists())
 
     def test_second_gate_that_cannot_tell_names_its_reason(self):
-        # The re-check right before the restart is where a 0.3.254 deploy refused with exit 2 and
-        # no reason, because only live-run lines were printed.
+        # The re-check right before the restart must keep the gate's reason even when the gate
+        # printed no live-run lines.
         env = self.restart_fixture()
         counter = self.tmp / "gate-called"
         gate = (
