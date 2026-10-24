@@ -75,6 +75,7 @@ fn record_sequence(run: &RunId, session: &BindIdentity) -> Vec<WalRecord> {
             speed_used: None,
         },
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: BatchId("b1".into()),
@@ -356,7 +357,7 @@ async fn collect_until_terminal(rx: &mut mpsc::Receiver<Delivery>) -> Vec<Contro
     {
         match d {
             Delivery::Control(event) => {
-                let (cursor, unit) = event.as_ref();
+                let (cursor, unit, _) = event.as_ref();
                 if let Some(prev) = last_cursor {
                     assert!(
                         *cursor > prev,
@@ -387,17 +388,21 @@ async fn collect_until_terminal(rx: &mut mpsc::Receiver<Delivery>) -> Vec<Contro
 fn expected_units() -> Vec<&'static str> {
     vec![
         "RunStarted",
+        "MessageBoundary",
+        "MessageBoundary",
         "StepStarted",
         "AssistantMessage",
         "ToolCall",
         "StepFinished",
         "ToolResult",
+        "MessageBoundary",
         "RunFinished",
     ]
 }
 
 fn tag(u: &ControlUnit) -> &'static str {
     match u {
+        ControlUnit::MessageBoundary { .. } => "MessageBoundary",
         ControlUnit::RunStarted { .. } => "RunStarted",
         ControlUnit::StepStarted { .. } => "StepStarted",
         ControlUnit::BudgetFired { .. } => "BudgetFired",
@@ -610,10 +615,21 @@ async fn live_attach_skips_idle_history_and_receives_the_next_run() {
         .await
         .expect("live attach succeeds");
     assert!(
+        matches!(
+            broca_test_support::event_timeout(
+                "live_attach_skips_idle_history_and_receives_the_next_run",
+                rx.recv(),
+                || "waiting for the initial display reset".into(),
+            ).await.expect("initial display reset arrives"),
+            Some(Delivery::Display(event)) if matches!(*event, broca_protocol::DisplayEvent::DisplayReset)
+        ),
+        "live attach first resets advisory display state"
+    );
+    assert!(
         tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
             .await
             .is_err(),
-        "live attach remains quiet instead of replaying the completed history"
+        "after its display reset, live attach remains quiet instead of replaying completed history"
     );
 
     registry

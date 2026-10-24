@@ -706,7 +706,7 @@ impl GeminiNormalizer {
         self
     }
 
-    fn push_part(&mut self, part: GeminiPartBuf) {
+    fn push_part(&mut self, part: GeminiPartBuf) -> u64 {
         match (self.parts.last_mut(), &part) {
             (
                 Some(GeminiPartBuf::Text {
@@ -719,7 +719,7 @@ impl GeminiNormalizer {
                 },
             ) => {
                 buffered.push_str(text);
-                return;
+                return (self.parts.len() - 1) as u64;
             }
             (
                 Some(GeminiPartBuf::Reasoning {
@@ -732,11 +732,12 @@ impl GeminiNormalizer {
                 },
             ) => {
                 buffered.push_str(text);
-                return;
+                return (self.parts.len() - 1) as u64;
             }
             _ => {}
         }
         self.parts.push(part);
+        (self.parts.len() - 1) as u64
     }
 
     fn handle_chunk(
@@ -875,7 +876,7 @@ impl GeminiNormalizer {
                     .to_owned();
                 let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                 let display_delta = args.to_string();
-                self.push_part(GeminiPartBuf::FunctionCall(FunctionCallBuf {
+                let part_index = self.push_part(GeminiPartBuf::FunctionCall(FunctionCallBuf {
                     index,
                     name,
                     args,
@@ -883,6 +884,8 @@ impl GeminiNormalizer {
                 }));
                 let tcid = synthetic_inbound_id(index, self.tool_id_policy);
                 out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
+                    mid: None,
+                    part: Some(part_index),
                     tool_call_id: ToolCallId(tcid),
                     delta: display_delta,
                 }));
@@ -896,11 +899,13 @@ impl GeminiNormalizer {
             // the wire part prevents model summaries from being persisted and replayed as answers.
             if is_thought {
                 if let Some(text) = text.filter(|text| !text.is_empty()) {
-                    self.push_part(GeminiPartBuf::Reasoning {
+                    let part_index = self.push_part(GeminiPartBuf::Reasoning {
                         text: text.to_owned(),
                         signature: thought_signature,
                     });
                     out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
+                        mid: None,
+                        part: Some(part_index),
                         message_id: message_id.clone(),
                         delta: text.to_owned(),
                     }));
@@ -930,6 +935,8 @@ impl GeminiNormalizer {
             }
             if let Some(text) = text.filter(|text| !text.is_empty()) {
                 out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
+                    mid: None,
+                    part: Some((self.parts.len() - 1) as u64),
                     message_id: message_id.clone(),
                     tool_call_id: None,
                     delta: text.to_owned(),

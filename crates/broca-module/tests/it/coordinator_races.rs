@@ -2152,6 +2152,7 @@ async fn reopened_actor_seals_indeterminate_run_before_draining_new_send() {
             planned_calls: vec![call_id.clone()],
         },
         broca_wal::WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             hooks: None,
             batch_id,
             tool_call_id: call_id,
@@ -4048,6 +4049,7 @@ fn seed_unsealed_run_with_queue(
                 planned_calls: vec![call_id.clone()],
             },
             broca_wal::WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: batch_id.clone(),

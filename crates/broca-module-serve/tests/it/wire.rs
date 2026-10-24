@@ -2131,6 +2131,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // Process-local lifetime operation counts. The isolated operation_counters target proves
         // their zero and non-zero readings; this test keeps their presence in the total key set.
         "stream_chunks",
+        "display_index_resets",
         "session_reads",
         "actor_opens",
         "management_ops",

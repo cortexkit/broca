@@ -213,6 +213,7 @@ fn gemini_normalizer_assembles_text_and_tool_call() {
             NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
                 tool_call_id,
                 delta,
+                ..
             }) => Some((&tool_call_id.0, delta.as_str())),
             _ => None,
         })

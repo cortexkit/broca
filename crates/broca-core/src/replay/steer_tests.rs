@@ -138,6 +138,7 @@ fn tool_turn(step: u64, call: &str) -> (Vec<WalRecord>, Vec<WalRecord>) {
                 planned_calls: vec![id.clone()],
             },
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: batch_id.clone(),
                 tool_call_id: id.clone(),
@@ -151,6 +152,7 @@ fn tool_turn(step: u64, call: &str) -> (Vec<WalRecord>, Vec<WalRecord>) {
         ],
         vec![
             WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: batch_id.clone(),

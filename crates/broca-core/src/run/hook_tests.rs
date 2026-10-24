@@ -36,6 +36,20 @@ fn writer() -> (WalHandle, Arc<Mutex<Vec<WalRecord>>>) {
         records,
     )
 }
+
+fn records_with_observed_result_times(records: &Mutex<Vec<WalRecord>>) -> Vec<WalRecord> {
+    let mut records = records.lock().unwrap().clone();
+    for record in &mut records {
+        if let WalRecord::ToolResult { finished_at_ms, .. } = record {
+            // Content and source order are deterministic; the observation clock is not.
+            assert!(
+                finished_at_ms.take().is_some(),
+                "a written result has an observed finish time"
+            );
+        }
+    }
+    records
+}
 enum Reply {
     Answer(HookAnswer),
     Unavailable,
@@ -759,6 +773,8 @@ impl Provider for Messages {
         }
         let (tx, rx) = mpsc::channel(8);
         tx.send(NormalizedEvent::Display(DisplayEvent::TextDelta {
+            mid: None,
+            part: None,
             message_id: broca_protocol::MessageId(format!("m{}", step.0)),
             tool_call_id: None,
             delta: "answer".into(),
@@ -1191,6 +1207,7 @@ async fn excluded_unknown(interrupted: bool) {
 
 fn result_record(id: &str, text: &str) -> WalRecord {
     WalRecord::ToolResult {
+        finished_at_ms: None,
         tags: None,
         batch_id: BatchId("b".into()),
         result: Arc::new(ToolResult {
@@ -1243,7 +1260,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
     assert!(!seal.deposit_hook(second, result_record("a", "loop-must-not-write")));
     seal.record_hook_fallbacks(&writer).await.unwrap();
     assert_eq!(
-        *records.lock().unwrap(),
+        records_with_observed_result_times(&records),
         vec![
             model,
             result_record("z", "answered-z"),
@@ -1266,7 +1283,7 @@ async fn loop_wins_handover_and_seal_writes_no_second_terminal() {
     seal.seal_and_collect(std::time::Duration::ZERO).await;
     seal.record_hook_fallbacks(&writer).await.unwrap();
     assert_eq!(
-        *records.lock().unwrap(),
+        records_with_observed_result_times(&records),
         vec![result_record("a", "answered")]
     );
     let _ = writer.shutdown().await;
@@ -2326,7 +2343,7 @@ async fn lost_post_tool_handover_parks_before_batch_or_turn_markers() {
     assert!(records.lock().unwrap().is_empty());
     seal.record_hook_fallbacks(&writer).await.unwrap();
     assert_eq!(
-        *records.lock().unwrap(),
+        records_with_observed_result_times(&records),
         vec![result_record("c", "fallback")]
     );
     let _ = writer.shutdown().await;
@@ -2541,3 +2558,36 @@ async fn cut_step_shutdown_fallback_keeps_exact_rejection_counts() {
 
 #[path = "dispatch_cancel_tests.rs"]
 mod dispatch_cancel_tests;
+
+#[tokio::test]
+async fn post_hook_restream_counts_delta_less_stored_blocks() {
+    let message = AssistantMessage {
+        message_id: broca_protocol::MessageId("hooked".into()),
+        content: vec![
+            ContentBlock::RedactedReasoning {
+                data: "opaque".into(),
+                provider_format: None,
+            },
+            ContentBlock::Reasoning {
+                text: "thinking".into(),
+                signature: None,
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
+        ],
+    };
+    let (out, mut events) = mpsc::channel(8);
+    restream_message(&message, &out).await;
+    assert_eq!(
+        events.try_recv().unwrap(),
+        OutputEvent::Display(DisplayEvent::DisplayReset)
+    );
+    let parts: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|e| match e {
+            OutputEvent::Display(e) => e.coordinates().map(|(_, part)| part),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parts, vec![1, 2]);
+}

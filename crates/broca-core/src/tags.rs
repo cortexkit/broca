@@ -484,6 +484,7 @@ mod tests {
 
     fn result(id: &str) -> WalRecord {
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             batch_id: BatchId("b".into()),
             result: Arc::new(ToolResult {

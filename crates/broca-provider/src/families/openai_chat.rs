@@ -514,6 +514,7 @@ struct ToolCallBuf {
 /// finish reason or the `[DONE]` sentinel confirms the response completed. Usage is
 /// taken from the optional trailing usage chunk.
 pub struct OpenAiChatNormalizer {
+    display_parts: crate::display_parts::DisplayParts,
     arguments_guard: crate::wire::ToolArgsGuard,
     step_id: StepId,
     sse: SseDecoder,
@@ -542,6 +543,7 @@ pub struct OpenAiChatNormalizer {
 impl OpenAiChatNormalizer {
     pub fn new(step_id: StepId, usage_policy: UsagePolicy) -> Self {
         Self {
+            display_parts: Default::default(),
             arguments_guard: Default::default(),
             step_id,
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Chat),
@@ -641,6 +643,10 @@ impl OpenAiChatNormalizer {
         if self.openrouter {
             if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
                 self.reasoning_details.extend(details.iter().cloned());
+                if !details.is_empty() {
+                    self.display_parts
+                        .reserve((0, 0), "openai_chat", self.step_id, out);
+                }
             }
         }
         let reasoning_key = if self.openrouter {
@@ -651,21 +657,37 @@ impl OpenAiChatNormalizer {
         if let Some(reasoning) = delta.get(reasoning_key).and_then(Value::as_str) {
             if !reasoning.is_empty() {
                 self.reasoning.push_str(reasoning);
-                out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
-                    message_id: mid.clone(),
-                    delta: reasoning.to_owned(),
-                }));
+                self.display_parts.delta(
+                    (0, 0),
+                    DisplayEvent::ReasoningDelta {
+                        mid: None,
+                        part: None,
+                        message_id: mid.clone(),
+                        delta: reasoning.to_owned(),
+                    },
+                    "openai_chat",
+                    self.step_id,
+                    out,
+                );
             }
         }
 
         if let Some(content) = delta.get("content").and_then(Value::as_str) {
             if !content.is_empty() {
                 self.text.push_str(content);
-                out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
-                    message_id: mid.clone(),
-                    tool_call_id: None,
-                    delta: content.to_owned(),
-                }));
+                self.display_parts.delta(
+                    (1, 0),
+                    DisplayEvent::TextDelta {
+                        mid: None,
+                        part: None,
+                        message_id: mid.clone(),
+                        tool_call_id: None,
+                        delta: content.to_owned(),
+                    },
+                    "openai_chat",
+                    self.step_id,
+                    out,
+                );
             }
         }
 
@@ -673,11 +695,19 @@ impl OpenAiChatNormalizer {
             self.saw_refusal = true;
             if !refusal.is_empty() {
                 self.text.push_str(refusal);
-                out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
-                    message_id: mid.clone(),
-                    tool_call_id: None,
-                    delta: refusal.to_owned(),
-                }));
+                self.display_parts.delta(
+                    (1, 0),
+                    DisplayEvent::TextDelta {
+                        mid: None,
+                        part: None,
+                        message_id: mid.clone(),
+                        tool_call_id: None,
+                        delta: refusal.to_owned(),
+                    },
+                    "openai_chat",
+                    self.step_id,
+                    out,
+                );
             }
         }
 
@@ -689,6 +719,8 @@ impl OpenAiChatNormalizer {
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty());
                 let slot = self.tool_call_slot(index, id);
+                self.display_parts
+                    .reserve((2, slot as u64), "openai_chat", self.step_id, out);
                 let buf = &mut self.tool_calls[slot];
                 if let Some(id) = id {
                     buf.id = id.to_owned();
@@ -709,10 +741,18 @@ impl OpenAiChatNormalizer {
                             args,
                         );
                         let tcid = ToolCallId(buf.id.clone());
-                        out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
-                            tool_call_id: tcid,
-                            delta: args.to_owned(),
-                        }));
+                        self.display_parts.delta(
+                            (2, slot as u64),
+                            DisplayEvent::ToolInputDelta {
+                                mid: None,
+                                part: None,
+                                tool_call_id: tcid,
+                                delta: args.to_owned(),
+                            },
+                            "openai_chat",
+                            self.step_id,
+                            out,
+                        );
                     }
                 }
             }
@@ -879,12 +919,22 @@ impl OpenAiChatNormalizer {
         }
     }
 
-    fn assemble_message(&mut self) -> Result<AssistantMessage, NormalizeError> {
+    fn assemble_message(
+        &mut self,
+        out: &mut Vec<NormalizedEvent>,
+    ) -> Result<AssistantMessage, NormalizeError> {
         for buf in &self.tool_calls {
             self.arguments_guard
                 .terminal(&buf.id, &buf.name, &buf.arguments);
         }
         let mut content = Vec::new();
+        let mut keys = Vec::new();
+        if !self.reasoning.is_empty() || (self.openrouter && !self.reasoning_details.is_empty()) {
+            keys.push((0, 0));
+        }
+        if !self.text.is_empty() {
+            keys.push((1, 0));
+        }
         if self.openrouter && (!self.reasoning.is_empty() || !self.reasoning_details.is_empty()) {
             content.push(ContentBlock::RedactedReasoning {
                 data: serde_json::to_string(&json!({
@@ -916,7 +966,7 @@ impl OpenAiChatNormalizer {
                 max_output_tokens: self.max_output_tokens,
                 output_tokens: self.usage.output_tokens,
             });
-        for buf in std::mem::take(&mut self.tool_calls) {
+        for (slot, buf) in std::mem::take(&mut self.tool_calls).into_iter().enumerate() {
             let Some(input) =
                 self.arguments_guard
                     .decode(&buf.arguments, &buf.name, ceiling, false)?
@@ -929,7 +979,10 @@ impl OpenAiChatNormalizer {
                 input,
                 thought_signature: None,
             }));
+            keys.push((2, slot as u64));
         }
+        self.display_parts
+            .retain(&keys, "openai_chat", self.step_id, out);
         Ok(AssistantMessage {
             message_id: self.message_id.clone().unwrap_or(MessageId(String::new())),
             content,
@@ -1006,7 +1059,7 @@ impl StreamNormalizer for OpenAiChatNormalizer {
             Some(finish_reason) => finish_reason,
             None => FinishReason::Other,
         };
-        let message = self.assemble_message()?;
+        let message = self.assemble_message(&mut out)?;
         let finish_reason = if self.arguments_guard.fired() {
             FinishReason::ToolCalls
         } else {

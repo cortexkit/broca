@@ -130,6 +130,11 @@ pub enum ControlUnit {
         #[serde(default)]
         retries_used: u32,
     },
+    /// Stored-message identity for a lifecycle event needing its own control unit.
+    /// The stream assigns a durable cursor without repeating the message body.
+    MessageBoundary {
+        mid: String,
+    },
     /// Tell the caller to discard partial display state (paired with a display-lane
     /// reset) — e.g. when a stream generation is abandoned.
     /// Unknown future control events use this conservative reset fallback.

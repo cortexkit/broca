@@ -26,7 +26,9 @@ pub mod hooks;
 pub mod import;
 pub mod input_budget;
 pub mod lease;
+pub mod media_store;
 pub mod media_validation;
+pub mod placement;
 pub mod projection;
 mod projection_health;
 pub mod projection_plan;
@@ -95,7 +97,8 @@ pub use import::{
 pub use lease::{lease_key_for, FileLeaseStore, LeaseError, LeaseHandle, LeaseStore};
 pub use projection::{
     advance_control_projection_state, classify_control_unit, last_control_cursor_through,
-    project_control, project_control_with_state, ControlClass, ControlProjectionState, Cursor,
+    project_control, project_control_with_mids, project_control_with_state, ControlClass,
+    ControlProjectionState, Cursor, PlacedControlUnit,
 };
 pub use provider::{Provider, StubProvider};
 pub use queue::{

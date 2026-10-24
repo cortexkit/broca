@@ -19,7 +19,7 @@ pub enum Role {
 }
 
 /// One message in a `Prompt` (`Vec<Message>`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
@@ -249,7 +249,7 @@ pub enum TextProviderFormat {
 }
 
 /// Opaque, format-owned metadata. Core and WAL retain these bytes without interpreting them.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextProviderState {
     pub format: TextProviderFormat,
     pub data: String,
@@ -370,7 +370,7 @@ pub fn media_not_shown_marker(media: &MediaRef, reason: MediaMarkerReason) -> St
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Media(MediaRef),
@@ -409,7 +409,7 @@ pub enum ContentBlock {
 }
 
 /// An assembled, complete tool call (input is the full JSON args, not deltas).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub tool_call_id: ToolCallId,
     pub tool_name: String,
@@ -424,7 +424,7 @@ pub struct ToolCall {
 /// or a denied/error placeholder so every assistant tool-call has a matching
 /// result before the next provider send (a tool_use with no matching result is a
 /// provider-invalid conversation).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub tool_call_id: ToolCallId,
     pub output: ToolOutput,
@@ -432,7 +432,7 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolOutput {
     Text {
@@ -456,7 +456,7 @@ pub enum ToolOutput {
 }
 
 /// The nested reference keeps a part's discriminator separate from the media modality.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolOutputPart {
     Text { text: String },
@@ -478,7 +478,7 @@ pub fn media_parts_text(parts: &[ToolOutputPart], reason: MediaMarkerReason) -> 
 /// The assembled assistant message — text + reasoning + tool-call blocks in
 /// source order. The provider module assembles this from its stream deltas; the
 /// runner validates/persists it and never re-assembles deltas itself.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub message_id: MessageId,
     pub content: Vec<ContentBlock>,

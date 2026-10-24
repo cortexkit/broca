@@ -382,6 +382,7 @@ impl SessionClient {
     /// with [`decode_subscribe_event`].
     pub async fn subscribe(&self, from: SubscribeFrom) -> Result<SubscribeStream, ConnError> {
         let params = SubscribeParams {
+            limits: None,
             from: Some(match from {
                 SubscribeFrom::Start => FromWire::Named("start".into()),
                 SubscribeFrom::Live => FromWire::Named("live".into()),

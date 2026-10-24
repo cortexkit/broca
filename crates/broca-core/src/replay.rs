@@ -24,6 +24,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::placement::{AppendKind, HoldKind, Placement, PlacementAction};
 use broca_protocol::{
     caller::RunFinishReason,
     content::{AssistantMessage, ContentBlock, Message, Role, ToolOutput, ToolResult},
@@ -797,10 +798,6 @@ impl OpenBatch {
         }
     }
 
-    fn all_terminated(&self) -> bool {
-        self.terminals.iter().all(Option::is_some)
-    }
-
     /// Whether any record after the batch start says something about one of its calls: a
     /// dispatch intent, a Prepared call, or a terminal. Replacing such a batch would forget
     /// that a call may have run, or already ran, and let a resume send it again.
@@ -1000,8 +997,6 @@ struct Episode {
     open_step_record: Option<usize>,
     /// Provider-free SeededFrom episodes are imports/forks, not resumable model runs.
     seeded_from: bool,
-    /// Prompt length before an import's input, used to discard a torn import during repair.
-    seeded_prompt_start: Option<usize>,
     /// The model that produced THIS episode's assistant turns — the episode's frozen
     /// `RunConfig.model`. Stamped onto each assistant `Message` this episode commits, so a
     /// later episode under a DIFFERENT model can detect the cross-model boundary at render
@@ -1016,7 +1011,6 @@ struct Episode {
     first_step_message: Option<usize>,
     /// Durable model steps in THIS episode (each billed). Resets per episode.
     completed_steps: u64,
-    budget: crate::BudgetReplayStateV1,
     /// Whether this episode has already replaced its pre-call render config.
     config_refrozen: bool,
     /// Usage accumulated across THIS episode's steps. Resets per episode.
@@ -1070,8 +1064,12 @@ struct Episode {
 impl Episode {
     /// Place every pending steered message at the end of `prompt`: the step boundary the
     /// replay has just reached.
-    fn place_steers(&mut self, prompt: &mut Vec<Message>) {
-        prompt.append(&mut self.pending_steers);
+    fn place_steers(&mut self, prompt: &mut Vec<Message>, actions: &[PlacementAction]) {
+        for action in actions {
+            if let PlacementAction::PlaceHeld { count, .. } = *action {
+                prompt.extend(self.pending_steers.drain(..count as usize));
+            }
+        }
     }
 }
 
@@ -1457,6 +1455,13 @@ fn replay_seeded_with_compaction<'a>(
     tag_seed: crate::tags::TagSeed,
 ) -> Result<ReplayState, ReplayError> {
     let (ordinal_base, require_caller_text) = position;
+    let mut placement = Placement::seeded(
+        ordinal_base,
+        seed_run_id.clone(),
+        seed_budget.clone(),
+        seed_budget_state.clone().unwrap_or_default(),
+        0,
+    );
     // Tag numbers under the computed rules, given in the order the transcript renders: each
     // message as it is placed in the prompt, a run's rules from its `RunStarted` on.
     let mut numbering = crate::tags::TagNumbering::new(tag_seed, 0);
@@ -1495,7 +1500,6 @@ fn replay_seeded_with_compaction<'a>(
         attributable: run_id.as_ref().is_some_and(|id| !id.0.is_empty()),
         seeded_last_ordinal: ordinal_base.checked_sub(1),
         origin: seed_origin,
-        budget: seed_budget_state.unwrap_or_default(),
         ..Episode::default()
     };
     let mut episode_step_spans: Vec<std::ops::Range<usize>> = Vec::new();
@@ -1530,6 +1534,25 @@ fn replay_seeded_with_compaction<'a>(
                 state.history = compaction_history.clone();
             }
         }
+        let expected_budget_text = matches!(rec, WalRecord::BudgetFired { .. })
+            .then(|| {
+                run_config
+                    .as_ref()
+                    .and_then(|config| config.budget.as_ref())
+                    .or(seeded_budget.as_ref())
+            })
+            .flatten()
+            .and_then(|budget| {
+                crate::budget_kernel::decide(placement.budget(), budget)
+                    .first()
+                    .map(|due| due.text.clone())
+            });
+        let actions = placement
+            .observe(rec)
+            .map_err(|reason| ReplayError::CorruptLineage {
+                episode_run_id: run_id.clone().unwrap_or_else(|| RunId(String::new())),
+                reason,
+            })?;
         match rec {
             WalRecord::RunStarted {
                 on_restart: on_restart_policy,
@@ -1582,14 +1605,6 @@ fn replay_seeded_with_compaction<'a>(
                 // Import/fork inputs describe historical messages, not messages produced by the
                 // synthetic seed run. A missing or empty producer id is never invented.
                 ep.attributable = !ep.seeded_from && !rid.0.is_empty();
-                ep.seeded_prompt_start = matches!(
-                    origin,
-                    broca_wal::RunOrigin::SeededFrom {
-                        origin_kind: broca_wal::SeedOriginKind::Import,
-                        ..
-                    }
-                )
-                .then_some(prompt.len());
                 // Stamp this episode's assistant turns with the model that produced them,
                 // so a later episode under a different model can strip a cross-model
                 // signature at render. From the durable per-episode config → reproduces on
@@ -1615,18 +1630,31 @@ fn replay_seeded_with_compaction<'a>(
                 let idle_delivery = submission_id
                     .as_ref()
                     .is_some_and(|id| ordered_submissions.remove(id));
-                prompt.extend(input.iter().enumerate().map(|(index, message)| {
-                    let mut message = tagged(message.clone(), input_tags.get(index));
-                    if idle_delivery {
+                let count = actions
+                    .iter()
+                    .find_map(|action| match action {
+                        PlacementAction::Append {
+                            count,
+                            kind: AppendKind::Input,
+                            ..
+                        } => Some(*count),
+                        _ => None,
+                    })
+                    .expect("RunStarted places input");
+                prompt.extend(input.iter().take(count as usize).enumerate().map(
+                    |(index, message)| {
+                        let mut message = tagged(message.clone(), input_tags.get(index));
+                        if idle_delivery {
+                            message
+                                .tags
+                                .set_delivery(broca_protocol::tags::DeliveryAttribution {
+                                    mode: broca_protocol::DeliveryMode::IdleStart,
+                                    tool_call_id: None,
+                                });
+                        }
                         message
-                            .tags
-                            .set_delivery(broca_protocol::tags::DeliveryAttribution {
-                                mode: broca_protocol::DeliveryMode::IdleStart,
-                                tool_call_id: None,
-                            });
-                    }
-                    message
-                }));
+                    },
+                ));
             }
             WalRecord::ModelStepFinished {
                 step_id,
@@ -1642,18 +1670,17 @@ fn replay_seeded_with_compaction<'a>(
                 ep.retries_used = ep.retries_used.saturating_add(*retries_used);
                 ep.last_step_usage = Some(*u);
                 ep.last_step_finish_reason = *finish_reason;
-                ep.completed_steps += 1;
+                ep.completed_steps = placement.completed_steps();
                 ep.natural_stop_reason = None;
-                let was_finalize_turn = ep.budget.finalize_pending;
-                crate::budget_kernel::apply(
-                    crate::budget_kernel::State {
-                        facts: &mut ep.budget,
-                        config: None,
-                        run_id: run_id.as_ref(),
-                    },
-                    rec,
-                )
-                .expect("model steps cannot invalidate budget facts");
+                let was_finalize_turn = actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Append {
+                            kind: AppendKind::Finalize,
+                            ..
+                        }
+                    )
+                });
                 if was_finalize_turn {
                     // A finalize turn is terminal even if a provider emits undeclared calls.
                     // Preserve its answer text in future history, but omit tool calls because
@@ -1695,7 +1722,15 @@ fn replay_seeded_with_compaction<'a>(
                     ep.open_batch = None;
                     ep.natural_end = true;
                     ep.natural_end_extendable = false;
-                } else if assistant_message.tool_calls().next().is_some() {
+                } else if actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Hold {
+                            kind: HoldKind::Assistant,
+                            ..
+                        }
+                    )
+                }) {
                     // Each tool turn opens and commits its own batch. A batch still open from an
                     // earlier turn cannot belong to this one: fail closed if it holds call
                     // evidence, and otherwise drop it so this turn is never paired with another
@@ -1714,7 +1749,15 @@ fn replay_seeded_with_compaction<'a>(
                     ep.open_step_record = Some(record_index);
                     ep.open_batch_id = None; // a new tool turn; its batch hasn't opened yet
                     ep.natural_end = false;
-                } else {
+                } else if actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Append {
+                            kind: AppendKind::Assistant,
+                            ..
+                        }
+                    )
+                }) {
                     // Terminal turn (no tools) — commit immediately. This step ends
                     // the loop, so the episode ended naturally here.
                     ep.first_step_message.get_or_insert(prompt.len());
@@ -1868,7 +1911,15 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::ToolBatchFinished { .. } => {
                 // Commit the tool turn IFF complete (every planned call terminated).
                 if let Some(b) = &ep.open_batch {
-                    if b.all_terminated() {
+                    if actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            PlacementAction::Append {
+                                kind: AppendKind::ToolTurn,
+                                ..
+                            }
+                        )
+                    }) {
                         // A committed all-synthetic-stop batch means the run hit its stop
                         // limit before dispatching → finish the lineage here even if the
                         // trailing RunFinished was lost in a crash (else replay would see a
@@ -1912,9 +1963,20 @@ fn replay_seeded_with_compaction<'a>(
             // never lands between a tool call and its result or ahead of the step it arrived in.
             WalRecord::Steered { input, .. } => {
                 let steer_tags = rec.runner_tags();
+                let count = actions
+                    .iter()
+                    .find_map(|action| match action {
+                        PlacementAction::Hold {
+                            count,
+                            kind: HoldKind::Steer,
+                        } => Some(*count),
+                        _ => None,
+                    })
+                    .expect("Steered holds input");
                 ep.pending_steers.extend(
                     input
                         .iter()
+                        .take(count as usize)
                         .enumerate()
                         .map(|(index, message)| tagged(message.clone(), steer_tags.get(index))),
                 );
@@ -1934,17 +1996,30 @@ fn replay_seeded_with_compaction<'a>(
                 ordered_submissions.remove(submission_id);
                 if let Some(input) = input {
                     let delivered_tags = rec.runner_tags();
+                    let count = actions
+                        .iter()
+                        .find_map(|action| match action {
+                            PlacementAction::Hold {
+                                count,
+                                kind: HoldKind::Steer,
+                            } => Some(*count),
+                            _ => None,
+                        })
+                        .expect("SendDelivered holds its input");
                     ep.pending_steers
-                        .extend(input.iter().enumerate().map(|(index, message)| {
-                            let mut message = tagged(message.clone(), delivered_tags.get(index));
-                            message
-                                .tags
-                                .set_delivery(broca_protocol::tags::DeliveryAttribution {
-                                    mode: *mode,
-                                    tool_call_id: None,
-                                });
-                            message
-                        }));
+                        .extend(input.iter().take(count as usize).enumerate().map(
+                            |(index, message)| {
+                                let mut message =
+                                    tagged(message.clone(), delivered_tags.get(index));
+                                message.tags.set_delivery(
+                                    broca_protocol::tags::DeliveryAttribution {
+                                        mode: *mode,
+                                        tool_call_id: None,
+                                    },
+                                );
+                                message
+                            },
+                        ));
                 }
                 if let (Some(tool_call_id), Some(text)) = (tool_call_id, appended_text) {
                     crate::delivery_order::apply_to_prompt(&mut prompt, tool_call_id, text);
@@ -1971,45 +2046,23 @@ fn replay_seeded_with_compaction<'a>(
             }
             WalRecord::BudgetFired {
                 run_id: fired_run_id,
-                ordinal,
                 caller_text,
                 ..
             } => {
-                let budget = run_config
-                    .as_ref()
-                    .and_then(|config| config.budget.as_ref())
-                    .or(seeded_budget.as_ref());
-                let Some(budget) = budget else {
+                if !actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        PlacementAction::Append {
+                            kind: AppendKind::Budget,
+                            ..
+                        }
+                    )
+                }) {
                     // Read-only transcript assembly has no checkpoint budget seed. Preserve its
                     // established best-effort behavior; admission and projection fail closed.
                     continue;
-                };
-                let expected_ordinal = ordinal_base.saturating_add(prompt.len() as u64);
-                if *ordinal != expected_ordinal {
-                    return Err(ReplayError::CorruptLineage {
-                        episode_run_id: fired_run_id.clone(),
-                        reason: format!(
-                            "budget message ordinal {ordinal} does not match prompt position {expected_ordinal}"
-                        ),
-                    });
                 }
-
-                let expected_text = crate::budget_kernel::decide(&ep.budget, budget)
-                    .first()
-                    .map(|due| due.text.clone());
-                crate::budget_kernel::apply(
-                    crate::budget_kernel::State {
-                        facts: &mut ep.budget,
-                        config: Some(budget),
-                        run_id: run_id.as_ref(),
-                    },
-                    rec,
-                )
-                .map_err(|reason| ReplayError::CorruptLineage {
-                    episode_run_id: fired_run_id.clone(),
-                    reason,
-                })?;
-                let expected_text = expected_text.expect("accepted firing was due");
+                let expected_text = expected_budget_text.expect("accepted firing was due");
                 let text = match caller_text {
                     Some(text) if text == &expected_text => text.clone(),
                     Some(_) => {
@@ -2037,14 +2090,14 @@ fn replay_seeded_with_compaction<'a>(
                 retries_used,
                 ..
             } => {
-                if ep.completed_steps == 0 && *reason == RunFinishReason::Interrupted {
-                    if let Some(start) = ep.seeded_prompt_start {
-                        prompt.truncate(start);
+                for action in &actions {
+                    if let PlacementAction::Truncate { to } = action {
+                        prompt.truncate(to.saturating_sub(ordinal_base) as usize);
                     }
                 }
                 // A steer no later step rendered stays in the transcript exactly once, at the
                 // episode's close, after anything the terminal's barrier committed.
-                ep.place_steers(&mut prompt);
+                ep.place_steers(&mut prompt, &actions);
                 ep.finished = Some(*reason);
                 ep.retries_used = *retries_used;
                 // A terminal SEALS any earlier pause in this episode (e.g. a cancel of a
@@ -2114,7 +2167,7 @@ fn replay_seeded_with_compaction<'a>(
                 ep.paused = None;
                 ep.provider_call_started = true;
                 // Pending steers are rendered by this step, after everything before it.
-                ep.place_steers(&mut prompt);
+                ep.place_steers(&mut prompt, &actions);
                 // A step after a no-tool step means that step did not end the episode: the live
                 // loop continued to render a steer.
                 ep.natural_end = false;
@@ -2272,11 +2325,11 @@ fn replay_seeded_with_compaction<'a>(
     let run_finished_durable = ep.finished.is_some();
     let provider_call_started = ep.provider_call_started;
     let completed_steps = ep.completed_steps;
-    let tool_call_count = ep.budget.tool_call_count;
+    let tool_call_count = placement.budget().tool_call_count;
     // Checkpoints encode sorted indexes; the replay API retains its seed prefix followed
     // by new firings in threshold order. This is an output representation, not budget state.
-    let mut tail_nudge_indices: Vec<_> = ep
-        .budget
+    let mut tail_nudge_indices: Vec<_> = placement
+        .budget()
         .fired_nudge_indices
         .iter()
         .copied()
@@ -2293,8 +2346,8 @@ fn replay_seeded_with_compaction<'a>(
         .into_iter()
         .chain(tail_nudge_indices)
         .collect();
-    let budget_finalize_fired = ep.budget.finalize_fired;
-    let budget_finalize_pending = ep.budget.finalize_pending;
+    let budget_finalize_fired = placement.budget().finalize_fired;
+    let budget_finalize_pending = placement.budget().finalize_pending;
     let usage = ep.usage;
     let retries_used = ep.retries_used;
     let last_step_usage = ep.last_step_usage;
@@ -2939,7 +2992,7 @@ fn classify(ep: Episode, run_id: Option<&RunId>, cancelling: bool) -> ReplayReso
     if ep.finished.is_none() && ep.indeterminate.is_empty() && !cancelling {
         if let Some(batch) = &ep.open_batch {
             if !batch.provider_held.is_empty()
-                && (batch.all_terminated()
+                && (batch.terminals.iter().all(Option::is_some)
                     || batch.planned.iter().enumerate().any(|(position, _)| {
                         batch.call_state(position) == OpenCallState::ProviderHeld
                     }))
@@ -3745,6 +3798,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn prepared(id: &str, batch: &str) -> WalRecord {
         WalRecord::ToolCallDeferred {
+            deferred_at_ms: None,
             batch_id: BatchId(batch.into()),
             call_id: ToolCallId(id.into()),
             executor: DeferredExecutor::Broca,
@@ -3778,6 +3832,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn approval(id: &str, key: &str, decision: DeferredDecision) -> WalRecord {
         WalRecord::ApprovalRecorded {
+            closed_at_ms: None,
             tags: None,
             call_key: key.into(),
             call_id: ToolCallId(id.into()),
@@ -3835,6 +3890,7 @@ pub(crate) mod deferred_tests {
 
     pub(crate) fn terminal(id: &str, withdrawal: Option<WithdrawElicitation>) -> WalRecord {
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: BatchId("b".into()),
@@ -4017,6 +4073,7 @@ pub(crate) mod deferred_tests {
             prepared("approved", "b"),
             approval("approved", "key-approved", DeferredDecision::Approved),
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b".into()),
                 tool_call_id: ToolCallId("approved".into()),
@@ -4084,6 +4141,7 @@ pub(crate) mod provider_held_tests {
 
     pub(crate) fn intent(id: &str) -> WalRecord {
         WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             batch_id: BatchId("b".into()),
             tool_call_id: ToolCallId(id.into()),
             tool_name: Some("edit".into()),
@@ -4111,6 +4169,7 @@ pub(crate) mod provider_held_tests {
 
     pub(crate) fn terminal(id: &str, outcome: DispatchOutcome) -> WalRecord {
         WalRecord::ToolResult {
+            finished_at_ms: None,
             batch_id: BatchId("b".into()),
             result: deferred_tests::result(id, "answer"),
             outcome,
@@ -4254,6 +4313,63 @@ pub(crate) mod provider_held_tests {
                 matches!(&close[0], WalRecord::ToolResult { result, outcome: DispatchOutcome::Interrupted, .. } if result.tool_call_id.0 == "b")
             );
         }
+    }
+
+    #[test]
+    fn held_and_ordinary_tool_turns_share_placement_and_model_bytes() {
+        use crate::placement::{AppendKind, Placement, PlacementAction};
+        let mut delayed = prefix(false);
+        delayed.push(terminal("b", DispatchOutcome::Completed));
+        delayed.push(WalRecord::RunPaused {
+            run_id: RunId("r".into()),
+            reason: PauseReason::ToolHeld,
+            error: None,
+            ts_ms: Some(43),
+        });
+        let mut placement = Placement::default();
+        for record in &delayed {
+            placement.observe(record).unwrap();
+        }
+        let before = placement.next_ordinal();
+        assert_eq!(before, replay(&delayed).unwrap().prompt.len() as u64);
+        let delivered = terminal("a", DispatchOutcome::Completed);
+        assert!(placement.observe(&delivered).unwrap().is_empty());
+        delayed.push(delivered);
+        assert_eq!(
+            placement.next_ordinal(),
+            before,
+            "a delivered terminal still owes its batch barrier"
+        );
+        assert!(
+            matches!(replay(&delayed).unwrap().resolution, ReplayResolution::ProviderHeld { open_held, .. } if open_held.is_empty())
+        );
+        let barrier = WalRecord::ToolBatchFinished {
+            batch_id: BatchId("b".into()),
+        };
+        assert_eq!(
+            placement.observe(&barrier).unwrap(),
+            vec![PlacementAction::Append {
+                first: before,
+                count: 2,
+                kind: AppendKind::ToolTurn
+            }]
+        );
+        delayed.push(barrier.clone());
+        let mut ordinary = deferred_tests::batch(&["a", "b"]);
+        ordinary.extend([
+            intent("a"),
+            intent("b"),
+            terminal("a", DispatchOutcome::Completed),
+            terminal("b", DispatchOutcome::Completed),
+            barrier,
+        ]);
+        let held_prompt = replay(&delayed).unwrap().prompt;
+        let ordinary_prompt = replay(&ordinary).unwrap().prompt;
+        assert_eq!(placement.next_ordinal(), held_prompt.len() as u64);
+        assert_eq!(
+            crate::canonical_request_bytes(&broca_protocol::CallOptions::new(held_prompt)),
+            crate::canonical_request_bytes(&broca_protocol::CallOptions::new(ordinary_prompt))
+        );
     }
 
     #[test]

@@ -465,6 +465,7 @@ fn batch_started() -> WalRecord {
 
 fn dispatch_intent() -> WalRecord {
     WalRecord::ToolDispatchIntent {
+        dispatched_at_ms: None,
         hooks: None,
         batch_id: BatchId(BATCH.into()),
         tool_call_id: ToolCallId(CALL.into()),

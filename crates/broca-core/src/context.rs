@@ -2028,6 +2028,7 @@ mod tests {
                 planned_calls: vec![ToolCallId("t1".into())],
             },
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 tool_call_id: ToolCallId("t1".into()),
@@ -2039,6 +2040,7 @@ mod tests {
                 call_key: None,
             },
             WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
@@ -2365,6 +2367,7 @@ mod tests {
                 planned_calls: vec![ToolCallId("t2".into())],
             },
             WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: BatchId("b2".into()),

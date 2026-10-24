@@ -8,6 +8,7 @@ use cortexkit_role_step_transform_provider::answer::{HookAnswer, Operation};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use subc_protocol::Frame;
 
 struct TimedHook {
     inner: broca_subc::SubcHookPlane,
@@ -72,6 +73,55 @@ fn only<'a>(records: &'a [Value], kind: &str) -> &'a Value {
     matches[0]
 }
 
+// The initial display reset belongs to attaching the stream, not to a hook. Remove only
+// that first display frame; every subsequent reset remains observable by hook assertions.
+fn hook_display_frames(frames: &[Frame]) -> Vec<Value> {
+    let mut display: Vec<Value> = frames
+        .iter()
+        .filter_map(|frame| serde_json::from_slice(&frame.body).ok())
+        .filter(|body: &Value| body["kind"] == "display")
+        .collect();
+    assert!(!display.is_empty(), "attached stream has a display reset");
+    assert_eq!(display.remove(0)["event"]["type"], "display_reset");
+    display
+}
+
+#[test]
+fn attach_reset_is_separate_from_hook_reset_and_control_metadata() {
+    let bodies = [
+        json!({"kind":"control","event":{"type":"display_reset"}}),
+        json!({"kind":"display","event":{"type":"display_reset"}}),
+        json!({"kind":"display","event":{"type":"text_delta","delta":"first"}}),
+        json!({"kind":"control","event":{"type":"display_reset"}}),
+        json!({"kind":"display","event":{"type":"display_reset"}}),
+        json!({"kind":"display","event":{"type":"text_delta","delta":"first-appended"}}),
+    ];
+    let frames: Vec<_> = bodies
+        .iter()
+        .map(|body| {
+            Frame::build(
+                subc_protocol::FrameType::StreamData,
+                subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+                8,
+                1,
+                9,
+                serde_json::to_vec(body).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let hook = hook_display_frames(&frames);
+    assert_eq!(
+        hook,
+        vec![bodies[2].clone(), bodies[4].clone(), bodies[5].clone()]
+    );
+    assert_eq!(
+        hook_display_frames(&frames[..3]),
+        vec![bodies[2].clone()],
+        "all-pass display has no hook reset"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn post_assistant_routes_text_only_and_publishes_final_values() {
     let (mut rig, daemon, state, plan) = start(
@@ -107,7 +157,7 @@ async fn post_assistant_routes_text_only_and_publishes_final_values() {
     // Release the held model only once the subscription is attached: the display lane is lossy.
     let script = rig.script.clone();
     let frames = rig
-        .subscribe_collect_after_attach(
+        .subscribe_collect_after_display_reset(
             8,
             json!({"from": "start"}),
             Duration::from_millis(500),
@@ -153,10 +203,7 @@ async fn post_assistant_routes_text_only_and_publishes_final_values() {
         encoded.contains("first-appended"),
         "control subscriber must read final text: {encoded}"
     );
-    let displays: Vec<_> = bodies
-        .iter()
-        .filter(|v| v.to_string().contains("display"))
-        .collect();
+    let displays = hook_display_frames(&frames);
     let encoded_display = serde_json::to_string(&displays).unwrap();
     let reset = encoded_display
         .find("display_reset")
@@ -1164,7 +1211,7 @@ async fn all_pass_post_assistant_emits_no_display_reset() {
     // Release the held model only once the subscription is attached: the display lane is lossy.
     let script = rig.script.clone();
     let frames = rig
-        .subscribe_collect_after_attach(
+        .subscribe_collect_after_display_reset(
             8,
             json!({"from": "start"}),
             Duration::from_millis(500),
@@ -1173,10 +1220,7 @@ async fn all_pass_post_assistant_emits_no_display_reset() {
         .await;
     let records = values(&rig.wait_for_finished(1).await);
     assert!(only(&records, "model_step_finished").get("hooks").is_none());
-    let stream = frames
-        .iter()
-        .map(|f| String::from_utf8_lossy(&f.body).to_string())
-        .collect::<String>();
+    let stream = serde_json::to_string(&hook_display_frames(&frames)).unwrap();
     assert!(stream.contains("unchanged"));
     assert!(!stream.contains("display_reset"));
     assert_eq!(state.hooks().len(), 1);
@@ -1207,7 +1251,7 @@ async fn two_step_empty_message_ids_keep_reset_on_the_display_lane() {
     // Release the held model only once the subscription is attached: the display lane is lossy.
     let script = rig.script.clone();
     let frames = rig
-        .subscribe_collect_after_attach(
+        .subscribe_collect_after_display_reset(
             8,
             json!({"from": "start"}),
             Duration::from_millis(500),
@@ -1215,11 +1259,7 @@ async fn two_step_empty_message_ids_keep_reset_on_the_display_lane() {
         )
         .await;
     rig.wait_for_finished(1).await;
-    let displays = frames
-        .iter()
-        .filter_map(|f| serde_json::from_slice::<Value>(&f.body).ok())
-        .filter(|v| v.to_string().contains("display"))
-        .collect::<Vec<_>>();
+    let displays = hook_display_frames(&frames);
     let lane = serde_json::to_string(&displays).unwrap();
     let original = lane.find("gemini-step-one").unwrap();
     let reset = lane.find("display_reset").unwrap();

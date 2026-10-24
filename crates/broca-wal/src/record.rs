@@ -420,6 +420,10 @@ pub enum WalRecord {
     },
     /// The barrier's "before" half — ONLY for a call planned dispatchable.
     ToolDispatchIntent {
+        /// Unix milliseconds observed by broca when it queued this durable dispatch record.
+        /// Absent for records written before tool timing was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatched_at_ms: Option<u64>,
         batch_id: BatchId,
         tool_call_id: ToolCallId,
         /// The tool name (replay/projection DISPLAY only — the reconstructed prompt
@@ -461,6 +465,9 @@ pub enum WalRecord {
     /// validation-failed / unavailable-before-send / policy-blocked. Resume NEVER
     /// re-dispatches these.
     ToolNoDispatch {
+        /// Unix milliseconds observed when broca recorded the no-dispatch decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatched_at_ms: Option<u64>,
         batch_id: BatchId,
         tool_call_id: ToolCallId,
         reason: NoDispatchReason,
@@ -480,6 +487,9 @@ pub enum WalRecord {
     /// repair. The embedded `ToolResult` is always provider-valid (so the
     /// reconstructed prompt is valid).
     ToolResult {
+        /// Unix milliseconds observed when broca recorded the result, not a replay-time clock.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finished_at_ms: Option<u64>,
         batch_id: BatchId,
         result: Arc<ToolResult>,
         outcome: DispatchOutcome,
@@ -978,6 +988,9 @@ pub enum WalRecord {
     /// `elicitation_id` is not stored either: it comes back from the filing, and after a crash
     /// re-filing under the same key returns it again.
     ToolCallDeferred {
+        /// Unix milliseconds observed when broca recorded the call's approval deferral.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deferred_at_ms: Option<u64>,
         batch_id: BatchId,
         call_id: ToolCallId,
         /// Who executes the call once approved. Always `broca` in this build.
@@ -1006,6 +1019,10 @@ pub enum WalRecord {
     /// renders `closing_result` as the call's result, and no `ToolNoDispatch` or `ToolResult` is
     /// written for the call.
     ApprovalRecorded {
+        /// Unix milliseconds observed when a closing result was recorded. An approval that
+        /// permits dispatch has no closing result and leaves this absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closed_at_ms: Option<u64>,
         call_key: String,
         call_id: ToolCallId,
         /// Absent only for an `unavailable` call whose question was never filed.
@@ -1462,8 +1479,31 @@ impl WalRecord {
         } else {
             base
         };
-        if self.carries_google_rpc_error_details() {
+        let base = if self.carries_google_rpc_error_details() {
             with_feature(base, crate::framing::GOOGLE_RPC_ERROR_DETAILS_FEATURE)
+        } else {
+            base
+        };
+        if matches!(
+            self,
+            Self::ToolDispatchIntent {
+                dispatched_at_ms: Some(_),
+                ..
+            } | Self::ToolNoDispatch {
+                dispatched_at_ms: Some(_),
+                ..
+            } | Self::ToolResult {
+                finished_at_ms: Some(_),
+                ..
+            } | Self::ToolCallDeferred {
+                deferred_at_ms: Some(_),
+                ..
+            } | Self::ApprovalRecorded {
+                closed_at_ms: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::TOOL_TIMES_FEATURE)
         } else {
             base
         }
@@ -3020,6 +3060,7 @@ mod schema_tests {
     #[test]
     fn tool_dispatch_intent_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             hooks: None,
             batch_id: BatchId("b1".into()),
             tool_call_id: ToolCallId("t1".into()),
@@ -3084,6 +3125,7 @@ mod schema_tests {
     #[test]
     fn tool_result_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: BatchId("b1".into()),
@@ -3942,6 +3984,7 @@ mod schema_tests {
             },
             WalRecord::StepStarted { step_id: StepId(1) },
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("b1".into()),
                 tool_call_id: ToolCallId("t1".into()),

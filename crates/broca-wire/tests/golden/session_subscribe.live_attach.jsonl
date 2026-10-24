@@ -1,0 +1,2 @@
+{"kind":"display","event":{"type":"display_reset"},"seq":1}
+{"kind":"display","event":{"type":"text_delta","mid":"m1","part":"0","message_id":"m","delta":"answer"},"seq":2}

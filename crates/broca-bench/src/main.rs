@@ -92,6 +92,8 @@ impl BodyCodec {
             BodyCodec::Json => {
                 // Representative coalesced text chunk (~22 chars).
                 let ev = DisplayEvent::TextDelta {
+                    mid: None,
+                    part: None,
                     message_id: MessageId("msg_01HQX7Z9".into()),
                     tool_call_id: None,
                     delta: "the quick brown fox ju".into(),

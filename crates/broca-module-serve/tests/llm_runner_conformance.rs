@@ -172,6 +172,7 @@ struct Shared {
     read_mids: Mutex<HashMap<String, String>>,
     plan_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
+    stream_holds: Mutex<HashMap<String, usize>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
     compaction: Mutex<HashMap<String, compaction::Session>>,
     session_roots: Mutex<HashMap<String, PathBuf>>,
@@ -614,7 +615,8 @@ async fn serve_model_request(
         .or_default()
         .push(request.clone());
     let model_gate = shared.model_holds.lock().unwrap().get(&session).cloned();
-    if let Some(gate) = model_gate {
+    let stream_parts = shared.stream_holds.lock().unwrap().remove(&session);
+    if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_none()) {
         HoldGate::set(&gate.arrived, &gate.arrived_wake);
         tokio::select! {
             () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
@@ -700,15 +702,31 @@ async fn serve_model_request(
                 "prompt_tokens_details": {"cached_tokens": usage.cache_read_tokens, "cache_write_tokens": usage.cache_write_tokens}}}));
     }
     let mut body = String::new();
-    for event in events {
+    let mut prefix_bytes = 0;
+    for (index, event) in events.into_iter().enumerate() {
         body.push_str(&format!("data: {event}\n\n"));
+        if stream_parts.is_some_and(|parts| index == parts) {
+            prefix_bytes = body.len();
+        }
     }
     body.push_str("data: [DONE]\n\n");
-    let reply = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(reply.as_bytes()).await?;
+    stream.write_all(headers.as_bytes()).await?;
+    if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_some()) {
+        stream.write_all(&body.as_bytes()[..prefix_bytes]).await?;
+        stream.flush().await?;
+        HoldGate::set(&gate.arrived, &gate.arrived_wake);
+        tokio::select! {
+            () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
+            () = shared.released.notified() => return Ok(()),
+        }
+        stream.write_all(&body.as_bytes()[prefix_bytes..]).await?;
+    } else {
+        stream.write_all(body.as_bytes()).await?;
+    }
     if let Some(state) = shared.compaction.lock().unwrap().get_mut(&session) {
         state.emitted += 1;
     }
@@ -1761,6 +1779,107 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    async fn seed_untimed_tool_call(
+        &self,
+        handle: &Live,
+        session: &str,
+        call: &cortexkit_role_llm_runner_conformance::ScriptedToolCall,
+    ) -> Result<(), HarnessError> {
+        use broca_core::{FileLeaseStore, FileWalStore, LeaseStore, WalHandle, WalStore};
+        use broca_protocol::{
+            ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
+        };
+        let fail = |e: String| HarnessError::new(e);
+        let identity = self.bind_identity(session);
+        let seed_root = handle.state_root.join(format!("untimed-fixture-{session}"));
+        let source = FileWalStore::new(&seed_root);
+        let writer = WalHandle::spawn(source.open(&identity).map_err(|e| fail(e.to_string()))?, 1)
+            .map_err(|e| fail(e.to_string()))?;
+        broca_core::run_import(
+            broca_core::ImportRequest {
+                project_id: None,
+                principal: None,
+                run_id: broca_protocol::RunId(format!("untimed-import-{session}")),
+                session: identity.clone(),
+                messages: vec![
+                    Message::new(
+                        Role::Assistant,
+                        vec![ContentBlock::ToolCall(ToolCall {
+                            thought_signature: None,
+                            tool_call_id: ToolCallId(call.tool_call_id.clone()),
+                            tool_name: call.tool.clone(),
+                            input: call.arguments.clone(),
+                        })],
+                    ),
+                    Message::new(
+                        Role::Tool,
+                        vec![ContentBlock::ToolResult(ToolResult {
+                            tool_call_id: ToolCallId(call.tool_call_id.clone()),
+                            output: ToolOutput::Text {
+                                text: "historical result".into(),
+                            },
+                            is_error: false,
+                        })],
+                    ),
+                ],
+                origin: broca_core::ImportOrigin {
+                    source_ref: "fixture:untimed-history".into(),
+                },
+            },
+            &writer,
+            &source,
+        )
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+        writer.shutdown().await.map_err(|e| fail(e.to_string()))?;
+        let records = source
+            .read_records(&identity)
+            .map_err(|e| fail(e.to_string()))?;
+        let leases = FileLeaseStore::new(handle.state_root.join("leases"));
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let lease = loop {
+            match leases.acquire(&broca_core::lease_key_for(&identity)) {
+                Ok(lease) => break lease,
+                Err(broca_core::LeaseError::Held { .. }) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(25)).await
+                }
+                Err(error) => {
+                    return Err(fail(format!(
+                        "untimed fixture could not obtain idle lease: {error}"
+                    )))
+                }
+            }
+        };
+        let target = FileWalStore::new(handle.state_root.join("wal"));
+        let mut wal = target.open(&identity).map_err(|e| fail(e.to_string()))?;
+        for frame in records {
+            wal.append(lease.epoch(), &frame.record, false)
+                .map_err(|e| fail(e.to_string()))?;
+        }
+        wal.sync().map_err(|e| fail(e.to_string()))?;
+        drop(wal);
+        drop(lease);
+        std::fs::remove_dir_all(seed_root).map_err(|e| fail(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn hold_next_model_stream(
+        &self,
+        session: &str,
+        parts: usize,
+    ) -> Result<(), HarnessError> {
+        self.shared
+            .model_holds
+            .lock()
+            .unwrap()
+            .insert(session.into(), Arc::default());
+        self.shared
+            .stream_holds
+            .lock()
+            .unwrap()
+            .insert(session.into(), parts);
+        Ok(())
+    }
     async fn hold_next_model_step(&self, session: &str) -> Result<(), HarnessError> {
         self.shared
             .model_holds
@@ -1824,6 +1943,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::Retract,
             Capability::DispatchAttribution,
             Capability::Streaming,
+            Capability::LiveEvents,
             Capability::Steer,
             Capability::Queue,
             Capability::Interrupt,
@@ -2237,7 +2357,9 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(&arguments.to_string())
             .cloned();
         match gate {
-            Some(gate) if gate.arrived.load(std::sync::atomic::Ordering::SeqCst) => {
+            Some(gate) => {
+                // Release is a permit for an installed script, not a claim that it arrived.
+                // A later held turn must observe this permit when it reaches the provider.
                 HoldGate::set(&gate.released, &gate.released_wake);
                 Ok(())
             }
@@ -4208,4 +4330,67 @@ async fn pending_delivery_order_send_is_retracted_before_tool_result() {
         !serde_json::to_string(&page).unwrap().contains(marker),
         "retracted send reached the transcript: {page}"
     );
+}
+
+#[cfg(test)]
+mod held_call_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn subject(shared: Arc<Shared>) -> BrocaSubject {
+        BrocaSubject {
+            shared,
+            model_url: String::new(),
+            project_root: PathBuf::new(),
+            dump_dir: None,
+            binary: None,
+            backup_classes: None,
+            bus_events_enabled: false,
+            process_kills_disabled: true,
+            reserved_reader: false,
+            #[cfg(feature = "test-clock")]
+            bus: None,
+            #[cfg(feature = "test-clock")]
+            mc: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn release_registered_future_call_keeps_release_until_arrival() {
+        let shared = Arc::new(Shared::default());
+        let arguments = json!({"nonce":"future-held-call"});
+        let gate = Arc::new(HoldGate::default());
+        shared
+            .holds
+            .lock()
+            .unwrap()
+            .insert(arguments.to_string(), gate.clone());
+        let subject = subject(shared);
+        subject
+            .release_tool_call(&arguments)
+            .await
+            .expect("a registered future hold can be released");
+        assert!(
+            !gate.arrived.load(Ordering::SeqCst),
+            "release must not fabricate provider arrival"
+        );
+        assert!(gate.released.load(Ordering::SeqCst));
+        HoldGate::set(&gate.arrived, &gate.arrived_wake);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            HoldGate::wait(&gate.released, &gate.released_wake),
+        )
+        .await
+        .expect("a later arriving provider must see the earlier release");
+    }
+
+    #[tokio::test]
+    async fn unregistered_call_release_is_rejected() {
+        let subject = subject(Arc::new(Shared::default()));
+        let error = subject
+            .release_tool_call(&json!({"nonce":"unknown-call"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("the call is not held"));
+    }
 }

@@ -166,7 +166,9 @@ pub(crate) fn prepared_resume_refusal() -> crate::run::RunError {
 
 /// The records that close an indeterminate batch, or any batch retaining a Deferred/Approved
 /// call, regardless of the resolution: one terminal per unfinished call, then commit markers.
-/// Reader close-out writes no gated record and leaves unanswered questions owed to a writer.
+/// Reader close-out cannot withdraw pending approval elicitations; a writer must still do so.
+/// The generated records leave observation times unset until enqueued by the WAL writer,
+/// rather than reconstructing them from an earlier dispatch.
 ///
 /// A call that already has a terminal gets nothing, so a resume after a crash inside an earlier
 /// resume's close-out writes only what that close-out did not make durable, and never a second
@@ -220,6 +222,7 @@ pub fn close_out_open_batch(
             ),
         };
         records.push(WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch.batch_id.clone(),
@@ -298,6 +301,7 @@ pub fn close_out_pending_turn(prior: &ReplayState) -> Vec<WalRecord> {
             continue;
         }
         records.push(WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch_id.clone(),

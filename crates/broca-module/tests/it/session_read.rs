@@ -2813,6 +2813,7 @@ fn dispatch_module_episode(key: &BindIdentity, run: &str, call: &str) -> Vec<Wal
         },
         intent,
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
@@ -2977,6 +2978,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
             planned_calls: vec![call_id.clone()],
         },
         WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
@@ -3189,7 +3191,8 @@ async fn read_head_resumes_subscribe_without_gaps_or_duplicates() {
         .expect("subscribe from read head");
 
     let mut actual = Vec::new();
-    for _ in 0..expected.len() {
+    let mut display_reset = false;
+    while actual.len() < expected.len() || !display_reset {
         match broca_test_support::event_timeout(
             "read_head_resumes_subscribe_without_gaps_or_duplicates",
             stream.recv(),
@@ -3199,8 +3202,17 @@ async fn read_head_resumes_subscribe_without_gaps_or_duplicates() {
         .expect("post-head unit arrives")
         .expect("stream stays open")
         {
-            Delivery::Control(event) => actual.push(event.as_ref().clone()),
-            Delivery::Display(_) => {}
+            Delivery::Control(event) => actual.push((event.0, event.1.clone())),
+            Delivery::Display(event)
+                if matches!(*event, broca_protocol::DisplayEvent::DisplayReset) =>
+            {
+                assert!(
+                    !display_reset,
+                    "attach emits exactly one initial display reset"
+                );
+                display_reset = true;
+            }
+            Delivery::Display(other) => panic!("idle attach replayed display content: {other:?}"),
             other => panic!("unexpected delivery after read head: {other:?}"),
         }
     }
@@ -3275,6 +3287,7 @@ async fn read_lineage_state_paused_and_active_with_open_dispatch() {
                 planned_calls: vec![ToolCallId("open-call".into())],
             },
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: broca_protocol::BatchId("b-open".into()),
                 tool_call_id: ToolCallId("open-call".into()),
@@ -3404,6 +3417,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
                 planned_calls: vec![call_id.clone()],
             },
             WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: batch_id.clone(),

@@ -275,6 +275,7 @@ impl AnthropicNormalizer {
             }
             "content_block_delta" => {
                 let idx = block_index(v);
+                let part = self.blocks.range(..idx).count() as u64;
                 let delta = v.get("delta");
                 let dty = delta
                     .and_then(|d| d.get("type"))
@@ -294,6 +295,8 @@ impl AnthropicNormalizer {
                             text.push_str(t);
                         }
                         out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
+                            mid: None,
+                            part: Some(part),
                             message_id: mid,
                             tool_call_id: None,
                             delta: t.to_owned(),
@@ -308,6 +311,8 @@ impl AnthropicNormalizer {
                             text.push_str(t);
                         }
                         out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: Some(part),
                             message_id: mid,
                             delta: t.to_owned(),
                         }));
@@ -344,6 +349,8 @@ impl AnthropicNormalizer {
                             _ => return Ok(out),
                         };
                         out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
+                            mid: None,
+                            part: Some(part),
                             tool_call_id: tcid,
                             delta: p.to_owned(),
                         }));

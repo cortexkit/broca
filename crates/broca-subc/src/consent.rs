@@ -647,6 +647,7 @@ mod tests {
     fn prepared() -> WalRecord {
         let input = fixture("broca/held-call-input.json");
         WalRecord::ToolCallDeferred {
+            deferred_at_ms: None,
             batch_id: broca_protocol::BatchId("b".into()),
             call_id: broca_protocol::ToolCallId("c".into()),
             executor: broca_wal::DeferredExecutor::Broca,

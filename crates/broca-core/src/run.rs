@@ -82,6 +82,10 @@ pub fn epoch_millis() -> Option<u64> {
 /// Control = the reliable assembled units.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputEvent {
+    /// Queue-ordered transcript position for the following step's advisory display output.
+    DisplayContext {
+        ordinal: Option<u64>,
+    },
     Display(DisplayEvent),
     Control(ControlUnit),
 }
@@ -298,6 +302,46 @@ impl PriorWalSnapshot {
     }
 }
 
+/// Initialize advisory placement from the same validated prefix used for admission.
+/// The actor calls this before exposing an inherited writer to concurrent run/steer work.
+pub fn seed_display_placement<W: WalStore + ?Sized>(
+    writer: &WalHandle,
+    snapshot: &PriorWalSnapshot,
+    wal_store: &W,
+    store: Option<&dyn SessionStore>,
+    session: &BindIdentity,
+) {
+    if !writer.needs_display_placement_seed() {
+        return;
+    }
+    let seed = store
+        .and_then(|s| s.projection_seed(session).ok().flatten())
+        .filter(|s| s.watermark_seq == snapshot.base_watermark)
+        .and_then(|s| crate::projection::ControlProjectionState::from_projection_seed(&s))
+        .map(|s| s.placement().clone());
+    let full;
+    let (mut placement, records) = if snapshot.base_watermark == 0 {
+        (
+            crate::placement::Placement::default(),
+            snapshot.tail.as_ref(),
+        )
+    } else if let Some(seed) = seed {
+        (seed, snapshot.tail.as_ref())
+    } else {
+        let Ok(records) = wal_store.read_records(session) else {
+            return;
+        };
+        full = records;
+        (crate::placement::Placement::default(), &full)
+    };
+    for frame in records.iter().filter(|f| f.seq <= snapshot.head_seq) {
+        if placement.observe(&frame.record).is_err() {
+            return;
+        }
+    }
+    writer.seed_display_placement(snapshot.head_seq, placement);
+}
+
 /// Load an admission snapshot bounded by `safe_head`. Valid materialized metadata reads only its
 /// WAL suffix; every unavailable or inconsistent metadata case falls back to the complete WAL.
 pub fn load_prior_wal_snapshot<W, S>(
@@ -498,6 +542,9 @@ pub struct RunControl {
     /// may disable this to avoid cloning payloads into an output channel that discards them.
     /// Lifecycle, pause, and error controls are never suppressed by this setting.
     pub emit_control_payloads: bool,
+    /// Emit queue-ordered step positions for an actor's display drain. This is opt-in so
+    /// direct loop consumers keep their existing bounded lifecycle-output flow.
+    pub emit_display_context: bool,
     /// Pause the run for re-authentication IMMEDIATELY after admission, before any provider
     /// call. Set when the caller already knows — authoritatively, before the loop — that the
     /// credential needs re-auth (e.g. the credential vault returned `needs_reauth`: the
@@ -644,6 +691,7 @@ impl Default for RunControl {
             test_compaction: None,
             provider_call_timeout: None,
             emit_control_payloads: true,
+            emit_display_context: false,
             pause_for_auth_at_start: None,
             auth_selection: None,
             admitted_context_limit: None,
@@ -1562,6 +1610,7 @@ where
         other => other,
     };
     writer.seed_lineage_tags(lineage_tags);
+    seed_display_placement(writer, &snapshot, wal_store, store.as_deref(), &req.session);
     let episode = snapshot.checkpoint_at_head.last_episode.as_ref();
     let is_resume = episode.is_some();
     let last_input = episode.map(|episode| episode.input.clone());
@@ -4466,6 +4515,15 @@ where
                 Vec::new()
             }
         };
+        if control.emit_display_context {
+            let _ = send(
+                out,
+                OutputEvent::DisplayContext {
+                    ordinal: writer.display_ordinal(),
+                },
+            )
+            .await;
+        }
         steer_backlog.append(&mut steered);
         if !steer_backlog.is_empty() {
             mutable_call_options(&mut opts)
@@ -4900,6 +4958,7 @@ where
                 if let Some(seal) = &control.shutdown_seal {
                     seal.note_usage(step_id, usage);
                 }
+                let unfiltered_blocks = message.content.len();
                 if finalize_turn {
                     message.content.retain(|block| match block {
                         ContentBlock::ToolCall(call) => rejected_tool_calls
@@ -4982,9 +5041,10 @@ where
                     crate::hooks::apply_message_ops(&mut message.content, &output.operations)
                         .expect("checked ops");
                 }
-                let message_changed = original_message
-                    .as_ref()
-                    .is_some_and(|original| &message != original);
+                let message_changed = message.content.len() != unfiltered_blocks
+                    || original_message
+                        .as_ref()
+                        .is_some_and(|original| &message != original);
                 let message_hooks = hook_output.as_ref().and_then(|output| {
                     output.trace.metadata(
                         serde_json::to_value(original_message.as_ref().unwrap()).unwrap(),
@@ -7137,6 +7197,7 @@ fn tool_args_rejection_records(
     let mut existing = std::collections::HashMap::new();
     for result in rejected {
         records.push(WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
@@ -7532,6 +7593,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     }
                     let seq = writer
                         .record(WalRecord::ToolDispatchIntent {
+                            dispatched_at_ms: None,
                             hooks: c.hooks.clone(),
                             batch_id: batch_id.clone(),
                             tool_call_id: c.tool_call_id.clone(),
@@ -7562,6 +7624,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolNoDispatch {
+                        dispatched_at_ms: None,
                         tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
@@ -7575,6 +7638,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
                         tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
@@ -7602,6 +7666,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolNoDispatch {
+                        dispatched_at_ms: None,
                         tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
@@ -7615,6 +7680,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                     hooks,
                 } => {
                     writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
                         tags: None,
                         hooks: hooks.clone(),
                         batch_id: batch_id.clone(),
@@ -7627,6 +7693,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 }
                 CallPlan::Synthetic { result, reason } => {
                     writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
                         tags: None,
                         hooks: None,
                         batch_id: batch_id.clone(),
@@ -7639,6 +7706,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 }
                 CallPlan::Stopped(tool_call_id) => {
                     writer.record(WalRecord::ToolResult {
+                        finished_at_ms: None,
                         tags: None,
                         hooks: None,
                         batch_id: batch_id.clone(),
@@ -7758,6 +7826,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: r.hooks.take(),
                 batch_id: batch_id.clone(),
@@ -8702,6 +8771,7 @@ async fn finalize_hard_stop(
             .iter()
             .any(|result| result.tool_call_id == r.tool_call_id);
         writer.record(WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
@@ -10071,6 +10141,24 @@ mod tests {
             .unwrap();
             assert_eq!(summary.paused, Some(PauseReason::ToolHeld));
             let state = crate::replay(&records.lock().unwrap()).unwrap();
+            let dispatch_times: Vec<_> = records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|record| match record {
+                    WalRecord::ToolDispatchIntent {
+                        tool_call_id,
+                        dispatched_at_ms,
+                        ..
+                    } => Some((tool_call_id.clone(), *dispatched_at_ms)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(dispatch_times.len(), 2);
+            assert!(
+                dispatch_times.iter().all(|(_, time)| time.is_some()),
+                "the writer stamps both barrier-1 observations"
+            );
             let ReplayResolution::ProviderHeld { pending, .. } = state.resolution else {
                 panic!("not provider-held")
             };
@@ -10141,6 +10229,35 @@ mod tests {
                     .filter(|record| matches!(record, WalRecord::ToolResult { .. }))
                     .count(),
                 2
+            );
+            assert_eq!(
+                records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|record| match record {
+                        WalRecord::ToolDispatchIntent {
+                            tool_call_id,
+                            dispatched_at_ms,
+                            ..
+                        } => Some((tool_call_id.clone(), *dispatched_at_ms)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                dispatch_times,
+                "resuming does not re-observe either original dispatch intent",
+            );
+            assert!(
+                records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|record| match record {
+                        WalRecord::ToolResult { finished_at_ms, .. } => Some(finished_at_ms),
+                        _ => None,
+                    })
+                    .all(Option::is_some),
+                "held delivery and successor completion use the writer's tool-time observations"
             );
             writer.shutdown().await.unwrap();
         })
@@ -10637,6 +10754,7 @@ mod tests {
             is_error: false,
         };
         let prior_record = WalRecord::ToolResult {
+            finished_at_ms: None,
             tags: None,
             hooks: None,
             batch_id: batch_id.clone(),
@@ -11964,6 +12082,7 @@ mod approval_gate {
         history.record(
             writer,
             WalRecord::ApprovalRecorded {
+                closed_at_ms: None,
                 tags: None,
                 call_key: call.key.clone(),
                 call_id: call.call().tool_call_id,
@@ -11983,6 +12102,7 @@ mod approval_gate {
     ) -> Result<(), RunError> {
         for call in open {
             writer.record(WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 batch_id: ctx.batch_id.clone(),
                 result: Arc::new(crate::resume::not_dispatched_result(
@@ -12079,6 +12199,7 @@ mod approval_gate {
     ) -> Result<(), RunError> {
         if let Some(outcome) = resolution.outcome.take() {
             let record = WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 batch_id: ctx.batch_id.clone(),
                 result: Arc::clone(&resolution.result),
@@ -12331,7 +12452,10 @@ mod approval_gate {
             .map_err(|error| RunError::Wal(format!("freeze approved arguments: {error}")))?;
         use sha2::Digest;
         let args_hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+        // Filing retains this exact Prepared record after sync, so observe its time before
+        // sharing it; the filed record must still equal the durable record.
         let prepared = WalRecord::ToolCallDeferred {
+            deferred_at_ms: epoch_millis(),
             batch_id: ctx.batch_id.clone(),
             call_id: call.tool_call_id.clone(),
             executor: broca_wal::DeferredExecutor::Broca,
@@ -12377,6 +12501,7 @@ mod approval_gate {
                 }
                 let seq = writer
                     .record(WalRecord::ToolDispatchIntent {
+                        dispatched_at_ms: None,
                         batch_id: ctx.batch_id.clone(),
                         tool_call_id: call.tool_call_id.clone(),
                         tool_name: Some(call.tool_name.clone()),
@@ -12398,6 +12523,7 @@ mod approval_gate {
                 hooks,
             } => {
                 writer.record(WalRecord::ToolNoDispatch {
+                    dispatched_at_ms: None,
                     tags: None,
                     batch_id: ctx.batch_id.clone(),
                     tool_call_id: tool_call_id.clone(),
@@ -12411,6 +12537,7 @@ mod approval_gate {
                 hooks,
             } => {
                 writer.record(WalRecord::ToolResult {
+                    finished_at_ms: None,
                     tags: None,
                     batch_id: ctx.batch_id.clone(),
                     result: Arc::clone(result),
@@ -13165,7 +13292,7 @@ mod approval_gate {
                                 let Slot::Held(held) = &slots[index] else { unreachable!() };
                                 let held = held.clone(); let call = held.call();
                                 let WalRecord::ToolCallDeferred { module, schema_pin, args_jcs, .. } = &*held.prepared else { unreachable!() };
-                                history.record(writer, WalRecord::ToolDispatchIntent { batch_id: ctx.batch_id.clone(), tool_call_id: call.tool_call_id.clone(), tool_name: Some(call.tool_name.clone()),
+                                history.record(writer, WalRecord::ToolDispatchIntent { dispatched_at_ms: None, batch_id: ctx.batch_id.clone(), tool_call_id: call.tool_call_id.clone(), tool_name: Some(call.tool_name.clone()),
                                     args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone(), hooks: None,
                                     approval_digest: None, call_key: Some(held.key.clone()) });
                                 writer.sync().await?;

@@ -57,3 +57,5 @@ pub use live::LiveAnthropicProvider;
 #[cfg(feature = "live")]
 pub use transport::{build_provider_http_client, LiveProvider, ProviderHttpClient};
 mod content_progress;
+mod display_parts;
+pub use display_parts::index_resets as display_index_resets;

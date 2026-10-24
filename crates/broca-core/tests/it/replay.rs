@@ -176,6 +176,7 @@ fn batch_started(b: &str, step: u64, ids: &[&str]) -> WalRecord {
 
 fn intent(b: &str, id: &str) -> WalRecord {
     WalRecord::ToolDispatchIntent {
+        dispatched_at_ms: None,
         hooks: None,
         batch_id: BatchId(b.into()),
         tool_call_id: ToolCallId(id.into()),
@@ -190,6 +191,7 @@ fn intent(b: &str, id: &str) -> WalRecord {
 
 fn result(b: &str, id: &str, outcome: DispatchOutcome) -> WalRecord {
     WalRecord::ToolResult {
+        finished_at_ms: None,
         tags: None,
         hooks: None,
         batch_id: BatchId(b.into()),
@@ -208,6 +210,7 @@ fn result(b: &str, id: &str, outcome: DispatchOutcome) -> WalRecord {
 
 fn no_dispatch(b: &str, id: &str) -> WalRecord {
     WalRecord::ToolNoDispatch {
+        dispatched_at_ms: None,
         tags: None,
         hooks: None,
         batch_id: BatchId(b.into()),
@@ -853,6 +856,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 planned_calls: vec![ToolCallId("t1".into()), ToolCallId("t2".into())],
             },
             WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: BatchId("r-b1".into()),
                 tool_call_id: ToolCallId("t1".into()),
@@ -864,6 +868,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 call_key: None,
             },
             WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: BatchId("r-b1".into()),

@@ -2009,6 +2009,8 @@ struct LiveTags {
 
 /// The loop's handle to the writer task.
 pub struct WalHandle {
+    /// Advisory display placement follows accepted queue order, not the lagging fsync head.
+    display_placement: Mutex<Option<crate::placement::Placement>>,
     /// Zero means unlimited; finite limits only decrease over the writer's lifetime.
     input_token_limit: AtomicU64,
     move_check: Option<Arc<dyn Fn() -> Result<(), WalError> + Send + Sync>>,
@@ -2230,6 +2232,7 @@ impl WalHandle {
                 WalWriteError::Failed(format!("WAL writer thread spawn failed: {error}"))
             })?;
         Ok(WalHandle {
+            display_placement: Mutex::new((last_seq == 0).then(Default::default)),
             input_token_limit: AtomicU64::new(0),
             move_check: None,
             fence,
@@ -2258,6 +2261,29 @@ impl WalHandle {
     /// WAL snapshot still matches the writer head before the loop appends anything.
     pub fn next_record_seq(&self) -> u64 {
         self.next_seq.load(Ordering::SeqCst)
+    }
+
+    pub fn needs_display_placement_seed(&self) -> bool {
+        self.display_placement.lock().unwrap().is_none()
+    }
+
+    /// A reconstructed prefix may seed only the exact queue head it describes. Never replace
+    /// a display placement this writer has already advanced, even if reconstruction raced an enqueue.
+    pub fn seed_display_placement(&self, head: u64, placement: crate::placement::Placement) {
+        let _guard = self.lock_enqueue();
+        let mut current = self.display_placement.lock().unwrap();
+        if current.is_none() && self.next_record_seq() == head.saturating_add(1) {
+            *current = Some(placement);
+        }
+    }
+
+    /// Read immediately after queuing StepStarted and carry the value with its output.
+    pub fn display_ordinal(&self) -> Option<u64> {
+        self.display_placement
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.next_ordinal())
     }
 
     /// Clone the lock-free gauge for the last successfully fsynced WAL sequence.
@@ -2456,6 +2482,34 @@ impl WalHandle {
         reserved_terminal: bool,
         assigned: &mut Option<Vec<MessageTags>>,
     ) -> RecordOutcome {
+        // Observe time once at enqueue, before encoding or publication. Recovered records
+        // retain an existing observation rather than acquiring a restart-time replacement.
+        match &mut record {
+            WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: at,
+                ..
+            }
+            | WalRecord::ToolNoDispatch {
+                dispatched_at_ms: at,
+                ..
+            }
+            | WalRecord::ToolResult {
+                finished_at_ms: at, ..
+            }
+            | WalRecord::ToolCallDeferred {
+                deferred_at_ms: at, ..
+            } if at.is_none() => {
+                *at = crate::run::epoch_millis();
+            }
+            WalRecord::ApprovalRecorded {
+                closed_at_ms,
+                closing_result: Some(_),
+                ..
+            } if closed_at_ms.is_none() => {
+                *closed_at_ms = crate::run::epoch_millis();
+            }
+            _ => {}
+        }
         *assigned = match self.stamp_tags(&mut record) {
             Ok(assigned) => assigned,
             Err(error) => {
@@ -2529,6 +2583,16 @@ impl WalHandle {
         }
         #[cfg(test)]
         self.run_after_reserve_probe(seq);
+        {
+            let mut placement = self.display_placement.lock().unwrap();
+            if placement
+                .as_mut()
+                .is_some_and(|p| p.observe(&record).is_err())
+            {
+                // Display attribution cannot make an otherwise valid durable append fail.
+                *placement = None;
+            }
+        }
         match &record {
             WalRecord::InputTokenCapFrozen { limit } => self.seed_input_token_limit(Some(*limit)),
             WalRecord::Queued { request, .. } => self.seed_input_token_limit(
@@ -3907,3 +3971,6 @@ pub(crate) mod retention_tests;
 
 #[cfg(test)]
 mod session_class_tests;
+
+#[cfg(test)]
+mod tool_times_tests;

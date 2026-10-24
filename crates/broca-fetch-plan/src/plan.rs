@@ -131,6 +131,9 @@ pub fn check_later_plan(frozen: Option<&str>, sent: &str) -> Result<(), Refusal>
 
 /// Refuse a send that carries a plan beside a member the plan replaces, naming the member.
 pub fn check_send_members(params: &Map<String, Value>) -> Result<(), Refusal> {
+    if let Some(plan) = params.get("plan") {
+        check_unsupported_output_refs(plan)?;
+    }
     match MEMBERS_REPLACED_BY_PLAN
         .iter()
         .find(|member| params.get(**member).is_some_and(|value| !value.is_null()))
@@ -138,6 +141,32 @@ pub fn check_send_members(params: &Map<String, Value>) -> Result<(), Refusal> {
         Some(member) => Err(Refusal::invalid(*member)),
         None => Ok(()),
     }
+}
+
+fn check_unsupported_output_refs(plan: &Value) -> Result<(), Refusal> {
+    // An unsupported plan member is not an ignored opt-out, even when its flag is false.
+    // Check it before plan overrides or provider parsing can obscure the offending member.
+    let in_lists = [
+        "items",
+        "tool_items",
+        "system_text_items",
+        "step_transform_items",
+    ]
+    .into_iter()
+    .filter_map(|name| plan.get(name).and_then(Value::as_array))
+    .flatten()
+    .any(|item| {
+        item.as_object()
+            .is_some_and(|item| item.contains_key("output_refs"))
+    });
+    let in_compaction = plan
+        .get("compaction_item")
+        .and_then(Value::as_object)
+        .is_some_and(|item| item.contains_key("output_refs"));
+    if in_lists || in_compaction {
+        return Err(Refusal::invalid("plan.items[].output_refs"));
+    }
+    Ok(())
 }
 
 fn string_member(object: &Map<String, Value>, key: &str, at: &str) -> Result<String, Refusal> {
@@ -292,6 +321,7 @@ pub enum CompactionSupport {
 /// order, does not list exactly the plan's providers, or does not repeat the plan's
 /// step-transform items and compaction provider.
 pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, Refusal> {
+    check_unsupported_output_refs(plan)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
     let system_text_items = items(object, "system_text_items", true)?;
@@ -529,5 +559,60 @@ mod sender_tests {
                 "{value}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unsupported_output_refs_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_output_refs_is_diagnosed_before_other_plan_fields() {
+        for key in [
+            "items",
+            "tool_items",
+            "system_text_items",
+            "step_transform_items",
+            "compaction_item",
+        ] {
+            for flag in [Value::Bool(true), Value::Bool(false), Value::Null] {
+                let mut plan = serde_json::json!({});
+                let item = serde_json::json!({"output_refs":flag});
+                plan[key] = if key == "compaction_item" {
+                    item
+                } else {
+                    serde_json::json!([item])
+                };
+                let refusal = parse_plan(&plan, CompactionSupport::Supported).unwrap_err();
+                assert_eq!(refusal.code(), "invalid_params");
+                assert_eq!(
+                    refusal.detail()["field"],
+                    "plan.items[].output_refs",
+                    "{plan}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_output_refs_precedes_tools_and_system_overrides() {
+        for flag in [true, false] {
+            let params = serde_json::json!({"tools":[],"system":"override","plan":{"items":[{"output_refs":flag}]}});
+            let refusal = check_send_members(params.as_object().unwrap()).unwrap_err();
+            assert_eq!(refusal.detail()["field"], "plan.items[].output_refs");
+        }
+    }
+
+    #[test]
+    fn provider_params_are_not_plan_members_and_existing_override_refusals_remain() {
+        let params = serde_json::json!({"plan":{"tool_items":[{"params":{"output_refs":true}}]}});
+        check_send_members(params.as_object().unwrap()).unwrap();
+        let params = serde_json::json!({"tools":[],"plan":{"items":[]}});
+        assert_eq!(
+            check_send_members(params.as_object().unwrap())
+                .unwrap_err()
+                .detail()["field"],
+            "tools"
+        );
     }
 }

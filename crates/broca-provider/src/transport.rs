@@ -5201,6 +5201,8 @@ mod tests {
                 return Ok(Vec::new());
             }
             Ok(vec![NormalizedEvent::Display(DisplayEvent::TextDelta {
+                mid: None,
+                part: Some(0),
                 message_id: MessageId("trickle".into()),
                 tool_call_id: None,
                 // One content byte per chunk keeps the measured rate equal to the chunk arrival rate.
@@ -9873,6 +9875,8 @@ mod stream_floor_tests {
 
     fn text(bytes: usize) -> NormalizedEvent {
         NormalizedEvent::Display(DisplayEvent::TextDelta {
+            mid: None,
+            part: None,
             message_id: MessageId("m1".to_string()),
             tool_call_id: None,
             delta: "x".repeat(bytes),

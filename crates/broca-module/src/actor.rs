@@ -4331,6 +4331,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         );
         let step_progress = Arc::new(std::sync::Mutex::new(None));
         let control = RunControl {
+            emit_display_context: true,
             step_progress: Some(Arc::clone(&step_progress)),
             clock: self
                 .registry
@@ -4392,8 +4393,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
         let durable_finish = Arc::new(std::sync::OnceLock::new());
         let output_finish = Arc::clone(&durable_finish);
         let output_handle = tokio::spawn(async move {
+            let mut display_mid = None;
             while let Some(ev) = out_rx.recv().await {
                 match ev {
+                    OutputEvent::DisplayContext { ordinal } => {
+                        display.finish_step();
+                        display_mid = ordinal.map(|n| format!("m{n}"));
+                    }
+                    OutputEvent::Control(broca_protocol::caller::ControlUnit::StepFinished {
+                        ..
+                    })
+                    | OutputEvent::Control(broca_protocol::caller::ControlUnit::Paused {
+                        ..
+                    }) => {
+                        display.finish_step();
+                    }
                     OutputEvent::Control(broca_protocol::caller::ControlUnit::StepStarted {
                         step_id,
                     }) => {
@@ -4411,14 +4425,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         reason,
                         ..
                     }) => {
+                        display.finish_step();
                         let _ = output_finish.set(DurableFinish { run_id, reason });
                     }
                     OutputEvent::Control(_) => {}
-                    OutputEvent::Display(d) => {
+                    OutputEvent::Display(mut d) => {
+                        d.set_mid(display_mid.clone());
                         let _ = display.send(Arc::new(d));
                     }
                 }
             }
+            display.finish_step();
         });
         let handle = tokio::spawn(async move {
             // The guard reports a synthetic terminal if execution panics, preventing the actor
@@ -7607,6 +7624,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 other => other,
             };
             writer.seed_lineage_tags(tags);
+            broca_core::run::seed_display_placement(
+                writer,
+                &snapshot,
+                self.wal_store.as_ref(),
+                self.materialized_store.as_deref(),
+                &self.key,
+            );
         }
         self.prior_snapshot = Some(snapshot);
         Ok(())
@@ -8034,6 +8058,7 @@ mod tests {
                     planned_calls: vec![broca_protocol::ToolCallId("a".into())],
                 },
                 WalRecord::ToolDispatchIntent {
+                    dispatched_at_ms: None,
                     batch_id: broca_protocol::BatchId("held-b1".into()),
                     tool_call_id: broca_protocol::ToolCallId("a".into()),
                     tool_name: Some("ask".into()),
@@ -11050,6 +11075,7 @@ mod import_idempotency_tests {
             planned_calls: vec![ToolCallId("call-1".into())],
         });
         writer.record(broca_wal::WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             hooks: None,
             batch_id: broca_protocol::BatchId("b1".into()),
             tool_call_id: ToolCallId("call-1".into()),
