@@ -34,6 +34,7 @@ base64 = "=0.22.1"
 sha2.workspace = true
 
 [dev-dependencies]
+broca-module-serve = { path = "../broca-module-serve" }
 cortexkit-role-tool-provider-conformance.workspace = true
 subc-client-rs = { workspace = true }
 broca-wal = { path = "../broca-wal" }

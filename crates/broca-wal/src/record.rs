@@ -2573,7 +2573,7 @@ pub struct RunConfig {
     /// → different rendered bytes → a cache bust and a provider-invalid history). This is
     /// NOT a render input: the loop never feeds it to the renderer, and the wire family it
     /// implies is already captured in `frozen_render_config`. `None` on a run with no vault
-    /// auth source (the OpenCode/mock path), so a pre-existing record replays unchanged.
+    /// token (for example, the mock path), so a pre-existing record replays unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_selection: Option<AuthSelection>,
     /// Whether the caller omitted the tool surface that resolved to `tools`. This is admission

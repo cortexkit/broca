@@ -14,3 +14,7 @@ mod common;
 
 mod catalog_live_e2e;
 mod catalog_native_live_e2e;
+
+#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[path = "../../../broca-provider/tests/live_common/vault.rs"]
+mod vault;

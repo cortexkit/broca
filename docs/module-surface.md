@@ -61,6 +61,22 @@ a routed error or a direct/tool-result JSON error document. A stale continuation
 uses the distinct `catalog_changed` code; `refused` and other codes do not signal
 a snapshot restart.
 
+### 1b. Provider credentials
+
+Real provider calls read credentials only from the claustrum vault, by credential id
+and the supervised module's read grant. A missing vault configuration or refused
+credential read never falls back to another application's credential store. Mock
+providers selected with `BROCA_PROVIDER_BASE_URL` need no credential route.
+
+Foreground developer tools use a separately provisioned capability handle:
+`broca-run` resolves a catalog model's provider and configured auth method, loads
+its handle through `vault_config::load_devtools_handle`, and reads it through subc.
+An explicit `--auth-bearer` overrides this; `--base-url` without a bearer remains
+credential-free for mocks. Live tests require `BROCA_LIVE_TESTS=1` before loading
+any handle or reading a credential, and use the same dev-tools handle map
+(`BROCA_DEVTOOLS_HANDLES` or `~/.config/cortexkit/broca/dev-tools-handles.json`).
+`BROCA_LIVE_SUBC` or `SUBC_SOCKET` can select their subc connection file.
+
 ## 2. Two consumer roles
 
 - **Drivers** start or steer work and inject prompts.

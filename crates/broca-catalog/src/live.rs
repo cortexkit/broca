@@ -5,12 +5,11 @@
 //! The catalog → live provider bridge: resolve a model id + auth into a runnable
 //! `Box<dyn Provider>`. Shared by every harness that builds a live provider (the
 //! `broca-run` CLI and the `broca-module-serve` module binary) so the resolution logic
-//! (catalog lookup, base_url override, the OpenCode credential read, the auth shaping)
+//! (catalog lookup, base_url override, and auth shaping)
 //! lives in ONE place — a harness can't drift from another on how a model resolves.
 //!
 //! Behind the `live` feature (it pulls the provider's live transport).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use broca_provider::credential_refresh::SharedSecretRefresher;
@@ -276,18 +275,9 @@ pub enum EpisodePersona<'a> {
 pub enum AuthMode {
     /// An explicit bearer token (wins over everything).
     Bearer(String),
-    /// Read `~/.local/share/opencode/auth.json` for the resolved provider (OAuth `access`
-    /// as a Bearer, or an `api` `key` into the provider's declared header).
-    FromOpencode,
-    /// Read the OpenCode auth-file format from this explicit path instead of the HOME-derived
-    /// one. Same entry handling as `FromOpencode`; it exists so a test can point an executor at
-    /// a fixture file rather than the operator's real credentials.
-    FromOpencodeFile(PathBuf),
-    /// A pre-fetched secret string (e.g. a token the caller already obtained from the
-    /// credential vault), shaped into the provider's declared header the SAME way the
-    /// OpenCode path shapes its secret — so e.g. Gemini's `x-goog-api-key` provider gets
-    /// the token in that header, not a Bearer. The caller owns HOW the secret was obtained
-    /// (the async vault fetch lives outside this synchronous resolver); this only shapes it.
+    /// A pre-fetched vault secret, shaped into the provider's declared header. For example,
+    /// Gemini uses `x-goog-api-key`, not Bearer. The caller owns the async vault fetch;
+    /// this synchronous resolver only shapes the supplied secret.
     Secret(String),
     /// No auth header (the mock path — aimock needs none).
     None,
@@ -297,7 +287,7 @@ pub enum AuthMode {
 /// and greppable/structured output need.
 pub struct ProviderResolution {
     pub provider: Box<dyn broca_core::provider::Provider>,
-    /// The effective method, including one discovered from an OpenCode auth entry.
+    /// The effective authentication method supplied by the caller.
     pub auth_method: Option<AuthMethod>,
     /// The resolved wire family as a typed value — used to assert (provider, auth-method)
     /// consistency at run start (a wire-changing method's credential MUST match the family
@@ -1619,7 +1609,7 @@ fn resolved_live_provider(
 
 /// The in-step 401 recovery for a vault secret: each refreshed secret is shaped by the same
 /// rule `resolve_auth` applied to the admission-time one, so it lands in the same header.
-/// `None` for every other auth source (an explicit bearer or an OpenCode file cannot be
+/// `None` for every other auth source (an explicit bearer cannot be
 /// force-refreshed) and when the caller supplied no refresher.
 fn secret_refresher_for(
     auth: &AuthMode,
@@ -1656,25 +1646,12 @@ fn shape_secret(secret: String, auth_kind: &AuthKind) -> AuthHandle {
     }
 }
 
-/// Resolve the runtime credential into an `AuthHandle`, its secret-free description, and its
-/// effective method. An explicit bearer wins; a vault secret uses the caller-resolved method;
-/// the OpenCode path uses that same resolved method when present and otherwise derives it from
-/// whether the entry carries `access` or `key`.
+/// Shape a caller-supplied credential and retain its resolved authentication method.
 fn resolve_auth(
     auth: &AuthMode,
     auth_kind: &AuthKind,
     auth_provider: &str,
     method: Option<AuthMethod>,
-) -> Result<(AuthHandle, String, Option<AuthMethod>), String> {
-    resolve_auth_with_opencode_path(auth, auth_kind, auth_provider, method, None)
-}
-
-fn resolve_auth_with_opencode_path(
-    auth: &AuthMode,
-    auth_kind: &AuthKind,
-    auth_provider: &str,
-    method: Option<AuthMethod>,
-    opencode_path: Option<&std::path::Path>,
 ) -> Result<(AuthHandle, String, Option<AuthMethod>), String> {
     match auth {
         AuthMode::Bearer(t) if !t.is_empty() => Ok((
@@ -1692,32 +1669,6 @@ fn resolve_auth_with_opencode_path(
             method,
         )),
         AuthMode::Secret(_) => Err(format!("empty vault credential for '{auth_provider}'")),
-        AuthMode::FromOpencode | AuthMode::FromOpencodeFile(_) => {
-            // An explicit file in the mode wins over the resolver's optional path.
-            let opencode_path = match auth {
-                AuthMode::FromOpencodeFile(path) => Some(path.as_path()),
-                _ => opencode_path,
-            };
-            let credential = match opencode_path {
-                Some(path) => opencode_credential_with_method_at(path, auth_provider),
-                None => opencode_credential_with_method(auth_provider),
-            }
-            .ok_or_else(|| {
-                format!("no usable credential for '{auth_provider}' in the OpenCode auth file")
-            })?;
-            // The executor resolves configured/frozen methods before selecting a wire family.
-            // Keep that method authoritative here; the auth-file type is only the fallback when
-            // no earlier decision exists.
-            let effective_method = method.unwrap_or(credential.method);
-            Ok((
-                shape_secret(
-                    credential.secret,
-                    &auth_kind_for_method(auth_provider, Some(effective_method), auth_kind),
-                ),
-                format!("opencode({auth_provider})"),
-                Some(effective_method),
-            ))
-        }
     }
 }
 
@@ -1754,7 +1705,7 @@ fn apply_auth_method_quirks(
 /// `chatgpt_account_id` claim rather than send a request with no/empty account header (which
 /// the codex backend rejects opaquely). Adapted from OpenCode's codex.ts header construction
 /// (MIT, Copyright (c) 2025 opencode; see THIRD-PARTY-NOTICES.md).
-/// broca prefers vault credentials and uses the frozen cache scope for the session header.
+/// broca uses vault credentials and the frozen cache scope for the session header.
 /// All of these are HTTP headers (off the rendered/hashed bytes).
 fn chatgpt_codex_auth(
     auth: &AuthMode,
@@ -1762,25 +1713,15 @@ fn chatgpt_codex_auth(
     cache_scope_key: Option<&str>,
     vault_account_id: Option<&str>,
 ) -> Result<(AuthHandle, String), String> {
-    // Extract the raw token. An explicit Bearer wins; a vault Secret is the served token; the
-    // OpenCode path reads the provider's credential. (A ChatGPT-subscription token is an OAuth
-    // access token, so it's never an api-key-header shape here.)
+    // A ChatGPT subscription token is an OAuth access token, never an API-key header.
     let token = match auth {
         AuthMode::Bearer(t) | AuthMode::Secret(t) if !t.is_empty() => t.clone(),
-        AuthMode::FromOpencode => opencode_credential(auth_provider).ok_or_else(|| {
-            format!("no usable credential for '{auth_provider}' in the OpenCode auth file")
-        })?,
-        AuthMode::FromOpencodeFile(path) => opencode_credential_with_method_at(path, auth_provider)
-            .map(|credential| credential.secret)
-            .ok_or_else(|| {
-                format!("no usable credential for '{auth_provider}' in the OpenCode auth file")
-            })?,
         _ => return Err(format!("no ChatGPT token for '{auth_provider}'")),
     };
 
     // The vault-served account id wins: the vault parses it from the token at refresh
     // time, so it tracks a re-login that swaps accounts. The local JWT decode remains the
-    // fallback for non-vault paths (opencode auth file, explicit Bearer).
+    // fallback for an explicit Bearer token.
     let account_id =
         cortexkit_chatgpt_policy::account_id(vault_account_id, &token).map_err(|_| {
             format!(
@@ -1867,71 +1808,6 @@ fn chatgpt_account_id(token: &str) -> Option<String> {
     cortexkit_chatgpt_policy::account_id(None, token).ok()
 }
 
-/// Read the method encoded by a provider's OpenCode auth entry without exposing its secret.
-/// The entry format distinguishes only API-key and generic OAuth credentials; provider-specific
-/// methods such as Antigravity and ChatGPT come from the module's configured/frozen selection.
-pub fn opencode_auth_method(provider: &str) -> Option<AuthMethod> {
-    opencode_credential_with_method(provider).map(|credential| credential.method)
-}
-
-/// [`opencode_auth_method`] against an explicit auth file rather than the HOME-derived one.
-pub fn opencode_auth_method_at(path: &std::path::Path, provider: &str) -> Option<AuthMethod> {
-    opencode_credential_with_method_at(path, provider).map(|credential| credential.method)
-}
-
-/// Read a usable credential string for `provider` from the OpenCode auth file: an OAuth
-/// `access` token (used as a Bearer) or an `api` `key`. Never logged; the caller's
-/// description carries only the provider name, never the secret. No token refresh.
-pub fn opencode_credential(provider: &str) -> Option<String> {
-    opencode_credential_with_method(provider).map(|credential| credential.secret)
-}
-
-struct OpencodeCredential {
-    secret: String,
-    method: AuthMethod,
-}
-
-fn opencode_credential_with_method(provider: &str) -> Option<OpencodeCredential> {
-    let home = std::env::var("HOME").ok()?;
-    let path = PathBuf::from(home).join(".local/share/opencode/auth.json");
-    opencode_credential_with_method_at(&path, provider)
-}
-
-fn opencode_credential_with_method_at(
-    path: &std::path::Path,
-    provider: &str,
-) -> Option<OpencodeCredential> {
-    let bytes = std::fs::read(path).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let entry = v.get(provider)?;
-    let oauth = || {
-        entry
-            .get("access")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .map(|access| OpencodeCredential {
-                secret: access.to_string(),
-                method: AuthMethod::Oauth,
-            })
-    };
-    let api_key = || {
-        entry
-            .get("key")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .map(|key| OpencodeCredential {
-                secret: key.to_string(),
-                method: AuthMethod::ApiKey,
-            })
-    };
-    match entry.get("type").and_then(|value| value.as_str()) {
-        Some("oauth") => oauth(),
-        Some("api") => api_key(),
-        // Older OpenCode files did not always stamp `type`; preserve their access-first behavior.
-        _ => oauth().or_else(api_key),
-    }
-}
-
 #[cfg(all(test, feature = "live"))]
 mod tests {
     use super::*;
@@ -1940,7 +1816,6 @@ mod tests {
     use broca_provider::families::{anthropic_frozen_config, AnthropicMessages};
     use broca_provider::policy::{ReasoningPolicy, SystemPromptPolicy};
     use broca_provider::wire::WireFamily;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn anthropic_options() -> CallOptions {
         CallOptions::new(vec![Message::new(
@@ -2366,88 +2241,6 @@ mod tests {
             Some("claude-cli/2.1.280 (external, cli)")
         );
         assert_eq!(header(&oauth_request, "x-app"), Some("cli"));
-    }
-
-    fn temp_auth_file(label: &str, contents: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = broca_test_support::scratch_root().join(format!(
-            "broca-catalog-auth-{label}-{}-{}.json",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, contents).expect("write temporary OpenCode auth file");
-        path
-    }
-
-    #[test]
-    fn opencode_anthropic_entry_type_selects_the_same_auth_shape() {
-        for (label, contents, expected_method) in [
-            (
-                "api-key",
-                r#"{"anthropic":{"type":"api","key":"api-secret"}}"#,
-                AuthMethod::ApiKey,
-            ),
-            (
-                "oauth",
-                r#"{"anthropic":{"type":"oauth","access":"oauth-secret","refresh":"r"}}"#,
-                AuthMethod::Oauth,
-            ),
-        ] {
-            let path = temp_auth_file(label, contents);
-            let (auth, _, method) = resolve_auth_with_opencode_path(
-                &AuthMode::FromOpencode,
-                &crate::default_auth_kind(WireFamilyId::AnthropicMessages),
-                "anthropic",
-                None,
-                Some(&path),
-            )
-            .expect("resolve OpenCode Anthropic credential");
-            std::fs::remove_file(&path).expect("remove temporary OpenCode auth file");
-            assert_eq!(method, Some(expected_method));
-
-            let mut frozen = anthropic_frozen_config("claude-opus-4-8");
-            apply_auth_method_quirks("anthropic", method, &mut frozen);
-            let request = AnthropicMessages.endpoint(&frozen, &auth, b"{}".to_vec());
-            match expected_method {
-                AuthMethod::ApiKey => {
-                    assert_eq!(header(&request, "x-api-key"), Some("api-secret"));
-                    assert!(header(&request, "authorization").is_none());
-                    assert!(header(&request, "anthropic-beta").is_none());
-                    assert_eq!(frozen.system_prompt, SystemPromptPolicy::TopLevelField);
-                    assert_eq!(frozen.reasoning, ReasoningPolicy::None);
-                }
-                AuthMethod::Oauth => {
-                    assert_eq!(
-                        header(&request, "authorization"),
-                        Some("Bearer oauth-secret")
-                    );
-                    assert!(header(&request, "x-api-key").is_none());
-                    assert!(header(&request, "anthropic-beta")
-                        .is_some_and(|value| value.contains("oauth-2025-04-20")));
-                }
-                _ => unreachable!("the fixture covers only Anthropic credential methods"),
-            }
-        }
-    }
-
-    #[test]
-    fn configured_opencode_method_precedes_the_generic_entry_type() {
-        let path = temp_auth_file(
-            "configured-method",
-            r#"{"openai":{"type":"oauth","access":"oauth-secret"}}"#,
-        );
-        let (auth, _, method) = resolve_auth_with_opencode_path(
-            &AuthMode::FromOpencode,
-            &AuthKind::Bearer,
-            "openai",
-            Some(AuthMethod::Chatgpt),
-            Some(&path),
-        )
-        .expect("resolve configured OpenCode method");
-        std::fs::remove_file(&path).expect("remove temporary OpenCode auth file");
-
-        assert_eq!(method, Some(AuthMethod::Chatgpt));
-        assert!(matches!(auth, AuthHandle::Bearer(value) if value == "oauth-secret"));
     }
 
     #[test]

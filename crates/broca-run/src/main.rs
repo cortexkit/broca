@@ -92,17 +92,10 @@ struct Args {
     #[arg(long, default_value = ".")]
     project_root: PathBuf,
 
-    /// If set, sent as `Authorization: Bearer <token>`. Omit for no auth header.
-    /// An explicit override; takes precedence over `--auth-from-opencode`.
+    /// Explicit Bearer override. Otherwise catalog models read a vault dev-tools handle;
+    /// an explicit --base-url needs no credential (for mock providers).
     #[arg(long)]
     auth_bearer: Option<String>,
-
-    /// Resolve the credential from the OpenCode auth file
-    /// (`~/.local/share/opencode/auth.json`) for the resolved provider — its OAuth
-    /// access token or api key, placed in the header the provider's auth kind requires.
-    /// No token refresh (uses whatever is on disk). Ignored if `--auth-bearer` is set.
-    #[arg(long)]
-    auth_from_opencode: bool,
 
     /// Max model steps before a structural stop.
     #[arg(long, default_value_t = 8)]
@@ -137,28 +130,49 @@ fn emit(json: bool, event: serde_json::Value, human: impl FnOnce() -> String) {
     }
 }
 
-/// Resolve the live provider from the CLI args, via the shared catalog→live resolver
-/// (so this CLI and the `broca-module-serve` binary can't drift on how a model resolves).
-/// `--auth-bearer` (explicit) wins; else `--auth-from-opencode`; else no auth.
+/// Resolve with a supplied credential so provider construction remains independent of IO.
 fn resolve_provider(
     args: &Args,
+    auth: &AuthMode,
+    method: Option<broca_module_serve::AuthMethod>,
 ) -> Result<ProviderResolution, broca_catalog::live::ResolutionError> {
-    let auth = if let Some(t) = args.auth_bearer.as_ref().filter(|s| !s.is_empty()) {
-        AuthMode::Bearer(t.clone())
-    } else if args.auth_from_opencode {
-        AuthMode::FromOpencode
-    } else {
-        AuthMode::None
-    };
     broca_catalog::live::resolve_provider(
         &args.model,
         args.base_url.as_deref(),
         args.max_tokens,
-        &auth,
-        // The CLI doesn't drive the vault auth-method routing, so no family override or
-        // antigravity project — a plain catalog-or-base_url resolution.
-        &broca_catalog::live::ResolveOptions::default(),
+        auth,
+        &broca_catalog::live::ResolveOptions {
+            auth_method: method,
+            family_override: method.and_then(broca_module_serve::family_for_method),
+            ..Default::default()
+        },
     )
+}
+
+async fn provider_auth(
+    args: &Args,
+    bind: &BindIdentity,
+) -> Result<(AuthMode, Option<broca_module_serve::AuthMethod>), String> {
+    if let Some(token) = args.auth_bearer.as_ref().filter(|token| !token.is_empty()) {
+        return Ok((AuthMode::Bearer(token.clone()), None));
+    }
+    if args.base_url.is_some() {
+        return Ok((AuthMode::None, None));
+    }
+    let (provider, _) = args
+        .model
+        .split_once('/')
+        .ok_or("model is not a catalog id")?;
+    let methods = broca_module_serve::MethodConfig::load_resolved(
+        broca_module_serve::MethodConfig::default_path(),
+    )?;
+    let method = methods
+        .method_for(provider)
+        .unwrap_or(broca_module_serve::AuthMethod::ApiKey);
+    let credential = broca_module_serve::CredentialId::new(method, provider, None);
+    broca_module_serve::devtools::credential(&credential, &args.subc, bind)
+        .await
+        .map(|token| (AuthMode::Secret(token), Some(method)))
 }
 
 /// The per-process nonce baked into fresh broca-run ids. `{pid}{start-nanos}` makes each
@@ -312,7 +326,9 @@ async fn run(args: Args) -> Result<i32, String> {
     //    - explicit --base-url: OpenAI-Chat at that URL, --model sent verbatim (the
     //      mock / openai-compatible path; the catalog is not consulted);
     //    - else: resolve provider/family/base_url/auth-kind from the catalog by --model.
-    let resolved = resolve_provider(&args).map_err(|e| format!("resolve provider: {e}"))?;
+    let (auth, method) = provider_auth(&args, &bind).await?;
+    let resolved =
+        resolve_provider(&args, &auth, method).map_err(|e| format!("resolve provider: {e}"))?;
     emit(
         json,
         serde_json::json!({"event": "provider", "family": resolved.family, "base_url": resolved.base_url, "wire_model": resolved.wire_model, "auth": resolved.auth_desc}),
@@ -601,7 +617,7 @@ mod tests {
     /// `resolve_provider` Ok-or-panic — `ProviderResolution` holds a `Box<dyn Provider>`
     /// (not `Debug`), so the tests can't use `.expect()` on the Result directly.
     fn resolved_ok(a: &Args) -> ProviderResolution {
-        match resolve_provider(a) {
+        match resolve_provider(a, &AuthMode::None, None) {
             Ok(r) => r,
             Err(e) => panic!("resolve_provider should succeed: {e}"),
         }
@@ -679,13 +695,44 @@ mod tests {
         );
     }
 
-    /// No `--auth-bearer`, no `--auth-from-opencode` → no auth header (the mock needs
-    /// none). Same as the old default.
+    /// An explicit mock URL needs no auth header or vault.
     #[test]
     fn base_url_path_defaults_to_no_auth() {
         let a = args(&["--base-url", "http://127.0.0.1:9999"]);
         let resolved = resolved_ok(&a);
         assert_eq!(resolved.auth_desc, "none");
+    }
+
+    #[tokio::test]
+    async fn mock_auth_bypasses_the_vault_and_explicit_bearer_wins() {
+        let bind = BindIdentity::new(".", "test", "test");
+        let mock = args(&["--base-url", "http://127.0.0.1:9999"]);
+        let (auth, method) = provider_auth(&mock, &bind).await.unwrap();
+        assert!(matches!(auth, AuthMode::None));
+        assert_eq!(method, None);
+
+        let explicit = args(&["--auth-bearer", "synthetic-token"]);
+        let (auth, method) = provider_auth(&explicit, &bind).await.unwrap();
+        assert!(matches!(auth, AuthMode::Bearer(value) if value == "synthetic-token"));
+        assert_eq!(method, None);
+    }
+
+    #[test]
+    fn vault_api_key_method_selects_anthropic_api_key_rendering() {
+        seed_catalog();
+        let mut a = args(&[]);
+        a.model = "anthropic/claude-opus-5".into();
+        let resolved = resolve_provider(
+            &a,
+            &AuthMode::Secret("synthetic-token".into()),
+            Some(broca_module_serve::AuthMethod::ApiKey),
+        )
+        .unwrap_or_else(|_| panic!("resolve supplied vault credential"));
+        assert_eq!(resolved.auth_desc, "vault(anthropic)");
+        assert_eq!(
+            resolved.provider.render_config_blob()["system_prompt"]["mode"],
+            "top_level_field"
+        );
     }
 
     /// Catalog mode resolves a native family correctly: `anthropic/<model>` → the
@@ -718,7 +765,7 @@ mod tests {
     fn catalog_mode_rejects_a_non_catalog_model() {
         let mut a = args(&[]);
         a.model = "just-a-bare-name".to_string();
-        let err = match resolve_provider(&a) {
+        let err = match resolve_provider(&a, &AuthMode::None, None) {
             Err(e) => e,
             Ok(_) => panic!("a bare model id without --base-url must error"),
         };
@@ -734,7 +781,7 @@ mod tests {
         seed_catalog();
         let mut a = args(&[]);
         a.model = "anthropic/no-such-model-xyz".to_string();
-        let err = match resolve_provider(&a) {
+        let err = match resolve_provider(&a, &AuthMode::None, None) {
             Err(e) => e,
             Ok(_) => panic!("unknown model must error"),
         };

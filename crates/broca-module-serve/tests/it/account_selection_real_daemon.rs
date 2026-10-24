@@ -986,7 +986,6 @@ impl Rig {
                         "env": {
                             "BROCA_STATE_ROOT": state_root,
                             "XDG_DATA_HOME": data_home,
-                            "BROCA_AUTH_SOURCE": "vault",
                             "BROCA_CONFIG_PATH": broca_config,
                             "BROCA_AUTH_METHODS_PATH": methods,
                             "BROCA_TOOL_MODULE": "unused-tools",

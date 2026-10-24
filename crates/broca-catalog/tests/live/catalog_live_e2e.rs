@@ -8,10 +8,9 @@
 //! just a renderable one.
 //!
 //! Driven against several OpenAI-compatible providers the catalog resolves to
-//! OpenAiChat purely from `base_url` (config, not code). Each target is gated on explicit
-//! `BROCA_LIVE_TESTS` consent and an `api`-type key in the OpenCode auth file, and skips
-//! cleanly (never a silent pass) when either is absent. Secrets are read from disk and never
-//! echoed.
+//! OpenAiChat purely from `base_url` (config, not code). Each target requires
+//! `BROCA_LIVE_TESTS=1` and a vault dev-tools handle. Missing consent or credentials
+//! skips cleanly; secrets are never echoed.
 // A file-level `cfg` DELETES this file when the feature is off, and a deleted file reports
 // "running 0 tests ... test result: ok" -- indistinguishable at a glance from a suite that
 // ran and passed, and impossible to instrument because no code survives to carry a notice.
@@ -43,14 +42,10 @@ mod gated {
     use broca_provider::live_provider;
     use broca_provider::wire::AuthHandle;
 
-    fn live_calls_opted_in() -> bool {
-        std::env::var("BROCA_LIVE_TESTS")
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
-    }
+    use crate::vault;
 
     /// A catalog-served OpenAI-compatible target: a provider/model in the vendored
-    /// catalog plus the auth-file key that reaches it.
+    /// catalog plus the vault credential provider that reaches it.
     struct Target {
         provider_id: &'static str,
         model_id: &'static str,
@@ -85,24 +80,8 @@ mod gated {
         },
     ];
 
-    /// Read an `api`-type key from the OpenCode auth file (never logged).
     fn read_api_key(provider: &str) -> Option<String> {
-        if !live_calls_opted_in() {
-            return None;
-        }
-        let home = std::env::var("HOME").ok()?;
-        let path = std::path::PathBuf::from(home).join(".local/share/opencode/auth.json");
-        let bytes = std::fs::read(&path).ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let entry = v.get(provider)?;
-        if entry.get("type").and_then(|t| t.as_str()) != Some("api") {
-            return None;
-        }
-        entry
-            .get("key")
-            .and_then(|k| k.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
+        vault::live_credential(&format!("apikey:{provider}"))
     }
 
     /// The outcome of one catalog-resolved live target.

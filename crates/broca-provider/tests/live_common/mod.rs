@@ -605,128 +605,22 @@ impl LiveOutcome {
 
 // ───────────────────────── auth loading ─────────────────────────
 
-/// The opt-in every live credential source is gated on.
-///
-/// WHY PRESENCE IS NOT CONSENT. Until this existed, `cargo test --workspace` on a FRESH CLONE
-/// made real, billed provider calls against whatever credentials happened to be on the machine --
-/// including another application's store at `~/.local/share/opencode/auth.json`. Reported from
-/// outside (issue #11) with 8 billed calls across deepseek and anthropic, from a contributor who
-/// had configured nothing.
-///
-/// The `live` feature was NOT the gate it looked like: three workspace members
-/// (broca-run, broca-subc, broca-module-serve) enable `broca-provider/live`, and cargo unifies
-/// features across a workspace build -- so `--workspace` compiles these tests with `live` on no
-/// matter what this crate's own default says. A feature flag cannot express consent when any
-/// dependent can turn it on.
-///
-/// So the gate is an explicit environment variable, checked at the two functions every credential
-/// flows through. Absent, they return None and each caller takes its existing clean skip path.
-/// Spending someone's money must be something they asked for, not something their filesystem
-/// implies.
-fn live_calls_opted_in() -> bool {
-    std::env::var("BROCA_LIVE_TESTS")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
+mod vault;
+
+pub fn vault_api_key(provider: &str) -> Option<String> {
+    vault::live_credential(&format!("apikey:{provider}"))
 }
 
-/// Read the opencode auth file fresh (tokens are short-lived — never cache across
-/// runs). Returns the parsed JSON, or None if absent.
-///
-/// Gated on `BROCA_LIVE_TESTS`: this reads ANOTHER APPLICATION'S credential store, so finding
-/// the file is not permission to spend against it.
-pub fn read_opencode_auth() -> Option<serde_json::Value> {
-    if !live_calls_opted_in() {
-        return None;
-    }
-    let path = dirs_home()?.join(".local/share/opencode/auth.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+pub fn vault_oauth_token(provider: &str) -> Option<String> {
+    vault::live_credential(&format!("oauth:{provider}"))
 }
 
-/// An `api`-type key for `provider` from the opencode auth file (e.g. deepseek,
-/// amazon-bedrock). `None` if absent or not an api-type entry.
-pub fn opencode_api_key(provider: &str) -> Option<String> {
-    let auth = read_opencode_auth()?;
-    let entry = auth.get(provider)?;
-    if entry.get("type")?.as_str()? != "api" {
-        return None;
-    }
-    entry
-        .get("key")?
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-}
-
-/// An `oauth` access token for `provider` from the opencode auth file, or `None` if
-/// missing OR expired. Tokens are short-lived — read fresh each run; an expired token
-/// is a provider-side condition the caller turns into a clean skip, never a failure.
-/// `expires == 0` is treated as "no expiry info" (attempt the call; a 401 then
-/// classifies as Auth → skip).
-pub fn opencode_oauth_token(provider: &str) -> Option<String> {
-    let auth = read_opencode_auth()?;
-    let entry = auth.get(provider)?;
-    if entry.get("type")?.as_str()? != "oauth" {
-        return None;
-    }
-    let access = entry.get("access")?.as_str().filter(|s| !s.is_empty())?;
-    if let Some(exp) = entry.get("expires").and_then(serde_json::Value::as_u64) {
-        if exp != 0 && exp <= now_ms() + 5_000 {
-            return None; // expired (5s skew so a call can't expire mid-flight)
-        }
-    }
-    Some(access.to_owned())
-}
-
-/// The Gemini API key: `$GEMINI_API_KEY` if set (CI / another machine), else the
-/// ground-truth file `~/.config/programbench/gemini.key`, else `None` (the caller
-/// skips cleanly — a machine without the key just can't run gemini-live, not a
-/// failure). The key authenticates via the `x-goog-api-key` header.
 pub fn gemini_api_key() -> Option<String> {
-    key_from_env_or_file("GEMINI_API_KEY", ".config/programbench/gemini.key")
+    vault_api_key("google")
 }
 
-/// The OpenAI PLATFORM key (sk-...): `$OPENAI_API_KEY` if set, else the file
-/// `~/.config/openai.key`, else `None` (caller skips). This is a platform key carrying
-/// the `api.responses.write` scope — distinct from the opencode OAuth token
-/// (ChatGPT/Codex), which lacks that scope and 401s on `/v1/responses`. So
-/// openai-RESPONSES live sources THIS key specifically; openai-chat can use either.
-/// Authenticates as `Bearer <key>`.
 pub fn openai_platform_key() -> Option<String> {
-    key_from_env_or_file("OPENAI_API_KEY", ".config/openai.key")
-}
-
-/// Read a one-line key from `$env_var` if set, else from `~/<rel_path>`, trimmed;
-/// `None` when neither yields a non-empty value (the caller skips cleanly).
-fn key_from_env_or_file(env_var: &str, rel_path: &str) -> Option<String> {
-    // Gated even for the ENV arm. A key exported in a shell for some other purpose is not an
-    // instruction to bill it from a test run, and the contributor who reported this had set no
-    // broca variables at all.
-    if !live_calls_opted_in() {
-        return None;
-    }
-    if let Ok(k) = std::env::var(env_var) {
-        let k = k.trim();
-        if !k.is_empty() {
-            return Some(k.to_owned());
-        }
-    }
-    let path = dirs_home()?.join(rel_path);
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    vault_api_key("openai")
 }
 
 /// A minimal base64 (no external dep) for the binary-capture fallback.

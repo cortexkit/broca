@@ -25824,3 +25824,29 @@ old = '''    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<crate::media_profile::MediaProfile>,'''
 new = '''    #[serde(default)] // NON-VACUITY BREAK: write media: null on every frozen config.
     pub media: Option<crate::media_profile::MediaProfile>,'''
+
+[[control]]
+id = "scan-no-foreign-credential-store"
+guards = "Shipped sources, tests and scripts never name the removed foreign credential store"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/credential_source_guard.rs"
+expect_red = ["credential_source_guard::shipped_sources_never_name_another_apps_credential_store"]
+expect_message = "forbidden credential-store path in: crates/broca-module-serve/src/devtools.rs"
+file = "crates/broca-module-serve/src/devtools.rs"
+old = "//! Capability-handle credential reads for foreground developer tools, not the daemon."
+new = "//! Capability-handle credential reads for foreground developer tools, not the daemon.\n// NON-VACUITY BREAK: opencode/auth.json"
+
+[[control]]
+id = "live-credential-read-requires-consent"
+guards = "Live credentials are never read before exact live-test consent"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+test_file = "crates/broca-provider/tests/live_common/vault.rs"
+expect_red = ["live_common::vault::live_credentials_require_explicit_consent_before_reading"]
+expect_message = "credential read without consent"
+file = "crates/broca-provider/tests/live_common/vault.rs"
+old = "    if consent != Some(\"1\") {"
+new = "    if false && consent != Some(\"1\") { // NON-VACUITY BREAK"

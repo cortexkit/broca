@@ -87,9 +87,9 @@ fn runtime_override_moves_only_host() {
 
 /// Resolve the provider for `auth` the way an episode does, send one step to a local listener,
 /// and return the `authorization` header it carried. That header is the only observable place
-/// the resolved secret lands, so it is what shows which auth file the credential came from.
+/// the resolved secret lands, so it proves the vault-served credential reached the wire.
 /// `None` when resolution fails (no usable credential) or no request arrives.
-async fn read_opencode_authorization(auth: &AuthResolution) -> Option<String> {
+async fn read_vault_authorization(auth: &AuthResolution) -> Option<String> {
     use tokio::io::AsyncReadExt;
     install_test_catalog();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -174,80 +174,22 @@ fn runtime_override_resume_keeps_frozen_host_and_bytes() {
 
 #[tokio::test]
 async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
-    // Only the tool-plane connection is stubbed. Auth and cache decisions below are the
-    // executor's real methods; no daemon, vault process or real provider is needed.
-    use subc_transport::connection_file::{ConnectionInfo, Endpoint, SCHEMA_VERSION};
-    let root = broca_test_support::scratch_root().join(format!("broca-host-override-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    // With no vault the executor takes the OpenCode credential source. Point it at a fixture:
-    // otherwise it reads the operator's real ~/.local/share/opencode/auth.json. The key is
-    // deliberately one no real auth file holds, so finding it on the wire below proves the
-    // credential came from this file and not from the host.
-    const FIXTURE_KEY: &str = "broca-test-fixture-deepseek-key-not-a-real-credential";
-    let opencode_auth = root.join("opencode-auth.json");
-    std::fs::write(
-        &opencode_auth,
-        serde_json::json!({"deepseek": {"type": "api", "key": FIXTURE_KEY}}).to_string(),
-    )
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let key = vec![0x5c; 32];
-    let connection_file = root.join("connection.json");
-    subc_transport::connection_file::write_atomic(
-        &connection_file,
-        &ConnectionInfo {
-            schema: SCHEMA_VERSION,
-            wire_version: None,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".into(),
-                port,
-            }],
-            key: key.clone(),
-            daemon_id: [0xc5; 16],
-            pid: std::process::id(),
-            daemon_ver: "test".into(),
-        },
-    )
-    .unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        subc_transport::authenticate_server(
-            &mut stream,
-            &key,
-            &[0xc5; 16],
-            "test",
-            broca_test_support::STAND_IN_AUTH_DEADLINE,
-        )
+    // The capturing vault serves a synthetic token over the real subc credential route.
+    let root = fresh_vault_root("host-override");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let mut executor = executor_with_capturing_vault(&root, &daemon)
         .await
-        .unwrap();
-        std::future::pending::<()>().await;
-    });
-    let connection = broca_subc::SubcConnection::connect(&connection_file)
-        .await
-        .unwrap();
-    let mut executor = LiveLoopExecutor::new(
-        Arc::new(FileWalStore::new(root.join("wal"))),
-        Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap()),
-        Arc::new(SubcToolPlane::new(connection, "unused")),
-        None,
-    )
-    .with_provider_overrides(runtime_overrides("http://127.0.0.1:4010/v1"))
-    .with_opencode_auth_path(opencode_auth.clone());
+        .with_provider_overrides(runtime_overrides("http://127.0.0.1:4010/v1"));
     let auth = executor
         .decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None)
         .await
         .unwrap();
+    assert!(matches!(&auth.mode, AuthMode::Secret(_)));
+    // A failed equality assertion must not reveal a credential header.
+    let authorization = read_vault_authorization(&auth).await;
     assert!(
-        matches!(&auth.mode, AuthMode::FromOpencodeFile(path) if *path == opencode_auth),
-        "the OpenCode auth mode must carry the injected file"
-    );
-    // Compare without assert_eq: on a failure that would print the header, and when the
-    // injection is ignored that header holds the operator's real key.
-    let authorization = read_opencode_authorization(&auth).await;
-    assert!(
-        authorization.as_deref() == Some(format!("Bearer {FIXTURE_KEY}").as_str()),
-        "the resolved credential must come from the fixture auth file (request carried an \
+        authorization.as_deref() == Some(format!("Bearer {}", stand_in_token(1)).as_str()),
+        "the resolved credential must come from the stand-in vault (request carried an \
          authorization header: {}; value withheld because it may be a real credential)",
         authorization.is_some()
     );
@@ -311,7 +253,7 @@ async fn runtime_override_preserves_auth_billing_and_cache_predicates() {
     let mock = executor.decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None).await.unwrap();
     assert!(mock.selection.is_none(), "mock auth has no vault witness, vault request, or selection");
     drop(executor);
-    server.abort();
+    daemon.assert_healthy();
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1490,12 +1432,9 @@ async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
         .join(format!("broca-prompt-ack-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let (executor, server) = stand_in_executor(&root).await;
-    // An absent auth file: no operator credential is read, and the episode is not API-key auth,
-    // so it speaks as Claude Code.
-    let executor = executor
-        .with_claude_code_install_id(Some("install-test".into()))
-        .with_opencode_auth_path(root.join("absent-auth.json"));
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_capturing_vault(&root, &daemon).await;
+    let executor = executor.with_claude_code_install_id(Some("install-test".into()));
     let mut req = drift_request(&root);
     req.input = vec![broca_protocol::Message::new(
         broca_protocol::Role::User,
@@ -1517,7 +1456,7 @@ async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
     let job = RunJob {
         conversation_key: None,
         req,
-        auth: None,
+        auth: Some(broca_protocol::AuthRequest { method: "oauth".into(), account: None }),
         writer: Arc::new(broca_core::WalHandle::spawn(wal, 1).unwrap()),
         kind: RunKind::AppendEpisode,
         skip_materialization: true,
@@ -1540,7 +1479,7 @@ async fn an_unreadable_prompt_history_is_refused_through_the_admission_ack() {
         other => panic!("the admission ack must carry the Config refusal, got {other:?}"),
     }
     drop(executor);
-    server.abort();
+    drop(daemon);
     let _ = std::fs::remove_dir_all(&root);
 }
 

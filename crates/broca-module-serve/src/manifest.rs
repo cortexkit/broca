@@ -936,7 +936,7 @@ mod consumes_tests {
     }
 
     /// broca never opens a route to routing with `legacy_static` on, or without the vault (the
-    /// OpenCode source or a mock provider resolve no accounts), so it declares none then.
+    /// mock providers resolve no accounts), so it declares none then.
     #[test]
     fn the_routing_module_is_declared_only_while_account_selection_is_active() {
         let legacy = crate::account_routing::AccountSelectionConfig::parse(
@@ -963,7 +963,7 @@ mod consumes_tests {
     /// Each configuration-dependent entry appears and disappears with its knob.
     #[test]
     fn optional_consumers_track_their_knobs() {
-        // The OpenCode auth source (or a mock provider) leaves the vault unopened: only the
+        // A mock provider leaves the vault unopened: only the
         // catalog remains a service dependency.
         let (tools, services) = declared(&ConsumerRoutes::resolve(None, false));
         assert_eq!(tools, vec!["aft"]);

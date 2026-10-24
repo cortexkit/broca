@@ -5,14 +5,13 @@
 //! nondeterministic), capture-and-keep, taxonomy-classified skip-vs-fail.
 //!
 //! Run: `cargo test -p broca-provider --features live --test live anthropic_live:: -- --nocapture`
-//! Needs a currently-valid anthropic OAuth token in the opencode auth file; skips
+//! Needs a currently-valid anthropic OAuth token in the vault dev-tools handle map; skips
 //! cleanly otherwise (a provider-side condition, never a code failure).
 
 use crate::live_common;
 
 use broca_protocol::FinishReason;
 use broca_provider::families::{anthropic_frozen_config, AnthropicMessages};
-use broca_provider::live::{default_auth_path, read_oauth_token, LiveAuthError};
 use broca_provider::wire::AuthHandle;
 use live_common::{run_live, LiveResult, LiveSpec};
 use serde_json::json;
@@ -22,14 +21,12 @@ const MODEL: &str = "claude-opus-4-8";
 /// Resolve the Anthropic auth + frozen config, or a skip reason (no/expired token is a
 /// provider-side condition).
 fn anthropic_auth() -> Result<AuthHandle, String> {
-    match read_oauth_token(&default_auth_path()) {
-        Ok(token) => Ok(AuthHandle::Bearer(token)),
-        Err(LiveAuthError::Missing) => {
-            Err("SKIP anthropic_live: no anthropic OAuth token in the auth file.".into())
-        }
-        Err(e @ LiveAuthError::Expired { .. }) => Err(format!("SKIP anthropic_live: {e}")),
-        Err(e) => Err(format!("SKIP anthropic_live: {e}")),
-    }
+    live_common::vault_oauth_token("anthropic")
+        .map(AuthHandle::Bearer)
+        .ok_or_else(|| {
+            "SKIP anthropic_live: BROCA_LIVE_TESTS=1 and a vault dev-tools credential are required."
+                .into()
+        })
 }
 
 /// A finish_reason that is a known canonical variant (not a wire string we failed to
