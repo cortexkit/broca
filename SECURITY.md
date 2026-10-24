@@ -42,6 +42,15 @@ it. A leaked developer handle or control of the supervised process can expose
 credentials. Protect the daemon, vault, module binaries and user account as part
 of the same trust boundary.
 
+Any caller the local daemon admits can read, subscribe to and get the status of
+any session. Only the session's owner can cancel a run in it or retract a send
+from it.
+
+broca has no spend-cap operations, and budget enforcement across sessions isn't
+built. The former `cap.install` and `spend.delta` operations accepted any caller
+the daemon admitted and recorded no installer, so any local module could remove
+a cap or report spend against one; both were removed rather than guarded.
+
 ### Environment variables that move a boundary
 
 Three variables in the module's environment change where credentials come from, where model

@@ -31,7 +31,6 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     materialized_store: Option<Arc<dyn broca_core::SessionStore>>,
     export_index: Option<Arc<dyn broca_core::ExportIndex>>,
     charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
-    cap_store: Option<Arc<dyn broca_core::CapStore>>,
 }
 
 impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
@@ -46,7 +45,6 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             materialized_store: None,
             export_index: None,
             charge_basis_resolver: None,
-            cap_store: None,
         }
     }
 
@@ -76,12 +74,6 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
     }
 
     /// Configure the provider/auth resolver used to derive immutable charge-basis facts.
-    /// Configure the daemon-scoped durable cap table used for admission checks.
-    pub fn with_cap_store(mut self, store: Arc<dyn broca_core::CapStore>) -> Self {
-        self.cap_store = Some(store);
-        self
-    }
-
     pub fn with_charge_basis_resolver(
         mut self,
         resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
@@ -376,7 +368,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         let writer = Arc::new(writer);
 
         // 4. Start the actor, which owns the lease + writer + fan-out until close.
-        Ok(LineageActor::spawn_with_export_and_caps(
+        Ok(LineageActor::spawn_with_export(
             key.clone(),
             gen,
             lease,
@@ -390,7 +382,6 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             self.materialized_store.clone(),
             self.export_index.clone(),
             self.charge_basis_resolver.clone(),
-            self.cap_store.clone(),
         ))
     }
 }

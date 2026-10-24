@@ -344,11 +344,6 @@ pub enum SendOutcome {
     },
     /// Admission failed before any durable write because a dependency is temporarily unavailable.
     Transient(String),
-    /// Admission was denied by a matching durable cap; no WAL record was written.
-    BudgetDenied {
-        cap_id: String,
-        reason: String,
-    },
     /// The routing module refused to choose a provider account; nothing was written.
     AccountSelectionRefused(broca_core::AccountSelectionRefusal),
     /// The owner check refused the send (a different identity, no stamp on a scoped session,
@@ -1149,85 +1144,6 @@ impl std::fmt::Display for StartRunFailure {
     }
 }
 
-/// Why a budget cap denied admission. The reason string is what callers and the queued-admission
-/// tombstone see; the classification decides whether a durably queued send may be failed for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BudgetDenial {
-    /// Recorded spend has reached the hard cap. Waiting does not lower spend.
-    HardCapExceeded,
-    /// Some spend is not yet resolved into the cap mirror.
-    UnresolvedSpend,
-    /// The cap mirror was applied against a different export source or epoch than this daemon's
-    /// export index reports, or past its high-water. Only the cap provider re-applying the cap
-    /// against this export store clears it, and nothing in broca triggers that, so it can last
-    /// indefinitely (for example after the export store is recreated).
-    ExportSourceMismatch,
-    /// The cap mirror has not yet consumed every export fact this daemon wrote.
-    TrailingWatermark,
-    /// Caps apply, but this actor has no export index to compare the mirror against. This is
-    /// fixed for the actor's lifetime, so it does not clear by waiting.
-    ExportIndexUnavailable,
-    /// The cap mirror is older than the cap allows.
-    Stale,
-}
-
-impl BudgetDenial {
-    fn reason(self) -> &'static str {
-        match self {
-            Self::HardCapExceeded => "hard_cap_exceeded",
-            Self::UnresolvedSpend => "unresolved_spend",
-            Self::ExportSourceMismatch => "export_source_mismatch",
-            Self::TrailingWatermark => "trailing_watermark",
-            Self::ExportIndexUnavailable => "export_index_unavailable",
-            Self::Stale => "stale",
-        }
-    }
-
-    /// Whether the denial may clear after accounting or cap-mirror state is updated in the normal
-    /// course (spend resolves, or the cap provider's regular refresh brings the mirror up to
-    /// date). A queued send denied for such a reason stays queued for a later drain. Any other
-    /// denial fails the send, so the caller sees the refusal rather than a send that waits
-    /// silently on something nothing will update.
-    fn clears_by_waiting(self) -> bool {
-        match self {
-            Self::UnresolvedSpend | Self::TrailingWatermark | Self::Stale => true,
-            Self::HardCapExceeded | Self::ExportIndexUnavailable | Self::ExportSourceMismatch => {
-                false
-            }
-        }
-    }
-
-    fn from_reason(reason: &str) -> Option<Self> {
-        [
-            Self::HardCapExceeded,
-            Self::UnresolvedSpend,
-            Self::ExportSourceMismatch,
-            Self::TrailingWatermark,
-            Self::ExportIndexUnavailable,
-            Self::Stale,
-        ]
-        .into_iter()
-        .find(|denial| denial.reason() == reason)
-    }
-
-    fn into_error(self, cap_id: String) -> RunError {
-        RunError::BudgetDenied {
-            cap_id,
-            reason: self.reason().into(),
-        }
-    }
-}
-
-fn queued_admission_is_permanent(error: &RunError) -> bool {
-    if let RunError::BudgetDenied { reason, .. } = error {
-        // An unrecognized reason keeps the permanent class it has always had.
-        if BudgetDenial::from_reason(reason).is_some_and(BudgetDenial::clears_by_waiting) {
-            return false;
-        }
-    }
-    error.admission_error_class() == ErrorClass::Permanent
-}
-
 fn submission_from_episode(episode: &broca_core::LastEpisodeV1) -> SubmissionRequest {
     let mut request = submission_from_config(episode.config.clone(), episode.input.clone());
     request.on_restart = episode.on_restart;
@@ -1431,11 +1347,6 @@ pub struct LineageActor<W: WalStore> {
     /// lightweight coordinator test openers and deployments can omit metering.
     export_index: Option<Arc<dyn broca_core::ExportIndex>>,
     charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
-    cap_store: Option<Arc<dyn broca_core::CapStore>>,
-    /// The terminal run whose usage export has not yet advanced the export watermark. A queued
-    /// run covered by the same cap must wait for that usage; retaining the id allows idle-tick
-    /// retries after temporary export failures.
-    pending_capped_export: Option<RunId>,
     /// Startup exhausted its bounded recovery retries without proving the durable queue state.
     /// Mutating admission must recover this state before it can use the in-memory queue view.
     startup_recovery_pending: bool,
@@ -1613,46 +1524,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
         registry: RegistryHandle,
         idle_ttl: Duration,
         fanout: crate::fanout::Fanout<W>,
-        run_index: Option<Arc<dyn RunIndex>>,
-        materialized_store: Option<Arc<dyn SessionStore>>,
-        export_index: Option<Arc<dyn broca_core::ExportIndex>>,
-        charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
-    ) -> ActorHandle {
-        Self::spawn_with_export_and_caps(
-            key,
-            gen,
-            lease,
-            writer,
-            executor,
-            wal_store,
-            registry,
-            idle_ttl,
-            fanout,
-            run_index,
-            materialized_store,
-            export_index,
-            charge_basis_resolver,
-            None,
-        )
-    }
-
-    /// Spawn with export accounting and the daemon-scoped cap-table mirror.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_export_and_caps(
-        key: LineageKey,
-        gen: u64,
-        lease: Box<dyn LeaseHandle>,
-        writer: Arc<WalHandle>,
-        executor: Arc<dyn RunExecutor>,
-        wal_store: Arc<W>,
-        registry: RegistryHandle,
-        idle_ttl: Duration,
-        fanout: crate::fanout::Fanout<W>,
         run_index: Option<Arc<dyn broca_core::RunIndex>>,
         materialized_store: Option<Arc<dyn broca_core::SessionStore>>,
         export_index: Option<Arc<dyn broca_core::ExportIndex>>,
         charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
-        cap_store: Option<Arc<dyn broca_core::CapStore>>,
     ) -> ActorHandle {
         let (tx, rx) = mpsc::channel(64);
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
@@ -1698,8 +1573,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
             materialized_store,
             export_index,
             charge_basis_resolver,
-            cap_store,
-            pending_capped_export: None,
             startup_recovery_pending: false,
             prior_snapshot: None,
             ceiling_drain_held: false,
@@ -2546,10 +2419,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // Reopening the affected lineage closes that earlier WAL-to-index window directly from
         // the authoritative finished episode. Repeated emission is safe by immutable fact_id.
         if episode_disposition == EpisodeDisposition::Finished {
-            if self.has_matching_caps() {
-                self.pending_capped_export = Some(episode_run_id.clone());
-                self.flush_capped_export_barrier().await?;
-            } else if let Err(error) = self.emit_usage_export(&episode_run_id).await {
+            if let Err(error) = self.emit_usage_export(&episode_run_id).await {
                 tracing::warn!(
                     target: "export",
                     "usage export reopen backfill failed (non-fatal): {error}"
@@ -3575,9 +3445,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(StartRunFailure::Admission(RunError::SendIdReuse { differing })) => {
                     SendOutcome::SendIdReuse { differing }
                 }
-                Err(StartRunFailure::Admission(RunError::BudgetDenied { cap_id, reason })) => {
-                    SendOutcome::BudgetDenied { cap_id, reason }
-                }
                 Err(StartRunFailure::Admission(RunError::VariantUnsupported(e))) => {
                     SendOutcome::VariantUnsupported(e)
                 }
@@ -4021,59 +3888,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
         })
     }
 
-    fn check_budget_admission(&self) -> Result<(), RunError> {
-        let Some(cap_store) = self.cap_store.as_ref() else {
-            return Ok(());
-        };
-        // This mirror lookup is the entire common-case path: no SQLite, WAL, or
-        // executor work occurs when no cap matches the daemon principal.
-        let caps = cap_store.matching_caps(&self.key.harness, &self.key.project_root);
-        if caps.is_empty() {
-            return Ok(());
-        }
-        let export_position = self.export_index.as_deref().map(|index| {
-            (
-                index.source_instance_id(),
-                index.source_epoch(),
-                index.high_water(),
-            )
-        });
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-            .unwrap_or(i64::MAX);
-        for cap in caps {
-            let denial = if cap.spend_nanos >= cap.hard_cap_nanos {
-                Some(BudgetDenial::HardCapExceeded)
-            // Upgrade safety: persisted negative counts are impossible accounting states, not
-            // proof that all spend resolved. Any nonzero value must therefore fail closed.
-            } else if cap.unresolved_count != 0 {
-                Some(BudgetDenial::UnresolvedSpend)
-            } else if let Some((source_instance_id, source_epoch, high_water)) = export_position {
-                if cap.applied_watermark.source_instance_id != source_instance_id
-                    || cap.applied_watermark.source_epoch != source_epoch
-                    || cap.applied_watermark.consumed_export_seq > high_water
-                {
-                    Some(BudgetDenial::ExportSourceMismatch)
-                } else if cap.applied_watermark.consumed_export_seq < high_water {
-                    Some(BudgetDenial::TrailingWatermark)
-                } else {
-                    None
-                }
-            } else {
-                Some(BudgetDenial::ExportIndexUnavailable)
-            };
-            if let Some(denial) = denial {
-                return Err(denial.into_error(cap.cap_id));
-            }
-            let age_ms = now_ms.saturating_sub(cap.as_of_ms).max(0) as u64;
-            if age_ms > cap.max_staleness_ms {
-                return Err(BudgetDenial::Stale.into_error(cap.cap_id));
-            }
-        }
-        Ok(())
-    }
-
     /// Resolve admission fields and start a run as a child task; track it Active. The run
     /// posts `RunFinished` back.
     ///
@@ -4136,12 +3950,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
             request_identity_digest: request_identity_digest.clone(),
             tools_were_omitted,
         };
-        // This is admission for fresh/resumed execution, not for sealing an already-admitted
-        // paused episode. A cancel finalizer must remain available even when a cap now denies work.
-        if !cancel_before_execute {
-            self.check_budget_admission()
-                .map_err(StartRunFailure::Admission)?;
-        }
         if self.prior_snapshot.is_none() {
             if let Err(error) = self.refresh_admission_view().await {
                 return Err(StartRunFailure::Infrastructure(error));
@@ -6307,10 +6115,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
         let _ = self.sync_retention_index().await;
         let should_emit_usage = index_state.is_terminal();
-        let capped_export = should_emit_usage && self.has_matching_caps();
-        if capped_export {
-            self.pending_capped_export = Some(run_id.clone());
-        }
         self.set_idle();
         // Only a terminal ends a one-shot's business with this session; a pause stays resumable.
         self.close_after_one_shot = skip_materialization && index_state.is_terminal();
@@ -6323,37 +6127,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
             self.approvals.finished(&run_id);
         }
 
-        let export_ready = if capped_export {
-            match self.flush_capped_export_barrier().await {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "export",
-                        "capped usage export failed; queued-run drain deferred: {error}"
-                    );
-                    false
+        match self.refresh_admission_view().await {
+            Ok(()) => {
+                if let Err(error) = self.drain_queue_one().await {
+                    tracing::warn!(target: "admission", "queued-run drain deferred: {error}");
                 }
             }
-        } else {
-            true
-        };
-        let admission_ready = match self.refresh_admission_view().await {
-            Ok(()) => true,
             Err(error) => {
                 tracing::warn!(target: "admission", "post-run admission refresh deferred: {error}");
-                false
-            }
-        };
-        if export_ready && admission_ready {
-            if let Err(error) = self.drain_queue_one().await {
-                tracing::warn!(target: "admission", "queued-run drain deferred: {error}");
             }
         }
-        if should_emit_usage && !capped_export {
+        if should_emit_usage {
             // The terminal WAL is durable and the synchronous run-index update above has finished.
             // Startup catch-up retries indexed runs whose export task was lost. Reopening a
-            // finished episode retries runs whose index write failed. If no admission cap depends
-            // on the export watermark, export I/O can remain off the queue-drain path.
+            // finished episode retries runs whose index write failed. Nothing at admission waits
+            // on the export, so its I/O stays off the queue-drain path.
             self.spawn_live_usage_export(run_id);
         }
         false
@@ -6367,7 +6155,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if self.registry.is_stopping() {
             return Ok(());
         }
-        self.flush_capped_export_barrier().await?;
         self.expire_ordered_sends().await?;
         loop {
             // An ordered send without `idle_start` never starts a run: it stays queued for the
@@ -6442,10 +6229,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                     return Ok(());
                 }
-                Err(StartRunFailure::Admission(error)) if queued_admission_is_permanent(&error) => {
-                    // Tombstone only failures intrinsic to the durable request. Export lag is an
-                    // external, recoverable dependency state, so a trailing watermark must leave
-                    // the queue head intact for the next drain tick.
+                Err(StartRunFailure::Admission(error))
+                    if error.admission_error_class() == ErrorClass::Permanent =>
+                {
+                    // Tombstone only failures intrinsic to the durable request. A transient
+                    // dependency failure leaves the queue head intact for the next drain tick.
                     self.persist_failed_queued_admission(
                         submission_id,
                         run_id,
@@ -7719,23 +7507,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
         Ok(())
     }
 
-    fn has_matching_caps(&self) -> bool {
-        self.cap_store.as_ref().is_some_and(|store| {
-            !store
-                .matching_caps(&self.key.harness, &self.key.project_root)
-                .is_empty()
-        })
-    }
-
-    async fn flush_capped_export_barrier(&mut self) -> Result<(), String> {
-        let Some(run_id) = self.pending_capped_export.clone() else {
-            return Ok(());
-        };
-        self.emit_usage_export(&run_id).await?;
-        self.pending_capped_export = None;
-        Ok(())
-    }
-
     async fn emit_usage_export(&self, run_id: &RunId) -> Result<(), String> {
         let (Some(export_index), Some(resolver)) = (
             self.export_index.clone(),
@@ -8022,17 +7793,15 @@ mod tests {
 
     use async_trait::async_trait;
     use broca_core::{
-        run_loop_on_writer_admitted_with_prior_snapshot, AllowAll, CapBaseline, CapInstallRequest,
-        CapOperation, CapStore, CapWatermark, ChargeBasis, ExportIndex, FileLeaseStore,
-        FileWalStore, LeaseStore, OutputEvent, Provider, RunError, RunIndex, RunSummary,
-        SpendDeltaRequest, StartMode, StubToolPlane, WalHandle, WalStore,
+        run_loop_on_writer_admitted_with_prior_snapshot, AllowAll, ChargeBasis, ExportIndex,
+        FileLeaseStore, FileWalStore, LeaseStore, OutputEvent, Provider, RunError, RunIndex,
+        RunSummary, StartMode, StubToolPlane, WalHandle, WalStore,
     };
     use broca_protocol::caller::{ControlUnit, RunFinishReason};
     use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason, ToolCall};
     use broca_protocol::provider::{NormalizedEvent, ProviderControl};
     use broca_protocol::request::{ExecutionMode, Tool};
     use broca_protocol::{BindIdentity, MessageId, RunId, StepId, ToolCallId, Usage};
-    use broca_store::CapsStore;
     use tokio::sync::{mpsc, Notify, Semaphore};
 
     use super::*;
@@ -8248,73 +8017,6 @@ mod tests {
             inherit_frozen_cache: false,
             structured_output: None,
         }
-    }
-
-    fn install_test_cap(
-        store: &CapsStore,
-        key: &BindIdentity,
-        source_instance_id: &str,
-        spend_nanos: i64,
-        hard_cap_nanos: i64,
-    ) {
-        store
-            .install_cap(&CapInstallRequest {
-                cap_id: "cap-test".into(),
-                cap_version: 1,
-                op: CapOperation::Install,
-                scope_key: key.harness.clone(),
-                project_root: Some(key.project_root.to_string_lossy().into_owned()),
-                constraint_dim: "spend_dollars".into(),
-                period: "calendar_month".into(),
-                period_tz: "Europe/Madrid".into(),
-                hard_cap_nanos,
-                max_staleness_ms: 60_000,
-                replaces_cap_id: None,
-                baseline: Some(CapBaseline {
-                    spend_nanos,
-                    unresolved_count: 0,
-                    watermark: CapWatermark {
-                        source_instance_id: source_instance_id.into(),
-                        source_epoch: 1,
-                        consumed_export_seq: 0,
-                    },
-                    period_bucket: Some("2026-07".into()),
-                    as_of_ms: i64::MAX,
-                }),
-            })
-            .expect("test cap installs");
-    }
-
-    fn apply_test_spend(store: &CapsStore, source_instance_id: &str, spend_nanos: i64) {
-        store
-            .apply_spend_delta(&SpendDeltaRequest {
-                cap_id: "cap-test".into(),
-                cap_version: 1,
-                from_watermark: CapWatermark {
-                    source_instance_id: source_instance_id.into(),
-                    source_epoch: 1,
-                    consumed_export_seq: 0,
-                },
-                to_watermark: CapWatermark {
-                    source_instance_id: source_instance_id.into(),
-                    source_epoch: 1,
-                    consumed_export_seq: 1,
-                },
-                priced_delta_nanos: spend_nanos,
-                unresolved_delta: 0,
-                period_bucket: "2026-07".into(),
-            })
-            .expect("test spend delta applies");
-    }
-
-    async fn wait_for_starts(executor: &GateFirstRun, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while executor.starts.load(Ordering::SeqCst) < expected {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("expected run starts");
     }
 
     async fn wait_for_active_step(registry: &LineageRegistry, key: &BindIdentity, expected: u64) {
@@ -8740,36 +8442,6 @@ mod tests {
 
         async fn on_session_close(&self, _session: &BindIdentity) {
             self.close_count.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    struct CountingCapStore {
-        inner: Arc<CapsStore>,
-        matching_calls: AtomicUsize,
-    }
-
-    impl CapStore for CountingCapStore {
-        fn install_cap(
-            &self,
-            request: &CapInstallRequest,
-        ) -> Result<broca_core::CapMutation, broca_core::CapStoreError> {
-            self.inner.install_cap(request)
-        }
-
-        fn apply_spend_delta(
-            &self,
-            request: &SpendDeltaRequest,
-        ) -> Result<broca_core::CapMutation, broca_core::CapStoreError> {
-            self.inner.apply_spend_delta(request)
-        }
-
-        fn matching_caps(
-            &self,
-            scope_key: &str,
-            project_root: &std::path::Path,
-        ) -> Vec<broca_core::CapRow> {
-            self.matching_calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.matching_caps(scope_key, project_root)
         }
     }
 
@@ -10209,223 +9881,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(15), export.wait_for_completions(2))
             .await
             .expect("both detached exports complete after release");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn capped_export_barrier_prevents_queued_run_from_overshooting_hard_cap() {
-        let dir = broca_test_support::scratch_root().join(format!(
-            "broca-actor-capped-export-barrier-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("proj")).unwrap();
-        let key = BindIdentity::new(dir.join("proj"), "runner", "s1");
-        let wal_store = Arc::new(FileWalStore::new(dir.join("wal")));
-        let executor = Arc::new(GateFirstRun {
-            starts: AtomicUsize::new(0),
-            release_first: tokio::sync::Notify::new(),
-        });
-        let export = Arc::new(BlockingExportIndex::new());
-        let caps = Arc::new(CapsStore::open_in_memory().unwrap());
-        install_test_cap(&caps, &key, "blocking-export", 9, 10);
-        let resolver = Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1));
-        let opener = crate::opener::DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal_store.clone(),
-            executor.clone(),
-        )
-        .with_export_index(export.clone())
-        .with_charge_basis_resolver(resolver)
-        .with_cap_store(caps.clone())
-        .with_idle_ttl(Duration::from_millis(20));
-        let registry = LineageRegistry::new(Arc::new(opener));
-
-        assert!(matches!(
-            registry
-                .route_send(&key, text_req(&key, "r1"), RunKind::FreshOrResume)
-                .await
-                .unwrap(),
-            SendOutcome::Active { .. }
-        ));
-        assert!(matches!(
-            registry
-                .route_send(&key, text_req(&key, "r2"), RunKind::FreshOrResume)
-                .await
-                .unwrap(),
-            SendOutcome::Pending { .. }
-        ));
-
-        let export_entered = export.entered.notified();
-        executor.release_first.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), export_entered)
-            .await
-            .expect("capped terminal reaches synchronous export barrier");
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        assert_eq!(
-            executor.starts.load(Ordering::SeqCst),
-            1,
-            "the queued run cannot overtake the capped export barrier"
-        );
-
-        export.release();
-        export.wait_for_completions(1).await;
-        apply_test_spend(&caps, "blocking-export", 2);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let records = wal_store.read_records(&key).unwrap();
-                if records.iter().any(|frame| {
-                    matches!(
-                        &frame.record,
-                        WalRecord::Retracted {
-                            failure: Some(failure),
-                            ..
-                        } if failure.error.message.contains("hard_cap_exceeded")
-                    )
-                }) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("caught-up hard cap rejects the queued run");
-        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn capped_export_failure_keeps_queued_run_pending() {
-        let dir = broca_test_support::scratch_root().join(format!(
-            "broca-actor-capped-export-failure-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("proj")).unwrap();
-        let key = BindIdentity::new(dir.join("proj"), "runner", "s1");
-        let wal_store = Arc::new(FileWalStore::new(dir.join("wal")));
-        let executor = Arc::new(GateFirstRun {
-            starts: AtomicUsize::new(0),
-            release_first: tokio::sync::Notify::new(),
-        });
-        let caps = Arc::new(CapsStore::open_in_memory().unwrap());
-        install_test_cap(&caps, &key, "failing-export", 0, 10);
-        let resolver = Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1));
-        let opener = crate::opener::DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal_store.clone(),
-            executor.clone(),
-        )
-        .with_export_index(Arc::new(FailingExportIndex))
-        .with_charge_basis_resolver(resolver)
-        .with_cap_store(caps)
-        .with_idle_ttl(Duration::from_millis(20));
-        let registry = LineageRegistry::new(Arc::new(opener));
-
-        registry
-            .route_send(&key, text_req(&key, "r1"), RunKind::FreshOrResume)
-            .await
-            .unwrap();
-        assert!(matches!(
-            registry
-                .route_send(&key, text_req(&key, "r2"), RunKind::FreshOrResume)
-                .await
-                .unwrap(),
-            SendOutcome::Pending { .. }
-        ));
-        executor.release_first.notify_one();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let records = wal_store.read_records(&key).unwrap();
-        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
-        assert!(records.iter().any(|frame| matches!(
-            &frame.record,
-            WalRecord::Queued { request, .. } if request.model.model_id == "fake"
-        )));
-        assert!(!records
-            .iter()
-            .any(|frame| matches!(frame.record, WalRecord::Retracted { .. })));
-        assert!(!records.iter().any(|frame| matches!(
-            &frame.record,
-            WalRecord::RunStarted { run_id, .. } if run_id.0 == "r2"
-        )));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn queued_trailing_watermark_retries_after_spend_delta() {
-        let dir = broca_test_support::scratch_root().join(format!(
-            "broca-actor-trailing-watermark-retry-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("proj")).unwrap();
-        let key = BindIdentity::new(dir.join("proj"), "runner", "s1");
-        let wal_store = Arc::new(FileWalStore::new(dir.join("wal")));
-        let executor = Arc::new(GateFirstRun {
-            starts: AtomicUsize::new(0),
-            release_first: tokio::sync::Notify::new(),
-        });
-        let export = Arc::new(BlockingExportIndex::new());
-        let caps = Arc::new(CapsStore::open_in_memory().unwrap());
-        install_test_cap(&caps, &key, "blocking-export", 0, 50);
-        let counting_caps = Arc::new(CountingCapStore {
-            inner: caps.clone(),
-            matching_calls: AtomicUsize::new(0),
-        });
-        let resolver = Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1));
-        let opener = crate::opener::DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            wal_store.clone(),
-            executor.clone(),
-        )
-        .with_export_index(export.clone())
-        .with_charge_basis_resolver(resolver)
-        .with_cap_store(counting_caps.clone())
-        .with_idle_ttl(Duration::from_millis(20));
-        let registry = LineageRegistry::new(Arc::new(opener));
-
-        registry
-            .route_send(&key, text_req(&key, "r1"), RunKind::FreshOrResume)
-            .await
-            .unwrap();
-        assert!(matches!(
-            registry
-                .route_send(&key, text_req(&key, "r2"), RunKind::FreshOrResume)
-                .await
-                .unwrap(),
-            SendOutcome::Pending { .. }
-        ));
-
-        let export_entered = export.entered.notified();
-        executor.release_first.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), export_entered)
-            .await
-            .expect("capped export barrier entered");
-        export.release();
-        export.wait_for_completions(1).await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while counting_caps.matching_calls.load(Ordering::SeqCst) < 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("queued admission observes the trailing export watermark");
-
-        let lagging_records = wal_store.read_records(&key).unwrap();
-        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
-        assert!(!lagging_records
-            .iter()
-            .any(|frame| matches!(frame.record, WalRecord::Retracted { .. })));
-
-        apply_test_spend(&caps, "blocking-export", 0);
-        wait_for_starts(&executor, 2).await;
-        export.wait_for_completions(2).await;
-        assert!(!wal_store
-            .read_records(&key)
-            .unwrap()
-            .iter()
-            .any(|frame| matches!(frame.record, WalRecord::Retracted { .. })));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

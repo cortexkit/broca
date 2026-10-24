@@ -385,8 +385,6 @@ impl Fixture {
             materialized_store: None,
             export_index: None,
             charge_basis_resolver: None,
-            cap_store: None,
-            pending_capped_export: None,
             startup_recovery_pending: false,
             prior_snapshot: None,
             pending_fifo: Vec::new(),

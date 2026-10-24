@@ -33,7 +33,7 @@ paths rather than begin an empty history (`crates/broca-module-serve/src/state_r
   wal-archive-durable/      sealed containers of durable WALs only
   run-index.db              SQLite: run index, materialized transcript,   (section 4)
                             admission checkpoints, usage export facts
-  caps.db                   SQLite: budget caps                           (section 4.6)
+  caps.db                   left over from removed spend caps; not opened (section 4.6)
   wal-manifest              diagnostic address -> identity sidecar         (section 2.7)
   leases/                   per-session lease files
   catalog/fusiform-lkg.json last-known-good model catalog
@@ -595,9 +595,9 @@ nothing, check the live path once more before concluding the session is absent.
 
 ## 4. SQLite stores
 
-broca writes two SQLite databases: `run-index.db` and `caps.db`. Both use
-`journal_mode=WAL`, so recent commits sit in the `-wal` sidecar until SQLite checkpoints
-them (see section 8).
+broca writes the SQLite database `run-index.db` described in this section. It uses
+`journal_mode=WAL`, so recent commits sit in the `-wal` sidecar until SQLite checkpoints them
+(see section 8). An older `caps.db` may sit beside it; broca no longer opens it (section 4.6).
 
 `run-index.db` is written by one connection per daemon. Its schema is created and migrated
 when the daemon opens it: `CREATE TABLE IF NOT EXISTS`, then `ALTER TABLE ADD COLUMN` for
@@ -759,8 +759,8 @@ A run gets a new slice at every `run_config_refrozen` and `run_auth_refrozen`. A
 
 **Writers.** After a run's terminal is durable and its `run_index` row is written, the
 actor spawns a detached task that reads the session's WAL and inserts that run's facts with
-`INSERT OR IGNORE` in one transaction. Only when a budget cap matches the session does the actor
-instead wait for the export, before it admits the session's next run. At every daemon start, a catch-up pass exports any terminal
+`INSERT OR IGNORE` in one transaction. The session's next run never waits for that export.
+At every daemon start, a catch-up pass exports any terminal
 `run_index` run that has no facts. An existing `fact_id` is **never overwritten**: a
 re-derivation that differs is logged and the stored row stays.
 
@@ -792,34 +792,15 @@ Consumers read `export_facts` in `run-index.db` with SQLite `mode=ro`; the
 `source_instance_id` means a different export database, and cursors from the old one must
 be reset. `sqlite_sequence` also exists; SQLite maintains it because of AUTOINCREMENT.
 
-### 4.6 `caps.db`: `cap_rows`
+### 4.6 `caps.db` (no longer opened)
 
-Daemon-scoped budget caps and the spend applied against them. This is its own durability
-domain, **not** a projection of any WAL: it is the source of truth for caps.
-
-| Column | Type |
-|---|---|
-| `cap_id` | TEXT PRIMARY KEY |
-| `cap_version` | INTEGER NOT NULL |
-| `scope_key` | TEXT NOT NULL |
-| `project_root` | TEXT |
-| `constraint_dim` | TEXT NOT NULL |
-| `period` | TEXT NOT NULL |
-| `period_bucket` | TEXT (added by migration) |
-| `period_tz` | TEXT NOT NULL |
-| `hard_cap_nanos` | INTEGER NOT NULL |
-| `max_staleness_ms` | INTEGER NOT NULL |
-| `replaces_cap_id` | TEXT |
-| `spend_nanos` | INTEGER NOT NULL |
-| `unresolved_count` | INTEGER NOT NULL |
-| `watermark_json` | TEXT NOT NULL |
-| `as_of_ms` | INTEGER NOT NULL |
-| `active` | INTEGER NOT NULL |
-| `replaced_by` | TEXT |
-
-Written only by the `cap.install` and `spend.delta` operations, each in one transaction
-with `synchronous=FULL`. `as_of_ms` comes from the caller's request, not from broca's clock.
-This table is internal.
+Older builds kept daemon-scoped spend caps in `caps.db`, table `cap_rows`, written only by
+the `cap.install` and `spend.delta` operations. Those operations and the admission check
+that read the table were removed, and nothing in the fleet called them. broca no longer
+opens, reads or writes `caps.db`. An existing file and its `-wal`/`-shm` sidecars are left on
+disk as they were; broca does not delete them, and a later build will not read them. No WAL
+record or frozen run config ever carried a cap field, so removing caps changes nothing about
+how old session logs decode or resume.
 
 ---
 
@@ -878,8 +859,7 @@ before v0.3.24). It never means zero.
 - Neither is the time the row was inserted. The catch-up pass can insert an old run's facts
   late, so `export_seq` order is not time order.
 
-**`cap_rows.as_of_ms`** comes from the caller (section 4.6). `meta`, `message` and
-`export_meta` hold no timestamps.
+`meta`, `message` and `export_meta` hold no timestamps.
 
 ### 5.3 The best "last activity" signal for an active run
 
@@ -952,7 +932,7 @@ it may change without notice.
 | `export_meta` | Metering source identity | Direct readers use `source_instance_id`, `source_epoch`, and `high_water` to detect database replacement and track incremental reads. |
 | `run_index` | Internal | An operational projection, not a declared contract. Its changes have so far been additive columns, but nothing promises that. The `session` column's JSON encoding, the state strings and `state_changed_ms` are the parts least likely to move. |
 | `meta`, `message`, `admission_checkpoint_json` | Internal | Rebuildable caches. The checkpoint has its own version envelope, which broca may bump. |
-| `caps.db` | Internal | Budget-cap implementation detail. |
+| `caps.db` | Internal | Left over from removed spend caps; broca no longer opens it. |
 | `wal-manifest`, `leases/`, `catalog/`, `logs/`, `request-dumps/` | Internal | Diagnostics and process state. |
 
 ---

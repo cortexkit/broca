@@ -140,7 +140,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let leases = Arc::new(FileLeaseStore::new(root.join("leases")));
     let store = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db"))?);
     wal.set_session_ref_index(store.clone());
-    let caps = Arc::new(broca_store::CapsStore::open(root.join("caps.db"))?);
     let exec = Arc::new(Executor {
         wal: wal.clone(),
         store: store.clone(),
@@ -159,16 +158,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_run_index(store.clone())
         .with_materialized_store(store.clone())
         .with_export_index(store.clone())
-        .with_cap_store(caps.clone())
         .with_charge_basis_resolver(resolver);
     if let Some(ttl) = idle_ttl {
         opener = opener.with_idle_ttl(ttl);
     }
-    let registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
+    let registry = Arc::new(LineageRegistry::new_with_sources(
         Arc::new(opener),
         Some(wal),
         Some(store),
-        Some(caps),
     ));
     registry.set_retention_service(retention);
     registry.boot_retention().await?;

@@ -302,11 +302,10 @@ impl Rig {
             &broca_core::ReadOnlyWalReader::new(&root),
         )
         .unwrap();
-        let registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
+        let registry = Arc::new(LineageRegistry::new_with_sources(
             Arc::new(NeverOpen),
             Some(wal.clone()),
             Some(index.clone()),
-            None,
         ));
         let service = Arc::new(AgentDataService::new(
             root.clone(),
@@ -613,14 +612,13 @@ fn assert_code(result: Result<Value, Value>, code: &str) -> Value {
 async fn stamped_principal_admission_precedes_json_and_every_store_read() {
     let mut rig = Rig::new("admission", Arc::new(FakeDoor::default()));
     let reads = Arc::new(AtomicUsize::new(0));
-    rig.registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
+    rig.registry = Arc::new(LineageRegistry::new_with_sources(
         Arc::new(NeverOpen),
         Some(Arc::new(CountingWalReads {
             inner: rig.wal.clone(),
             reads: reads.clone(),
         })),
         Some(rig.index.clone()),
-        None,
     ));
     std::fs::write(
         rig.root.join("wal/not-a-valid-address.wal"),

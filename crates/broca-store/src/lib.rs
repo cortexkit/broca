@@ -36,7 +36,6 @@ mod busy;
 use busy::STORE_BUSY_TIMEOUT;
 
 pub mod bus_events;
-pub mod caps;
 pub mod compaction_facts;
 pub mod compaction_receipts;
 pub mod export_index;
@@ -47,7 +46,6 @@ pub mod session_refs;
 pub mod system_one;
 pub use fold_identities::fold_identities;
 
-pub use caps::CapsStore;
 pub use system_one::SystemOneStore;
 
 /// Auditable outcome of one explicit legacy page-usage backfill.
@@ -5299,12 +5297,6 @@ mod windows_acl_tests {
                 }
             }
         }
-        let caps_path = root.join("caps.db");
-        let _caps = CapsStore::open(&caps_path).unwrap();
-        assert_protected_private(&caps_path);
-        for suffix in ["-wal", "-shm"] {
-            assert_inherited_private(&sidecar(&caps_path, suffix));
-        }
     }
     #[test]
     fn windows_sqlite_refuses_acl_before_initialisation() {
@@ -5347,10 +5339,6 @@ mod windows_acl_tests {
                         Err(StoreError::PrivateAccess { .. })
                     ),
                     "insecure or unreadable ACL must refuse before SQLite"
-                );
-                assert!(
-                    CapsStore::open(&path).is_err(),
-                    "caps store accepted an insecure ACL"
                 );
                 SQLITE_OPENS.with(|count| {
                     assert_eq!(

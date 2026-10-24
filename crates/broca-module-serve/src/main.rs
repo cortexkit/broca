@@ -293,12 +293,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| ServeIoError(format!("open run index: {e}")))?,
     );
     wal_store.set_session_ref_index(run_index.clone());
-    // Budget caps have their own durability domain. Keeping this database separate
-    // prevents session WAL and run-index maintenance from changing admission state.
-    let cap_store = Arc::new(
-        broca_store::CapsStore::open(state_root.join("caps.db"))
-            .map_err(|e| ServeIoError(format!("open cap table: {e}")))?,
-    );
+    // Older builds kept spend caps in `caps.db` beside this file. Spend caps were removed, so the
+    // file is no longer opened; it is left on disk untouched rather than deleted.
 
     // Load the last-known-good before any admission is possible. The fetch leg gets its own
     // consumer connection, but construction performs no fusiform route.open; only the detached
@@ -626,16 +622,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .with_run_index(run_index.clone())
         .with_materialized_store(run_index.clone())
         .with_export_index(run_index.clone())
-        .with_charge_basis_resolver(charge_basis_table.clone())
-        .with_cap_store(cap_store.clone());
+        .with_charge_basis_resolver(charge_basis_table.clone());
     if let Some(ttl) = idle_ttl {
         opener_builder = opener_builder.with_idle_ttl(ttl);
     }
-    let registry = Arc::new(LineageRegistry::new_with_reader_and_caps(
+    let registry = Arc::new(LineageRegistry::new_with_sources(
         Arc::new(opener_builder),
         Some(wal_reader),
         Some(store_reader),
-        Some(cap_store),
     ));
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record

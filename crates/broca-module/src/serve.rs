@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::fanout::{Delivery, FromCursor};
 use crate::registry::{LineageKey, OpenError};
-use broca_core::{CapInstallRequest, CapMutation, SpendDeltaRequest};
 
 /// Shared refusal spelling for wire adapters of this management surface.
 pub use cortexkit_role_llm_runner::errors::PRE_USER_UNAVAILABLE;
@@ -1448,15 +1447,6 @@ pub enum ServeError {
     /// which may anchor the run's tag numbers at a checkpoint. Refused `transient`, writing
     /// nothing, so no reader sees a number that changes once the answer is durable.
     TagsAwaitSetup,
-    /// A durable cap receiver needs a fresh baseline before it can continue.
-    BaselineRequired,
-    /// The daemon's cap table was not configured.
-    CapUnavailable(String),
-    /// Admission was denied by a durable budget cap.
-    BudgetDenied {
-        cap_id: String,
-        reason: String,
-    },
     /// An import was rejected by lineage/content admission.
     Import(String),
     /// A deterministic import identity was reused with different bytes.
@@ -1572,11 +1562,6 @@ impl std::fmt::Display for ServeError {
             ServeError::TagsAwaitSetup => f.write_str(
                 "the running run's tag numbers wait for its compaction Setup answer; retry shortly",
             ),
-            ServeError::BaselineRequired => f.write_str("baseline_required"),
-            ServeError::CapUnavailable(s) => write!(f, "cap table unavailable: {s}"),
-            ServeError::BudgetDenied { cap_id, reason } => {
-                write!(f, "budget_denied: cap '{cap_id}' ({reason})")
-            }
             ServeError::ContextCeiling(detail) => write!(f, "context_ceiling: estimated request size {} in window {} ({})", detail.size, detail.window, detail.cause),
             ServeError::Import(s) => write!(f, "import rejected: {s}"),
             ServeError::ImportIdReuse => write!(f, "import_id was reused with different content"),
@@ -1681,20 +1666,6 @@ pub trait ServeHandler: Send + Sync {
         _principal: Option<&broca_protocol::BindPrincipal>,
     ) -> Result<broca_wire::SendReplyWire, ServeError> {
         Err(ServeError::UnknownSend)
-    }
-
-    /// Install or remove one daemon-scoped durable cap.
-    async fn cap_install(&self, _req: CapInstallRequest) -> Result<CapMutation, ServeError> {
-        Err(ServeError::CapUnavailable(
-            "cap table is not configured".into(),
-        ))
-    }
-
-    /// Apply one already-priced daemon-scoped spend delta.
-    async fn spend_delta(&self, _req: SpendDeltaRequest) -> Result<CapMutation, ServeError> {
-        Err(ServeError::CapUnavailable(
-            "cap table is not configured".into(),
-        ))
     }
 
     /// The adoption check a stamped `route.bind` gets before it is acknowledged: `Ok(Some)` when
@@ -2384,9 +2355,6 @@ impl ServeHandler for crate::LineageRegistry {
                 Err(ServeError::WalNewerWriter { missing, reason })
             }
             SendOutcome::Transient(e) => Err(ServeError::Transient(e)),
-            SendOutcome::BudgetDenied { cap_id, reason } => {
-                Err(ServeError::BudgetDenied { cap_id, reason })
-            }
             SendOutcome::AccountSelectionRefused(refusal) => {
                 Err(ServeError::AccountSelectionRefused(refusal))
             }
@@ -2607,26 +2575,6 @@ impl ServeHandler for crate::LineageRegistry {
             Err(broca_core::ScopeRefusal::AdoptionRefused(refusal)) => Ok(Some(refusal)),
             _ => Ok(None),
         }
-    }
-
-    async fn cap_install(&self, req: CapInstallRequest) -> Result<CapMutation, ServeError> {
-        self.install_cap(req).await.map_err(|error| match error {
-            broca_core::CapStoreError::BaselineRequired => ServeError::BaselineRequired,
-            broca_core::CapStoreError::Storage(message)
-            | broca_core::CapStoreError::Invalid(message) => ServeError::CapUnavailable(message),
-        })
-    }
-
-    async fn spend_delta(&self, req: SpendDeltaRequest) -> Result<CapMutation, ServeError> {
-        self.apply_spend_delta(req)
-            .await
-            .map_err(|error| match error {
-                broca_core::CapStoreError::BaselineRequired => ServeError::BaselineRequired,
-                broca_core::CapStoreError::Storage(message)
-                | broca_core::CapStoreError::Invalid(message) => {
-                    ServeError::CapUnavailable(message)
-                }
-            })
     }
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {
