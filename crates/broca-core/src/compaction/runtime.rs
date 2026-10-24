@@ -222,6 +222,50 @@ pub(crate) struct BoundaryViews {
     /// view, or one that is not (yet) a prefix of the transcript, is offered again at a later
     /// boundary from here, without fetching it again.
     held: Option<(ViewReady, CompactionView)>,
+    ceiling_events: Vec<Event>,
+    ceiling_pause_until: Option<u64>,
+    ceiling_release_pending: bool,
+    #[cfg(feature = "test-clock")]
+    ceiling_reentry: bool,
+}
+
+pub(crate) enum CeilingProgress {
+    Finished(Option<broca_protocol::ContextCeilingDetail>),
+    /// Release the owning prompt before continuing the ceiling wait.
+    ViewApplied,
+}
+
+impl BoundaryViews {
+    fn yield_applied(
+        &mut self,
+        events: Vec<Event>,
+        pause_until: Option<u64>,
+    ) -> Option<broca_protocol::ContextCeilingDetail> {
+        self.ceiling_events = events;
+        self.ceiling_pause_until = pause_until;
+        self.ceiling_release_pending = true;
+        #[cfg(feature = "test-clock")]
+        {
+            self.ceiling_reentry = true;
+        }
+        None
+    }
+}
+
+pub(crate) struct CeilingAt<'a> {
+    pub views: &'a mut BoundaryViews,
+    pub state: &'a mut CompactionState,
+    pub session_ref: &'a str,
+    pub lineage_id: &'a str,
+    pub step_id: broca_protocol::StepId,
+    pub run_id: &'a broca_protocol::RunId,
+    pub out: &'a tokio::sync::mpsc::Sender<crate::OutputEvent>,
+    pub opts: &'a broca_protocol::CallOptions,
+    pub systems: &'a [usize],
+    pub request: &'a mut super::BoundaryRequest,
+    pub stored: super::StoredTranscript<'a>,
+    pub provider: &'a dyn crate::Provider,
+    pub window: Option<u64>,
 }
 
 /// The run and step at whose boundary a view is offered, named in the line that logs the
@@ -492,11 +536,40 @@ impl Runtime<'_> {
         Ok(())
     }
 
+    /// Yield to the owner after each applied view, before borrowing its prompt for more wait I/O.
+    pub(crate) async fn ceiling_progress(
+        &self,
+        at: CeilingAt<'_>,
+    ) -> Result<CeilingProgress, crate::RunError> {
+        let detail = self
+            .ceiling_before_request(
+                at.views,
+                at.state,
+                at.session_ref,
+                at.lineage_id,
+                at.step_id,
+                at.run_id,
+                at.out,
+                at.opts,
+                at.systems,
+                at.request,
+                at.stored,
+                at.provider,
+                at.window,
+            )
+            .await?;
+        Ok(if std::mem::take(&mut at.views.ceiling_release_pending) {
+            CeilingProgress::ViewApplied
+        } else {
+            CeilingProgress::Finished(detail)
+        })
+    }
+
     /// Decide before model I/O and retain both the absolute wait bound and its decision for
     /// recovery. The published compaction-provider 0.3.1 CONTRACT.md §8, lines 629–641,
     /// refuses a request still at the ceiling after the bound even if it fits the window.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn ceiling_before_request(
+    async fn ceiling_before_request(
         &self,
         views: &mut BoundaryViews,
         state: &mut CompactionState,
@@ -513,7 +586,14 @@ impl Runtime<'_> {
         window: Option<u64>,
     ) -> Result<Option<broca_protocol::ContextCeilingDetail>, crate::RunError> {
         use crate::compaction_provider::ceiling::WaitEnd;
-        let mut events = Vec::new();
+        let mut events = std::mem::take(&mut views.ceiling_events);
+        // Continue at the original absolute poll deadline after the owner releases history.
+        if let Some(until) = views.ceiling_pause_until.take() {
+            tokio::select! {
+                _ = clock_deadline(self.control.clock.as_ref(), until) => {},
+                _ = cancelled(self.control) => return Ok(None),
+            }
+        }
         let mut estimate = |state: &CompactionState| -> Result<u64, crate::RunError> {
             request
                 .refresh(opts, state, systems, |model| provider.render_request(model))
@@ -575,12 +655,14 @@ impl Runtime<'_> {
                     }
                 };
                 #[cfg(feature = "test-clock")]
-                crate::compaction::test_control::barrier(
-                    self.control.clock.as_ref(),
-                    &self.bind.session,
-                    "CeilingWaitRecorded",
-                )
-                .await?;
+                if !std::mem::take(&mut views.ceiling_reentry) {
+                    crate::compaction::test_control::barrier(
+                        self.control.clock.as_ref(),
+                        &self.bind.session,
+                        "CeilingWaitRecorded",
+                    )
+                    .await?;
+                }
                 if unavailable.is_none() && self.now() < deadline_ms {
                     let remaining = deadline_ms.saturating_sub(self.now());
                     let request = view::ceiling_ride(session_ref, remaining, None);
@@ -598,6 +680,7 @@ impl Runtime<'_> {
                     // still wins even when select polls the response first.
                     let answer = answer.filter(|_| self.now() < deadline_ms);
                     unavailable = Some(answer.is_none());
+                    let before = state.applied_view_version(lineage_id);
                     if let Some(RideAnswer::View { view, .. }) = answer {
                         let ready = ViewReady::for_view(&view);
                         self.offer(
@@ -630,6 +713,9 @@ impl Runtime<'_> {
                         },
                     )
                     .await?;
+                    if state.applied_view_version(lineage_id) != before {
+                        return Ok(views.yield_applied(events, None));
+                    }
                 }
                 loop {
                     let size = estimate(state)?;
@@ -685,6 +771,7 @@ impl Runtime<'_> {
                         }
                         match fetched {
                             Fetch::View(view) => {
+                                let before = state.applied_view_version(lineage_id);
                                 self.offer(
                                     views,
                                     state,
@@ -703,6 +790,10 @@ impl Runtime<'_> {
                                     &mut events,
                                 )
                                 .await?;
+                                if state.applied_view_version(lineage_id) != before {
+                                    let until = self.now().saturating_add(50).min(deadline_ms);
+                                    return Ok(views.yield_applied(events, Some(until)));
+                                }
                             }
                             Fetch::Refused(_) => views.declined = Some(ready.view_version),
                             Fetch::Unavailable => {}
