@@ -5569,7 +5569,7 @@ new = "    // NON-VACUITY BREAK: route private approval content through ordinary
 
 [[control]]
 id = "retention-approval-warning-production"
-guards = "retained withdrawal metadata failures increment their warning counter in production rather than only in test builds"
+guards = "retained head or withdrawal metadata failures increment their warning counter in production rather than only in test builds"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
@@ -5578,10 +5578,9 @@ test_file = "crates/broca-core/src/run.rs"
 expect_red = ["run::tests::projection_warning_mutations_are_not_test_gated"]
 expect_message = "projection warning counter mutation is test-gated"
 file = "crates/broca-core/src/run.rs"
-old = '            tracing::warn!(target: "store", "retention withdrawal metadata projection failed; the WAL remains authoritative");'
-new = '''            tracing::warn!(target: "store", "retention withdrawal metadata projection failed; the WAL remains authoritative");
-            // NON-VACUITY BREAK: hide the retained metadata counter from release builds.
-            #[cfg(test)]'''
+old = '            tracing::warn!(target: "store", "retention head or withdrawal metadata projection failed; the WAL remains authoritative");'
+new = '''            tracing::warn!(target: "store", "retention head or withdrawal metadata projection failed; the WAL remains authoritative");
+            #[cfg(test)] // NON-VACUITY BREAK: hide the retained metadata counter from release builds.'''
 
 # This proof checks the following behavior: retained Prepared calls are refused when they lack the WAL
 # identity needed to link their approval metadata to the run.
