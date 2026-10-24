@@ -63,6 +63,38 @@ old = """            (None, Some(rules)) => {
 new = """            (None, Some(_rules)) => Ok(()), // NON-VACUITY BREAK: expose the open turn unnumbered."""
 
 [[control]]
+id = "actor-nested-startup-recovery-boxed"
+guards = "Startup recovery a send runs nested inside itself is boxed, so its future is not carried in the send's and the actor loop's frames on a 2 MiB thread"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::deeply_awaited_actor_futures_are_boxed"]
+expect_message = "recover_startup_admission_view is carried inline in its callers"
+file = "crates/broca-module/src/actor.rs"
+old = "        Box::pin(self.recover_durable_work()).await?;"
+new = "        self.recover_durable_work().await?; // NON-VACUITY BREAK: carry nested recovery inline."
+
+[[control]]
+id = "actor-queue-drain-future-boxed"
+guards = "The queue drain recovery and terminals await at many sites is boxed, so it is not multiplied into every caller's frame on a 2 MiB thread"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::deeply_awaited_actor_futures_are_boxed"]
+expect_message = "drain_queue_one is carried inline in its callers"
+file = "crates/broca-module/src/actor.rs"
+old = """    fn drain_queue_one(&mut self) -> ActorFuture<'_, Result<(), String>> {
+        Box::pin(self.drain_queue_one_inline())
+    }"""
+new = """    async fn drain_queue_one(&mut self) -> Result<(), String> {
+        self.drain_queue_one_inline().await // NON-VACUITY BREAK: carry the drain inline.
+    }"""
+
+[[control]]
 id = "core-admission-rejects-unidentified-checkpoint"
 guards = "An admission checkpoint with missing lineage cannot replace the authoritative full-WAL summary"
 runner = "cargo"

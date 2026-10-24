@@ -1476,6 +1476,15 @@ fn crash_orphan_sealable(
     }
 }
 
+/// A boxed actor future, for the large ones awaited at many sites deep in the actor's call
+/// chain. Every `.await` site of an async fn reserves stack for the awaited future in the
+/// caller's poll frame, and unoptimized builds do not share that space between sites, so a
+/// large future awaited at a dozen sites multiplies its size into every caller's frame. A
+/// send that runs pending startup recovery nests that chain inside the send's own chain,
+/// which overflowed a 2 MiB thread (a test thread; also tokio's default worker size) on
+/// unoptimized Windows builds. A plain function that returns the future boxed keeps that
+/// space in its own short-lived frame and leaves each await site holding one pointer.
+type ActorFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 impl<W: WalStore + 'static> LineageActor<W> {
     /// Spawn the actor task; returns its command handle. The caller (the opener) has
     /// already acquired `lease` and spawned the session `writer` (stamping the lease epoch as
@@ -3970,7 +3979,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// written). Because the actor blocks on admission (~1 fsync) and the index write before
     /// replying, a cancel/status racing the reply is serialized BEHIND it and always finds
     /// the durable index row.
-    async fn start_run(
+    ///
+    /// Returns the run's future boxed (see [`ActorFuture`]): recovery and send handling await
+    /// it at many sites, nested several calls deep.
+    fn start_run(
         &mut self,
         run_id: RunId,
         request: SubmissionRequest,
@@ -3978,8 +3990,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
         submission_id: Option<broca_protocol::SubmissionId>,
         identity: SendIdentity,
         skip_materialization: bool,
-    ) -> Result<RunId, StartRunFailure> {
-        self.start_run_with_cancel(
+    ) -> ActorFuture<'_, Result<RunId, StartRunFailure>> {
+        Box::pin(self.start_run_with_cancel(
             run_id,
             request,
             kind,
@@ -3990,8 +4002,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 cancel_before_execute: false,
                 input_delivery: broca_protocol::Delivery::Queue,
             },
-        )
-        .await
+        ))
     }
 
     async fn start_run_with_cancel(
@@ -6249,7 +6260,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// error cannot improve while its durable bytes stay unchanged, so resolve that head as an
     /// atomic failed tombstone and continue to the next submission. Retryable failures leave the
     /// head untouched for startup backoff or a later idle-tick attempt.
-    async fn drain_queue_one(&mut self) -> Result<(), String> {
+    ///
+    /// Returns the drain's future boxed (see [`ActorFuture`]): recovery and run terminals await
+    /// it at many sites, nested several calls deep.
+    fn drain_queue_one(&mut self) -> ActorFuture<'_, Result<(), String>> {
+        Box::pin(self.drain_queue_one_inline())
+    }
+
+    async fn drain_queue_one_inline(&mut self) -> Result<(), String> {
         if self.registry.is_stopping() {
             return Ok(());
         }
@@ -7339,7 +7357,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if !self.startup_recovery_pending {
             return Ok(());
         }
-        self.recover_durable_work().await?;
+        // Boxed for the reason `ActorFuture` gives: a send and an idle close run this whole
+        // recovery nested inside themselves, a recover-and-start chain deeper than the
+        // recovery `run` starts with. Recovery is rare here, so the allocation is off the hot
+        // path.
+        Box::pin(self.recover_durable_work()).await?;
         self.startup_recovery_pending = false;
         Ok(())
     }
@@ -10459,6 +10481,41 @@ mod tests {
             vec!["a", "b", "c"]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The actor's deep call chain must not carry its largest futures inline. A send runs
+    /// pending startup recovery nested inside itself (`on_send` calls
+    /// `recover_startup_admission_view`), a whole recover-and-start chain deeper than the
+    /// recovery `run` starts with, and recovery awaits `start_run` and `drain_queue_one` at a
+    /// dozen sites. Inline, unoptimized Windows builds overflowed a 2 MiB thread running
+    /// `startup_recovery_budget_exhaustion_fails_send_closed`. These must stay boxed.
+    #[test]
+    fn deeply_awaited_actor_futures_are_boxed() {
+        fn future_size<'a, T: 'a, Fut>(_: impl FnOnce(&'a mut T) -> Fut) -> usize {
+            std::mem::size_of::<Fut>()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn future_size_6<'a, T: 'a, A, B, C, D, E, G, Fut>(
+            _: impl FnOnce(&'a mut T, A, B, C, D, E, G) -> Fut,
+        ) -> usize {
+            std::mem::size_of::<Fut>()
+        }
+        type Actor = LineageActor<FileWalStore>;
+        let recovery = future_size(Actor::recover_durable_work);
+        for (name, size) in [
+            (
+                "recover_startup_admission_view",
+                future_size(Actor::recover_startup_admission_view),
+            ),
+            ("drain_queue_one", future_size(Actor::drain_queue_one)),
+            ("start_run", future_size_6(Actor::start_run)),
+        ] {
+            assert!(
+                size * 4 < recovery,
+                "{name} is carried inline in its callers: {size} bytes, recovery itself is \
+                 {recovery} bytes"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
