@@ -15,6 +15,10 @@ broca-wire = { path = "../broca-wire" }
 broca-core = { path = "../broca-core" }
 broca-wal = { path = "../broca-wal" }
 broca-store = { path = "../broca-store" }
+# The intake's registration store is SQLite, written only on dispatch groups and prunes.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# The late-results wire types: entry kinds, cursors and the custodian's dedupe key.
+cortexkit-role-tool-provider = { workspace = true }
 # Fetch-plan admission: the refusals a plan meets and the baseline a frozen manifest answers.
 broca-fetch-plan = { path = "../broca-fetch-plan" }
 # The `llm-runner/v1` role's steer delivery receipt, which a retried steer's answer carries.
@@ -43,7 +47,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # streaming from a local server, rather than an in-process imitation of it.
 broca-provider = { path = "../broca-provider", features = ["live"] }
 sha2.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 test-clock = ["broca-core/test-clock"]

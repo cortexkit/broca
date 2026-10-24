@@ -13,6 +13,8 @@ pub mod cache;
 mod compaction_watch;
 pub mod executor;
 pub mod fanout;
+pub mod late_results_puller;
+pub mod late_results_store;
 pub mod opener;
 pub mod registry;
 pub mod retention;

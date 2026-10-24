@@ -412,9 +412,10 @@ impl HeldCallFacts {
 
 /// Read provider-held facts out of one session WAL.
 ///
-/// `call_key` names a single call the caller already knows about. It then counts even a held
-/// call whose close-out terminal is durable, because the entry for that key still has to be
-/// classed as a no-op rather than delivered.
+/// `call_key` names a single call the caller already knows about, which is how a registration
+/// asks about its own entry. It still counts a held call whose close-out terminal is durable
+/// (the entry is then classed rather than delivered), and only that read also lists the
+/// sequential held successors, which no delivery needs.
 pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> HeldCallFacts {
     let mut facts = HeldCallFacts::default();
     for frame in records {
@@ -477,6 +478,9 @@ pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> Held
             _ => {}
         }
     }
+    // Each registered call is asked about its own key. Successors are read only then, so the
+    // per-registration scan stays linear.
+    let registered = call_key.is_some();
     if let Some(key) = call_key {
         if !facts.held.iter().any(|held| held.call_key == key) {
             // An approved call's key is its deferred anchor, so the intent carries it.
@@ -501,7 +505,11 @@ pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> Held
             }
         }
     }
-    facts.held_successors = held_successor_calls(records);
+    facts.held_successors = if registered {
+        held_successor_calls(records)
+    } else {
+        Vec::new()
+    };
     facts.barrier_owed = barrier_owed(records);
     facts
 }
