@@ -174,6 +174,7 @@ async fn live_tail_and_steer_rows_cover_parts_before_materialization() {
                 tags: None,
                 retention: None,
                 ts_ms: None,
+                written_at_ms: None,
                 title: None,
                 send_id: Some("steer-1".into()),
                 request_identity_digest: None,
