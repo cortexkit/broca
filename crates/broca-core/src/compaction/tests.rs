@@ -1881,7 +1881,8 @@ async fn step_boundary_logs_applied_and_superseded_views_with_session_ref() {
                             run_id: "run",
                             step: 1,
                             superseded: &[]
-                        }
+                        },
+                        None,
                     ),
                     async {
                         racing.fetching_first.notified().await;

@@ -24,6 +24,11 @@ impl OriginalMessages {
     pub(crate) fn len(&self) -> usize {
         self.messages.len()
     }
+
+    /// The saved original of the message at `ordinal`, when its rendered form differs.
+    pub(crate) fn get(&self, ordinal: u64) -> Option<&Message> {
+        self.messages.get(&usize::try_from(ordinal).ok()?)
+    }
     pub(crate) fn release(
         &mut self,
         view: &crate::compaction_provider::view::CompactionView,
@@ -42,6 +47,19 @@ impl OriginalMessages {
         if original.content != rendered.content {
             original.ordinal = Some(index as u64);
             self.messages.entry(index).or_insert(original);
+        }
+    }
+
+    /// Keep the stored originals of messages read back into `prompt` after a release, and note
+    /// the model origins `prompt` now holds.
+    pub(crate) fn insert_originals(&mut self, originals: Vec<Message>, prompt: &[Message]) {
+        for original in originals {
+            if let Some(ordinal) = original.ordinal {
+                self.messages.entry(ordinal as usize).or_insert(original);
+            }
+        }
+        for message in prompt.iter().filter(|message| message.origin.is_some()) {
+            self.origin_roles[role_index(message.role)] = true;
         }
     }
 
@@ -150,6 +168,40 @@ impl<'a> StoredTranscript<'a> {
             .iter()
             .map(|message| self.original(message).clone())
             .collect()
+    }
+
+    /// The saved originals for `merged`: this transcript's prompt with messages read back by
+    /// ordinal merged in, whose own stored forms are `loaded` (only those that differ from their
+    /// prompt form). Which roles carry a model origin is taken from this transcript's index when
+    /// it is current, since that index also covers messages the run has since released.
+    pub(crate) fn judging_originals(
+        self,
+        merged: &[Message],
+        loaded: &[Message],
+    ) -> OriginalMessages {
+        let mut judging = OriginalMessages {
+            messages: self
+                .originals
+                .map(|originals| originals.messages.clone())
+                .unwrap_or_default(),
+            ..OriginalMessages::default()
+        };
+        for original in loaded {
+            if let Some(ordinal) = original.ordinal {
+                judging
+                    .messages
+                    .entry(ordinal as usize)
+                    .or_insert_with(|| original.clone());
+            }
+        }
+        if let Some(originals) = self
+            .originals
+            .filter(|originals| originals.indexed_len == self.prompt.len())
+        {
+            judging.origin_roles = originals.origin_roles;
+        }
+        judging.index_origins(merged);
+        judging
     }
 }
 

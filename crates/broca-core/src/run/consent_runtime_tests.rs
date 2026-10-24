@@ -454,6 +454,7 @@ async fn approved_run() -> Rig {
         None,
         Some(&rig.tools.store),
         None,
+        None,
     ))
     .await
     .unwrap();
@@ -620,6 +621,7 @@ async fn ordinary_crash_cuts_close_at_every_durable_step_and_owe_no_postresult_r
                 &out,
                 None,
                 Some(&store),
+                None,
                 None,
             )),
         )

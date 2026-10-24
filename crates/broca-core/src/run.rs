@@ -51,6 +51,7 @@ use crate::{
 };
 
 pub(crate) mod held_prompt;
+pub(crate) mod released_history;
 pub mod repetition_guidance;
 use held_prompt::PromptPosition;
 
@@ -1877,6 +1878,15 @@ async fn store_episode_render_history(
     let Some(stored) = stored else {
         return Ok(None);
     };
+    episode_render_inputs(&stored)
+}
+
+/// The render inputs of an episode projection read from the store, or `Ok(None)` when one of
+/// its values was never computed or the episodes are out of order, so the caller replays the
+/// WAL instead.
+fn episode_render_inputs(
+    stored: &[crate::context::EpisodeRenderProjection],
+) -> Result<Option<Vec<broca_protocol::request::EpisodeRenderInput>>, String> {
     if stored.is_empty()
         || !stored
             .iter()
@@ -1892,7 +1902,7 @@ async fn store_episode_render_history(
         return Ok(None);
     }
     let mut episodes = Vec::with_capacity(stored.len());
-    for episode in &stored {
+    for episode in stored {
         if episode.first_step().is_none() {
             return Ok(None);
         }
@@ -2575,6 +2585,7 @@ where
             on_admitted,
             Some(wal_store),
             approval_frames,
+            None,
         )
         .await;
         return seal_size_refusal(
@@ -2594,6 +2605,7 @@ where
     // performs the ordered drain below.
     let (projector, pending) = projection_channel();
     let projection_session = req.session.clone();
+    let history_store = Arc::clone(&store);
     let projection = projector_task(wal_store, store, &projection_session, pending);
     tokio::pin!(projection);
 
@@ -2616,6 +2628,7 @@ where
             on_admitted,
             Some(wal_store),
             approval_frames,
+            Some(history_store),
         );
         tokio::pin!(body);
         tokio::select! {
@@ -2855,6 +2868,7 @@ async fn run_body<P: Provider, T: ToolPlane, A: ApprovalPolicy>(
         on_admitted,
         None,
         None,
+        None,
     ))
     .await
 }
@@ -2878,6 +2892,7 @@ async fn run_body_with_approval_history<P, T, A>(
     on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
     approval_store: Option<&dyn WalStore>,
     approval_frames: Option<Arc<Vec<broca_wal::FramedRecord>>>,
+    history_store: Option<Arc<dyn SessionStore>>,
 ) -> Result<RunSummary, RunError>
 where
     P: Provider,
@@ -4573,6 +4588,22 @@ where
     let mut natural_final_text: Option<String> = None;
     let mut interrupt_reason = None;
     let mut raw_notice_anchor: Option<crate::compaction::view::NoticeAnchor> = None;
+    // Reads back messages released from the prompt when a newer view keeps or copies them.
+    let released_history = compaction_runtime
+        .as_ref()
+        .map(|_| released_history::RunHistory {
+            wal: approval_store,
+            store: history_store,
+            writer,
+            session: req.session.clone(),
+            form: released_history::PromptForm {
+                render_tags,
+                render_config: provider.render_config_blob(),
+            },
+        });
+    let released_history = released_history
+        .as_ref()
+        .map(|history| history as &dyn crate::compaction::ReleasedHistory);
     macro_rules! release_held {
         ($state:expr) => {{
             let releasing_state: Option<&crate::compaction::CompactionState> = $state;
@@ -4586,6 +4617,19 @@ where
                     true
                 }
             };
+            // Released messages the newly applied view keeps were read back to decide it; they
+            // join the prompt before it is trimmed to that view.
+            let reheld = boundary_views.take_reheld();
+            let reheld = release_history
+                && reheld.is_some_and(|reheld| {
+                    held_prompt::rehold(
+                        &mut mutable_call_options(&mut opts).prompt,
+                        originals.as_mut(),
+                        &mut stamped_len,
+                        &mut guidance_episodes,
+                        reheld,
+                    )
+                });
             if release_history
                 && held_prompt::release(
                     &mut mutable_call_options(&mut opts).prompt,
@@ -4593,6 +4637,7 @@ where
                     originals.as_mut(),
                     &mut stamped_len,
                 )
+                || reheld
             {
                 tag_numbering.released(opts.prompt.len());
                 tags_rendered_len = opts.prompt.len();
@@ -4940,6 +4985,7 @@ where
                         step: step_id.0,
                         superseded: &[],
                     },
+                    released_history,
                 ))
                 .await?
             };
@@ -4992,6 +5038,7 @@ where
                         systems: &system_positions,
                         request: &mut request,
                         stored: raw,
+                        released: released_history,
                         provider,
                         window: context_limit,
                     },
@@ -9378,6 +9425,7 @@ mod tests {
             || Ok(false),
             None,
             &out,
+            None,
             None,
             None,
             None,
