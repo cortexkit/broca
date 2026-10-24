@@ -139,7 +139,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// records every call it is asked to make. `refuse` makes one provider's catalog fetch refuse
 /// with a code.
 #[derive(Default)]
-struct CountingAdmitter {
+pub(super) struct CountingAdmitter {
     calls: Mutex<Vec<String>>,
     refuse: Mutex<Option<(String, String)>>,
     /// A composition digest every provider answers instead of the plan's, so the answers
@@ -281,7 +281,7 @@ impl PlanAdmitter for CountingAdmitter {
     }
 }
 
-async fn plan_rig(tag: &str) -> (Rig, Arc<CountingAdmitter>) {
+pub(super) async fn plan_rig(tag: &str) -> (Rig, Arc<CountingAdmitter>) {
     let rig = Rig::start(tag).await;
     let admitter = Arc::new(CountingAdmitter::default());
     rig.registry().set_plan_admitter(admitter.clone());
