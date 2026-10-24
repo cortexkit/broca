@@ -274,6 +274,7 @@ pub struct RouteHandle {
     pub channel: u16,
     pub epoch: u32,
     conn: ConnToken,
+    pub(crate) reads_held_reply: bool,
 }
 
 impl RouteHandle {
@@ -282,6 +283,7 @@ impl RouteHandle {
             channel,
             epoch,
             conn,
+            reads_held_reply: false,
         }
     }
 
@@ -1126,6 +1128,31 @@ impl SubcConnection {
         .await
     }
 
+    pub(crate) async fn route_open_dispatch_single_attempt(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: Option<&subc_protocol::scope::ScopeSelector>,
+        provider_held_installed: bool,
+    ) -> ConnResult<RouteHandle> {
+        let capabilities = provider_held_installed.then(|| {
+            vec![
+                cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+                cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
+            ]
+        });
+        self.route_open_target_with_capabilities(
+            RouteTarget::ToolProvider {
+                module_id: module_id.into(),
+            },
+            identity,
+            scope.cloned(),
+            None,
+            capabilities,
+        )
+        .await
+    }
+
     /// ONE `route.open` attempt to a tool provider that declares `tool-provider: v1`, asking
     /// the module to serve its v1 role surface on the route: `tool.catalog` with its system
     /// text, and its declarations. Only fetch-plan admission opens such routes, and its own
@@ -1398,14 +1425,28 @@ impl SubcConnection {
         scope: Option<subc_protocol::scope::ScopeSelector>,
         role_versions: Option<std::collections::BTreeMap<String, String>>,
     ) -> ConnResult<RouteHandle> {
+        self.route_open_target_with_capabilities(target, identity, scope, role_versions, None)
+            .await
+    }
+
+    async fn route_open_target_with_capabilities(
+        &self,
+        target: RouteTarget,
+        identity: &BindIdentity,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
+        role_versions: Option<std::collections::BTreeMap<String, String>>,
+        consumer_capabilities: Option<Vec<String>>,
+    ) -> ConnResult<RouteHandle> {
+        let reads_held_reply = cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
+            consumer_capabilities.as_deref(),
+        );
         let req = ClientControlRequest::RouteOpen {
             identity: to_subc_bind(identity, &target, role_versions.as_ref()),
             target,
             consumer_identity: self.shared.consumer_identity.clone(),
-            // Reverse-request capabilities (MCP elicitation/sampling/roots). The runner's
-            // consumer legs (tool plane, vault) are plain request/response
-            // callers and serve no reverse requests, so none are declared.
-            consumer_capabilities: None,
+            // Result-format capabilities are installed as a pair by the tool plane. Role,
+            // plan-fetch and management callers keep their previous undeclared format.
+            consumer_capabilities,
             // Admission facts come from a configured carrier module; the runner's
             // consumer legs carry none.
             admission_facts: None,
@@ -1424,7 +1465,11 @@ impl SubcConnection {
                     Ok(ClientControlResponse::RouteOpen {
                         route_channel,
                         route_epoch,
-                    }) => Ok(RouteHandle::new(route_channel, route_epoch, conn)),
+                    }) => {
+                        let mut handle = RouteHandle::new(route_channel, route_epoch, conn);
+                        handle.reads_held_reply = reads_held_reply;
+                        Ok(handle)
+                    }
                     Ok(other) => Err(ConnError::Protocol(format!(
                         "unexpected route.open reply: {other:?}"
                     ))),
@@ -1754,10 +1799,8 @@ impl SubcConnection {
             arguments: arguments.clone(),
             tool_call_id: tool_call_id.map(str::to_string),
             progress_token: None,
-            // Not sent yet, deliberately. Providers silently ignore an unknown `call_key` today,
-            // so a key sent before a provider really decodes it would be dropped without any
-            // error, and a later withdrawal could not find the call. broca starts sending its
-            // `<lineage_id>:<wal_seq>` only once each receiving provider confirms a live decode.
+            // This unkeyed API has no intake registration or provider-declaration context.
+            // Eligible dispatch keys go through the tool plane's guarded staged path instead.
             call_key: None,
             // Not sent yet, for the same reason: the pin's content is defined by the
             // tool-provider role, and broca sends one only after it freezes each tool's pin at
@@ -4005,6 +4048,56 @@ impl InProcessModuleEnd {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn dispatch_capabilities_are_installed_together_and_role_routes_stay_undeclared() {
+        for installed in [false, true] {
+            let (conn, mut write_rx, pending) = route_open_test_connection();
+            let identity = broca_protocol::BindIdentity {
+                project_root: "/project".into(),
+                harness: "broca".into(),
+                session: "session".into(),
+            };
+            let open =
+                conn.route_open_dispatch_single_attempt("provider", &identity, None, installed);
+            tokio::pin!(open);
+            let request = tokio::select! {
+                result = &mut open => panic!("premature result: {result:?}"),
+                request = write_rx.recv() => request.unwrap(),
+            };
+            let raw: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if installed {
+                assert_eq!(
+                    raw["consumer_capabilities"],
+                    serde_json::json!(["content/v1", "held-reply/v1"])
+                );
+            } else {
+                assert_eq!(
+                    request.body,
+                    include_str!("../tests/fixtures/held_dispatch_route_legacy.json")
+                        .trim_end()
+                        .as_bytes()
+                );
+            }
+            answer_route_open(&pending, &request, 7);
+            assert_eq!(open.await.unwrap().reads_held_reply, installed);
+        }
+        let (conn, mut write_rx, pending) = route_open_test_connection();
+        let identity = broca_protocol::BindIdentity {
+            project_root: "/project".into(),
+            harness: "broca".into(),
+            session: "session".into(),
+        };
+        let open = conn.route_open_tool_provider_v1("provider", &identity, None);
+        tokio::pin!(open);
+        let request = tokio::select! {
+            result = &mut open => panic!("premature role result: {result:?}"),
+            request = write_rx.recv() => request.unwrap(),
+        };
+        let raw: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(raw.get("consumer_capabilities").is_none());
+        answer_route_open(&pending, &request, 8);
+        assert!(!open.await.unwrap().reads_held_reply);
+    }
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -4965,7 +5058,7 @@ mod tests {
     /// This is what made the migration to the shared `ToolCallRequest` safe to ship without a
     /// coordinated window: every existing module reader sees exactly what it saw before, so
     /// the change is inert until someone reads the new field. The two-key length check also
-    /// pins `call_key` as absent, not null, while broca does not send it.
+    /// pins `call_key` as absent, not null, on the unkeyed API.
     #[test]
     fn tool_call_body_without_an_id_preserves_the_legacy_shape() {
         let name = "apply_patch_雪";

@@ -1,8 +1,8 @@
 //! Explicit mapping for negotiated `content/v1` tool results.
 //!
 //! Callers must establish both the route's `content/v1` declaration and the tool catalog's
-//! opt-in before decoding a reply with the role's types. Ordinary dispatch still uses its
-//! legacy mapper until it can supply that context; reply shape alone is not negotiation.
+//! opt-in before decoding a reply with the role's types. Dispatch supplies that context only
+//! when the held-call integration seams are installed; reply shape alone is not negotiation.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use broca_protocol::{

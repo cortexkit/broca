@@ -25863,3 +25863,97 @@ expect_message = "credential read without consent"
 file = "crates/broca-provider/tests/live_common/vault.rs"
 old = "    if consent != Some(\"1\") {"
 new = "    if false && consent != Some(\"1\") { // NON-VACUITY BREAK"
+
+[[control]]
+id = "subc-held-dispatch-capability-installation-gate"
+guards = "The content/v1 and held-reply/v1 pair remains undeclared until every held integration seam is installed"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::dispatch_capabilities_are_installed_together_and_role_routes_stay_undeclared"]
+file = "crates/broca-subc/src/connection.rs"
+old = "        let capabilities = provider_held_installed.then(|| {"
+new = "        let capabilities = (provider_held_installed || true).then(|| { // NON-VACUITY BREAK: advertise without installed lifecycle."
+
+[[control]]
+id = "subc-held-dispatch-undeclared-reply-refusal"
+guards = "A held marker on an undeclared route is a protocol refusal, never a final model answer"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
+expect_red = ["subc_plane::held_dispatch_tests::undeclared_held_reply_is_a_protocol_refusal_not_a_final_answer"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "                let has_held = raw.get(\"held\").is_some();"
+new = "                let has_held = raw.get(\"held\").is_some() && sent_on.reads_held_reply; // NON-VACUITY BREAK: hide undeclared markers from the refusal."
+
+[[control]]
+id = "subc-held-dispatch-registration-before-key"
+guards = "No key leaves the process before the complete dispatch group's intake transaction has synced"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
+expect_red = ["subc_plane::held_dispatch_tests::no_key_is_sent_until_the_whole_dispatch_group_registration_syncs"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "            && sent_key.is_some_and(|key| {"
+new = "            && false /* NON-VACUITY BREAK: bypass the registration acknowledgement. */ && sent_key.is_some_and(|key| {"
+
+[[control]]
+id = "core-provider-held-record-synced-before-action"
+guards = "The batch's ToolCallProviderHeld append is synced before the adapter can enter its held lifecycle"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_dispatch_syncs_its_record_before_acting"]
+file = "crates/broca-core/src/run.rs"
+old = '''        self.writer
+            .sync()
+            .await
+            .map_err(|error| error.to_string())?;'''
+new = "        // NON-VACUITY BREAK: acknowledge the held append without syncing it."
+
+[[control]]
+id = "subc-held-dispatch-interim-never-final"
+guards = "An accepted held reply returns only the eventual terminal, never the provider's interim content"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
+expect_red = ["subc_plane::held_dispatch_tests::held_reply_requires_every_prerequisite_and_never_exposes_interim_content"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "                            let terminal = support.lifecycle.wait(ctx, call, &reply).await;"
+new = "                            let terminal = DispatchResult::Completed(map_call_tool_result(&call.tool_call_id, &raw)); // NON-VACUITY BREAK: treat interim content as terminal."
+
+[[control]]
+id = "store-late-results-dispatch-group-atomic"
+guards = "A failed registration rolls back every member of its dispatch group rather than publishing a partial group"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::dispatch_group_is_atomic_and_cannot_retarget_an_issued_key"]
+file = "crates/broca-store/src/late_results_store.rs"
+old = "            if changed != 1 {"
+new = "            if changed != 1 { transaction.commit().unwrap(); // NON-VACUITY BREAK: keep the successful prefix of a failed group."
+
+[[control]]
+id = "store-late-results-full-synchronous-registration"
+guards = "The registration backend uses SQLite FULL synchronous commits before acknowledging provider keys"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::dispatch_group_registrations_survive_reopen"]
+file = "crates/broca-store/src/late_results_store.rs"
+old = "             PRAGMA synchronous = FULL;"
+new = "             PRAGMA synchronous = OFF; -- NON-VACUITY BREAK: acknowledge without durable SQLite commit sync."
