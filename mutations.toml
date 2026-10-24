@@ -27545,3 +27545,68 @@ expect_red = ["llm_runner_role::upload_roundtrip_is_staged_but_not_advertised_or
 file = "crates/broca-wire/src/lib.rs"
 old = "        if let Some(part) = parts.first() {"
 new = "        if let Some(part) = parts.first().filter(|_| false) { // NON-VACUITY BREAK: silently omit upload content."
+
+[[control]]
+id = "serve-role-binding-one-role-per-route"
+guards = "A management route cannot declare two supported roles and reach either operation namespace"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test role_binding"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/role_binding.rs"
+expect_red = ["mixed_roles_are_refused_as_one_role_per_route"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "if let Some((other, _, _)) = declared_roles.next() {"
+new = "if let Some((other, _, _)) = None::<(&str, &str, RouteRole)> { // NON-VACUITY BREAK: admit multiple roles on one route."
+
+[[control]]
+id = "serve-role-binding-pinned-versions"
+guards = "Every supported management role refuses a wire version this build does not serve"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test role_binding"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/role_binding.rs"
+expect_red = ["unsupported_role_versions_are_refused"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if declared != version {"
+new = "    if false { // NON-VACUITY BREAK: admit unsupported role versions."
+
+[[control]]
+id = "serve-new-roles-bypass-session-identity"
+guards = "Tool-provider and permissions binds do not validate a session identity that keys nothing"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test role_binding"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/role_binding.rs"
+expect_red = ["new_roles_are_sessionless_and_answer_only_unknown_method"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "if let Err(error) = if bind.agent_data || bind.role.is_sessionless() {"
+new = "if let Err(error) = if bind.agent_data || bind.role == RouteRole::Classifier { // NON-VACUITY BREAK: require a session identity for new sessionless roles."
+
+[[control]]
+id = "serve-new-roles-isolate-operation-dispatch"
+guards = "Unimplemented tool-provider and permissions operations cannot fall through to session dispatch"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test role_binding"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/role_binding.rs"
+expect_red = ["new_roles_are_sessionless_and_answer_only_unknown_method"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "if matches!(bind.role, RouteRole::ToolProvider | RouteRole::Permissions) {"
+new = "if false { // NON-VACUITY BREAK: dispatch new roles as session operations."
+
+[[control]]
+id = "serve-new-roles-bypass-session-history"
+guards = "Tool-provider and permissions binds skip session-history authorization even with a scope stamp"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test role_binding"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/role_binding.rs"
+expect_red = ["new_roles_are_sessionless_and_answer_only_unknown_method"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                && !completed.bind.role.is_sessionless()"
+new = "                && completed.bind.role != RouteRole::Classifier // NON-VACUITY BREAK: read session history for new sessionless roles."
