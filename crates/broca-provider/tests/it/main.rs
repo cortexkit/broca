@@ -57,6 +57,7 @@ mod gemini_render_golden;
 mod gemini_thought_parts;
 mod google_codeassist_render_golden;
 mod live_consent_gate;
+mod media_profile_frozen;
 #[cfg(feature = "live")]
 mod mixed_family_concurrency_e2e;
 mod normalize_fixture;

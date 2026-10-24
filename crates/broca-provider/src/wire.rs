@@ -257,6 +257,12 @@ pub struct FrozenRenderConfig {
     /// Whether Go's Kimi K2.6 route rejects 24-hour OpenAI prompt-cache hints.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub opencode_go_long_cache_retention_unsupported: bool,
+    /// The media profile frozen at admission (see `crate::media_profile::freeze_media_profile`)
+    /// and refrozen when a model switch refreezes the run config. It gates media rendering: a
+    /// config without one renders exactly as before media existed. Optional and omitted when
+    /// absent, so it is not a must-understand field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<crate::media_profile::MediaProfile>,
 }
 
 /// Conversation identity and episode-local request numbering for the Antigravity envelope.
