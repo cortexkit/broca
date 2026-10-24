@@ -39,6 +39,10 @@ async fn unknown_facts_keep_pre_addition_default_reply_bytes() {
 }
 
 fn capture_known(frame: &subc_protocol::Frame, name: &str) {
+    capture_known_with_run(frame, name, None);
+}
+
+fn capture_known_with_run(frame: &subc_protocol::Frame, name: &str, run: Option<&str>) {
     assert_eq!(
         frame.header.ty,
         subc_protocol::FrameType::Response,
@@ -60,6 +64,9 @@ fn capture_known(frame: &subc_protocol::Frame, name: &str) {
             &format!("\"updated_at\":{at}"),
             "\"updated_at\":\"@UPDATED_AT@\"",
         );
+    }
+    if let Some(run) = run {
+        bytes = bytes.replace(run, "@RUN_ID@");
     }
     if let Some(version) = answer["implementation_version"].as_str() {
         bytes = bytes.replace(
@@ -542,5 +549,61 @@ async fn retained_head_checkpoint_and_typical_read_cost_through_serve() {
         "the run writer checkpoints new spend before any subsequent head read"
     );
     drop(db);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn reasoning_tokens_are_an_output_breakdown_on_run_and_session_spend() {
+    let mut rig = Rig::start("reasoning-spend").await;
+    let _diagnostics = rig.failure_diagnostics();
+    rig.script.push(&[
+        Step::Usage {
+            content: vec![broca_protocol::ContentBlock::ToolCall(
+                broca_protocol::ToolCall {
+                    tool_call_id: broca_protocol::ToolCallId("reasoning-call".into()),
+                    tool_name: "work".into(),
+                    input: json!({}),
+                    thought_signature: None,
+                },
+            )],
+            usage: broca_protocol::Usage {
+                input_tokens: Some(7),
+                output_tokens: Some(10),
+                reasoning_tokens: Some(3),
+                ..Default::default()
+            },
+        },
+        Step::Usage {
+            content: vec![broca_protocol::ContentBlock::Text {
+                text: "answer".into(),
+            }],
+            usage: broca_protocol::Usage {
+                input_tokens: Some(9),
+                output_tokens: Some(12),
+                reasoning_tokens: Some(4),
+                ..Default::default()
+            },
+        },
+    ]);
+    let send = rig.send("reasoning", "question", None).await;
+    let run = result(&send)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let result = result(
+        &rig.request(7, json!({"method":"run.result","params":{"run_id":run}}))
+            .await,
+    );
+    assert_eq!(result["usage"]["output_tokens"], 22);
+    assert_eq!(result["usage"]["reasoning_tokens"], 7);
+    let head = rig
+        .request(7, json!({"method":"session.head","params":{}}))
+        .await;
+    let answer = delivery_rig::result(&head);
+    assert_eq!(answer["usage"]["since"], run);
+    assert_eq!(answer["usage"]["output_tokens"], 22);
+    assert_eq!(answer["usage"]["reasoning_tokens"], 7);
+    assert_eq!(answer["usage"]["input_tokens"], 16);
+    assert_eq!(answer["usage"]["steps"], 2);
+    capture_known_with_run(&head, "session_head.reasoning_usage.json", Some(&run));
     rig.finish().await;
 }

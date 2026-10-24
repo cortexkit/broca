@@ -27335,3 +27335,44 @@ expect_red = ["framing::tests::message_times_compose_with_existing_admission_fea
 file = "crates/broca-wal/src/record.rs"
 old = "input_cap_features(base)"
 new = "input_cap_features(with_feature(base, crate::framing::MESSAGE_TIMES_FEATURE)) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "head-additions-reasoning-breakdown"
+select = "expected"
+guards = "reasoning tokens are already inside output tokens and are not billed a second time in run or session usage"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["reasoning_tokens_are_an_output_breakdown_on_run_and_session_spend"]
+file = "crates/broca-core/src/replay.rs"
+old = "step.output_tokens = usage.output_tokens;"
+new = "step.output_tokens = usage.output_tokens.map(|output| output.saturating_add(usage.reasoning_tokens.unwrap_or(0))); // NON-VACUITY BREAK: double bill reasoning"
+
+[[control]]
+id = "head-additions-conformance-reasoning-report"
+platforms = ["linux", "macos"]
+select = "expected"
+guards = "the native kit model fixture reports scripted reasoning instead of silently omitting the newly exercised breakdown"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["scripted_usage_chunk_preserves_reasoning_as_an_output_breakdown"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = "if let Some(reasoning) = usage.reasoning_tokens {"
+new = "if let Some(reasoning) = usage.reasoning_tokens.filter(|_| false) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "head-additions-conformance-reasoning-bound"
+platforms = ["linux", "macos"]
+select = "expected"
+guards = "a capped fixture completion keeps its reasoning breakdown within the reported output total"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["scripted_usage_chunk_preserves_reasoning_as_an_output_breakdown"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = "reasoning.min(output)"
+new = "reasoning /* NON-VACUITY BREAK */"

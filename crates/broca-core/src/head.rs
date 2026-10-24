@@ -194,7 +194,9 @@ mod tests {
         let mut head: HeadProjection = serde_json::from_str(&persisted).unwrap();
         head.observe(&start("second-counted", None));
         head.observe(&step(json!({})));
-        head.observe(&step(json!({"input_tokens":0,"reasoning_tokens":5})));
+        head.observe(&step(
+            json!({"input_tokens":0,"output_tokens":5,"reasoning_tokens":2}),
+        ));
         assert_eq!(
             serde_json::to_value(&head.model).unwrap(),
             json!({"provider":"p","model":"m"})
@@ -204,10 +206,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(usage).unwrap(),
             json!({
-                "since":"first-counted", "steps":3,"unreported_steps":1,"input_tokens":7,"output_tokens":3,"reasoning_tokens":5,
+                "since":"first-counted", "steps":3,"unreported_steps":1,"input_tokens":7,"output_tokens":8,"reasoning_tokens":2,
                 "by_model":[
                     {"provider":"p","model":"m","variant":"deep","steps":1,"unreported_steps":0,"input_tokens":7,"output_tokens":3},
-                    {"provider":"p","model":"m","steps":2,"unreported_steps":1,"input_tokens":0,"reasoning_tokens":5}
+                    {"provider":"p","model":"m","steps":2,"unreported_steps":1,"input_tokens":0,"output_tokens":5,"reasoning_tokens":2}
                 ]
             })
         );

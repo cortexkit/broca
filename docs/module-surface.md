@@ -201,7 +201,9 @@ JSON. `usage`, behind the `session_usage` group, is incremental durable session 
 `since` naming the first counted run. Its selection keys, first-use ordering and lower-bound
 totals are exactly run usage's: a field no counted step reported is absent; unreported steps
 are counted, not silently treated as measured zeros. Projection commits totals with its WAL
-watermark, and head folds only the unprojected suffix. Retained sessions use a separate,
+watermark. `reasoning_tokens` is already included in `output_tokens`, not an additional charge;
+the session and run totals preserve that breakdown without adding it again. Head folds only
+the unprojected suffix. Retained sessions use a separate,
 lineage-bound checkpoint of content-free spend and grant facts; its watermark never advances
 the transcript projection. Expiry deletes that checkpoint in the retained-metadata transaction,
 and late writes cannot recreate it. A missing or unreadable checkpoint is reconstructed from

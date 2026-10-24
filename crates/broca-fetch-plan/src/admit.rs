@@ -1716,26 +1716,28 @@ mod tests {
         )
         .await
         .unwrap();
-        let refusal = admit(
-            &plan,
-            &DefaultDeclaration(Err(FetchError::provider_refused(
-                "invalid_request".into(),
-                Some(json!({"field":"preset"})),
-                "no default selector",
-                false,
-            ))),
-            &session,
-            ADMISSION_DEADLINE,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(refusal.code(), "fetch_unavailable");
-        assert_eq!(
-            refusal.detail(),
-            json!({"provider":"magic-context","reason":"refused","provider_code":"invalid_request",
-            "op":DECLARE_OP,"message":"no default selector","field":"preset","retryable":false})
-        );
-        assert!(!refusal.detail().to_string().contains("preset_missing"));
+        for code in ["invalid_params", "invalid_request"] {
+            let refusal = admit(
+                &plan,
+                &DefaultDeclaration(Err(FetchError::provider_refused(
+                    code.into(),
+                    Some(json!({"field":"preset"})),
+                    "no default selector",
+                    false,
+                ))),
+                &session,
+                ADMISSION_DEADLINE,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refusal.code(), "fetch_unavailable");
+            assert_eq!(
+                refusal.detail(),
+                json!({"provider":"magic-context","reason":"refused","provider_code":code,
+                "op":DECLARE_OP,"message":"no default selector","field":"preset","retryable":false})
+            );
+            assert!(!refusal.detail().to_string().contains("preset_missing"));
+        }
     }
 
     #[tokio::test]
