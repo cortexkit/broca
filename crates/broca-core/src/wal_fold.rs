@@ -5,10 +5,10 @@ use crate::{
     LeaseError, LeaseStore,
 };
 use broca_owner_only::OpenOptions;
-use broca_protocol::BindIdentity;
+use broca_protocol::{BindIdentity, ToolCallId};
 use broca_wal::{
     archive::{ArchiveReader, ArchiveWriter, ContainerState},
-    WalRecord,
+    FramedRecord, WalRecord,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -269,10 +269,75 @@ fn live_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
     Ok(Some(bytes))
 }
+/// How a range's provider-held calls keep it out of the archive, as far as the caller can say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldRanges {
+    /// No intake store is given, or its state is unknown to the caller. A range holding a
+    /// `ToolCallProviderHeld` record is skipped: without the store, no reader can prove that the
+    /// call was delivered, closed out, or that its lineage is free of a registration.
+    UnknownStore,
+    /// What the intake store knows, for a range holding a provider-held record.
+    Store(StoreHeld),
+}
+
+/// What the intake store can say about provider-held calls for the fold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreHeld {
+    /// The store exists and is not rebuilding, so its registrations are authoritative.
+    pub complete: bool,
+}
+impl HeldRanges {
+    /// The fold's default: no store, so no proof.
+    pub const DEFAULT: HeldRanges = HeldRanges::UnknownStore;
+}
+
+/// The provider-held calls and terminals of one range.
+#[derive(Default)]
+struct Batch {
+    held: Vec<ToolCallId>,
+    terminals: Vec<ToolCallId>,
+}
+impl Batch {
+    fn open_held(&self) -> bool {
+        self.held.iter().any(|held| !self.terminals.contains(held))
+    }
+    fn needs_intake(&self) -> bool {
+        !self.held.is_empty()
+    }
+}
+
+fn held_batches(records: &[FramedRecord]) -> Batch {
+    let mut batch = Batch::default();
+    for frame in records {
+        match &frame.record {
+            WalRecord::ToolCallProviderHeld { tool_call_id, .. } => {
+                batch.held.push(tool_call_id.clone())
+            }
+            WalRecord::ToolResult {
+                result, outcome, ..
+            } if !outcome.is_indeterminate() => batch.terminals.push(result.tool_call_id.clone()),
+            WalRecord::ToolNoDispatch { tool_call_id, .. } => {
+                batch.terminals.push(tool_call_id.clone())
+            }
+            _ => {}
+        }
+    }
+    batch
+}
+
 fn eligible(
     bytes: &[u8],
     start: u64,
     cold_ms: u64,
+) -> Result<(Option<BindIdentity>, bool), &'static str> {
+    eligible_with(bytes, start, cold_ms, HeldRanges::DEFAULT)
+}
+
+fn eligible_with(
+    bytes: &[u8],
+    start: u64,
+    cold_ms: u64,
+    held_ranges: HeldRanges,
 ) -> Result<(Option<BindIdentity>, bool), &'static str> {
     if bytes.is_empty() {
         return Err("zero_byte");
@@ -304,6 +369,15 @@ fn eligible(
     {
         // Prepared anchors require a lineage. Without it, no reader can prove debt discharged.
         return Err("deferred_call_open");
+    }
+    // A held call's late result is pulled by the intake, not read back from this range, so the
+    // range must stay live while the call can still be delivered or its lineage still registered.
+    let held = held_batches(records);
+    if held.open_held() {
+        return Err("provider_held_open");
+    }
+    if matches!(held_ranges, HeldRanges::UnknownStore) && held.needs_intake() {
+        return Err("provider_held_registered");
     }
     let mut identity = None;
     let mut last_ts = None;
