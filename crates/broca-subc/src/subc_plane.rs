@@ -3082,6 +3082,12 @@ pub(crate) fn owner_principal(scope: &SessionScope) -> Result<Principal, String>
         })
 }
 
+/// The daemon's principal for a scope owner, for a caller that must ask the daemon about the
+/// scope rather than open a route under it.
+pub fn principal_for(scope: &SessionScope) -> Result<Principal, String> {
+    owner_principal(scope)
+}
+
 /// Always select the frozen epoch: reusing a scope ref must not carry a call into a new session.
 pub(crate) fn frozen_scope_selector(scope: &SessionScope) -> Result<ScopeSelector, String> {
     Ok(ScopeSelector::new(

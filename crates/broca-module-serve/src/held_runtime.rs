@@ -166,6 +166,51 @@ impl HeldDelivery for ActorDelivery {
     }
 }
 
+/// Delivers a pulled entry back to the provider that holds the call, on behalf of the run.
+///
+/// The provider's answer becomes the call's result only through this post: the run's batch is
+/// still the single writer of the terminal, and it receives the body as a completed reply on
+/// the route, under the same call key, that the held call was sent on.
+pub struct ProviderDelivery {
+    #[allow(dead_code)]
+    plane: Arc<broca_subc::SubcToolPlane>,
+    #[allow(dead_code)]
+    connection: Arc<broca_subc::SubcConnection>,
+    #[allow(dead_code)]
+    identity: BindIdentity,
+}
+
+impl ProviderDelivery {
+    /// `connection` must be the consumer-identity connection the plane dispatches on: a held
+    /// call's result is served only to its custodian.
+    pub fn new(
+        plane: Arc<broca_subc::SubcToolPlane>,
+        connection: Arc<broca_subc::SubcConnection>,
+        identity: BindIdentity,
+    ) -> Self {
+        Self {
+            plane,
+            connection,
+            identity,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HeldEntrySink for ProviderDelivery {
+    async fn deliver(
+        &self,
+        registration: &LateResultRegistration,
+        entry: &LateEntry,
+    ) -> Result<(), String> {
+        Err(format!(
+            "provider delivery is not wired yet for {} ({:?})",
+            registration.call_key,
+            entry.kind()
+        ))
+    }
+}
+
 /// The intake a tool plane is handed, with the store kept so boot recovery can read it.
 pub struct InstalledIntake {
     pub intake: Arc<LateResultsIntake>,
