@@ -28155,3 +28155,81 @@ expect_red = ["new_roles_are_sessionless_and_answer_only_unknown_method"]
 file = "crates/broca-module-serve/src/serve.rs"
 old = "                && !completed.bind.role.is_sessionless()"
 new = "                && completed.bind.role != RouteRole::Classifier // NON-VACUITY BREAK: read session history for new sessionless roles."
+
+[[control]]
+id = "media-provenance-finds-media-block"
+guards = "A caller-supplied transcript naming a media block is detected as supplied media"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_provenance_tests.rs"
+expect_red = ["media_provenance::tests::a_media_block_is_found_with_its_path"]
+file = "crates/broca-core/src/media_provenance.rs"
+old = '        ContentBlock::Media(_) => Some(None),'
+new = '        ContentBlock::Media(_) => None, // NON-VACUITY BREAK: let a supplied media block through.'
+
+[[control]]
+id = "media-provenance-finds-parts-media-part"
+guards = "A caller-supplied tool result whose Parts output names media is detected at its part index"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_provenance_tests.rs"
+expect_red = ["media_provenance::tests::a_tool_result_media_part_is_found_with_its_part_index"]
+file = "crates/broca-core/src/media_provenance.rs"
+old = '                .position(|part| matches!(part, ToolOutputPart::Media { .. }))'
+new = '                .position(|_| false) // NON-VACUITY BREAK: let a supplied media part through.'
+
+[[control]]
+id = "import-refuses-supplied-media"
+guards = "run_import refuses a transcript naming media inline before anything is written"
+runner = "cargo"
+package = "broca-core"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-core/tests/it/session_import.rs"
+expect_red = ["session_import::import_refuses_inline_media_and_writes_nothing"]
+file = "crates/broca-core/src/import.rs"
+old = '    if let Some(found) = crate::media_provenance::find_supplied_media(&request.messages) {'
+new = '    if let Some(found) = None::<crate::media_provenance::SuppliedMedia> { // NON-VACUITY BREAK: import inline media.'
+
+[[control]]
+id = "serve-import-refuses-supplied-media-before-routing"
+guards = "session.import naming media inline is refused invalid_params before the session is opened, writing nothing"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/serve_dispatch.rs"
+expect_red = ["serve_dispatch::import_naming_media_inline_is_refused_before_anything_is_written"]
+file = "crates/broca-module/src/serve.rs"
+old = '        if let Err((field, message)) = broca_wire::check_supplied_media(&req.messages) {'
+new = '        if let Err((field, message)) = Ok::<(), (String, String)>(()) { // NON-VACUITY BREAK: route the import before checking media.'
+
+[[control]]
+id = "wire-supplied-media-refused"
+guards = "The shared wire check refuses an imported transcript naming media, with the member path"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/supplied_media_tests.rs"
+expect_red = ["supplied_media_tests::an_imported_media_block_is_refused_naming_its_member"]
+file = "crates/broca-wire/src/lib.rs"
+old = '        Some(found) => Err((found.path(), found.to_string())),'
+new = '        Some(_) => Ok(()), // NON-VACUITY BREAK: accept supplied media.'
+
+[[control]]
+id = "wire-send-content-names-inline-media"
+guards = "A session.send content entry naming media inline is refused with the upload-reference rule"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/supplied_media_tests.rs"
+expect_red = ["supplied_media_tests::a_send_naming_media_inline_is_refused_with_the_upload_rule"]
+file = "crates/broca-wire/src/lib.rs"
+old = '            .and_then(|parts| parts.iter().position(names_media_inline))'
+new = '            .and_then(|_| None::<usize>) // NON-VACUITY BREAK: fall through to the generic decode error.'
