@@ -713,13 +713,14 @@ session's rows costs only speed.
 
 ### 4.4 `export_facts`
 
-Usage facts for metering: one row per billing-homogeneous slice of a finished run.
+Usage facts for metering: one row per billing-homogeneous slice of a finished run. The same
+table also carries sessionless System One facts and per-step diagnostic facts (`kind`, below).
 
 | Column | Type | Notes |
 |---|---|---|
 | `export_seq` | INTEGER PRIMARY KEY AUTOINCREMENT | Insertion order. Increasing but **not dense**. |
 | `fact_id` | TEXT NOT NULL UNIQUE | SHA-256 (hex) over the length-prefixed source instance id, triple, run id and the segment ordinal. Independent of usage and time. |
-| `run_id` | TEXT NOT NULL | Indexed (`export_facts_run_id`). |
+| `run_id` | TEXT NOT NULL | Indexed (`export_facts_run_id`). Empty on flow System One facts and on every model step fact. |
 | `segment_json` | TEXT NOT NULL | The fact (below). |
 
 Older files had a `session` column and a second `fact_id` index; both are dropped when the
@@ -754,6 +755,61 @@ outbox in the same transaction as the paid outcome and frozen-rate ceiling spend
 Publishing inserts once into `export_facts`, then acknowledges the outbox. A crash
 on either side of that acknowledgement only replays the same immutable bytes.
 
+**Model step facts** dispatch on `kind: "model_step"`: one row per committed model step
+(one durable `model_step_finished`), written while the run is still going. They are
+diagnostics, **never spend**: nothing in broca's billing reads them, and they never replace,
+split or change a session fact or its `fact_id`. Members, in serialized order:
+
+| Member | Meaning |
+|---|---|
+| `fact_id` | Lowercase hex SHA-256 over the length-prefixed UTF-8 bytes of `model_step/v1`, `lineage_id` and `run_id`, then `step_id` as 8 little-endian bytes. Each length prefix is the byte length as 8 little-endian bytes. |
+| `lineage_id` | The session WAL's lineage id in UUID form (the `meta.lineage_id` / run-event `epoch` string). A replaced or re-imported WAL has a new one. |
+| `run_id` | broca's episode id, the same value as the run's session facts. |
+| `step_id` | The run's model step number: 1 for its first committed step, +1 per committed step. A step answered after retries, or asked again after an auth pause or a crash resume, keeps its number, so (`run_id`, `step_id`) names one committed step. |
+| `session_ref` | The 32-hex session reference run events carry. |
+| `session`, `agent_id`, `agent_run_id` | Exactly as on the run's session facts (the bind triple, and the scope's agent and agent run; the last two absent when unscoped). |
+| `provider`, `model` | The run's frozen model handle, as on session facts. |
+| `variant`, `wire_family` | The frozen reasoning variant and the frozen render config's `family_id`; each absent when not frozen. |
+| `usage` | This step's `Usage` (section 2.5): same members, nesting and absent-versus-zero rule as session facts. |
+| `finish_reason` | The provider's finish reason for the step; absent when it reported none. |
+| `attempts`, `retried` | Provider HTTP attempts for this step, retries and aborted attempts included (also those cut short by an auth pause under the same step number): the larger of the step's `model_attempt_finished` count and `retries_used + 1`. `retried` is `attempts > 1`. Aborted attempts never get rows of their own. |
+| `request_body_len`, `request_body_sha256` | From the `model_attempt_finished` of the attempt that produced the committed answer; absent when the WAL has no attempt record for the step. |
+| `started_at_ms` | The step's first attempt's `sent_at_ms`. |
+| `first_content_at_ms`, `finished_at_ms` | The committed attempt's `first_content_at_ms` and `ts_ms`. Each timing member is absent when not recorded. |
+| `context_limit` | The run's frozen context limit; absent when none. |
+| `cache_policy` | The frozen render config's prompt-cache policy: `class` (`markers`, `hints`, `none`), and when present `ttl` (`5m`/`1h`, marker breakpoint lifetime), `max_breakpoints`, `retention` (hints). Absent when the run froze none. |
+
+No prompt, assistant text, tool argument or tool output is carried. A step fact leaves the SQL
+`run_id` column **empty**: the startup catch-up finds terminal runs missing their session facts
+by asking whether any row carries the run's id, and a step row there would hide a run whose
+billing facts were lost. Steps of runs installed from another machine (`export_imported_runs`)
+are not written; that machine reports them.
+
+**Writer.** A background task in the daemon, never the request path. Every successful WAL
+barrier hints the session's durable head; on the next pass (every 250 ms) the task reads the WAL
+tail after the session's checkpoint in `model_step_projection` and commits the new step facts
+and the advanced checkpoint in **one** transaction (at most 128 facts each). A crash before that
+commit writes neither, so the range is derived again; a crash after it leaves the checkpoint past
+those steps, so they are never derived twice, and `fact_id` makes any re-derivation hit the
+existing row. On the first start of a build with this writer, a resumable walk derives the last
+30 days of steps from the WALs still on disk (every session with a run whose
+`run_index.state_changed_ms` is in that window, or a run still active or paused), in 100 ms slices
+between live passes, logging its progress every 30 s under target `export`. Later starts walk the
+sessions changed since the previous walk began, which covers a crash between a step becoming
+durable and its fact being written. `model_step_projection`, `export_fact_expiry` and
+`model_step_walk` are internal bookkeeping.
+
+**Expiry: the boundary between billing and diagnostics.** A model step fact is deleted 30 days
+after `finished_at_ms` (or, when the WAL recorded no attempt time, after its run's
+`run_started.ts_ms`, or after the time it was written when neither exists), at exactly that
+millisecond, by a sweep that runs every 10 minutes in transactions of at most 500 rows. A step
+already that old is never written, so re-reading an old WAL cannot bring one back. The sweep
+deletes only rows it recorded in `export_fact_expiry` and re-checks `kind = "model_step"` before
+each delete. **Session facts are the billing record and are kept forever; System One facts are
+kept forever too.** Neither is ever touched by the sweep. A consumer that needs a step longer than
+30 days must copy it within that window; an `export_seq` whose row was swept simply no longer
+appears in a page.
+
 A run gets a new slice at every `run_config_refrozen` and `run_auth_refrozen`. A slice's
 `usage` is the sum of its `model_step_finished` usages.
 
@@ -772,8 +828,8 @@ of spend.
 
 `export_steps`, a per-step usage table added in v0.3.125, was removed in v0.3.127. Every
 open runs `DROP TABLE IF EXISTS export_steps`. Rolling back to v0.3.125 or v0.3.126
-recreates it empty. Per-step usage is in the WAL
-(`model_step_finished.usage`).
+recreates it empty. Per-step usage is in the WAL (`model_step_finished.usage`) and, for the
+last 30 days, in the `kind: "model_step"` facts above.
 
 ### 4.5 `export_meta`
 
@@ -916,7 +972,7 @@ expectation of how long a step or a tool call may take.
 | Question | Read |
 |---|---|
 | Spend, per run or per period | `export_facts.segment_json` (a stable contract). |
-| Per-step usage or service tier | WAL `model_step_finished`. |
+| Per-step usage or service tier | WAL `model_step_finished`; the last 30 days of steps also as `kind: "model_step"` facts in `export_facts` (no service tier). |
 | Run state by `run_id` | `run_index.state`. Treat `active`/`paused` as possibly stale and confirm from the WAL if it matters. |
 | When a run started / ended | WAL `run_started.ts_ms` / `run_finished.ts_ms`, or the fact's `occurred_at_ms`. |
 | Last activity of an active run | WAL file mtime (section 5.3). |
@@ -948,6 +1004,7 @@ it may change without notice.
 | Archive container format version 1 (section 3.2) and the live-first resolution rule | Stable | Sealed containers are immutable and must stay readable; the header carries a format version for any future layout. |
 | `fold-*.journal` contents | Internal | Crash-recovery state of the fold pass. |
 | `export_facts` table and `segment_json` | Stable | The documented metering contract. Facts are immutable; new fields are optional and change neither existing bytes nor `fact_id`. |
+| `kind: "model_step"` facts | Stable (additive) | Immutable while they exist, but deleted 30 days after the step finished (section 4.4). Never spend. |
 | `export_facts.export_seq` as an increasing cursor | Stable | Consumers cursor on it. It is not dense. |
 | `export_meta` | Metering source identity | Direct readers use `source_instance_id`, `source_epoch`, and `high_water` to detect database replacement and track incremental reads. |
 | `run_index` | Internal | An operational projection, not a declared contract. Its changes have so far been additive columns, but nothing promises that. The `session` column's JSON encoding, the state strings and `state_changed_ms` are the parts least likely to move. |

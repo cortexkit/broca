@@ -33,6 +33,7 @@ pub mod consumer_routes;
 pub mod context_management;
 pub mod keep_warm_quota;
 pub mod manifest;
+pub mod model_step_facts;
 pub mod opencode_go_identity;
 pub mod provider_overrides;
 pub mod run_routing;
