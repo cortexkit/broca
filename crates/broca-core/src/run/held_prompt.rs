@@ -11,7 +11,7 @@ pub(super) fn release_read_metadata(prior: &mut crate::ReplayState) {
     prior.open_tool_run = None;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GuidanceEpisode {
     pub render: broca_protocol::request::EpisodeRenderInput,
     pub first_step: Option<u64>,
@@ -55,6 +55,32 @@ impl GuidanceEpisodes {
         if let Some(active) = self.episodes.last_mut() {
             active.first_step.get_or_insert(ordinal);
         }
+    }
+
+    /// Know again the earlier episodes of messages a newer view holds after they were released,
+    /// so [`Self::retain`] keeps their render inputs while those messages are held. An episode
+    /// already known keeps its entry; the active episode stays last.
+    ///
+    /// An inserted episode ends no later than the next known episode starts. That bounds an
+    /// episode whose end its source could not tell (the newest one a store projected): every
+    /// held message's own episode is known, so no held message falls between.
+    pub(super) fn restore(&mut self, episodes: Vec<GuidanceEpisode>) {
+        for mut episode in episodes {
+            let start = episode.render.prompt_start;
+            if let Err(at) = self
+                .episodes
+                .binary_search_by_key(&start, |known| known.render.prompt_start)
+            {
+                if let Some(next) = self.episodes.get(at) {
+                    episode.end = episode.end.min(next.render.prompt_start as u64);
+                    self.episodes.insert(at, episode);
+                }
+            }
+        }
+    }
+
+    pub(super) fn into_episodes(self) -> Vec<GuidanceEpisode> {
+        self.episodes
     }
 
     pub(super) fn retain(
@@ -144,6 +170,47 @@ pub(crate) fn held_by(
         })
 }
 
+/// Hold again the released messages a newly applied view keeps (`reheld`, read back in prompt
+/// form to decide it), merged in by ordinal with their stored originals, before [`release`]
+/// trims the prompt to that view. Returns whether the prompt changed. Every message already in
+/// `prompt` is stamped at a step boundary, so the inserted messages are counted as stamped and
+/// the next ordinal stays `extent`.
+pub(super) fn rehold(
+    prompt: &mut Vec<Message>,
+    originals: Option<&mut crate::compaction::OriginalMessages>,
+    position: &mut PromptPosition,
+    episodes: &mut GuidanceEpisodes,
+    reheld: crate::compaction::ReleasedMessages,
+) -> bool {
+    debug_assert_eq!(position.extent(prompt), position.stamped_len);
+    episodes.restore(reheld.episodes);
+    let mut inserted = 0;
+    let mut merged = Vec::with_capacity(prompt.len() + reheld.prompt.len());
+    let mut extra = reheld.prompt.into_iter().peekable();
+    for message in prompt.drain(..) {
+        if let Some(ordinal) = message.ordinal {
+            while let Some(next) = extra.next_if(|next| next.ordinal <= Some(ordinal)) {
+                // A message the prompt already holds is never duplicated.
+                if next.ordinal != Some(ordinal) {
+                    merged.push(next);
+                    inserted += 1;
+                }
+            }
+        }
+        merged.push(message);
+    }
+    for message in extra {
+        merged.push(message);
+        inserted += 1;
+    }
+    *prompt = merged;
+    if let Some(originals) = originals {
+        originals.insert_originals(reheld.originals, prompt);
+    }
+    position.held_stamped += inserted;
+    inserted > 0
+}
+
 pub(super) fn release(
     prompt: &mut Vec<Message>,
     state: Option<&crate::compaction::CompactionState>,
@@ -221,6 +288,98 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(Some(0), Some(1), 10), (Some(20), Some(21), 30)]
         );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn restored_episodes_are_ordered_bounded_and_never_replace_known_ones() {
+        let render = |start: usize| broca_protocol::request::EpisodeRenderInput {
+            prompt_start: start,
+            first_user: Some(start),
+            frozen_config: serde_json::json!({"episode":start}),
+        };
+        let mut episodes = GuidanceEpisodes::new(&[render(10), render(30)], Some(&[11..20]), 40);
+        let episode = |start: usize, end: u64| GuidanceEpisode {
+            render: render(start),
+            first_step: Some(start as u64 + 1),
+            end,
+        };
+        episodes.restore(vec![
+            episode(0, 10),
+            episode(20, u64::MAX),
+            episode(10, 99),
+            episode(50, u64::MAX),
+        ]);
+        assert_eq!(
+            episodes
+                .episodes()
+                .iter()
+                .map(|episode| (episode.render.prompt_start, episode.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 10), (10, 30), (20, 30), (30, 40)],
+            "an unknown end stops at the next known episode; the active one stays last"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn reheld_messages_join_in_ordinal_order_without_moving_the_next_ordinal() {
+        let mut prompt = vec![Message::new(Role::User, vec![]); 3];
+        for (message, ordinal) in prompt.iter_mut().zip([0, 5, 6]) {
+            message.ordinal = Some(ordinal);
+        }
+        let mut position = PromptPosition::restored(7, 3);
+        let render = |start: usize| broca_protocol::request::EpisodeRenderInput {
+            prompt_start: start,
+            first_user: Some(start),
+            frozen_config: serde_json::json!({"episode":start}),
+        };
+        let mut episodes = GuidanceEpisodes::new(&[render(4)], Some(&[5..7]), 7);
+        let reheld = |ordinal: u64| {
+            let mut message = Message::new(Role::Assistant, vec![]);
+            message.ordinal = Some(ordinal);
+            message
+        };
+        let mut originals = crate::compaction::OriginalMessages::default();
+        assert!(rehold(
+            &mut prompt,
+            Some(&mut originals),
+            &mut position,
+            &mut episodes,
+            crate::compaction::ReleasedMessages {
+                prompt: vec![reheld(2), reheld(3), reheld(5)],
+                originals: vec![reheld(3)],
+                stored: Vec::new(),
+                episodes: vec![GuidanceEpisode {
+                    render: render(0),
+                    first_step: Some(1),
+                    end: u64::MAX,
+                }],
+            },
+        ));
+        assert_eq!(
+            episodes
+                .episodes()
+                .iter()
+                .map(|episode| (episode.render.prompt_start, episode.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 7)],
+            "the reheld messages' episode is known again"
+        );
+        assert_eq!(
+            prompt
+                .iter()
+                .map(|message| message.ordinal.unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3, 5, 6],
+            "a message already held is not duplicated"
+        );
+        assert_eq!(prompt[3].role, Role::User);
+        assert_eq!(originals.len(), 1);
+        assert_eq!(position.extent(&prompt), 7);
+        prompt.push(Message::new(Role::User, vec![]));
+        position.stamp(&mut prompt);
+        assert_eq!(prompt.last().unwrap().ordinal, Some(7));
     }
 
     #[test]

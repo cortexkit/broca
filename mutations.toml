@@ -28651,3 +28651,120 @@ expect_red = ["supplied_media_tests::a_send_naming_media_inline_is_refused_with_
 file = "crates/broca-wire/src/lib.rs"
 old = '            .and_then(|parts| parts.iter().position(names_media_inline))'
 new = '            .and_then(|_| None::<usize>) // NON-VACUITY BREAK: fall through to the generic decode error.'
+
+[[control]]
+id = "released-history-judging-merges-read-back-messages"
+guards = "A newer view is decided over the live prompt with the released messages it needs merged back in by ordinal"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::a_later_view_copying_a_released_signed_message_is_accepted_like_a_full_run"]
+file = "crates/broca-core/src/compaction/released.rs"
+old = "                    merged.push(next.clone());"
+new = "                    let _ = next; // NON-VACUITY BREAK: judge without the read-back messages"
+
+[[control]]
+id = "released-history-needs-stored-copies"
+guards = "Replace ranges whose replacement could copy model-authored content are read back as stored to judge authorship"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/released.rs"
+expect_red = ["compaction::released::tests::needs_cover_kept_uncovered_and_judged_ordinals_the_prompt_lacks"]
+file = "crates/broca-core/src/compaction/released.rs"
+old = "                absent(prompt, *from, (*to).min(extent), &mut needs.stored);"
+new = "                    let _ = (from, to); // NON-VACUITY BREAK: never read the stored messages a copy stands for"
+
+[[control]]
+id = "released-history-prompt-form-tags"
+guards = "Messages read back for a decision carry the runner tags the full prompt shows"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::released_lookup_returns_the_transcript_message_of_the_full_prompt"]
+file = "crates/broca-core/src/run/released_history.rs"
+old = "                form.render(&mut shown);"
+new = "                let _ = &form; // NON-VACUITY BREAK: read back stored text without runner tags"
+
+[[control]]
+id = "released-history-prompt-form-guidance"
+guards = "Tool results read back for a decision carry the repetition guidance their episode's fold gives them"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::released_lookup_returns_the_transcript_message_of_the_full_prompt"]
+file = "crates/broca-core/src/run/released_history.rs"
+old = "            .filter(|first| *first < fold_end);"
+new = "            .filter(|first| *first < fold_end && false); // NON-VACUITY BREAK: skip the guidance fold"
+
+[[control]]
+id = "released-history-store-episode-first-step"
+guards = "Store-read messages fold guidance from the projected first model step, matching a WAL replay"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::released_messages_read_from_store_pages_match_the_wal"]
+file = "crates/broca-core/src/run/released_history.rs"
+old = "            first_step: projected.first_step().flatten(),"
+new = "            first_step: projected.first_step().flatten().map(|first| first + 1), // NON-VACUITY BREAK: fold from the wrong step"
+
+[[control]]
+id = "released-history-rehold-kept-messages"
+guards = "Released messages a newly applied view keeps are held again before anything renders under it"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::a_later_view_editing_a_released_message_renders_like_a_full_run"]
+file = "crates/broca-core/src/run/held_prompt.rs"
+old = "                    merged.push(next);"
+new = "                    let _ = next; // NON-VACUITY BREAK: render the new view without the kept messages"
+
+[[control]]
+id = "released-history-rehold-episodes"
+guards = "Holding released messages again restores their episodes' render inputs"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/held_prompt.rs"
+expect_red = ["run::held_prompt::tests::reheld_messages_join_in_ordinal_order_without_moving_the_next_ordinal"]
+file = "crates/broca-core/src/run/held_prompt.rs"
+old = "    episodes.restore(reheld.episodes);"
+new = "    drop(reheld.episodes); // NON-VACUITY BREAK: forget the reheld messages' episodes"
+
+[[control]]
+id = "released-history-restored-episode-end"
+guards = "A restored episode whose end its source did not know ends at the next known episode"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/held_prompt.rs"
+expect_red = ["run::held_prompt::tests::restored_episodes_are_ordered_bounded_and_never_replace_known_ones"]
+file = "crates/broca-core/src/run/held_prompt.rs"
+old = "                    episode.end = episode.end.min(next.render.prompt_start as u64);"
+new = "                    let _ = next; // NON-VACUITY BREAK: keep an unbounded episode end"
+
+[[control]]
+id = "released-history-unavailable-refuses"
+guards = "A view keeping released messages that neither the store nor the WAL can supply is refused, never decided over a short history"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::a_later_view_whose_released_messages_cannot_be_read_is_refused_not_rendered_short"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "                                view::Decision::Refuse(view::HISTORY_UNAVAILABLE)"
+new = "                                view::decide_stored_at(fetched, ready, state, lineage_id, prompt, stored, prefix_bound, run_start) // NON-VACUITY BREAK: decide over the released prompt"

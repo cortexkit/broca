@@ -1599,6 +1599,7 @@ async fn expire_rig(mut rig: Rig) -> Rig {
         None,
         Some(rig.wal_store()),
         None,
+        None,
     ));
     let expire = async {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
@@ -2540,6 +2541,7 @@ async fn running_approved_resume_without_elicitation_plane_never_dispatches() {
         None,
         Some(&tools.store),
         None,
+        None,
     ))
     .await;
     assert!(
@@ -2602,6 +2604,7 @@ async fn recorded_late_approval_without_elicitation_plane_never_dispatches() {
         &out,
         None,
         Some(rig.wal_store()),
+        None,
         None,
     ))
     .await;

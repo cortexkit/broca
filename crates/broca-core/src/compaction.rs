@@ -30,7 +30,9 @@ use std::{
 };
 
 pub use broca_wal::MAX_REPLACEMENT_BYTES;
+mod released;
 mod stored;
+pub(crate) use released::{ReleasedHistory, ReleasedMessages, ReleasedNeeds};
 pub use runtime::{
     apply_idle_view, CompactionConfig, CompactionPlane, CompactionUnavailable, CompactionViews,
     ViewReadyInbox,

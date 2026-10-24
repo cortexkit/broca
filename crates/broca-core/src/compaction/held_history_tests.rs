@@ -11,9 +11,22 @@ enum WaitViews {
     BoundaryThenRide,
 }
 
+/// What the provider's second view (version 3) does with the messages the first one replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Later {
+    /// The same shape as the first view, covering more.
+    Same,
+    /// Replace `[0, 2)` with a summary and a copy of the stored signed message at ordinal 1
+    /// (with one byte of its signature changed when `tamper`), and keep `[2, coverage]`.
+    CopySigned { tamper: bool },
+    /// Replace `[0, 2)` with a summary and keep `[2, coverage]`, editing the text of ordinal 2.
+    EditReleased,
+}
+
 struct Windows {
     wal: Shared,
     newer: bool,
+    later: Later,
     lineage: Mutex<String>,
     wait: WaitViews,
     releases: Arc<AtomicUsize>,
@@ -24,6 +37,48 @@ impl Windows {
     fn candidate(&self, session: &str, version: u64) -> CompactionView {
         let state = crate::replay(&self.wal.records()).unwrap();
         let covered = if version == 2 { 2 } else { state.extent - 1 };
+        if version == 3 && self.later != Later::Same {
+            let mut replacement = vec![text(Role::User, "summary of the first exchange")];
+            let mut edits = Vec::new();
+            match self.later {
+                Later::CopySigned { tamper } => {
+                    let mut copy = state.prompt[1].clone();
+                    assert!(copy.content.iter().any(super::is_signed));
+                    if tamper {
+                        let ContentBlock::Reasoning {
+                            signature: Some(signature),
+                            ..
+                        } = &mut copy.content[0]
+                        else {
+                            panic!("ordinal 1 starts with signed reasoning");
+                        };
+                        signature.pop();
+                        signature.push('f');
+                    }
+                    replacement.push(copy);
+                }
+                Later::EditReleased => edits.push(PartEdit::replace(
+                    2,
+                    "m2",
+                    broca_protocol::tags::part_key(2, 0),
+                    json!({"type":"text","text":"edited second question"}).to_string(),
+                )),
+                Later::Same => unreachable!(),
+            }
+            return CompactionView::new(
+                session,
+                version,
+                self.lineage.lock().unwrap().clone(),
+                MessageRef {
+                    ordinal: covered,
+                    mid: format!("m{covered}"),
+                },
+                vec![
+                    ViewRange::replace(0, 2, serde_json::to_string(&replacement).unwrap()),
+                    ViewRange::keep_with_edits(2, covered + 1, edits),
+                ],
+            );
+        }
         CompactionView::new(
             session,
             version,
@@ -202,16 +257,38 @@ async fn run_episode(
         EpisodeScenario {
             mode,
             wait,
-            budget: true,
+            ..EpisodeScenario::fresh(Later::Same)
         },
     )
     .await
 }
 
+/// The prompt a run held when each view was first rendered, by view version.
+type ViewPrompts = Arc<Mutex<Vec<(u64, Vec<Message>)>>>;
+
 struct EpisodeScenario {
     mode: crate::StartMode,
     wait: WaitViews,
     budget: bool,
+    later: Later,
+    /// The WAL refuses to be read once a view applied, so released messages cannot be read
+    /// back from it.
+    history_unavailable: bool,
+    /// Receives the prompt the run holds when each view is first rendered, by view version.
+    prompts: Option<ViewPrompts>,
+}
+
+impl EpisodeScenario {
+    fn fresh(later: Later) -> Self {
+        Self {
+            mode: crate::StartMode::FreshOrResume,
+            wait: WaitViews::Off,
+            budget: true,
+            later,
+            history_unavailable: false,
+            prompts: None,
+        }
+    }
 }
 
 async fn run_configured(
@@ -222,7 +299,14 @@ async fn run_configured(
     store: Option<Arc<dyn crate::SessionStore>>,
     scenario: EpisodeScenario,
 ) -> (Vec<CallOptions>, Vec<Held>) {
-    let EpisodeScenario { mode, wait, budget } = scenario;
+    let EpisodeScenario {
+        mode,
+        wait,
+        budget,
+        later,
+        history_unavailable,
+        prompts,
+    } = scenario;
     let (mut request, mut control, _) = history_request();
     request.input.extend([
         text(Role::Assistant, "third answer"),
@@ -259,6 +343,7 @@ async fn run_configured(
     let windows = Arc::new(Windows {
         wal: shared.clone(),
         newer,
+        later,
         lineage: Mutex::new(String::new()),
         wait,
         releases: releases.clone(),
@@ -276,10 +361,20 @@ async fn run_configured(
     control.retain_full_prompt = retain;
     let release_count = releases.clone();
     control.view_release_probe = Some(Arc::new(move |prompt, extent, state| {
-        let covered = state.view.as_ref().unwrap().view.covers_through.ordinal;
+        let view = &state.view.as_ref().unwrap().view;
+        if let Some(prompts) = &prompts {
+            let mut prompts = prompts.lock().unwrap();
+            if prompts.last().map(|(version, _)| *version) != Some(view.view_version) {
+                prompts.push((view.view_version, prompt.to_vec()));
+            }
+        }
         if !retain {
-            let expected = std::iter::once(0)
-                .chain(covered + 1..extent)
+            let expected = (0..extent)
+                .filter(|ordinal| {
+                    let mut message = Message::new(Role::User, vec![]);
+                    message.ordinal = Some(*ordinal);
+                    crate::run::held_prompt::held_by(view, &message)
+                })
                 .collect::<Vec<_>>();
             assert_eq!(
                 prompt
@@ -345,7 +440,7 @@ async fn run_configured(
         &model,
         &tools,
         &crate::AllowAll,
-        &ResumeWal(shared),
+        &ResumeWal(shared, history_unavailable),
         store,
         control,
         &out,
@@ -491,12 +586,22 @@ fn assert_records(actual: &[WalRecord], expected: &[WalRecord]) {
     }
 }
 
-struct ResumeWal<'a>(&'a Shared);
+struct ResumeWal<'a>(&'a Shared, bool);
 impl crate::WalStore for ResumeWal<'_> {
     fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
         crate::WalStore::open(self.0, session)
     }
     fn read_records(&self, _: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
+        let applied = self
+            .0
+            .records()
+            .iter()
+            .any(|record| matches!(record, WalRecord::CompactionViewApplied { .. }));
+        if self.1 && applied {
+            return Err(WalError::Io(std::io::Error::other(
+                "the WAL cannot be read",
+            )));
+        }
         Ok(self.0.frames())
     }
     fn read_records_range(
@@ -888,9 +993,8 @@ async fn admission_only_prefix_and_tail_views_keep_episode_metadata() {
         scripts(0),
         None,
         EpisodeScenario {
-            mode: crate::StartMode::FreshOrResume,
-            wait: WaitViews::Off,
             budget: false,
+            ..EpisodeScenario::fresh(Later::Same)
         },
     )
     .await;
@@ -936,9 +1040,8 @@ async fn admission_only_prefix_and_tail_views_keep_episode_metadata() {
         scripts(3),
         Some(store.clone()),
         EpisodeScenario {
-            mode: crate::StartMode::FreshOrResume,
-            wait: WaitViews::Off,
             budget: false,
+            ..EpisodeScenario::fresh(Later::Same)
         },
     )
     .await;
@@ -952,4 +1055,380 @@ async fn admission_only_prefix_and_tail_views_keep_episode_metadata() {
             crate::canonical_request_bytes(expected)
         );
     }
+}
+
+/// Run the scripted episode with `later` as the provider's second view, holding everything
+/// (`retain`) or releasing history; returns the requests, the held prompts and the prompt the
+/// run held each time a view applied.
+async fn run_later(
+    shared: &Shared,
+    retain: bool,
+    later: Later,
+    history_unavailable: bool,
+) -> (Vec<CallOptions>, Vec<Held>, Vec<(u64, Vec<Message>)>) {
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let (calls, held) = run_configured(
+        shared,
+        retain,
+        true,
+        scripts(0),
+        None,
+        EpisodeScenario {
+            history_unavailable,
+            prompts: Some(prompts.clone()),
+            ..EpisodeScenario::fresh(later)
+        },
+    )
+    .await;
+    let prompts = std::mem::take(&mut *prompts.lock().unwrap());
+    (calls, held, prompts)
+}
+
+fn assert_same_requests(actual: &[CallOptions], expected: &[CallOptions]) {
+    assert_eq!(actual.len(), expected.len());
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(
+            String::from_utf8(crate::canonical_request_bytes(actual)).unwrap(),
+            String::from_utf8(crate::canonical_request_bytes(expected)).unwrap(),
+            "request {index}"
+        );
+    }
+}
+
+fn request_text(call: &CallOptions) -> String {
+    String::from_utf8(crate::canonical_request_bytes(call)).unwrap()
+}
+
+fn records_text(records: &[WalRecord]) -> String {
+    serde_json::to_string(records).unwrap()
+}
+
+#[tokio::test]
+async fn a_later_view_copying_a_released_signed_message_is_accepted_like_a_full_run() {
+    let later = Later::CopySigned { tamper: false };
+    let full = Shared::default();
+    let (expected, _, _) = run_later(&full, true, later, false).await;
+    let sparse = Shared::default();
+    let (actual, held, _) = run_later(&sparse, false, later, false).await;
+    assert_eq!(views_applied(&full.records()), vec![2, 3]);
+    assert_eq!(
+        views_applied(&sparse.records()),
+        vec![2, 3],
+        "the copy of the released signed message is judged against its stored bytes"
+    );
+    assert_same_requests(&actual, &expected);
+    assert_records(&sparse.records(), &full.records());
+    let last = request_text(actual.last().unwrap());
+    for shown in [
+        "summary of the first exchange",
+        "first answer",
+        "second question",
+    ] {
+        assert!(last.contains(shown), "{shown} is rendered: {last}");
+    }
+    // Ordinal 2 was released under the first view; the second keeps it, so it is held again.
+    let last_held = held.last().unwrap();
+    assert_eq!(last_held.ordinals.first(), Some(&2));
+    assert_eq!(
+        last_held.ordinals,
+        (2..last_held.extent).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn a_later_view_with_one_changed_byte_in_a_released_signed_copy_is_refused() {
+    let later = Later::CopySigned { tamper: true };
+    let full = Shared::default();
+    let (expected, _, _) = run_later(&full, true, later, false).await;
+    let sparse = Shared::default();
+    let (actual, held, _) = run_later(&sparse, false, later, false).await;
+    for records in [full.records(), sparse.records()] {
+        assert_eq!(
+            views_applied(&records),
+            vec![2],
+            "the first view stays applied"
+        );
+        assert!(records_text(&records).contains("view_refused:3:provider_constraint"));
+    }
+    assert_same_requests(&actual, &expected);
+    assert_records(&sparse.records(), &full.records());
+    assert!(!request_text(actual.last().unwrap()).contains("summary of the first exchange"));
+    let last_held = held.last().unwrap();
+    assert_eq!(
+        last_held.ordinals,
+        std::iter::once(0)
+            .chain(3..last_held.extent)
+            .collect::<Vec<_>>(),
+        "the messages read back to judge the refused view were released again"
+    );
+}
+
+#[tokio::test]
+async fn a_later_view_editing_a_released_message_renders_like_a_full_run() {
+    let later = Later::EditReleased;
+    let full = Shared::default();
+    let (expected, _, _) = run_later(&full, true, later, false).await;
+    let sparse = Shared::default();
+    let (actual, _, _) = run_later(&sparse, false, later, false).await;
+    assert_eq!(views_applied(&full.records()), vec![2, 3]);
+    assert_eq!(views_applied(&sparse.records()), vec![2, 3]);
+    assert_same_requests(&actual, &expected);
+    assert_records(&sparse.records(), &full.records());
+    assert!(request_text(actual.last().unwrap()).contains("edited second question"));
+}
+
+#[tokio::test]
+async fn a_later_view_whose_released_messages_cannot_be_read_is_refused_not_rendered_short() {
+    let sparse = Shared::default();
+    let (actual, held, _) =
+        run_later(&sparse, false, Later::CopySigned { tamper: false }, true).await;
+    let records = sparse.records();
+    assert_eq!(views_applied(&records), vec![2]);
+    assert!(records_text(&records).contains("view_refused:3:history_unavailable"));
+    for call in &actual {
+        assert!(!request_text(call).contains("summary of the first exchange"));
+    }
+    let last_held = held.last().unwrap();
+    assert_eq!(
+        last_held.ordinals,
+        std::iter::once(0)
+            .chain(3..last_held.extent)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The full-run prompt at the second view's decision, the first view, the second view, and
+/// that prompt released to the first view's held set.
+fn released_case(
+    shared: &Shared,
+    prompts: &[(u64, Vec<Message>)],
+) -> (Vec<Message>, CompactionView, CompactionView, Vec<Message>) {
+    let applied: Vec<CompactionView> = shared
+        .records()
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::CompactionViewApplied { view, choice, .. } => {
+                Some(view::AppliedView::decode(view, choice).unwrap().view)
+            }
+            _ => None,
+        })
+        .collect();
+    let [first, second] = <[CompactionView; 2]>::try_from(applied).unwrap();
+    // The run holds everything, so the prompt it held when the second view first rendered is
+    // the prompt that view was decided over at that boundary.
+    let full = prompts
+        .iter()
+        .find(|(version, _)| *version == second.view_version)
+        .unwrap()
+        .1
+        .clone();
+    let released: Vec<Message> = full
+        .iter()
+        .filter(|message| crate::run::held_prompt::held_by(&first, message))
+        .cloned()
+        .collect();
+    (full, first, second, released)
+}
+
+fn prompt_form() -> crate::run::released_history::PromptForm {
+    crate::run::released_history::PromptForm {
+        render_tags: true,
+        render_config: crate::Provider::render_config_blob(&HistoryModel(
+            crate::StubProvider::new(vec![]),
+        )),
+    }
+}
+
+#[tokio::test]
+async fn released_lookup_returns_the_transcript_message_of_the_full_prompt() {
+    let full_wal = Shared::default();
+    let (_, _, prompts) = run_later(&full_wal, true, Later::EditReleased, false).await;
+    let (full, _, second, released) = released_case(&full_wal, &prompts);
+    let extent = full.last().unwrap().ordinal.unwrap() + 1;
+    assert!(
+        !released.iter().any(|message| message.ordinal == Some(2)),
+        "the edited message lies outside the held set"
+    );
+    let stored = StoredTranscript::plain(&released).with_extent(extent);
+    let needs = released::released_needs(&second, &released, stored, extent);
+    assert!(needs.prompt.iter().any(|range| range.contains(&2)));
+    let wal = ResumeWal(&full_wal, false);
+    let writer = full_wal.writer();
+    let history = crate::run::released_history::RunHistory {
+        wal: Some(&wal),
+        store: None,
+        writer: &writer,
+        session: bind(),
+        form: prompt_form(),
+    };
+    let loaded = history.load(&needs).await.unwrap();
+    let judging = released::Judging::new(&released, stored, &loaded);
+    // `dispose_fetched` looks up the coverage's last message and each edited message.
+    for ordinal in [2, second.covers_through.ordinal] {
+        let looked_up = view::transcript_at(&judging.prompt, ordinal);
+        assert!(looked_up.is_some());
+        assert_eq!(looked_up, view::transcript_at(&full, ordinal), "m{ordinal}");
+    }
+    // Every message read back in prompt form has the full prompt's bytes, tags and repetition
+    // guidance included.
+    let everything = ReleasedNeeds {
+        prompt: std::iter::once(0..extent).collect(),
+        stored: Vec::new(),
+    };
+    let all = history.load(&everything).await.unwrap();
+    assert_eq!(all.prompt, full);
+    assert!(
+        serde_json::to_string(&all.prompt)
+            .unwrap()
+            .contains("Tool repetition guidance"),
+        "the fixture exercises the repetition guidance fold"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+/// A materialized store holding a whole transcript: raw rows by page and the episode
+/// projection, counting the page reads it answers.
+struct PagedStore {
+    rows: Vec<Message>,
+    episodes: Vec<crate::context::EpisodeRenderProjection>,
+    page_reads: AtomicUsize,
+}
+
+impl PagedStore {
+    fn from_wal(records: &[WalRecord]) -> Self {
+        let replay = crate::replay(records).unwrap();
+        let spans = replay.episode_step_spans.clone().unwrap();
+        let render = replay.render_episodes.clone().unwrap();
+        let episodes = render
+            .iter()
+            .enumerate()
+            .map(|(index, episode)| {
+                let start = episode.prompt_start as u64;
+                let end = render
+                    .get(index + 1)
+                    .map_or(replay.extent, |next| next.prompt_start as u64);
+                crate::context::EpisodeRenderProjection {
+                    start: Some(start),
+                    first_user: Some(episode.first_user.map(|user| user as u64)),
+                    first_step: Some(
+                        spans
+                            .iter()
+                            .map(|span| span.start as u64)
+                            .find(|first| start <= *first && *first < end),
+                    ),
+                    render_config: Some(episode.frozen_config.clone()),
+                }
+            })
+            .collect();
+        Self {
+            rows: replay.prompt,
+            episodes,
+            page_reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl crate::MaterializedStore for PagedStore {
+    fn read_prefix_with_watermark(&self, _: &BindIdentity) -> Result<crate::StorePrefix, String> {
+        panic!("released messages are read by page, never as a whole prefix")
+    }
+
+    fn read_page_with_watermark(
+        &self,
+        _: &BindIdentity,
+        from: Option<u64>,
+        limit: u64,
+        view: crate::context::ReadView,
+    ) -> Result<crate::context::StorePageSnapshot, String> {
+        assert_eq!(view, crate::context::ReadView::Raw);
+        self.page_reads.fetch_add(1, Ordering::SeqCst);
+        let from = from.unwrap();
+        // Pages are capped, so a long range takes several reads.
+        let end = from + limit.min(3);
+        Ok(crate::context::StorePageSnapshot {
+            watermark_seq: 7,
+            lineage_id: Some(fixture_lineage_id().to_string()),
+            prefix_len: self.rows.len() as u64,
+            rows: self
+                .rows
+                .iter()
+                .filter(|m| m.ordinal.is_some_and(|o| from <= o && o < end))
+                .map(|m| crate::context::StorePageRow {
+                    written_at: None,
+                    ordinal: m.ordinal.unwrap(),
+                    message: m.clone(),
+                    run: None,
+                })
+                .collect(),
+            ..crate::context::StorePageSnapshot::empty()
+        })
+    }
+
+    fn read_episode_projection(
+        &self,
+        _: &BindIdentity,
+    ) -> Result<Option<Vec<crate::context::EpisodeRenderProjection>>, String> {
+        Ok(Some(self.episodes.clone()))
+    }
+}
+
+impl crate::Persister for PagedStore {
+    fn project(&self, _: &BindIdentity, _: &[FramedRecord]) -> Result<u64, String> {
+        Ok(7)
+    }
+}
+
+#[tokio::test]
+async fn released_messages_read_from_store_pages_match_the_wal() {
+    let full_wal = Shared::default();
+    let (_, _, prompts) =
+        run_later(&full_wal, true, Later::CopySigned { tamper: false }, false).await;
+    let (full, _, second, released) = released_case(&full_wal, &prompts);
+    let extent = full.last().unwrap().ordinal.unwrap() + 1;
+    let store = Arc::new(PagedStore::from_wal(&full_wal.records()));
+    let writer = full_wal.writer();
+    writer.sync().await.unwrap();
+    let wal = ResumeWal(&full_wal, false);
+    let from_wal = crate::run::released_history::RunHistory {
+        wal: Some(&wal),
+        store: None,
+        writer: &writer,
+        session: bind(),
+        form: prompt_form(),
+    };
+    // No WAL reader: only the store can answer.
+    let from_store = crate::run::released_history::RunHistory {
+        wal: None,
+        store: Some(store.clone()),
+        writer: &writer,
+        session: bind(),
+        form: prompt_form(),
+    };
+    let stored = StoredTranscript::plain(&released).with_extent(extent);
+    let needs = released::released_needs(&second, &released, stored, extent);
+    assert!(
+        needs.stored.iter().any(|range| range.contains(&1)),
+        "the signed copy is judged against the stored message it stands for"
+    );
+    let everything = ReleasedNeeds {
+        prompt: std::iter::once(0..extent).collect(),
+        stored: vec![],
+    };
+    for needs in [needs, everything] {
+        let expected = from_wal.load(&needs).await.unwrap();
+        let actual = from_store.load(&needs).await.unwrap();
+        assert_eq!(actual.prompt, expected.prompt);
+        assert_eq!(actual.originals, expected.originals);
+        assert_eq!(actual.stored, expected.stored);
+        let renders = |loaded: &ReleasedMessages| {
+            loaded
+                .episodes
+                .iter()
+                .map(|episode| (episode.render.clone(), episode.first_step))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(renders(&actual), renders(&expected));
+    }
+    assert!(store.page_reads.load(Ordering::SeqCst) > 2);
+    writer.shutdown().await.unwrap();
 }
