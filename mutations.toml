@@ -3197,7 +3197,7 @@ test_file = "crates/broca-core/src/resume.rs"
 expect_red = ["resume::tests::seal_closes_prepared_calls_whatever_the_resolution"]
 file = "crates/broca-core/src/resume.rs"
 old = "if !matches!(prior.resolution, ReplayResolution::Interrupted { .. })\n        && !batch"
-new = "if !matches!(prior.resolution, ReplayResolution::Interrupted { .. })\n        || false && !batch // NON-VACUITY BREAK"
+new = "if !matches!(prior.resolution, ReplayResolution::Interrupted { .. })\n        || false /* NON-VACUITY BREAK: skip prepared close-out outside interruption. */ && !batch"
 
 # This proof checks the following behavior: a recorded approval decision never leaves a question-
 # withdrawal notice waiting to be acknowledged.
@@ -14560,7 +14560,7 @@ old = '''if settled.is_some_and(|answer| answer.decision == ConsentDecision::App
         report('''
 new = '''if settled.is_some_and(|answer| answer.decision == ConsentDecision::Approved) {
         let WalRecord::ToolCallDeferred { call_id, .. } = prepared else { unreachable!() };
-        durable(WalRecord::ApprovalRecorded { call_key: key.into(), call_id: call_id.clone(), elicitation_id: Some(recovered.id.clone()), decision: broca_wal::DeferredDecision::Approved, approval_digest: None, closing_result: None, tags: None }).await?; // NON-VACUITY BREAK
+        durable(WalRecord::ApprovalRecorded { call_key: key.into(), call_id: call_id.clone(), elicitation_id: Some(recovered.id.clone()), decision: broca_wal::DeferredDecision::Approved, closed_at_ms: None, approval_digest: None, closing_result: None, tags: None }).await?; // NON-VACUITY BREAK: authorize a recovered approval during crash close-out.
         report('''
 
 [[control]]
@@ -18563,11 +18563,12 @@ guards = "a resumed episode keeps its recorded provider_text_state instead of re
 runner = "cargo"
 package = "broca-module-serve"
 target = "--bin ck-broca"
+select = "expected"
 test_file = "crates/broca-module-serve/src/provider_override_tests.rs"
-expect_red = ["executor::tests::chatgpt_run_recorded_at_version_7_resumes_under_version_8", "executor::tests::every_declared_previous_version_resumes_through_the_executor_restore_path"]
+expect_red = ["executor::tests::every_declared_previous_version_resumes_through_the_executor_restore_path"]
 file = "crates/broca-catalog/src/live.rs"
-old = "            config.provider_text_state = recorded;"
-new = "            let _ = recorded; // NON-VACUITY BREAK: re-resolve the flag on resume"
+old = "        let mut frozen = recorded.clone();"
+new = "        let mut frozen = recorded.clone();\n        frozen.provider_text_state = true; // NON-VACUITY BREAK: enable provider text state instead of restoring its recorded value."
 
 [[control]]
 id = "bedrock-reasoning-text-decode"
@@ -23408,7 +23409,6 @@ expect_red = [
   "runtime::tests::a_reasoning_row_that_loses_its_flag_refuses_a_reasoning_send",
   "runtime::tests::a_model_missing_a_capability_or_context_fact_loads_it_as_unstated",
   "runtime::tests::curated_decision_rows_beside_chat_rows_refresh_without_refusing",
-  "runtime::tests::curated_system_one_rows_refresh_beside_chat_rows_without_moving_them",
 ]
 file = "crates/broca-catalog/src/runtime.rs"
 old = "            CapabilityFlag::Absent => CapabilityFlag::Unknown,"
@@ -25860,6 +25860,7 @@ guards = "Shipped sources, tests and scripts never name the removed foreign cred
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test it"
+select = "expected"
 test_file = "crates/broca-module-serve/tests/it/credential_source_guard.rs"
 expect_red = ["credential_source_guard::shipped_sources_never_name_another_apps_credential_store"]
 expect_message = "forbidden credential-store path in: crates/broca-module-serve/src/devtools.rs"
