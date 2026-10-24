@@ -1318,29 +1318,6 @@ impl WalRecord {
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
         let base = self.base_required_features();
-        let base = if matches!(
-            self,
-            Self::RunStarted {
-                written_at_ms: Some(_),
-                ..
-            } | Self::ModelStepFinished {
-                written_at_ms: Some(_),
-                ..
-            } | Self::Steered {
-                written_at_ms: Some(_),
-                ..
-            } | Self::Queued {
-                written_at_ms: Some(_),
-                ..
-            } | Self::SendDelivered {
-                written_at_ms: Some(_),
-                ..
-            }
-        ) {
-            with_feature(base, crate::framing::MESSAGE_TIMES_FEATURE)
-        } else {
-            base
-        };
         let base = if self.carries_media_content() {
             with_feature(base, crate::framing::MEDIA_CONTENT_FEATURE)
         } else {
@@ -1518,6 +1495,31 @@ impl WalRecord {
         };
         let base = if self.carries_google_rpc_error_details() {
             with_feature(base, crate::framing::GOOGLE_RPC_ERROR_DETAILS_FEATURE)
+        } else {
+            base
+        };
+        // Scope, session-class and input-cap helpers accept only their fixed older feature sets.
+        // Add message times afterward, so a timed record cannot reach those tables with a new name.
+        let base = if matches!(
+            self,
+            Self::RunStarted {
+                written_at_ms: Some(_),
+                ..
+            } | Self::ModelStepFinished {
+                written_at_ms: Some(_),
+                ..
+            } | Self::Steered {
+                written_at_ms: Some(_),
+                ..
+            } | Self::Queued {
+                written_at_ms: Some(_),
+                ..
+            } | Self::SendDelivered {
+                written_at_ms: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::MESSAGE_TIMES_FEATURE)
         } else {
             base
         };

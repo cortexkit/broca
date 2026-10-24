@@ -827,6 +827,33 @@ mod tests {
     }
 
     #[test]
+    fn message_times_compose_with_existing_admission_features() {
+        use super::*;
+        let mut value: serde_json::Value = serde_json::from_str(
+            include_str!("../tests/fixtures/before_message_times.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        value["written_at_ms"] = serde_json::json!(42);
+        value["session_class"] = serde_json::json!("head");
+        value["config"]["budget"] = serde_json::json!({"max_input_tokens":5});
+        let record: WalRecord = serde_json::from_value(value).unwrap();
+        for feature in [
+            MESSAGE_TIMES_FEATURE,
+            SESSION_CLASS_FEATURE,
+            INPUT_TOKEN_CAP_FEATURE,
+        ] {
+            assert!(record.required_features().contains(&feature));
+        }
+        assert!(matches!(
+            decode_next(&encode(1, 1, &record).unwrap()),
+            DecodeStep::Record { .. }
+        ));
+    }
+
+    #[test]
     fn incarnation_requires_a_uuid_v4_header() {
         use super::*;
         assert!(WalLineageId::from_bytes([0; 16]).incarnation().is_none());

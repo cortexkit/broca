@@ -43,9 +43,8 @@ async fn one_tool_turn(tag: &str) -> (Rig, String) {
 }
 
 /// A `session.read` and a `session.subscribe` from the start, each with no params, of a session
-/// whose one run called a tool, pinned byte for byte. Run attribution is emitted without
-/// requiring new request parameters; existing cursor/unit bytes remain pinned separately from
-/// added live metadata and message boundaries.
+/// whose one run called a tool. Existing member and cursor/unit bytes remain pinned separately
+/// from the default read-entry times, dispatch attribution, live metadata and message boundaries.
 #[tokio::test]
 async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
     let (mut rig, run_id) = one_tool_turn("pin-read").await;
@@ -57,9 +56,19 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
         .await;
     let page = result(&read);
     let lineage_id = page["lineage_id"].as_str().unwrap().to_owned();
-    // Every read now carries a `tool_calls` member on each message holding a tool call. With
-    // that member removed, the bytes are exactly the ones pinned before it existed.
-    let body = normalized(&read.body, &run_id, &lineage_id);
+    // Times are intentional default envelope additions. Require each one, then remove only
+    // its envelope spelling to compare the older member bytes; new shape goldens pin the additions.
+    let mut body = normalized(&read.body, &run_id, &lineage_id);
+    for entry in page["messages"].as_array().unwrap() {
+        let at = entry["written_at"]
+            .as_u64()
+            .expect("new messages have recorded times");
+        assert!(at > 0);
+        let ordinal = entry["ordinal"].as_u64().unwrap();
+        let timed = format!("\"written_at\":{at},\"ordinal\":{ordinal}");
+        assert_eq!(body.matches(&timed).count(), 1);
+        body = body.replace(&timed, &format!("\"ordinal\":{ordinal}"));
+    }
     let attribution = format!(
         r#","tool_calls":[{{"tool_call_id":"call-1","call_key":"@LINEAGE_ID@:5","dispatched_to":"{WORK_MODULE}","indeterminate":false}}]"#
     );

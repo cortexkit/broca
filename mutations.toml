@@ -27322,3 +27322,16 @@ expect_red = ["retained_head_checkpoint_and_typical_read_cost_through_serve"]
 file = "crates/broca-core/src/run.rs"
 old = "store.project_retained_head(&session, &lineage, records)?;"
 new = "let _ = (&session, &lineage, records); // NON-VACUITY BREAK"
+
+[[control]]
+id = "message-times-admission-feature-composition"
+select = "expected"
+guards = "new message-time requirements are added after fixed scope/class/input-cap feature unions"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::message_times_compose_with_existing_admission_features"]
+file = "crates/broca-wal/src/record.rs"
+old = "input_cap_features(base)"
+new = "input_cap_features(with_feature(base, crate::framing::MESSAGE_TIMES_FEATURE)) /* NON-VACUITY BREAK */"
