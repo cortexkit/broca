@@ -175,6 +175,17 @@ run_gate() {
   set -e
 }
 
+# Print why the gate could not decide. live-runs.py states its reason on a "cannot compare:"
+# line; filtering the log for live-run lines alone dropped it, so a refused deploy could not say
+# why. Fall back to the log's last lines when the gate printed no such line.
+gate_reason() {
+  if grep -aq "cannot compare" "$GATE_LOG" 2>/dev/null; then
+    grep -a "cannot compare" "$GATE_LOG" | head -3 | sed 's/^/  gate: /' >&2
+  else
+    tail -3 "$GATE_LOG" 2>/dev/null | sed 's/^/  gate: /' >&2
+  fi
+}
+
 write_report() {
   [ -n "$REPORT" ] || return 0
   python3 - "$REPORT" "${BACKUP:-}" "${1:-}" "$GATE_LOG" "$REPO_ROOT/scripts" "$ACTIVE_RUNS_FILE" "${CLIENT_BACKUPS[0]}" "${CLIENT_BACKUPS[1]}" <<'PY'
@@ -293,6 +304,7 @@ if [ "$SKIP_GATE" -eq 0 ]; then
            exit 1
          fi ;;
       *) echo "place-release: REFUSING -- gate could not determine live runs (exit $gate_rc)." >&2
+         gate_reason
          echo "  A gate that cannot tell must not be read as a clear gate." >&2
          exit 2 ;;
     esac
@@ -805,7 +817,11 @@ if [ "$SKIP_GATE" -eq 0 ]; then
     cat "$GATE_LOG"
   elif [ "$gate_rc" -ne 0 ]; then
     echo "place-release: PLACED but NOT restarted -- the live-run gate is no longer clear (exit $gate_rc)." >&2
-    grep -aE "live runs|session" "$GATE_LOG" | head -3 >&2 || true
+    if [ "$gate_rc" -eq 1 ]; then
+      grep -aE "live runs|session" "$GATE_LOG" | head -3 >&2 || true
+    else
+      gate_reason
+    fi
     echo "  The new binary is on disk and not loaded. Restart when the gate is clear:" >&2
     echo "    scripts/place-release.sh --restart-only --dest '$DEST'" >&2
     exit 3
