@@ -339,6 +339,39 @@ fn partial_manifest_write_cannot_swallow_a_later_registration() {
     assert_eq!(text, format!("{0}\n{0}\n", reference.sha256));
 }
 
+#[test]
+fn live_manifest_and_objects_are_readable_from_separate_handles() {
+    let (_, store, mut manifest) = fixture();
+    let reference = reference();
+    let path = store
+        .root
+        .join("refs")
+        .join(crate::wal_writer::session_addr(&identity()));
+    manifest
+        .register_and_append(&reference, BYTES, || {
+            assert_eq!(
+                fs::read_to_string(&path)?,
+                format!("{}\n", reference.sha256)
+            );
+            assert_eq!(store.read_verified(&reference).unwrap(), BYTES);
+            Ok(())
+        })
+        .unwrap();
+    let mut reader = broca_owner_only::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .unwrap();
+    manifest
+        .register_and_append(&reference, BYTES, || Ok(()))
+        .unwrap();
+    let mut text = String::new();
+    reader.read_to_string(&mut text).unwrap();
+    assert_eq!(text, format!("{0}\n{0}\n", reference.sha256));
+    assert_eq!(store.read_verified(&reference).unwrap(), BYTES);
+    broca_owner_only::validate(&path).unwrap();
+    broca_owner_only::validate(store.root.join("objects").join(&reference.sha256)).unwrap();
+}
+
 struct CrashAt(Step);
 impl StorageSteps for CrashAt {
     fn reached(&mut self, step: Step) -> io::Result<()> {
