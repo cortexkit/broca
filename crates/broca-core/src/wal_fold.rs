@@ -283,7 +283,8 @@ pub enum HeldRanges {
 /// What the intake store can say about provider-held calls for the fold.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StoreHeld {
-    /// The store exists and is not rebuilding, so its registrations are authoritative.
+    /// Whether the intake store is present. A caller that cannot answer this should pass
+    /// `HeldRanges::UnknownStore` instead, which keeps every held range.
     pub complete: bool,
 }
 impl HeldRanges {

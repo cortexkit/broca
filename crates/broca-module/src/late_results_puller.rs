@@ -12,12 +12,13 @@
 //!   lineage is found from the store and never from the rebuildable run index.
 //!
 //! A puller runs only while the module still needs its feed: a registered call with an open held
-//! record or an owed batch commit barrier, or a settled entry no ack covers yet. Ordinary calls
-//! to a provider that can settle late never start one.
+//! record or an owed batch commit barrier, an entry no ack covers yet, or a registered WAL the
+//! intake cannot read (which may hide a hold). Ordinary calls to a provider that can settle late
+//! never start one.
 //!
-//! This module deliberately installs nothing itself. Declaring the held-reply capabilities and
-//! holding a batch open belong to the tool plane and the run once their lifecycle seams are
-//! installed; this intake is the store and puller those seams are handed.
+//! This module deliberately enables nothing itself. The tool plane declares the held-reply
+//! capabilities on its routes, and the run holds a batch open; this module is the store, the
+//! puller and the delivery hook that code is written against.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -121,7 +122,8 @@ pub enum StartOutcome {
 }
 
 struct PullerState {
-    /// The entries a previous tick settled but could not ack, in reply order.
+    /// Entries an earlier reply left unacked because one of them could not be settled, in reply
+    /// order.
     pinned: Vec<IntakeKey>,
 }
 
@@ -141,7 +143,7 @@ impl Puller {
         }
     }
 
-    /// The entries a previous tick settled but did not ack yet.
+    /// Entries an earlier reply left unacked because one of them could not be settled.
     pub fn pinned(&self) -> Vec<IntakeKey> {
         self.state.lock().expect("puller state").pinned.clone()
     }
@@ -1063,8 +1065,9 @@ pub fn entry_result(tool_call_id: &ToolCallId, entry: &LateEntry) -> Option<Tool
     })
 }
 
-/// The fold's view of the intake store: a range holding a held record is never archived while
-/// the store is incomplete, and never while the record is open.
+/// The fold's view of the intake store. The fold itself never archives a range with an open held
+/// call; this only tells it whether the store is present, so a store-aware caller can keep the
+/// ranges a missing store cannot vouch for.
 pub fn fold_held_ranges(store: &LateResultsStore) -> HeldRanges {
     HeldRanges::Store(broca_core::wal_fold::StoreHeld {
         complete: store.path().is_file(),

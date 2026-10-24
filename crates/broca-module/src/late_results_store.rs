@@ -38,7 +38,7 @@ impl FeedPosition {
 pub struct FeedRow {
     pub module: String,
     pub position: Option<FeedPosition>,
-    /// A registered call needs an entry the intake has not acked yet.
+    /// The module has entries to acknowledge on this feed.
     pub ack_owed: bool,
     /// Set while the feed is being pulled, so a second puller does not start for the module.
     pub puller: bool,
@@ -60,12 +60,13 @@ impl Disposition {
     }
 }
 
-/// Why a registered call stopped needing its feed.
+/// Whether a registered call still needs its feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegistrationState {
     /// Written before the call's key was sent; the call has not been seen in its WAL yet.
     Registered,
-    /// The call reached a non-held terminal, or its batch commit barrier, or its seal.
+    /// A terminal was written for the call, or its batch commit barrier or seal was recorded, so
+    /// the feed no longer has to wait for it. The row is kept so a later entry is still classed.
     Settled,
 }
 
@@ -440,9 +441,10 @@ impl LateResultsStore {
         }))
     }
 
-    /// Record that an entry is settled. A delivered entry's receipt is written only after its
-    /// terminal is synced, and a no-op's before the ack that covers it, so a receipt never
-    /// stands in for a missing terminal.
+    /// Record that an entry is settled. A delivered receipt is only ever added: once an entry has
+    /// been delivered, a later re-read must not record it as a no-op. A delivered receipt is
+    /// written only after its terminal is synced, and a no-op's before the ack that covers it, so
+    /// a receipt never stands in for a missing terminal.
     pub fn record_receipt(
         &self,
         key: &IntakeKey,
@@ -455,7 +457,11 @@ impl LateResultsStore {
                 "INSERT INTO receipts (provider, custodian, call_key, event_id, kind, disposition)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (provider, custodian, call_key, event_id) DO UPDATE SET
-                     kind = excluded.kind, disposition = excluded.disposition",
+                     kind = excluded.kind,
+                     disposition = CASE
+                         WHEN receipts.disposition = 'delivered' THEN 'delivered'
+                         ELSE excluded.disposition
+                     END",
                 params![
                     key.provider,
                     key.custodian,
@@ -731,11 +737,12 @@ mod tests {
             .record_receipt(&key, "result", Disposition::Delivered)
             .unwrap();
         assert_eq!(store.receipt(&key).unwrap(), Some(Disposition::Delivered));
-        // A re-read of the same entry must not turn a delivery into a no-op.
+        // A re-read of the same entry must not turn a delivery into a no-op, because the
+        // delivery already wrote its terminal.
         store
             .record_receipt(&key, "result", Disposition::NoOp)
             .unwrap();
-        assert_eq!(store.receipt(&key).unwrap(), Some(Disposition::NoOp));
+        assert_eq!(store.receipt(&key).unwrap(), Some(Disposition::Delivered));
         store.prune_receipts(std::slice::from_ref(&key)).unwrap();
         assert_eq!(store.receipt(&key).unwrap(), None);
     }
