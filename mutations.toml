@@ -25863,3 +25863,172 @@ expect_message = "credential read without consent"
 file = "crates/broca-provider/tests/live_common/vault.rs"
 old = "    if consent != Some(\"1\") {"
 new = "    if false && consent != Some(\"1\") { // NON-VACUITY BREAK"
+
+[[control]]
+id = "media-capture-detected-mime-wins"
+guards = "Capture records detected PNG even when the tool declares JPEG"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::png_magic_overrides_declared_jpeg_without_changing_bytes"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        mime: mime.into(),'
+new = '        mime: _declared_mime.into(), // NON-VACUITY BREAK: trust the declaration instead of magic.'
+
+[[control]]
+id = "media-capture-unknown-mime-refused"
+guards = "Unsupported types and unknown signatures cannot become media references"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::outside_table_types_and_unknown_magic_are_mime"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '    let (kind, mime) = detect(bytes).ok_or(MediaMarkerReason::Mime)?;'
+new = '    let (kind, mime) = detect(bytes).unwrap_or((MediaKind::Document, "application/pdf")); // NON-VACUITY BREAK: guess unknown bytes are PDF.'
+
+[[control]]
+id = "media-capture-fixed-store-maximum"
+guards = "An over-maximum payload yields too_large before any reference can be published"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::fixed_store_maxima_reject_oversized_payloads_before_publication"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '    if bytes.len() as u64 > store_max_bytes(kind) {'
+new = '    if false && bytes.len() as u64 > store_max_bytes(kind) { // NON-VACUITY BREAK: remove the store size fence.'
+
+[[control]]
+id = "media-capture-store-maximum-inclusive"
+guards = "The fixed store maximum is inclusive and independent of a profile's smaller limit"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::store_maximum_is_inclusive_and_not_a_profile_limit"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '    if bytes.len() as u64 > store_max_bytes(kind) {'
+new = '    if bytes.len() as u64 >= store_max_bytes(kind) { // NON-VACUITY BREAK: reject the allowed boundary.'
+
+[[control]]
+id = "media-capture-png-container-through-iend"
+guards = "An intact PNG header cannot hide a truncated body"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::png_intact_header_does_not_hide_a_truncated_container"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                "image/png" => png(bytes),'
+new = '                "image/png" => Some((1, 1)), // NON-VACUITY BREAK: skip the PNG container walk.'
+
+[[control]]
+id = "media-capture-png-crc"
+guards = "Every PNG chunk including IDAT and IEND is protected by its CRC"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::png_crc_covers_body_and_end_chunks"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        if png_crc(chunk) != crc {'
+new = '        if false && png_crc(chunk) != crc { // NON-VACUITY BREAK: ignore PNG CRC mismatches.'
+
+[[control]]
+id = "media-capture-jpeg-container-through-eoi"
+guards = "JPEG segments and entropy data must reach EOI without overrunning a segment"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::jpeg_walks_segments_and_entropy_to_eoi"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                "image/jpeg" => jpeg(bytes),'
+new = '                "image/jpeg" => Some((1, 1)), // NON-VACUITY BREAK: skip the JPEG container walk.'
+
+[[control]]
+id = "media-capture-gif-container-through-trailer"
+guards = "GIF tables, extensions and subblocks must fit before the trailer"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::gif_walks_tables_extensions_and_subblocks_to_trailer"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                "image/gif" => gif(bytes),'
+new = '                "image/gif" => Some((1, 1)), // NON-VACUITY BREAK: skip the GIF container walk.'
+
+[[control]]
+id = "media-capture-valid-webp"
+guards = "A valid WebP is captured with its original dimensions and digest"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::valid_webp_is_accepted_with_original_digest"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                "image/webp" => webp(bytes),'
+new = '                "image/webp" => None, // NON-VACUITY BREAK: reject all WebP payloads.'
+
+[[control]]
+id = "media-capture-webp-riff-size"
+guards = "WebP RIFF size plus eight must equal the complete received byte size"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::webp_checks_riff_size_and_chunk_boundaries"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        || u64::from(le32(bytes.get(4..8)?)) + 8 != bytes.len() as u64'
+new = '        || false && u64::from(le32(bytes.get(4..8)?)) + 8 != bytes.len() as u64 // NON-VACUITY BREAK: ignore RIFF size.'
+
+[[control]]
+id = "media-capture-webp-nested-frame"
+guards = "A complete RIFF must not hide a truncated animated WebP frame chunk"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::animated_webp_walks_nested_frame_chunks"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                if data.len() < 16 || !webp_frame(&data[16..]) {'
+new = '                if data.len() < 16 { // NON-VACUITY BREAK: trust only the outer frame length.'
+
+[[control]]
+id = "media-capture-original-byte-digest"
+guards = "The captured digest describes every received byte, without transformation"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::png_magic_overrides_declared_jpeg_without_changing_bytes"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        sha256: format!("{:x}", Sha256::digest(bytes)),'
+new = '        sha256: format!("{:x}", Sha256::digest(&bytes[1..])), // NON-VACUITY BREAK: omit the first received byte.'
+
+[[control]]
+id = "media-capture-header-dimensions"
+guards = "Image dimensions describe the actual header rather than a guessed size"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::image_dimensions_come_from_headers"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        width: dimensions.map(|(w, _)| w),'
+new = '        width: dimensions.map(|_| 1), // NON-VACUITY BREAK: replace the header width with a guess.'
