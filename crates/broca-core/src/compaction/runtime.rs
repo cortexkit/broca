@@ -1078,11 +1078,11 @@ impl Runtime<'_> {
             if !matches!(decision, view::Decision::Defer(_)) || first_report {
                 if at.superseded.is_empty() {
                     tracing::info!(target: "compaction", run_id = at.run_id, step = at.step,
-                        view_version = version, choice, reason,
+                        session_ref = %ready.session_ref, view_version = version, choice, reason,
                         "compaction view decided at a step boundary");
                 } else {
                     tracing::info!(target: "compaction", run_id = at.run_id, step = at.step,
-                        view_version = version, choice, reason,
+                        session_ref = %ready.session_ref, view_version = version, choice, reason,
                         superseded = %version_list(at.superseded),
                         "compaction view decided at a step boundary");
                 }
