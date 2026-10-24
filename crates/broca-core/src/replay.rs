@@ -4693,4 +4693,40 @@ pub(crate) mod provider_held_tests {
             matches!(&*pending.approved[0].prepared, WalRecord::ToolCallDeferred { args_jcs, .. } if args_jcs == "{\"n\":1}")
         );
     }
+    /// One held call's records as `FramedRecord`s, the shape a registration's WAL read returns.
+    fn framed(records: Vec<WalRecord>) -> Vec<FramedRecord> {
+        records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| FramedRecord {
+                seq: index as u64 + 2,
+                fence: 1,
+                record,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_registered_call_needs_its_feed_only_while_it_is_held() {
+        // The registered read of a held call: it names the call, reports its held record and its
+        // sequential successor, and keeps the feed alive.
+        let held_read = held_call_facts(&framed(prefix(true)), Some("lineage:4"));
+        assert!(held_read.needs_intake());
+        assert_eq!(held_read.held.len(), 1);
+        assert_eq!(held_read.held_successors, vec![ToolCallId("b".into())]);
+        // Once the held call has its terminal the same read needs nothing, though it still
+        // reports the call so its entry can be classed.
+        let mut settled = prefix(true);
+        // The entries of a closed-out or delivered call are still reported by a read that names
+        // it, so its late entry can be classed.
+        settled.push(terminal("a", DispatchOutcome::Completed));
+        let settled_read = held_call_facts(&framed(settled.clone()), Some("lineage:4"));
+        assert!(!settled_read.needs_intake());
+        assert_eq!(settled_read.held.len(), 1);
+        // A read that names no call reports the WAL's held records but no successors, which no
+        // delivery needs.
+        let unnamed = held_call_facts(&framed(settled), None);
+        assert_eq!(unnamed.held.len(), 1);
+        assert!(unnamed.held_successors.is_empty());
+    }
 }

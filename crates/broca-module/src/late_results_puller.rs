@@ -14,6 +14,10 @@
 //! A puller runs only while the module still needs its feed: a registered call with an open held
 //! record or an owed batch commit barrier, or a settled entry no ack covers yet. Ordinary calls
 //! to a provider that can settle late never start one.
+//!
+//! This module deliberately installs nothing itself. Declaring the held-reply capabilities and
+//! holding a batch open belong to the tool plane and the run once their lifecycle seams are
+//! installed; this intake is the store and puller those seams are handed.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -466,7 +470,8 @@ impl LateResultsIntake {
                 provider_incarnation: reply.cursor.provider_incarnation.clone(),
                 seq: reply.cursor.seq,
             });
-            // An entry delivered on a page is durable before anything can ack that page.
+            // An entry delivered on a page is durable before anything can ack that page: a
+            // delivery that could not be made pins the ack here instead.
             let (settled, still) = self.settle(module, &reply.entries).await?;
             if !still.is_empty() {
                 puller.set_pinned(still);
@@ -529,13 +534,15 @@ impl LateResultsIntake {
             }
             if matches!(kind, Classified::Delivered) {
                 // A delivery is this module's only settlement that needs the run, so it is
-                // handed over before anything can ack the entry's position.
-                self.store
-                    .set_ack_owed(module, true)
-                    .map_err(FeedError::Retryable)?;
-                self.deliver_settled(module, std::slice::from_ref(entry), &rows)
+                // handed over before anything can ack the entry's position. A delivery that
+                // could not be made leaves the entry exactly where it was.
+                if let Err(_reason) = self
+                    .deliver_settled(module, std::slice::from_ref(entry), &rows)
                     .await
-                    .map_err(FeedError::Retryable)?;
+                {
+                    pinned.push(key);
+                    continue;
+                }
             }
             settled += 1;
         }
@@ -721,6 +728,14 @@ impl LateResultsIntake {
             match entry_result(&held_call_id, entry) {
                 Some(_) => {
                     self.delivery.deliver(&row.call, entry).await?;
+                    // The batch wrote the call's terminal: a later entry for the same call is
+                    // then too late, and this memory keeps that decision across re-reads.
+                    self.store.remember_held_terminal(
+                        module,
+                        &row.call.call_key,
+                        &held_call_id,
+                        "completed",
+                    )?;
                     self.store
                         .record_receipt(&key, &entry.kind, Disposition::Delivered)?;
                     self.store.mark_settled(module, &row.call.call_key)?;
@@ -753,13 +768,8 @@ impl LateResultsIntake {
         cursor: &Cursor,
         entries: &[LateEntry],
     ) -> Result<(), FeedError> {
-        let rows = self
-            .store
-            .registration_rows()
-            .map_err(FeedError::Retryable)?;
-        self.deliver_settled(module, entries, &rows)
-            .await
-            .map_err(FeedError::Retryable)?;
+        // Every entry of the page is already durable before the ack: the puller delivers each
+        // one as it settles, so the ack never stands in for a missing terminal.
         self.feed.ack(cursor).await?;
         self.store
             .record_ack(
@@ -804,6 +814,13 @@ impl LateResultsIntake {
             );
             return Ok(false);
         }
+        let rows = self
+            .store
+            .registration_rows()
+            .map_err(FeedError::Retryable)?;
+        self.deliver_settled(module, &reply.entries, &rows)
+            .await
+            .map_err(FeedError::Retryable)?;
         self.feed.ack(&reply.cursor).await?;
         self.store
             .record_ack(
@@ -1512,6 +1529,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nothing_is_acked_before_its_delivery_is_durable() {
+        let call_key = "lineage:4";
+        let bind = session("held");
+        let rig = Rig::new(
+            "no-early-ack",
+            Some((call_key, "tools", bind.clone())),
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        let _puller = rig.puller("tools");
+        *rig.delivery.refuse.lock().unwrap() = Some("session cannot be written".into());
+        rig.feed.replies(vec![reply(
+            vec![entry(kinds::RESULT, call_key, "ev-1")],
+            1,
+            false,
+        )]);
+        let outcome = rig.intake.tick("tools").await;
+        assert_eq!(
+            rig.store.feed("tools").unwrap().unwrap().position,
+            None,
+            "an undelivered entry leaves the feed where it was; tick said {outcome:?}"
+        );
+        assert!(
+            rig.feed.acks().is_empty(),
+            "an undelivered entry is never acked; tick said {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_pinned_entry_pins_the_ack_but_a_later_page_is_still_delivered() {
         let call_key = "lineage:4";
         let pending_key = "lineage:5";
@@ -1616,6 +1662,7 @@ mod tests {
             RegistrationState::Registered,
             "an unknown kind does not settle the call"
         );
+        assert_eq!(rig.store.held_terminal("tools", call_key).unwrap(), None);
         rig.feed.replies(vec![reply(
             vec![entry(kinds::RESULT, call_key, "ev-2")],
             2,
