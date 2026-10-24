@@ -263,20 +263,15 @@ impl LateResultsIntake {
         self.wal.read_records(session).ok()
     }
 
+    /// Whether retention already tombstoned this lineage. A session deleted through the
+    /// unreadable-WAL fallback can leave its live WAL behind, and then this is the only evidence
+    /// that nothing of it can be delivered any more.
     fn tombstoned(&self, session: &BindIdentity, lineage: &str) -> bool {
-        // Retention deletes the WAL last; its tombstone directory names the lineage that went.
-        let root = self.wal.root();
-        let address = broca_core::session_addr(session);
-        root.join("wal-ephemeral")
-            .join(format!("{address}.expired"))
-            .join(lineage)
-            .exists()
-            || root
-                .join("wal-ephemeral")
-                .join(format!("{address}.expired"))
-                .join(lineage)
-                .with_extension("deleting")
-                .exists()
+        let directory = self
+            .wal
+            .ephemeral_root()
+            .join(format!("{}.expired", broca_core::session_addr(session)));
+        directory.join(lineage).exists()
     }
 
     /// Whether the module's feed is still needed, decided from the store's registrations and the
