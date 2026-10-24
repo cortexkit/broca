@@ -80,6 +80,10 @@ pub enum ImportError {
     /// the lineage, so the later real import fails `LineageNotEmpty` and the caller is left
     /// with a session that can never be filled.
     NoImportableContent,
+    /// The transcript names media directly. A `MediaRef` enters a WAL record only from broca's
+    /// own capture path, which publishes bytes it holds; an imported reference holds none and
+    /// could name an object the session never captured.
+    SuppliedMedia(crate::media_provenance::SuppliedMedia),
 }
 
 impl std::fmt::Display for ImportError {
@@ -124,6 +128,7 @@ impl std::fmt::Display for ImportError {
                      there is nothing to seed and the session stays empty and importable"
                 )
             }
+            Self::SuppliedMedia(found) => write!(f, "import {found}"),
         }
     }
 }
@@ -245,6 +250,11 @@ pub async fn run_import_with_store<W: WalStore>(
         .position(|message| message.content.is_empty())
     {
         return Err(ImportError::EmptyMessage { ordinal });
+    }
+    // Checked on the request as supplied, before normalization can drop a message (a system
+    // message, an orphan tool result) that still names media the caller tried to bring in.
+    if let Some(found) = crate::media_provenance::find_supplied_media(&request.messages) {
+        return Err(ImportError::SuppliedMedia(found));
     }
     let serialized = serde_json::to_vec(&request.messages)
         .map_err(|error| ImportError::Wal(error.to_string()))?;

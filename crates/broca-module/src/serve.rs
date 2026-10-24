@@ -2615,6 +2615,11 @@ impl ServeHandler for crate::LineageRegistry {
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {
         use crate::actor::ImportOutcome;
+        // Refused before the session is routed or opened, so a transcript naming media inline
+        // writes nothing: a person names media only through upload references.
+        if let Err((field, message)) = broca_wire::check_supplied_media(&req.messages) {
+            return Err(ServeError::InvalidParams { field, message });
+        }
         let request = broca_core::ImportRequest {
             project_id: req.project_id,
             principal: req.principal,
@@ -2639,6 +2644,12 @@ impl ServeHandler for crate::LineageRegistry {
             ImportOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
             ImportOutcome::Error(broca_core::ImportError::ImportIdReuse) => {
                 Err(ServeError::ImportIdReuse)
+            }
+            ImportOutcome::Error(broca_core::ImportError::SuppliedMedia(found)) => {
+                Err(ServeError::InvalidParams {
+                    field: found.path(),
+                    message: found.to_string(),
+                })
             }
             ImportOutcome::Error(error) => Err(ServeError::Import(error.to_string())),
         }

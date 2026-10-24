@@ -632,6 +632,116 @@ async fn import_rejects_an_empty_canonical_message_with_its_ordinal() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Messages decoded from the JSON a `session.import` carries, so the shapes are exactly the
+/// wire's.
+fn wire_messages(messages: serde_json::Value) -> Vec<Message> {
+    serde_json::from_value(messages).expect("wire messages decode")
+}
+
+fn wire_image() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "image",
+        "mime": "image/png",
+        "byte_size": 67,
+        "sha256": "ab".repeat(32),
+        "width": 1,
+        "height": 1
+    })
+}
+
+#[tokio::test]
+async fn import_refuses_inline_media_and_writes_nothing() {
+    let mut media_block = wire_image();
+    media_block["type"] = "media".into();
+    let cases = [
+        (
+            "user media block",
+            wire_messages(serde_json::json!([
+                {"role": "user", "content": [{"type": "text", "text": "look"}, media_block]}
+            ])),
+            "messages[0].content[1]",
+        ),
+        (
+            "tool result media part",
+            wire_messages(serde_json::json!([
+                {"role": "assistant", "content": [{
+                    "type": "tool_call", "tool_call_id": "call-1",
+                    "tool_name": "screenshot", "input": {}
+                }]},
+                {"role": "tool", "content": [{
+                    "type": "tool_result", "tool_call_id": "call-1",
+                    "output": {"kind": "parts", "parts": [
+                        {"kind": "text", "text": "before"},
+                        {"kind": "media", "media": wire_image()}
+                    ]}
+                }]}
+            ])),
+            "messages[1].content[0].output.parts[1]",
+        ),
+        // Normalization drops system messages; the media they name is refused all the same.
+        (
+            "system message normalization would drop",
+            wire_messages(serde_json::json!([
+                {"role": "system", "content": [media_block]},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+            ])),
+            "messages[0].content[0]",
+        ),
+    ];
+    for (label, messages, path) in cases {
+        let root = temp_dir("inline-media");
+        let store = FileWalStore::new(root.join("wal"));
+        let session = BindIdentity::new("/project", "runner", "inline-media");
+        let writer =
+            WalHandle::spawn(store.open(&session).expect("open WAL"), 1).expect("spawn writer");
+
+        let refusal = run_import(request(&session, "media-import", messages), &writer, &store)
+            .await
+            .expect_err(label);
+        let ImportError::SuppliedMedia(found) = &refusal else {
+            panic!("{label}: expected a supplied-media refusal, got {refusal:?}");
+        };
+        assert_eq!(found.path(), path, "{label}");
+        assert!(
+            refusal.to_string().contains("upload references"),
+            "{label}: {refusal}"
+        );
+        assert!(
+            store.read_records(&session).expect("read WAL").is_empty(),
+            "{label}: nothing is written"
+        );
+
+        let _ = writer.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[tokio::test]
+async fn import_keeps_accepting_a_text_only_parts_result() {
+    let root = temp_dir("text-parts");
+    let store = FileWalStore::new(root.join("wal"));
+    let session = BindIdentity::new("/project", "runner", "text-parts");
+    let writer =
+        WalHandle::spawn(store.open(&session).expect("open WAL"), 1).expect("spawn writer");
+    let messages = wire_messages(serde_json::json!([
+        {"role": "assistant", "content": [{
+            "type": "tool_call", "tool_call_id": "call-1", "tool_name": "read", "input": {}
+        }]},
+        {"role": "tool", "content": [{
+            "type": "tool_result", "tool_call_id": "call-1",
+            "output": {"kind": "parts", "parts": [{"kind": "text", "text": "only text"}]}
+        }]}
+    ]));
+
+    run_import(request(&session, "text-parts", messages), &writer, &store)
+        .await
+        .expect("a Parts result without a media part names no media");
+    assert_eq!(store.read_records(&session).expect("read WAL").len(), 2);
+
+    let _ = writer.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn duplicate_tool_call_ids_are_tracked_as_a_multiset() {
     let root = temp_dir("duplicate-tool-ids");

@@ -84,6 +84,62 @@ async fn import_then_read_returns_the_canonical_transcript() {
     assert_eq!(page.lineage_state.state, "completed");
 }
 
+/// Every file and directory under `dir`, keyed by its relative path; directories have length 0.
+fn tree_files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, u64> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).expect("read rig dir") {
+            let entry = entry.expect("rig dir entry");
+            let path = entry.path();
+            if entry.file_type().expect("entry type").is_dir() {
+                files.insert(path.strip_prefix(dir).unwrap().to_path_buf(), 0);
+                pending.push(path);
+            } else {
+                let len = entry.metadata().expect("entry metadata").len();
+                files.insert(path.strip_prefix(dir).unwrap().to_path_buf(), len);
+            }
+        }
+    }
+    files
+}
+
+/// A `session.import` naming media inline is refused `invalid_params` at the member that names
+/// it, before the session is routed, so no lease, WAL or store file changes.
+#[tokio::test]
+async fn import_naming_media_inline_is_refused_before_anything_is_written() {
+    let rig = Rig::new("serve-import-media", FakeExecutor::auto(), LONG_TTL);
+    let key = rig.key("s-import-media");
+    let messages: Vec<broca_protocol::Message> = serde_json::from_value(serde_json::json!([
+        {"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "media", "kind": "image", "mime": "image/png", "byte_size": 67,
+             "sha256": "ab".repeat(32), "width": 1, "height": 1}
+        ]}
+    ]))
+    .expect("wire messages decode");
+    let before = tree_files(&rig.dir);
+
+    let refusal = rig
+        .registry
+        .import(SessionImportRequest {
+            project_id: None,
+            principal: None,
+            session: key.clone(),
+            run_id: broca_protocol::RunId("run-import-media".into()),
+            messages,
+            source_ref: "cc:source-1".into(),
+        })
+        .await
+        .expect_err("inline media is refused");
+    let broca_module::serve::ServeError::InvalidParams { field, message } = &refusal else {
+        panic!("expected invalid_params, got {refusal:?}");
+    };
+    assert_eq!(field, "messages[0].content[1]");
+    assert!(message.contains("upload references"), "{message}");
+    assert_eq!(tree_files(&rig.dir), before, "nothing is written");
+}
+
 /// session.send on an idle lineage → Active{run_id}; a second send while active → Pending.
 #[tokio::test]
 async fn send_maps_active_then_pending() {

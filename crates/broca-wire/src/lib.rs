@@ -296,6 +296,19 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
 /// model checks or to publication into its session's media store.
 pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String> {
     if let Some(content) = params.get("content").filter(|value| !value.is_null()) {
+        // A content part is an upload reference and nothing else. A `media` block, or a tool
+        // result with a media part, is refused by the closed decode below anyway; naming the
+        // rule here tells the caller how to send media instead of only that the variant is
+        // unknown.
+        if let Some(index) = content
+            .as_array()
+            .and_then(|parts| parts.iter().position(names_media_inline))
+        {
+            return Err(format!(
+                "content[{index}] names media inline; a message names media only through \
+                 upload references"
+            ));
+        }
         let parts: Vec<cortexkit_role_llm_runner::attachments::ContentPart> =
             serde_json::from_value(content.clone())
                 .map_err(|error| format!("invalid content: {error}"))?;
@@ -307,6 +320,35 @@ pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+/// A raw content entry shaped like a stored `media` block, or a stored tool result whose
+/// `parts` output holds a media part.
+fn names_media_inline(part: &serde_json::Value) -> bool {
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some("media") => true,
+        Some("tool_result") => part
+            .pointer("/output/parts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|entry| {
+                    entry.get("kind").and_then(serde_json::Value::as_str) == Some("media")
+                })
+            }),
+        _ => false,
+    }
+}
+
+/// Refuse a caller-supplied transcript (a `session.import`'s `messages`) that names media
+/// directly, as a `media` block or a `Parts` media part. A `MediaRef` enters a WAL record only
+/// from broca's own capture path (an upload commit or a tool capture), which publishes bytes broca
+/// holds; an inline reference holds no bytes and could name an object the session never
+/// captured. The error is `(field, message)`, naming the offending member's path.
+pub fn check_supplied_media(messages: &[broca_protocol::Message]) -> Result<(), (String, String)> {
+    match broca_core::media_provenance::find_supplied_media(messages) {
+        Some(found) => Err((found.path(), found.to_string())),
+        None => Ok(()),
+    }
 }
 
 /// Check every `tools[i].reply` of a `session.send` before anything else reads the send, so a
@@ -1522,6 +1564,10 @@ pub struct PendingApproval {
 #[cfg(test)]
 #[path = "../tests/support/run_usage.rs"]
 mod usage_compat;
+
+#[cfg(test)]
+#[path = "supplied_media_tests.rs"]
+mod supplied_media_tests;
 
 #[cfg(test)]
 mod approval_wire_tests {
