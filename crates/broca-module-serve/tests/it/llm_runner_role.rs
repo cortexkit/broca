@@ -132,6 +132,110 @@ async fn read_and_subscribe_bytes_without_new_params_are_pinned() {
     rig.finish().await;
 }
 
+#[tokio::test]
+async fn tagged_open_tool_turn_read_bytes_are_pinned() {
+    let (mut rig, _) = crate::plan_admission::plan_rig("pin-tagged-open-read").await;
+    rig.script.push(&[
+        Step::Usage {
+            content: vec![
+                ContentBlock::Text {
+                    text: "checking".into(),
+                },
+                ContentBlock::ToolCall(broca_protocol::ToolCall {
+                    tool_call_id: broca_protocol::ToolCallId("call-1".into()),
+                    tool_name: "work".into(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                }),
+            ],
+            usage: Default::default(),
+        },
+        Step::Call("call-open"),
+        Step::Text("answer"),
+    ]);
+    rig.script.hold_tool(true);
+    let composition = serde_json::json!({"providers": [{"provider": WORK_MODULE, "tools": [
+        {"name": "work", "capabilities": []}
+    ]}], "step_transform_items": []});
+    let plan = serde_json::json!({
+        "tool_items": [{"provider": WORK_MODULE, "preset": "head", "params": {}}],
+        "system_text_items": [], "step_transform_items": [], "render_tags": true,
+        "composition_digest": cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+        "composition": composition,
+    });
+    let active = rig.request(7, serde_json::json!({"method": "session.send", "params": {
+        "send_id": "tagged-turn", "prompt": "hi", "model": {"provider": "fake", "model": "fake"},
+        "plan": plan,
+    }})).await;
+    let run_id = result(&active)["run_id"].as_str().unwrap().to_owned();
+    rig.wait_entered().await;
+
+    // After call-1 commits, pause the next model request, then hold call-open's execution.
+    // session.read can then see the assistant's open call before its batch commits, so its
+    // part rows must exist without depending on commit-time numbering.
+    rig.script.hold_model(true);
+    rig.script.hold_tool(false);
+    rig.wait_entered().await;
+    rig.script.hold_tool(true);
+    rig.script.hold_model(false);
+    rig.wait_entered().await;
+    let records = rig.records();
+    let config = records
+        .iter()
+        .find_map(|record| match record {
+            broca_wal::WalRecord::RunStarted { config, .. } => Some(config),
+            _ => None,
+        })
+        .unwrap();
+    assert!(config.render_tags);
+    assert!(config.computed_tags.is_some());
+    assert!(records.iter().any(|record| matches!(record,
+        broca_wal::WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "call-1")));
+    assert!(!records.iter().any(|record| matches!(record,
+        broca_wal::WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "call-open")));
+
+    let read = rig
+        .request(
+            7,
+            serde_json::json!({"method": "session.read", "params": {}}),
+        )
+        .await;
+    let page = result(&read);
+    let lineage_id = page["lineage_id"].as_str().unwrap();
+    assert_eq!(page["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        page["messages"][0]["tags"],
+        serde_json::json!([{"part": "m0#0", "tag": "§1§"}])
+    );
+    assert_eq!(
+        page["messages"][1]["tags"],
+        serde_json::json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1"}])
+    );
+    assert_eq!(
+        page["messages"][2]["tags"],
+        serde_json::json!([{"part": "m2#0", "tag": "§3§"}])
+    );
+    assert_eq!(
+        page["messages"][3]["tags"],
+        serde_json::json!([{"part": "m3#0"}])
+    );
+    assert_eq!(
+        page["messages"][3]["tool_calls"][0]["tool_call_id"],
+        "call-open"
+    );
+    let body = normalized(&read.body, &run_id, lineage_id);
+    let file = "session_read.tagged_open_tool_turn.json";
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(golden_path(file), format!("{body}\n")).unwrap();
+        println!("GOLDEN_BEGIN {file}\n{body}\nGOLDEN_END {file}");
+    }
+    assert_eq!(body, pinned(file));
+    rig.script.hold_tool(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.finish().await;
+}
+
 // ---- helpers ------------------------------------------------------------------------------
 
 /// Keep the captured frame template, substituting only this run's two WAL observations.
