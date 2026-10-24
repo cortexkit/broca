@@ -336,6 +336,9 @@ struct PreparedProjection {
     message_times: Vec<Option<u64>>,
     episode_spans: Vec<std::ops::Range<u64>>,
     open_episode_span: Option<u64>,
+    /// Every episode's render inputs as JSON, in lineage order (see
+    /// [`broca_core::context::EpisodeRenderProjection`]).
+    episodes_json: Option<String>,
     expected_watermark: u64,
     expected_lineage_id: Option<String>,
     reset: bool,
@@ -1109,6 +1112,14 @@ impl SqliteStore {
             ("episode_spans_complete", "INTEGER NOT NULL DEFAULT 0"),
             ("episode_spans_seq", "INTEGER"),
             ("open_episode_span", "INTEGER"),
+            // Every projected episode's render inputs (start, original first user, first model
+            // step, frozen render config), JSON in lineage order. NULL on a row not reprojected
+            // since the column existed, and on a session with no episode yet.
+            ("episode_metadata_json", "TEXT"),
+            // The watermark `episode_metadata_json` was computed at. A row carrying another
+            // value is a projection that advanced without recomputing it, so its metadata reads
+            // as absent and the session replays from the WAL.
+            ("episode_metadata_seq", "INTEGER"),
         ] {
             if !columns.contains(column) {
                 conn.execute(
@@ -1496,6 +1507,12 @@ impl SqliteStore {
                         head_json: prepared.head_json,
                         episode_spans: prepared.episode_spans,
                         open_episode_span: prepared.open_episode_span,
+                        // Serialization of plain JSON values cannot fail; a failure would only
+                        // mean an absent projection, which reads back as a WAL replay.
+                        episodes_json: Some(
+                            serde_json::to_string(&prepared.episodes)
+                                .unwrap_or_else(|_| "null".into()),
+                        ),
                         expected_watermark: prepared.expected_watermark,
                         expected_lineage_id: prepared.expected_lineage_id,
                         reset: prepared.reset,
@@ -1734,13 +1751,16 @@ impl SqliteStore {
             rusqlite::params![key, prepared.deferred_calls_json, RUN_ATTRIBUTION_VERSION],
         )?;
         tx.execute(
-            "UPDATE meta SET episode_spans_complete=1, open_episode_span=?2, episode_spans_seq=?3 WHERE session=?1",
+            "UPDATE meta SET episode_spans_complete=1, open_episode_span=?2, episode_spans_seq=?3, \
+             episode_metadata_json=?4, episode_metadata_seq=?5 WHERE session=?1",
             rusqlite::params![
                 key,
                 prepared
                     .open_episode_span
                     .map(broca_core::projection_plan::u64_to_i64)
                     .transpose()?,
+                prepared.new_watermark as i64,
+                prepared.episodes_json,
                 prepared.new_watermark as i64
             ],
         )?;
@@ -1862,6 +1882,22 @@ impl MaterializedStore for SqliteStore {
     }
     fn read_run_event(&self, event_key: &str) -> Result<Option<(BindIdentity, Vec<u8>)>, String> {
         self.get_bus_event(event_key).map_err(|e| e.to_string())
+    }
+    fn read_episode_projection(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<Vec<broca_core::context::EpisodeRenderProjection>>, String> {
+        let key = Self::key(session);
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let stored = episode_projection_json(&tx, &key).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        let Some(json) = stored else {
+            return Ok(None);
+        };
+        let metadata: Vec<broca_core::context::EpisodeRenderProjection> =
+            serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        Ok(Some(metadata))
     }
     fn read_prefix_with_watermark(&self, session: &BindIdentity) -> Result<StorePrefix, String> {
         let key = Self::key(session);
@@ -2225,10 +2261,20 @@ impl MaterializedStore for SqliteStore {
                             .map_err(|e| e.to_string())?,
                     );
                 }
+                let episodes = episode_projection_json(&tx, &key)
+                    .map_err(|e| e.to_string())?
+                    .and_then(|json| {
+                        serde_json::from_str::<Vec<broca_core::context::EpisodeRenderProjection>>(
+                            &json,
+                        )
+                        .ok()
+                    });
                 model_history = Some(broca_core::context::ModelHistory {
                     spans,
                     open_span,
+                    episodes,
                     row_ranges,
+                    prefix_len,
                 });
             }
         }
@@ -2722,6 +2768,47 @@ fn episode_history_metadata(
     ).optional()
 }
 
+/// Split the stored episode projection into the episode open at the watermark and the earlier
+/// ones, for a [`ProjectionSeed`]. An absent projection leaves both empty: the next write then
+/// cannot continue the open episode's metadata, and its own read falls back to the WAL until a
+/// complete projection restores it.
+fn episode_projection_from_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> rusqlite::Result<Option<Vec<broca_core::context::EpisodeRenderProjection>>> {
+    Ok(episode_projection_json(tx, key)?.and_then(|json| serde_json::from_str(&json).ok()))
+}
+
+/// The stored episode render projection, when it was computed at the row's current
+/// materialization watermark.
+///
+/// A write from a build that does not know the episode metadata columns advances the transcript
+/// without them, so the values are bound to the watermark they were actually computed from (as
+/// the episode spans are). Mismatched, missing, or unreadable values are `None`: the caller
+/// reads the WAL instead of rendering episode coordinates the store cannot vouch for.
+fn episode_projection_json(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> rusqlite::Result<Option<String>> {
+    let stored = tx
+        .query_row(
+            "SELECT episode_metadata_json, episode_metadata_seq, watermark_seq FROM meta WHERE session=?1",
+            [key],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(stored.and_then(|(json, seq, watermark)| {
+        json.filter(|_| seq == Some(watermark))
+            .filter(|json| !json.is_empty())
+    }))
+}
+
 fn current_projection_position(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
@@ -2875,8 +2962,21 @@ fn projection_seed_from_complete_tx(
     let Some(deferred_calls_json) = deferred_calls_json else {
         return Ok(None);
     };
+    // The episodes the stored projection holds, split into the one open at this watermark and
+    // the earlier ones: a later write continues the open episode and keeps the rest.
+    let projection_episodes = episode_projection_from_tx(tx, key)?;
+    let (open_episode, earlier_episodes) = projection_episodes
+        .clone()
+        .map(|mut episodes| {
+            let open = episodes.pop();
+            (open, episodes)
+        })
+        .unwrap_or_default();
     Ok(Some(ProjectionSeed {
         open_episode_span,
+        open_episode,
+        earlier_episodes,
+        projection_episodes,
         deferred_calls: serde_json::from_str(&deferred_calls_json)?,
         watermark_seq,
         anchor,

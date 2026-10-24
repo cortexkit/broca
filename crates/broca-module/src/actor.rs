@@ -1465,14 +1465,15 @@ fn crash_orphan_sealable(
     disposition: EpisodeDisposition,
     resolution: &broca_core::ReplayResolution,
 ) -> bool {
-    matches!(
-        (disposition, resolution),
-        (
-            EpisodeDisposition::Running,
-            broca_core::ReplayResolution::Resume { .. }
-                | broca_core::ReplayResolution::Interrupted { .. }
-        )
-    )
+    match resolution {
+        broca_core::ReplayResolution::Resume { .. }
+        | broca_core::ReplayResolution::Interrupted { .. } => {
+            disposition == EpisodeDisposition::Running
+        }
+        broca_core::ReplayResolution::ProviderHeld { .. }
+        | broca_core::ReplayResolution::AuthRequired { .. }
+        | broca_core::ReplayResolution::LineageIdle { .. } => false,
+    }
 }
 
 impl<W: WalStore + 'static> LineageActor<W> {
@@ -2452,6 +2453,43 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .map_err(|error| error.to_string());
         }
 
+        if let broca_core::ReplayResolution::ProviderHeld {
+            pending, open_held, ..
+        } = &tail_resolution
+        {
+            if !open_held.is_empty() && pending.deferred.is_empty() && pending.approved.is_empty() {
+                self.park_provider_held(
+                    &episode_run_id,
+                    episode_pause_reason == Some(broca_protocol::PauseReason::ToolHeld),
+                )
+                .await?;
+                self.refresh_admission_view().await?;
+                return Ok(());
+            }
+            // Approval cards stay live; a delivered batch with no open held call owes its barrier.
+            // Both resume the original batch rather than entering an authentication path.
+            let mut request = submission_from_config(episode_config, episode_input);
+            request.keep_warm = episode_keep_warm;
+            request.on_restart = episode_on_restart;
+            return self
+                .start_run(
+                    episode_run_id,
+                    request,
+                    RunKind::FreshOrResume,
+                    None,
+                    SendIdentity {
+                        title: None,
+                        conversation_key: None,
+                        send_id: None,
+                        request_identity_digest: episode_request_identity_digest,
+                    },
+                    false,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+        }
+
         if episode_disposition == EpisodeDisposition::Paused
             && episode_pause_reason == Some(broca_protocol::PauseReason::Restart)
             && self.registry.restart_resume_ready()
@@ -2561,7 +2599,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // the crash lost RunFinished. That inferred end is sufficient for reads, but it is not a
         // durable seal: RunStarted may follow only a synced RunFinished. Recover the original
         // episode first so core writes the missing terminal before any queued append can drain.
-        if episode_disposition == EpisodeDisposition::Running
+        let held_interrupted = matches!(
+            tail_resolution,
+            broca_core::ReplayResolution::Interrupted { .. }
+        ) && tail
+            .iter()
+            .any(|record| matches!(record, WalRecord::ToolCallProviderHeld { .. }));
+        if (episode_disposition == EpisodeDisposition::Running || held_interrupted)
             && matches!(
                 tail_resolution,
                 broca_core::ReplayResolution::Resume { .. }
@@ -3120,11 +3164,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         };
                     }
                     Ok(Some(state))
-                        if state.pause_reason == Some(broca_protocol::PauseReason::Restart) =>
+                        if matches!(
+                            state.pause_reason,
+                            Some(
+                                broca_protocol::PauseReason::Restart
+                                    | broca_protocol::PauseReason::ToolHeld
+                            )
+                        ) =>
                     {
                         return SendOutcome::Paused {
                             run_id,
-                            reason: broca_protocol::PauseReason::Restart,
+                            reason: state.pause_reason.expect("runner-owned pause"),
                             delivered,
                         };
                     }
@@ -3404,10 +3454,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
     ) -> SendOutcome {
         if matches!(self.state, RunState::Idle) && !resume_indexed_run {
             match self.paused_run().await {
-                Ok(Some((_, broca_protocol::PauseReason::Restart))) => {
+                Ok(Some((
+                    paused,
+                    reason @ (broca_protocol::PauseReason::Restart
+                    | broca_protocol::PauseReason::ToolHeld),
+                ))) => {
+                    if paused == run_id && reason == broca_protocol::PauseReason::ToolHeld {
+                        return SendOutcome::Paused {
+                            run_id,
+                            reason,
+                            delivered: None,
+                        };
+                    }
                     return self
                         .queue_submission(run_id, request, identity, skip_materialization, delivery)
-                        .await
+                        .await;
                 }
                 Ok(_) => {}
                 Err(error) => return SendOutcome::Error(error),
@@ -3805,6 +3866,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Ok(paused) => paused,
             Err(error) => return SendOutcome::Transient(error),
         };
+        if let Some((run_id, broca_protocol::PauseReason::ToolHeld)) = &paused {
+            return SendOutcome::RunPaused {
+                run_id: run_id.clone(),
+                reason: broca_protocol::PauseReason::ToolHeld,
+            };
+        }
         let Some((paused, _)) = paused else {
             return self
                 .send_plain(
@@ -6748,6 +6815,28 @@ impl<W: WalStore + 'static> LineageActor<W> {
         Ok(sealed)
     }
 
+    /// Park a runner-owned wait only after the held metadata is durable. Indexing follows the WAL.
+    async fn park_provider_held(&self, run_id: &RunId, already_paused: bool) -> Result<(), String> {
+        let writer = self.writer.as_ref().expect("writer live during recovery");
+        if !already_paused {
+            writer
+                .record(WalRecord::RunPaused {
+                    run_id: run_id.clone(),
+                    reason: broca_protocol::PauseReason::ToolHeld,
+                    error: None,
+                    ts_ms: self
+                        .retention_timestamp()
+                        .or_else(broca_core::run::epoch_millis),
+                })
+                .into_result()
+                .map_err(|error| error.to_string())?;
+            writer.sync().await.map_err(|error| error.to_string())?;
+        }
+        self.index_terminal_from_wal(run_id, RunIndexState::Paused, None, None, 0)
+            .await?;
+        Ok(())
+    }
+
     /// Check the full durable WAL for unanswered questions that closed calls still need to
     /// withdraw, then publish the run's terminal index state. The withdrawal task shares this
     /// lock so it cannot clear `withdrawals_owed` using a read older than this terminal write.
@@ -6976,6 +7065,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .map_err(|e| e.to_string())??;
         if prior.run_id.is_none() || prior.run_finished_durable {
             return Ok(false);
+        }
+        match &prior.resolution {
+            broca_core::ReplayResolution::ProviderHeld {
+                run_id, open_held, ..
+            } => {
+                // With no indeterminate sibling, shutdown must leave the provider's obligation
+                // live, including open approval cards, regardless of the restart policy.
+                if !open_held.is_empty() {
+                    self.park_provider_held(run_id, false).await?;
+                }
+                return Ok(false);
+            }
+            broca_core::ReplayResolution::Resume { .. }
+            | broca_core::ReplayResolution::Interrupted { .. }
+            | broca_core::ReplayResolution::LineageIdle { .. }
+            | broca_core::ReplayResolution::AuthRequired { .. } => {}
         }
         if let Some(sealed) = sealed_attempt {
             // Ordinals within a step stay gapless and unique: the handed-over attempt
@@ -7902,6 +8007,208 @@ mod tests {
                 retries_used: 0,
                 final_step_finish_reason: None,
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_held_session_activity_is_queued_or_refused_without_redrive() {
+        use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
+        for on_restart in [None, Some(broca_protocol::request::OnRestart::Resume)] {
+            let root = broca_test_support::scratch_root().join(format!(
+                "held-activity-{}-{on_restart:?}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(root.join("project")).unwrap();
+            let key = BindIdentity::new(root.join("project"), "broca", "held");
+            let mut held_request = text_req(&key, "held");
+            held_request.on_restart = on_restart;
+            let digest = broca_core::submission_identity_digest(&held_request.to_submission());
+            let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+            let mut records = vec![
+                WalRecord::RunStarted {
+                    tags: None,
+                    session_class: None,
+                    retention: None,
+                    hooks: None,
+                    title: None,
+                    on_restart,
+                    keep_warm: None,
+                    marker_order_version: None,
+                    manifest: None,
+                    scope: None,
+                    send_id: None,
+                    request_identity_digest: Some(digest),
+                    project_id: None,
+                    principal: None,
+                    ts_ms: Some(1),
+                    run_id: RunId("held".into()),
+                    session: key.clone(),
+                    config: Box::new(min_config()),
+                    input: held_request.input.clone().into(),
+                    origin: broca_wal::RunOrigin::Fresh,
+                    submission_id: None,
+                },
+                WalRecord::ModelStepFinished {
+                    tags: None,
+                    hooks: None,
+                    step_id: broca_protocol::StepId(1),
+                    assistant_message: Arc::new(AssistantMessage {
+                        message_id: broca_protocol::MessageId("m".into()),
+                        content: vec![ContentBlock::ToolCall(ToolCall {
+                            tool_call_id: broca_protocol::ToolCallId("a".into()),
+                            tool_name: "ask".into(),
+                            input: serde_json::json!({}),
+                            thought_signature: None,
+                        })],
+                    }),
+                    usage: Usage::default(),
+                    retries_used: 0,
+                    finish_reason: None,
+                    service_tier_used: None,
+                    speed_used: None,
+                },
+                WalRecord::ToolBatchStarted {
+                    batch_id: broca_protocol::BatchId("held-b1".into()),
+                    step_id: broca_protocol::StepId(1),
+                    planned_calls: vec![broca_protocol::ToolCallId("a".into())],
+                },
+                WalRecord::ToolDispatchIntent {
+                    dispatched_at_ms: None,
+                    batch_id: broca_protocol::BatchId("held-b1".into()),
+                    tool_call_id: broca_protocol::ToolCallId("a".into()),
+                    tool_name: Some("ask".into()),
+                    args: Arc::new(serde_json::json!({})),
+                    module_id: Some("tools".into()),
+                    schema_pin: None,
+                    hooks: None,
+                    approval_digest: None,
+                    call_key: None,
+                },
+                WalRecord::ToolCallProviderHeld {
+                    batch_id: broca_protocol::BatchId("held-b1".into()),
+                    tool_call_id: broca_protocol::ToolCallId("a".into()),
+                    call_key: "lineage:4".into(),
+                    module: "tools".into(),
+                    reason: "running".into(),
+                    detail_digest: None,
+                    held_at_ms: 42,
+                    sequential: false,
+                },
+            ];
+            records.push(WalRecord::RunPaused {
+                run_id: RunId("held".into()),
+                reason: broca_protocol::PauseReason::ToolHeld,
+                error: None,
+                ts_ms: Some(43),
+            });
+            // Exercise actor policy with supplied records while the framed feature remains disabled.
+            // Production writers gate these values and the default reader refuses those frames.
+            let path = wal_store.wal_path(&key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes: Vec<_> = records
+                .iter()
+                .enumerate()
+                .flat_map(|(index, record)| {
+                    broca_wal::framing::encode_payload(
+                        index as u64 + 1,
+                        1,
+                        &serde_json::to_vec(record).unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            std::fs::write(path, bytes).unwrap();
+            let executor = Arc::new(RecoveryGate::new());
+            let registry = LineageRegistry::new(Arc::new(SeamOpener {
+                lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))),
+                wal_store: wal_store.clone(),
+                idle_ttl: Duration::from_secs(60),
+                executor: executor.clone(),
+            }));
+            let own = registry
+                .route_send(&key, held_request, RunKind::FreshOrResume)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    own,
+                    SendOutcome::Paused {
+                        reason: broca_protocol::PauseReason::ToolHeld,
+                        ..
+                    }
+                ),
+                "{own:?}"
+            );
+            let head = wal_store.read_records(&key).unwrap().len();
+            for delivery in [
+                broca_protocol::Delivery::Steer,
+                broca_protocol::Delivery::Interrupt,
+            ] {
+                let outcome = registry
+                    .route_submission_with_delivery(
+                        &key,
+                        RunId("other".into()),
+                        text_req(&key, "other").to_submission(),
+                        RunKind::FreshOrResume,
+                        SendKey::RunId,
+                        false,
+                        delivery,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(
+                        outcome,
+                        SendOutcome::RunPaused {
+                            reason: broca_protocol::PauseReason::ToolHeld,
+                            ..
+                        }
+                    ),
+                    "{outcome:?}"
+                );
+                assert_eq!(
+                    wal_store.read_records(&key).unwrap().len(),
+                    head,
+                    "refused activity writes nothing"
+                );
+            }
+            let queued = registry
+                .route_send(&key, text_req(&key, "queued"), RunKind::FreshOrResume)
+                .await
+                .unwrap();
+            assert!(matches!(queued, SendOutcome::Pending { .. }), "{queued:?}");
+            assert!(
+                executor.started().is_empty(),
+                "a held run is never re-driven by a send"
+            );
+            let frames = wal_store.read_records(&key).unwrap();
+            let raw: Vec<_> = frames.iter().map(|frame| frame.record.clone()).collect();
+            let prior = broca_core::replay(&raw).unwrap();
+            assert!(!crash_orphan_sealable(
+                EpisodeDisposition::Running,
+                &prior.resolution
+            ));
+            let page = broca_core::read_session_page(
+                &broca_core::StorePageSnapshot::empty(),
+                &frames,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(page.lineage_state.reason.unwrap().as_str(), "tool_held");
+            assert_eq!(
+                raw.iter()
+                    .filter(|record| matches!(record, WalRecord::RunPaused { .. }))
+                    .count(),
+                1
+            );
+            assert!(registry.stop_and_seal().await);
+            assert!(!wal_store
+                .read_records(&key)
+                .unwrap()
+                .iter()
+                .any(|frame| matches!(frame.record, WalRecord::RunFinished { .. })));
+            let _ = std::fs::remove_dir_all(root);
         }
     }
 

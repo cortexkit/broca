@@ -34,6 +34,8 @@ mod billing_floor;
 mod compaction;
 #[cfg(test)]
 mod model_history;
+#[cfg(test)]
+mod streamed_guidance;
 pub use attribution::{
     imported_and_pre_run_id_messages_omit_run, interrupted_tool_result_is_final,
     rollback_rows_require_attribution_backfill, run_attribution_follows_each_episode,

@@ -347,6 +347,7 @@ async fn held_retry_reads_new_denial_after_duplicate_proof_failure() {
             approval: None,
             elicitation_id: Some(id),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("c")], Some(resume), true)

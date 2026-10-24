@@ -153,6 +153,7 @@ async fn provisional_id_resume_reconciles_conflicting_settlements_before_get() {
             approval: None,
             elicitation_id: paused.open[0].id.clone(),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("c")], Some(resume), true)
@@ -275,6 +276,7 @@ async fn conflict_wait(split: bool) -> Rig {
             approval: None,
             elicitation_id: Some("held".into()),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
@@ -1313,6 +1315,7 @@ async fn live_cursor_probe(unreadable: bool) {
             approval: None,
             elicitation_id: Some("held".into()),
         }],
+        ..Default::default()
     };
     let batch = rig.batch(&crate::AllowAll, vec![call("held")], Some(resume), false);
     let monitor = async {

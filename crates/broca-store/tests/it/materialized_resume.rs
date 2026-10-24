@@ -1954,3 +1954,145 @@ async fn paused_budgeted_run_projects_once_at_pause() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The provider of the store's frozen render config.
+struct HistoryProvider {
+    /// Episodes whose render inputs the run loop handed to a provider call.
+    rendered: Mutex<Vec<Arc<broca_protocol::request::RenderHistory>>>,
+}
+
+#[async_trait]
+impl Provider for HistoryProvider {
+    fn render_config_blob(&self) -> serde_json::Value {
+        json!({ "render_config": "history" })
+    }
+    fn renderer_version(&self) -> u32 {
+        1
+    }
+    async fn step(
+        &self,
+        _step_id: StepId,
+        opts: &broca_protocol::CallOptions,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        self.rendered
+            .lock()
+            .unwrap()
+            .push(opts.render_episodes.clone());
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(NormalizedEvent::Control(
+                    ProviderControl::AssistantMessage {
+                        message: AssistantMessage {
+                            message_id: MessageId("continued".into()),
+                            content: vec![ContentBlock::Text {
+                                text: "continued".into(),
+                            }],
+                        },
+                    },
+                ))
+                .await;
+            let _ = tx
+                .send(NormalizedEvent::Control(ProviderControl::Finished {
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                    retries_used: 0,
+                }))
+                .await;
+        });
+        rx
+    }
+}
+
+/// Drive one run over `dir` and return the render history its first provider call received.
+async fn run_history(
+    dir: &std::path::Path,
+    store: Arc<SqliteStore>,
+) -> Arc<broca_protocol::request::RenderHistory> {
+    let provider = HistoryProvider {
+        rendered: Mutex::new(Vec::new()),
+    };
+    let lease = FileLeaseStore::new(dir.join("lease"));
+    let wal = FileWalStore::new(dir.join("wal"));
+    let (tx, mut rx) = mpsc::channel(64);
+    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let summary = run_loop_with_store(
+        request(dir),
+        &provider,
+        &StubToolPlane::new(),
+        &lease,
+        &AllowAll,
+        &wal,
+        Some(store as Arc<dyn broca_core::SessionStore>),
+        &tx,
+    )
+    .await;
+    drop(tx);
+    collector.await.unwrap();
+    let rendered = provider.rendered.lock().unwrap();
+    assert!(
+        !rendered.is_empty(),
+        "the run made no provider call: {summary:?}"
+    );
+    rendered[0].clone()
+}
+
+#[tokio::test]
+async fn projected_episode_render_inputs_equal_a_full_wal_replay() {
+    let base = broca_test_support::scratch_root()
+        .join(format!("broca-episode-projection-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = base.join("session");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let store = Arc::new(SqliteStore::open(dir.join("store.db")).unwrap());
+    let rendered = run_history(&dir, store.clone()).await;
+    let frames = wal_frames(&dir);
+    let history = replay(
+        &frames
+            .iter()
+            .map(|frame| frame.record.clone())
+            .collect::<Vec<_>>(),
+    )
+    .expect("the run's history replays");
+    let expected: Vec<broca_protocol::request::EpisodeRenderInput> =
+        broca_core::replay::projected_episode_metadata(&history)
+            .into_iter()
+            .map(|episode| broca_protocol::request::EpisodeRenderInput {
+                prompt_start: usize::try_from(episode.start().expect("a start")).unwrap(),
+                first_user: episode
+                    .first_user()
+                    .expect("a known first user")
+                    .map(|value| value as usize),
+                frozen_config: episode.render_config().cloned().unwrap_or_default(),
+            })
+            .collect();
+    assert_eq!(expected.len(), 1, "the fixture opened one episode");
+    assert_eq!(
+        rendered.episodes, expected,
+        "the run's episode inputs equal what a full WAL replay derives"
+    );
+
+    // The store's own projection holds the same values, so a later resume can read them.
+    let session = session_of(&dir);
+    let projected = MaterializedStore::read_episode_projection(store.as_ref(), &session)
+        .expect("read episode projection")
+        .expect("the live store keeps its episodes");
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].start(), Some(expected[0].prompt_start as u64));
+    assert_eq!(
+        projected[0].first_user(),
+        Some(expected[0].first_user.map(|value| value as u64))
+    );
+    assert_eq!(
+        projected[0].render_config(),
+        Some(&expected[0].frozen_config)
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+fn session_of(dir: &std::path::Path) -> BindIdentity {
+    request(dir).session
+}

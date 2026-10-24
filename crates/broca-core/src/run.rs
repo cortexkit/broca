@@ -36,7 +36,6 @@ use broca_protocol::{
     ProviderControl, ProviderError, RunId, StepId, ToolCallId, Usage,
 };
 use broca_wal::{DispatchOutcome, NoDispatchReason, RunConfig, WalRecord};
-use futures::future::join_all;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -47,9 +46,11 @@ use crate::{
     provider::Provider,
     replay::{replay, PendingTurn, ReplayResolution, ReplayState},
     tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError},
-    tool_repetition::{result_bytes, RepetitionObserver},
+    tool_repetition::{result_bytes, RepetitionFold, RepetitionObserver},
     wal_writer::{session_addr, WalHandle, WalStore, WalWriteError},
 };
+
+pub mod repetition_guidance;
 
 /// Default safety cap when the caller supplies no `stop_when`.
 ///
@@ -520,6 +521,9 @@ pub(crate) struct ApprovalWaitProbe {
 /// emission defaults to "on" so existing callers retain the complete output stream.
 #[derive(Clone)]
 pub struct RunControl {
+    /// Installed by the late-result runtime to rejoin durable waiting slots without re-dispatch.
+    /// Absent by default: a reader or a caller retry cannot drive a provider-held run.
+    pub provider_held_lifecycle: Option<Arc<dyn crate::tool_plane::ProviderHeldLifecycle>>,
     /// Cheap actor-owned status; never a durability or cancellation input.
     pub step_progress: Option<crate::provider::LiveStepProgress>,
     #[cfg(all(test, feature = "test-clock"))]
@@ -679,6 +683,7 @@ impl RunControl {
 impl Default for RunControl {
     fn default() -> Self {
         Self {
+            provider_held_lifecycle: None,
             step_progress: None,
             #[cfg(all(test, feature = "test-clock"))]
             approval_wait_probe: None,
@@ -1466,6 +1471,21 @@ where
             return Err(e);
         }
     };
+    // An applied view can leave the resumed prompt without the episode coordinates of earlier
+    // episodes, which ChatGPT effort updates and per-episode repetition guidance render from.
+    // The store projects them, so take them from there instead of replaying the whole WAL.
+    if is_resume && !append_episode && prior.render_episodes.is_none() {
+        if let Some(store) = store.as_ref() {
+            match store_episode_render_history(Arc::clone(store), req.session.clone()).await {
+                Ok(Some(episodes)) => prior.render_episodes = Some(episodes),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    target: "store",
+                    "episode projection read failed; the admission replay decides: {error}"
+                ),
+            }
+        }
+    }
     // Compaction notices are numbered per session, not per lineage: the provider and the bus
     // both key them on the session. A compaction session's lineage that has recorded no notice
     // yet numbers its first one past every notice of this session's earlier lineages that
@@ -1800,6 +1820,69 @@ fn replay_complete_snapshot_or_wal<W: WalStore>(
             .collect()
     };
     replay(&records).map_err(|error| RunError::Wal(error.to_string()))
+}
+
+/// The resumed run's per-episode render inputs, from the store's episode projection.
+///
+/// A resumed prompt rebuilt from a materialized store prefix carries no episode boundaries, and
+/// an applied view can hide most of the messages that would show them. The projection holds each
+/// episode's start ordinal, its original admitted first user, its first model-step ordinal and its
+/// frozen render config: the same coordinates a full WAL replay derives, which is what the test
+/// beside this reads them against.
+///
+/// `Ok(None)` means the store cannot supply them, and the caller's WAL replay decides instead:
+/// the session has no projection (a store written before the column existed), its projection is
+/// older than the store's watermark (a write that advanced the transcript without recomputing
+/// it), or a value in it was never computed. The stored render config is the episode's whole
+/// frozen run config, from which replay renders the config blob it puts on the episode.
+async fn store_episode_render_history(
+    store: Arc<dyn SessionStore>,
+    session: BindIdentity,
+) -> Result<Option<Vec<broca_protocol::request::EpisodeRenderInput>>, String> {
+    let stored = store
+        .read_episode_projection_async(&session)
+        .await
+        .map_err(|error| format!("store episode projection read failed: {error}"))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    if stored.is_empty()
+        || !stored
+            .iter()
+            .all(crate::context::EpisodeRenderProjection::is_complete)
+        || stored
+            .iter()
+            .skip(1)
+            .any(|episode| episode.start() == Some(0))
+        || stored
+            .windows(2)
+            .any(|pair| pair[0].start() >= pair[1].start())
+    {
+        return Ok(None);
+    }
+    let mut episodes = Vec::with_capacity(stored.len());
+    for episode in &stored {
+        if episode.first_step().is_none() {
+            return Ok(None);
+        }
+        let (Some(start), Some(first_user)) = (episode.start(), episode.first_user()) else {
+            return Ok(None);
+        };
+        let usize_of = |ordinal: u64| usize::try_from(ordinal).map_err(|e| e.to_string());
+        episodes.push(broca_protocol::request::EpisodeRenderInput {
+            prompt_start: usize_of(start)?,
+            first_user: first_user.map(usize_of).transpose()?,
+            frozen_config: episode
+                .render_config()
+                .and_then(|config| {
+                    serde_json::from_value::<crate::RunConfig>(config.clone())
+                        .ok()
+                        .map(|config| config.frozen_render_config)
+                })
+                .unwrap_or_else(|| episode.render_config().cloned().unwrap_or_default()),
+        });
+    }
+    Ok(Some(episodes))
 }
 
 async fn read_store_prefix_blocking(
@@ -2816,6 +2899,7 @@ where
         let pending = match &prior.resolution {
             ReplayResolution::AuthRequired { pending, .. }
             | ReplayResolution::Resume { pending } => pending.as_ref(),
+            ReplayResolution::ProviderHeld { pending, .. } => Some(pending),
             _ => None,
         };
         approval_gate::require_approval_adapter(
@@ -3679,6 +3763,91 @@ where
                 }
                 return Ok(summary);
             }
+            ReplayResolution::ProviderHeld {
+                pending, open_held, ..
+            } => {
+                if !open_held.is_empty()
+                    && pending.deferred.is_empty()
+                    && pending.approved.is_empty()
+                    && control.provider_held_lifecycle.is_none()
+                {
+                    let already_paused = approval_frames.iter().rev().any(|frame| {
+                        matches!(
+                            frame.record,
+                            WalRecord::RunPaused {
+                                reason: PauseReason::ToolHeld,
+                                ..
+                            }
+                        )
+                    });
+                    if !already_paused {
+                        return pause_run(
+                            writer,
+                            out,
+                            control,
+                            resolved_run_id.clone(),
+                            PauseReason::ToolHeld,
+                            None,
+                            prior.completed_steps,
+                            prior.usage,
+                            prior.retries_used,
+                        )
+                        .await;
+                    }
+                    control.close_steers();
+                    let _ = send(
+                        out,
+                        OutputEvent::Control(ControlUnit::Paused {
+                            run_id: resolved_run_id.clone(),
+                            reason: PauseReason::ToolHeld,
+                            error: None,
+                        }),
+                    )
+                    .await;
+                    return Ok(RunSummary {
+                        reason: RunFinishReason::Interrupted,
+                        paused: Some(PauseReason::ToolHeld),
+                        steps: prior.completed_steps,
+                        usage: prior.usage,
+                        retries_used: prior.retries_used,
+                        final_step_finish_reason: None,
+                    });
+                }
+                if let Some(error) = prior
+                    .run_config
+                    .as_ref()
+                    .and_then(|config| render_config_error(provider, config))
+                {
+                    writer.record(resume_sealing);
+                    let (summary, head) = finish_run(
+                        writer,
+                        control,
+                        out,
+                        &resolved_run_id,
+                        RunFinishReason::Interrupted,
+                        prior.completed_steps,
+                        prior.usage,
+                        prior.retries_used,
+                        Some(error),
+                        prior_last_step_finish_reason,
+                    )
+                    .await?;
+                    if let Some(projector) = projector {
+                        projector.enqueue_terminal(head);
+                    }
+                    return Ok(summary);
+                }
+                writer.record(resume_continuing);
+                writer.sync().await?;
+                prompt = prior.prompt;
+                own_messages_start = prompt.len();
+                stamped_len = prompt.len();
+                total_usage = prior.usage;
+                total_retries_used = prior.retries_used;
+                last_step_finish_reason = prior_last_step_finish_reason;
+                completed_steps = prior.completed_steps;
+                pending_turn = Some(pending);
+            }
             // The last episode is PAUSED awaiting (re-)auth — a NON-terminal durable
             // state. The actual re-auth-and-continue (resuming the SAME run_id from the
             // last durable boundary) is a later phase; here we must NOT write a
@@ -4182,8 +4351,7 @@ where
         episode_history_start,
         originals.as_mut(),
     );
-    let mut repetition_observer = RepetitionObserver::from_prompt(&prompt[episode_history_start..]);
-    restore_guidance_with_originals(
+    let mut repetition_observer = restore_guidance_with_originals(
         &mut prompt[episode_history_start..],
         episode_history_start,
         originals.as_mut(),
@@ -4236,10 +4404,11 @@ where
             out,
             control,
             approval_history.as_mut(),
+            &approval_frames,
         ))
         .await?;
         raw_len = prompt.len();
-        if !interrupt.1.is_empty() {
+        if !interrupt.1.is_empty() || interrupt.2 {
             return pause_approval(
                 writer,
                 out,
@@ -4250,6 +4419,7 @@ where
                 total_usage,
                 total_retries_used,
                 &interrupt.1,
+                interrupt.2,
             )
             .await;
         }
@@ -5516,7 +5686,10 @@ where
         ));
         let mut batch = batch_future.await?;
 
-        if batch.interruption == Some(BatchInterruption::RestartPause) {
+        if matches!(
+            batch.interruption,
+            Some(BatchInterruption::RestartPause | BatchInterruption::ProviderHeldPause)
+        ) {
             return pause_approval(
                 writer,
                 out,
@@ -5527,6 +5700,7 @@ where
                 total_usage,
                 total_retries_used,
                 &batch.open,
+                batch.interruption == Some(BatchInterruption::ProviderHeldPause),
             )
             .await;
         }
@@ -6287,6 +6461,9 @@ fn store_prior_needs_episode_spans(prior: &ReplayState) -> bool {
                     .saturating_sub(u64::from(pending.is_some())),
             )
         }
+        ReplayResolution::ProviderHeld { .. } => {
+            episode_history_start(&prior.prompt, prior.completed_steps.saturating_sub(1))
+        }
         // An ambiguous episode is sealed without another request, so nothing is rendered.
         ReplayResolution::Interrupted { .. } => return false,
     };
@@ -6295,37 +6472,12 @@ fn store_prior_needs_episode_spans(prior: &ReplayState) -> bool {
 
 /// Whether folding `prompt` with a single observer produces guidance for any tool result.
 fn repetition_guidance_fires(prompt: &[Message]) -> bool {
-    let mut observer = RepetitionObserver::new();
-    let mut index = 0;
-    while index + 1 < prompt.len() {
-        if prompt[index].role != Role::Assistant || prompt[index + 1].role != Role::Tool {
-            index += 1;
-            continue;
-        }
-        let mut calls = prompt[index]
-            .content
+    let mut fold = RepetitionFold::default();
+    prompt.iter().any(|message| {
+        fold.push(message)
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall(call) => Some(call),
-                _ => None,
-            });
-        for block in &prompt[index + 1].content {
-            if let ContentBlock::ToolResult(result) = block {
-                if let Some(call) = calls.next() {
-                    let bytes = result_bytes(&result.output);
-                    if observer
-                        .observe(call, bytes.as_ref(), result.is_error)
-                        .guidance()
-                        .is_some()
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        index += 2;
-    }
-    false
+            .any(|(_, verdict)| verdict.guidance().is_some())
+    })
 }
 
 fn append_repetition_guidance(result: &mut ToolResult, guidance: &str) {
@@ -6387,37 +6539,26 @@ fn restore_guidance_with_originals(
     prompt: &mut [Message],
     base: usize,
     mut originals: Option<&mut crate::compaction::OriginalMessages>,
-) {
-    let mut observer = RepetitionObserver::new();
-    let mut index = 0;
-    while index + 1 < prompt.len() {
-        if prompt[index].role != Role::Assistant || prompt[index + 1].role != Role::Tool {
-            index += 1;
-            continue;
-        }
-
-        let calls: Vec<ToolCall> = prompt[index]
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall(call) => Some(call.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut calls = calls.iter();
-        let original = originals.as_ref().map(|_| prompt[index + 1].clone());
-        for block in &mut prompt[index + 1].content {
-            if let ContentBlock::ToolResult(result) = block {
-                if let Some(call) = calls.next() {
-                    attach_repetition_guidance_to_result(&mut observer, call, result);
+) -> RepetitionObserver {
+    let mut fold = RepetitionFold::default();
+    for (index, message) in prompt.iter_mut().enumerate() {
+        let verdicts = fold.push(message);
+        let original = originals
+            .as_ref()
+            .filter(|_| !verdicts.is_empty())
+            .map(|_| message.clone());
+        for (block_index, verdict) in verdicts {
+            if let Some(guidance) = verdict.guidance() {
+                if let ContentBlock::ToolResult(result) = &mut message.content[block_index] {
+                    append_repetition_guidance(result, &guidance);
                 }
             }
         }
         if let (Some(originals), Some(original)) = (originals.as_deref_mut(), original) {
-            originals.retain_change(base + index + 1, original, &prompt[index + 1]);
+            originals.retain_change(base + index, original, message);
         }
-        index += 2;
     }
+    fold.into_observer()
 }
 
 /// On resume, complete an incomplete trailing tool turn WITHOUT re-running the
@@ -6448,7 +6589,9 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     out: &mpsc::Sender<OutputEvent>,
     control: &RunControl,
     history: Option<&mut approval_gate::History>,
-) -> Result<(Option<RunFinishReason>, Vec<approval_gate::Held>), RunError> {
+    frames: &[broca_wal::FramedRecord],
+) -> Result<(Option<RunFinishReason>, Vec<approval_gate::Held>, bool), RunError> {
+    let intents = held_resume_intents(&pending, frames, writer)?;
     // The full ToolCall set (name+input) from the durable assistant message, in
     // PLANNED order (so the reconstructed tool-role message is source-ordered).
     let mut by_id: std::collections::HashMap<ToolCallId, std::collections::VecDeque<ToolCall>> =
@@ -6486,6 +6629,8 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
             .into_iter()
             .chain(pending.approved)
             .collect(),
+        provider_held: pending.provider_held,
+        intents,
     };
     if args_cut {
         // A crash may preserve the assistant's calls but lose their error results. Calls
@@ -6536,8 +6681,15 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         req.on_restart == Some(broca_protocol::request::OnRestart::Resume),
     )
     .await?;
-    if batch.interruption == Some(BatchInterruption::RestartPause) {
-        return Ok((None, batch.open));
+    if matches!(
+        batch.interruption,
+        Some(BatchInterruption::RestartPause | BatchInterruption::ProviderHeldPause)
+    ) {
+        return Ok((
+            None,
+            batch.open,
+            batch.interruption == Some(BatchInterruption::ProviderHeldPause),
+        ));
     }
 
     // As on the uninterrupted path, dispatch persistence is complete before the model-facing copy
@@ -6601,7 +6753,11 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     }
     prompt.push(results);
 
-    Ok((BatchOutcome::finish_reason(batch.interruption), Vec::new()))
+    Ok((
+        BatchOutcome::finish_reason(batch.interruption),
+        Vec::new(),
+        false,
+    ))
 }
 
 /// Return the durable request only when no blocking renderer can still hold its snapshot.
@@ -7018,10 +7174,75 @@ impl PlannedDispatch {
 /// `tool_batch_started` may already be durable (don't rewrite it — that would
 /// reset the batch if we crash and replay again), and the already-terminated
 /// calls' reconstructed results are included as-is.
+// Default is an unopened batch with no existing terminal, approval, held slot or dispatch intent.
+#[derive(Default)]
 struct ResumeCtx {
     batch_already_started: bool,
     existing: std::collections::HashMap<ToolCallId, std::collections::VecDeque<ToolResult>>,
     prepared: Vec<crate::replay::PreparedCall>,
+    provider_held: Vec<crate::replay::ProviderHeldCall>,
+    intents: std::collections::HashMap<ToolCallId, PlannedDispatch>,
+}
+
+fn held_resume_intents(
+    pending: &PendingTurn,
+    frames: &[broca_wal::FramedRecord],
+    writer: &WalHandle,
+) -> Result<std::collections::HashMap<ToolCallId, PlannedDispatch>, RunError> {
+    let mut intents = std::collections::HashMap::new();
+    for frame in frames {
+        if let WalRecord::ToolDispatchIntent {
+            batch_id,
+            tool_call_id,
+            args,
+            call_key,
+            ..
+        } = &frame.record
+        {
+            if Some(batch_id) != pending.batch_id.as_ref()
+                || !(pending.held_successors.contains(tool_call_id)
+                    || pending
+                        .provider_held
+                        .iter()
+                        .any(|held| &held.tool_call_id == tool_call_id))
+            {
+                continue;
+            }
+            let Some(call) = pending
+                .assistant
+                .tool_calls()
+                .find(|call| &call.tool_call_id == tool_call_id)
+            else {
+                continue;
+            };
+            let mut dispatch = PlannedDispatch::from(call.clone());
+            dispatch.input = Arc::clone(args);
+            dispatch.call_key = call_key.clone().or_else(|| {
+                writer
+                    .lineage_id()
+                    .map(|lineage| crate::context::call_key(lineage, frame.seq))
+            });
+            if let Some(key) = call_key {
+                dispatch.approved = frames.iter().find_map(|frame| match &frame.record {
+                    WalRecord::ToolCallDeferred { args_jcs, .. }
+                        if writer.lineage_id().is_some_and(|lineage| {
+                            crate::context::call_key(lineage, frame.seq) == *key
+                        }) =>
+                    {
+                        Some(args_jcs.clone())
+                    }
+                    _ => None,
+                });
+            }
+            intents.insert(tool_call_id.clone(), dispatch);
+        }
+    }
+    if intents.len() != pending.provider_held.len() + pending.held_successors.len() {
+        return Err(RunError::Wal(
+            "provider-held resume lacks its durable dispatch intents".into(),
+        ));
+    }
+    Ok(intents)
 }
 
 fn step_attempt_was_args_cut(frames: &[broca_wal::FramedRecord], step_id: StepId) -> bool {
@@ -7074,6 +7295,8 @@ fn tool_args_rejection_records(
             batch_already_started: true,
             existing,
             prepared: Vec::new(),
+            provider_held: Vec::new(),
+            intents: std::collections::HashMap::new(),
         }),
     )
 }
@@ -7082,6 +7305,7 @@ fn tool_args_rejection_records(
 /// remains distinct from shutdown, scope loss, and ambiguous dispatched outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchInterruption {
+    ProviderHeldPause,
     CallerCancel,
     StopRequested,
     Ambiguous,
@@ -7100,7 +7324,7 @@ impl BatchOutcome {
         match interruption {
             Some(BatchInterruption::CallerCancel) => Some(RunFinishReason::Cancelled),
             Some(BatchInterruption::StopRequested) => Some(RunFinishReason::Interrupted),
-            Some(BatchInterruption::RestartPause) => None,
+            Some(BatchInterruption::RestartPause | BatchInterruption::ProviderHeldPause) => None,
             Some(BatchInterruption::Ambiguous | BatchInterruption::ScopeDrained) => {
                 Some(RunFinishReason::Interrupted)
             }
@@ -7240,7 +7464,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     };
     let scope_stopped = matches!(batch_refusal, Some(BatchRefusal::ScopeDrained(_)));
     let batch_stopped = matches!(batch_refusal, Some(BatchRefusal::Stopped));
-    let mut existing = resume.map(|r| r.existing).unwrap_or_default();
+    let (mut existing, mut existing_intents, resumed_held) = resume
+        .map(|r| (r.existing, r.intents, r.provider_held))
+        .unwrap_or_default();
+    let durable_intents: HashSet<_> = existing_intents.keys().cloned().collect();
 
     // Gate every call (sequential, cheap): capability then approval. A call that
     // already has a durable terminal (resume) is Already — never re-gated/dispatched.
@@ -7263,6 +7490,10 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
             .and_then(|results| results.pop_front())
         {
             plan.push(CallPlan::Already(prior));
+            continue;
+        }
+        if let Some(dispatch) = existing_intents.remove(&call.tool_call_id) {
+            plan.push(CallPlan::Dispatch(dispatch));
             continue;
         }
         if gating_stop.is_some() {
@@ -7434,6 +7665,9 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         for p in &mut plan {
             match p {
                 CallPlan::Dispatch(c) => {
+                    if durable_intents.contains(&c.tool_call_id) {
+                        continue;
+                    }
                     let seq = writer
                         .record(WalRecord::ToolDispatchIntent {
                             dispatched_at_ms: None,
@@ -7639,55 +7873,16 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         writer,
         ctx: &ctx,
         sequential: any_sequential,
+        held: ProviderHeldBatch::new(resumed_held),
+        lifecycle: ordered.and_then(|control| control.provider_held_lifecycle.as_deref()),
+        clock: ordered.and_then(|control| control.clock.as_ref()),
     };
     let tool_plane = &recording_plane;
-    let mut resolutions = crate::keep_warm_wait::wait_tools(
-        async {
-            let resolutions: Vec<CallResolution> = if any_sequential {
-                // Sequential dispatch stops at the first ambiguous result so no later operation is sent.
-                // Give an interrupted terminal only to remaining Dispatch plans; NoDispatch and Already
-                // plans retain their existing results, while Synthetic retains its precomputed result.
-                let mut acc: Vec<CallResolution> = Vec::with_capacity(plan.len());
-                let mut tripped = false;
-                for (source_index, p) in plan.into_iter().enumerate() {
-                    if tripped {
-                        if let CallPlan::Dispatch(call) = p {
-                            acc.push(interrupted_resolution(&call.tool_call_id));
-                            continue;
-                        }
-                    }
-                    let r = resolve_hooked(
-                        p,
-                        source_index,
-                        step_id,
-                        &ctx,
-                        tool_plane,
-                        cancel,
-                        stop,
-                        hooks,
-                    )
-                    .await;
-                    if r.ambiguous {
-                        tripped = true;
-                    }
-                    acc.push(r);
-                }
-                acc
-            } else {
-                // Parallel: the whole batch is already in flight; collect all results, then
-                // the run stops if any was ambiguous. We don't START more after the fact,
-                // but the concurrently-launched calls all finish — that's the source-order
-                // result set.
-                join_all(plan.into_iter().enumerate().map(|(index, p)| {
-                    resolve_hooked(p, index, step_id, &ctx, tool_plane, cancel, stop, hooks)
-                }))
-                .await
-            };
-            resolutions
-        },
+    let (mut resolutions, provider_held_pause) = crate::keep_warm_wait::wait_tools(
+        resolve_provider_held_batch(plan, step_id, &ctx, tool_plane, cancel, stop, hooks),
         warm,
     )
-    .await;
+    .await?;
 
     // A call the stop request kept from being sent ends the run after this batch, like an
     // ambiguous one: the run was asked to start nothing further.
@@ -7727,6 +7922,14 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                 writer.record(record);
             }
         }
+    }
+    if provider_held_pause {
+        writer.sync().await?;
+        return Ok(BatchOutcome {
+            results: Vec::new(),
+            interruption: Some(BatchInterruption::ProviderHeldPause),
+            open: Vec::new(),
+        });
     }
     writer.record(WalRecord::ToolBatchFinished {
         batch_id: batch_id.clone(),
@@ -7959,17 +8162,128 @@ async fn register_dispatch_plans<'a>(
     Ok(())
 }
 
+#[derive(Default)]
+struct ProviderHeldBatch {
+    open: std::sync::Mutex<std::collections::HashMap<ToolCallId, crate::replay::ProviderHeldCall>>,
+    changed: tokio::sync::Notify,
+    resumed: Vec<crate::replay::ProviderHeldCall>,
+}
+
+impl ProviderHeldBatch {
+    fn new(resumed: Vec<crate::replay::ProviderHeldCall>) -> Self {
+        Self {
+            open: std::sync::Mutex::new(
+                resumed
+                    .iter()
+                    .map(|held| (held.tool_call_id.clone(), held.clone()))
+                    .collect(),
+            ),
+            resumed,
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn contains(&self, id: &ToolCallId) -> bool {
+        self.open
+            .lock()
+            .expect("provider-held slots")
+            .contains_key(id)
+    }
+
+    fn len(&self) -> usize {
+        self.open.lock().expect("provider-held slots").len()
+    }
+
+    fn complete(&self, id: &ToolCallId) {
+        self.open.lock().expect("provider-held slots").remove(id);
+    }
+}
+
+/// Sync a delivered sequential held terminal before the next send, not at the batch barrier.
+async fn sync_held_terminal(
+    result: &mut CallResolution,
+    ctx: &BatchCtx,
+    writer: &WalHandle,
+    hooks: Option<&crate::hooks::HookRuntime<'_>>,
+) -> Result<(), RunError> {
+    approval_gate::sync_result(result, ctx, writer, hooks).await?;
+    result.outcome = None;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_provider_held_batch<T: ToolPlane>(
+    plans: Vec<CallPlan>,
+    step: StepId,
+    ctx: &BatchCtx,
+    plane: &ProviderHeldPlane<'_, T>,
+    cancel: Option<&CancellationToken>,
+    stop: Option<&CancellationToken>,
+    hooks: Option<&crate::hooks::HookRuntime<'_>>,
+) -> Result<(Vec<CallResolution>, bool), RunError> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let count = plans.len();
+    let mut remaining = plans.into_iter().enumerate();
+    let mut jobs = FuturesUnordered::new();
+    let mut results = std::collections::BTreeMap::new();
+    let mut tripped = false;
+    loop {
+        while !plane.sequential || jobs.is_empty() {
+            let Some((index, plan)) = remaining.next() else {
+                break;
+            };
+            let stopped = tripped && matches!(plan, CallPlan::Dispatch(_));
+            jobs.push(async move {
+                let result = if stopped {
+                    let CallPlan::Dispatch(call) = plan else {
+                        unreachable!()
+                    };
+                    interrupted_resolution(&call.tool_call_id)
+                } else {
+                    resolve_hooked(plan, index, step, ctx, plane, cancel, stop, hooks).await
+                };
+                (index, result)
+            });
+        }
+        if results.len() == count {
+            return Ok((results.into_values().collect(), false));
+        }
+        tokio::select! {
+            biased;
+            Some((index, mut result)) = jobs.next() => {
+                tripped |= result.ambiguous;
+                if plane.held.contains(&result.result.tool_call_id) {
+                    // Even on resume, no successor may leave until the held terminal is durable.
+                    sync_held_terminal(&mut result, ctx, plane.writer, hooks).await?;
+                    plane.held.complete(&result.result.tool_call_id);
+                }
+                results.insert(index, result);
+            }
+            _ = async {}, if !tripped && plane.held.len() > 0 && jobs.len() == plane.held.len() => {
+                return Ok((results.into_values().collect(), true));
+            }
+            _ = plane.held.changed.notified() => {}
+        }
+    }
+}
+
 /// Keeps the batch's WAL writer on the held path, before the adapter can join a waiting slot.
 struct ProviderHeldPlane<'a, T> {
     inner: &'a T,
     writer: &'a WalHandle,
     ctx: &'a BatchCtx,
     sequential: bool,
+    held: ProviderHeldBatch,
+    lifecycle: Option<&'a dyn crate::tool_plane::ProviderHeldLifecycle>,
+    clock: Option<&'a crate::Clock>,
 }
 
 #[async_trait::async_trait]
 impl<T: ToolPlane> crate::tool_plane::ProviderHeldRecorder for ProviderHeldPlane<'_, T> {
     async fn sync_held(&self, reply: &crate::tool_plane::ProviderHeldReply) -> Result<(), String> {
+        let held_at_ms = self
+            .clock
+            .map_or_else(|| epoch_millis().unwrap_or(0), crate::Clock::now_ms);
         self.writer
             .record(WalRecord::ToolCallProviderHeld {
                 batch_id: self.ctx.batch_id.clone(),
@@ -7978,7 +8292,7 @@ impl<T: ToolPlane> crate::tool_plane::ProviderHeldRecorder for ProviderHeldPlane
                 module: reply.module.clone(),
                 reason: reply.reason.clone(),
                 detail_digest: reply.detail_digest.clone(),
-                held_at_ms: epoch_millis().unwrap_or(0),
+                held_at_ms,
                 sequential: self.sequential,
             })
             .into_result()
@@ -7987,6 +8301,19 @@ impl<T: ToolPlane> crate::tool_plane::ProviderHeldRecorder for ProviderHeldPlane
             .sync()
             .await
             .map_err(|error| error.to_string())?;
+        self.held.open.lock().expect("provider-held slots").insert(
+            reply.tool_call_id.clone(),
+            crate::replay::ProviderHeldCall {
+                tool_call_id: reply.tool_call_id.clone(),
+                call_key: reply.call_key.clone(),
+                module: reply.module.clone(),
+                reason: reply.reason.clone(),
+                detail_digest: reply.detail_digest.clone(),
+                held_at_ms,
+                sequential: self.sequential,
+            },
+        );
+        self.held.changed.notify_one();
         Ok(())
     }
 }
@@ -8023,6 +8350,17 @@ impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
         call: &ToolCall,
         key: crate::tool_plane::DispatchKey<'_>,
     ) -> DispatchResult {
+        if let Some(held) = self
+            .held
+            .resumed
+            .iter()
+            .find(|held| held.tool_call_id == call.tool_call_id)
+        {
+            return match self.lifecycle {
+                Some(lifecycle) => lifecycle.wait(ctx, call, &held.reply()).await,
+                None => std::future::pending().await,
+            };
+        }
         self.inner
             .dispatch_keyed(
                 ctx,
@@ -8054,6 +8392,14 @@ impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
         key: crate::tool_plane::DispatchKey<'_>,
         signals: &crate::tool_plane::DispatchSignals,
     ) -> DispatchResult {
+        if self
+            .held
+            .resumed
+            .iter()
+            .any(|held| held.tool_call_id == call.tool_call_id)
+        {
+            return self.dispatch_keyed(ctx, call, key).await;
+        }
         self.inner
             .dispatch_approved_keyed(
                 ctx,
@@ -8734,7 +9080,10 @@ use hook_dispatch::{
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        time::Duration,
+    };
 
     use tokio::sync::Notify;
 
@@ -9576,6 +9925,9 @@ mod tests {
             writer: &writer,
             ctx: &ctx,
             sequential: true,
+            held: ProviderHeldBatch::default(),
+            lifecycle: None,
+            clock: None,
         };
         let mut dispatch = PlannedDispatch::from(ToolCall {
             tool_call_id: ToolCallId("call".into()),
@@ -9657,6 +10009,477 @@ mod tests {
             record,
             WalRecord::RunPaused { .. } | WalRecord::ToolCallProviderHeld { .. }
         )));
+        writer.shutdown().await.unwrap();
+    }
+
+    struct LineageRecordingWal(RecordingWal);
+    impl broca_wal::Wal for LineageRecordingWal {
+        fn append(
+            &mut self,
+            fence: u64,
+            record: &WalRecord,
+            sync: bool,
+        ) -> Result<u64, broca_wal::WalError> {
+            self.0.append(fence, record, sync)
+        }
+        fn sync(&self) -> Result<(), broca_wal::WalError> {
+            self.0.sync()
+        }
+        fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.0.replay()
+        }
+        fn tail_after_seq(
+            &self,
+            seq: u64,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.0.tail_after_seq(seq)
+        }
+        fn last_seq(&self) -> u64 {
+            self.0.last_seq()
+        }
+        fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
+            use sha2::Digest;
+            let mut frame = [0x5a; 69];
+            frame[..4].copy_from_slice(&16u32.to_le_bytes());
+            frame[4] = 2;
+            frame[5..21].fill(0);
+            let digest = sha2::Sha256::digest([&frame[4..21], &frame[53..69]].concat());
+            frame[21..53].copy_from_slice(&digest);
+            let broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } =
+                broca_wal::framing::decode_next(&frame)
+            else {
+                panic!("test lineage frame")
+            };
+            Some(lineage_id)
+        }
+    }
+
+    struct ParkedPlane {
+        records: Arc<std::sync::Mutex<Vec<WalRecord>>>,
+        head: Arc<std::sync::atomic::AtomicU64>,
+        sent: std::sync::Mutex<Vec<ToolCallId>>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolPlane for ParkedPlane {
+        async fn batch_started(
+            &self,
+            _: &BatchCtx,
+            _: &[ToolCall],
+            _: &ToolManifest,
+        ) -> Result<(), ToolPlaneError> {
+            Ok(())
+        }
+        async fn batch_finished(&self, _: &BatchCtx) -> Result<(), ToolPlaneError> {
+            Ok(())
+        }
+        async fn dispatch(&self, _: &BatchCtx, _: &ToolCall) -> DispatchResult {
+            panic!("keyed dispatch required")
+        }
+        async fn dispatch_keyed(
+            &self,
+            _: &BatchCtx,
+            call: &ToolCall,
+            key: crate::tool_plane::DispatchKey<'_>,
+        ) -> DispatchResult {
+            self.sent.lock().unwrap().push(call.tool_call_id.clone());
+            if call.tool_call_id.0 == "a" {
+                if let Some(gate) = &self.gate {
+                    gate.notified().await;
+                }
+                key.held_recorder
+                    .unwrap()
+                    .sync_held(&crate::tool_plane::ProviderHeldReply {
+                        tool_call_id: call.tool_call_id.clone(),
+                        call_key: key.call_key.into(),
+                        module: "tools".into(),
+                        reason: "running".into(),
+                        detail_digest: None,
+                    })
+                    .await
+                    .unwrap();
+                return std::future::pending().await;
+            }
+            let records = self.records.lock().unwrap();
+            let terminal = records.iter().position(|record| matches!(record, WalRecord::ToolResult { result, outcome: DispatchOutcome::Completed, .. } if result.tool_call_id.0 == "a")).expect("held terminal before successor send");
+            assert!(
+                self.head.load(Ordering::Acquire) > terminal as u64,
+                "held terminal must be synced before successor send"
+            );
+            DispatchResult::Completed(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                is_error: false,
+                output: ToolOutput::Text {
+                    text: "successor".into(),
+                },
+            })
+        }
+    }
+
+    struct DeliveredHeld;
+    #[async_trait::async_trait]
+    impl crate::tool_plane::ProviderHeldLifecycle for DeliveredHeld {
+        async fn wait(
+            &self,
+            _: &BatchCtx,
+            call: &ToolCall,
+            _: &crate::tool_plane::ProviderHeldReply,
+        ) -> DispatchResult {
+            DispatchResult::Completed(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                is_error: false,
+                output: ToolOutput::Text {
+                    text: "answer".into(),
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_held_sequential_pause_resume_syncs_before_successor() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut prefix = crate::replay::deferred_tests::batch(&["a", "b"]);
+            if let WalRecord::ToolBatchStarted { batch_id, .. } = &mut prefix[2] {
+                *batch_id = BatchId("r-b1".into());
+            }
+            let records = Arc::new(std::sync::Mutex::new(prefix));
+            let writer = WalHandle::spawn(
+                Box::new(LineageRecordingWal(RecordingWal {
+                    records: records.clone(),
+                })),
+                1,
+            )
+            .unwrap();
+            writer.seed_lineage_tags(Some(crate::tags::LineageTags::Off));
+            let plane = ParkedPlane {
+                records: records.clone(),
+                head: writer.durable_head(),
+                sent: Default::default(),
+                gate: None,
+            };
+            let calls: Vec<_> = match &records.lock().unwrap()[1] {
+                WalRecord::ModelStepFinished {
+                    assistant_message, ..
+                } => assistant_message.tool_calls().cloned().collect(),
+                _ => unreachable!(),
+            };
+            let manifest = ToolManifest::from_tools(vec![Tool {
+                name: "edit".into(),
+                description: "edit".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                module: Some("tools".into()),
+                execution_mode: ExecutionMode::Sequential,
+                reply: None,
+            }]);
+            let (out, _rx) = mpsc::channel(32);
+            let control = RunControl::default();
+            let batch = dispatch_batch(
+                &RunId("r".into()),
+                StepId(1),
+                &BindIdentity::new("/project", "broca", "session"),
+                None,
+                calls.clone(),
+                &manifest,
+                &plane,
+                &crate::AllowAll,
+                &writer,
+                Some(ResumeCtx {
+                    batch_already_started: true,
+                    ..Default::default()
+                }),
+                &[],
+                false,
+                None,
+                None,
+                None,
+                &out,
+                Some(&control),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                batch.interruption,
+                Some(BatchInterruption::ProviderHeldPause)
+            );
+            assert_eq!(*plane.sent.lock().unwrap(), [ToolCallId("a".into())]);
+            let summary = pause_approval(
+                &writer,
+                &out,
+                &control,
+                &BindIdentity::new("/project", "broca", "session"),
+                &RunId("r".into()),
+                1,
+                Usage::default(),
+                0,
+                &[],
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(summary.paused, Some(PauseReason::ToolHeld));
+            let state = crate::replay(&records.lock().unwrap()).unwrap();
+            let dispatch_times: Vec<_> = records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|record| match record {
+                    WalRecord::ToolDispatchIntent {
+                        tool_call_id,
+                        dispatched_at_ms,
+                        ..
+                    } => Some((tool_call_id.clone(), *dispatched_at_ms)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(dispatch_times.len(), 2);
+            assert!(
+                dispatch_times.iter().all(|(_, time)| time.is_some()),
+                "the writer stamps both barrier-1 observations"
+            );
+            let ReplayResolution::ProviderHeld { pending, .. } = state.resolution else {
+                panic!("not provider-held")
+            };
+            assert_eq!(pending.held_successors, [ToolCallId("b".into())]);
+            let frames: Vec<_> = records
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(index, record)| broca_wal::FramedRecord {
+                    seq: index as u64 + 1,
+                    fence: 1,
+                    record: record.clone(),
+                })
+                .collect();
+            let intents = held_resume_intents(&pending, &frames, &writer).unwrap();
+            let resumed = ResumeCtx {
+                batch_already_started: true,
+                intents,
+                provider_held: pending.provider_held,
+                ..Default::default()
+            };
+            let control = RunControl {
+                provider_held_lifecycle: Some(Arc::new(DeliveredHeld)),
+                ..Default::default()
+            };
+            let outcome = dispatch_batch(
+                &RunId("r".into()),
+                StepId(1),
+                &BindIdentity::new("/project", "broca", "session"),
+                None,
+                calls,
+                &manifest,
+                &plane,
+                &crate::AllowAll,
+                &writer,
+                Some(resumed),
+                &[],
+                false,
+                None,
+                None,
+                None,
+                &out,
+                Some(&control),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.interruption, None);
+            assert_eq!(outcome.results.len(), 2);
+            assert_eq!(
+                *plane.sent.lock().unwrap(),
+                [ToolCallId("a".into()), ToolCallId("b".into())]
+            );
+            assert_eq!(
+                records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|record| matches!(record, WalRecord::ToolDispatchIntent { .. }))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|record| matches!(record, WalRecord::ToolResult { .. }))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|record| match record {
+                        WalRecord::ToolDispatchIntent {
+                            tool_call_id,
+                            dispatched_at_ms,
+                            ..
+                        } => Some((tool_call_id.clone(), *dispatched_at_ms)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                dispatch_times,
+                "resuming does not re-observe either original dispatch intent",
+            );
+            assert!(
+                records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|record| match record {
+                        WalRecord::ToolResult { finished_at_ms, .. } => Some(finished_at_ms),
+                        _ => None,
+                    })
+                    .all(Option::is_some),
+                "held delivery and successor completion use the writer's tool-time observations"
+            );
+            writer.shutdown().await.unwrap();
+        })
+        .await
+        .expect("held batch must pause or deliver without sending through its hold");
+    }
+
+    struct WarmProbe {
+        active: Arc<AtomicBool>,
+        started: tokio::sync::Notify,
+        calls: AtomicU64,
+    }
+    #[async_trait::async_trait]
+    impl crate::keep_warm_wait::KeepWarmDriver for WarmProbe {
+        fn timing(&self, _: &RunConfig) -> Result<crate::keep_warm_wait::WarmTiming, String> {
+            Ok(crate::keep_warm_wait::WarmTiming {
+                ttl_ms: 1000,
+                lead_ms: 1,
+                after_send_ms: Some(1),
+            })
+        }
+        fn last_sent_at_ms(&self) -> Option<u64> {
+            Some(0)
+        }
+        fn costs(&self, _: &RunConfig) -> Result<crate::keep_warm::WarmCosts, String> {
+            Ok(crate::keep_warm::WarmCosts {
+                warm: 1.0,
+                bust: 100.0,
+            })
+        }
+        async fn warm(&self, _: &RunConfig, _: &RunId) -> crate::keep_warm_wait::WarmTick {
+            struct ActiveWarm(Arc<AtomicBool>);
+            impl Drop for ActiveWarm {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            self.active.store(true, Ordering::Release);
+            let _active = ActiveWarm(self.active.clone());
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_held_pause_stops_keep_warm_for_a_day() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(LineageRecordingWal(RecordingWal {
+                records: records.clone(),
+            })),
+            1,
+        )
+        .unwrap();
+        writer.seed_lineage_tags(Some(crate::tags::LineageTags::Off));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let plane = ParkedPlane {
+            records,
+            head: writer.durable_head(),
+            sent: Default::default(),
+            gate: Some(gate.clone()),
+        };
+        let probe = Arc::new(WarmProbe {
+            active: Arc::new(AtomicBool::new(false)),
+            started: tokio::sync::Notify::new(),
+            calls: AtomicU64::new(0),
+        });
+        let driver: Arc<dyn crate::keep_warm_wait::KeepWarmDriver> = probe.clone();
+        let config = match crate::replay::deferred_tests::batch(&["a"]).remove(0) {
+            WalRecord::RunStarted { config, .. } => config,
+            _ => unreachable!(),
+        };
+        let run = RunId("r".into());
+        let unsupported = AtomicBool::new(false);
+        let missed = AtomicBool::new(false);
+        let warm = crate::keep_warm_wait::WarmWait {
+            driver: &driver,
+            config: &config,
+            run_id: &run,
+            cancel: None,
+            unsupported_logged: &unsupported,
+            warm_missed: &missed,
+        };
+        let manifest = ToolManifest::from_tools(vec![Tool {
+            name: "edit".into(),
+            description: "edit".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            module: Some("tools".into()),
+            execution_mode: ExecutionMode::Sequential,
+            reply: None,
+        }]);
+        let (out, _rx) = mpsc::channel(16);
+        let bind = BindIdentity::new("/project", "broca", "warm-held");
+        let call = ToolCall {
+            tool_call_id: ToolCallId("a".into()),
+            tool_name: "edit".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let batch = dispatch_batch(
+            &run,
+            StepId(1),
+            &bind,
+            None,
+            vec![call],
+            &manifest,
+            &plane,
+            &crate::AllowAll,
+            &writer,
+            None,
+            &[],
+            false,
+            None,
+            None,
+            Some(warm),
+            &out,
+            None,
+        );
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(batch, async {
+                probe.started.notified().await;
+                gate.notify_one();
+            })
+        })
+        .await
+        .expect("provider-held batch must pause rather than warm indefinitely");
+        assert_eq!(
+            result.unwrap().interruption,
+            Some(BatchInterruption::ProviderHeldPause)
+        );
+        assert!(
+            !probe.active.load(Ordering::Acquire),
+            "pausing drops in-flight keep-warm IO"
+        );
+        let count = probe.calls.load(Ordering::Acquire);
+        assert_eq!(count, 1, "live tool waits still warm");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+        assert_eq!(
+            probe.calls.load(Ordering::Acquire),
+            count,
+            "paused runs never warm"
+        );
         writer.shutdown().await.unwrap();
     }
 
@@ -10067,6 +10890,8 @@ mod tests {
         let resume = ResumeCtx {
             batch_already_started: true,
             prepared: Vec::new(),
+            provider_held: Vec::new(),
+            intents: std::collections::HashMap::new(),
             existing: [(
                 ToolCallId("call_b".into()),
                 std::collections::VecDeque::from([prior_result.clone()]),
@@ -10334,6 +11159,9 @@ mod tests {
         };
         let seed = crate::ProjectionSeed {
             open_episode_span: Some(1),
+            open_episode: None,
+            earlier_episodes: Vec::new(),
+            projection_episodes: None,
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,
@@ -11445,7 +12273,7 @@ mod approval_gate {
             }
         }
     }
-    async fn sync_result(
+    pub(super) async fn sync_result(
         resolution: &mut CallResolution,
         ctx: &BatchCtx,
         writer: &WalHandle,
@@ -11750,6 +12578,9 @@ mod approval_gate {
     ) -> Result<(), RunError> {
         match plan {
             CallPlan::Dispatch(call) => {
+                if call.call_key.is_some() {
+                    return Ok(());
+                }
                 let seq = writer
                     .record(WalRecord::ToolDispatchIntent {
                         dispatched_at_ms: None,
@@ -11870,6 +12701,8 @@ mod approval_gate {
             batch_already_started: false,
             existing: HashMap::new(),
             prepared: Vec::new(),
+            provider_held: Vec::new(),
+            intents: std::collections::HashMap::new(),
         });
         let mut held: HashMap<ToolCallId, Held> = HashMap::new();
         for prepared in resume.prepared {
@@ -11953,6 +12786,8 @@ mod approval_gate {
                 .and_then(|queue| queue.pop_front())
             {
                 Slot::Ready(Some(CallPlan::Already(result)))
+            } else if let Some(dispatch) = resume.intents.remove(&call.tool_call_id) {
+                Slot::Ready(Some(CallPlan::Dispatch(dispatch)))
             } else if let Some(prepared) = held.remove(&call.tool_call_id) {
                 Slot::Held(prepared)
             } else if is_duplicate {
@@ -11992,13 +12827,26 @@ mod approval_gate {
             crate::keep_warm_wait::batch_spend_iter(warm.as_ref(), step, history.frames.iter());
         let result = crate::keep_warm_wait::wait_tools_with_spend(
             Box::pin(wait(
-                &mut slots, &ctx, step, plane, writer, control, hooks, history, sequential, restart,
+                &mut slots,
+                &ctx,
+                step,
+                plane,
+                writer,
+                control,
+                hooks,
+                history,
+                sequential,
+                restart,
+                resume.provider_held,
             )),
             warm,
             spend,
         )
         .await?;
-        if result == Some(BatchInterruption::RestartPause) {
+        if matches!(
+            result,
+            Some(BatchInterruption::RestartPause | BatchInterruption::ProviderHeldPause)
+        ) {
             let open = slots
                 .into_iter()
                 .filter_map(|slot| match slot {
@@ -12006,7 +12854,7 @@ mod approval_gate {
                     _ => None,
                 })
                 .collect();
-            if announced {
+            if announced && result != Some(BatchInterruption::ProviderHeldPause) {
                 let _ = plane.batch_finished(&ctx).await;
             }
             return Ok(BatchOutcome {
@@ -12067,6 +12915,50 @@ mod approval_gate {
         }
     }
 
+    fn provider_held_can_pause(slots: &[Slot], open_held: usize, active: usize) -> bool {
+        open_held > 0
+            && active == open_held
+            && !slots
+                .iter()
+                .any(|slot| matches!(slot, Slot::Held(call) if !call.approved))
+    }
+
+    #[test]
+    fn provider_held_pause_waits_for_approval_and_inflight_siblings() {
+        let mut slots = vec![
+            Slot::Running,
+            Slot::Held(Held {
+                key: "key".into(),
+                prepared: Arc::new(crate::replay::deferred_tests::prepared("b", "b")),
+                id: Some("card".into()),
+                approved: false,
+                filed: true,
+                retry_at: 0,
+                backoff: 50,
+            }),
+        ];
+        assert!(
+            !provider_held_can_pause(&slots, 1, 1),
+            "an unanswered card keeps consent intake live"
+        );
+        let Slot::Held(call) = &mut slots[1] else {
+            unreachable!()
+        };
+        call.approved = true;
+        assert!(
+            provider_held_can_pause(&slots, 1, 1),
+            "approval behind a sequential hold may wait"
+        );
+        assert!(
+            !provider_held_can_pause(&slots, 1, 2),
+            "an in-flight sibling keeps the batch live"
+        );
+        assert!(
+            !provider_held_can_pause(&slots, 0, 0),
+            "ordinary approvals do not pause tool_held"
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn wait<T: ToolPlane>(
         slots: &mut [Slot],
@@ -12079,12 +12971,16 @@ mod approval_gate {
         history: &mut History,
         sequential: bool,
         restart: bool,
+        resumed_held: Vec<crate::replay::ProviderHeldCall>,
     ) -> Result<Option<BatchInterruption>, RunError> {
         let recording_plane = ProviderHeldPlane {
             inner: plane,
             writer,
             ctx,
             sequential,
+            held: ProviderHeldBatch::new(resumed_held),
+            lifecycle: control.provider_held_lifecycle.as_deref(),
+            clock: control.clock.as_ref(),
         };
         let plane = &recording_plane;
         let mut jobs: FuturesUnordered<Job<'_>> = FuturesUnordered::new();
@@ -12328,6 +13224,17 @@ mod approval_gate {
                 }
                 return Ok(interruption);
             }
+            if provider_held_can_pause(slots, plane.held.len(), active.len())
+                && (!stopping || (stopped && !cancelled))
+            {
+                // Sequential successors retain intents but must not be sent through a hold.
+                for slot in slots.iter_mut() {
+                    if let Slot::Ready(Some(plan)) = slot {
+                        prepare_ready(plan, ctx, plane, writer).await?;
+                    }
+                }
+                return Ok(Some(BatchInterruption::ProviderHeldPause));
+            }
             if stopping && dispatched.is_empty() && active.is_empty() {
                 if stopped
                     && !cancelled
@@ -12418,6 +13325,7 @@ mod approval_gate {
                             if result.stopped && interruption.is_none() { interruption = Some(BatchInterruption::StopRequested); }
                             let value = execution(&result);
                             sync_result(&mut result, ctx, writer, hooks).await?;
+                            plane.held.complete(&result.result.tool_call_id);
                             if let (Some(held), Some(elicitation)) = (approved_calls.remove(&index), control.elicitation_plane.as_ref()) {
                                 feedback.push(Box::pin(async move { if let Some(id) = &held.id { crate::consent::report(elicitation.as_ref(), &held.ctx(ctx), id, value, None).await; } Feedback::Reported }));
                             }
@@ -12544,6 +13452,7 @@ mod approval_gate {
                 _ = cancelled_token(control.cancel.as_ref()), if !stopping => {}
                 _ = cancelled_token(control.stop_requested.as_ref()), if !stopping => {}
                 _ = clock_changes.changed() => {}
+                _ = plane.held.changed.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(wake_at.saturating_sub(timestamp))), if wake_at != u64::MAX => {}
             }
         }
@@ -13711,9 +14620,11 @@ async fn pause_approval(
     usage: Usage,
     retries: u32,
     open: &[approval_gate::Held],
+    provider_held: bool,
 ) -> Result<RunSummary, RunError> {
     let batch_id = match open.first().map(|call| &*call.prepared) {
         Some(WalRecord::ToolCallDeferred { batch_id, .. }) => batch_id.clone(),
+        _ if provider_held => BatchId(format!("{}-b{}", run.0, steps)),
         _ => return Err(RunError::Wal("approval pause lacks open calls".into())),
     };
     let ctx = BatchCtx {
@@ -13727,7 +14638,11 @@ async fn pause_approval(
         out,
         control,
         run.clone(),
-        PauseReason::Restart,
+        if provider_held {
+            PauseReason::ToolHeld
+        } else {
+            PauseReason::Restart
+        },
         None,
         steps,
         usage,

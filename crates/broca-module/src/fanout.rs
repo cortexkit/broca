@@ -1611,6 +1611,9 @@ mod tests {
     ) -> broca_core::ProjectionSeed {
         broca_core::ProjectionSeed {
             open_episode_span: None,
+            open_episode: None,
+            earlier_episodes: Vec::new(),
+            projection_episodes: None,
             deferred_calls: None,
             watermark_seq,
             anchor: Some(anchor),

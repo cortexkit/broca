@@ -31,7 +31,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CK_MUTATE_REV: 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e
+  CK_MUTATE_REV: 516f74c85d8adc6004c54e9e5ebcbb3a6c7569b4
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:

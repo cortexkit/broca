@@ -127,6 +127,7 @@ async fn resumed_duplicate_of_a_restored_call_is_refused_not_dispatched() {
             .into_iter()
             .collect(),
         prepared: Vec::new(),
+        ..Default::default()
     };
     let result = rig
         .batch(

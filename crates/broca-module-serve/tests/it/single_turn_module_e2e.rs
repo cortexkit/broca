@@ -550,6 +550,8 @@ struct Daemon {
     child: RefCell<broca_test_support::RigChild>,
     dir: PathBuf,
     connection_file: PathBuf,
+    // Only direct credential.get wire probes use a handle; the supervised module uses its grant.
+    vault_probe_handle: Option<String>,
 }
 
 impl Drop for Daemon {
@@ -971,6 +973,7 @@ impl Daemon {
         // Seed the vault and declare its module BEFORE the supervisor starts: the vault holds a
         // single-writer lease once its daemon is up, and `reserved` is required because the
         // module echoes the launch nonce to prove it is the process the supervisor spawned.
+        let mut vault_probe_handle = None;
         if let Some(seed) = vault_seed.as_ref() {
             let (vault_binary, ck_auth_binary) = vault_binaries.as_ref()?;
             let data_home = dir.join("vault-data");
@@ -985,14 +988,14 @@ impl Daemon {
                 "create vault data dir",
                 std::fs::create_dir_all(&vault_dir).ok(),
             )?;
-            let handle = setup(
+            vault_probe_handle = Some(setup(
                 "seed the vault credential",
                 if seed.order == VaultSeedOrder::PutThenMint {
                     seed_live_credential(&vault_dir, &key_path, ck_auth_binary, seed)
                 } else {
                     seed_dead_credential(&vault_dir, &key_path, ck_auth_binary, seed)
                 },
-            )?;
+            )?);
 
             config["storage"] =
                 json!({ "backend": "sqlite", "data_home": data_home.to_string_lossy() });
@@ -1044,27 +1047,6 @@ impl Daemon {
                 },
                 "enabled": true,
             });
-            let handles_path = dir.join("vault-handles.json");
-            setup(
-                "write seeded vault handles",
-                std::fs::write(
-                    &handles_path,
-                    serde_json::to_string(&json!({ "handles": { &seed.credential_id: handle } }))
-                        .unwrap(),
-                )
-                .ok(),
-            )?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                setup(
-                    "restrict vault handles to 0600",
-                    std::fs::set_permissions(&handles_path, std::fs::Permissions::from_mode(0o600))
-                        .ok(),
-                )?;
-            }
-            config["modules"]["broca"]["env"]["BROCA_VAULT_HANDLES_PATH"] =
-                json!(handles_path.to_string_lossy());
             config["modules"]["broca"]["env"]["BROCA_CREDENTIAL_VAULT_MODULE_ID"] =
                 json!("claustrum");
         }
@@ -1118,6 +1100,7 @@ impl Daemon {
             child: RefCell::new(child),
             dir,
             connection_file,
+            vault_probe_handle,
         };
         // Wait until the broca MODULE is actually LIVE (registered + bindable), not just
         // until subc is up. A supervised module spawns + HELLO-registers ASYNCHRONOUSLY after
@@ -3105,6 +3088,7 @@ async fn the_readiness_diagnosis_separates_a_dead_supervisor_from_a_missing_modu
         child: RefCell::new(broca_test_support::RigChild::new(dead, &dir, "daemon")),
         dir: dir.clone(),
         connection_file: dir.join("subc-connection.json"),
+        vault_probe_handle: None,
     };
     let msg = daemon.readiness_diagnosis("broca");
     assert!(
@@ -3118,6 +3102,7 @@ async fn the_readiness_diagnosis_separates_a_dead_supervisor_from_a_missing_modu
         child: RefCell::new(broca_test_support::RigChild::new(alive, &dir, "daemon")),
         dir,
         connection_file: std::path::PathBuf::from("/nonexistent"),
+        vault_probe_handle: None,
     };
     let msg = daemon.readiness_diagnosis("broca");
     assert!(
@@ -3191,10 +3176,10 @@ async fn live_vault_reply_shapes_match_the_decoder() {
         claustrum_bin(),
         std::fs::read_to_string(daemon.dir.join("runtime/data-home/cortexkit/run/logs/claustrum.stderr.log")),
     );
-    let handles: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(daemon.dir.join("vault-handles.json")).unwrap())
-            .unwrap();
-    let handle = handles["handles"]["apikey:wire-probe"].as_str().unwrap();
+    let handle = daemon
+        .vault_probe_handle
+        .as_deref()
+        .expect("wire probe needs the handle minted while seeding the isolated vault");
     let conn = broca_subc::SubcConnection::connect(&daemon.connection_file)
         .await
         .unwrap();

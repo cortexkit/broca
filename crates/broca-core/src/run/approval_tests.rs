@@ -689,6 +689,7 @@ async fn late_feed_wait_bounds_real_reads_and_picks_up_mid_backoff_answer() {
             approval: None,
             elicitation_id: Some(id),
         }],
+        ..Default::default()
     };
     let (entered, mut waiting) = mpsc::unbounded_channel();
     let (release, resume_wait) = mpsc::unbounded_channel();
@@ -1127,6 +1128,7 @@ async fn restart_pause_refiles_same_key_without_mutate_and_continues_approved_ca
                 elicitation_id: held.id.clone(),
             })
             .collect(),
+        ..Default::default()
     };
     rig.control.stop_requested = None;
     let result = rig
@@ -1182,6 +1184,7 @@ async fn cancel_racing_restart_pause_withdraws_deferred_questions() {
         Usage::default(),
         0,
         &paused.open,
+        false,
     )
     .await
     .unwrap();
@@ -2033,6 +2036,7 @@ async fn approved_not_dispatched_restart_resumes_only_second_validation() {
             approval: Some(Arc::new(recorded)),
             elicitation_id: paused.open[0].id.clone(),
         }],
+        ..Default::default()
     };
     rig.control.stop_requested = None;
     rig.hooks = Arc::new(Hooks {
@@ -2217,6 +2221,7 @@ async fn deferred_resume_uses_saved_target_when_catalog_resolution_changes() {
                 elicitation_id: held.id.clone(),
             })
             .collect(),
+        ..Default::default()
     };
     rig.control.stop_requested = None;
     *rig.tools.default_module.lock().unwrap() = "changed-provider".into();
@@ -2273,6 +2278,7 @@ async fn approved_schema_pin_is_refused_instead_of_silently_dropped_by_raw_carri
             approval: Some(Arc::new(approval)),
             elicitation_id: Some("q".into()),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("c")], Some(resume), false)

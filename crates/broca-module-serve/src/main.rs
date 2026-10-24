@@ -263,6 +263,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
     create_state_directories(&state_root)?;
+    if let Err(error) = broca_core::media_store::spawn_startup_sweep(state_root.clone()) {
+        tracing::warn!(target: "media", "could not start media maintenance; continuing to serve: {error}");
+    }
     // The catalog only guides external backup capture; a filesystem refusal must not take
     // session service offline.
     if let Err(error) = write_engram_catalog(&state_root) {
@@ -5644,6 +5647,8 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
         }
     }
 
+    broca_core::media_store::create_media_directories(state_root)
+        .map_err(|error| ServeIoError(error.to_string()))?;
     Ok(())
 }
 
@@ -5903,8 +5908,8 @@ mod state_directory_tests {
                 std::fs::read_dir(&path)
                     .expect("read newly created portable directory")
                     .count(),
-                0,
-                "boot must create {entry_id} before any session writes a WAL"
+                if relative_path == "media-durable" { 2 } else { 0 },
+                "boot must create {entry_id} and only its structural subdirectories before any session writes a WAL"
             );
         }
         assert!(
@@ -5912,6 +5917,42 @@ mod state_directory_tests {
             "placed descriptor has no portable entries"
         );
         let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn media_trees_exist_before_catalog_and_match_backup_classes() {
+        let state_root = fresh_root("media-catalog");
+        create_state_directories(&state_root).unwrap();
+        assert!(!state_root.join("engram-catalog.json").exists());
+        for name in ["media-durable", "media", "media-ephemeral", "media-uploads"] {
+            for child in ["objects", "refs"] {
+                let path = state_root.join(name).join(child);
+                assert!(path.is_dir(), "startup must create {}", path.display());
+                broca_owner_only::validate(&path).unwrap();
+            }
+        }
+        write_engram_catalog(&state_root).unwrap();
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_root.join("engram-catalog.json")).unwrap())
+                .unwrap();
+        let entries = catalog["entries"].as_array().unwrap();
+        for (path, class) in [
+            ("media-durable", "portable"),
+            ("media", "excluded"),
+            ("media-ephemeral", "excluded"),
+            ("media-uploads", "excluded"),
+        ] {
+            let matching: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry["path"] == path)
+                .collect();
+            assert_eq!(matching.len(), 1, "one catalog entry for {path}");
+            assert_eq!(matching[0]["class"], class, "backup class for {path}");
+            if class == "excluded" {
+                assert!(!matching[0]["reason"].as_str().unwrap().is_empty());
+            }
+        }
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[cfg(unix)]

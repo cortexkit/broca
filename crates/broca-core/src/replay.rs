@@ -20,7 +20,7 @@
 //!  - no Prepared, intent or terminal → safe to re-dispatch.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -216,6 +216,10 @@ pub enum OpenCallState {
     Terminated,
     /// A dispatch intent is durable and no terminal is: the call may or may not have run.
     Dispatched,
+    /// The provider durably accepted responsibility for returning a late result.
+    ProviderHeld,
+    /// A sequential intent behind an open or closed-out held call; it was never sent.
+    HeldSuccessor,
     /// Neither Prepared, intent nor terminal is durable: the call never left the process.
     NotSent,
     /// Prepared arguments are durable, but no approval or terminal is durable.
@@ -240,6 +244,13 @@ pub enum ReplayResolution {
     /// A clean resume point. `pending` is the trailing tool-turn that needs
     /// completing (None ⇒ resume re-runs the model from `prompt`).
     Resume { pending: Option<PendingTurn> },
+    /// A provider-held batch, including one whose delivered terminals still owe its barrier.
+    /// This is a runner-owned wait, never an authentication pause.
+    ProviderHeld {
+        run_id: RunId,
+        pending: PendingTurn,
+        open_held: Vec<ToolCallId>,
+    },
     /// The last episode is PAUSED awaiting (re-)auth — a NON-terminal, resumable
     /// state (a `RunPaused` record, distinct from a terminal `RunFinished`). Resume
     /// continues the SAME run_id from the last durable boundary; no new episode starts
@@ -282,6 +293,10 @@ pub struct PendingTurn {
     pub deferred: Vec<PreparedCall>,
     /// Approved calls awaiting second validation, never ordinary redispatch.
     pub approved: Vec<PreparedCall>,
+    /// Durable held replies to rejoin without sending the call again.
+    pub provider_held: Vec<ProviderHeldCall>,
+    /// Intents already written at barrier 1 but kept behind a sequential hold.
+    pub held_successors: Vec<ToolCallId>,
     /// The assistant message's runner tags, when the session has tags.
     pub assistant_tags: Option<broca_protocol::tags::MessageTags>,
     /// The runner tag of each already-durable terminal in `existing`, by call id in planned
@@ -299,6 +314,30 @@ pub struct PreparedCall {
     pub approval: Option<Arc<WalRecord>>,
     /// Latest filing marker's id, if filing returned before the cut.
     pub elicitation_id: Option<String>,
+}
+
+/// The durable metadata needed to rejoin a provider's waiting slot without another send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderHeldCall {
+    pub tool_call_id: ToolCallId,
+    pub call_key: String,
+    pub module: String,
+    pub reason: String,
+    pub detail_digest: Option<String>,
+    pub held_at_ms: u64,
+    pub sequential: bool,
+}
+
+impl ProviderHeldCall {
+    pub fn reply(&self) -> crate::tool_plane::ProviderHeldReply {
+        crate::tool_plane::ProviderHeldReply {
+            tool_call_id: self.tool_call_id.clone(),
+            call_key: self.call_key.clone(),
+            module: self.module.clone(),
+            reason: self.reason.clone(),
+            detail_digest: self.detail_digest.clone(),
+        }
+    }
 }
 
 /// A closed Prepared call whose unanswered question still needs a withdrawal.
@@ -744,6 +783,7 @@ struct OpenBatch {
     intents: HashSet<ToolCallId>,
     terminals: Vec<Option<Terminal>>,
     prepared: Vec<Option<PreparedCall>>,
+    provider_held: HashMap<ToolCallId, ProviderHeldCall>,
 }
 
 impl OpenBatch {
@@ -754,6 +794,7 @@ impl OpenBatch {
             prepared: vec![None; planned.len()],
             planned,
             intents: HashSet::new(),
+            provider_held: HashMap::new(),
         }
     }
 
@@ -825,6 +866,13 @@ impl OpenBatch {
             .filter(|(position, _)| match &self.terminals[*position] {
                 Some(Terminal::Result(_, DispatchOutcome::Unknown, _)) => true,
                 Some(_) => false,
+                None if matches!(
+                    self.call_state(*position),
+                    OpenCallState::ProviderHeld | OpenCallState::HeldSuccessor
+                ) =>
+                {
+                    false
+                }
                 None => self.has_intent(*position), // intent ∧ ¬terminal
             })
             .map(|(_, id)| id.clone())
@@ -835,7 +883,29 @@ impl OpenBatch {
         if self.terminals[position].is_some() {
             OpenCallState::Terminated
         } else if self.has_intent(position) {
-            OpenCallState::Dispatched
+            if self.provider_held.contains_key(&self.planned[position]) {
+                OpenCallState::ProviderHeld
+            } else if self.planned[..position]
+                .iter()
+                .enumerate()
+                .any(|(index, id)| {
+                    self.provider_held.get(id).is_some_and(|held| {
+                        held.sequential
+                            && matches!(
+                                self.terminals[index],
+                                None | Some(Terminal::Result(
+                                    _,
+                                    DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps,
+                                    _
+                                ))
+                            )
+                    })
+                })
+            {
+                OpenCallState::HeldSuccessor
+            } else {
+                OpenCallState::Dispatched
+            }
         } else if let Some(prepared) = &self.prepared[position] {
             if prepared.approval.is_some() {
                 OpenCallState::Approved
@@ -1035,6 +1105,14 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
 pub struct ProjectionSeed {
     /// First model-produced message of the episode open at the watermark, if it has one.
     pub open_episode_span: Option<u64>,
+    /// The episode open at the watermark, as the projection holds it, and every earlier
+    /// episode's render inputs. A seed without them cannot continue an open episode's metadata,
+    /// so the successor projection would drop it (see `projected_open_episode`).
+    pub open_episode: Option<crate::context::EpisodeRenderProjection>,
+    pub earlier_episodes: Vec<crate::context::EpisodeRenderProjection>,
+    /// Every episode the projection holds, when it computed them and its reader may reuse any.
+    /// `None` while they are absent or superseded, which is when a projection refills them.
+    pub projection_episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
     pub watermark_seq: u64,
     pub anchor: Option<WalByteAnchor>,
     pub prefix_len: u64,
@@ -1056,6 +1134,9 @@ impl ProjectionSeed {
     pub fn empty() -> Self {
         Self {
             open_episode_span: None,
+            open_episode: None,
+            earlier_episodes: Vec::new(),
+            projection_episodes: None,
             watermark_seq: 0,
             anchor: None,
             prefix_len: 0,
@@ -1078,6 +1159,7 @@ impl ProjectionSeed {
 pub struct ProjectionDelta {
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
+    pub open_episode: Option<crate::context::EpisodeRenderProjection>,
     pub messages: Vec<Message>,
     pub message_runs: Vec<Option<RunAttribution>>,
     pub run_finals: BTreeMap<u64, RunAttribution>,
@@ -1192,7 +1274,10 @@ pub fn replay_projection_tail(
             seed.open_episode_span
         },
     );
-    let last_run_id = tail_state.run_id.or_else(|| seed.last_run_id.clone());
+    let last_run_id = tail_state
+        .run_id
+        .clone()
+        .or_else(|| seed.last_run_id.clone());
     debug_assert_eq!(
         last_run_id.as_ref(),
         admission_checkpoint
@@ -1200,9 +1285,17 @@ pub fn replay_projection_tail(
             .as_ref()
             .map(|episode| &episode.run_id)
     );
+    // A truncation restarts the transcript from ordinal zero, so no earlier episode survives
+    // it and the tail's own ordinals are already the projection's.
+    let open_episode = if truncate_prefix_to.is_some() {
+        projected_episode_metadata(&tail_state).pop()
+    } else {
+        projected_open_episode(&tail_state, seed.prefix_len, seed.open_episode.clone())
+    };
     Ok(ProjectionDelta {
         episode_spans,
         open_episode_span,
+        open_episode,
         messages: tail_state.prompt,
         message_runs: tail_state.message_runs,
         run_finals: tail_state.run_finals,
@@ -1221,6 +1314,41 @@ pub fn replay_projection_tail(
             seed.last_run_id.as_ref(),
         ),
     })
+}
+
+/// Every replayed episode's render inputs as durable ordinals, for the store's episode
+/// projection. A resumed run under an applied view reads the projection instead of replaying the
+/// whole WAL, and this is the WAL-derived truth it must match.
+///
+/// Each episode's coordinates come from the same replay facts the run loop renders from: its
+/// `RunStarted` position, its admitted first user, its `frozen_render_config`, and the start of
+/// its first model-step span (`episode_step_spans`, which runs from the first model-produced
+/// message to the end of the episode). A value for an episode present in the replay is always
+/// known here: a known absence is `Some(None)`.
+pub fn projected_episode_metadata(
+    state: &ReplayState,
+) -> Vec<crate::context::EpisodeRenderProjection> {
+    let episodes = state.render_episodes.as_deref().unwrap_or_default();
+    let step_starts: Vec<usize> = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|span| span.start)
+        .collect();
+    episodes
+        .iter()
+        .enumerate()
+        .map(|(index, episode)| crate::context::EpisodeRenderProjection {
+            start: Some(episode.prompt_start as u64),
+            first_user: Some(episode.first_user.map(|first| first as u64)),
+            // Episode spans list only the episodes that committed a model step, in episode
+            // order, so once an episode has no span every later one shifts: an episode at or
+            // past that point records an unknown first step rather than another episode's.
+            first_step: Some(step_starts.get(index).map(|start| *start as u64)),
+            render_config: Some(episode.frozen_config.clone()),
+        })
+        .collect()
 }
 
 /// Continue the materialized episode across a replay seam, closing it before the next
@@ -1255,6 +1383,63 @@ pub(crate) fn projected_episode_spans(
         None => previous_open.or_else(|| spans.last().map(|span| span.start)),
     };
     (spans, open)
+}
+
+/// The episode that is open after a replay tail, in the coordinates of the projection this seed
+/// produces. Seeding hands the tail's own episode boundaries forward only for replay; this is the
+/// metadata the store keeps, and it must describe the same episode so a later read continues its
+/// first model step instead of losing it.
+pub(crate) fn projected_open_episode(
+    state: &ReplayState,
+    base: u64,
+    previous: Option<crate::context::EpisodeRenderProjection>,
+) -> Option<crate::context::EpisodeRenderProjection> {
+    let episodes = state.render_episodes.as_deref().unwrap_or_default();
+    let first_boundary = episodes
+        .first()
+        .map_or(state.prompt.len(), |episode| episode.prompt_start);
+    // Episodes that committed a model step, in episode order.
+    let spanned = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .len();
+    let first_step = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|span| base + span.start as u64)
+        .find(|start| episodes.is_empty() || *start >= base + first_boundary as u64);
+    let previous = previous.filter(|previous| previous.start.is_some());
+    match episodes.last() {
+        // A tail whose first record opens an episode shows nothing of the projection's open
+        // episode, so the projection's open episode keeps its own facts and takes the tail
+        // episode's first step only if it had none. Otherwise the tail's last episode is open,
+        // and it is the episode every one of its records belongs to.
+        Some(_) if first_boundary == 0 && episodes.len() > 1 => {
+            let metadata = projected_episode_metadata(state);
+            let mut last = metadata.last().cloned()?;
+            if let Some(start) = last.start.as_mut() {
+                *start += base;
+            }
+            if let Some(Some(first_user)) = last.first_user.as_mut() {
+                *first_user += base;
+            }
+            last.first_step = Some(first_step);
+            Some(last)
+        }
+        _ => {
+            let previous = previous?;
+            let tail_first_step = (spanned == 0).then_some(first_step).flatten();
+            Some(crate::context::EpisodeRenderProjection {
+                start: previous.start,
+                first_user: previous.first_user,
+                first_step: previous.first_step.or(Some(tail_first_step)),
+                render_config: previous.render_config,
+            })
+        }
+    }
 }
 
 /// Validate a budgeted projection/admission seed before it can affect replay.
@@ -2145,11 +2330,33 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
-            // Unreachable in this build: `provider-held/v1` is not in `broca_wal::KNOWN_FEATURES`,
-            // so a WAL carrying this record is refused before replay reads it. The release that
-            // lists the feature makes replay class the call as open and provider-held, never
-            // indeterminate; until then this arm must not be read as that behaviour.
-            WalRecord::ToolCallProviderHeld { .. } => {}
+            // The framed reader still refuses provider-held/v1 until runtime intake is installed.
+            // Replay also serves the supplied in-memory lifecycle and must preserve its obligations.
+            WalRecord::ToolCallProviderHeld {
+                tool_call_id,
+                call_key,
+                module,
+                reason,
+                detail_digest,
+                held_at_ms,
+                sequential,
+                ..
+            } => {
+                if let Some(batch) = &mut ep.open_batch {
+                    batch.provider_held.insert(
+                        tool_call_id.clone(),
+                        ProviderHeldCall {
+                            tool_call_id: tool_call_id.clone(),
+                            call_key: call_key.clone(),
+                            module: module.clone(),
+                            reason: reason.clone(),
+                            detail_digest: detail_digest.clone(),
+                            held_at_ms: *held_at_ms,
+                            sequential: *sequential,
+                        },
+                    );
+                }
+            }
             // These metadata records are omitted from prompt construction: they contain no messages.
             WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::InputTokenBudgetExhausted { .. }
@@ -2320,7 +2527,7 @@ fn replay_seeded_with_compaction<'a>(
             ep.hard_stopped = Some(RunFinishReason::BudgetExhausted);
         }
     }
-    let mut resolution = classify(ep);
+    let mut resolution = classify(ep, run_id.as_ref(), cancel_at.is_some());
     if input_budget.exhausted().is_some() {
         match &mut resolution {
             ReplayResolution::Resume {
@@ -2329,7 +2536,8 @@ fn replay_seeded_with_compaction<'a>(
             | ReplayResolution::AuthRequired {
                 pending: Some(pending),
                 ..
-            } => {
+            }
+            | ReplayResolution::ProviderHeld { pending, .. } => {
                 // Recovery still needs the assistant and existing results to close the turn,
                 // but none of its unexecuted calls is authorized for redispatch.
                 pending.redispatch.clear();
@@ -2866,10 +3074,61 @@ pub fn reconcile_run_state<'a>(
 /// effects, so exactly-once execution requires `Interrupted`, never a retry. The producer currently
 /// pauses only at a step-entry boundary after the previous batch finished, but replay enforces this
 /// fail-closed rule as defense in depth.
-fn classify(ep: Episode) -> ReplayResolution {
+fn classify(ep: Episode, run_id: Option<&RunId>, cancelling: bool) -> ReplayResolution {
+    let closing = ep.open_batch.as_ref().is_some_and(|batch| {
+        batch.provider_held.keys().any(|id| {
+            batch
+                .planned
+                .iter()
+                .position(|planned| planned == id)
+                .is_some_and(|position| {
+                    matches!(
+                        batch.terminals[position],
+                        Some(Terminal::Result(
+                            _,
+                            DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps,
+                            _
+                        ))
+                    )
+                })
+        })
+    });
+    if closing && ep.finished.is_none() {
+        return ReplayResolution::Interrupted {
+            indeterminate: ep.indeterminate,
+        };
+    }
+    if ep.finished.is_none() && ep.indeterminate.is_empty() && !cancelling {
+        if let Some(batch) = &ep.open_batch {
+            if !batch.provider_held.is_empty()
+                && (batch.terminals.iter().all(Option::is_some)
+                    || batch.planned.iter().enumerate().any(|(position, _)| {
+                        batch.call_state(position) == OpenCallState::ProviderHeld
+                    }))
+            {
+                if let (Some(run_id), Some(pending)) = (run_id, pending_turn(&ep)) {
+                    let open_held = pending
+                        .provider_held
+                        .iter()
+                        .map(|reply| reply.tool_call_id.clone())
+                        .collect();
+                    return ReplayResolution::ProviderHeld {
+                        run_id: run_id.clone(),
+                        pending,
+                        open_held,
+                    };
+                }
+            }
+        }
+    }
     // A non-terminal pause is resumable, not finished — check it FIRST so a paused
     // episode is never read as terminal (which would seal a resumable run).
-    if ep.paused.is_some() && ep.indeterminate.is_empty() {
+    if ep
+        .paused
+        .as_ref()
+        .is_some_and(|(_, reason, _)| *reason != PauseReason::ToolHeld)
+        && ep.indeterminate.is_empty()
+    {
         let pending = pending_turn(&ep);
         let (run_id, reason, error) = match ep.paused {
             Some(paused) => paused,
@@ -2963,6 +3222,23 @@ fn pending_turn(ep: &Episode) -> Option<PendingTurn> {
             redispatch: b.redispatchable(),
             deferred: b.prepared_in_state(OpenCallState::Deferred),
             approved: b.prepared_in_state(OpenCallState::Approved),
+            provider_held: b
+                .planned
+                .iter()
+                .enumerate()
+                .filter_map(|(position, id)| {
+                    (b.call_state(position) == OpenCallState::ProviderHeld)
+                        .then(|| b.provider_held.get(id).cloned())
+                        .flatten()
+                })
+                .collect(),
+            held_successors: b
+                .planned
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| b.call_state(*position) == OpenCallState::HeldSuccessor)
+                .map(|(_, id)| id.clone())
+                .collect(),
             assistant_tags: ep.open_assistant_tags.clone(),
             existing_tags: b.existing_tags(),
         },
@@ -2982,6 +3258,8 @@ fn pending_turn(ep: &Episode) -> Option<PendingTurn> {
                 existing: Vec::new(),
                 deferred: Vec::new(),
                 approved: Vec::new(),
+                provider_held: Vec::new(),
+                held_successors: Vec::new(),
                 assistant_tags: ep.open_assistant_tags.clone(),
                 existing_tags: Vec::new(),
             }
@@ -3198,7 +3476,10 @@ pub(crate) mod projection_boundary_tests {
             unreachable!("fixture starts a run")
         };
         ProjectionSeed {
+            projection_episodes: None,
             open_episode_span: Some(1),
+            open_episode: None,
+            earlier_episodes: Vec::new(),
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,
@@ -3967,5 +4248,262 @@ pub(crate) mod deferred_tests {
                 before
             );
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod provider_held_tests {
+    use super::*;
+
+    pub(crate) fn intent(id: &str) -> WalRecord {
+        WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
+            batch_id: BatchId("b".into()),
+            tool_call_id: ToolCallId(id.into()),
+            tool_name: Some("edit".into()),
+            args: Arc::new(serde_json::json!({"n":1})),
+            module_id: Some("tools".into()),
+            schema_pin: None,
+            hooks: None,
+            approval_digest: None,
+            call_key: None,
+        }
+    }
+
+    pub(crate) fn held(sequential: bool) -> WalRecord {
+        WalRecord::ToolCallProviderHeld {
+            batch_id: BatchId("b".into()),
+            tool_call_id: ToolCallId("a".into()),
+            call_key: "lineage:4".into(),
+            module: "tools".into(),
+            reason: "running".into(),
+            detail_digest: None,
+            held_at_ms: 42,
+            sequential,
+        }
+    }
+
+    pub(crate) fn terminal(id: &str, outcome: DispatchOutcome) -> WalRecord {
+        WalRecord::ToolResult {
+            finished_at_ms: None,
+            batch_id: BatchId("b".into()),
+            result: deferred_tests::result(id, "answer"),
+            outcome,
+            reason: None,
+            tags: None,
+            hooks: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+        }
+    }
+
+    pub(crate) fn prefix(sequential: bool) -> Vec<WalRecord> {
+        let mut records = deferred_tests::batch(&["a", "b"]);
+        records.extend([intent("a"), intent("b"), held(sequential)]);
+        records
+    }
+
+    #[test]
+    fn provider_held_and_sequential_successor_are_not_indeterminate() {
+        let records = prefix(true);
+        let state = replay(&records).unwrap();
+        assert_eq!(
+            state.open_tool_batch.as_ref().unwrap().calls,
+            vec![
+                (ToolCallId("a".into()), OpenCallState::ProviderHeld),
+                (ToolCallId("b".into()), OpenCallState::HeldSuccessor),
+            ]
+        );
+        let ReplayResolution::ProviderHeld {
+            pending, open_held, ..
+        } = &state.resolution
+        else {
+            panic!("{:?}", state.resolution)
+        };
+        assert_eq!(open_held, &[ToolCallId("a".into())]);
+        assert_eq!(pending.held_successors, [ToolCallId("b".into())]);
+        assert!(pending.redispatch.is_empty());
+        assert!(
+            matches!(crate::resume::resume_started_record(&state, 6, vec![]), WalRecord::ResumeStarted { indeterminate, .. } if indeterminate.is_empty())
+        );
+        for reason in [PauseReason::ToolHeld, PauseReason::Restart] {
+            let mut paused = records.clone();
+            paused.push(WalRecord::RunPaused {
+                run_id: RunId("r".into()),
+                reason,
+                error: None,
+                ts_ms: None,
+            });
+            assert!(matches!(
+                replay(&paused).unwrap().resolution,
+                ReplayResolution::ProviderHeld { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn delivered_held_terminal_makes_both_successor_kill_points_interrupted() {
+        let mut records = prefix(true);
+        records.push(terminal("a", DispatchOutcome::Completed));
+        // No durable boundary separates a successor just before send from one already sent.
+        for _kill_after_send in [false, true] {
+            let state = replay(&records).unwrap();
+            assert_eq!(
+                state.open_tool_batch.as_ref().unwrap().calls[1].1,
+                OpenCallState::Dispatched
+            );
+            assert_eq!(
+                state.resolution,
+                ReplayResolution::Interrupted {
+                    indeterminate: vec![ToolCallId("b".into())]
+                }
+            );
+            let close = crate::resume::close_out_open_batch(&state, |_| {
+                crate::resume::DeferredCloseKind::NotDispatched
+            });
+            assert_eq!(
+                close
+                    .iter()
+                    .filter(|record| matches!(record, WalRecord::ToolResult { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                matches!(&close[0], WalRecord::ToolResult { result, outcome: DispatchOutcome::Unknown, .. } if result.tool_call_id.0 == "b")
+            );
+        }
+        records.push(terminal("b", DispatchOutcome::Completed));
+        assert!(
+            matches!(replay(&records).unwrap().resolution, ReplayResolution::ProviderHeld { open_held, .. } if open_held.is_empty())
+        );
+        records.push(WalRecord::ToolBatchFinished {
+            batch_id: BatchId("b".into()),
+        });
+        assert!(matches!(
+            replay(&records).unwrap().resolution,
+            ReplayResolution::Resume { pending: None }
+        ));
+    }
+
+    #[test]
+    fn provider_held_parallel_indeterminate_sibling_uses_full_close_out() {
+        let state = replay(&prefix(false)).unwrap();
+        assert_eq!(
+            state.resolution,
+            ReplayResolution::Interrupted {
+                indeterminate: vec![ToolCallId("b".into())]
+            }
+        );
+        let close = crate::resume::close_out_open_batch(&state, |_| {
+            crate::resume::DeferredCloseKind::NotDispatched
+        });
+        assert!(
+            matches!(&close[0], WalRecord::ToolResult { outcome: DispatchOutcome::Interrupted, reason: Some(reason), .. } if reason == "provider_held_interrupted")
+        );
+        assert!(matches!(
+            &close[1],
+            WalRecord::ToolResult {
+                outcome: DispatchOutcome::Unknown,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn closed_out_held_predecessor_keeps_successor_never_sent() {
+        for outcome in [DispatchOutcome::Interrupted, DispatchOutcome::MaxSteps] {
+            let mut records = prefix(true);
+            records.push(terminal("a", outcome));
+            let state = replay(&records).unwrap();
+            assert_eq!(
+                state.open_tool_batch.as_ref().unwrap().calls[1].1,
+                OpenCallState::HeldSuccessor
+            );
+            assert!(
+                matches!(state.resolution, ReplayResolution::Interrupted { ref indeterminate } if indeterminate.is_empty())
+            );
+            let close = crate::resume::close_out_open_batch(&state, |_| {
+                crate::resume::DeferredCloseKind::NotDispatched
+            });
+            assert!(
+                matches!(&close[0], WalRecord::ToolResult { result, outcome: DispatchOutcome::Interrupted, .. } if result.tool_call_id.0 == "b")
+            );
+        }
+    }
+
+    #[test]
+    fn held_and_ordinary_tool_turns_share_placement_and_model_bytes() {
+        use crate::placement::{AppendKind, Placement, PlacementAction};
+        let mut delayed = prefix(false);
+        delayed.push(terminal("b", DispatchOutcome::Completed));
+        delayed.push(WalRecord::RunPaused {
+            run_id: RunId("r".into()),
+            reason: PauseReason::ToolHeld,
+            error: None,
+            ts_ms: Some(43),
+        });
+        let mut placement = Placement::default();
+        for record in &delayed {
+            placement.observe(record).unwrap();
+        }
+        let before = placement.next_ordinal();
+        assert_eq!(before, replay(&delayed).unwrap().prompt.len() as u64);
+        let delivered = terminal("a", DispatchOutcome::Completed);
+        assert!(placement.observe(&delivered).unwrap().is_empty());
+        delayed.push(delivered);
+        assert_eq!(
+            placement.next_ordinal(),
+            before,
+            "a delivered terminal still owes its batch barrier"
+        );
+        assert!(
+            matches!(replay(&delayed).unwrap().resolution, ReplayResolution::ProviderHeld { open_held, .. } if open_held.is_empty())
+        );
+        let barrier = WalRecord::ToolBatchFinished {
+            batch_id: BatchId("b".into()),
+        };
+        assert_eq!(
+            placement.observe(&barrier).unwrap(),
+            vec![PlacementAction::Append {
+                first: before,
+                count: 2,
+                kind: AppendKind::ToolTurn
+            }]
+        );
+        delayed.push(barrier.clone());
+        let mut ordinary = deferred_tests::batch(&["a", "b"]);
+        ordinary.extend([
+            intent("a"),
+            intent("b"),
+            terminal("a", DispatchOutcome::Completed),
+            terminal("b", DispatchOutcome::Completed),
+            barrier,
+        ]);
+        let held_prompt = replay(&delayed).unwrap().prompt;
+        let ordinary_prompt = replay(&ordinary).unwrap().prompt;
+        assert_eq!(placement.next_ordinal(), held_prompt.len() as u64);
+        assert_eq!(
+            crate::canonical_request_bytes(&broca_protocol::CallOptions::new(held_prompt)),
+            crate::canonical_request_bytes(&broca_protocol::CallOptions::new(ordinary_prompt))
+        );
+    }
+
+    #[test]
+    fn provider_held_with_approval_retains_approved_argument_bytes() {
+        let mut records = deferred_tests::batch(&["a", "b"]);
+        records.extend([
+            intent("a"),
+            held(false),
+            deferred_tests::prepared("b", "b"),
+            deferred_tests::approval("b", "lineage:6", DeferredDecision::Approved),
+        ]);
+        let state = replay(&records).unwrap();
+        let ReplayResolution::ProviderHeld { pending, .. } = state.resolution else {
+            panic!("not provider-held")
+        };
+        assert_eq!(pending.approved.len(), 1);
+        assert!(
+            matches!(&*pending.approved[0].prepared, WalRecord::ToolCallDeferred { args_jcs, .. } if args_jcs == "{\"n\":1}")
+        );
     }
 }

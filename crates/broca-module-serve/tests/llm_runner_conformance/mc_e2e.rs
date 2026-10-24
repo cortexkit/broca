@@ -916,7 +916,8 @@ async fn real_mc_async_compaction_end_to_end() {
         || async {
             let records = subject.records(&live, SESSION);
             let newest = highest_applied(&records);
-            if newest >= held.view_version {
+            let log = compaction_log(&root, &session_ref);
+            if gated_view_applied(&log, held.view_version, newest) {
                 return Ok(newest);
             }
             if let Some((seq, _, reason)) = view_refusals(&records)
@@ -926,7 +927,7 @@ async fn real_mc_async_compaction_end_to_end() {
                 panic!("broca refused Magic Context's view v{} (advance notice seq {seq}, reason {reason}); see broca's log and MC's logs", held.view_version);
             }
             Err(format!(
-                "newest applied view is v{newest}; advance notice events: {:?}; WAL record kinds: {:?}",
+                "newest applied view is v{newest}; log={log:?}; advance notice events: {:?}; WAL record kinds: {:?}",
                 notice_events(&records),
                 records.iter().map(record_kind).collect::<Vec<_>>()
             ))
@@ -1327,6 +1328,67 @@ fn highest_applied(records: &[WalRecord]) -> u64 {
         })
         .max()
         .unwrap_or(0)
+}
+
+/// A gated receipt is settled by its own application, or by a newer applied view
+/// and an explicit superseded receipt. Refusal or merely announcing a newer view
+/// does not prove application.
+fn gated_view_applied(
+    log: &[std::collections::BTreeMap<String, String>],
+    gated: u64,
+    newest: u64,
+) -> bool {
+    let version = |fields: &std::collections::BTreeMap<String, String>| {
+        fields
+            .get("view_version")
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let applied = |v| {
+        log.iter().any(|f| {
+            f["message"].starts_with("compaction view decided at ")
+                && f.get("choice").map(String::as_str) == Some("applied")
+                && version(f) == Some(v)
+        })
+    };
+    newest >= gated
+        && (applied(gated)
+            || (newest > gated
+                && applied(newest)
+                && log.iter().any(|f| {
+                    f["message"] == "compaction view receipt cleared"
+                        && version(f) == Some(gated)
+                        && f.get("reason").map(String::as_str) == Some("superseded")
+                })))
+}
+
+#[test]
+fn gated_view_wait_accepts_only_applied_or_explicitly_superseded() {
+    let applied = |version: &str| {
+        std::collections::BTreeMap::from([
+            (
+                "message".into(),
+                "compaction view decided at a step boundary".into(),
+            ),
+            ("view_version".into(), version.into()),
+            ("choice".into(), "applied".into()),
+        ])
+    };
+    let mut cleared = std::collections::BTreeMap::from([
+        ("message".into(), "compaction view receipt cleared".into()),
+        ("view_version".into(), "2".into()),
+        ("reason".into(), "superseded".into()),
+    ]);
+    assert!(gated_view_applied(&[applied("2")], 2, 2));
+    assert!(gated_view_applied(&[applied("3"), cleared.clone()], 2, 3));
+    assert!(!gated_view_applied(&[applied("3")], 2, 3));
+    assert!(!gated_view_applied(&[cleared.clone()], 2, 3));
+    assert!(!gated_view_applied(&[applied("1"), cleared.clone()], 2, 1));
+    assert!(!gated_view_applied(&[applied("3"), cleared.clone()], 2, 2));
+    cleared.insert("reason".into(), "refused".into());
+    assert!(!gated_view_applied(&[applied("3"), cleared.clone()], 2, 3));
+    cleared.insert("reason".into(), "superseded".into());
+    cleared.insert("view_version".into(), "1".into());
+    assert!(!gated_view_applied(&[applied("3"), cleared], 2, 3));
 }
 
 /// A WAL record's `type` tag, for failure messages that would be unreadable with whole records.
