@@ -505,10 +505,7 @@ fn interrupted_import_merge_matches_full_replay_at_every_watermark() {
 
     for watermark in 0..=records.len() {
         let projected = replay(&records[..watermark]).expect("prefix replay");
-        let mut stored = projected.prompt;
-        for message in &mut stored {
-            message.ordinal = None;
-        }
+        let stored = projected.prompt;
         let prefix = StorePrefix {
             lineage_id: None,
             prefix: stored,

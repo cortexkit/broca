@@ -267,6 +267,11 @@ impl TagNumbering {
         self.high
     }
 
+    /// Forget resident positions, not assigned tag numbers, after releasing compacted history.
+    pub(crate) fn released(&mut self, held: usize) {
+        self.numbered = held;
+    }
+
     /// Number the messages appended to `prompt` since the last call. Refused, with nothing
     /// renumbered, when the numbers would pass `u64::MAX`.
     pub fn number_new(

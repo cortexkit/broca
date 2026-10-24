@@ -331,6 +331,7 @@ pub trait MaterializedStore: Send + Sync {
     /// consistent transaction (never two racing reads). Any decode or component-read
     /// failure must surface as an error so the caller can fall back to a full WAL replay
     /// instead of merging a partial snapshot.
+    /// Messages carry their absolute store-row ordinals; merging never renumbers loaded rows.
     fn read_prefix_with_watermark(&self, session: &BindIdentity) -> Result<StorePrefix, String>;
 
     /// Read the session's projected episode render inputs (start, original first user, first
@@ -1344,7 +1345,8 @@ pub fn effective_context(
     tail: &[WalRecord],
 ) -> Result<Vec<Message>, crate::ReplayError> {
     let mut prompt = prefix.prefix.clone();
-    if materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail) {
+    let abandoned = materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail);
+    if abandoned {
         prompt.clear();
     }
     // The tail may begin mid-episode (its `RunStarted` already materialized into the
@@ -1358,17 +1360,16 @@ pub fn effective_context(
             None,
             None,
             None,
-            prefix.prefix.len() as u64,
+            if abandoned {
+                0
+            } else {
+                prefix.prefix.len() as u64
+            },
             false,
             crate::tags::TagSeed::from_prefix(&prefix.prefix),
         )?
         .prompt,
     );
-    // Stamp the merged prompt's durable lineage positions over the WHOLE prompt (prefix
-    // messages come back from the store with no ordinal — the field is not serialized). This
-    // matches `replay`'s stamping so the fast path and a full replay assign identical
-    // ordinals (the `merge_equals_full_replay` gate proves it).
-    broca_protocol::content::stamp_ordinals(&mut prompt);
     Ok(prompt)
 }
 
@@ -1408,6 +1409,7 @@ pub fn resume_state_from_store(
     run_id: Option<crate::RunId>,
     budget_state: Option<crate::BudgetReplayStateV1>,
 ) -> Result<crate::ReplayState, crate::ReplayError> {
+    let abandoned = materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail);
     // Seed the mid-episode tail's origin from the prefix's trailing assistant turn (see
     // `effective_context`) so a resumed turn stamps the same model a full replay would.
     let tail_state = crate::replay::replay_seeded(
@@ -1416,7 +1418,11 @@ pub fn resume_state_from_store(
         run_id.clone(),
         run_config.as_ref().and_then(|config| config.budget.clone()),
         budget_state,
-        prefix.prefix.len() as u64,
+        if abandoned {
+            0
+        } else {
+            prefix.prefix.len() as u64
+        },
         !prefix.prefix.is_empty(),
         crate::tags::TagSeed::from_prefix(&prefix.prefix),
     )?;
@@ -1454,7 +1460,7 @@ pub fn resume_state_from_store(
     // otherwise copy the entire transcript again when the first new message is appended.
     let mut prompt = Vec::with_capacity(prefix.prefix.len() + tail_state.prompt.len() + 256);
     prompt.extend_from_slice(&prefix.prefix);
-    if materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail) {
+    if abandoned {
         prompt.clear();
     }
     // Episode boundaries are only known for what the tail replay itself walked. With an empty
@@ -1466,9 +1472,6 @@ pub fn resume_state_from_store(
         None
     };
     prompt.extend(tail_state.prompt);
-    // Stamp durable lineage positions over the whole merged prompt (as `replay` does), so a
-    // resumed run's messages carry the same ordinals a full replay would assign.
-    broca_protocol::content::stamp_ordinals(&mut prompt);
     let starts_new_episode = tail
         .iter()
         .any(|record| matches!(record, WalRecord::RunStarted { .. }));
@@ -1522,6 +1525,7 @@ pub fn resume_state_from_store(
         )
     };
     Ok(crate::ReplayState {
+        extent: tail_state.extent,
         tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,
         cancel_at: tail_state.cancel_at,
@@ -2537,10 +2541,7 @@ mod tests {
             .map(|record| record.record.clone())
             .collect();
         let committed_state = replay(&committed).expect("committed corpus replays");
-        let mut prefix = committed_state.prompt;
-        for message in &mut prefix {
-            message.ordinal = None;
-        }
+        let prefix = committed_state.prompt;
         (
             framed,
             StorePrefix {
@@ -2826,7 +2827,7 @@ mod tests {
         let framed = framed(&wal);
         let watermark = framed.len() as u64 - 1;
         let committed = replay(&wal[..watermark as usize]).expect("committed prefix replays");
-        let mut prefix = StorePrefix {
+        let prefix = StorePrefix {
             lineage_id: None,
             prefix: committed.prompt,
             completed_steps: committed.completed_steps,
@@ -2837,9 +2838,6 @@ mod tests {
             watermark_seq: watermark,
             context_epoch: 0,
         };
-        for message in &mut prefix.prefix {
-            message.ordinal = None;
-        }
         let snapshot = snapshot_for_request(&prefix, &framed, None, Some(10));
         let tail = &framed[watermark as usize..];
         let actual = read_session_page(&snapshot, tail, None, Some(10)).expect("paged read");
@@ -3219,10 +3217,7 @@ mod episode_merge_regression {
             WalRecord::StepStarted { step_id: StepId(1) },
         ];
         let projected = crate::replay(&wal[..2]).expect("episode A prefix replays");
-        let mut stored_messages = projected.prompt;
-        for message in &mut stored_messages {
-            message.ordinal = None;
-        }
+        let stored_messages = projected.prompt;
         let prefix = StorePrefix {
             lineage_id: None,
             prefix: stored_messages,

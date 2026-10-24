@@ -11,6 +11,9 @@ use std::sync::{
     Mutex,
 };
 
+#[path = "held_history_tests.rs"]
+mod held_history;
+
 pub(super) fn text(role: Role, text: &str) -> Message {
     Message::new(role, vec![ContentBlock::Text { text: text.into() }])
 }

@@ -27410,3 +27410,198 @@ expect_red = ["session_read::no_media_inline_and_descriptors_response_bytes_are_
 file = "crates/broca-module/src/serve.rs"
 old = "        if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {"
 new = "        if false { // NON-VACUITY BREAK: omit descriptors from opted-in reads."
+
+[[control]]
+id = "sparse-held-release-rule"
+guards = "An applied view releases every transcript row outside systems, keep ranges and suffix"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/held_prompt.rs"
+expect_red = ["run::held_prompt::tests::release_retains_systems_keep_ranges_suffix_and_only_their_originals"]
+file = "crates/broca-core/src/run/held_prompt.rs"
+old = "    prompt.retain(|message| held_by(&view.view, message));"
+new = "    prompt.retain(|_| true); // NON-VACUITY BREAK: retain discarded history"
+
+[[control]]
+id = "sparse-held-release-originals"
+guards = "Releasing a view also releases the untagged originals of discarded messages"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/held_prompt.rs"
+expect_red = ["run::held_prompt::tests::release_retains_systems_keep_ranges_suffix_and_only_their_originals"]
+file = "crates/broca-core/src/compaction/stored.rs"
+old = "            .retain(|_, message| crate::run::held_prompt::held_by(view, message));"
+new = "            .retain(|_, message| { let _ = (view, message); true }); // NON-VACUITY BREAK: leak discarded originals"
+
+[[control]]
+id = "sparse-held-append-at-extent"
+guards = "New live messages use the absolute extent even when the newest transcript row was released"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/held_prompt.rs"
+expect_red = ["run::held_prompt::tests::new_messages_start_at_extent_even_when_the_newest_message_was_released"]
+file = "crates/broca-core/src/run/held_prompt.rs"
+old = "            message.ordinal = Some(self.stamped_len);"
+new = "            message.ordinal = Some(self.held_stamped as u64); // NON-VACUITY BREAK: stamp at held count"
+
+[[control]]
+id = "sparse-held-no-view-keeps-transcript"
+guards = "Setup without an applied asynchronous view retains the whole transcript"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/held_prompt.rs"
+expect_red = ["run::held_prompt::tests::setup_without_an_applied_view_never_releases_history"]
+file = "crates/broca-core/src/run/held_prompt.rs"
+old = "    let Some(view) = state.and_then(|state| state.view.as_ref()) else {\n        return false;"
+new = "    let Some(view) = state.and_then(|state| state.view.as_ref()) else {\n        prompt.clear(); return false; // NON-VACUITY BREAK: release without a view"
+
+[[control]]
+id = "sparse-held-replay-placement-ordinals"
+guards = "Seeded WAL replay stamps each message with the shared placement action's absolute ordinal"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay/steer_tests.rs"
+expect_red = ["replay::steer_tests::seeded_episode_coordinates_are_absolute_and_a_steer_is_not_the_first_user"]
+file = "crates/broca-core/src/replay.rs"
+old = "                    newly_placed.next().expect(\"placement message\").ordinal = Some(ordinal);"
+new = "                    newly_placed.next().expect(\"placement message\").ordinal = Some(ordinal - ordinal); // NON-VACUITY BREAK: lose absolute position"
+
+[[control]]
+id = "sparse-held-replay-episode-coordinates"
+guards = "Episode rendering starts at the absolute WAL position rather than a seeded tail index"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay/steer_tests.rs"
+expect_red = ["replay::steer_tests::seeded_episode_coordinates_are_absolute_and_a_steer_is_not_the_first_user"]
+file = "crates/broca-core/src/replay.rs"
+old = "                    prompt_start: extent_before as usize,"
+new = "                    prompt_start: prompt.len(), // NON-VACUITY BREAK: use held index as an ordinal"
+
+[[control]]
+id = "sparse-held-companion-strip-extent"
+guards = "Companion strips record the full transcript extent even when its newest message is not held"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/view_tests.rs"
+expect_red = ["compaction::view::tests::companion_strip_ends_at_extent_not_the_last_held_ordinal"]
+file = "crates/broca-core/src/compaction/view.rs"
+old = "    let to_ordinal = stored.extent();"
+new = "    let to_ordinal = prompt.len() as u64; // NON-VACUITY BREAK: truncate the strip to held count"
+
+[[control]]
+id = "sparse-held-fallback-releases-before-request"
+guards = "Every full replay fallback releases to the held set before the resumed provider call"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::every_full_replay_fallback_releases_before_the_first_request"]
+file = "crates/broca-core/src/run.rs"
+old = "        if release_history\n            && held_prompt::release("
+new = "        if release_history && !is_resume // NON-VACUITY BREAK: retain full history after resume\n            && held_prompt::release("
+
+[[control]]
+id = "sparse-held-tag-cursor-preserves-high-water"
+guards = "Releasing resident message indexes does not renumber tags assigned before the cut"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::release_keeps_absolute_positions_request_bytes_and_later_wal_records"]
+file = "crates/broca-core/src/tags.rs"
+old = "        self.numbered = held;"
+new = "        self.numbered = held; self.high = 0; // NON-VACUITY BREAK: reuse released tag numbers"
+
+[[control]]
+id = "sparse-held-store-row-ordinals"
+guards = "Store resume messages carry the ordinal read from their own rows"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["stored_prefix_messages_carry_row_ordinals_and_refuse_gaps"]
+file = "crates/broca-store/src/lib.rs"
+old = "            let mut message = decode_message(json, tags_json)?;\n            message.ordinal = Some(ordinal);"
+new = "            let mut message = decode_message(json, tags_json)?;\n            message.ordinal = None; // NON-VACUITY BREAK: discard the row's absolute ordinal"
+
+[[control]]
+id = "sparse-held-active-episode-metadata"
+guards = "An active episode keeps its original coordinates and first model step even with no held messages"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/held_prompt.rs"
+expect_red = ["run::held_prompt::tests::guidance_metadata_keeps_intersections_and_an_empty_active_episode"]
+file = "crates/broca-core/src/run/held_prompt.rs"
+old = "            Some(episode.render.prompt_start) == active"
+new = "            (Some(episode.render.prompt_start) == active && false) // NON-VACUITY BREAK: drop an empty active episode"
+
+[[control]]
+id = "sparse-held-active-first-step"
+guards = "Live appends remember the active episode's first model-step ordinal after release"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::active_episode_without_held_messages_keeps_its_live_observer"]
+file = "crates/broca-core/src/run/held_prompt.rs"
+old = "            active.first_step.get_or_insert(ordinal);"
+new = "            let _ = ordinal; active.first_step = None; // NON-VACUITY BREAK: forget the live first step"
+
+[[control]]
+id = "sparse-held-original-episode-metadata-fallback"
+guards = "A compaction resume without projected episode coordinates replays originals instead of a synthetic effort placeholder"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::every_full_replay_fallback_releases_before_the_first_request"]
+file = "crates/broca-core/src/run.rs"
+old = "                            let missing_compaction_episodes = prior.render_episodes.is_none()"
+new = "                            let missing_compaction_episodes = false && prior.render_episodes.is_none() // NON-VACUITY BREAK: accept unknown episode coordinates"
+
+[[control]]
+id = "sparse-held-release-replay-indexes"
+guards = "A running session releases read-only transcript attribution indexes reconstructed during full replay"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/held_prompt.rs"
+expect_red = ["run::held_prompt::tests::running_state_releases_read_only_transcript_indexes"]
+file = "crates/broca-core/src/run/held_prompt.rs"
+old = "    prior.message_runs = Vec::new();"
+new = "    let _ = &prior.message_runs; // NON-VACUITY BREAK: retain the full attribution index"
+
+[[control]]
+id = "sparse-held-release-replay-wal-frames"
+guards = "Full-WAL resume does not retain the decoded admission frames after pending-turn recovery"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::full_wal_resume_releases_before_its_first_request_and_preserves_guidance"]
+file = "crates/broca-core/src/run.rs"
+old = "    drop(approval_frames);"
+new = "    std::mem::forget(approval_frames); // NON-VACUITY BREAK: retain the whole decoded WAL"

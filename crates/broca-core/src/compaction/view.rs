@@ -564,10 +564,7 @@ pub(crate) fn decide_stored_at(
     if invalidated.is_empty() && !invalidated_copies {
         return Decision::Apply(CompactionViewChoice::Applied);
     }
-    let to_ordinal = transcript(prompt)
-        .filter_map(|message| message.ordinal)
-        .max()
-        .map_or(0, |last| last + 1);
+    let to_ordinal = stored.extent();
     // With only copies invalidated the recorded range is empty; the companion choice itself
     // strips the copies' reasoning when the view renders.
     let from_ordinal = invalidated.iter().min().copied().unwrap_or(to_ordinal);

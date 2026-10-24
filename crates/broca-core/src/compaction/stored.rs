@@ -20,6 +20,19 @@ fn role_index(role: Role) -> usize {
 }
 
 impl OriginalMessages {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.messages.len()
+    }
+    pub(crate) fn release(
+        &mut self,
+        view: &crate::compaction_provider::view::CompactionView,
+        held: usize,
+    ) {
+        self.messages
+            .retain(|_, message| crate::run::held_prompt::held_by(view, message));
+        self.indexed_len = held;
+    }
     pub(crate) fn retain_change(
         &mut self,
         index: usize,
@@ -50,11 +63,28 @@ impl OriginalMessages {
 pub(crate) struct StoredTranscript<'a> {
     prompt: &'a [Message],
     originals: Option<&'a OriginalMessages>,
+    extent: u64,
 }
 
 impl<'a> StoredTranscript<'a> {
     pub(crate) fn new(prompt: &'a [Message], originals: Option<&'a OriginalMessages>) -> Self {
-        Self { prompt, originals }
+        Self {
+            prompt,
+            originals,
+            extent: prompt
+                .last()
+                .and_then(|m| m.ordinal)
+                .map_or(prompt.len() as u64, |o| o + 1),
+        }
+    }
+
+    pub(crate) fn with_extent(mut self, extent: u64) -> Self {
+        self.extent = extent;
+        self
+    }
+
+    pub(crate) fn extent(self) -> u64 {
+        self.extent
     }
 
     pub(crate) fn plain(prompt: &'a [Message]) -> Self {
@@ -89,10 +119,6 @@ impl<'a> StoredTranscript<'a> {
             .rev()
             .find(|m| m.role != Role::System && m.ordinal.is_some())
             .map(|message| self.original(message))
-    }
-
-    pub(crate) fn len(self) -> usize {
-        self.prompt.len()
     }
 
     pub(crate) fn has_model_origin(self, role: Role) -> bool {

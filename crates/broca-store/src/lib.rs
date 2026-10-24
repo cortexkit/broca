@@ -2985,16 +2985,20 @@ fn trailing_origin_from_tx(
     Ok(None)
 }
 
-type EncodedMessage = (String, Option<String>);
+type EncodedMessage = (u64, String, Option<String>);
 
 fn read_message_json(
     tx: &rusqlite::Transaction,
     key: &str,
 ) -> Result<Vec<EncodedMessage>, StoreError> {
     let mut stmt =
-        tx.prepare("SELECT json, tags_json FROM message WHERE session=?1 ORDER BY ord ASC")?;
+        tx.prepare("SELECT ord, json, tags_json FROM message WHERE session=?1 ORDER BY ord ASC")?;
     let rows = stmt.query_map([key], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        Ok((
+            row.get::<_, i64>(0)? as u64,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
@@ -3012,8 +3016,34 @@ fn decode_message(json: String, tags_json: Option<String>) -> Result<Message, St
 fn decode_messages(encoded: Vec<EncodedMessage>) -> Result<Vec<Message>, StoreError> {
     encoded
         .into_iter()
-        .map(|(json, tags_json)| decode_message(json, tags_json))
+        .enumerate()
+        .map(|(expected, (ordinal, json, tags_json))| {
+            if ordinal != expected as u64 {
+                return Err(StoreError::InconsistentSnapshot(
+                    "materialized transcript has an ordinal gap",
+                ));
+            }
+            let mut message = decode_message(json, tags_json)?;
+            message.ordinal = Some(ordinal);
+            Ok(message)
+        })
         .collect()
+}
+
+#[test]
+fn stored_prefix_messages_carry_row_ordinals_and_refuse_gaps() {
+    let json = serde_json::to_string(&Message::new(broca_protocol::Role::User, vec![])).unwrap();
+    let rows = decode_messages(vec![(0, json.clone(), None), (1, json.clone(), None)]).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|message| message.ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1)]
+    );
+    assert!(matches!(
+        decode_messages(vec![(0, json.clone(), None), (2, json, None)]),
+        Err(StoreError::InconsistentSnapshot(_))
+    ));
 }
 
 #[cfg(test)]

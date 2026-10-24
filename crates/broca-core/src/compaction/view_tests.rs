@@ -82,6 +82,111 @@ fn conversation() -> Vec<Message> {
 }
 
 #[test]
+fn companion_strip_ends_at_extent_not_the_last_held_ordinal() {
+    let mut prompt = stamped(vec![
+        assistant(vec![signed("copy")]),
+        text(Role::User, "tail"),
+    ]);
+    prompt[1].ordinal = Some(5);
+    let (view, ready) = make_view(
+        2,
+        5,
+        vec![ViewRange::replace(
+            0,
+            6,
+            replace_bytes(&[
+                text(Role::User, "summary"),
+                prompt[0].clone(),
+                text(Role::User, "continue"),
+            ]),
+        )],
+    );
+    let decision = decide_stored_at(
+        &view,
+        &ready,
+        &after_setup(),
+        LINEAGE,
+        &prompt,
+        crate::compaction::StoredTranscript::plain(&prompt).with_extent(100),
+        true,
+        false,
+    );
+    assert_eq!(
+        decision,
+        Decision::Apply(CompactionViewChoice::Companion {
+            edit: companion_edits::STRIP_SIGNED_REASONING.into(),
+            strip: CompactionStrip {
+                from_ordinal: 100,
+                to_ordinal: 100
+            },
+        })
+    );
+}
+
+#[test]
+fn sparse_render_maps_original_first_users_without_promoting_later_steers() {
+    use broca_protocol::request::EpisodeRenderInput;
+    let prompt = stamped(vec![
+        text(Role::User, "original"),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "discarded original"),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "later steer"),
+        text(Role::Assistant, "admitted without a user"),
+        text(Role::User, "another later steer"),
+    ]);
+    let mut opts = CallOptions::new(prompt);
+    opts.render_episodes = std::sync::Arc::new(
+        vec![
+            EpisodeRenderInput {
+                prompt_start: 0,
+                first_user: Some(0),
+                frozen_config: json!({"effort":"low"}),
+            },
+            EpisodeRenderInput {
+                prompt_start: 2,
+                first_user: Some(2),
+                frozen_config: json!({"effort":"medium"}),
+            },
+            EpisodeRenderInput {
+                prompt_start: 5,
+                first_user: None,
+                frozen_config: json!({"effort":"high"}),
+            },
+        ]
+        .into(),
+    );
+    let (view, _) = make_view(
+        2,
+        6,
+        vec![
+            ViewRange::keep(0, 1),
+            ViewRange::replace(1, 4, "[]"),
+            ViewRange::keep(4, 7),
+        ],
+    );
+    let mut state = after_setup();
+    state.view = Some(AppliedView {
+        view,
+        choice: CompactionViewChoice::Applied,
+    });
+    let full = model_options(&opts, &state).unwrap();
+    opts.prompt.retain(|message| {
+        crate::run::held_prompt::held_by(&state.view.as_ref().unwrap().view, message)
+    });
+    let sparse = model_options(&opts, &state).unwrap();
+    assert_eq!(sparse, full);
+    let episodes = &sparse.render_episodes.episodes;
+    assert_eq!(
+        episodes
+            .iter()
+            .map(|episode| (episode.prompt_start, episode.first_user))
+            .collect::<Vec<_>>(),
+        vec![(0, Some(0)), (1, None), (2, None)]
+    );
+}
+
+#[test]
 fn ordinal_ranges_bound_the_work_to_the_requested_window() {
     let mut prompt = stamped(vec![text(Role::User, "old"); 150_000]);
     prompt[0].role = Role::System;

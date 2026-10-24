@@ -101,6 +101,8 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    /// Next absolute transcript ordinal, including messages not held in the prompt.
+    pub extent: u64,
     /// The last episode renders tags under the computed rules on a compaction-managed session,
     /// is still running, and no Setup answer is recorded yet: the answer may carry a tag
     /// checkpoint that renumbers the run's parts from its cut (llm-runner §9.6), so no read
@@ -1081,7 +1083,7 @@ impl Episode {
 /// the last episode is a resume/continue target. Fails with [`ReplayError`] on a
 /// corrupt lineage (a new episode opened over an unfinished prior one).
 pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
-    let mut state = replay_seeded(
+    replay_seeded(
         records,
         None,
         None,
@@ -1090,14 +1092,7 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
         0,
         false,
         crate::tags::TagSeed::default(),
-    )?;
-    // Stamp the fully-assembled prompt with each message's durable lineage position. Done at
-    // this top-level finalization point (not inside `replay_seeded`, which produces sub-lists
-    // like a store-merge tail) so the position is over the WHOLE prompt. The store-merge fast
-    // path stamps the same way in `effective_context`/`resume_state_from_store`, so live and
-    // resume assign identical ordinals — asserted by `merge_equals_full_replay`.
-    broca_protocol::content::stamp_ordinals(&mut state.prompt);
-    Ok(state)
+    )
 }
 
 /// Persisted state needed to project a WAL suffix without replaying the materialized prefix.
@@ -1361,7 +1356,7 @@ pub(crate) fn projected_episode_spans(
     let episodes = state.render_episodes.as_deref().unwrap_or_default();
     let first_boundary = episodes
         .first()
-        .map_or(state.prompt.len(), |e| e.prompt_start);
+        .map_or(state.prompt.len(), |e| e.prompt_start - base as usize);
     let mut spans = Vec::new();
     if let Some(start) = previous_open {
         spans.push(start..base + first_boundary as u64);
@@ -1378,7 +1373,7 @@ pub(crate) fn projected_episode_spans(
         Some(episode) => spans
             .iter()
             .rev()
-            .find(|span| span.start >= base + episode.prompt_start as u64)
+            .find(|span| span.start >= episode.prompt_start as u64)
             .map(|span| span.start),
         None => previous_open.or_else(|| spans.last().map(|span| span.start)),
     };
@@ -1395,9 +1390,9 @@ pub(crate) fn projected_open_episode(
     previous: Option<crate::context::EpisodeRenderProjection>,
 ) -> Option<crate::context::EpisodeRenderProjection> {
     let episodes = state.render_episodes.as_deref().unwrap_or_default();
-    let first_boundary = episodes
-        .first()
-        .map_or(state.prompt.len(), |episode| episode.prompt_start);
+    let first_boundary = episodes.first().map_or(state.prompt.len(), |episode| {
+        episode.prompt_start - base as usize
+    });
     // Episodes that committed a model step, in episode order.
     let spanned = state
         .episode_step_spans
@@ -1420,12 +1415,6 @@ pub(crate) fn projected_open_episode(
         Some(_) if first_boundary == 0 && episodes.len() > 1 => {
             let metadata = projected_episode_metadata(state);
             let mut last = metadata.last().cloned()?;
-            if let Some(start) = last.start.as_mut() {
-                *start += base;
-            }
-            if let Some(Some(first_user)) = last.first_user.as_mut() {
-                *first_user += base;
-            }
             last.first_step = Some(first_step);
             Some(last)
         }
@@ -1642,7 +1631,8 @@ fn replay_seeded_with_compaction<'a>(
                 .map_err(ReplayError::TagNumbering)?;
             numbering.start_run(config);
         }
-        compaction.fold_at(rec, ordinal_base.saturating_add(prompt.len() as u64));
+        let extent_before = placement.next_ordinal();
+        compaction.fold_at(rec, extent_before);
         if compaction_session || compaction.state().is_some() {
             compaction_history.fold(rec);
             if let crate::compaction::CompactionCheckpoint::State(state) = &mut compaction {
@@ -1734,11 +1724,11 @@ fn replay_seeded_with_compaction<'a>(
                 seeded_budget = None;
                 saw_run_started = true;
                 render_episodes.push(broca_protocol::request::EpisodeRenderInput {
-                    prompt_start: prompt.len(),
+                    prompt_start: extent_before as usize,
                     first_user: input
                         .iter()
                         .position(|m| m.role == Role::User)
-                        .map(|i| prompt.len() + i),
+                        .map(|i| extent_before as usize + i),
                     frozen_config: config.frozen_render_config.clone(),
                 });
                 let input_tags = rec.runner_tags();
@@ -2363,6 +2353,27 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
         }
+        // Placement is the authority for transcript positions, including a seeded prefix and
+        // steers held until a boundary. Assign its ordinals as each record places its messages.
+        let placed = actions
+            .iter()
+            .map(|action| match action {
+                PlacementAction::Append { count, .. }
+                | PlacementAction::PlaceHeld { count, .. } => *count as usize,
+                _ => 0,
+            })
+            .sum::<usize>();
+        let placed_start = prompt.len() - placed;
+        let mut newly_placed = prompt[placed_start..].iter_mut();
+        for action in &actions {
+            if let PlacementAction::Append { first, count, .. }
+            | PlacementAction::PlaceHeld { first, count } = *action
+            {
+                for ordinal in first..first + count {
+                    newly_placed.next().expect("placement message").ordinal = Some(ordinal);
+                }
+            }
+        }
         message_runs.truncate(prompt.len());
         for message in &prompt[message_runs.len()..] {
             let mut attribution = run_id
@@ -2381,11 +2392,7 @@ fn replay_seeded_with_compaction<'a>(
                     .last()
                     .and_then(|run| run.as_ref())
                     .filter(|run| Some(&run.run_id) == run_id.as_ref().map(|id| &id.0))
-                    .and_then(|_| {
-                        ordinal_base
-                            .checked_add(prompt.len() as u64)?
-                            .checked_sub(1)
-                    })
+                    .and_then(|_| placement.next_ordinal().checked_sub(1))
                     .or_else(|| {
                         prompt
                             .is_empty()
@@ -2560,6 +2567,7 @@ fn replay_seeded_with_compaction<'a>(
             .as_ref()
             .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
     Ok(ReplayState {
+        extent: placement.next_ordinal(),
         tags_await_setup,
         input_budget,
         cancel_at,
