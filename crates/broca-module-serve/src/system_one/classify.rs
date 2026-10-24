@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
-use super::{internal_refusal, ModelPin, ProviderReply, SystemOne, STORE_ROLE};
+use super::{internal_refusal, ModelPin, ProviderReply, SystemOne};
 
 /// The catalog kind fusiform gives a decision model. `classifier/v1` calls the same kind
 /// `classifier`; a row stating either is a classifier.
@@ -165,8 +165,8 @@ struct Hold<'a> {
 
 /// End this process's store hold on a batch. A failure is only logged: the call is answered
 /// anyway, and the next start releases every hold a previous process left.
-fn release_stored(store: &SystemOneStore, batch_id: &str, owner: &str) {
-    if let Err(error) = store.release(STORE_ROLE, batch_id, owner) {
+fn release_stored(store: &SystemOneStore, role: &str, batch_id: &str, owner: &str) {
+    if let Err(error) = store.release(role, batch_id, owner) {
         tracing::warn!(target: "system_one", %error, batch_id,
             "could not release a batch hold; the next start releases it");
     }
@@ -183,10 +183,15 @@ impl Hold<'_> {
             // is dropped mid-wait, the blocking task still runs to completion.
             self.stored = false;
             let store = Arc::clone(&self.service.store);
-            let (batch_id, owner) = (self.batch_id.clone(), self.service.owner.clone());
-            let released =
-                tokio::task::spawn_blocking(move || release_stored(&store, &batch_id, &owner))
-                    .await;
+            let (role, batch_id, owner) = (
+                self.service.role.clone(),
+                self.batch_id.clone(),
+                self.service.owner.clone(),
+            );
+            let released = tokio::task::spawn_blocking(move || {
+                release_stored(&store, &role, &batch_id, &owner)
+            })
+            .await;
             if let Err(error) = released {
                 tracing::warn!(target: "system_one", %error, batch_id = %self.batch_id,
                     "could not release a batch hold; the next start releases it");
@@ -199,7 +204,11 @@ impl Drop for Hold<'_> {
     fn drop(&mut self) {
         if self.stored {
             let store = Arc::clone(&self.service.store);
-            let (batch_id, owner) = (self.batch_id.clone(), self.service.owner.clone());
+            let (role, batch_id, owner) = (
+                self.service.role.clone(),
+                self.batch_id.clone(),
+                self.service.owner.clone(),
+            );
             #[cfg(test)]
             let gate = self
                 .service
@@ -213,7 +222,7 @@ impl Drop for Hold<'_> {
                     // Returns once the test drops the sending side.
                     let _ = gate.recv();
                 }
-                release_stored(&store, &batch_id, &owner);
+                release_stored(&store, &role, &batch_id, &owner);
             };
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => drop(runtime.spawn_blocking(release)),
@@ -494,11 +503,13 @@ struct PaidAnswer {
     account_ref: Option<String>,
 }
 
-/// Serve one `classify.run`.
+/// Serve one `classify.run`. `admitted_at_ms`, when given, is when the call was first admitted:
+/// a new batch's retention runs from it instead of from now.
 pub(crate) async fn run(
     service: &Arc<SystemOne>,
     params: &str,
     scope: &broca_store::system_one::BatchScope,
+    admitted_at_ms: Option<i64>,
 ) -> Result<Box<RawValue>, Refusal> {
     let flush = Arc::clone(service);
     tokio::task::spawn_blocking(move || flush.flush_facts())
@@ -572,6 +583,7 @@ pub(crate) async fn run(
         &identity_json,
         &digest,
         sent_ceiling,
+        admitted_at_ms,
     )
     .await;
     hold.release().await;
@@ -596,6 +608,7 @@ async fn serve_claimed(
     identity_json: &str,
     digest: &str,
     sent_ceiling: Option<u64>,
+    admitted_at_ms: Option<i64>,
 ) -> Result<Box<RawValue>, Refusal> {
     let live_frozen = FrozenRow {
         input_rate_nanos: row.input_rate_nanos,
@@ -604,7 +617,8 @@ async fn serve_claimed(
     let now = (service.clock)();
     let claimed = {
         let store = Arc::clone(&service.store);
-        let (batch_id, model, owner) = (
+        let (role, batch_id, model, owner) = (
+            service.role.clone(),
             request.batch_id.clone(),
             request.model.clone(),
             service.owner.clone(),
@@ -613,18 +627,21 @@ async fn serve_claimed(
         let frozen = serde_json::to_string(&live_frozen).expect("frozen facts encode");
         let scope = scope.clone();
         blocking(move || {
-            store.claim(&BatchClaim {
-                role: STORE_ROLE,
-                batch_id: &batch_id,
-                model: &model,
-                identity: &identity_json,
-                body_digest: &digest,
-                frozen_row: &frozen,
-                scope: &scope,
-                ceiling_nanos: sent_ceiling,
-                owner: &owner,
-                now_ms: now,
-            })
+            store.claim_admitted_at(
+                &BatchClaim {
+                    role: &role,
+                    batch_id: &batch_id,
+                    model: &model,
+                    identity: &identity_json,
+                    body_digest: &digest,
+                    frozen_row: &frozen,
+                    scope: &scope,
+                    ceiling_nanos: sent_ceiling,
+                    owner: &owner,
+                    now_ms: now,
+                },
+                admitted_at_ms.unwrap_or(now),
+            )
         })
         .await?
     };
@@ -867,12 +884,17 @@ async fn record_paid(
     fact: Option<broca_store::system_one::FactContext>,
 ) -> Result<(), Refusal> {
     let store = Arc::clone(&service.store);
-    let (batch_id, owner, outcome) = (batch_id.to_owned(), service.owner.clone(), outcome.clone());
+    let (role, batch_id, owner) = (
+        service.role.clone(),
+        batch_id.to_owned(),
+        service.owner.clone(),
+    );
     let outcome_for_metrics = outcome.clone();
+    let outcome = outcome.clone();
     let now = (service.clock)();
     let held = blocking(move || {
         store.record_paid(
-            STORE_ROLE,
+            &role,
             &batch_id,
             &owner,
             &outcome,
@@ -905,9 +927,12 @@ async fn record_paid(
 
 async fn discard_fresh(service: &Arc<SystemOne>, batch_id: &str) {
     let store = Arc::clone(&service.store);
-    let (batch_id, owner) = (batch_id.to_owned(), service.owner.clone());
-    if let Err(refusal) = blocking(move || store.discard_fresh(STORE_ROLE, &batch_id, &owner)).await
-    {
+    let (role, batch_id, owner) = (
+        service.role.clone(),
+        batch_id.to_owned(),
+        service.owner.clone(),
+    );
+    if let Err(refusal) = blocking(move || store.discard_fresh(&role, &batch_id, &owner)).await {
         tracing::warn!(target: "system_one", message = %refusal.message,
             "could not remove a refused batch's record");
     }

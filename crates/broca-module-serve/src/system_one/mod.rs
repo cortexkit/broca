@@ -43,8 +43,14 @@ use cortexkit_role_classifier::{
 use serde_json::value::RawValue;
 use tokio::sync::Semaphore;
 
-/// The store's role key for `classifier/v1` batches.
+/// The store's role key for `classifier/v1` batches, and the role a [`SystemOne`] serves
+/// under unless [`SystemOne::with_store_role`] names another.
 pub(crate) const STORE_ROLE: &str = "classifier";
+
+/// The store's role key for the `llm.classify/v1` tool's batches. The tool runs on its own
+/// [`SystemOne`] under this role, so a tool call and a `classifier/v1` batch that happen to
+/// share a `batch_id` are two batches: neither replays, holds or refuses the other.
+pub const LLM_CLASSIFY_STORE_ROLE: &str = "llm.classify";
 
 /// The method names this surface answers.
 pub const OP_ROLE_DESCRIBE: &str = cortexkit_role_classifier::ops::ROLE_DESCRIBE;
@@ -234,6 +240,8 @@ impl ModelPin {
 /// The System One service: the batch store, the routing pins, and the concurrency caps.
 pub struct SystemOne {
     store: Arc<SystemOneStore>,
+    /// The store role every batch this service claims, records and releases is keyed under.
+    role: String,
     /// This process's name on a batch it holds, so a hold left by another process is told
     /// apart and a write after a lost hold is refused.
     owner: String,
@@ -288,6 +296,7 @@ impl SystemOne {
     ) -> Self {
         Self {
             store,
+            role: STORE_ROLE.to_owned(),
             owner: owner.into(),
             catalog,
             pins,
@@ -344,6 +353,34 @@ impl SystemOne {
         let mut value = serde_json::to_value(&*metrics).expect("health counters encode");
         value["batches_in_flight"] = self.in_flight.load(Ordering::Relaxed).into();
         value
+    }
+
+    /// Serve under another store role. Each `SystemOne` keeps its own in-process claims and its
+    /// own process-call and per-model semaphores, so a second instance under another role (the
+    /// `llm.classify/v1` tool's, [`LLM_CLASSIFY_STORE_ROLE`]) can share the batch store
+    /// without sharing a batch id space or concurrency with `classifier/v1`.
+    pub fn with_store_role(mut self, role: impl Into<String>) -> Self {
+        self.role = role.into();
+        self
+    }
+
+    /// The store role this service's batches are keyed under.
+    pub fn store_role(&self) -> &str {
+        &self.role
+    }
+
+    /// The batch recorded under this service's role for `batch_id`, with its outcomes; `None`
+    /// when there is none. Reads only: nothing is claimed or written.
+    pub async fn stored_batch(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<broca_store::system_one::StoredBatch>, String> {
+        let store = Arc::clone(&self.store);
+        let (role, batch_id) = (self.role.clone(), batch_id.to_owned());
+        tokio::task::spawn_blocking(move || store.lookup(&role, &batch_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
     }
 
     /// Replace the clock; tests drive retention with it.
@@ -517,6 +554,19 @@ impl SystemOne {
         params: String,
         scope: broca_store::system_one::BatchScope,
     ) -> Result<Box<RawValue>, Vec<u8>> {
+        self.spawn_call_admitted_at(params, scope, None).await
+    }
+
+    /// [`Self::spawn_call`] for a call admitted before it runs. When `admitted_at_ms` is given
+    /// and the batch is new, its seven-day retention runs from that time rather than from
+    /// now, so a call held for consent and executed later expires on the same day as the
+    /// record of its admission. A batch already recorded keeps its first admission time.
+    pub async fn spawn_call_admitted_at(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+        admitted_at_ms: Option<i64>,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
         // Raised here and lowered by the task itself, so a caller that stops waiting (its
         // route closed) does not hide a call that is still running.
         let gauge = Arc::clone(&self.in_flight);
@@ -526,7 +576,7 @@ impl SystemOne {
         let task = tokio::spawn(async move {
             let _lowered = lowered;
             let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
-            classify::run(&service, &params, &scope).await
+            classify::run(&service, &params, &scope, admitted_at_ms).await
         });
         let result = match task.await {
             Ok(Ok(reply)) => Ok(reply),
