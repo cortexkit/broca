@@ -67,13 +67,22 @@ fn assert_rows(entry: &Value, expected: Value) {
 #[tokio::test]
 async fn open_batch_has_rows_before_results_commit() {
     let rig = Rig::new("open-batch-tags", Arc::new(NoopExec));
-    let key = rig.key("open");
-    let records = tagged_episode(&key);
-    append_seed(&rig.wal_store, &key, &records[..4]);
+    // A tag-rendering run numbers the open turn when a read exposes it; a session with no
+    // numbering ledger at all (written before tags existed) still needs every part's row.
+    let tagged = rig.key("open");
+    let ledgerless = rig.key("open-ledgerless");
+    append_seed(&rig.wal_store, &tagged, &tagged_episode(&tagged)[..4]);
+    append_seed(
+        &rig.wal_store,
+        &ledgerless,
+        &dispatch_module_episode(&ledgerless, "ledgerless", "call-1")[..4],
+    );
     let mut pages = Vec::new();
-    for media in [MediaMode::Inline, MediaMode::Descriptors] {
-        let page = page_bytes(&rig, &key, media).await;
-        pages.push(page);
+    for key in [&tagged, &ledgerless] {
+        for media in [MediaMode::Inline, MediaMode::Descriptors] {
+            let page = page_bytes(&rig, key, media).await;
+            pages.push(page);
+        }
     }
     for page in pages {
         assert_eq!(page["messages"].as_array().unwrap().len(), 2);
@@ -112,8 +121,12 @@ async fn open_and_committed_rows_keep_the_same_part_keys() {
     assert_eq!(open["messages"][1]["tags"], stored["messages"][1]["tags"]);
 }
 
+/// A read that lands after a tool turn is written but before its batch commits exposes the
+/// turn's text. The text counts, so the read must already show the number commit gives it:
+/// llm-runner §9.6 makes any change to an exposed part's number a new lineage, and an
+/// unnumbered row that later gains a number is such a change.
 #[tokio::test]
-async fn open_text_is_unnumbered_until_batch_commit() {
+async fn open_text_shows_its_final_number_before_batch_commit() {
     let rig = Rig::new("open-text-tags", Arc::new(NoopExec));
     let key = rig.key("open-text");
     let mut records = tagged_episode(&key);
@@ -128,21 +141,35 @@ async fn open_text_is_unnumbered_until_batch_commit() {
             },
         );
     }
+    let expected = json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1"}]);
+    // Stop the WAL between the step's dispatch intent and its results: the batch is open.
     append_seed(&rig.wal_store, &key, &records[..4]);
+    let mut open_pages = Vec::new();
     for media in [MediaMode::Inline, MediaMode::Descriptors] {
         let open = page_bytes(&rig, &key, media).await;
-        assert_rows(
-            &open["messages"][1],
-            json!([{"part": "m1#0"}, {"part": "m1#1"}]),
+        assert_eq!(
+            open["messages"][1]["tags"], expected,
+            "an exposed counted part shows its final number before batch commitment"
         );
+        assert_rows(&open["messages"][1], expected.clone());
+        open_pages.push(open);
     }
     append_seed(&rig.wal_store, &key, &records[4..]);
-    for media in [MediaMode::Inline, MediaMode::Descriptors] {
+    for (media, open) in [MediaMode::Inline, MediaMode::Descriptors]
+        .into_iter()
+        .zip(open_pages)
+    {
         let committed = page_bytes(&rig, &key, media).await;
-        assert_rows(
-            &committed["messages"][1],
-            json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1"}]),
+        assert_eq!(open["lineage_id"], committed["lineage_id"]);
+        assert_eq!(
+            open["messages"][1]["tags"], committed["messages"][1]["tags"],
+            "batch commitment changes no number a read exposed"
         );
+        assert_eq!(
+            open["messages"][1]["part_digests"],
+            committed["messages"][1]["part_digests"]
+        );
+        assert_rows(&committed["messages"][1], expected.clone());
     }
 }
 

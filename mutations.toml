@@ -33,11 +33,34 @@ select = "expected"
 test_file = "crates/broca-module/tests/it/session_read/tags.rs"
 expect_red = ["session_read::tags::open_and_committed_rows_keep_the_same_part_keys"]
 expect_message = "part keys must survive batch commitment"
-file = "crates/broca-wire/src/lib.rs"
-old = """        .map(|(index, _)| {
-            let part = broca_protocol::tags::part_key(ordinal, index);"""
-new = """        .map(|(index, _)| {
-            let part = broca_protocol::tags::part_key(ordinal + u64::from(message.part_tags().is_none()), index); // NON-VACUITY BREAK: rekey uncounted parts."""
+file = "crates/broca-core/src/replay.rs"
+old = """                let mut message = tagged(
+                    Message {
+                        cache_prefix_blocks: None,
+                        role: Role::Assistant,
+                        content: assistant.content.clone(),"""
+new = """                let mut message = tagged(
+                    Message {
+                        cache_prefix_blocks: None,
+                        role: Role::Assistant,
+                        content: assistant.content.iter().filter(|block| !matches!(block, ContentBlock::ToolCall(_))).cloned().collect(), // NON-VACUITY BREAK: expose the open turn without its calls."""
+
+[[control]]
+id = "session-read-open-turn-final-number"
+guards = "A read that exposes a tool turn before its batch commits shows each counted part's final number, never none followed by a number on the same lineage"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/tags.rs"
+expect_red = ["session_read::tags::open_text_shows_its_final_number_before_batch_commit"]
+expect_message = "an exposed counted part shows its final number before batch commitment"
+file = "crates/broca-core/src/tags.rs"
+old = """            (None, Some(rules)) => {
+                let mut high = self.high;
+                broca_protocol::tags::number_message(message, rules, &mut high)
+            }"""
+new = """            (None, Some(_rules)) => Ok(()), // NON-VACUITY BREAK: expose the open turn unnumbered."""
 
 [[control]]
 id = "core-admission-rejects-unidentified-checkpoint"

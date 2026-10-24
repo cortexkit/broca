@@ -2494,21 +2494,27 @@ fn replay_seeded_with_compaction<'a>(
             .as_ref()
             .zip(ep.open_step_record)
             .map(|(assistant, step_record)| {
-                (
-                    tagged(
-                        Message {
-                            cache_prefix_blocks: None,
-                            role: Role::Assistant,
-                            content: assistant.content.clone(),
-                            origin: ep.origin.clone(),
-                            ordinal: None,
-                            tags: Default::default(),
-                        },
-                        ep.open_assistant_tags.as_ref(),
-                    ),
-                    step_record,
-                )
+                let mut message = tagged(
+                    Message {
+                        cache_prefix_blocks: None,
+                        role: Role::Assistant,
+                        content: assistant.content.clone(),
+                        origin: ep.origin.clone(),
+                        ordinal: None,
+                        tags: Default::default(),
+                    },
+                    ep.open_assistant_tags.as_ref(),
+                );
+                // Reads expose this turn before its batch commits. Commit appends it right
+                // after the numbered prompt, so number it now exactly as commit will: an
+                // exposed part that later gained a number would be a renumbering within the
+                // lineage.
+                numbering
+                    .number_pending(&mut message)
+                    .map_err(ReplayError::TagNumbering)?;
+                Ok::<_, ReplayError>((message, step_record))
             })
+            .transpose()?
     } else {
         None
     };
