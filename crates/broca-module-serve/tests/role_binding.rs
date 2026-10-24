@@ -481,22 +481,26 @@ async fn unconfigured_classifier_is_still_refused() {
 }
 
 #[test]
-fn manifest_declares_the_new_role_operations_and_effect_kinds() {
-    use subc_protocol::manifest::{ManagementOperationKind, ProviderRole};
+fn manifest_does_not_advertise_unimplemented_roles_or_operations() {
+    use subc_protocol::manifest::ProviderRole;
     let manifest = broca_module_serve::manifest::manifest("broca");
     let capabilities = manifest.capabilities.as_ref().unwrap();
-    for capability in [
-        "llm-runner/v1",
-        "classifier/v1",
-        "tool-provider/v1",
-        "permissions/v1",
-    ] {
+    for capability in ["llm-runner/v1", "classifier/v1"] {
         assert!(
             capabilities
                 .provides
                 .iter()
                 .any(|provided| provided == capability),
             "missing {capability}"
+        );
+    }
+    for capability in ["tool-provider/v1", "permissions/v1"] {
+        assert!(
+            !capabilities
+                .provides
+                .iter()
+                .any(|provided| provided == capability),
+            "unimplemented role advertised: {capability}"
         );
     }
     let operations = manifest
@@ -507,19 +511,17 @@ fn manifest_declares_the_new_role_operations_and_effect_kinds() {
             _ => None,
         })
         .unwrap();
-    for (name, kind) in [
-        ("tool.catalog", ManagementOperationKind::Query),
-        ("tool.call", ManagementOperationKind::Mutate),
-        ("late_results", ManagementOperationKind::Query),
-        ("late_results.ack", ManagementOperationKind::Mutate),
-        ("permissions.list", ManagementOperationKind::Query),
-        ("permissions.revoke", ManagementOperationKind::Mutate),
+    for name in [
+        "tool.catalog",
+        "tool.call",
+        "late_results",
+        "late_results.ack",
+        "permissions.list",
+        "permissions.revoke",
     ] {
-        let entries: Vec<_> = operations
-            .iter()
-            .filter(|operation| operation.name == name)
-            .collect();
-        assert_eq!(entries.len(), 1, "{name} must be declared once");
-        assert_eq!(entries[0].kind, kind, "{name}");
+        assert!(
+            !operations.iter().any(|operation| operation.name == name),
+            "unimplemented operation advertised: {name}"
+        );
     }
 }

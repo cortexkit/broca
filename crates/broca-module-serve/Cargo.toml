@@ -41,8 +41,6 @@ cortexkit-role-llm-runner = { workspace = true }
 # System One classification (classifier/v1) and the batch rules it implements.
 cortexkit-role-classifier = { workspace = true }
 cortexkit-model-batch = { workspace = true }
-cortexkit-role-tool-provider = { workspace = true }
-cortexkit-llm-tools = { workspace = true }
 # System One's provider calls. The same release and TLS backend broca-provider builds, so the
 # lockfile gains no crate.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -119,8 +117,8 @@ subc-control = { workspace = true }
 # The role's own wire types and checks, so the role-surface tests decode broca's answers the way
 # a consumer of the role does rather than against broca's own types.
 cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }
-# The tool-provider contract's conformance kit, shared with the consumer tests.
-cortexkit-role-tool-provider-conformance = { workspace = true }
+# The catalog and declaration wire types the fetch-plan tests answer with.
+cortexkit-role-tool-provider = { workspace = true }
 # The role's conformance suite and the crash harness it drives, run against the real ck-broca
 # (tests/llm_runner_conformance.rs). Its scripted tool provider registers with the rig's daemon
 # as a module from inside the test process, through the module SDK.
