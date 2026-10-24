@@ -45,7 +45,7 @@ use family::{resolve_provider_family, FamilyResolution, ResolutionSource};
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Native routing holds and renderer compatibility choices layered over Fusiform.
+/// Serving exceptions for renderer or transport behavior, never copied model routing facts.
 const OVERLAY: &str = include_str!("../data/overlay.json");
 
 /// Where the vendored snapshot came from and when — so a stale catalog is visible

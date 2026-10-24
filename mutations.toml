@@ -24957,6 +24957,51 @@ old = '''        let api = self
 new = '''        let api = self.api.clone().unwrap_or_else(|| WireFact { value: "https://guessed.example/v1".into(), from: "local".into() }); // NON-VACUITY BREAK: guess a withheld endpoint'''
 
 [[control]]
+id = "catalog-withdrawn-admission-keeps-successor"
+guards = "withdrawn Fusiform rows name their served successor before a send can append to the WAL or call a model"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test cache_warm_admission"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/cache_warm_admission.rs"
+expect_red = ["retired_antigravity_sends_refuse_before_wal_writes_or_model_calls"]
+expect_message = "choose a different model"
+file = "crates/broca-catalog/src/live.rs"
+old = '.successor(provider_id, model_id)'
+new = '.successor(provider_id, model_id).filter(|_| false) // NON-VACUITY BREAK: discard the published successor'
+
+[[control]]
+id = "catalog-missing-code-assist-tiers-explains-unavailable-route"
+guards = "a present model without published backend tiers explains that Google Code Assist is unavailable, rather than claiming withdrawal"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test cache_warm_admission"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/cache_warm_admission.rs"
+expect_red = ["present_antigravity_without_backend_tiers_explains_unavailable_code_assist"]
+expect_message = "missing route.reasoning_wire_ids"
+file = "crates/broca-catalog/src/routing.rs"
+old = '.ok_or(MISSING_CODE_ASSIST_TIERS)?;'
+new = '.ok_or("missing route.reasoning_wire_ids")?; // NON-VACUITY BREAK: hide the unavailable credential route behind a bare fact key'
+
+[[control]]
+id = "rig-structured-output-catalog-declares-wire-package"
+platforms = ["linux", "macos"]
+guards = "the conformance rig's explicit Chat transport reaches admission alongside its true, false and absent schema-support facts"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["structured_output_catalogs_preserve_admission_decisions_without_a_daemon"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = 'row["wire.npm"] = json!({"value":"@ai-sdk/openai-compatible", "from":"fixture"});'
+new = 'row.as_object_mut().unwrap().remove("wire.npm"); // NON-VACUITY BREAK: omit the rig transport package'
+
+[[control]]
 id = "catalog-tier-wire-id-from-fusiform"
 guards = "a requested reasoning tier freezes Fusiform's opaque backend id rather than a local or default tier"
 runner = "cargo"

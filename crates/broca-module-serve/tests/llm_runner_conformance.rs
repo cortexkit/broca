@@ -284,9 +284,9 @@ const STRUCTURED_OUTPUT_PROVIDER: &str = "xai";
 /// The catalog model a structured-output session resolves against, by what its route reports.
 fn structured_output_model(support: Option<bool>) -> &'static str {
     match support {
-        Some(true) => "grok-composer-2.5-fast",
-        Some(false) => "grok-4.20-0309-non-reasoning",
-        None => "grok-imagine-image",
+        Some(true) => "conformance-structured-supported",
+        Some(false) => "conformance-structured-unsupported",
+        None => "conformance-structured-unknown",
     }
 }
 
@@ -310,6 +310,11 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
             "existence": "present",
             "limit.context": 128000
         });
+        // The scripted provider speaks Chat Completions. Declare that synthetic transport
+        // explicitly so schema support depends on the authored tri-state capability, not on
+        // whichever real model happens to share a name with the rig.
+        row["wire.npm"] = json!({"value":"@ai-sdk/openai-compatible", "from":"fixture"});
+        row["wire.api"] = json!({"value":"https://conformance.invalid/v1", "from":"fixture"});
         if let Some(support) = support {
             row["capability.structured_output"] = json!(support);
         }
@@ -332,6 +337,80 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
         "source": "models.dev"
     });
     std::fs::write(path, serde_json::to_vec_pretty(&lkg).unwrap())
+}
+
+#[test]
+fn structured_output_catalogs_preserve_admission_decisions_without_a_daemon() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("structured-output-catalog-{}", std::process::id()));
+    seed_structured_output_catalog(&root).unwrap();
+    let mut response: broca_catalog::FusiformCatalogResponse =
+        serde_json::from_slice(&std::fs::read(root.join("catalog/fusiform-lkg.json")).unwrap())
+            .unwrap();
+    let real: broca_catalog::FusiformCatalogResponse =
+        serde_json::from_str(include_str!("fixtures/fusiform_cache_warm_admission.json")).unwrap();
+    response
+        .models
+        .insert("openai/gpt-5".into(), real.models["openai/gpt-5"].clone());
+    let cache = std::sync::Arc::new(broca_catalog::CatalogCache::empty());
+    cache.refresh(response).unwrap();
+    broca_catalog::install_global_catalog_cache(cache);
+    let request = serde_json::from_value(json!({
+        "mode":"final_text", "name":"answer",
+        "schema":{"type":"object", "properties":{"answer":{"type":"string"}}, "required":["answer"], "additionalProperties":false}
+    }))
+    .unwrap();
+    for (model, enforcement, reason) in [
+        (
+            format!("xai/{}", structured_output_model(Some(true))),
+            "enforced",
+            None,
+        ),
+        (
+            format!("xai/{}", structured_output_model(Some(false))),
+            "best_effort",
+            Some("route_unsupported"),
+        ),
+        (
+            format!("xai/{}", structured_output_model(None)),
+            "best_effort",
+            Some("catalog_unknown"),
+        ),
+        ("openai/gpt-5".into(), "enforced", None),
+    ] {
+        let resolved = broca_catalog::live::resolve_provider_with_catalog_base_url(
+            &model,
+            "http://127.0.0.1:1",
+            None,
+            None,
+            &broca_catalog::live::AuthMode::None,
+            &broca_catalog::live::ResolveOptions {
+                structured_output: Some(&request),
+                ..Default::default()
+            },
+            broca_provider::build_provider_http_client(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.family_id,
+            if model.starts_with("xai/") {
+                broca_catalog::live::WireFamilyId::OpenAiChat
+            } else {
+                broca_catalog::live::WireFamilyId::OpenAiResponses
+            },
+            "{model} must use its declared wire package"
+        );
+        let blob = resolved.provider.render_config_blob();
+        assert_eq!(
+            blob["structured_output"]["enforcement"], enforcement,
+            "{model}"
+        );
+        assert_eq!(
+            blob["structured_output"]["reason"].as_str(),
+            reason,
+            "{model}"
+        );
+    }
 }
 
 /// What one OpenAI Chat request carried, as the scripted model received it: the offered tool

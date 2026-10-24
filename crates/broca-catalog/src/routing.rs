@@ -5,6 +5,8 @@ use broca_provider::spec::WireFamilyId;
 use serde::Deserialize;
 use serde_json::Value;
 
+pub(crate) const MISSING_CODE_ASSIST_TIERS: &str = "Google Code Assist is unavailable for this model: Fusiform has not published reasoning-tier backend model IDs (missing route.reasoning_wire_ids); choose a model with a published Google Code Assist route";
+
 /// Fusiform's wire.api follows models.dev's published Anthropic-root convention:
 /// the root already includes `/v1` (https://models.dev/api.json). Broca's unchanged
 /// Anthropic renderer instead adds `/v1/messages` to a versionless root
@@ -97,7 +99,7 @@ impl RoutingFacts {
         let tiers = self
             .reasoning_wire_ids
             .as_ref()
-            .ok_or("missing route.reasoning_wire_ids")?;
+            .ok_or(MISSING_CODE_ASSIST_TIERS)?;
         let level = requested
             .or(self.reasoning_default.as_deref())
             .ok_or("missing route.reasoning_default")?;

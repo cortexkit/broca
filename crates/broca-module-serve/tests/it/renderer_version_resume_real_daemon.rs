@@ -138,7 +138,7 @@ impl Rig {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         // The catalog lists the one Gemini model; with BROCA_PROVIDER_BASE_URL set the module
         // resolves it through the catalog at the mock host with no credential.
-        let catalog = serde_json::json!({
+        let catalog = super::routing_fixture::with_served_routing(serde_json::json!({
             "source": "renderer-version-resume",
             "resolved_at_ms": 1,
             "catalog_version": 1,
@@ -152,7 +152,7 @@ impl Rig {
                     "limit.output": 8192
                 }
             }
-        });
+        }));
         let catalog_path = runtime_dir.join("broca-state/catalog/fusiform-lkg.json");
         std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
         std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();

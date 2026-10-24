@@ -821,14 +821,16 @@ impl Daemon {
                 serde_json::from_str(include_str!("../fixtures/fusiform-lkg-minimal.json"))
                     .expect("the checked-in minimal fusiform LKG is valid JSON");
             if seed.order == VaultSeedOrder::PutThenMint {
-                // `atomic-chat` is a shipped catalog overlay that the live-vault 401 arm routes
-                // to aimock through `ProviderRoute::AtomicChat`. Adding only the model fact here
-                // keeps `BROCA_PROVIDER_BASE_URL` unset, because that mock override deliberately
-                // skips credential resolution and would make the cache proof vacuous.
+                // This synthetic Chat route keeps the original loopback root as its published
+                // endpoint; ProviderRoute::AtomicChat must override it with aimock's own address.
+                // BROCA_PROVIDER_BASE_URL stays unset because that mock override skips credential
+                // resolution and would make the credential-cache proof vacuous.
                 lkg["models"]["atomic-chat/cache-eviction-probe"] = json!({
                     "capability.attachment": false,
                     "capability.reasoning": false,
                     "capability.tool_call": false,
+                    "wire.npm": {"value":"@ai-sdk/openai-compatible", "from":"fixture"},
+                    "wire.api": {"value":"http://127.0.0.1:1337/v1", "from":"fixture"},
                     "existence": "present",
                     "limit.context": 8192
                 });
@@ -850,6 +852,9 @@ impl Daemon {
                     "limit.output": 32000
                 });
             }
+            // Real model routing comes from the same captured fact plane as the other daemon rigs.
+            // The synthetic cache probe above declares its transport explicitly instead.
+            lkg = super::routing_fixture::with_served_routing(lkg);
             setup(
                 "seed lkg catalog",
                 std::fs::write(
@@ -2687,7 +2692,7 @@ const VAULT_REJECTION_FIXTURES: &str = r#"{
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_provider_401_evicts_the_current_real_vault_credential_from_process_cache() {
-    // The shipped catalog points `atomic-chat` at this loopback port, and real desktop apps
+    // The rig's synthetic catalog points `atomic-chat` at this loopback port, and real desktop apps
     // listen on it too. Keep it occupied for the whole test -- by this listener when it is free,
     // by whatever already holds it otherwise -- so the arm passes only when aimock boots on its
     // own port and the provider route really reaches it. When this test binds the port, its

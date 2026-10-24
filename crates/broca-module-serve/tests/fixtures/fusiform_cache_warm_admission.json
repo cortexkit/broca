@@ -1,0 +1,381 @@
+{
+  "source": "models.dev",
+  "resolved_at_ms": 1792787066962,
+  "catalog_version": 1792784518157,
+  "models": {
+    "openai/gpt-5": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "text"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 400000,
+      "limit.output": 128000,
+      "model.canonical_id": "openai/gpt-5",
+      "model.family": "gpt",
+      "model.open_weights": false,
+      "model.status": null,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 125000000
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 250000000
+      },
+      "rate.cache_read.mode.flex": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 62500000
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 1250000000
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 2500000000
+      },
+      "rate.input.mode.flex": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 625000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10000000000
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 20000000000
+      },
+      "rate.output.mode.flex": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 5000000000
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "openai/gpt-4o": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": false,
+      "capability.reasoning_options": null,
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 128000,
+      "limit.output": 16384,
+      "model.canonical_id": null,
+      "model.family": "gpt",
+      "model.open_weights": false,
+      "model.status": null,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 1250000000
+      },
+      "rate.cache_read.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 2125000000
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 2500000000
+      },
+      "rate.input.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 4250000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 10000000000
+      },
+      "rate.output.mode.fast": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 17000000000
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
+    },
+    "google/gemini-2.5-flash": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "audio",
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.output_modalities": [
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "max": 24576,
+          "min": 0,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536,
+      "model.canonical_id": "google/gemini-2.5-flash",
+      "model.family": "gemini-flash",
+      "model.open_weights": false,
+      "model.status": null,
+      "rate.cache_read": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 30000000
+      },
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 300000000
+      },
+      "rate.input_audio": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 1000000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 2500000000
+      },
+      "wire.api": {
+        "from": "curated",
+        "value": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      }
+    },
+    "google/antigravity-gemini-3.1-flash-image": {
+      "capability.attachment": true,
+      "capability.input_modalities": [
+        "image",
+        "pdf",
+        "text",
+        "video"
+      ],
+      "capability.output_modalities": [
+        "image",
+        "text"
+      ],
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": false,
+      "existence": "present",
+      "limit.context": 131072,
+      "limit.output": 32768,
+      "model.canonical_id": "google/gemini-3.1-flash-image",
+      "model.family": "gemini-flash",
+      "model.open_weights": false,
+      "model.status": null,
+      "rate.input": {
+        "currency": "USD",
+        "exponent": 9,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini-flash",
+          "model_id": "gemini-3.1-flash-image",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 500000000
+      },
+      "rate.output": {
+        "currency": "USD",
+        "exponent": 9,
+        "inherited_from": {
+          "basis": "alias",
+          "family": "gemini-flash",
+          "model_id": "gemini-3.1-flash-image",
+          "provider_id": "google"
+        },
+        "state": "priced",
+        "unit_provenance": {
+          "kind": "assumed_by_policy",
+          "policy": "models-dev-usd-v1"
+        },
+        "units": 60000000000
+      }
+    },
+    "google/antigravity-gemini-3.6-flash": {
+      "existence": "absent",
+      "successor": "google/antigravity-gemini-3.8-flash"
+    },
+    "google/antigravity-gemini-3.7-flash": {
+      "existence": "absent",
+      "successor": "google/antigravity-gemini-3.8-flash"
+    },
+    "google/antigravity-claude-sonnet-4-6-thinking": {
+      "existence": "absent"
+    }
+  }
+}

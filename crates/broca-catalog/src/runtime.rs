@@ -525,7 +525,8 @@ impl CatalogSnapshot {
             }
         }
         Err(format!(
-            "catalog model '{provider}/{model}': missing route.reasoning_wire_ids"
+            "catalog model '{provider}/{model}': {}",
+            crate::routing::MISSING_CODE_ASSIST_TIERS
         ))
     }
     pub fn resolved_at_ms(&self) -> i64 {
