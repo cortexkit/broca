@@ -138,6 +138,7 @@ mod gated {
 
     fn request(dir: &std::path::Path) -> RunRequest {
         RunRequest {
+            input_written_at_ms: None,
             directives: None,
             session_class: None,
             retention: None,
@@ -299,6 +300,7 @@ mod gated {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,

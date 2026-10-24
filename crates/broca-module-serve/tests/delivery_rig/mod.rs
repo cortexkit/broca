@@ -159,6 +159,7 @@ impl Step {
 /// What the provider and tool plane of the rig do, shared with the test.
 #[derive(Default)]
 pub struct Script {
+    pub attempt_time: Mutex<Option<u64>>,
     pub hold_stream: Mutex<bool>,
     pub stream_gate: Notify,
     /// Model steps, consumed in order across every run. An exhausted script answers text.
@@ -290,8 +291,15 @@ impl Provider for ScriptedProvider {
             .unwrap_or(Step::Text("done"));
         let (tx, rx) = mpsc::channel(8);
         let script = self.0.clone();
+        let mut events = step.events();
+        if let Some(at) = *self.0.attempt_time.lock().unwrap() {
+            events.insert(0, NormalizedEvent::Control(ProviderControl::AttemptFinished {
+                attempt: serde_json::from_value(serde_json::json!({"attempt":0,"outcome":"complete","ts_ms":at,
+                    "request_body_len":0,"request_body_sha256":"a","response_body_len":0,"response_body_sha256":"b"})).unwrap(),
+            }));
+        }
         tokio::spawn(async move {
-            for event in step.events() {
+            for event in events {
                 if matches!(
                     event,
                     NormalizedEvent::Control(ProviderControl::AssistantMessage { .. })

@@ -464,12 +464,15 @@ pub fn catalog_request(
             .unwrap_or_default(),
     )
     .with_composition(plan.composition.clone());
-    if let Some(item) = tool_item {
-        request = request.with_preset(item.preset.clone());
+    if let Some(preset) = tool_item.and_then(|item| item.preset.clone()) {
+        request = request.with_preset(preset);
     }
     if let Some(item) = text_item {
         request = request.with_system_text(SystemTextItem {
-            preset: item.preset.clone(),
+            preset: item
+                .preset
+                .clone()
+                .expect("system-text presets are checked before fetching"),
             params: item.params.clone(),
         });
     }
@@ -913,9 +916,11 @@ pub async fn admit(
         }
     }));
     let declarations = futures::future::join_all(plan.step_items.iter().map(|step| {
-        let request = DeclareRequest::new(step.item.params.clone())
-            .with_preset(step.item.preset.clone())
+        let mut request = DeclareRequest::new(step.item.params.clone())
             .with_composition(plan.composition.clone());
+        if let Some(preset) = &step.item.preset {
+            request = request.with_preset(preset.clone());
+        }
         async move {
             match within_deadline(deadline, || fetcher.declare(&step.item.provider, &request)).await
             {
@@ -929,7 +934,9 @@ pub async fn admit(
                     ))),
                 },
                 // A provider that no longer knows the item's preset makes the plan stale.
-                Err(error) if error.refused_field() == Some("preset") => {
+                Err(error)
+                    if step.item.preset.is_some() && error.refused_field() == Some("preset") =>
+                {
                     DeclarationOutcome::RefusedPreset(FetchMiss::from_error(error))
                 }
                 Err(error) => DeclarationOutcome::Unanswered(FetchMiss::from_error(error)),
@@ -1187,14 +1194,26 @@ pub async fn admit(
                 unreachable!("an unanswered declaration refused admission above")
             }
         };
-        match check_item(
-            index,
-            &step.item.provider,
-            &step.item.preset,
-            declaration.as_deref(),
-            &step.subscriptions,
-            reduction_owner,
-        ) {
+        let checked = match step.item.preset.as_deref() {
+            Some(preset) => check_item(
+                index,
+                &step.item.provider,
+                preset,
+                declaration.as_deref(),
+                &step.subscriptions,
+                reduction_owner,
+            ),
+            None => check_default_item(
+                index,
+                &step.item.provider,
+                declaration.as_deref().expect(
+                    "a refused default declaration stops admission before subscription checks",
+                ),
+                &step.subscriptions,
+                reduction_owner,
+            ),
+        };
+        match checked {
             Ok(_) => {}
             Err(ItemRefusal::PlanStale(stale)) => differences.extend(
                 stale
@@ -1329,6 +1348,56 @@ pub async fn admit(
             role_versions,
         },
     })
+}
+
+/// A default declaration has no preset name to attach to a `preset_missing` difference.
+/// All other subscription checks retain the provider role's rules and difference shapes.
+fn check_default_item(
+    item: usize,
+    provider: &str,
+    declaration: &Declaration,
+    planned: &[cortexkit_role_step_transform_provider::subscription::Subscription],
+    reduction_owner: Option<&str>,
+) -> Result<Vec<usize>, ItemRefusal> {
+    use cortexkit_role_step_transform_provider::subscription::{
+        check_reduction, InvalidSubscriptionDetail, StaleDifference, SubscriptionProblem,
+    };
+    let mut bounds = Vec::new();
+    let mut differences = Vec::new();
+    for (index, subscription) in planned.iter().enumerate() {
+        match subscription
+            .check()
+            .and_then(|()| check_reduction(subscription, provider, reduction_owner))
+            .and_then(|()| declaration.bound(subscription))
+        {
+            Ok(bound) => bounds.push(bound),
+            Err(SubscriptionProblem::SubscriptionMissing) => {
+                differences.push(StaleDifference::SubscriptionMissing {
+                    provider: provider.into(),
+                    hook: subscription.hook,
+                    phase: subscription.phase,
+                })
+            }
+            Err(SubscriptionProblem::SubscriptionLoosened(field)) => {
+                differences.push(StaleDifference::SubscriptionLoosened {
+                    provider: provider.into(),
+                    hook: subscription.hook,
+                    phase: subscription.phase,
+                    field,
+                })
+            }
+            Err(problem) => {
+                return Err(ItemRefusal::InvalidParams(InvalidSubscriptionDetail::new(
+                    item, index, problem,
+                )))
+            }
+        }
+    }
+    if differences.is_empty() {
+        Ok(bounds)
+    } else {
+        Err(ItemRefusal::PlanStale(differences))
+    }
 }
 
 /// The `session.baseline` facts a manifest froze, read from the manifest alone so the admission
@@ -1473,7 +1542,7 @@ mod tests {
             step_items: vec![crate::plan::StepItem {
                 item: Item {
                     provider: provider.into(),
-                    preset: "worker".into(),
+                    preset: Some("worker".into()),
                     params: serde_json::Map::new(),
                     optional: false,
                 },
@@ -1612,6 +1681,91 @@ mod tests {
                 "provider":"magic-context",
                 "preset":"worker"
             }]})
+        );
+    }
+
+    struct DefaultDeclaration(Result<Value, FetchError>);
+    #[async_trait::async_trait]
+    impl Fetcher for DefaultDeclaration {
+        async fn catalog(&self, _: &str, _: &CatalogRequest) -> Result<Value, FetchError> {
+            panic!("a step-only plan fetches no catalogs")
+        }
+        async fn declare(&self, _: &str, request: &DeclareRequest) -> Result<Value, FetchError> {
+            assert!(serde_json::to_value(request)
+                .unwrap()
+                .get("preset")
+                .is_none());
+            self.0.clone()
+        }
+        async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
+            panic!("a step-only plan names no compaction provider")
+        }
+    }
+
+    #[tokio::test]
+    async fn default_declaration_omits_preset_and_preserves_provider_refusal() {
+        let mut plan = plan_with_declaration("magic-context");
+        plan.step_items[0].item.preset = None;
+        let session =
+            broca_protocol::BindIdentity::new("/tmp/default-declaration", "runner", "session");
+        admit(
+            &plan,
+            &DefaultDeclaration(Ok(json!({"subscriptions":[]}))),
+            &session,
+            ADMISSION_DEADLINE,
+        )
+        .await
+        .unwrap();
+        let refusal = admit(
+            &plan,
+            &DefaultDeclaration(Err(FetchError::provider_refused(
+                "invalid_request".into(),
+                Some(json!({"field":"preset"})),
+                "no default selector",
+                false,
+            ))),
+            &session,
+            ADMISSION_DEADLINE,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal.code(), "fetch_unavailable");
+        assert_eq!(
+            refusal.detail(),
+            json!({"provider":"magic-context","reason":"refused","provider_code":"invalid_request",
+            "op":DECLARE_OP,"message":"no default selector","field":"preset","retryable":false})
+        );
+        assert!(!refusal.detail().to_string().contains("preset_missing"));
+    }
+
+    #[tokio::test]
+    async fn default_declaration_rechecks_reduction_and_subscription_bounds() {
+        let mut plan = plan_with_declaration("other-context");
+        plan.step_items[0].item.preset = None;
+        plan.step_items[0].subscriptions = vec![serde_json::from_value(json!({
+            "hook":"pre_user","ops":["replace"],"budget_ms":1000,"on_unavailable":"pass"
+        }))
+        .unwrap()];
+        let session = broca_protocol::BindIdentity::new("/tmp/default-bounds", "runner", "session");
+        let empty = DefaultDeclaration(Ok(json!({"subscriptions":[]})));
+        let refusal = admit(&plan, &empty, &session, ADMISSION_DEADLINE)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal.detail(),
+            json!({"field":"plan.step_transform_items","item":0,"subscription":0,"problem":"replace_not_reduction_owner"})
+        );
+        plan.step_items[0].subscriptions[0] = serde_json::from_value(json!({
+            "hook":"pre_user","ops":["append"],"budget_ms":1000,"on_unavailable":"pass"
+        }))
+        .unwrap();
+        let refusal = admit(&plan, &empty, &session, ADMISSION_DEADLINE)
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code(), "plan_stale");
+        assert_eq!(
+            refusal.detail(),
+            json!({"differences":[{"kind":"subscription_missing","provider":"other-context","hook":"pre_user","phase":null}]})
         );
     }
 

@@ -25,7 +25,7 @@ use subc_protocol::FrameType;
 
 /// The `RunStarted` a plan-less first send writes, as record JSON, with the parts that differ
 /// per run (the scratch project root, the run id and the timestamp) replaced by placeholders. Every other byte is pinned.
-const PLAN_LESS_RUN_STARTED: &str = r#"{"type":"run_started","run_id":"@RUN_ID@","session":{"project_root":"@ROOT@","harness":"runner","session":"delivery"},"ts_ms":0,"config":{"model":{"provider_module_id":"fake","model_id":"fake"},"tools":[{"name":"work","description":"does work","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"render_config":"stateless"},"computed_tags":{"checkpoint":0}},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"},"send_id":"turn-1","request_identity_digest":"{\"version\":1,\"model\":\"158ff0524c84046f8e4277fe15cb3c7c9b77118fc5b296d09e0dea85c0fa281f\",\"input\":\"4047097b2648d6b400be8a670f467110f9366f7b79e3b450d3eb138e36acdab4\",\"tools\":\"0c1c3c61240370c46bbf8b8cf618a7ac639f1f2c70481bf04a1497d7069e0594\",\"policy_allowed\":\"22f199ad3c03aa6cdc52d4e7e38efd8ae9d46f28bfcdf960d1d4a16de4f4bb30\",\"tool_choice\":\"d7522ccd58caaccd080ff42fc701046086ea73d690df7b1b597b620e0aa33284\",\"generation\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"cache\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"budget\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"stop_when\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\"}","marker_order_version":1}"#;
+const PLAN_LESS_RUN_STARTED: &str = r#"{"type":"run_started","written_at_ms":0,"run_id":"@RUN_ID@","session":{"project_root":"@ROOT@","harness":"runner","session":"delivery"},"ts_ms":0,"config":{"model":{"provider_module_id":"fake","model_id":"fake"},"tools":[{"name":"work","description":"does work","input_schema":{"type":"object"},"execution_mode":"parallel"}],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"frozen_render_config":{"render_config":"stateless"},"computed_tags":{"checkpoint":0}},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"},"send_id":"turn-1","request_identity_digest":"{\"version\":1,\"model\":\"158ff0524c84046f8e4277fe15cb3c7c9b77118fc5b296d09e0dea85c0fa281f\",\"input\":\"4047097b2648d6b400be8a670f467110f9366f7b79e3b450d3eb138e36acdab4\",\"tools\":\"0c1c3c61240370c46bbf8b8cf618a7ac639f1f2c70481bf04a1497d7069e0594\",\"policy_allowed\":\"22f199ad3c03aa6cdc52d4e7e38efd8ae9d46f28bfcdf960d1d4a16de4f4bb30\",\"tool_choice\":\"d7522ccd58caaccd080ff42fc701046086ea73d690df7b1b597b620e0aa33284\",\"generation\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"cache\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"budget\":\"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\"stop_when\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\"}","marker_order_version":1}"#;
 
 /// The `session.baseline` reply of a session admitted without a plan, running the rig's one
 /// tool: no items, no composition digest, both generations 0.
@@ -34,8 +34,14 @@ const PLAN_LESS_BASELINE_REPLY: &str = r#"{"result":{"state":"ready","baseline":
 /// `record` as JSON with the per-run parts replaced, so the rest can be compared byte for byte.
 fn normalized_run_started(record: &WalRecord, run_id: &str, root: &str) -> String {
     let mut normalized = record.clone();
-    if let WalRecord::RunStarted { ts_ms, .. } = &mut normalized {
+    if let WalRecord::RunStarted {
+        ts_ms,
+        written_at_ms,
+        ..
+    } = &mut normalized
+    {
         *ts_ms = Some(0);
+        *written_at_ms = Some(0);
     }
     // The root as it appears inside a JSON string (backslashes escaped on Windows).
     let escaped_root = serde_json::to_string(root).unwrap();
@@ -69,11 +75,14 @@ async fn a_plan_less_session_keeps_its_bytes() {
         unreachable!()
     };
     assert!(manifest.is_none());
-    // Every run a computed-tag build admits freezes the computed tag rules, which are the only
-    // must-understand member a plan-less first episode carries.
+    // Plan-less episodes freeze computed tags and their newly recorded input time; both
+    // facts require an understanding reader even without a plan manifest.
     assert_eq!(
         started.required_features(),
-        [broca_wal::RUNNER_TAGS_V2_FEATURE]
+        [
+            broca_wal::MESSAGE_TIMES_FEATURE,
+            broca_wal::RUNNER_TAGS_V2_FEATURE
+        ]
     );
 
     let baseline = rig
@@ -332,6 +341,33 @@ async fn a_worker_preset_plan_requires_a_scoped_route() {
         !admitter.calls().is_empty(),
         "a scoped worker plan is admitted"
     );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn absent_system_text_preset_refuses_before_fetch_or_wal_write() {
+    let (mut rig, admitter) = plan_rig("no-default-system-text").await;
+    let mut plan = vector("plans/broca-head-no-compaction.json");
+    plan["system_text_items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("preset");
+    let frame = send_plan(
+        &mut rig,
+        7,
+        "missing-text-preset",
+        "hi",
+        Some(&plan),
+        json!({}),
+    )
+    .await;
+    assert_eq!(error_body(&frame)["code"], "invalid_params");
+    assert_eq!(
+        error_body(&frame)["detail"],
+        json!({"field":"plan.system_text_items[0].preset"})
+    );
+    assert!(admitter.calls().is_empty());
+    assert!(rig.wal_bytes().is_empty());
     rig.finish().await;
 }
 
@@ -1033,6 +1069,7 @@ async fn the_first_planned_episode_raises_the_feature_floor() {
     assert_eq!(
         started[0].required_features(),
         [
+            broca_wal::MESSAGE_TIMES_FEATURE,
             broca_wal::PLAN_MANIFEST_FEATURE,
             broca_wal::RUNNER_TAGS_V2_FEATURE
         ]

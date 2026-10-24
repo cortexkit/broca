@@ -1060,6 +1060,8 @@ impl serde::Serialize for CallerBlockRef<'_> {
 /// One message in a `session.read` page.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_at: Option<u64>,
     pub ordinal: u64,
     /// Message-coordinate spelling used by consumers for stable message badges.
     pub mid: String,
@@ -1117,6 +1119,8 @@ impl Serialize for SessionReadMessage {
         // inline read keeps its exact bytes.
         #[derive(Serialize)]
         struct Wire<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            written_at: Option<u64>,
             ordinal: u64,
             mid: &'a str,
             message: Body<'a>,
@@ -1137,6 +1141,7 @@ impl Serialize for SessionReadMessage {
             part_digests: &'a Option<Vec<cortexkit_role_llm_runner::read::descriptors::PartDigest>>,
         }
         Wire {
+            written_at: self.written_at,
             ordinal: self.ordinal,
             mid: &self.mid,
             message: Body(&self.message, self.described.as_ref()),
@@ -1291,6 +1296,7 @@ pub fn describe_resolved_part(
         message.content.get(index).cloned().into_iter().collect(),
     );
     let mut entry = SessionReadMessage {
+        written_at: None,
         ordinal,
         mid: format!("m{ordinal}"),
         message: single,
@@ -5504,6 +5510,7 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            written_at: None,
             delivered_as: None,
             tags: Vec::new(),
             ordinal: 3,
@@ -5788,6 +5795,7 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            written_at: None,
             delivered_as: None,
             tags: Vec::new(),
             ordinal: 0,
@@ -5929,5 +5937,18 @@ mod live_subscribe_tests {
         expected.pop();
         expected.extend_from_slice(br#","seq":13}"#);
         assert_eq!(live, expected);
+    }
+}
+
+#[cfg(test)]
+mod envelope_time_tests {
+    use super::SessionReadMessage;
+
+    #[test]
+    fn untimed_entries_keep_their_pre_addition_bytes() {
+        let pinned = r#"{"ordinal":0,"mid":"m0","message":{"role":"user","content":[{"type":"text","text":"legacy"}]}}"#;
+        let entry: SessionReadMessage = serde_json::from_str(pinned).unwrap();
+        assert_eq!(entry.written_at, None);
+        assert_eq!(serde_json::to_string(&entry).unwrap(), pinned);
     }
 }

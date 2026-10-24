@@ -380,6 +380,7 @@ mod tests {
         key: Option<&str>,
     ) -> crate::delivery_order::OrderedSend {
         crate::delivery_order::OrderedSend {
+            admitted_at_ms: None,
             submission_id: broca_protocol::SubmissionId(id.into()),
             order: broca_protocol::DeliveryOrder {
                 modes: modes.to_vec(),
@@ -490,6 +491,7 @@ mod retract_tests {
 
     fn queued(mode: DeliveryMode) -> crate::delivery_order::OrderedSend {
         crate::delivery_order::OrderedSend {
+            admitted_at_ms: None,
             submission_id: SubmissionId("queued".into()),
             order: broca_protocol::DeliveryOrder {
                 modes: vec![mode],

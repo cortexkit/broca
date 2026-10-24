@@ -204,6 +204,7 @@ impl SteerOnce {
         let writer = self.writer.lock().unwrap().clone().expect("writer set");
         let input = vec![Message::new(Role::User, vec![text("also check the docs")])];
         let record = WalRecord::Steered {
+            written_at_ms: None,
             tags: None,
             retention: None,
             ts_ms: None,
@@ -518,6 +519,7 @@ async fn a_resumed_stored_ledger_run_renders_a_steer_delivery_live_as_its_rebuil
     let records = load_fixture_records("steer-delivery");
     let cut = cut_at(&records);
     let send = broca_core::delivery_order::OrderedSend {
+        admitted_at_ms: None,
         submission_id: SubmissionId("send-in-order".into()),
         order: broca_protocol::DeliveryOrder {
             modes: vec![broca_protocol::DeliveryMode::Steer],

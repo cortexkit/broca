@@ -27,7 +27,7 @@ pub(crate) fn is_retention_records<'a>(records: impl IntoIterator<Item = &'a Wal
 }
 
 /// Recognize both sequence origins supported by the materialized-store API.
-pub(crate) fn starts_at_lineage_origin(records: &[FramedRecord]) -> bool {
+pub fn starts_at_lineage_origin(records: &[FramedRecord]) -> bool {
     // The materialized-store API has always accepted zero-based record vectors;
     // file WALs start at one. Either origin can establish a complete prefix;
     // a later sequence is only a suffix and cannot establish its first run.

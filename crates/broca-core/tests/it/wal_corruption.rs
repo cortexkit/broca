@@ -125,6 +125,7 @@ fn scripts_with_nondispatched_second_call() -> Vec<Vec<NormalizedEvent>> {
 
 fn request(run: &str, dir: &Path) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

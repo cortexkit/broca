@@ -408,6 +408,7 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                written_at: message.written_at,
                 delivered_as: message
                     .run
                     .as_ref()
@@ -1864,6 +1865,15 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
+    async fn head_for(
+        &self,
+        session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+    ) -> Result<broca_wire::HeadResponse, ServeError> {
+        self.head(session).await
+    }
+
     /// `session.warm` — re-send the session's most recent model request shaped to generate
     /// nothing, keeping the provider's cached prefix alive.
     async fn warm(
@@ -2798,10 +2808,22 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn head(&self, session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
+        self.head_for(session, None, &broca_protocol::SendScope::default())
+            .await
+    }
+
+    async fn head_for(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<broca_wire::HeadResponse, ServeError> {
         // The newest page of one message: the store's last row and the WAL past its watermark,
         // so the cost follows what is not yet materialized, never the session's length.
         let crate::registry::RouteReadPage {
             page,
+            head_facts,
+            head_facts_complete,
             newest_record_ms,
             retention_activity_ms,
             last_title,
@@ -2814,6 +2836,12 @@ impl ServeHandler for crate::LineageRegistry {
         let Some(lineage_id) = page.lineage_id else {
             return Ok(broca_wire::HeadResponse::default());
         };
+        if !head_facts_complete {
+            return Err(crate::registry::OpenError::Open(
+                "session.head cannot attest metadata from an incomplete WAL suffix".into(),
+            )
+            .into());
+        }
         // Retained sessions report expiry activity; maintenance must not move that clock.
         // Otherwise use the live WAL file's own write time, a stat; else
         // (its WAL was folded into an archive) the newest timestamped record of the read's
@@ -2841,7 +2869,12 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             None
         };
+        let sender = head_facts.sender(principal, scope, broca_wire::DELIVERY_MODES);
         Ok(broca_wire::HeadResponse {
+            model: head_facts.model,
+            usage: head_facts.usage.filter(|usage| usage.consistent()),
+            sender,
+            incarnation: lineage_id.incarnation(),
             lineage_id: Some(lineage_id.to_string()),
             last_ordinal: page.prompt_len.checked_sub(1),
             first_ordinal: Some(0),

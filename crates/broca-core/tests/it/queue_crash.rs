@@ -29,6 +29,7 @@ fn msg(text: &str) -> Message {
 
 fn queued(id: &str) -> WalRecord {
     WalRecord::Queued {
+        written_at_ms: None,
         retention: None,
         ts_ms: None,
         hooks: None,
@@ -78,6 +79,7 @@ fn retracted(id: &str) -> WalRecord {
 
 fn consume(run: &str, sub: &str) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,

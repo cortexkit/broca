@@ -113,6 +113,7 @@ fn queued_title(request: &RunRequest, index: usize, bytes: usize) -> [WalRecord;
     let submission_id = broca_protocol::SubmissionId(format!("noise-{index}"));
     [
         WalRecord::Queued {
+            written_at_ms: None,
             retention: None,
             ts_ms: None,
             keep_warm: None,
@@ -439,6 +440,7 @@ fn scripts() -> Vec<Vec<NormalizedEvent>> {
 
 fn request(dir: &std::path::Path) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

@@ -506,6 +506,7 @@ mod tests {
 
     fn steer(blocks: usize) -> WalRecord {
         WalRecord::Steered {
+            written_at_ms: None,
             tags: None,
             retention: None,
             ts_ms: None,

@@ -828,6 +828,7 @@ mod tests {
         });
         let fresh = AnthropicMessages.shape(&frozen, &CallOptions::new(submission.input.clone()));
         let queued = broca_wal::WalRecord::Queued {
+            written_at_ms: None,
             retention: None,
             ts_ms: None,
             hooks: None,

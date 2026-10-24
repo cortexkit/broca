@@ -104,6 +104,7 @@ impl Provider for Model {
 
 fn ordered(id: &str, modes: &[DeliveryMode]) -> OrderedSend {
     OrderedSend {
+        admitted_at_ms: None,
         submission_id: SubmissionId(id.into()),
         order: DeliveryOrder {
             modes: modes.to_vec(),

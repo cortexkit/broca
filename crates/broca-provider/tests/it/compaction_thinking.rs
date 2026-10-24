@@ -67,6 +67,7 @@ fn seed() -> Vec<Message> {
 fn start(input: Vec<Message>) -> WalRecord {
     let frozen = anthropic_frozen_config("claude-opus-5-5");
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,
@@ -143,6 +144,7 @@ fn applied(version: u64, to: u64) -> WalRecord {
 
 fn completion(label: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         step_id: StepId(0),
         assistant_message: Arc::new(broca_protocol::AssistantMessage {

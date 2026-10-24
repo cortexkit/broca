@@ -1331,6 +1331,7 @@ mod tests {
                 seq,
                 fence: 1,
                 record: WalRecord::Steered {
+                    written_at_ms: None,
                     tags: None,
                     retention: None,
                     ts_ms: Some(1100),

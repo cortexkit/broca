@@ -226,6 +226,7 @@ fn request(name: &str, mode: ExecutionMode) -> RunRequest {
     }];
     let policy_allowed: HashSet<String> = ["edit".to_string()].into_iter().collect();
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

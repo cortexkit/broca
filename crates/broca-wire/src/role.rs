@@ -174,6 +174,14 @@ pub struct HeadResponse {
     /// conformance kit requires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<cortexkit_role_llm_runner::read::HeadInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<cortexkit_role_llm_runner::read::HeadModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<cortexkit_role_llm_runner::usage::SessionUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<cortexkit_role_llm_runner::read::HeadSender>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
 }
 
 /// `session.head.input` as broca states it: a send's prompt is text (`prompt` or text
@@ -306,6 +314,13 @@ pub use cortexkit_role_llm_runner::capabilities::DELIVERY_ORDER as DELIVERY_ORDE
 /// The capability group that exposes a run's tool-call ledger.
 pub use cortexkit_role_llm_runner::capabilities::RUN_TOOL_CALLS as RUN_TOOL_CALLS_GROUP;
 
+/// Discovery and caller grants use the same supported delivery modes.
+pub const DELIVERY_MODES: &[cortexkit_role_llm_runner::delivery_order::Mode] = &[
+    cortexkit_role_llm_runner::delivery_order::Mode::ToolResult,
+    cortexkit_role_llm_runner::delivery_order::Mode::Steer,
+    cortexkit_role_llm_runner::delivery_order::Mode::IdleStart,
+];
+
 /// Discovery follows all installed writers through one capability calculation. Decoding
 /// compaction, retention or hook records alone does not promise to execute those writers.
 pub fn broca_role_describe_with_writers(
@@ -339,6 +354,8 @@ pub fn broca_role_describe_with_writers(
         "run_ops",
         cortexkit_role_llm_runner::capabilities::RUN_STATUS,
         cortexkit_role_llm_runner::capabilities::RUN_USAGE,
+        cortexkit_role_llm_runner::capabilities::SESSION_USAGE,
+        cortexkit_role_llm_runner::capabilities::HEAD_SENDER,
         cortexkit_role_llm_runner::capabilities::RUN_CANCEL,
         cortexkit_role_llm_runner::capabilities::RETRACT,
         "dispatch_attribution",
@@ -391,11 +408,12 @@ pub fn broca_role_describe_with_writers(
         implementation_version,
     )
     .with_capabilities(capabilities)
-    .with_delivery_order_modes(vec![
-        "tool_result".into(),
-        "steer".into(),
-        "idle_start".into(),
-    ])
+    .with_delivery_order_modes(
+        DELIVERY_MODES
+            .iter()
+            .map(|mode| mode.as_str().into())
+            .collect(),
+    )
     // A session's own capabilities come back on the reply to the send that admits (first
     // writes) the session, not from a separate `session.baseline` call.
     .with_session_capabilities_from("admission")
@@ -569,6 +587,10 @@ mod pinned_reply_bytes {
     fn session_head_bytes_are_pinned() {
         assert_golden(
             HeadResponse {
+                model: None,
+                usage: None,
+                sender: None,
+                incarnation: None,
                 title: None,
                 lineage_id: Some("lin-1".into()),
                 last_ordinal: Some(3),
@@ -598,6 +620,10 @@ mod pinned_reply_bytes {
     fn session_head_with_a_title_bytes_are_pinned() {
         assert_golden(
             HeadResponse {
+                model: None,
+                usage: None,
+                sender: None,
+                incarnation: None,
                 title: Some("Fix the login bug".into()),
                 lineage_id: Some("lin-1".into()),
                 last_ordinal: Some(3),
@@ -628,6 +654,10 @@ mod pinned_reply_bytes {
     #[test]
     fn session_head_lineage_members_are_pinned() {
         let head = HeadResponse {
+            model: None,
+            usage: None,
+            sender: None,
+            incarnation: None,
             title: None,
             lineage_id: Some("lin-1".into()),
             last_ordinal: Some(3),
@@ -983,7 +1013,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "9c23fbd2139eff95d5c433b4e441c83245cbb0655de197e9a758f679ad6b6c2c",
+            "92063b9c9713f00291f1d0083d3adbbb56bd8a6c9d17c2cc8e9c60346be28e58",
         );
     }
 
@@ -1079,6 +1109,10 @@ mod pinned_reply_bytes {
     fn cache_facts_on_head_and_baseline_are_pinned() {
         assert_golden(
             HeadResponse {
+                model: None,
+                usage: None,
+                sender: None,
+                incarnation: None,
                 title: None,
                 lineage_id: Some("lin-1".into()),
                 last_ordinal: Some(3),
@@ -1140,7 +1174,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "5b6671997aa5b44ee646f96fba6ad7416f8707aa4c36c5dc4bacb0058d62328c";
+        "56dc44341e12dee5fbfbba7824ebc49bfab447319e66aa5766332c9fc66911ec";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

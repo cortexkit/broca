@@ -233,6 +233,7 @@ impl RunExecutor for FakeExec {
         }
         self.started.fetch_add(1, Ordering::SeqCst);
         job.writer.record(broca_wal::WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -355,6 +356,7 @@ impl RunExecutor for ReauthCoreExec {
             config.budget = job.req.budget.clone();
             config.stop_when = job.req.stop_when.clone();
             job.writer.record(WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -412,6 +414,7 @@ impl RunExecutor for ReauthCoreExec {
                 account_decision: None,
             });
             job.writer.record(WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -5356,6 +5359,7 @@ impl PreparedWalRoute {
                 file.append(
                     1,
                     &WalRecord::RunStarted {
+                        written_at_ms: None,
                         tags: None,
                         session_class: None,
                         retention: None,
@@ -5540,6 +5544,7 @@ async fn run_status_frozen_auth_selection_matches_served_golden() {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    written_at_ms: None,
                     tags: None,
                     session_class: None,
                     retention: None,
@@ -6295,6 +6300,7 @@ async fn history_unreachable_refusal_golden_from_real_serve() {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -6329,6 +6335,7 @@ async fn history_unreachable_refusal_golden_from_real_serve() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: broca_protocol::StepId(1),

@@ -547,6 +547,7 @@ impl ToolPlane for ToolResultAllocationProbePlane {
 async fn terminal_no_tool_step_does_not_retain_a_second_assistant_message_copy() {
     let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -652,6 +653,7 @@ async fn terminal_no_tool_step_does_not_retain_a_second_assistant_message_copy()
 async fn tool_step_does_not_retain_a_second_assistant_message_copy() {
     let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -781,6 +783,7 @@ async fn admitted_turn_does_not_retain_a_second_input_copy() {
         serde_json::from_slice(&serialized).expect("deserialize production-shaped input");
 
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -893,6 +896,7 @@ async fn admitted_turn_does_not_retain_a_second_tool_copy() {
         .len();
     let policy_allowed = tools.iter().map(|tool| tool.name.clone()).collect();
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -992,6 +996,7 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
         reply: None,
     };
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1118,6 +1123,7 @@ async fn dispatch_plan_does_not_retain_a_second_tool_call_copy() {
 async fn dispatched_tool_result_does_not_retain_a_second_payload_copy() {
     let _allocation_test_lock = ALLOCATION_TEST_LOCK.lock().await;
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1239,6 +1245,7 @@ impl Provider for StepAllocationProbeProvider {
 
 fn append_probe_request(run_id: &str, input: Vec<Message>) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

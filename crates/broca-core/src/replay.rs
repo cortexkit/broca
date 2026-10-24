@@ -2492,33 +2492,27 @@ impl RunUsageProjection {
             }
             WalRecord::ModelStepFinished { usage, .. } if self.active => {
                 if let Some((model, variant)) = &self.model {
-                    let mut step_usage = cortexkit_role_llm_runner::usage::StepUsage::unreported();
-                    if let Some(tokens) = usage.input_tokens {
-                        step_usage = step_usage.with_input_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.cached_input_tokens {
-                        step_usage = step_usage.with_cached_input_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.cache_write_tokens {
-                        step_usage = step_usage.with_cache_write_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.output_tokens {
-                        step_usage = step_usage.with_output_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.reasoning_tokens {
-                        step_usage = step_usage.with_reasoning_tokens(tokens);
-                    }
                     self.usage.record_step(
                         &model.provider_module_id,
                         &model.model_id,
                         variant.as_deref().filter(|value| !value.is_empty()),
-                        step_usage,
+                        reported_step_usage(usage),
                     );
                 }
             }
             _ => {}
         }
     }
+}
+
+pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::usage::StepUsage {
+    let mut step = cortexkit_role_llm_runner::usage::StepUsage::unreported();
+    step.input_tokens = usage.input_tokens;
+    step.cached_input_tokens = usage.cached_input_tokens;
+    step.cache_write_tokens = usage.cache_write_tokens;
+    step.output_tokens = usage.output_tokens;
+    step.reasoning_tokens = usage.reasoning_tokens;
+    step
 }
 
 /// A run state reconciled from the WAL, including terminal metadata absent from the index.
@@ -3078,6 +3072,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(step_id),
@@ -3135,6 +3130,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -3223,6 +3219,7 @@ pub(crate) mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                head: None,
                 has_deferred_calls: None,
                 tags: None,
                 pending_order: None,
@@ -3694,6 +3691,7 @@ pub(crate) mod deferred_tests {
         vec![
             super::projection_boundary_tests::run_started(1, "r").record,
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),

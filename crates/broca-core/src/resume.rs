@@ -547,6 +547,7 @@ mod tests {
             drop(file);
             let before = std::fs::read(store.wal_path(&session)).unwrap();
             let request = RunRequest {
+                input_written_at_ms: None,
                 directives: None,
                 session_class: None,
                 retention: None,

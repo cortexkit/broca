@@ -561,6 +561,7 @@ fn req(key: &BindIdentity, run: &str, text: &str) -> RunRequest {
     let tools = vec![tool("lookup")];
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1685,6 +1686,7 @@ fn min_config() -> RunConfig {
 
 fn started(key: &BindIdentity, run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,
@@ -1719,6 +1721,7 @@ fn assistant_text(step: u64, text: &str) -> WalRecord {
 
 fn assistant_text_with_usage(step: u64, text: &str, step_usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(step),
@@ -2787,6 +2790,7 @@ fn dispatch_module_episode(key: &BindIdentity, run: &str, call: &str) -> Vec<Wal
     vec![
         started(key, run, &format!("{run} question")),
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(0),
@@ -2924,6 +2928,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
     let batch_id = BatchId("batch-1".into());
     let records = vec![
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -2953,6 +2958,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
             submission_id: None,
         },
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(0),
@@ -3262,6 +3268,7 @@ async fn read_lineage_state_paused_and_active_with_open_dispatch() {
         &[
             started(&active, "run-active", "open"),
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(0),
@@ -3363,6 +3370,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
         &key,
         &[
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -3392,6 +3400,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(0),
@@ -3498,6 +3507,7 @@ async fn torn_import_is_publicly_interrupted_for_read_and_run_status() {
         &rig.wal_store,
         &key,
         &[WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -4104,6 +4114,7 @@ async fn session_read_renders_a_steered_message_at_its_wal_position() {
     let rig = Rig::new("steered-read", Arc::new(NoopExec));
     let key = rig.key("steered");
     let steered = WalRecord::Steered {
+        written_at_ms: None,
         tags: None,
         retention: None,
         ts_ms: None,
