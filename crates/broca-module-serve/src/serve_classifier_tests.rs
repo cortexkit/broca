@@ -649,8 +649,35 @@ async fn a_hung_classifier_provider_never_delays_session_work() {
         )
         .await;
     }
-    while rig.provider.held.load(Ordering::SeqCst) == 0 {
-        rig.provider.entered.notified().await;
+    let provider = rig.provider.clone();
+    // A refusal can answer before the provider is called. Observe that reply as well as
+    // entry, otherwise an admission regression leaves the test waiting for an impossible event.
+    let entered = broca_test_support::event_timeout(
+        "the classifier provider to hold a call",
+        async {
+            loop {
+                let notified = provider.entered.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if provider.held.load(Ordering::SeqCst) > 0 {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    reply = read_frame(&mut rig.daemon) => {
+                        return Err(format!("classify.run answered before its provider was held: {reply:?}"));
+                    }
+                }
+            }
+        },
+        || format!("{} provider calls held", provider.held.load(Ordering::SeqCst)),
+    )
+    .await;
+    if !matches!(entered, Ok(Ok(()))) {
+        provider.gate.add_permits(batches as usize);
+        rig.serve.abort();
+        let _ = rig.serve.await;
+        panic!("the classifier provider must hold a call before session work: {entered:?}");
     }
     rig.request(7, 1, "session.read", json!({})).await;
     rig.request(
