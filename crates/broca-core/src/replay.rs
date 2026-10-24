@@ -1035,6 +1035,11 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
 pub struct ProjectionSeed {
     /// First model-produced message of the episode open at the watermark, if it has one.
     pub open_episode_span: Option<u64>,
+    /// The episode open at the watermark, as the projection holds it, and every earlier
+    /// episode's render inputs. A seed without them cannot continue an open episode's metadata,
+    /// so the successor projection would drop it (see `projected_open_episode`).
+    pub open_episode: Option<crate::context::EpisodeRenderProjection>,
+    pub earlier_episodes: Vec<crate::context::EpisodeRenderProjection>,
     pub watermark_seq: u64,
     pub anchor: Option<WalByteAnchor>,
     pub prefix_len: u64,
@@ -1056,6 +1061,8 @@ impl ProjectionSeed {
     pub fn empty() -> Self {
         Self {
             open_episode_span: None,
+            open_episode: None,
+            earlier_episodes: Vec::new(),
             watermark_seq: 0,
             anchor: None,
             prefix_len: 0,
@@ -1078,6 +1085,7 @@ impl ProjectionSeed {
 pub struct ProjectionDelta {
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
+    pub open_episode: Option<crate::context::EpisodeRenderProjection>,
     pub messages: Vec<Message>,
     pub message_runs: Vec<Option<RunAttribution>>,
     pub run_finals: BTreeMap<u64, RunAttribution>,
@@ -1192,7 +1200,10 @@ pub fn replay_projection_tail(
             seed.open_episode_span
         },
     );
-    let last_run_id = tail_state.run_id.or_else(|| seed.last_run_id.clone());
+    let last_run_id = tail_state
+        .run_id
+        .clone()
+        .or_else(|| seed.last_run_id.clone());
     debug_assert_eq!(
         last_run_id.as_ref(),
         admission_checkpoint
@@ -1200,9 +1211,17 @@ pub fn replay_projection_tail(
             .as_ref()
             .map(|episode| &episode.run_id)
     );
+    // A truncation restarts the transcript from ordinal zero, so no earlier episode survives
+    // it and the tail's own ordinals are already the projection's.
+    let open_episode = if truncate_prefix_to.is_some() {
+        projected_episode_metadata(&tail_state).pop()
+    } else {
+        projected_open_episode(&tail_state, seed.prefix_len, seed.open_episode.clone())
+    };
     Ok(ProjectionDelta {
         episode_spans,
         open_episode_span,
+        open_episode,
         messages: tail_state.prompt,
         message_runs: tail_state.message_runs,
         run_finals: tail_state.run_finals,
@@ -1221,6 +1240,48 @@ pub fn replay_projection_tail(
             seed.last_run_id.as_ref(),
         ),
     })
+}
+
+/// Every replayed episode's render inputs as durable ordinals, for the store's episode
+/// projection. A resumed run under an applied view reads the projection instead of replaying the
+/// whole WAL, and this is the WAL-derived truth it must match.
+///
+/// Each episode's coordinates come from the same replay facts the run loop renders from: its
+/// `RunStarted` position, its admitted first user, its `frozen_render_config`, and the start of
+/// its first model-step span (`episode_step_spans`, which runs from the first model-produced
+/// message to the end of the episode). A value for an episode present in the replay is always
+/// known here: a known absence is `Some(None)`.
+pub fn projected_episode_metadata(
+    state: &ReplayState,
+) -> Vec<crate::context::EpisodeRenderProjection> {
+    let episodes = state.render_episodes.as_deref().unwrap_or_default();
+    let step_starts: Vec<usize> = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|span| span.start)
+        .collect();
+    episodes
+        .iter()
+        .enumerate()
+        .map(|(index, episode)| crate::context::EpisodeRenderProjection {
+            start: Some(episode.prompt_start as u64),
+            first_user: Some(episode.first_user.map(|first| first as u64)),
+            // Episode spans are recorded only for episodes that committed a model step, in
+            // episode order, so an episode after the first one without a span has an unknown
+            // first step here rather than a borrowed span from a later episode.
+            first_step: Some(
+                step_starts
+                    .iter()
+                    .take(index + 1)
+                    .copied()
+                    .nth(index)
+                    .map(|start| start as u64),
+            ),
+            render_config: Some(episode.frozen_config.clone()),
+        })
+        .collect()
 }
 
 /// Continue the materialized episode across a replay seam, closing it before the next
@@ -1255,6 +1316,63 @@ pub(crate) fn projected_episode_spans(
         None => previous_open.or_else(|| spans.last().map(|span| span.start)),
     };
     (spans, open)
+}
+
+/// The episode that is open after a replay tail, in the coordinates of the projection this seed
+/// produces. Seeding hands the tail's own episode boundaries forward only for replay; this is the
+/// metadata the store keeps, and it must describe the same episode so a later read continues its
+/// first model step instead of losing it.
+pub(crate) fn projected_open_episode(
+    state: &ReplayState,
+    base: u64,
+    previous: Option<crate::context::EpisodeRenderProjection>,
+) -> Option<crate::context::EpisodeRenderProjection> {
+    let episodes = state.render_episodes.as_deref().unwrap_or_default();
+    let first_boundary = episodes
+        .first()
+        .map_or(state.prompt.len(), |episode| episode.prompt_start);
+    // Episodes that committed a model step, in episode order.
+    let spanned = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .len();
+    let first_step = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|span| base + span.start as u64)
+        .find(|start| episodes.is_empty() || *start >= base + first_boundary as u64);
+    let previous = previous.filter(|previous| previous.start.is_some());
+    match episodes.last() {
+        // A tail whose first record opens an episode shows nothing of the projection's open
+        // episode, so the projection's open episode keeps its own facts and takes the tail
+        // episode's first step only if it had none. Otherwise the tail's last episode is open,
+        // and it is the episode every one of its records belongs to.
+        Some(_) if first_boundary == 0 && episodes.len() > 1 => {
+            let metadata = projected_episode_metadata(state);
+            let mut last = metadata.last().cloned()?;
+            if let Some(start) = last.start.as_mut() {
+                *start += base;
+            }
+            if let Some(Some(first_user)) = last.first_user.as_mut() {
+                *first_user += base;
+            }
+            last.first_step = Some(first_step);
+            Some(last)
+        }
+        _ => {
+            let previous = previous?;
+            let tail_first_step = (spanned == 0).then_some(first_step).flatten();
+            Some(crate::context::EpisodeRenderProjection {
+                start: previous.start,
+                first_user: previous.first_user,
+                first_step: previous.first_step.or(Some(tail_first_step)),
+                render_config: previous.render_config,
+            })
+        }
+    }
 }
 
 /// Validate a budgeted projection/admission seed before it can affect replay.
@@ -3203,6 +3321,8 @@ pub(crate) mod projection_boundary_tests {
         };
         ProjectionSeed {
             open_episode_span: Some(1),
+            open_episode: None,
+            earlier_episodes: Vec::new(),
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,

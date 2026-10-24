@@ -100,14 +100,71 @@ pub struct StorePageRow {
     pub run: Option<crate::RunAttribution>,
 }
 
+/// One episode's durable render inputs, with the state of every value separated from the value
+/// itself.
+///
+/// A resumed run under an applied compaction view reads these from the store projection instead
+/// of replaying the whole WAL (see `ModelHistory::episodes`). Each coordinate is an absolute
+/// transcript ordinal and states which of three things it is: a known value (a `Some(Some(_))`
+/// for the optional coordinates), a known absence (`Some(None)`), or a value nobody has computed
+/// yet (`None`), which sends the reader back to the WAL for that episode instead of guessing.
+/// Read through the accessors, which never let a stored zero stand in for an unknown ordinal.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EpisodeRenderProjection {
+    /// The episode's first message, the ordinal its `RunStarted` input starts at.
+    pub start: Option<u64>,
+    /// The episode's original admitted first user message, `Some(None)` when its admitted input
+    /// carried none (a later steer is never this).
+    pub first_user: Option<Option<u64>>,
+    /// The episode's first model-produced message: its first model step's start. `Some(None)`
+    /// while the episode has committed no model step.
+    pub first_step: Option<Option<u64>>,
+    /// The episode's frozen render config, the bytes its `RunStarted` recorded.
+    #[serde(default)]
+    pub render_config: Option<serde_json::Value>,
+}
+
+impl EpisodeRenderProjection {
+    pub fn start(&self) -> Option<u64> {
+        self.start
+    }
+
+    pub fn first_user(&self) -> Option<Option<u64>> {
+        self.first_user
+    }
+
+    pub fn first_step(&self) -> Option<Option<u64>> {
+        self.first_step
+    }
+
+    pub fn render_config(&self) -> Option<&serde_json::Value> {
+        self.render_config.as_ref()
+    }
+
+    /// Whether every value a reader needs was computed for this episode. `false` means the
+    /// reader must take this episode's metadata from the WAL.
+    pub fn is_complete(&self) -> bool {
+        self.start.is_some()
+            && self.first_user.is_some()
+            && self.first_step.is_some()
+            && self.render_config.is_some()
+    }
+}
+
 /// Rebuildable model-guidance coordinates captured with a page's rows and watermark.
 /// Missing metadata means replay, not an episode without repeated calls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelHistory {
     pub spans: Vec<std::ops::Range<u64>>,
     pub open_span: Option<u64>,
+    /// Every episode's render inputs, in lineage order, for a session with an applied view.
+    /// `None` when the store holds no complete episode metadata; readers then replay the WAL.
+    pub episodes: Option<Vec<EpisodeRenderProjection>>,
     /// The exact ordinal ranges the store read, including episode history and lookahead.
     pub row_ranges: Vec<std::ops::Range<u64>>,
+    /// How many transcript messages the materialized prefix holds: the session's extent below
+    /// the WAL tail, and the end of the episode that is open at the watermark.
+    pub prefix_len: u64,
 }
 
 /// The metadata and requested rows captured by one store transaction for `session.read`.
@@ -265,6 +322,23 @@ pub trait MaterializedStore: Send + Sync {
     /// failure must surface as an error so the caller can fall back to a full WAL replay
     /// instead of merging a partial snapshot.
     fn read_prefix_with_watermark(&self, session: &BindIdentity) -> Result<StorePrefix, String>;
+
+    /// Read the session's projected episode render inputs (start, original first user, first
+    /// model step and frozen render config per episode) without reading a transcript message.
+    ///
+    /// The default implementation keeps no such projection. A store that does returns
+    /// `Ok(Some(episodes))` only when every episode's values were computed at the projection's
+    /// materialization watermark. `Ok(None)` means they were not: a store written before the
+    /// column existed, or one whose projection advanced without recomputing them. A caller that
+    /// needs episode coordinates then replays the WAL rather than render from an absence, and
+    /// the projection fills the values on its next write. `Err` is a read failure, answered the
+    /// same way.
+    fn read_episode_projection(
+        &self,
+        _session: &BindIdentity,
+    ) -> Result<Option<Vec<EpisodeRenderProjection>>, String> {
+        Ok(None)
+    }
 
     /// Read the watermark, matching byte anchor, and admission checkpoint in one transaction.
     /// `None` means there is no metadata row; callers use the complete WAL.

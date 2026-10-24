@@ -144,6 +144,9 @@ impl ProjectionPlan {
 pub struct PreparedProjection {
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
+    /// Every episode's render inputs, in lineage order. Read by a resumed run under an applied
+    /// view, which cannot take them from the discarded transcript.
+    pub episodes: Vec<crate::context::EpisodeRenderProjection>,
     pub expected_watermark: u64,
     pub expected_lineage_id: Option<String>,
     pub reset: bool,
@@ -355,6 +358,7 @@ pub fn plan_projection(
         admission_checkpoint,
         episode_spans,
         open_episode_span,
+        episode_metadata,
     ) = if let Some(seed) = seed.filter(|seed| {
         // A seed stored before the ownership summary existed (or before it recorded the frozen
         // plan manifest) cannot carry it forward: the summary covers every episode, and the
@@ -383,6 +387,11 @@ pub fn plan_projection(
             delta.admission_checkpoint,
             delta.episode_spans,
             delta.open_episode_span,
+            {
+                let mut episodes = seed.earlier_episodes.clone();
+                episodes.extend(delta.open_episode);
+                episodes
+            },
         )
     } else {
         // Legacy or malformed checkpoint metadata asks the caller for a complete WAL read;
@@ -399,6 +408,7 @@ pub fn plan_projection(
         let prefix_state = replay(&up_to)?;
         let (episode_spans, open_episode_span) =
             crate::replay::projected_episode_spans(&prefix_state, 0, None);
+        let episode_metadata = crate::replay::projected_episode_metadata(&prefix_state);
         let admission_checkpoint = AdmissionCheckpointV1::from_frames(&up_to_frames)?;
         let last_run_id = admission_checkpoint
             .last_episode
@@ -417,6 +427,7 @@ pub fn plan_projection(
             admission_checkpoint,
             episode_spans,
             open_episode_span,
+            episode_metadata,
         )
     };
 
@@ -529,6 +540,7 @@ pub fn plan_projection(
     Ok(ProjectionPlan::Write(Box::new(PreparedProjection {
         episode_spans,
         open_episode_span,
+        episodes: episode_metadata,
         expected_watermark,
         expected_lineage_id,
         reset,
