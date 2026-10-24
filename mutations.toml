@@ -19929,6 +19929,7 @@ guards = "a queued send whose ordered delivery list has no idle_start never drai
 runner = "cargo"
 package = "broca-module"
 target = "--test it"
+features = ["test-clock"]
 test_file = "crates/broca-module/tests/it/delivery_order.rs"
 # Each of these sends waits with a list that has no idle_start; under the break it drains into a run.
 expect_red = [
