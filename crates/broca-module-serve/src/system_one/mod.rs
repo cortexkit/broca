@@ -249,6 +249,12 @@ pub struct SystemOne {
     metrics: Mutex<Metrics>,
     export: Option<Arc<broca_store::SqliteStore>>,
     charge_basis: Arc<crate::billing_routing::ChargeBasisTable>,
+    /// Tests only: when set, the next store release made from a hold's `Drop` (the fallback
+    /// for a panicked or dropped call) waits until the sender side is dropped. A test holds
+    /// it shut to prove that a call which ends normally never leaves its release to that
+    /// fallback, since a release still pending after the reply refuses an immediate re-send.
+    #[cfg(test)]
+    fallback_release_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 /// Process-lifetime observations only. No batch ids, questions, states or answers enter health.
@@ -294,6 +300,8 @@ impl SystemOne {
             metrics: Mutex::new(Metrics::default()),
             export: None,
             charge_basis: Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
+            #[cfg(test)]
+            fallback_release_gate: Mutex::new(None),
         }
     }
 
