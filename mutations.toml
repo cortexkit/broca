@@ -22906,8 +22906,8 @@ select = "expected"
 test_file = "crates/broca-protocol/src/caller.rs"
 expect_red = ["caller::tests::durable_reason_enums_stay_closed_to_unknown_values", "caller::tests::unknown_finish_and_pause_reasons_decode_as_explicit_unknown_states"]
 file = "crates/broca-protocol/src/caller.rs"
-old = "    /// A graceful process stop at a clean boundary; the same episode can resume after boot.\n    Restart,"
-new = "    /// A graceful process stop at a clean boundary; the same episode can resume after boot.\n    #[serde(other)] // NON-VACUITY BREAK: read an unknown pause as a restart.\n    Restart,"
+old = "    ToolHeld,\n}"
+new = "    #[serde(other)] // NON-VACUITY BREAK: read an unknown pause as a held tool.\n    ToolHeld,\n}"
 
 [[control]]
 id = "subscribe-unknown-run-reason-becomes-unrecognized-state"
@@ -24316,7 +24316,7 @@ target = "--lib"
 select = "expected"
 test_file = "crates/broca-module-serve/src/wal_archive.rs"
 expect_red = ["wal_archive::tests::a_never_folded_tree_folds_once_on_its_first_poll"]
-expect_message = "a never-folded tree must run exactly one pass, on its first poll"
+expect_message = "timed out waiting for the first fold pass to be recorded after 60s; last observed: 0 pass(es) recorded"
 file = "crates/broca-module-serve/src/wal_archive.rs"
 old = "                    None => tracing::info!(\n                        target: \"archive\",\n                        \"WAL archive pass due: no earlier pass is recorded under this root\"\n                    ),"
 new = "                    None => continue, // NON-VACUITY BREAK: never run a first pass."
