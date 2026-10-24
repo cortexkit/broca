@@ -57,12 +57,19 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          -- The resumable walk that derives step facts for sessions no live write reached:
          -- the 30-day backfill on first start, and recovery after a crash on later starts.
          CREATE TABLE IF NOT EXISTS model_step_walk (
-             id         INTEGER PRIMARY KEY CHECK (id = 1),
-             since_ms   INTEGER NOT NULL,
-             started_ms INTEGER NOT NULL,
-             cursor     TEXT NOT NULL,
-             done       INTEGER NOT NULL
-         );",
+             id          INTEGER PRIMARY KEY CHECK (id = 1),
+             since_ms    INTEGER NOT NULL,
+             started_ms  INTEGER NOT NULL,
+             -- run_index rowid the queue has been filled through; NULL once it is complete.
+             build_rowid INTEGER,
+             done        INTEGER NOT NULL
+         );
+         -- The sessions the current walk has yet to visit, by their run_index `session` JSON.
+         -- Kept on disk rather than in memory, because a backfill can list every session the
+         -- store knows; a visited session is deleted from it.
+         CREATE TABLE IF NOT EXISTS model_step_walk_queue (
+             session TEXT PRIMARY KEY
+         ) WITHOUT ROWID;",
     )
 }
 
@@ -96,8 +103,9 @@ pub struct ModelStepWalk {
     pub since_ms: u64,
     /// When the walk began; the next walk starts from here (less a margin).
     pub started_ms: u64,
-    /// The store key of the last session visited; the walk resumes after it.
-    pub cursor: String,
+    /// The run_index rowid the walk's queue has been filled through; `None` once the queue
+    /// holds every session the walk visits.
+    pub build_rowid: Option<i64>,
     pub done: bool,
 }
 
@@ -110,6 +118,89 @@ pub fn model_step_expires_at(basis_ms: u64) -> u64 {
 /// exactly this boundary and the writer refuses to write at it, so the two never disagree.
 pub fn model_step_expired(basis_ms: u64, now_ms: u64) -> bool {
     model_step_expires_at(basis_ms) <= now_ms
+}
+
+/// Folds one session's durable records in WAL order and writes their step facts in bounded
+/// transactions, each also moving the checkpoint past the records it covers. It holds no
+/// records, only the fold state and at most one transaction's facts, so a caller streaming a
+/// WAL of any size through it keeps a bounded footprint.
+pub struct ModelStepWriter<'a> {
+    store: &'a SqliteStore,
+    key: String,
+    session_json: String,
+    lineage_id: String,
+    identity: StepFactIdentity,
+    /// The stored checkpoint as last read or written; a commit refuses if it moved.
+    expected: Option<ModelStepCheckpoint>,
+    /// Records at or before this sequence are already covered by the checkpoint.
+    after: u64,
+    /// The last record folded (or `after` before the first).
+    last: u64,
+    fold: ModelStepFold,
+    batch: Vec<FoldedStep>,
+    /// Records folded since the last commit.
+    pending: usize,
+    now_ms: u64,
+    report: StepProjectionReport,
+}
+
+impl ModelStepWriter<'_> {
+    /// The checkpoint this writer continues from: records at or before it are skipped.
+    pub fn after(&self) -> u64 {
+        self.after
+    }
+
+    /// Fold one durable record. Records at or before the checkpoint are skipped; a record that
+    /// does not follow the previous one is refused, because the fold would silently miss steps.
+    pub fn push(&mut self, frame: &FramedRecord) -> Result<(), StoreError> {
+        if frame.seq <= self.after {
+            return Ok(());
+        }
+        // Without a checkpoint (after == 0) the first record may be anywhere: a caller folds
+        // from wherever its read began.
+        let follows = (self.last == 0 && self.after == 0) || frame.seq == self.last + 1;
+        if !follows {
+            return Err(StoreError::InconsistentSnapshot(
+                "model step projection range has a gap after its checkpoint",
+            ));
+        }
+        self.batch.extend(self.fold.apply(frame, &self.identity));
+        self.last = frame.seq;
+        self.pending += 1;
+        if self.batch.len() >= FACTS_PER_TRANSACTION || self.pending >= RECORDS_PER_TRANSACTION {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Commit what is left and report what this writer did.
+    pub fn finish(mut self) -> Result<StepProjectionReport, StoreError> {
+        if self.pending > 0 {
+            self.commit()?;
+        }
+        Ok(self.report)
+    }
+
+    fn commit(&mut self) -> Result<(), StoreError> {
+        self.store.commit_model_step_batch(
+            &self.key,
+            &self.session_json,
+            &self.lineage_id,
+            self.expected.as_ref(),
+            self.last,
+            &self.fold,
+            std::mem::take(&mut self.batch),
+            self.now_ms,
+            &mut self.report,
+        )?;
+        self.expected = Some(ModelStepCheckpoint {
+            lineage_id: self.lineage_id.clone(),
+            seq: self.last,
+        });
+        self.report.through_seq = self.last;
+        self.pending = 0;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -126,11 +217,6 @@ fn int(value: u64) -> Result<i64, StoreError> {
 }
 
 impl SqliteStore {
-    /// The store key `model_step_projection` and the walk cursor use for `session`.
-    pub fn model_step_session_key(session: &BindIdentity) -> String {
-        Self::key(session)
-    }
-
     pub fn model_step_checkpoint(
         &self,
         session: &BindIdentity,
@@ -167,6 +253,22 @@ impl SqliteStore {
         records: &[FramedRecord],
         now_ms: u64,
     ) -> Result<StepProjectionReport, StoreError> {
+        let mut writer = self.model_step_writer(session, lineage_id, now_ms)?;
+        for frame in records {
+            writer.push(frame)?;
+        }
+        writer.finish()
+    }
+
+    /// A writer for `session`'s step facts that continues from the stored checkpoint when it
+    /// names `lineage_id`, and from an empty fold otherwise. Feed it records in WAL order with
+    /// [`ModelStepWriter::push`] and end with [`ModelStepWriter::finish`].
+    pub fn model_step_writer(
+        &self,
+        session: &BindIdentity,
+        lineage_id: &str,
+        now_ms: u64,
+    ) -> Result<ModelStepWriter<'_>, StoreError> {
         let key = Self::key(session);
         let stored: Option<(String, u64, String)> = self
             .conn
@@ -184,61 +286,36 @@ impl SqliteStore {
                 },
             )
             .optional()?;
-        let mut expected = stored
+        let expected = stored
             .as_ref()
-            .map(|(lineage, seq, _)| (lineage.clone(), *seq));
-        let (after, mut fold) = match stored {
+            .map(|(lineage, seq, _)| ModelStepCheckpoint {
+                lineage_id: lineage.clone(),
+                seq: *seq,
+            });
+        let (after, fold) = match stored {
             Some((lineage, seq, fold_json)) if lineage == lineage_id => {
                 (seq, serde_json::from_str::<ModelStepFold>(&fold_json)?)
             }
             _ => (0, ModelStepFold::default()),
         };
-        let pending: Vec<&FramedRecord> =
-            records.iter().filter(|frame| frame.seq > after).collect();
-        let mut report = StepProjectionReport {
-            through_seq: after,
-            ..StepProjectionReport::default()
-        };
-        if pending.is_empty() {
-            return Ok(report);
-        }
-        let continues = after == 0 || pending[0].seq == after + 1;
-        if !continues
-            || pending
-                .windows(2)
-                .any(|pair| pair[1].seq != pair[0].seq + 1)
-        {
-            return Err(StoreError::InconsistentSnapshot(
-                "model step projection range has a gap after its checkpoint",
-            ));
-        }
-
-        let identity = StepFactIdentity::new(lineage_id, session);
-        let session_json = serde_json::to_string(session)?;
-        let mut batch: Vec<FoldedStep> = Vec::new();
-        let mut folded = 0usize;
-        for (index, frame) in pending.iter().enumerate() {
-            batch.extend(fold.apply(frame, &identity));
-            folded += 1;
-            let last = index + 1 == pending.len();
-            if last || batch.len() >= FACTS_PER_TRANSACTION || folded >= RECORDS_PER_TRANSACTION {
-                self.commit_model_step_batch(
-                    &key,
-                    &session_json,
-                    lineage_id,
-                    expected.as_ref(),
-                    frame.seq,
-                    &fold,
-                    std::mem::take(&mut batch),
-                    now_ms,
-                    &mut report,
-                )?;
-                expected = Some((lineage_id.to_string(), frame.seq));
-                report.through_seq = frame.seq;
-                folded = 0;
-            }
-        }
-        Ok(report)
+        Ok(ModelStepWriter {
+            store: self,
+            session_json: serde_json::to_string(session)?,
+            key,
+            lineage_id: lineage_id.to_string(),
+            identity: StepFactIdentity::new(lineage_id, session),
+            expected,
+            after,
+            last: after,
+            fold,
+            batch: Vec::new(),
+            pending: 0,
+            now_ms,
+            report: StepProjectionReport {
+                through_seq: after,
+                ..StepProjectionReport::default()
+            },
+        })
     }
 
     // One transaction: the facts of a folded range and the checkpoint past it.
@@ -248,7 +325,7 @@ impl SqliteStore {
         key: &str,
         session_json: &str,
         lineage_id: &str,
-        expected: Option<&(String, u64)>,
+        expected: Option<&ModelStepCheckpoint>,
         through_seq: u64,
         fold: &ModelStepFold,
         batch: Vec<FoldedStep>,
@@ -264,11 +341,16 @@ impl SqliteStore {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Another writer moved this session's checkpoint since it was read: what this call
         // folded may no longer follow it. Stop; the caller's next attempt re-reads it.
-        let current: Option<(String, u64)> = tx
+        let current: Option<ModelStepCheckpoint> = tx
             .query_row(
                 "SELECT lineage_id, seq FROM model_step_projection WHERE session=?1",
                 [key],
-                |row| Ok((row.get(0)?, row.get::<_, i64>(1)?.max(0) as u64)),
+                |row| {
+                    Ok(ModelStepCheckpoint {
+                        lineage_id: row.get(0)?,
+                        seq: row.get::<_, i64>(1)?.max(0) as u64,
+                    })
+                },
             )
             .optional()?;
         if current.as_ref() != expected {
@@ -394,13 +476,13 @@ impl SqliteStore {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT since_ms, started_ms, cursor, done FROM model_step_walk WHERE id=1",
+                "SELECT since_ms, started_ms, build_rowid, done FROM model_step_walk WHERE id=1",
                 [],
                 |row| {
                     Ok(ModelStepWalk {
                         since_ms: row.get::<_, i64>(0)?.max(0) as u64,
                         started_ms: row.get::<_, i64>(1)?.max(0) as u64,
-                        cursor: row.get(2)?,
+                        build_rowid: row.get(2)?,
                         done: row.get(3)?,
                     })
                 },
@@ -410,47 +492,97 @@ impl SqliteStore {
 
     pub fn save_model_step_walk(&self, walk: &ModelStepWalk) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO model_step_walk (id, since_ms, started_ms, cursor, done)
+            "INSERT INTO model_step_walk (id, since_ms, started_ms, build_rowid, done)
              VALUES (1, ?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET since_ms=excluded.since_ms,
-                 started_ms=excluded.started_ms, cursor=excluded.cursor, done=excluded.done",
+                 started_ms=excluded.started_ms, build_rowid=excluded.build_rowid,
+                 done=excluded.done",
             params![
                 int(walk.since_ms)?,
                 int(walk.started_ms)?,
-                walk.cursor,
+                walk.build_rowid,
                 walk.done
             ],
         )?;
         Ok(())
     }
 
-    /// Sessions a walk visits, as `(store key, session)` sorted by key: every session with a run
-    /// whose state changed at or after `since_ms`, and every session with a run still active or
-    /// paused (one that may have committed steps just before a crash).
-    pub fn model_step_walk_sessions(
+    /// Begin a new walk's queue: forget what an earlier walk left in it.
+    pub fn clear_model_step_walk_queue(&self) -> Result<(), StoreError> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM model_step_walk_queue", [])?;
+        Ok(())
+    }
+
+    /// Add to the walk's queue every session that has a run in `run_index` rows
+    /// `(after_rowid, after_rowid + rows]` whose state changed at or after `since_ms`, or that
+    /// is still active or paused (it may have committed steps just before a crash). One short
+    /// transaction per call. Returns the rowid to continue after, or `None` when the table has
+    /// been covered.
+    pub fn fill_model_step_walk_queue(
         &self,
         since_ms: u64,
+        after_rowid: i64,
+        rows: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let through = after_rowid.saturating_add(rows);
+        conn.execute(
+            "INSERT OR IGNORE INTO model_step_walk_queue (session)
+             SELECT session FROM run_index
+              WHERE rowid > ?1 AND rowid <= ?2
+                AND (state_changed_ms >= ?3 OR state IN ('active','paused'))",
+            params![after_rowid, through, int(since_ms)?],
+        )?;
+        let max: i64 =
+            conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM run_index", [], |row| {
+                row.get(0)
+            })?;
+        Ok((through < max).then_some(through))
+    }
+
+    /// How many sessions the walk's queue still holds.
+    pub fn model_step_walk_queue_len(&self) -> Result<u64, StoreError> {
+        let count: i64 = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM model_step_walk_queue",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// The next `limit` sessions of the walk's queue, as `(queue key, session)` in key order.
+    pub fn model_step_walk_page(
+        &self,
+        limit: u64,
     ) -> Result<Vec<(String, BindIdentity)>, StoreError> {
         let encoded: Vec<String> = self
             .conn
             .lock()
             .unwrap()
-            .prepare(
-                "SELECT DISTINCT session FROM run_index
-                  WHERE state_changed_ms >= ?1 OR state IN ('active','paused')",
-            )?
-            .query_map([int(since_ms)?], |row| row.get(0))?
+            .prepare("SELECT session FROM model_step_walk_queue ORDER BY session LIMIT ?1")?
+            .query_map([int(limit)?], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
-        let mut sessions = encoded
-            .iter()
+        encoded
+            .into_iter()
             .map(|json| {
-                let session: BindIdentity = serde_json::from_str(json)?;
-                Ok((Self::key(&session), session))
+                let session: BindIdentity = serde_json::from_str(&json)?;
+                Ok((json, session))
             })
-            .collect::<Result<Vec<_>, StoreError>>()?;
-        sessions.sort_by(|left, right| left.0.cmp(&right.0));
-        sessions.dedup_by(|left, right| left.0 == right.0);
-        Ok(sessions)
+            .collect()
+    }
+
+    /// Remove visited sessions (by queue key) from the walk's queue, in one transaction.
+    pub fn model_step_walk_visited(&self, keys: &[String]) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for key in keys {
+            tx.execute("DELETE FROM model_step_walk_queue WHERE session=?1", [key])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 

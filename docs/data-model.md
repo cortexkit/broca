@@ -786,18 +786,22 @@ billing facts were lost. Steps of runs installed from another machine (`export_i
 are not written; that machine reports them.
 
 **Writer.** A background task in the daemon, never the request path. Every successful WAL
-barrier hints the session's durable head; on the next pass (every 250 ms) the task reads the WAL
-tail after the session's checkpoint in `model_step_projection` and commits the new step facts
-and the advanced checkpoint in **one** transaction (at most 128 facts each). A crash before that
-commit writes neither, so the range is derived again; a crash after it leaves the checkpoint past
-those steps, so they are never derived twice, and `fact_id` makes any re-derivation hit the
-existing row. On the first start of a build with this writer, a resumable walk derives the last
-30 days of steps from the WALs still on disk (every session with a run whose
-`run_index.state_changed_ms` is in that window, or a run still active or paused), in 100 ms slices
-between live passes, logging its progress every 30 s under target `export`. Later starts walk the
-sessions changed since the previous walk began, which covers a crash between a step becoming
-durable and its fact being written. `model_step_projection`, `export_fact_expiry` and
-`model_step_walk` are internal bookkeeping.
+barrier hints the session's durable head; on the next pass (every 250 ms) the task reads the
+records after the session's checkpoint in `model_step_projection` and commits the new step facts
+and the advanced checkpoint in **one** transaction (at most 128 facts or 8,192 records each). A
+crash before that commit writes neither, so the range is derived again; a crash after it leaves
+the checkpoint past those steps, so they are never derived twice, and `fact_id` makes any
+re-derivation hit the existing row. Records after a checkpoint are read from a WAL tail of at most
+4 MB; a session with no checkpoint (or one too far behind) is decoded from its first record one
+record at a time, so the writer's memory does not grow with a WAL's size. On the first start of a
+build with this writer, a resumable walk derives the last 30 days of steps from the WALs still on
+disk (every session with a run whose `run_index.state_changed_ms` is in that window, or a run still
+active or paused), in 100 ms slices between live passes, logging its progress every 30 s under
+target `export`. The sessions it has yet to visit are kept in `model_step_walk_queue`, filled from
+`run_index` in short transactions. Later starts walk the sessions changed since the previous walk
+began, which covers a crash between a step becoming durable and its fact being written.
+`model_step_projection`, `export_fact_expiry`, `model_step_walk` and `model_step_walk_queue` are
+internal bookkeeping.
 
 **Expiry: the boundary between billing and diagnostics.** A model step fact is deleted 30 days
 after `finished_at_ms` (or, when the WAL recorded no attempt time, after its run's

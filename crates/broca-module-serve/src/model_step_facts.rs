@@ -46,7 +46,7 @@ const EXPIRY_BATCH: u64 = 500;
 /// Most facts one sweep deletes before yielding to the rest of the loop.
 const EXPIRY_PER_SWEEP: u64 = 20 * EXPIRY_BATCH;
 
-/// Sessions a walk visits between saves of its place.
+/// Sessions a walk visits between saves of its place (removing them from its queue).
 const SAVE_PLACE_EVERY: u64 = 64;
 
 /// How often an unfinished walk logs its progress.
@@ -107,15 +107,25 @@ pub enum Visit {
     Absent,
 }
 
+fn missing(error: &broca_wal::WalError) -> bool {
+    match error {
+        broca_wal::WalError::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
 /// Project `session`'s step facts up to its durable head.
 ///
 /// `durable_head` is the head a live barrier proved durable; records after it are not read
 /// into facts. Without one (the walk), a read-side flush proves what was read durable first.
 ///
-/// A session with a checkpoint for its WAL's lineage needs only the records after it. One
-/// without needs every run that may have a step in the last 30 days, so the read reaches back
-/// to a `run_started` older than that (or the WAL's start): runs in a session are sequential,
-/// so every run with a step inside the window starts at or after that record.
+/// MEMORY IS BOUNDED WHATEVER THE WAL'S SIZE. A session whose checkpoint is near the WAL's end
+/// (every live projection, and a walk revisiting a session it already covered) reads a tail of
+/// at most [`TAIL_CAP`] bytes. Anything else (a session never projected, a replaced WAL, a
+/// checkpoint far behind) is decoded from the start ONE RECORD AT A TIME and folded as it is
+/// read, so only one record and one transaction's facts are held at once. Decoding a whole
+/// WAL at once instead held every record of the session, content included, and on production
+/// state that dominated the backfill's footprint.
 pub fn project_session(
     store: &SqliteStore,
     wal: &FileWalStore,
@@ -123,77 +133,152 @@ pub fn project_session(
     now: u64,
     durable_head: Option<u64>,
 ) -> Result<Visit, String> {
-    let missing = |error: &broca_wal::WalError| match error {
-        broca_wal::WalError::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
-        _ => false,
-    };
-    let checkpoint = store
+    if let Some(checkpoint) = store
         .model_step_checkpoint(session)
-        .map_err(|e| e.to_string())?;
-    let cutoff = now.saturating_sub(MODEL_STEP_FACT_RETENTION_MS);
-    let mut window = TAIL_WINDOW;
-    let (records, lineage) = loop {
-        let tail = match wal.read_records_tail(session, window) {
-            Ok(tail) => tail,
-            Err(error) if missing(&error) => return Ok(Visit::Absent),
-            Err(error) => return Err(error.to_string()),
-        };
-        if !tail.file_present {
-            return Ok(Visit::Absent);
-        }
-        let Some(lineage) = tail.lineage_id.map(|id| id.to_string()) else {
-            return Ok(Visit::Absent);
-        };
-        let after = checkpoint
-            .as_ref()
-            .filter(|checkpoint| checkpoint.lineage_id == lineage)
-            .map(|checkpoint| checkpoint.seq);
-        let enough = tail.from_start
-            || match after {
-                Some(after) => tail
-                    .records
-                    .first()
-                    .is_none_or(|record| record.seq <= after + 1),
-                None => tail.records.iter().any(|record| {
-                    matches!(
-                        record.record,
-                        broca_wal::WalRecord::RunStarted { ts_ms, .. }
-                            if ts_ms.is_none_or(|ts_ms| ts_ms < cutoff)
-                    )
-                }),
-            };
-        if enough {
-            let mut records = tail.records;
-            if let Some(head) = durable_head {
-                records.retain(|record| record.seq <= head);
-            }
-            break (records, lineage);
-        }
-        window = window.saturating_mul(4);
-    };
-    let unprojected = records.last().is_some_and(|last| {
-        checkpoint
-            .as_ref()
-            .is_none_or(|c| c.lineage_id != lineage || c.seq < last.seq)
-    });
-    if durable_head.is_none() && unprojected {
-        match wal.flush_for_read(session) {
-            Ok(_identity) => {}
-            // An archived WAL has no live file to flush, and its member is sealed and durable.
-            Err(error) if missing(&error) => {}
-            Err(error) => return Err(error.to_string()),
+        .map_err(|e| e.to_string())?
+    {
+        if let Some(visit) = project_tail(store, wal, session, &checkpoint, now, durable_head)? {
+            return Ok(visit);
         }
     }
-    store
-        .project_model_step_facts(session, &lineage, &records, now)
-        .map(Visit::Projected)
-        .map_err(|e| e.to_string())
+    project_stream(store, wal, session, now, durable_head)
 }
 
+/// The largest tail a projection reads at once. Records after a checkpoint that do not fit
+/// are streamed from the WAL's start instead.
+const TAIL_CAP: u64 = 4 * 1024 * 1024;
+
+/// Project the records after `checkpoint` from a bounded tail read, or `None` when they do not
+/// fit in [`TAIL_CAP`] (or the WAL is not live, or its lineage changed), leaving the session to
+/// [`project_stream`].
+fn project_tail(
+    store: &SqliteStore,
+    wal: &FileWalStore,
+    session: &BindIdentity,
+    checkpoint: &broca_store::model_step_facts::ModelStepCheckpoint,
+    now: u64,
+    durable_head: Option<u64>,
+) -> Result<Option<Visit>, String> {
+    let mut window = TAIL_WINDOW;
+    loop {
+        let range = match wal.read_live_tail_bounded(session, window) {
+            Ok(range) => range,
+            Err(error) if missing(&error) => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let records = match range.as_ref().map(|range| range.records()) {
+            Some(broca_wal::WalRangeRecords::Complete(records))
+            | Some(broca_wal::WalRangeRecords::Partial(records))
+            | Some(broca_wal::WalRangeRecords::Unknown(records)) => Some(records),
+            _ => None,
+        };
+        if let (Some(range), Some(records)) = (range.as_ref(), records) {
+            if range.lineage_id.map(|id| id.to_string()).as_deref()
+                != Some(checkpoint.lineage_id.as_str())
+            {
+                return Ok(None);
+            }
+            if records
+                .first()
+                .is_none_or(|first| first.seq <= checkpoint.seq + 1)
+            {
+                let head = records.last().map(|last| last.seq);
+                let records: Vec<_> = records
+                    .iter()
+                    .filter(|record| durable_head.is_none_or(|head| record.seq <= head))
+                    .cloned()
+                    .collect();
+                if durable_head.is_none() && head.is_some_and(|head| head > checkpoint.seq) {
+                    match wal.flush_for_read(session) {
+                        Ok(_identity) => {}
+                        Err(error) if missing(&error) => return Ok(None),
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                return store
+                    .project_model_step_facts(session, &checkpoint.lineage_id, &records, now)
+                    .map(|report| Some(Visit::Projected(report)))
+                    .map_err(|e| e.to_string());
+            }
+        }
+        if window >= TAIL_CAP {
+            return Ok(None);
+        }
+        window = window.saturating_mul(4).min(TAIL_CAP);
+    }
+}
+
+/// Stream `session`'s WAL from its first record through the store's step-fact writer.
+fn project_stream(
+    store: &SqliteStore,
+    wal: &FileWalStore,
+    session: &BindIdentity,
+    now: u64,
+    durable_head: Option<u64>,
+) -> Result<Visit, String> {
+    let mut writer = None;
+    let mut failure: Option<String> = None;
+    let mut unlabelled = false;
+    let scanned = wal.scan_durable_records(session, durable_head, |frame, lineage| {
+        // A WAL written before lineage ids existed gains its lineage frame only on its next
+        // append by a newer build, after its old records. Those records have no lineage to file
+        // facts under, so such a session yields no step facts.
+        let Some(lineage) = lineage else {
+            unlabelled = true;
+            return false;
+        };
+        if writer.is_none() {
+            match store.model_step_writer(session, &lineage.to_string(), now) {
+                Ok(created) => writer = Some(created),
+                Err(error) => {
+                    failure = Some(error.to_string());
+                    return false;
+                }
+            }
+        }
+        match writer.as_mut().map(|writer| writer.push(frame)) {
+            Some(Err(error)) => {
+                failure = Some(error.to_string());
+                false
+            }
+            _ => true,
+        }
+    });
+    match scanned {
+        Ok(None) => return Ok(Visit::Absent),
+        Ok(Some(_)) => {}
+        Err(error) if missing(&error) => return Ok(Visit::Absent),
+        Err(error) => return Err(error.to_string()),
+    }
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    match writer {
+        Some(writer) => writer
+            .finish()
+            .map(Visit::Projected)
+            .map_err(|e| e.to_string()),
+        None if unlabelled => Ok(Visit::Absent),
+        None => Ok(Visit::Projected(Default::default())),
+    }
+}
+
+/// Sessions read from the walk's on-disk queue at a time.
+const WALK_PAGE: u64 = 256;
+
+/// `run_index` rows scanned per transaction while filling the walk's queue.
+const WALK_FILL_ROWS: i64 = 20_000;
+
 /// A resumable pass over the sessions a hint may not have reached; see the module comment.
+///
+/// The sessions to visit live in the store's `model_step_walk_queue`, filled from `run_index`
+/// in bounded transactions and read a page at a time, so a walk over every session the store
+/// knows holds one page in memory rather than the whole list.
 pub struct Walk {
     state: broca_store::model_step_facts::ModelStepWalk,
-    queue: VecDeque<(String, BindIdentity)>,
+    page: VecDeque<(String, BindIdentity)>,
+    /// Visited sessions not yet removed from the queue.
+    visited_keys: Vec<String>,
     /// When this process began; a walk that started earlier is followed by one more.
     process_started_ms: u64,
     pub total: u64,
@@ -209,18 +294,33 @@ impl Walk {
     /// Resume an interrupted walk, or begin the one this start owes: the 30-day backfill on
     /// the first start with this build, otherwise one since the previous walk began.
     pub fn begin(store: &SqliteStore, now: u64) -> Result<Self, String> {
-        let state = match store.model_step_walk().map_err(|e| e.to_string())? {
-            Some(walk) if !walk.done => walk,
-            previous => broca_store::model_step_facts::ModelStepWalk {
-                since_ms: previous
+        match store.model_step_walk().map_err(|e| e.to_string())? {
+            Some(walk) if !walk.done => Self::start(store, walk, now),
+            previous => {
+                let since_ms = previous
                     .map(|walk| walk.started_ms.saturating_sub(WALK_OVERLAP_MS))
-                    .unwrap_or(0),
-                started_ms: now,
-                cursor: String::new(),
-                done: false,
-            },
+                    .unwrap_or(0);
+                Self::fresh(store, since_ms, now, now)
+            }
+        }
+    }
+
+    fn fresh(
+        store: &SqliteStore,
+        since_ms: u64,
+        started_ms: u64,
+        process_started_ms: u64,
+    ) -> Result<Self, String> {
+        store
+            .clear_model_step_walk_queue()
+            .map_err(|e| e.to_string())?;
+        let state = broca_store::model_step_facts::ModelStepWalk {
+            since_ms,
+            started_ms,
+            build_rowid: Some(0),
+            done: false,
         };
-        Self::start(store, state, now)
+        Self::start(store, state, process_started_ms)
     }
 
     fn start(
@@ -235,23 +335,26 @@ impl Walk {
         store
             .save_model_step_walk(&state)
             .map_err(|e| e.to_string())?;
-        let queue: VecDeque<_> = store
-            .model_step_walk_sessions(state.since_ms)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|(key, _)| key.as_str() > state.cursor.as_str())
-            .collect();
         tracing::info!(
             target: "export",
-            sessions = queue.len(),
             since_ms = state.since_ms,
-            resumed = !state.cursor.is_empty(),
+            resumed = state.started_ms < process_started_ms,
             "model step fact walk started"
         );
+        // A resumed walk whose queue is complete knows its size now; otherwise it is known once
+        // the queue is filled.
+        let total = if state.build_rowid.is_none() {
+            store
+                .model_step_walk_queue_len()
+                .map_err(|e| e.to_string())?
+        } else {
+            0
+        };
         Ok(Self {
-            total: queue.len() as u64,
+            total,
             state,
-            queue,
+            page: VecDeque::new(),
+            visited_keys: Vec::new(),
             process_started_ms,
             visited: 0,
             written: 0,
@@ -263,11 +366,24 @@ impl Walk {
     }
 
     pub fn is_done(&self) -> bool {
-        self.queue.is_empty() && self.state.done
+        self.state.done
     }
 
-    /// Visit sessions until `budget` has passed, at least one per call. Returns whether the
-    /// walk (and any follow-up walk it owes) is finished.
+    /// Remove the sessions visited so far from the queue and record the walk's state.
+    /// Re-visiting a session after a crash writes nothing new, so this runs every few
+    /// sessions and whenever a slice yields rather than after each one.
+    fn save(&mut self, store: &SqliteStore) {
+        let visited = std::mem::take(&mut self.visited_keys);
+        let saved = store
+            .model_step_walk_visited(&visited)
+            .and_then(|()| store.save_model_step_walk(&self.state));
+        if let Err(error) = saved {
+            tracing::warn!(target: "export", %error, "could not record the model step fact walk's place");
+        }
+    }
+
+    /// Fill the queue or visit sessions until `budget` has passed, at least one step per call.
+    /// Returns whether the walk (and any follow-up walk it owes) is finished.
     pub fn slice(
         &mut self,
         store: &SqliteStore,
@@ -276,64 +392,83 @@ impl Walk {
         now: u64,
     ) -> bool {
         let started = Instant::now();
-        while let Some((key, session)) = self.queue.pop_front() {
-            match project_session(store, wal, &session, now, None) {
-                Ok(Visit::Projected(report)) => {
-                    self.written += report.written;
-                    self.expired += report.expired;
-                }
-                Ok(Visit::Absent) => {}
-                Err(error) => {
-                    self.failed += 1;
-                    tracing::warn!(target: "export", %error, "model step fact walk could not project a session; a later walk retries it");
-                }
+        loop {
+            if self.state.done {
+                return true;
             }
-            self.visited += 1;
-            self.state.cursor = key;
-            let out_of_time = started.elapsed() >= budget;
-            // The place is saved every few sessions and whenever the slice yields, not after
-            // each one: re-visiting a few sessions after a crash writes nothing new, while a
-            // write per session was one store transaction per session on a large backfill.
-            if out_of_time || self.visited.is_multiple_of(SAVE_PLACE_EVERY) {
-                if let Err(error) = store.save_model_step_walk(&self.state) {
-                    tracing::warn!(target: "export", %error, "could not record the model step fact walk's place");
+            if let Some(after) = self.state.build_rowid {
+                match store.fill_model_step_walk_queue(self.state.since_ms, after, WALK_FILL_ROWS) {
+                    Ok(next) => {
+                        self.state.build_rowid = next;
+                        if next.is_none() {
+                            self.total = store.model_step_walk_queue_len().unwrap_or(0);
+                            self.log("model step fact walk queued its sessions");
+                        }
+                        self.save(store);
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "export", %error, "could not fill the model step fact walk's queue; retrying");
+                        return false;
+                    }
+                }
+            } else if let Some((key, session)) = self.page.pop_front() {
+                match project_session(store, wal, &session, now, None) {
+                    Ok(Visit::Projected(report)) => {
+                        self.written += report.written;
+                        self.expired += report.expired;
+                    }
+                    Ok(Visit::Absent) => {}
+                    Err(error) => {
+                        self.failed += 1;
+                        tracing::warn!(target: "export", %error, "model step fact walk could not project a session; a later walk retries it");
+                    }
+                }
+                self.visited += 1;
+                self.visited_keys.push(key);
+                if self.visited.is_multiple_of(SAVE_PLACE_EVERY) {
+                    self.save(store);
+                }
+            } else {
+                // The page is used up: drop its sessions from the queue, then read the next.
+                self.save(store);
+                match store.model_step_walk_page(WALK_PAGE) {
+                    Ok(page) if page.is_empty() => {
+                        self.finish(store, now);
+                        return self.state.done;
+                    }
+                    Ok(page) => self.page = page.into(),
+                    Err(error) => {
+                        tracing::warn!(target: "export", %error, "could not read the model step fact walk's queue; retrying");
+                        return false;
+                    }
                 }
             }
             if self.logged.elapsed() >= PROGRESS_EVERY {
                 self.logged = Instant::now();
                 self.log("model step fact walk in progress");
             }
-            if out_of_time {
+            if started.elapsed() >= budget {
+                self.save(store);
                 return false;
             }
         }
-        if !self.state.done {
-            self.state.done = true;
-            if let Err(error) = store.save_model_step_walk(&self.state) {
-                tracing::warn!(target: "export", %error, "could not record that the model step fact walk finished");
-            }
-            self.log("model step fact walk finished");
-            // A walk resumed from an earlier process did not see sessions that changed before
-            // its cursor while it was interrupted; one more walk since its start covers them.
-            if self.state.started_ms < self.process_started_ms {
-                let next = broca_store::model_step_facts::ModelStepWalk {
-                    since_ms: self.state.started_ms.saturating_sub(WALK_OVERLAP_MS),
-                    started_ms: now,
-                    cursor: String::new(),
-                    done: false,
-                };
-                match Self::start(store, next, self.process_started_ms) {
-                    Ok(next) => {
-                        *self = next;
-                        return false;
-                    }
-                    Err(error) => {
-                        tracing::warn!(target: "export", %error, "could not begin the follow-up model step fact walk")
-                    }
+    }
+
+    fn finish(&mut self, store: &SqliteStore, now: u64) {
+        self.state.done = true;
+        self.save(store);
+        self.log("model step fact walk finished");
+        // A walk resumed from an earlier process did not see sessions whose runs changed after
+        // its queue was filled; one more walk since that walk began covers them.
+        if self.state.started_ms < self.process_started_ms {
+            let since_ms = self.state.started_ms.saturating_sub(WALK_OVERLAP_MS);
+            match Self::fresh(store, since_ms, now, self.process_started_ms) {
+                Ok(next) => *self = next,
+                Err(error) => {
+                    tracing::warn!(target: "export", %error, "could not begin the follow-up model step fact walk")
                 }
             }
         }
-        true
     }
 
     fn log(&self, message: &'static str) {

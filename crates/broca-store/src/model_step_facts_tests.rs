@@ -587,16 +587,23 @@ fn a_run_missing_its_session_facts_is_still_caught_up_when_it_has_step_facts() {
 }
 
 #[test]
-fn the_walk_lists_recent_and_live_sessions_once_each_and_keeps_its_place() {
+fn the_walk_queue_lists_recent_and_live_sessions_once_each_in_bounded_fills() {
     let store = SqliteStore::open_in_memory().unwrap();
     let other = BindIdentity::new("/tmp/other", "runner", "session");
-    for (run_id, session) in [("a", session()), ("b", session()), ("c", other.clone())] {
+    let old = BindIdentity::new("/tmp/old", "runner", "session");
+    let runs = [
+        ("a", session(), RunIndexState::Active),
+        ("b", session(), RunIndexState::Active),
+        ("c", other.clone(), RunIndexState::Active),
+        ("d", old.clone(), RunIndexState::Completed),
+    ];
+    for (run_id, session, _) in &runs {
         store
             .index_run_active(&RunIndexRow {
                 withdrawals_owed: false,
                 title: None,
-                run_id: run_id.into(),
-                session,
+                run_id: (*run_id).into(),
+                session: session.clone(),
                 submission_id: None,
                 request_identity_digest: None,
                 state: RunIndexState::Active,
@@ -606,22 +613,42 @@ fn the_walk_lists_recent_and_live_sessions_once_each_and_keeps_its_place() {
             })
             .unwrap();
     }
-    let listed = store.model_step_walk_sessions(u64::MAX / 4).unwrap();
-    let mut expected = vec![
-        (SqliteStore::model_step_session_key(&session()), session()),
-        (SqliteStore::model_step_session_key(&other), other),
-    ];
-    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    store
+        .index_run_terminal("d", RunIndexState::Completed, None, None, 0)
+        .unwrap();
+    // A finished run whose state changed before `since` is not listed; active runs are listed
+    // whatever their age. One row per fill: four fills cover the table.
+    let since = u64::MAX / 4;
+    let mut after = 0;
+    let mut fills = 0;
+    while let Some(next) = store.fill_model_step_walk_queue(since, after, 1).unwrap() {
+        after = next;
+        fills += 1;
+    }
+    assert_eq!(fills, 3);
+    assert_eq!(store.model_step_walk_queue_len().unwrap(), 2);
+    let page = store.model_step_walk_page(10).unwrap();
+    let mut expected = vec![session(), other];
+    expected.sort_by_key(|session| serde_json::to_string(session).unwrap());
     assert_eq!(
-        listed, expected,
-        "active runs are listed whatever their age"
+        page.iter()
+            .map(|(_, session)| session.clone())
+            .collect::<Vec<_>>(),
+        expected
     );
+    // Filling again adds nothing twice; visiting removes a session.
+    store.fill_model_step_walk_queue(since, 0, 100).unwrap();
+    assert_eq!(store.model_step_walk_queue_len().unwrap(), 2);
+    store.model_step_walk_visited(&[page[0].0.clone()]).unwrap();
+    assert_eq!(store.model_step_walk_page(10).unwrap(), page[1..]);
+    store.clear_model_step_walk_queue().unwrap();
+    assert_eq!(store.model_step_walk_queue_len().unwrap(), 0);
 
     assert_eq!(store.model_step_walk().unwrap(), None);
     let walk = ModelStepWalk {
         since_ms: 1,
         started_ms: 2,
-        cursor: "k".into(),
+        build_rowid: Some(7),
         done: false,
     };
     store.save_model_step_walk(&walk).unwrap();
