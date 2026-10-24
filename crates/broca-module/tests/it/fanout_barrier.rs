@@ -615,10 +615,21 @@ async fn live_attach_skips_idle_history_and_receives_the_next_run() {
         .await
         .expect("live attach succeeds");
     assert!(
+        matches!(
+            broca_test_support::event_timeout(
+                "live_attach_skips_idle_history_and_receives_the_next_run",
+                rx.recv(),
+                || "waiting for the initial display reset".into(),
+            ).await.expect("initial display reset arrives"),
+            Some(Delivery::Display(event)) if matches!(*event, broca_protocol::DisplayEvent::DisplayReset)
+        ),
+        "live attach first resets advisory display state"
+    );
+    assert!(
         tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
             .await
             .is_err(),
-        "live attach remains quiet instead of replaying the completed history"
+        "after its display reset, live attach remains quiet instead of replaying completed history"
     );
 
     registry

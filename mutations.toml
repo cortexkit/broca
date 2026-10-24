@@ -26543,3 +26543,73 @@ expect_red = ["llm_runner_role::live_attach_after_cancel_discards_the_uncommitte
 file = "crates/broca-module/src/display_replay.rs"
 old = "        *self.state.lock().unwrap() = State::default();"
 new = "        let _ = &self.state; // NON-VACUITY BREAK: keep ended-step replay state alive."
+
+[[control]]
+id = "live-display-context-direct-consumer-flow"
+guards = "Direct loop consumers retain their bounded lifecycle-output flow before the model allocation seam"
+runner = "cargo"
+package = "broca-core"
+target = "--test input_allocation"
+select = "expected"
+test_file = "crates/broca-core/tests/input_allocation.rs"
+expect_red = ["terminal_no_tool_step_does_not_retain_a_second_assistant_message_copy"]
+file = "crates/broca-core/src/run.rs"
+old = "        if control.emit_display_context {"
+new = "        if true { // NON-VACUITY BREAK: send actor metadata to an unprepared bounded direct consumer."
+
+[[control]]
+id = "live-display-context-before-late-subscribe"
+guards = "The actor captures step display coordinates even when no subscriber exists when the step starts"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::late_subscriber_gets_context_captured_before_the_step_streamed"]
+file = "crates/broca-module/src/actor.rs"
+old = "            emit_display_context: true,"
+new = "            emit_display_context: self.fanout.has_live_subscribers(), // NON-VACUITY BREAK: lose context before a late attach."
+
+[[control]]
+id = "live-display-attach-barrier-before-provider-release"
+guards = "Display-sensitive tests wait for the display reset barrier rather than releasing the provider on a control replay frame"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/delivery_rig/mod.rs"
+expect_red = ["delivery_rig::subscription_tests::display_barrier_keeps_control_prefix_and_releases_only_on_display_reset"]
+file = "crates/broca-module-serve/tests/delivery_rig/mod.rs"
+old = "next.header.ty != FrameType::StreamData || attach_condition(&next);"
+new = "next.header.ty != FrameType::StreamData || true || attach_condition(&next); // NON-VACUITY BREAK: release before the display receiver is ready."
+
+[[control]]
+id = "live-hook-reset-view-excludes-only-attach"
+platforms = ["linux", "macos"]
+guards = "Hook display assertions remove only the initial display reset and do not misclassify control metadata as hook resets"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/step_transforms.rs"
+expect_red = ["step_transforms::attach_reset_is_separate_from_hook_reset_and_control_metadata"]
+file = "crates/broca-module-serve/tests/it/step_transforms.rs"
+old = ".filter(|body: &Value| body[\"kind\"] == \"display\")"
+new = ".filter(|body: &Value| body.to_string().contains(\"display\")) // NON-VACUITY BREAK: confuse control reset metadata with the display lane."
+
+[[control]]
+id = "synthetic-capture-checks-new-display-coordinates"
+guards = "Legacy capture payload comparison cannot hide a wrong new display part coordinate"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/synthetic_capture_replay.rs"
+expect_red = ["synthetic_capture_replay::anthropic_signed_thinking"]
+file = "crates/broca-provider/src/normalize.rs"
+old = '''                            part: Some(part),
+                            message_id: mid,
+                            tool_call_id: None,'''
+new = '''                            part: Some(part + 1), // NON-VACUITY BREAK: corrupt only the new display coordinate.
+                            message_id: mid,
+                            tool_call_id: None,'''

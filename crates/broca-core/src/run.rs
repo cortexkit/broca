@@ -540,6 +540,9 @@ pub struct RunControl {
     /// may disable this to avoid cloning payloads into an output channel that discards them.
     /// Lifecycle, pause, and error controls are never suppressed by this setting.
     pub emit_control_payloads: bool,
+    /// Emit queue-ordered step positions for an actor's display drain. This is opt-in so
+    /// direct loop consumers keep their existing bounded lifecycle-output flow.
+    pub emit_display_context: bool,
     /// Pause the run for re-authentication IMMEDIATELY after admission, before any provider
     /// call. Set when the caller already knows — authoritatively, before the loop — that the
     /// credential needs re-auth (e.g. the credential vault returned `needs_reauth`: the
@@ -685,6 +688,7 @@ impl Default for RunControl {
             test_compaction: None,
             provider_call_timeout: None,
             emit_control_payloads: true,
+            emit_display_context: false,
             pause_for_auth_at_start: None,
             auth_selection: None,
             admitted_context_limit: None,
@@ -4420,13 +4424,15 @@ where
                 Vec::new()
             }
         };
-        let _ = send(
-            out,
-            OutputEvent::DisplayContext {
-                ordinal: writer.display_ordinal(),
-            },
-        )
-        .await;
+        if control.emit_display_context {
+            let _ = send(
+                out,
+                OutputEvent::DisplayContext {
+                    ordinal: writer.display_ordinal(),
+                },
+            )
+            .await;
+        }
         steer_backlog.append(&mut steered);
         if !steer_backlog.is_empty() {
             mutable_call_options(&mut opts)

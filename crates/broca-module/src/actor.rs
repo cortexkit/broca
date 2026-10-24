@@ -4264,6 +4264,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         );
         let step_progress = Arc::new(std::sync::Mutex::new(None));
         let control = RunControl {
+            emit_display_context: true,
             step_progress: Some(Arc::clone(&step_progress)),
             clock: self
                 .registry

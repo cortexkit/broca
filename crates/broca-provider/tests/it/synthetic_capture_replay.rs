@@ -1,13 +1,89 @@
 //! Offline snapshots for every non-empty live-harness artifact. The bytes and expected events
 //! are synthetic, but retain the family event order, chunking and usage-field presence.
 
-use broca_protocol::StepId;
+use broca_protocol::{ContentBlock, DisplayEvent, NormalizedEvent, ProviderControl, StepId};
 use broca_provider::families::{
     anthropic_frozen_config, gemini_frozen_config, openai_chat_frozen_config,
     openai_responses_frozen_config, AnthropicMessages, Gemini, OpenAiChat, OpenAiResponses,
 };
 use broca_provider::wire::WireFamily;
 use serde_json::Value;
+
+// Capture snapshots predate transcript coordinates. Keep every historical payload field
+// pinned, and check the new coordinates separately against the assembled stored message.
+fn captured_event(event: &NormalizedEvent) -> String {
+    match event {
+        NormalizedEvent::Display(DisplayEvent::TextDelta { message_id, tool_call_id, delta, .. }) =>
+            format!("Display(TextDelta {{ message_id: {message_id:?}, tool_call_id: {tool_call_id:?}, delta: {delta:?} }})"),
+        NormalizedEvent::Display(DisplayEvent::ReasoningDelta { message_id, delta, .. }) =>
+            format!("Display(ReasoningDelta {{ message_id: {message_id:?}, delta: {delta:?} }})"),
+        NormalizedEvent::Display(DisplayEvent::ToolInputDelta { tool_call_id, delta, .. }) =>
+            format!("Display(ToolInputDelta {{ tool_call_id: {tool_call_id:?}, delta: {delta:?} }})"),
+        _ => format!("{event:?}"),
+    }
+}
+
+fn check_display_coordinates(events: &[NormalizedEvent], capture: &str) {
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .expect("completed capture step has an assembled message");
+    for event in events {
+        let NormalizedEvent::Display(display) = event else {
+            continue;
+        };
+        if display.delta().is_none() {
+            continue;
+        }
+        let (mid, part) = display
+            .coordinates()
+            .expect("every normalized delta has a stored part");
+        assert!(
+            mid.is_none(),
+            "{capture}: only the actor attaches transcript mids"
+        );
+        let block = message
+            .content
+            .get(part as usize)
+            .expect("delta addresses a stored block");
+        match (display, block) {
+            (
+                DisplayEvent::TextDelta {
+                    message_id, delta, ..
+                },
+                ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. },
+            )
+            | (
+                DisplayEvent::ReasoningDelta {
+                    message_id, delta, ..
+                },
+                ContentBlock::Reasoning { text, .. },
+            ) => {
+                assert_eq!(
+                    message_id, &message.message_id,
+                    "{capture}: provider identity"
+                );
+                assert!(
+                    text.contains(delta),
+                    "{capture}: delta belongs to its stored part"
+                );
+            }
+            (DisplayEvent::ReasoningDelta { .. }, ContentBlock::RedactedReasoning { .. }) => {}
+            (DisplayEvent::ToolInputDelta { tool_call_id, .. }, ContentBlock::ToolCall(call)) => {
+                assert_eq!(
+                    tool_call_id, &call.tool_call_id,
+                    "{capture}: tool part identity"
+                )
+            }
+            pair => panic!("{capture}: delta addresses the wrong stored block: {pair:?}"),
+        }
+    }
+}
 
 fn replay(relative: &str) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -61,10 +137,12 @@ fn replay(relative: &str) {
         });
         if terminal {
             let mut normalizer = family.normalizer(&frozen, StepId(step_id));
+            let start = actual.len();
             for chunk in step.as_bytes().chunks(61) {
                 actual.extend(normalizer.push(chunk).expect("synthetic stream normalizes"));
             }
             actual.extend(normalizer.finish().expect("synthetic stream ends cleanly"));
+            check_display_coordinates(&actual[start..], relative);
             step.clear();
             step_id += 1;
         }
@@ -74,7 +152,7 @@ fn replay(relative: &str) {
         "{relative}: complete response bodies"
     );
     assert!(step_id > 1, "{relative}: at least one completed step");
-    let actual: Vec<String> = actual.iter().map(|event| format!("{event:?}")).collect();
+    let actual: Vec<String> = actual.iter().map(captured_event).collect();
     if std::env::var_os("BROCA_UPDATE_SYNTHETIC_CAPTURE_EVENTS").is_some() {
         capture["normalized_events"] = serde_json::to_value(&actual).unwrap();
         std::fs::write(

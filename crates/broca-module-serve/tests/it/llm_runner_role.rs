@@ -2291,3 +2291,33 @@ async fn live_attach_after_cancel_discards_the_uncommitted_step() {
     assert_eq!(values[0]["event"]["type"], "display_reset");
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn late_subscriber_gets_context_captured_before_the_step_streamed() {
+    let mut rig = Rig::start("display-context-late-attach").await;
+    rig.script.push(&[Step::Stream(vec![ContentBlock::Text {
+        text: "before attach".into(),
+    }])]);
+    rig.script.hold_stream(true);
+    rig.send("late", "task", None).await;
+    rig.wait_entered().await;
+    assert_eq!(
+        rig.script.prompts.lock().unwrap().len(),
+        1,
+        "the provider ran before any subscribe call"
+    );
+    let frames = rig.subscribe_release_after_part(20, 0).await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let delta = frames
+        .iter()
+        .map(|f| serde_json::from_slice::<serde_json::Value>(&f.body).unwrap())
+        .find(|v| v["event"]["type"] == "text_delta")
+        .expect("late attach replays the streamed part");
+    assert_eq!(delta["event"]["mid"], "m1");
+    assert_eq!(delta["event"]["part"], "0");
+    assert_eq!(delta["event"]["delta"], "before attach");
+    let page = read(&mut rig, serde_json::json!({})).await;
+    assert_eq!(delta["event"]["mid"], page.messages.last().unwrap().mid);
+    rig.finish().await;
+}

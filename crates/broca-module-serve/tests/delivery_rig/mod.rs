@@ -733,17 +733,16 @@ impl Rig {
         params: serde_json::Value,
         quiet: Duration,
     ) -> Vec<Frame> {
-        self.subscribe_collect_inner(channel, params, quiet, None::<fn()>)
+        self.subscribe_collect_inner(channel, params, quiet, None::<fn()>, |_| true)
             .await
     }
 
     /// `subscribe_collect`, calling `on_attach` once the subscription's first frame arrives.
     /// Subscribed with `{"from": "start"}`, the control lane replays the lineage's durable
-    /// records at attach, so for a run that has started, that first frame proves the subscriber
-    /// is attached. A live subscription (`{}`) sends nothing until something new happens, so its
-    /// first frame may only be the advisory display reset, rather than durable replay. Tests
-    /// that require a particular part use `subscribe_release_after_part` instead of treating
-    /// a control replay as evidence that a display snapshot already crossed serve.
+    /// records at attach, so its first control frame proves control replay has started, not
+    /// that the later display snapshot has crossed serve. Display-sensitive callers use
+    /// `subscribe_collect_after_display_reset` or `subscribe_release_after_part`. A live
+    /// subscription (`{}`) receives its initial display reset even when the session is idle.
     /// Attachment uses the shared hang guard; `quiet` applies only after replay arrives.
     pub async fn subscribe_collect_after_attach(
         &mut self,
@@ -752,8 +751,26 @@ impl Rig {
         quiet: Duration,
         on_attach: impl FnOnce(),
     ) -> Vec<Frame> {
-        self.subscribe_collect_inner(channel, params, quiet, Some(on_attach))
+        self.subscribe_collect_inner(channel, params, quiet, Some(on_attach), |_| true)
             .await
+    }
+
+    /// Wait for the display snapshot barrier, not merely a control replay frame, before
+    /// releasing a provider. Subsequent original deltas and hook resets cannot be lost
+    /// before the display receiver exists.
+    pub async fn subscribe_collect_after_display_reset(
+        &mut self,
+        channel: u16,
+        params: serde_json::Value,
+        quiet: Duration,
+        on_attach: impl FnOnce(),
+    ) -> Vec<Frame> {
+        self.subscribe_collect_inner(channel, params, quiet, Some(on_attach), |frame| {
+            serde_json::from_slice::<serde_json::Value>(&frame.body).is_ok_and(|body| {
+                body["kind"] == "display" && body["event"]["type"] == "display_reset"
+            })
+        })
+        .await
     }
 
     async fn subscribe_collect_inner(
@@ -762,6 +779,7 @@ impl Rig {
         params: serde_json::Value,
         quiet: Duration,
         on_attach: Option<impl FnOnce()>,
+        attach_condition: fn(&Frame) -> bool,
     ) -> Vec<Frame> {
         self.bind(channel).await;
         self.corr += 1;
@@ -779,7 +797,8 @@ impl Rig {
         )
         .unwrap();
         write_frame(&mut self.writer, &frame).await.unwrap();
-        collect_subscription_frames(&mut self.reader, corr, quiet, on_attach).await
+        collect_subscription_frames_at(&mut self.reader, corr, quiet, on_attach, attach_condition)
+            .await
     }
 
     /// Release a held provider only after the requested display part actually crossed serve.
@@ -1249,19 +1268,35 @@ async fn collect_subscription_frames(
     quiet: Duration,
     on_attach: Option<impl FnOnce()>,
 ) -> Vec<Frame> {
+    collect_subscription_frames_at(reader, corr, quiet, on_attach, |_| true).await
+}
+
+async fn collect_subscription_frames_at(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    corr: u64,
+    quiet: Duration,
+    on_attach: Option<impl FnOnce()>,
+    attach_condition: impl Fn(&Frame) -> bool,
+) -> Vec<Frame> {
     let mut frames = Vec::new();
     if let Some(attached) = on_attach {
         // A slow first replay is not a quiet subscription: the caller may still hold the model.
         let first = broca_test_support::wait_for(
             "subscription attachment replay",
             async {
+                let mut prefix = Vec::new();
                 loop {
                     let next = read_frame(reader)
                         .await
                         .unwrap()
                         .expect("subscription stays open");
                     if next.header.corr == corr {
-                        return next;
+                        let attached =
+                            next.header.ty != FrameType::StreamData || attach_condition(&next);
+                        prefix.push(next);
+                        if attached {
+                            return prefix;
+                        }
                     }
                 }
             },
@@ -1269,11 +1304,11 @@ async fn collect_subscription_frames(
         )
         .await;
         assert_eq!(
-            first.header.ty,
+            first.last().unwrap().header.ty,
             FrameType::StreamData,
             "subscription did not attach: {first:?}"
         );
-        frames.push(first);
+        frames.extend(first);
         attached();
     }
     while let Ok(next) = tokio::time::timeout(quiet, read_frame(reader)).await {
@@ -1344,6 +1379,63 @@ mod subscription_tests {
             .find_map(|line| line.split_once("RIG_DIR=").map(|(_, dir)| dir.trim()))
             .unwrap_or_else(|| panic!("child printed no RIG_DIR= line: {stdout}"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn display_barrier_keeps_control_prefix_and_releases_only_on_display_reset() {
+        let script = Arc::new(Script::default());
+        script.hold_model(true);
+        let held = script.clone();
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        let quiet = Duration::from_millis(500);
+        let collect = collect_subscription_frames_at(
+            &mut reader,
+            9,
+            quiet,
+            Some(move || held.hold_model(false)),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body).is_ok_and(|body| {
+                    body["kind"] == "display" && body["event"]["type"] == "display_reset"
+                })
+            },
+        );
+        tokio::pin!(collect);
+        let control = Frame::build(
+            FrameType::StreamData,
+            Flags::new(false, Priority::Interactive, false),
+            8,
+            8,
+            9,
+            br#"{"kind":"control","event":{"type":"display_reset"}}"#.to_vec(),
+        )
+        .unwrap();
+        write_frame(&mut writer, &control).await.unwrap();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(collect.as_mut().poll(cx).is_pending())).await
+        );
+        assert!(
+            *script.hold_model.lock().unwrap(),
+            "control replay is not the display barrier"
+        );
+        let reset = Frame::build(
+            FrameType::StreamData,
+            Flags::new(false, Priority::Background, false),
+            8,
+            8,
+            9,
+            br#"{"kind":"display","event":{"type":"display_reset"}}"#.to_vec(),
+        )
+        .unwrap();
+        write_frame(&mut writer, &reset).await.unwrap();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(collect.as_mut().poll(cx).is_pending())).await
+        );
+        assert!(!*script.hold_model.lock().unwrap());
+        tokio::time::advance(quiet).await;
+        let frames = collect.await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].body, control.body);
+        assert_eq!(frames[1].body, reset.body);
     }
 
     #[tokio::test(start_paused = true)]
