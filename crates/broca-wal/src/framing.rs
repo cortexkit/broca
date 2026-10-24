@@ -621,14 +621,6 @@ pub const LINEAGE_FRAME_LEN: usize = HEADER_LEN + LINEAGE_PAYLOAD_LEN as usize;
 /// legacy-mint path that needs it: `file_wal.rs` calls it unconditionally and only afterwards
 /// decides whether the bytes are used. A heap allocation per WAL append is pure waste for a
 /// frame whose length is known at compile time.
-/// The exact lineage frame a writer puts first in a fresh WAL whose lineage id has these bytes.
-/// Test builds only: a golden fixture needs a WAL whose lineage id does not change from run to
-/// run, and the writer always mints a random one.
-#[cfg(any(test, feature = "test-known-feature"))]
-pub fn lineage_frame_for_test(bytes: [u8; 16]) -> [u8; LINEAGE_FRAME_LEN] {
-    encode_lineage(WalLineageId::from_bytes(bytes))
-}
-
 pub(crate) fn encode_lineage(lineage_id: WalLineageId) -> [u8; LINEAGE_FRAME_LEN] {
     let payload = lineage_id.as_bytes();
     let digest = compute_digest(LINEAGE_FRAMING_VERSION, 0, 0, &payload);

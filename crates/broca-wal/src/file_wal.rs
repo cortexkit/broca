@@ -1119,49 +1119,9 @@ fn read_up_to(file: &mut impl Read, bytes: &mut [u8]) -> Result<usize, WalError>
 /// Strictly decode one body at a time, retaining only the caller's selected value.
 /// Recovery needs the verified end and sequence, not all historical message bodies.
 fn scan_prefix<T>(
-    file: impl Read,
-    max_bytes: u64,
-    mut found: impl FnMut(&FramedRecord) -> Option<T>,
-) -> Result<PrefixScan<T>, WalError> {
-    scan_prefix_with_lineage(file, max_bytes, |framed, _| found(framed))
-}
-
-/// What [`scan_records`] read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WalScan {
-    /// The lineage identity the scanned bytes carry, if they carry one.
-    pub lineage_id: Option<WalLineageId>,
-    /// The last record decoded, whether or not the scan stopped early.
-    pub last_seq: Option<u64>,
-}
-
-/// Decode a WAL from its first byte ONE RECORD AT A TIME, handing each record to `visit` with the
-/// lineage identity seen so far, and keeping none of them. `visit` returns `false` to stop.
-///
-/// Memory stays at one decoded record whatever the WAL's size, which is what a reader that only
-/// folds records (rather than replaying a transcript) needs. Validation is the same strict
-/// decoding as recovery: a torn tail ends the scan, and corruption before it is an error. A
-/// reader limited with `Read::take` sees a frame cut at the limit as a torn tail.
-pub fn scan_records(
-    reader: impl Read,
-    max_bytes: u64,
-    mut visit: impl FnMut(&FramedRecord, Option<WalLineageId>) -> bool,
-) -> Result<WalScan, WalError> {
-    let scan = scan_prefix_with_lineage(
-        std::io::BufReader::new(reader),
-        max_bytes,
-        |framed, lineage| (!visit(framed, lineage)).then_some(()),
-    )?;
-    Ok(WalScan {
-        lineage_id: scan.lineage_id,
-        last_seq: scan.last_seq,
-    })
-}
-
-fn scan_prefix_with_lineage<T>(
     mut file: impl Read,
     max_bytes: u64,
-    mut found: impl FnMut(&FramedRecord, Option<WalLineageId>) -> Option<T>,
+    mut found: impl FnMut(&FramedRecord) -> Option<T>,
 ) -> Result<PrefixScan<T>, WalError> {
     let mut scan = PrefixScan {
         found: None,
@@ -1200,7 +1160,7 @@ fn scan_prefix_with_lineage<T>(
                 validate_contiguous_sequence(scan.last_seq, 1, framed.seq)?;
                 scan.last_seq = Some(framed.seq);
                 scan.valid_end += consumed as u64;
-                if let Some(value) = found(&framed, scan.lineage_id) {
+                if let Some(value) = found(&framed) {
                     scan.found = Some(value);
                     return Ok(scan);
                 }
@@ -2920,69 +2880,6 @@ mod tests {
         let whole = read_records_tail(&path, DEFAULT_MAX_READ_BYTES, size).unwrap();
         assert!(whole.from_start);
         assert_eq!(whole.records.len(), 2000);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn scan_records_visits_each_record_once_with_its_lineage_and_stops_or_ends_cleanly() {
-        let path = tmp("scan-records");
-        let _ = std::fs::remove_file(&path);
-        let mut wal = FileWal::open(&path).unwrap();
-        for step in 1..=50 {
-            wal.append(
-                1,
-                &WalRecord::StepStarted {
-                    step_id: StepId(step),
-                },
-                false,
-            )
-            .unwrap();
-        }
-        wal.sync().unwrap();
-        let lineage = wal.lineage_id.expect("fresh WAL has a lineage");
-        drop(wal);
-
-        let mut seen = Vec::new();
-        let scan = scan_records(
-            File::open(&path).unwrap(),
-            DEFAULT_MAX_READ_BYTES,
-            |frame, id| {
-                assert_eq!(id, Some(lineage), "the lineage frame precedes every record");
-                seen.push(frame.seq);
-                true
-            },
-        )
-        .unwrap();
-        assert_eq!(seen, (1..=50).collect::<Vec<_>>());
-        assert_eq!((scan.lineage_id, scan.last_seq), (Some(lineage), Some(50)));
-
-        let mut stopped = 0;
-        let scan = scan_records(
-            File::open(&path).unwrap(),
-            DEFAULT_MAX_READ_BYTES,
-            |frame, _| {
-                stopped = frame.seq;
-                frame.seq < 7
-            },
-        )
-        .unwrap();
-        assert_eq!((stopped, scan.last_seq), (7, Some(7)));
-
-        // A limit that cuts the last record's frame reads as a torn tail, not an error. Every
-        // append ends with a lineage frame, so the cut goes past that one into the record.
-        let size = std::fs::metadata(&path).unwrap().len();
-        let cut = size - crate::framing::LINEAGE_FRAME_LEN as u64 - 3;
-        let mut count = 0;
-        let scan = scan_records(
-            File::open(&path).unwrap().take(cut),
-            DEFAULT_MAX_READ_BYTES,
-            |_, _| {
-                count += 1;
-                true
-            },
-        )
-        .unwrap();
-        assert_eq!((count, scan.last_seq), (49, Some(49)));
         let _ = std::fs::remove_file(&path);
     }
 

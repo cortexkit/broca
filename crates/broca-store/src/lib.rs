@@ -41,7 +41,6 @@ pub mod compaction_receipts;
 pub mod export_index;
 mod fold_identities;
 pub mod late_results_store;
-pub mod model_step_facts;
 pub mod retention;
 pub mod retention_withdrawals;
 pub mod session_refs;
@@ -1228,7 +1227,6 @@ impl SqliteStore {
         compaction_receipts::init_schema(conn)?;
         compaction_facts::init_schema(conn)?;
         let source = export_index::init_schema(conn).map_err(StoreError::from)?;
-        model_step_facts::init_schema(conn)?;
         if from_version < STORE_SCHEMA_VERSION {
             // `user_version` provides one global checkpoint for this idempotent schema path.
             // New databases get the marker without being reported as an upgrade.

@@ -1269,69 +1269,6 @@ impl FileWalStore {
         )
     }
 
-    /// The newest records of a session's LIVE WAL from at most its last `tail_bytes`, or `None`
-    /// when there is no live file or no frame boundary inside the window (a single frame larger
-    /// than it). Unlike [`Self::read_records_tail`] this never falls back to decoding the whole
-    /// file, so its memory is bounded by the window. An archived lineage answers `None`.
-    pub fn read_live_tail_bounded(
-        &self,
-        session: &BindIdentity,
-        tail_bytes: u64,
-    ) -> Result<Option<WalRangeRead>, WalError> {
-        let address = session_addr(session);
-        broca_wal::migration::guard(&self.root.join(format!("{address}.wal")), "", false)?;
-        let Some(path) = self.resolve_live_address(&address)? else {
-            return Ok(None);
-        };
-        broca_wal::file_wal::read_records_tail_bounded(path, self.max_read_bytes, tail_bytes)
-    }
-
-    /// Decode a session's WAL from its first record ONE RECORD AT A TIME, handing each DURABLE
-    /// record to `visit` (see [`broca_wal::scan_records`]); `visit` returns `false` to stop.
-    /// `None` means the session has no WAL.
-    ///
-    /// With `through_seq`, records after it are never visited: the caller already holds a
-    /// barrier that proved that head durable. Without it, the live file's length is read first
-    /// and a read-side flush follows, and only the bytes present before that flush are scanned,
-    /// so a record appended while the scan runs is never visited before it is durable. An
-    /// archived member is sealed, so all of it is durable.
-    pub fn scan_durable_records(
-        &self,
-        session: &BindIdentity,
-        through_seq: Option<u64>,
-        mut visit: impl FnMut(&broca_wal::FramedRecord, Option<broca_wal::WalLineageId>) -> bool,
-    ) -> Result<Option<broca_wal::WalScan>, WalError> {
-        let address = session_addr(session);
-        broca_wal::migration::guard(&self.root.join(format!("{address}.wal")), "", false)?;
-        let mut bounded = |frame: &broca_wal::FramedRecord, lineage| {
-            through_seq.is_none_or(|head| frame.seq <= head) && visit(frame, lineage)
-        };
-        let lookup = self.archived_member_at_address(&address)?;
-        if let Some(member) = lookup.member {
-            return broca_wal::scan_records(
-                &member.payload[..],
-                member.payload.len() as u64,
-                bounded,
-            )
-            .map(Some);
-        }
-        if lookup.consulted {
-            return Ok(None);
-        }
-        let path = self.read_address_path(&address)?;
-        let file = match std::fs::File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(WalError::Io(error)),
-        };
-        let size = file.metadata().map_err(WalError::Io)?.len();
-        if through_seq.is_none() {
-            self.flush_for_read(session)?;
-        }
-        use std::io::Read as _;
-        broca_wal::scan_records(file.take(size), self.max_read_bytes, &mut bounded).map(Some)
-    }
-
     fn read_address_range_for_authorization(
         &self,
         address: &str,

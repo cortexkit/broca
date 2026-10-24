@@ -16,13 +16,12 @@ pub mod record;
 
 pub use file_wal::{
     file_identity, format_manifest_line, read_records_range, read_records_range_from_valid_anchor,
-    read_records_tail, replay_file, scan_records, wal_bytes_read, wal_file_exists, FileWal, Wal,
-    WalByteAnchor, WalError, WalRangeRead, WalRangeRecords, WalScan, WalTailRead,
-    DEFAULT_MAX_READ_BYTES,
+    read_records_tail, replay_file, wal_bytes_read, wal_file_exists, FileWal, Wal, WalByteAnchor,
+    WalError, WalRangeRead, WalRangeRecords, WalTailRead, DEFAULT_MAX_READ_BYTES,
 };
 pub use floor::{raise_floor, read_floor, FEATURE_FLOOR_FILENAME};
 #[cfg(any(test, feature = "test-known-feature"))]
-pub use framing::{forget_feature_for_test, lineage_frame_for_test, ForgottenFeature};
+pub use framing::{forget_feature_for_test, ForgottenFeature};
 pub use framing::{
     FrameError, FramedRecord, WalLineageId, ARCHIVE_INDEX_V2_FEATURE, COMPACTION_FEATURE,
     COMPACTION_VIEW_FEATURE, COMPACTION_WAIT_FEATURE, DEFERRED_CALL_FEATURE,

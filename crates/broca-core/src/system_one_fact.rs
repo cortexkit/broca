@@ -1,5 +1,4 @@
-//! Sessionless provider measurements in the immutable usage export stream, and the decoder
-//! that tells every kind of export fact apart. Pricing belongs
+//! Sessionless provider measurements in the immutable usage export stream. Pricing belongs
 //! to the consumer; batch estimates and frozen ceiling rates never become measurements.
 
 use serde::{Deserialize, Serialize};
@@ -43,15 +42,13 @@ pub struct SystemOneUsage {
 pub enum UsageExportSegment {
     Session(Box<SpendSegment>),
     SystemOne(Box<SystemOneFact>),
-    /// Per-step diagnostics; never spend. See [`crate::model_step_fact`].
-    ModelStep(Box<crate::model_step_fact::ModelStepFact>),
 }
 
 impl UsageExportSegment {
     pub fn as_session(&self) -> Option<&SpendSegment> {
         match self {
             Self::Session(segment) => Some(segment),
-            Self::SystemOne(_) | Self::ModelStep(_) => None,
+            Self::SystemOne(_) => None,
         }
     }
 }
@@ -62,9 +59,6 @@ impl<'de> Deserialize<'de> for UsageExportSegment {
         match value.get("kind").and_then(serde_json::Value::as_str) {
             Some("system_one") => {
                 serde_json::from_value(value).map(|fact| Self::SystemOne(Box::new(fact)))
-            }
-            Some("model_step") => {
-                serde_json::from_value(value).map(|fact| Self::ModelStep(Box::new(fact)))
             }
             None => serde_json::from_value(value).map(|segment| Self::Session(Box::new(segment))),
             Some(kind) => {

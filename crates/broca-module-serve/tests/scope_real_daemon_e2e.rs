@@ -1134,16 +1134,8 @@ fn admission_index_rows(rig: &Rig) -> (Vec<(String, String, String)>, Vec<String
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    // Per-step diagnostic facts (`kind: "model_step"`) are written in the background shortly
-    // after an earlier run's steps became durable, so one can land between two snapshots that
-    // bracket a refusal. A refusal writes no WAL and therefore no step fact; the billing and
-    // System One facts are the ones a refusal must not touch.
     let mut facts = db
-        .prepare(
-            "SELECT segment_json FROM export_facts
-              WHERE COALESCE(json_extract(segment_json, '$.kind'), '') != 'model_step'
-              ORDER BY fact_id",
-        )
+        .prepare("SELECT segment_json FROM export_facts ORDER BY fact_id")
         .unwrap();
     let facts = facts
         .query_map([], |row| row.get(0))
