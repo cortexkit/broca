@@ -426,6 +426,7 @@ dependencies = [
  "cortexkit-bus-nats",
  "cortexkit-bus-testkit",
  "cortexkit-bus-trait",
+ "cortexkit-llm-tools",
  "cortexkit-log",
  "cortexkit-model-batch",
  "cortexkit-role-agent-data",
@@ -436,6 +437,7 @@ dependencies = [
  "cortexkit-role-llm-runner-conformance",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
+ "cortexkit-role-tool-provider-conformance",
  "flate2",
  "futures",
  "getrandom 0.3.4",
@@ -947,6 +949,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-llm-tools"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9dc9e22cfe5d7e05e552fa8ea4311152174770a2beceb1b9b2cc23be46a5e65"
+dependencies = [
+ "cortexkit-model-batch",
+ "cortexkit-role-classifier",
+ "cortexkit-role-extractor",
+ "indexmap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cortexkit-log"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1033,6 +1049,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-role-extractor"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62372f03db4c981cd47da7530ec28e0a55a3a11a022ddb3a1526e0774f1d04a7"
+dependencies = [
+ "cortexkit-model-batch",
+ "indexmap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cortexkit-role-harness"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1086,9 +1114,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.10.4"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca097348ffbd27d40a327528b078140bcbc3fa06ac096c13f84a7c7dc908ccc4"
+checksum = "b6f01258ddb6261fd1e2089c1fac40f46b9e2f7fcaa7f023843a924277964731"
 dependencies = [
  "serde",
  "serde_jcs",

@@ -209,6 +209,36 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             ),
         },
         ManagementOperation {
+            name: "tool.catalog".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("List the tools served on a tool-provider/v1 route.".into()),
+        },
+        ManagementOperation {
+            name: "tool.call".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Execute a tool on a tool-provider/v1 route.".into()),
+        },
+        ManagementOperation {
+            name: "late_results".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read held tool calls' completed results on a tool-provider/v1 route.".into()),
+        },
+        ManagementOperation {
+            name: "late_results.ack".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Acknowledge delivered late results on a tool-provider/v1 route.".into()),
+        },
+        ManagementOperation {
+            name: "permissions.list".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("List private-content grants on a permissions/v1 route.".into()),
+        },
+        ManagementOperation {
+            name: "permissions.revoke".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Revoke a private-content grant on a permissions/v1 route.".into()),
+        },
+        ManagementOperation {
             name: OP_RESOLVE.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some(
@@ -412,6 +442,8 @@ pub fn manifest_configured(
             // `classifier` role. A caller finds broca by this entry, then picks it for a model
             // its classifier `role.describe` lists.
             cortexkit_role_classifier::PROVIDES.to_string(),
+            cortexkit_role_tool_provider::PROVIDES.to_string(),
+            "permissions/v1".to_string(),
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
         ],
@@ -520,11 +552,11 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
+                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),
-            "broca declares runner, agent-data and classifier roles, flow and agent-run scope handling, and requires or denies nothing"
+            "broca declares runner, agent-data, classifier, tool-provider and permissions roles, flow and agent-run scope handling, and requires or denies nothing"
         );
         //
         // `consumes` has skip_serializing_if = "Vec::is_empty" since subc-protocol 0.19.0, so
