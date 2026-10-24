@@ -193,6 +193,36 @@ async fn run_episode(
     mode: crate::StartMode,
     wait: WaitViews,
 ) -> (Vec<CallOptions>, Vec<Held>) {
+    run_configured(
+        shared,
+        retain,
+        newer,
+        scripts,
+        store,
+        EpisodeScenario {
+            mode,
+            wait,
+            budget: true,
+        },
+    )
+    .await
+}
+
+struct EpisodeScenario {
+    mode: crate::StartMode,
+    wait: WaitViews,
+    budget: bool,
+}
+
+async fn run_configured(
+    shared: &Shared,
+    retain: bool,
+    newer: bool,
+    scripts: Vec<Vec<broca_protocol::NormalizedEvent>>,
+    store: Option<Arc<dyn crate::SessionStore>>,
+    scenario: EpisodeScenario,
+) -> (Vec<CallOptions>, Vec<Held>) {
+    let EpisodeScenario { mode, wait, budget } = scenario;
     let (mut request, mut control, _) = history_request();
     request.input.extend([
         text(Role::Assistant, "third answer"),
@@ -216,10 +246,10 @@ async fn run_episode(
     .unwrap()];
     request.policy_allowed.insert("read".into());
     request.stop_when = vec![broca_protocol::StopCondition::StepCount { n: 10 }];
-    request.budget = Some(
+    request.budget = budget.then(|| {
         serde_json::from_value(json!({"nudges":[{"at_tool_calls":2,"text":"budget reminder"}]}))
-            .unwrap(),
-    );
+            .unwrap()
+    });
     let releases = Arc::new(AtomicUsize::new(0));
     let cancel = tokio_util::sync::CancellationToken::new();
     if wait != WaitViews::Off {
@@ -839,5 +869,81 @@ async fn every_full_replay_fallback_releases_before_the_first_request() {
                 "{failure:?} never reached prefix validation"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn admission_only_prefix_and_tail_views_keep_episode_metadata() {
+    let full = Shared::default();
+    let (expected, _) = run_configured(
+        &full,
+        true,
+        true,
+        scripts(0),
+        None,
+        EpisodeScenario {
+            mode: crate::StartMode::FreshOrResume,
+            wait: WaitViews::Off,
+            budget: false,
+        },
+    )
+    .await;
+    let records = full.records();
+    let watermark = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::RunStarted { .. }))
+        .unwrap()
+        + 1;
+    let cut = records
+        .iter()
+        .position(|record| matches!(record, WalRecord::StepStarted { step_id } if step_id.0 == 4))
+        .unwrap();
+    let projected = crate::replay(&records[..watermark]).unwrap();
+    let store = Arc::new(BrokenStore {
+        prefix: crate::StorePrefix {
+            lineage_id: Some(fixture_lineage_id().to_string()),
+            prefix: projected.prompt,
+            completed_steps: projected.completed_steps,
+            usage: projected.usage,
+            retries_used: projected.retries_used,
+            last_step_usage: projected.last_step_usage,
+            last_step_finish_reason: projected.last_step_finish_reason,
+            watermark_seq: watermark as u64,
+            context_epoch: 0,
+        },
+        admission: crate::AdmissionStoreSnapshot {
+            watermark_seq: watermark as u64,
+            lineage_id: Some(fixture_lineage_id().to_string()),
+            anchor: None,
+            checkpoint: Some(
+                crate::AdmissionCheckpointV1::from_frames(&full.frames()[..watermark]).unwrap(),
+            ),
+        },
+        failure: Fallback::MissingEpisodes,
+        prefix_reads: AtomicUsize::new(0),
+    });
+    let resumed = Shared::with_records(records[..cut].to_vec());
+    let (calls, held) = run_configured(
+        &resumed,
+        false,
+        true,
+        scripts(3),
+        Some(store.clone()),
+        EpisodeScenario {
+            mode: crate::StartMode::FreshOrResume,
+            wait: WaitViews::Off,
+            budget: false,
+        },
+    )
+    .await;
+    assert!(store.prefix_reads.load(Ordering::SeqCst) > 0);
+    assert_eq!(held[0].ordinals, vec![0, 9, 10]);
+    assert_eq!(held[0].episodes, vec![(0, Some(0), Some(5), 11)]);
+    assert_eq!(calls.len(), 2);
+    for (actual, expected) in calls.iter().zip(&expected[3..]) {
+        assert_eq!(
+            crate::canonical_request_bytes(actual),
+            crate::canonical_request_bytes(expected)
+        );
     }
 }

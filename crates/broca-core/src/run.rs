@@ -1703,7 +1703,10 @@ where
                             // restore_unchanged_effort creates a placeholder with first_user=None
                             // and no active-episode boundary. A sparse view needs the original
                             // episode coordinates after its messages are released, so replay them.
-                            let missing_compaction_episodes = prior.render_episodes.is_none()
+                            // A tail-only view can leave Some(empty) render inputs; absent prefix
+                            // spans still mean the lineage's original episode history is unknown.
+                            let missing_compaction_episodes = (prior.render_episodes.is_none()
+                                || prior.episode_step_spans.is_none())
                                 && snapshot
                                     .checkpoint_at_head
                                     .compaction

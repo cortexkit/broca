@@ -27577,8 +27577,8 @@ select = "expected"
 test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
 expect_red = ["compaction::tests::held_history::every_full_replay_fallback_releases_before_the_first_request"]
 file = "crates/broca-core/src/run.rs"
-old = "                            let missing_compaction_episodes = prior.render_episodes.is_none()"
-new = "                            let missing_compaction_episodes = false && prior.render_episodes.is_none() // NON-VACUITY BREAK: accept unknown episode coordinates"
+old = "                            let missing_compaction_episodes = (prior.render_episodes.is_none()"
+new = "                            let missing_compaction_episodes = false && (prior.render_episodes.is_none() // NON-VACUITY BREAK: accept unknown episode coordinates"
 
 [[control]]
 id = "sparse-held-release-replay-indexes"
@@ -27670,3 +27670,16 @@ expect_red = ["compaction::tests::held_history::deferred_approval_history_keeps_
 file = "crates/broca-core/src/run.rs"
 old = "                    base: frames,"
 new = "                    base: Arc::new(Vec::new()), // NON-VACUITY BREAK: prune approval recovery frames"
+
+[[control]]
+id = "sparse-held-prefix-episode-span-completeness"
+guards = "A tail view without tail admissions cannot substitute an empty render list for the original prefix episodes"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::admission_only_prefix_and_tail_views_keep_episode_metadata"]
+file = "crates/broca-core/src/run.rs"
+old = "|| prior.episode_step_spans.is_none())"
+new = "|| false) // NON-VACUITY BREAK: trust incomplete tail-only episode metadata"
