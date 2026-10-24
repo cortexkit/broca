@@ -27,7 +27,7 @@ fn tracked_descriptor() -> serde_json::Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("tracked descriptor is not JSON: {e}"))
 }
 
-/// The backup descriptor declares ten entries. Engram includes only `portable` entries in
+/// Engram includes only `portable` entries in
 /// each backup generation; `rebuild`, `device-local` and `excluded` entries are left out.
 /// Only durable sessions are backed up, in their own trees. `wal/` and
 /// `wal-archive/` hold disposable sessions whose callers relaunch rather than restore
@@ -37,7 +37,7 @@ fn tracked_descriptor() -> serde_json::Value {
 /// not depend on these trees surviving a disk loss: the billing collector ingests export
 /// facts into its own backed-up store.
 #[test]
-fn the_tracked_descriptor_declares_brocas_ten_entries_with_their_classes() {
+fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
     let d = tracked_descriptor();
     assert_eq!(d["module_id"], "broca");
 
@@ -62,6 +62,10 @@ fn the_tracked_descriptor_declares_brocas_ten_entries_with_their_classes() {
         ("broca/caps", "rebuild", "whole-db"),
         ("broca/durable-wals", "portable", "filetree"),
         ("broca/durable-archive", "portable", "filetree"),
+        ("broca/durable-media", "portable", "filetree"),
+        ("broca/session-media", "excluded", "filetree"),
+        ("broca/ephemeral-media", "excluded", "filetree"),
+        ("broca/media-uploads", "excluded", "filetree"),
         ("broca/ephemeral-wals", "excluded", "filetree"),
         ("broca/leases", "device-local", "filetree"),
         ("broca/request-dumps", "device-local", "filetree"),
@@ -91,13 +95,24 @@ fn the_tracked_descriptor_declares_brocas_ten_entries_with_their_classes() {
         .filter_map(|e| e["entry_id"].as_str())
         .collect();
     portable.sort();
-    assert_eq!(portable, ["broca/durable-archive", "broca/durable-wals"]);
+    assert_eq!(
+        portable,
+        [
+            "broca/durable-archive",
+            "broca/durable-media",
+            "broca/durable-wals"
+        ]
+    );
     for (id, path) in [
         ("broca/session-wals", "wal"),
         ("broca/session-archive", "wal-archive"),
         ("broca/ephemeral-wals", "wal-ephemeral"),
         ("broca/durable-wals", "wal-durable"),
         ("broca/durable-archive", "wal-archive-durable"),
+        ("broca/durable-media", "media-durable"),
+        ("broca/session-media", "media"),
+        ("broca/ephemeral-media", "media-ephemeral"),
+        ("broca/media-uploads", "media-uploads"),
     ] {
         let entry = entries.iter().find(|e| e["entry_id"] == id).unwrap();
         assert_eq!(entry["path"], path, "{id} must describe `{path}/`");
