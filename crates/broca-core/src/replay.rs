@@ -1219,10 +1219,6 @@ pub fn replay_projection_tail(
     // it and the tail's own ordinals are already the projection's.
     let open_episode = if truncate_prefix_to.is_some() {
         projected_episode_metadata(&tail_state).pop()
-    } else if seed.projection_episodes.is_none() {
-        // A projection with no reusable episode list cannot be continued from this tail, and
-        // the store fills the whole list from the records it holds at its next write.
-        None
     } else {
         projected_open_episode(&tail_state, seed.prefix_len, seed.open_episode.clone())
     };
