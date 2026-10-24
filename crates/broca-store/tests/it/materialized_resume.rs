@@ -2002,9 +2002,6 @@ impl Provider for HistoryProvider {
     }
 }
 
-/// Drive one run over the session's WAL: a fresh episode 1, or a resume of the episode encoded by
-/// the request's run id. Returns the render history the run loop handed to its first provider
-/// call.
 /// Drive one run over `dir` and return the render history its first provider call received.
 async fn run_history(
     dir: &std::path::Path,

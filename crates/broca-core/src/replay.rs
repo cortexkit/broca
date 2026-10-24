@@ -1272,17 +1272,10 @@ pub fn projected_episode_metadata(
         .map(|(index, episode)| crate::context::EpisodeRenderProjection {
             start: Some(episode.prompt_start as u64),
             first_user: Some(episode.first_user.map(|first| first as u64)),
-            // Episode spans are recorded only for episodes that committed a model step, in
-            // episode order, so an episode after the first one without a span has an unknown
-            // first step here rather than a borrowed span from a later episode.
-            first_step: Some(
-                step_starts
-                    .iter()
-                    .take(index + 1)
-                    .copied()
-                    .nth(index)
-                    .map(|start| start as u64),
-            ),
+            // Episode spans list only the episodes that committed a model step, in episode
+            // order, so once an episode has no span every later one shifts: an episode at or
+            // past that point records an unknown first step rather than another episode's.
+            first_step: Some(step_starts.get(index).map(|start| *start as u64)),
             render_config: Some(episode.frozen_config.clone()),
         })
         .collect()

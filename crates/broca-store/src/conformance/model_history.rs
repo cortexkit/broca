@@ -430,18 +430,12 @@ fn replay_coordinates(
         .collect()
 }
 
-/// A store written before the episode projection existed gains it from its next write, and the
-/// values equal what a full WAL replay derives.
-///
-/// The fixture's episodes are complete: every episode opened, committed a step, and ended, except
-/// the last, which stays open with one step. Its ids, first users, first model steps and frozen
-/// render configs are the coordinates a resumed run renders effort updates and repetition
-/// guidance from, so the store must hold exactly the replay's values.
 /// A session's incremental projection writes its episodes' render inputs as their records
-/// materialize, and those values equal what a full WAL replay of the same records derives.
+/// materialize, and the values it records equal what a full WAL replay of the same records
+/// derives.
 ///
 /// The fixture's three episodes are complete: every one opened, committed a model step and
-/// ended, and the middle one was admitted without any user message. Its coordinates are what a
+/// ended, and the middle one was admitted without any user message. Their coordinates are what a
 /// resumed run renders ChatGPT effort updates and per-episode repetition guidance from, so the
 /// store must hold exactly the replay's values, including a known absent first user.
 #[test]
