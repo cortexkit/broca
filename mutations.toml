@@ -27512,8 +27512,8 @@ select = "expected"
 test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
 expect_red = ["compaction::tests::held_history::every_full_replay_fallback_releases_before_the_first_request"]
 file = "crates/broca-core/src/run.rs"
-old = "        if release_history\n            && held_prompt::release("
-new = "        if release_history && !is_resume // NON-VACUITY BREAK: retain full history after resume\n            && held_prompt::release("
+old = "            if release_history\n                && held_prompt::release("
+new = "            if release_history && !is_resume // NON-VACUITY BREAK: retain full history after resume\n                && held_prompt::release("
 
 [[control]]
 id = "sparse-held-tag-cursor-preserves-high-water"
@@ -27605,3 +27605,68 @@ expect_red = ["compaction::tests::held_history::full_wal_resume_releases_before_
 file = "crates/broca-core/src/run.rs"
 old = "    drop(approval_frames);"
 new = "    std::mem::forget(approval_frames); // NON-VACUITY BREAK: retain the whole decoded WAL"
+
+[[control]]
+id = "sparse-held-release-during-ceiling-wait"
+guards = "A view applied inside a ceiling ride releases discarded history before the wait continues"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::views_release_before_continuing_a_ceiling_wait"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "                        return Ok(views.yield_applied(events, None));"
+new = "                        let _ = &events; // NON-VACUITY BREAK: keep waiting with discarded history resident"
+
+[[control]]
+id = "sparse-held-release-before-ceiling-io"
+guards = "A boundary-applied view releases its discarded rows before waiting on the ceiling provider"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::views_release_before_continuing_a_ceiling_wait"]
+file = "crates/broca-core/src/run.rs"
+old = "            release_held!(Some(&*state));\n            let mut request = crate::compaction::BoundaryRequest::default();"
+new = "            let mut request = crate::compaction::BoundaryRequest::default(); // NON-VACUITY BREAK: defer release until after ceiling I/O"
+
+[[control]]
+id = "sparse-held-closing-notice-anchor"
+guards = "Closing notices keep the ordinal and digest of the newest transcript row after a view releases it"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::views_release_before_continuing_a_ceiling_wait"]
+file = "crates/broca-core/src/run.rs"
+old = "        let through = self\n            .anchor\n            .into_iter()"
+new = "        let through = self\n            .anchor.filter(|_| false) // NON-VACUITY BREAK: forget the released newest message\n            .into_iter()"
+
+[[control]]
+id = "sparse-held-release-on-ceiling-view-ready"
+guards = "A view fetched from a ceiling-wait notification releases discarded history before the next poll"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::views_release_before_continuing_a_ceiling_wait"]
+file = "crates/broca-core/src/compaction/runtime.rs"
+old = "return Ok(views.yield_applied(events, Some(until)));"
+new = "let _ = (&events, until); // NON-VACUITY BREAK: poll again before releasing the applied view"
+
+[[control]]
+id = "sparse-held-preserves-approval-recovery-frames"
+guards = "Historical deferred approvals retain their independent full-frame recovery owner while ordinary admission frames are released"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/compaction/held_history_tests.rs"
+expect_red = ["compaction::tests::held_history::deferred_approval_history_keeps_its_independent_frame_owner"]
+file = "crates/broca-core/src/run.rs"
+old = "                    base: frames,"
+new = "                    base: Arc::new(Vec::new()), // NON-VACUITY BREAK: prune approval recovery frames"

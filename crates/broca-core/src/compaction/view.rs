@@ -699,8 +699,31 @@ pub(crate) fn notice_through(
     through: &Message,
     facts: NoticeFacts<'_>,
 ) -> Option<AdvanceNotice> {
+    notice_at(state, &notice_anchor(through)?, facts)
+}
+
+pub(crate) struct NoticeAnchor {
+    pub(crate) ordinal: u64,
+    digest: String,
+}
+
+/// Only the ordinal and digest are needed after a view releases the newest raw message.
+pub(crate) fn notice_anchor(through: &Message) -> Option<NoticeAnchor> {
     let through_ordinal = through.ordinal?;
     let through_digest = content_digest(&serde_json::to_value(through).expect("native JSON"));
+    Some(NoticeAnchor {
+        ordinal: through_ordinal,
+        digest: through_digest,
+    })
+}
+
+pub(crate) fn notice_at(
+    state: &CompactionState,
+    through: &NoticeAnchor,
+    facts: NoticeFacts<'_>,
+) -> Option<AdvanceNotice> {
+    let through_ordinal = through.ordinal;
+    let through_digest = through.digest.clone();
     let applied = state.applied_view_version(facts.lineage_id);
     let mut events: Vec<Event> = state
         .unannounced

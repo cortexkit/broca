@@ -3,10 +3,21 @@
 use super::*;
 use crate::compaction_provider::{lineage::MessageRef, notice::ViewReady, view::*};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitViews {
+    Off,
+    RideOnly,
+    EventOnly,
+    BoundaryThenRide,
+}
+
 struct Windows {
     wal: Shared,
     newer: bool,
     lineage: Mutex<String>,
+    wait: WaitViews,
+    releases: Arc<AtomicUsize>,
+    ready_after_ride: std::sync::atomic::AtomicBool,
 }
 
 impl Windows {
@@ -40,6 +51,11 @@ impl Windows {
 impl CompactionViews for Windows {
     fn newest_ready(&self, session: &str, lineage: &str, after: Option<u64>) -> Option<ViewReady> {
         *self.lineage.lock().unwrap() = lineage.into();
+        if self.wait == WaitViews::RideOnly
+            || (self.wait == WaitViews::EventOnly && !self.ready_after_ride.load(Ordering::SeqCst))
+        {
+            return None;
+        }
         let steps = self
             .wal
             .records()
@@ -61,8 +77,14 @@ impl CompactionPlane for Windows {
         request: SetupRequest,
     ) -> Result<SetupAnswer, CompactionUnavailable> {
         let mut answer = ready();
+        if let Some(lineage) = &request.lineage_id {
+            *self.lineage.lock().unwrap() = lineage.clone();
+        }
         answer["request_id"] = request.request_id.into();
         answer["initial"]["replacement"] = json!([]);
+        if self.wait != WaitViews::Off {
+            answer["ceiling"] = json!({"at_share":0.0001,"on_overflow":true,"wait_ms":10000});
+        }
         Ok(serde_json::from_value(answer).unwrap())
     }
 
@@ -81,8 +103,32 @@ impl CompactionPlane for Windows {
         &self,
         _: &str,
         _: &BindIdentity,
-        _: crate::compaction_provider::ride::RideRequest,
+        request: crate::compaction_provider::ride::RideRequest,
     ) -> Result<crate::compaction_provider::ride::RideAnswer, CompactionUnavailable> {
+        if self.wait != WaitViews::Off
+            && matches!(
+                request.cause,
+                crate::compaction_provider::ride::RideCause::Ceiling
+            )
+        {
+            if self.wait == WaitViews::EventOnly {
+                self.ready_after_ride.store(true, Ordering::SeqCst);
+                return Ok(crate::compaction_provider::ride::RideAnswer::nothing());
+            }
+            let version = if self.wait == WaitViews::BoundaryThenRide {
+                assert_eq!(
+                    self.releases.load(Ordering::SeqCst),
+                    1,
+                    "ordinary view released before waiting for the ceiling provider"
+                );
+                3
+            } else {
+                2
+            };
+            return Ok(crate::compaction_provider::ride::RideAnswer::view(
+                self.candidate(&request.session_ref, version),
+            ));
+        }
         Ok(crate::compaction_provider::ride::RideAnswer::nothing())
     }
 }
@@ -94,9 +140,14 @@ struct Held {
     originals: usize,
     episodes: Vec<(usize, Option<usize>, Option<u64>, u64)>,
     extra_wal_input_owners: usize,
+    approval_base: usize,
 }
 
 struct HistoryModel(crate::StubProvider);
+
+struct NoPendingElicitation;
+#[async_trait::async_trait]
+impl crate::tool_plane::ElicitationPlane for NoPendingElicitation {}
 #[async_trait::async_trait]
 impl crate::Provider for HistoryModel {
     async fn step(
@@ -128,6 +179,7 @@ async fn run(
         scripts,
         store,
         crate::StartMode::FreshOrResume,
+        WaitViews::Off,
     )
     .await
 }
@@ -139,6 +191,7 @@ async fn run_episode(
     scripts: Vec<Vec<broca_protocol::NormalizedEvent>>,
     store: Option<Arc<dyn crate::SessionStore>>,
     mode: crate::StartMode,
+    wait: WaitViews,
 ) -> (Vec<CallOptions>, Vec<Held>) {
     let (mut request, mut control, _) = history_request();
     request.input.extend([
@@ -167,14 +220,52 @@ async fn run_episode(
         serde_json::from_value(json!({"nudges":[{"at_tool_calls":2,"text":"budget reminder"}]}))
             .unwrap(),
     );
+    let releases = Arc::new(AtomicUsize::new(0));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    if wait != WaitViews::Off {
+        control.admitted_context_limit = Some(10000);
+        control.cancel = Some(cancel.clone());
+    }
     let windows = Arc::new(Windows {
         wal: shared.clone(),
         newer,
         lineage: Mutex::new(String::new()),
+        wait,
+        releases: releases.clone(),
+        ready_after_ride: std::sync::atomic::AtomicBool::new(false),
     });
     control.compaction_views = Some(windows.clone());
     control.compaction_plane = Some(windows);
+    if shared
+        .records()
+        .iter()
+        .any(|record| matches!(record, WalRecord::ToolCallDeferred { .. }))
+    {
+        control.elicitation_plane = Some(Arc::new(NoPendingElicitation));
+    }
     control.retain_full_prompt = retain;
+    let release_count = releases.clone();
+    control.view_release_probe = Some(Arc::new(move |prompt, extent, state| {
+        let covered = state.view.as_ref().unwrap().view.covers_through.ordinal;
+        if !retain {
+            let expected = std::iter::once(0)
+                .chain(covered + 1..extent)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                prompt
+                    .iter()
+                    .map(|message| message.ordinal.unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        if wait != WaitViews::Off {
+            release_count.fetch_add(1, Ordering::SeqCst);
+            if matches!(state.ceiling_check, Some(CeilingCheck::Waiting { .. })) {
+                cancel.cancel();
+            }
+        }
+    }));
     let held = Arc::new(Mutex::new(Vec::new()));
     let capture = held.clone();
     let input = shared.records().iter().find_map(|record| match record {
@@ -182,30 +273,33 @@ async fn run_episode(
         _ => None,
     });
     let input_owners = input.as_ref().map_or(0, |input| input.strong_count());
-    control.held_prompt_probe = Some(Arc::new(move |prompt, extent, originals, history| {
-        capture.lock().unwrap().push(Held {
-            ordinals: prompt
-                .iter()
-                .map(|message| message.ordinal.unwrap())
-                .collect(),
-            extent,
-            originals,
-            episodes: history
-                .iter()
-                .map(|episode| {
-                    (
-                        episode.render.prompt_start,
-                        episode.render.first_user,
-                        episode.first_step,
-                        episode.end,
-                    )
-                })
-                .collect(),
-            extra_wal_input_owners: input
-                .as_ref()
-                .map_or(0, |input| input.strong_count().saturating_sub(input_owners)),
-        });
-    }));
+    control.held_prompt_probe = Some(Arc::new(
+        move |prompt, extent, originals, history, approval_base| {
+            capture.lock().unwrap().push(Held {
+                ordinals: prompt
+                    .iter()
+                    .map(|message| message.ordinal.unwrap())
+                    .collect(),
+                extent,
+                originals,
+                episodes: history
+                    .iter()
+                    .map(|episode| {
+                        (
+                            episode.render.prompt_start,
+                            episode.render.first_user,
+                            episode.first_step,
+                            episode.end,
+                        )
+                    })
+                    .collect(),
+                extra_wal_input_owners: input
+                    .as_ref()
+                    .map_or(0, |input| input.strong_count().saturating_sub(input_owners)),
+                approval_base,
+            });
+        },
+    ));
     let model = HistoryModel(crate::StubProvider::new(scripts));
     let tools = crate::StubToolPlane::new().with_tool("read", |_| {
         crate::StubReply::Output(broca_protocol::ToolOutput::Text {
@@ -229,6 +323,17 @@ async fn run_episode(
     .await
     .unwrap();
     writer.shutdown().await.unwrap();
+    if wait != WaitViews::Off {
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            if wait == WaitViews::BoundaryThenRide {
+                2
+            } else {
+                1
+            },
+            "view releases observed before more ceiling I/O"
+        );
+    }
     (
         model.0.calls(),
         Arc::try_unwrap(held).unwrap().into_inner().unwrap(),
@@ -248,12 +353,90 @@ fn stable_records(records: &[WalRecord]) -> Vec<Value> {
         .map(|record| {
             let mut value = serde_json::to_value(record).unwrap();
             // Independent executions have different wall-clock I/O times, not different records.
-            for key in ["ts_ms", "dispatched_at_ms", "finished_at_ms"] {
+            for key in ["ts_ms", "dispatched_at_ms", "finished_at_ms", "deadline_ms"] {
                 value.as_object_mut().unwrap().remove(key);
             }
             value
         })
         .collect()
+}
+
+#[tokio::test]
+async fn views_release_before_continuing_a_ceiling_wait() {
+    for wait in [
+        WaitViews::RideOnly,
+        WaitViews::EventOnly,
+        WaitViews::BoundaryThenRide,
+    ] {
+        let sparse = Shared::default();
+        let (actual, _) = run_episode(
+            &sparse,
+            false,
+            false,
+            scripts(0),
+            None,
+            crate::StartMode::FreshOrResume,
+            wait,
+        )
+        .await;
+        let full = Shared::default();
+        let (expected, _) = run_episode(
+            &full,
+            true,
+            false,
+            scripts(0),
+            None,
+            crate::StartMode::FreshOrResume,
+            wait,
+        )
+        .await;
+        assert!(
+            expected.is_empty() && actual.is_empty(),
+            "cancellation occurs inside the wait"
+        );
+        let records = sparse.records();
+        assert_records(&records, &full.records());
+        let waits: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| match record {
+                WalRecord::ContextCeilingWait { deadline_ms, .. } => Some((index, *deadline_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            waits.len(),
+            2,
+            "the ride result is committed once: {wait:?}"
+        );
+        assert_eq!(
+            waits[0].1, waits[1].1,
+            "yielding does not reset the absolute deadline"
+        );
+        let applied: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                matches!(record, WalRecord::CompactionViewApplied { .. }).then_some(index)
+            })
+            .collect();
+        assert!(applied.last().unwrap() > &waits[0].0);
+        if wait == WaitViews::BoundaryThenRide {
+            assert!(applied[0] < waits[0].0);
+            assert_eq!(applied.len(), 2);
+        }
+        let through = records.iter().rev().find_map(|record| match record {
+            WalRecord::CompactionNotice { headers, .. } => {
+                view::Announced::from_headers(headers).through_ordinal
+            }
+            _ => None,
+        });
+        assert_eq!(
+            through,
+            Some(4),
+            "notices retain the newest message's ordinal and digest after release"
+        );
+    }
 }
 
 fn assert_records(actual: &[WalRecord], expected: &[WalRecord]) {
@@ -355,9 +538,91 @@ async fn full_wal_resume_releases_before_its_first_request_and_preserves_guidanc
     assert_eq!(held[0].ordinals, vec![0, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     assert_eq!(held[0].extent, 12);
     assert_eq!(
+        held[0].approval_base, 0,
+        "ordinary runs have no approval recovery owner"
+    );
+    assert_eq!(
         held[0].extra_wal_input_owners, 0,
         "the complete replay's WAL frames were released"
     );
+    for (actual, expected) in calls.iter().zip(&expected[3..]) {
+        assert_eq!(
+            crate::canonical_request_bytes(actual),
+            crate::canonical_request_bytes(expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn deferred_approval_history_keeps_its_independent_frame_owner() {
+    let full = Shared::default();
+    let (expected, _) = run(&full, true, false, scripts(0), None).await;
+    let mut records = full.records();
+    let intent = records
+        .iter()
+        .position(|record| {
+            matches!(record,
+        WalRecord::ToolDispatchIntent { tool_call_id, .. } if tool_call_id.0 == "call-1")
+        })
+        .unwrap();
+    let (batch, id, args) = match &records[intent] {
+        WalRecord::ToolDispatchIntent {
+            batch_id,
+            tool_call_id,
+            args,
+            ..
+        } => (
+            batch_id.0.clone(),
+            tool_call_id.0.clone(),
+            args.as_ref().clone(),
+        ),
+        _ => unreachable!(),
+    };
+    let mut deferred = crate::replay::deferred_tests::prepared(&id, &batch);
+    if let WalRecord::ToolCallDeferred { tool, args_jcs, .. } = &mut deferred {
+        *tool = "read".into();
+        *args_jcs = serde_json::to_string(&args).unwrap();
+    }
+    // Prepared call keys bind the WAL lineage and the deferred record's absolute sequence.
+    let key = format!("{}:{}", fixture_lineage_id(), intent + 1);
+    let mut approved =
+        crate::replay::deferred_tests::approval(&id, &key, broca_wal::DeferredDecision::Approved);
+    if let WalRecord::ApprovalRecorded {
+        approval_digest, ..
+    } = &mut approved
+    {
+        *approval_digest = None;
+    }
+    records.insert(intent, deferred);
+    records.insert(intent + 1, approved);
+    if let WalRecord::ToolDispatchIntent {
+        call_key,
+        approval_digest,
+        ..
+    } = &mut records[intent + 2]
+    {
+        *call_key = Some(key);
+        *approval_digest = None;
+    }
+    let cut = records
+        .iter()
+        .position(|record| {
+            matches!(record,
+        WalRecord::StepStarted { step_id } if step_id.0 == 4)
+        })
+        .unwrap();
+    let resumed = Shared::with_records(records[..cut].to_vec());
+    let (calls, held) = run(&resumed, false, false, scripts(3), None).await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        held[0].approval_base, cut,
+        "approval recovery retains its complete source frames"
+    );
+    assert_eq!(
+        held[0].extra_wal_input_owners, 1,
+        "History, not the ordinary admission owner, keeps the raw WAL"
+    );
+    assert_eq!(held[0].ordinals, vec![0, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     for (actual, expected) in calls.iter().zip(&expected[3..]) {
         assert_eq!(
             crate::canonical_request_bytes(actual),
@@ -439,6 +704,7 @@ async fn active_episode_without_held_messages_keeps_its_live_observer() {
         scripts(0),
         None,
         crate::StartMode::AppendEpisode,
+        WaitViews::Off,
     )
     .await;
     let sparse = Shared::with_records(prefix);
@@ -449,6 +715,7 @@ async fn active_episode_without_held_messages_keeps_its_live_observer() {
         scripts(0),
         None,
         crate::StartMode::AppendEpisode,
+        WaitViews::Off,
     )
     .await;
     assert_eq!(

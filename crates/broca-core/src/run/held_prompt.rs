@@ -92,7 +92,11 @@ impl GuidanceEpisodes {
 }
 
 #[cfg(test)]
-pub(crate) type Probe = dyn Fn(&[Message], u64, usize, &[GuidanceEpisode]) + Send + Sync;
+pub(crate) type Probe = dyn Fn(&[Message], u64, usize, &[GuidanceEpisode], usize) + Send + Sync;
+
+#[cfg(test)]
+pub(crate) type ReleaseProbe =
+    dyn Fn(&[Message], u64, &crate::compaction::CompactionState) + Send + Sync;
 
 #[derive(Default)]
 pub(super) struct PromptPosition {

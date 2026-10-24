@@ -523,6 +523,8 @@ pub struct RunControl {
     #[cfg(test)]
     pub(crate) held_prompt_probe: Option<Arc<held_prompt::Probe>>,
     #[cfg(test)]
+    pub(crate) view_release_probe: Option<Arc<held_prompt::ReleaseProbe>>,
+    #[cfg(test)]
     pub(crate) retain_full_prompt: bool,
     /// Installed by the late-result runtime to rejoin durable waiting slots without re-dispatch.
     /// Absent by default: a reader or a caller retry cannot drive a provider-held run.
@@ -688,6 +690,8 @@ impl Default for RunControl {
         Self {
             #[cfg(test)]
             held_prompt_probe: None,
+            #[cfg(test)]
+            view_release_probe: None,
             #[cfg(test)]
             retain_full_prompt: false,
             provider_held_lifecycle: None,
@@ -4496,6 +4500,10 @@ where
         }
     }
 
+    // History keeps full frames for historical ToolCallDeferred records (outside an args-cut
+    // recovery, or with an installed adapter), a frozen hook plan that approves calls, or a
+    // resumed batch containing a deferred/approved call.
+    // Only runs without that independent History owner release all admission frames here.
     drop(approval_frames);
     // The typed terminal error, set only when the loop breaks with `Error`. Persisted on
     // the durable RunFinished so the control-stream projection can surface the cause.
@@ -4549,6 +4557,54 @@ where
         .is_some_and(|frozen| frozen.mode == broca_protocol::structured_output::Mode::FinalText);
     let mut natural_final_text: Option<String> = None;
     let mut interrupt_reason = None;
+    let mut raw_notice_anchor: Option<crate::compaction::view::NoticeAnchor> = None;
+    macro_rules! release_held {
+        ($state:expr) => {{
+            let releasing_state: Option<&crate::compaction::CompactionState> = $state;
+            let release_history = {
+                #[cfg(test)]
+                {
+                    !control.retain_full_prompt
+                }
+                #[cfg(not(test))]
+                {
+                    true
+                }
+            };
+            if release_history
+                && held_prompt::release(
+                    &mut mutable_call_options(&mut opts).prompt,
+                    releasing_state,
+                    originals.as_mut(),
+                    &mut stamped_len,
+                )
+            {
+                tag_numbering.released(opts.prompt.len());
+                tags_rendered_len = opts.prompt.len();
+                system_positions = opts
+                    .prompt
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, message)| (message.role == Role::System).then_some(index))
+                    .collect();
+                system_indexed_len = opts.prompt.len();
+                raw_len = opts.prompt.len();
+            }
+            if releasing_state.is_some_and(|state| state.view.is_some()) {
+                let history =
+                    guidance_episodes.retain(&opts.prompt, stamped_len.extent(&opts.prompt));
+                mutable_call_options(&mut opts).render_episodes = Arc::new(history);
+                #[cfg(test)]
+                if let Some(probe) = &control.view_release_probe {
+                    probe(
+                        &opts.prompt,
+                        stamped_len.extent(&opts.prompt),
+                        releasing_state.unwrap(),
+                    );
+                }
+            }
+        }};
+    }
     let reason = loop {
         input_budget.limit = writer.input_token_limit().or(input_budget.limit);
         // A session budget is independent of episode counters and reminder inheritance.
@@ -4818,6 +4874,17 @@ where
             }
             let raw = crate::compaction::StoredTranscript::new(&opts.prompt, originals.as_ref())
                 .with_extent(stamped_len.extent(&opts.prompt));
+            if let Some(anchor) = raw
+                .newest()
+                .and_then(crate::compaction::view::notice_anchor)
+            {
+                if raw_notice_anchor
+                    .as_ref()
+                    .is_none_or(|prior| prior.ordinal <= anchor.ordinal)
+                {
+                    raw_notice_anchor = Some(anchor);
+                }
+            }
             let state = compaction_state.as_mut().expect("Setup is durable");
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
@@ -4861,6 +4928,7 @@ where
                 ))
                 .await?
             };
+            release_held!(Some(&*state));
             let mut request = crate::compaction::BoundaryRequest::default();
             request
                 .refresh(&opts, state, &system_positions, |view| {
@@ -4873,8 +4941,8 @@ where
             // Tell the provider what the session wrote since its last notice. The notice is
             // durable in the WAL before the model call, and the bus publisher projects it from
             // there, so it is never published before it is durable.
-            if let Some(notice) = raw.newest().and_then(|through| {
-                crate::compaction::view::notice_through(
+            if let Some(notice) = raw_notice_anchor.as_ref().and_then(|through| {
+                crate::compaction::view::notice_at(
                     state,
                     through,
                     crate::compaction::view::NoticeFacts {
@@ -4892,22 +4960,35 @@ where
                 runtime.record_notice(state, notice).await?;
             }
             state.history = compaction_history.clone();
-            let ceiling_detail = Box::pin(runtime.ceiling_before_request(
-                &mut boundary_views,
-                state,
-                &session_ref,
-                &lineage_id,
-                step_id,
-                &resolved_run_id,
-                out,
-                &opts,
-                &system_positions,
-                &mut request,
-                raw,
-                provider,
-                context_limit,
-            ))
-            .await?;
+            let ceiling_detail = loop {
+                let raw =
+                    crate::compaction::StoredTranscript::new(&opts.prompt, originals.as_ref())
+                        .with_extent(stamped_len.extent(&opts.prompt));
+                let progress = Box::pin(runtime.ceiling_progress(
+                    crate::compaction::runtime::CeilingAt {
+                        views: &mut boundary_views,
+                        state,
+                        session_ref: &session_ref,
+                        lineage_id: &lineage_id,
+                        step_id,
+                        run_id: &resolved_run_id,
+                        out,
+                        opts: &opts,
+                        systems: &system_positions,
+                        request: &mut request,
+                        stored: raw,
+                        provider,
+                        window: context_limit,
+                    },
+                ))
+                .await?;
+                match progress {
+                    crate::compaction::runtime::CeilingProgress::Finished(detail) => break detail,
+                    crate::compaction::runtime::CeilingProgress::ViewApplied => {
+                        release_held!(Some(&*state));
+                    }
+                }
+            };
             // A ceiling ride or a view-ready notification may have changed the durable view.
             request
                 .refresh(&opts, state, &system_positions, |view| {
@@ -4915,8 +4996,8 @@ where
                 })
                 .map_err(|error| RunError::Wal(error.to_string()))?;
             notice_request_bytes = request.bytes;
-            if let Some(notice) = raw.newest().and_then(|through| {
-                crate::compaction::view::notice_through(
+            if let Some(notice) = raw_notice_anchor.as_ref().and_then(|through| {
+                crate::compaction::view::notice_at(
                     state,
                     through,
                     crate::compaction::view::NoticeFacts {
@@ -4964,42 +5045,7 @@ where
                 .await?;
             }
         }
-        let release_history = {
-            #[cfg(test)]
-            {
-                !control.retain_full_prompt
-            }
-            #[cfg(not(test))]
-            {
-                true
-            }
-        };
-        if release_history
-            && held_prompt::release(
-                &mut mutable_call_options(&mut opts).prompt,
-                compaction_state.as_ref(),
-                originals.as_mut(),
-                &mut stamped_len,
-            )
-        {
-            tag_numbering.released(opts.prompt.len());
-            tags_rendered_len = opts.prompt.len();
-            system_positions = opts
-                .prompt
-                .iter()
-                .enumerate()
-                .filter_map(|(index, message)| (message.role == Role::System).then_some(index))
-                .collect();
-            system_indexed_len = opts.prompt.len();
-            raw_len = opts.prompt.len();
-        }
-        if compaction_state
-            .as_ref()
-            .is_some_and(|state| state.view.is_some())
-        {
-            let history = guidance_episodes.retain(&opts.prompt, stamped_len.extent(&opts.prompt));
-            mutable_call_options(&mut opts).render_episodes = Arc::new(history);
-        }
+        release_held!(compaction_state.as_ref());
         #[cfg(test)]
         if let Some(probe) = &control.held_prompt_probe {
             probe(
@@ -5007,6 +5053,9 @@ where
                 stamped_len.extent(&opts.prompt),
                 originals.as_ref().map_or(0, |o| o.len()),
                 guidance_episodes.episodes(),
+                approval_history
+                    .as_ref()
+                    .map_or(0, |history| history.retained_base_len()),
             );
         }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
@@ -5497,6 +5546,7 @@ where
                         )
                         .with_extent(raw_extent),
                         &closing_tail,
+                        raw_notice_anchor.as_ref(),
                         writer,
                         &req.session,
                         &cfg.model,
@@ -5553,6 +5603,7 @@ where
                     )
                     .with_extent(raw_extent),
                     &closing_tail,
+                    raw_notice_anchor.as_ref(),
                     writer,
                     &req.session,
                     &cfg.model,
@@ -5595,6 +5646,7 @@ where
                         )
                         .with_extent(raw_extent),
                         &closing_tail,
+                        raw_notice_anchor.as_ref(),
                         writer,
                         &req.session,
                         &cfg.model,
@@ -5692,6 +5744,7 @@ where
                         )
                         .with_extent(raw_extent),
                         &closing_tail,
+                        raw_notice_anchor.as_ref(),
                         writer,
                         &req.session,
                         &cfg.model,
@@ -5923,6 +5976,7 @@ where
             crate::compaction::StoredTranscript::new(&opts.prompt[..raw_len], originals.as_ref())
                 .with_extent(raw_extent),
             &closing_tail,
+            raw_notice_anchor.as_ref(),
             writer,
             &req.session,
             &cfg.model,
@@ -8725,6 +8779,7 @@ struct ClosingNotice<'a> {
     state: &'a mut crate::compaction::CompactionState,
     raw: crate::compaction::StoredTranscript<'a>,
     extra: &'a [Message],
+    anchor: Option<&'a crate::compaction::view::NoticeAnchor>,
     lineage_id: String,
     session: &'a broca_protocol::BindIdentity,
     model: &'a broca_protocol::ModelHandle,
@@ -8740,6 +8795,7 @@ impl<'a> ClosingNotice<'a> {
         state: Option<&'a mut crate::compaction::CompactionState>,
         raw: crate::compaction::StoredTranscript<'a>,
         extra: &'a [Message],
+        anchor: Option<&'a crate::compaction::view::NoticeAnchor>,
         writer: &WalHandle,
         session: &'a broca_protocol::BindIdentity,
         model: &'a broca_protocol::ModelHandle,
@@ -8752,6 +8808,7 @@ impl<'a> ClosingNotice<'a> {
             state: state?,
             raw,
             extra,
+            anchor,
             lineage_id: writer.lineage_id()?.to_string(),
             session,
             model,
@@ -8809,8 +8866,20 @@ impl<'a> ClosingNotice<'a> {
             self.request_bytes.saturating_add(appended),
             self.history,
         );
-        let through = extra.last().or_else(|| self.raw.newest())?;
-        let notice = crate::compaction::view::notice_through(
+        let raw_anchor = self
+            .raw
+            .newest()
+            .and_then(crate::compaction::view::notice_anchor);
+        let extra_anchor = extra
+            .last()
+            .and_then(crate::compaction::view::notice_anchor);
+        let through = self
+            .anchor
+            .into_iter()
+            .chain(raw_anchor.as_ref())
+            .chain(extra_anchor.as_ref())
+            .max_by_key(|anchor| anchor.ordinal)?;
+        let notice = crate::compaction::view::notice_at(
             self.state,
             through,
             crate::compaction::view::NoticeFacts {
@@ -11980,6 +12049,11 @@ mod approval_gate {
         live_scan: Arc<std::sync::Mutex<FeedProgress>>,
     }
     impl History {
+        #[cfg(test)]
+        pub(super) fn retained_base_len(&self) -> usize {
+            self.frames.base.len()
+        }
+
         pub fn new(
             writer: &WalHandle,
             frames: impl Into<Arc<Vec<broca_wal::FramedRecord>>>,
