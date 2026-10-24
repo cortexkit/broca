@@ -358,7 +358,9 @@ int main(int argc, char **argv) {
             scratch = self.tmp / "scratch"
             scratch.mkdir()
             env = dict(self.env, BUILT=built, BUILD_SCRATCH=str(scratch))
-            staged = subprocess.run(["bash", "-c", "set -euo pipefail\n" + source[start:end]],
+            # The slice skips the script's prologue, so load the helpers it calls, as the prologue does.
+            prologue = "set -euo pipefail\nsource scripts/nonshipping-markers.sh\n"
+            staged = subprocess.run(["bash", "-c", prologue + source[start:end]],
                                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
             self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
             seam = Path(self.env["HOME"]) / ".local/share/cortexkit/staging"
