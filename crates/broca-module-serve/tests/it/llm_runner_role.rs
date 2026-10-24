@@ -232,7 +232,21 @@ async fn tagged_open_tool_turn_read_bytes_are_pinned() {
         page["messages"][3]["tool_calls"][0]["tool_call_id"],
         "call-open"
     );
-    let body = normalized(&read.body, &run_id, lineage_id);
+    let mut body = normalized(&read.body, &run_id, lineage_id);
+    // Entry times are pinned by session_read.written_at.json. This golden pins the tag rows, so
+    // remove each recorded time from the envelope (the user message must carry one) and compare
+    // the rest.
+    for entry in page["messages"].as_array().unwrap() {
+        let ordinal = entry["ordinal"].as_u64().unwrap();
+        match entry["written_at"].as_u64() {
+            Some(at) => {
+                let timed = format!("\"written_at\":{at},\"ordinal\":{ordinal}");
+                assert_eq!(body.matches(&timed).count(), 1);
+                body = body.replace(&timed, &format!("\"ordinal\":{ordinal}"));
+            }
+            None => assert_ne!(ordinal, 0, "the user message has a recorded time"),
+        }
+    }
     let file = "session_read.tagged_open_tool_turn.json";
     if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
         std::fs::write(golden_path(file), format!("{body}\n")).unwrap();
