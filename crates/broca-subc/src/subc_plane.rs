@@ -83,6 +83,10 @@ const RELOAD_REOPEN_PATIENCE: RouteOpenPatience = RouteOpenPatience {
 /// first accepted `scope.sync`.
 pub const SCOPE_SYNC_HOLD: Duration = Duration::from_secs(45);
 
+/// How long a post that answers a held call may take before it is abandoned. The provider
+/// already owes an answer, so it is not doing the call's work again; it only hands it over.
+const LATEST_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The widest wait between attempts while holding on `scope_not_synced`. At the ordinary
 /// 100 ms interval a 45 s hold would be hundreds of route.open calls per waiting call; doubling
 /// up to 2 s keeps it to a few dozen while still noticing a sync within two seconds.
@@ -264,6 +268,32 @@ struct RouteKey {
     module_id: String,
 }
 
+/// Every cached route, split by who it belongs to.
+///
+/// A session's own routes are keyed by its bind triple; a delivery reuses one plane while naming
+/// only the session, so it can reach those without re-deriving the caller's other fields. A route
+/// whose target is module-wide (a provider feed, opened once for the whole process) is cached
+/// under the module alone, so one feed serves every session and never opens a second channel.
+#[derive(Default)]
+struct RouteIndex {
+    sessions: HashMap<RouteKey, RouteState>,
+    modules: HashMap<String, RouteState>,
+}
+
+impl RouteIndex {
+    fn get(&self, key: &RouteKey) -> Option<&RouteState> {
+        self.sessions.get(key)
+    }
+
+    fn module(&self, module_id: &str) -> Option<&RouteState> {
+        self.modules.get(module_id)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&RouteKey, &RouteState) -> bool) {
+        self.sessions.retain(|key, route| keep(key, route));
+    }
+}
+
 /// What one run has learned that holds for the rest of its calls.
 #[derive(Clone, Debug)]
 enum RunScopeLatch {
@@ -415,6 +445,21 @@ trait ToolPlaneConnection: Send + Sync {
         ))
     }
 
+    /// Send `body` on `route` exactly as given and return the provider's reply body. The late
+    /// result a provider must return in answer to a held call is body-shaped, not tool-shaped:
+    /// it carries no arguments, only the call key and the id it answers.
+    async fn tool_call_raw_late_result(
+        &self,
+        route: &RouteHandle,
+        body: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<serde_json::Value, ConnError> {
+        let _ = (route, body, deadline);
+        Err(ConnError::Protocol(
+            "late result delivery unavailable".into(),
+        ))
+    }
+
     async fn tool_call_staged(
         &self,
         route: &RouteHandle,
@@ -504,6 +549,16 @@ impl ToolPlaneConnection for SubcConnection {
         // One attempt: the plane's retry runs above this seam (`route_open_for_lifecycle`),
         // where its tests can script each attempt.
         SubcConnection::route_open_single_attempt(self, module_id, identity, scope).await
+    }
+
+    async fn tool_call_raw_late_result(
+        &self,
+        route: &RouteHandle,
+        body: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<serde_json::Value, ConnError> {
+        self.send_raw_tool_body(route, "late_result", body, deadline)
+            .await
     }
 
     async fn tool_call_approved(
@@ -626,7 +681,7 @@ type RegisteredKeys = HashMap<BatchRouteKey, HashMap<ToolCallId, (String, String
 pub struct SubcToolPlane {
     conn: Arc<dyn ToolPlaneConnection>,
     default_module_id: Option<String>,
-    routes: Mutex<HashMap<RouteKey, RouteState>>,
+    routes: Mutex<RouteIndex>,
     batch_routes: Mutex<BatchRouteMap>,
     batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
     approved_args: Mutex<HashMap<BatchRouteKey, HashMap<ToolCallId, ApprovedArgs>>>,
@@ -818,7 +873,7 @@ impl SubcToolPlane {
         Self {
             conn,
             default_module_id,
-            routes: Mutex::new(HashMap::new()),
+            routes: Mutex::new(RouteIndex::default()),
             batch_routes: Mutex::new(HashMap::new()),
             batch_presets: Mutex::new(HashMap::new()),
             approved_args: Mutex::new(HashMap::new()),
@@ -1176,7 +1231,7 @@ impl SubcToolPlane {
         let key = Self::route_key(&ctx.bind, ctx.scope.as_ref(), module_id);
         let mut routes = self.routes.lock().unwrap();
         if routes.get(&key).is_some_and(|route| route.handle == handle) {
-            routes.remove(&key);
+            routes.sessions.remove(&key);
         }
     }
 
@@ -1195,6 +1250,7 @@ impl SubcToolPlane {
             .routes
             .lock()
             .unwrap()
+            .sessions
             .iter()
             .filter(|(key, _)| key.session == session && key.scope == key_scope)
             .map(|(key, route)| (key.module_id.clone(), route.handle))
@@ -1976,7 +2032,7 @@ impl SubcToolPlane {
             if let Some(loser) = cached.loser_handle {
                 let _ = self.conn.route_close(&loser).await;
             } else {
-                self.routes.lock().unwrap().remove(&key);
+                self.routes.lock().unwrap().sessions.remove(&key);
                 let _ = self.conn.route_close(&cached.handle).await;
             }
             return Err(RouteEnsureError::Plane(ToolPlaneError::Unavailable(
@@ -2043,6 +2099,7 @@ impl SubcToolPlane {
             .routes
             .lock()
             .unwrap()
+            .sessions
             .remove(&key)
             .map(|route| route.handle);
         // A dead route usually means a module restarted or disappeared. The dispatch or external
@@ -2073,6 +2130,97 @@ impl SubcToolPlane {
         module_id: &str,
     ) -> Option<u16> {
         self.cached_route_channel_for_scope(bind, None, module_id)
+    }
+
+    /// The module a tool the session's frozen plan offered is dispatched to, or `None` when the
+    /// plan does not name it. Used to find a held call's provider from the call's own name.
+    pub fn tool_module(&self, ctx: &BatchCtx, tool: &str) -> Option<String> {
+        let manifests = self.batch_manifests.lock().unwrap();
+        manifests
+            .get(&Self::batch_route_key(ctx))
+            .and_then(|manifest| manifest.get(tool))
+            .and_then(|tool| tool.module.clone())
+    }
+
+    /// Post one late result to `module` as `call_key`, on a route opened once for the whole
+    /// process, and return the provider's reply body unchanged.
+    ///
+    /// A feed route is bound unscoped because the custodian comes from this process's consumer
+    /// identity, not from any session. Every session's late result for the module rides it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn post_late_result(
+        &self,
+        identity: &BindIdentity,
+        module: &str,
+        call_key: &str,
+        tool: &str,
+        args: &str,
+        tool_call_id: &str,
+        lifecycle: &CancellationToken,
+    ) -> Result<serde_json::Value, ToolPlaneError> {
+        let (route, _sem) = self
+            .shared_module_route(identity, module, lifecycle)
+            .await?;
+        // The provider answers a held call by re-sending the same tool call, keyed and with its
+        // saved argument bytes; the reply body is the result it owed.
+        let body = serde_json::json!({
+            "name": tool,
+            "arguments": serde_json::Value::Null,
+            "tool_call_id": tool_call_id,
+            "call_key": call_key,
+            "preset": serde_json::Value::Null,
+        })
+        .to_string()
+        .replacen("\"arguments\":null", &format!("\"arguments\":{args}"), 1);
+        self.conn
+            .tool_call_raw_late_result(&route, body.into_bytes(), LATEST_RESULT_TIMEOUT)
+            .await
+            .map_err(|error| ToolPlaneError::Unavailable(error.to_string()))
+    }
+
+    /// The one route this process holds to `module` for module-wide work, opened on first use.
+    async fn shared_module_route(
+        &self,
+        identity: &BindIdentity,
+        module: &str,
+        lifecycle: &CancellationToken,
+    ) -> Result<(RouteHandle, Arc<Semaphore>), ToolPlaneError> {
+        if let Some(route) = self.routes.lock().unwrap().module(module) {
+            return Ok((route.handle, Arc::clone(&route.sem)));
+        }
+        let handle = self
+            .conn
+            .route_open_dispatch(module, identity, None, self.provider_held.is_some())
+            .await
+            .map_err(|error| ToolPlaneError::Unavailable(error.to_string()))?;
+        if lifecycle.is_cancelled() {
+            let _ = self.conn.route_close(&handle).await;
+            return Err(ToolPlaneError::Unavailable(
+                "session closed while opening the feed route".into(),
+            ));
+        }
+        let sem = Arc::new(Semaphore::new(1));
+        let cached = {
+            let mut routes = self.routes.lock().unwrap();
+            match routes.modules.entry(module.to_owned()) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    Some((existing.get().handle, Arc::clone(&existing.get().sem)))
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(RouteState {
+                        handle,
+                        sem: Arc::clone(&sem),
+                        stamp: None,
+                    });
+                    None
+                }
+            }
+        };
+        if let Some((winner, winner_sem)) = cached {
+            let _ = self.conn.route_close(&handle).await;
+            return Ok((winner, winner_sem));
+        }
+        Ok((handle, sem))
     }
 
     /// The cached route channel for `bind` to `module_id` opened under `scope` (`None` for an
@@ -2137,12 +2285,13 @@ impl SubcToolPlane {
         let channels = {
             let mut routes = self.routes.lock().unwrap();
             let keys: Vec<RouteKey> = routes
+                .sessions
                 .keys()
                 .filter(|key| key.session == session)
                 .cloned()
                 .collect();
             keys.into_iter()
-                .filter_map(|key| routes.remove(&key).map(|route| route.handle))
+                .filter_map(|key| routes.sessions.remove(&key).map(|route| route.handle))
                 .collect::<Vec<_>>()
         };
         for handle in channels {
@@ -2799,13 +2948,13 @@ struct CachedRoute {
 }
 
 fn cache_route_state(
-    routes: &mut HashMap<RouteKey, RouteState>,
+    routes: &mut RouteIndex,
     key: RouteKey,
     handle: RouteHandle,
     sem: Arc<Semaphore>,
     stamp: Option<ScopeStamp>,
 ) -> CachedRoute {
-    match routes.entry(key) {
+    match routes.sessions.entry(key) {
         std::collections::hash_map::Entry::Vacant(entry) => {
             entry.insert(RouteState {
                 handle,
@@ -2830,7 +2979,7 @@ fn cache_route_state(
 }
 
 fn route_matches(
-    routes: &HashMap<RouteKey, RouteState>,
+    routes: &RouteIndex,
     key: &RouteKey,
     handle: RouteHandle,
     sem: &Arc<Semaphore>,
@@ -2992,6 +3141,12 @@ fn warm_bind_backoff(attempt: u32) -> Duration {
 /// JSON, while execution errors remain textual errors. A reply carrying none of `content`,
 /// `structuredContent` or `isError` is not CallToolResult-shaped and maps to an error quoting
 /// the (bounded) raw reply.
+/// Map a provider's reply body to the model-facing result without the `content/v1`
+/// transformation: the shape a non-opted-in tool's reply has always had.
+pub fn tool_result_from_provider_reply(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
+    map_call_tool_result(id, raw)
+}
+
 fn map_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
     let is_error = raw
         .get("isError")
@@ -5542,7 +5697,7 @@ mod tests {
         let key = route_key("/tmp/proj", "runner", "s1", "aft");
         let first_sem = Arc::new(Semaphore::new(1));
         let second_sem = Arc::new(Semaphore::new(2));
-        let mut routes = HashMap::new();
+        let mut routes = RouteIndex::default();
 
         let first_handle = RouteHandle::synthetic(11);
         let second_handle = RouteHandle::synthetic(12);
@@ -5582,11 +5737,11 @@ mod tests {
         let key = route_key("/tmp/proj", "runner", "s1", "aft");
         let old_sem = Arc::new(Semaphore::new(1));
         let new_sem = Arc::new(Semaphore::new(1));
-        let mut routes = HashMap::new();
+        let mut routes = RouteIndex::default();
 
         let old_handle = RouteHandle::synthetic_epoch(11, 1);
         let new_handle = RouteHandle::synthetic_epoch(11, 2);
-        routes.insert(
+        routes.sessions.insert(
             key.clone(),
             RouteState {
                 handle: old_handle,
@@ -5594,7 +5749,7 @@ mod tests {
                 stamp: None,
             },
         );
-        routes.insert(
+        routes.sessions.insert(
             key.clone(),
             RouteState {
                 handle: new_handle,
@@ -6902,7 +7057,7 @@ mod approved_queue_contract_tests {
                 run_id: broca_protocol::RunId("run".into()),
                 scope: None,
             };
-            plane.routes.lock().unwrap().insert(
+            plane.routes.lock().unwrap().sessions.insert(
                 SubcToolPlane::route_key(&ctx.bind, None, "aft"),
                 RouteState {
                     handle: route,
@@ -6998,7 +7153,7 @@ mod approved_queue_contract_tests {
             run_id: broca_protocol::RunId("run".into()),
             scope: None,
         };
-        plane.routes.lock().unwrap().insert(
+        plane.routes.lock().unwrap().sessions.insert(
             SubcToolPlane::route_key(&ctx.bind, None, "aft"),
             RouteState {
                 handle: route,
@@ -7038,7 +7193,7 @@ mod approved_queue_contract_tests {
             run_id: broca_protocol::RunId("run".into()),
             scope: None,
         };
-        plane.routes.lock().unwrap().insert(
+        plane.routes.lock().unwrap().sessions.insert(
             SubcToolPlane::route_key(&ctx.bind, None, "aft"),
             RouteState {
                 handle: route,
@@ -7074,7 +7229,7 @@ mod approved_queue_contract_tests {
                 run_id: broca_protocol::RunId("run".into()),
                 scope: None,
             };
-            plane.routes.lock().unwrap().insert(
+            plane.routes.lock().unwrap().sessions.insert(
                 SubcToolPlane::route_key(&ctx.bind, None, "aft"),
                 RouteState {
                     handle: route,

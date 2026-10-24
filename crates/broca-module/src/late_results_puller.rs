@@ -48,15 +48,19 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const FEED_HARNESS: &str = "broca";
 const FEED_SESSION: &str = "late-results";
 
-/// The provider feed one puller pulls, reduced to what the intake acts on.
+/// The provider feeds the intake pulls, reduced to what it acts on.
 #[async_trait]
 pub trait LateResultsFeed: Send + Sync {
+    /// Pull the entries after `since` for one provider module. Fragments filled in by the
+    /// callee (its cursor, whether more wait) stay as given.
     async fn pull(
         &self,
+        module: &str,
         since: Option<&Cursor>,
         limit: Option<u32>,
     ) -> Result<FeedReply, FeedError>;
-    async fn ack(&self, through: &Cursor) -> Result<(), FeedError>;
+    /// Acknowledge one provider module's entries through a cursor it returned.
+    async fn ack(&self, module: &str, through: &Cursor) -> Result<(), FeedError>;
 }
 
 /// One `late_results` reply.
@@ -438,7 +442,7 @@ impl LateResultsIntake {
             .map_err(FeedError::Retryable)?
             .and_then(|row| row.position);
         if !puller.pinned().is_empty() {
-            let reply = self.pull(read_from.as_ref(), None).await?;
+            let reply = self.pull(module, read_from.as_ref(), None).await?;
             read_from = Some(FeedPosition {
                 provider_incarnation: reply.cursor.provider_incarnation.clone(),
                 seq: reply.cursor.seq,
@@ -467,7 +471,7 @@ impl LateResultsIntake {
             // A feed with no acked position yet is read from its start: `None` names no cursor,
             // and every cursor broca sends is one the provider returned.
             let from = read_from.clone();
-            let reply = self.pull(from.as_ref(), None).await?;
+            let reply = self.pull(module, from.as_ref(), None).await?;
             let next = Some(FeedPosition {
                 provider_incarnation: reply.cursor.provider_incarnation.clone(),
                 seq: reply.cursor.seq,
@@ -497,11 +501,12 @@ impl LateResultsIntake {
 
     async fn pull(
         &self,
+        module: &str,
         since: Option<&FeedPosition>,
         limit: Option<u32>,
     ) -> Result<FeedReply, FeedError> {
         let cursor = since.map(FeedPosition::cursor);
-        self.feed.pull(cursor.as_ref(), limit).await
+        self.feed.pull(module, cursor.as_ref(), limit).await
     }
 
     /// Nothing is acked before its durable write: every entry is delivered or classed first. The
@@ -772,7 +777,7 @@ impl LateResultsIntake {
     ) -> Result<(), FeedError> {
         // Every entry of the page is already durable before the ack: the puller delivers each
         // one as it settles, so the ack never stands in for a missing terminal.
-        self.feed.ack(cursor).await?;
+        self.feed.ack(module, cursor).await?;
         self.store
             .record_ack(
                 module,
@@ -804,7 +809,7 @@ impl LateResultsIntake {
         let since = since.map(FeedPosition::cursor);
         let reply = self
             .feed
-            .pull(since.as_ref(), Some(prefix.len() as u32))
+            .pull(module, since.as_ref(), Some(prefix.len() as u32))
             .await?;
         let keys: Vec<IntakeKey> = reply.entries.iter().map(|e| e.intake_key(module)).collect();
         let expected: Vec<IntakeKey> = prefix.iter().map(|e| e.intake_key(module)).collect();
@@ -823,7 +828,7 @@ impl LateResultsIntake {
         self.deliver_settled(module, &reply.entries, &rows)
             .await
             .map_err(FeedError::Retryable)?;
-        self.feed.ack(&reply.cursor).await?;
+        self.feed.ack(module, &reply.cursor).await?;
         self.store
             .record_ack(
                 module,
@@ -1096,13 +1101,14 @@ impl UnavailableFeed {
 impl LateResultsFeed for UnavailableFeed {
     async fn pull(
         &self,
+        _module: &str,
         _since: Option<&Cursor>,
         _limit: Option<u32>,
     ) -> Result<FeedReply, FeedError> {
         Err(FeedError::Retryable(self.reason.clone()))
     }
 
-    async fn ack(&self, _through: &Cursor) -> Result<(), FeedError> {
+    async fn ack(&self, _module: &str, _through: &Cursor) -> Result<(), FeedError> {
         Err(FeedError::Retryable(self.reason.clone()))
     }
 }
@@ -1177,6 +1183,7 @@ mod tests {
     impl LateResultsFeed for ScriptedFeed {
         async fn pull(
             &self,
+            _module: &str,
             since: Option<&Cursor>,
             limit: Option<u32>,
         ) -> Result<FeedReply, FeedError> {
@@ -1191,7 +1198,7 @@ mod tests {
             Ok(replies.remove(0))
         }
 
-        async fn ack(&self, through: &Cursor) -> Result<(), FeedError> {
+        async fn ack(&self, _module: &str, through: &Cursor) -> Result<(), FeedError> {
             self.acks.lock().unwrap().push(through.clone());
             Ok(())
         }

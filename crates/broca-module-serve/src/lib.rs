@@ -31,6 +31,7 @@ pub mod compaction_bus;
 pub mod config_home;
 pub mod consumer_routes;
 pub mod context_management;
+pub mod held_runtime;
 pub mod keep_warm_quota;
 pub mod manifest;
 pub mod opencode_go_identity;
