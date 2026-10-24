@@ -28,6 +28,7 @@ pub mod input_budget;
 pub mod lease;
 pub mod media_store;
 pub mod media_validation;
+pub mod model_step_fact;
 pub mod placement;
 pub mod projection;
 mod projection_health;

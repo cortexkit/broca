@@ -278,11 +278,24 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let _archive_timer = archive_config.spawn(state_root.clone());
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
-    let mut wal_store =
-        FileWalStore::new(state_root.join("wal")).with_backup_classes(backup_classes.0);
-    if bus_event_config.enabled {
-        wal_store = wal_store.with_durable_observer(bus_hints.observer());
-    }
+    // Every durable barrier also tells the model step fact writer which session moved, so a
+    // committed step reaches the usage export within a pass of becoming durable. The WAL store
+    // holds one observer, so with run events on it calls both.
+    let model_step_hints = Arc::new(broca_module_serve::model_step_facts::Hints::default());
+    let model_step_observer = model_step_hints.observer();
+    let durable_observer: Arc<broca_core::wal_writer::DurableWalObserver> =
+        if bus_event_config.enabled {
+            let bus_observer = bus_hints.observer();
+            Arc::new(move |session, seq, lineage| {
+                bus_observer(session, seq, lineage);
+                model_step_observer(session, seq, lineage);
+            })
+        } else {
+            model_step_observer
+        };
+    let wal_store = FileWalStore::new(state_root.join("wal"))
+        .with_backup_classes(backup_classes.0)
+        .with_durable_observer(durable_observer);
     let wal_store = Arc::new(wal_store);
     let crash_orphan_wal = wal_store.clone();
     let run_index = Arc::new(
@@ -728,6 +741,16 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Per-step diagnostics for the usage export (`kind: "model_step"`), written off the request
+    // path from durable WAL ranges; also backfills the last 30 days on the first start and
+    // deletes step facts after 30 days. Never spend: nothing in billing reads them.
+    let _model_step_facts = broca_module_serve::model_step_facts::Service {
+        store: run_index.clone(),
+        wal: crash_orphan_wal.clone(),
+        hints: model_step_hints,
+        stop: bus_stop.clone(),
+    }
+    .spawn();
     let _bus_events = broca_module_serve::bus_events::Service {
         config: bus_event_config,
         store: run_index.clone(),
