@@ -1242,6 +1242,37 @@ and "no reverse-request handler is registered for <family>", the same reply the 
 consumer SDK sends. It never reaches a pending call, even one with the same corr, and each
 refusal is counted in `health.check` as `reverse_requests_refused`.
 
+**Provider-held dispatch is a fail-closed integration seam, not enabled runtime support.**
+`SubcToolPlane::with_provider_held_support` requires intake, lifecycle and per-batch typed
+catalog sources together, before any route is warmed. Until they are installed, tool route
+opens declare neither `content/v1` nor `held-reply/v1` and keep their previous bytes. Once
+installed, tool-dispatch routes declare both together; role and plan-fetch routes still
+declare neither. A reply carrying `held` on an undeclared route becomes a malformed-reply
+error result with reason `malformed_provider_held_reply`, without pausing or exposing its
+interim content to the model.
+
+The core batch passes durable intent keys through its keyed dispatch methods and registers
+each dispatch group before sending it. The adapter sends plain keys only to providers that
+declare `late_results`, on a consumer-identity connection. Approved calls keep their deferred
+key and exact argument bytes. With support installed, the adapter requires a synced intake
+registration before sending either kind of key to a late-results provider. The standalone
+registration backend is `broca_store::late_results_store::LateResultsStore`; it implements
+the core intake trait with one fully synced SQLite transaction per group. Registration alone
+does not start a puller. An accepted held reply first syncs the batch's
+`ToolCallProviderHeld` record, then enters the installed lifecycle's waiting slot. Only an
+eventual terminal can return as a model-facing result.
+
+The later held-lifecycle/runtime-wiring slice must install these seams, not this dispatch
+slice. Before enabling either capability, that slice must implement replay, pause/resume,
+delivery, registration pruning and module puller ownership, and make `provider-held/v1` a
+known reader feature. It must also freeze each provider's `result_format` and `late_results`
+declarations into the stored plan manifest at admission: the current stored manifest retains
+neither. First pin existing manifest bytes in a separate commit, then add optional fields,
+omitted when undeclared, behind a named must-understand feature required only when present.
+Fresh dispatch and resume must read only those frozen declarations, never a later global
+catalog or caller-declared tools. The per-batch catalog seam fails closed when a provider's
+catalog is absent; it is not permission to fetch mutable declarations at dispatch time.
+
 ## 20. Persistence + storage
 
 ```

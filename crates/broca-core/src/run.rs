@@ -7519,6 +7519,8 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         });
     }
 
+    register_dispatch_plans(tool_plane, &ctx, plan.iter()).await?;
+
     // Sequential if ANY dispatched call's tool forces it; else parallel.
     let any_sequential = plan.iter().any(|p| match p {
         CallPlan::Dispatch(c) => {
@@ -7530,6 +7532,13 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
         _ => false,
     });
 
+    let recording_plane = ProviderHeldPlane {
+        inner: tool_plane,
+        writer,
+        ctx: &ctx,
+        sequential: any_sequential,
+    };
+    let tool_plane = &recording_plane;
     let mut resolutions = crate::keep_warm_wait::wait_tools(
         async {
             let resolutions: Vec<CallResolution> = if any_sequential {
@@ -7819,6 +7828,152 @@ fn unsent_stop_cause(cancel: Option<&CancellationToken>) -> BatchInterruption {
     }
 }
 
+async fn register_dispatch_plans<'a>(
+    plane: &impl ToolPlane,
+    ctx: &BatchCtx,
+    plans: impl Iterator<Item = &'a CallPlan>,
+) -> Result<(), RunError> {
+    let calls: Vec<_> = plans
+        .filter_map(|plan| match plan {
+            CallPlan::Dispatch(call) => {
+                call.call_key
+                    .as_ref()
+                    .map(|key| crate::tool_plane::DispatchRegistration {
+                        tool_call_id: call.tool_call_id.clone(),
+                        call_key: key.clone(),
+                        approved: call.approved.is_some(),
+                    })
+            }
+            _ => None,
+        })
+        .collect();
+    if !calls.is_empty() {
+        plane
+            .register_dispatch_group(ctx, &calls)
+            .await
+            .map_err(|error| RunError::Wal(format!("late-results registration: {error}")))?;
+    }
+    Ok(())
+}
+
+/// Keeps the batch's WAL writer on the held path, before the adapter can join a waiting slot.
+struct ProviderHeldPlane<'a, T> {
+    inner: &'a T,
+    writer: &'a WalHandle,
+    ctx: &'a BatchCtx,
+    sequential: bool,
+}
+
+#[async_trait::async_trait]
+impl<T: ToolPlane> crate::tool_plane::ProviderHeldRecorder for ProviderHeldPlane<'_, T> {
+    async fn sync_held(&self, reply: &crate::tool_plane::ProviderHeldReply) -> Result<(), String> {
+        self.writer
+            .record(WalRecord::ToolCallProviderHeld {
+                batch_id: self.ctx.batch_id.clone(),
+                tool_call_id: reply.tool_call_id.clone(),
+                call_key: reply.call_key.clone(),
+                module: reply.module.clone(),
+                reason: reply.reason.clone(),
+                detail_digest: reply.detail_digest.clone(),
+                held_at_ms: epoch_millis().unwrap_or(0),
+                sequential: self.sequential,
+            })
+            .into_result()
+            .map_err(|error| error.to_string())?;
+        self.writer
+            .sync()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
+    async fn batch_started(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+    ) -> Result<(), ToolPlaneError> {
+        self.inner.batch_started(ctx, calls, manifest).await
+    }
+    async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+        self.inner.batch_finished(ctx).await
+    }
+    fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
+        self.inner.dispatch_target(ctx, id)
+    }
+    async fn register_dispatch_group(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[crate::tool_plane::DispatchRegistration],
+    ) -> Result<(), ToolPlaneError> {
+        self.inner.register_dispatch_group(ctx, calls).await
+    }
+    async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        self.inner.dispatch(ctx, call).await
+    }
+    async fn dispatch_keyed(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: crate::tool_plane::DispatchKey<'_>,
+    ) -> DispatchResult {
+        self.inner
+            .dispatch_keyed(
+                ctx,
+                call,
+                crate::tool_plane::DispatchKey {
+                    call_key: key.call_key,
+                    held_recorder: Some(self),
+                },
+            )
+            .await
+    }
+    async fn dispatch_approved(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        args: &str,
+        key: &str,
+        signals: &crate::tool_plane::DispatchSignals,
+    ) -> DispatchResult {
+        self.inner
+            .dispatch_approved(ctx, call, args, key, signals)
+            .await
+    }
+    async fn dispatch_approved_keyed(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        args: &str,
+        key: crate::tool_plane::DispatchKey<'_>,
+        signals: &crate::tool_plane::DispatchSignals,
+    ) -> DispatchResult {
+        self.inner
+            .dispatch_approved_keyed(
+                ctx,
+                call,
+                args,
+                crate::tool_plane::DispatchKey {
+                    call_key: key.call_key,
+                    held_recorder: Some(self),
+                },
+                signals,
+            )
+            .await
+    }
+    async fn recheck_approval_scope(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        module: Option<&str>,
+    ) -> Result<(), ToolPlaneError> {
+        self.inner.recheck_approval_scope(ctx, call, module).await
+    }
+}
+
 /// Execute one planned call, classifying the dispatch outcome:
 ///  - `Completed`  → the definite result, recorded as `Completed`.
 ///  - `NotSent`    → the request never left, so it's a safe graceful `is_error`;
@@ -7882,21 +8037,42 @@ async fn resolve<T: ToolPlane>(
             let result = match approved {
                 Some(bytes) => {
                     tool_plane
-                        .dispatch_approved(
+                        .dispatch_approved_keyed(
                             ctx,
                             &call,
                             &bytes,
-                            key.as_deref().expect("approved call has Prepared key"),
+                            crate::tool_plane::DispatchKey {
+                                call_key: key.as_deref().expect("approved call has Prepared key"),
+                                held_recorder: None,
+                            },
                             &crate::tool_plane::DispatchSignals::new(cancel, stop),
                         )
                         .await
                 }
-                None => tool_plane.dispatch(ctx, &call).await,
+                None => match key.as_deref() {
+                    Some(call_key) => {
+                        tool_plane
+                            .dispatch_keyed(
+                                ctx,
+                                &call,
+                                crate::tool_plane::DispatchKey {
+                                    call_key,
+                                    held_recorder: None,
+                                },
+                            )
+                            .await
+                    }
+                    None => tool_plane.dispatch(ctx, &call).await,
+                },
             };
             match result {
                 DispatchResult::Completed(result) => {
+                    let malformed_held = matches!(&result.output, ToolOutput::Error { message } if message.starts_with("malformed provider-held reply:"));
                     let mut resolution =
                         CallResolution::plain(result, Some(DispatchOutcome::Completed));
+                    if malformed_held {
+                        resolution.reason = Some("malformed_provider_held_reply".into());
+                    }
                     resolution.plane_subject = true;
                     resolution
                 }
@@ -9205,6 +9381,178 @@ mod tests {
 
     struct RecordingWal {
         records: Arc<std::sync::Mutex<Vec<WalRecord>>>,
+    }
+
+    struct HeldProbePlane {
+        durable_head: Arc<std::sync::atomic::AtomicU64>,
+        groups: std::sync::Mutex<Vec<Vec<crate::tool_plane::DispatchRegistration>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolPlane for HeldProbePlane {
+        async fn batch_started(
+            &self,
+            _: &BatchCtx,
+            _: &[ToolCall],
+            _: &ToolManifest,
+        ) -> Result<(), ToolPlaneError> {
+            Ok(())
+        }
+        async fn batch_finished(&self, _: &BatchCtx) -> Result<(), ToolPlaneError> {
+            Ok(())
+        }
+        async fn dispatch(&self, _: &BatchCtx, _: &ToolCall) -> DispatchResult {
+            panic!("durable call key was dropped")
+        }
+        async fn register_dispatch_group(
+            &self,
+            _: &BatchCtx,
+            calls: &[crate::tool_plane::DispatchRegistration],
+        ) -> Result<(), ToolPlaneError> {
+            self.groups.lock().unwrap().push(calls.to_vec());
+            Ok(())
+        }
+        async fn dispatch_keyed(
+            &self,
+            _: &BatchCtx,
+            call: &ToolCall,
+            key: crate::tool_plane::DispatchKey<'_>,
+        ) -> DispatchResult {
+            assert_eq!(self.groups.lock().unwrap().len(), 1);
+            key.held_recorder
+                .expect("batch supplies its writer")
+                .sync_held(&crate::tool_plane::ProviderHeldReply {
+                    tool_call_id: call.tool_call_id.clone(),
+                    call_key: key.call_key.into(),
+                    module: "provider".into(),
+                    reason: "running".into(),
+                    detail_digest: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                self.durable_head.load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "held record must be synced before acting"
+            );
+            DispatchResult::Completed(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Text {
+                    text: "late terminal".into(),
+                },
+                is_error: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_held_dispatch_syncs_its_record_before_acting() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: records.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        writer.seed_lineage_tags(Some(crate::tags::LineageTags::Off));
+        let ctx = BatchCtx {
+            batch_id: BatchId("batch".into()),
+            bind: BindIdentity::new("/project", "broca", "session"),
+            run_id: RunId("run".into()),
+            scope: None,
+        };
+        let inner = HeldProbePlane {
+            durable_head: writer.durable_head(),
+            groups: Default::default(),
+        };
+        let plane = ProviderHeldPlane {
+            inner: &inner,
+            writer: &writer,
+            ctx: &ctx,
+            sequential: true,
+        };
+        let mut dispatch = PlannedDispatch::from(ToolCall {
+            tool_call_id: ToolCallId("call".into()),
+            tool_name: "tool".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        });
+        dispatch.call_key = Some("lineage:19".into());
+        let plan = CallPlan::Dispatch(dispatch);
+        register_dispatch_plans(&plane, &ctx, std::iter::once(&plan))
+            .await
+            .unwrap();
+        let result = resolve(plan, &ctx, &plane, None, None).await;
+        assert_eq!(
+            result.result.output,
+            ToolOutput::Text {
+                text: "late terminal".into()
+            }
+        );
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        assert!(
+            matches!(&records[0], WalRecord::ToolCallProviderHeld { batch_id, tool_call_id, call_key, module, reason, sequential: true, .. }
+            if batch_id == &ctx.batch_id && tool_call_id.0 == "call" && call_key == "lineage:19" && module == "provider" && reason == "running")
+        );
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_provider_held_reply_is_recorded_as_refused_without_pausing() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(RecordingWal {
+                records: records.clone(),
+            }),
+            1,
+        )
+        .unwrap();
+        writer.seed_lineage_tags(Some(crate::tags::LineageTags::Off));
+        let call = ToolCall {
+            tool_call_id: ToolCallId("call".into()),
+            tool_name: "tool".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let manifest = ToolManifest::from_tools(vec![serde_json::from_value(serde_json::json!({"name":"tool","description":"","input_schema":{},"execution_mode":"parallel"})).unwrap()]);
+        let plane = crate::StubToolPlane::new().with_tool("tool", |_| {
+            crate::StubReply::Output(ToolOutput::Error {
+                message: "malformed provider-held reply: prerequisites not met".into(),
+            })
+        });
+        let (out, _events) = mpsc::channel(64);
+        let outcome = dispatch_batch(
+            &RunId("run".into()),
+            StepId(1),
+            &BindIdentity::new("/project", "broca", "session"),
+            None,
+            vec![call],
+            &manifest,
+            &plane,
+            &crate::AllowAll,
+            &writer,
+            None,
+            &[],
+            false,
+            None,
+            None,
+            None,
+            &out,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.interruption.is_none());
+        assert!(outcome.open.is_empty());
+        let records = records.lock().unwrap().clone();
+        assert!(records.iter().any(|record| matches!(record, WalRecord::ToolResult { reason: Some(reason), .. } if reason == "malformed_provider_held_reply")));
+        assert!(!records.iter().any(|record| matches!(
+            record,
+            WalRecord::RunPaused { .. } | WalRecord::ToolCallProviderHeld { .. }
+        )));
+        writer.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -11338,6 +11686,7 @@ mod approval_gate {
             _ => return Ok(()),
         }
         writer.sync().await?;
+        register_dispatch_plans(plane, ctx, std::iter::once(&*plan)).await?;
         Ok(())
     }
 
@@ -11615,6 +11964,13 @@ mod approval_gate {
         sequential: bool,
         restart: bool,
     ) -> Result<Option<BatchInterruption>, RunError> {
+        let recording_plane = ProviderHeldPlane {
+            inner: plane,
+            writer,
+            ctx,
+            sequential,
+        };
+        let plane = &recording_plane;
         let mut jobs: FuturesUnordered<Job<'_>> = FuturesUnordered::new();
         let mut active = HashSet::new();
         let mut dispatched = HashSet::new();
@@ -12006,6 +12362,7 @@ mod approval_gate {
                                 dispatch.call_key = Some(held.key.clone());
                                 dispatch.approved = Some(bytes);
                                 let plan = if stopped_after_intent { CallPlan::Stopped(dispatch.tool_call_id.clone()) } else { CallPlan::Dispatch(dispatch) };
+                                register_dispatch_plans(plane, &held.ctx(ctx), std::iter::once(&plan)).await?;
                                 jobs.push(Box::pin(async move {
                                     let resolution = resolve_hooked(plan, index, step, &held.ctx(ctx), plane, before_send_cancel, control.stop_requested.as_ref(), hooks).await;
                                     (index, Work::Dispatched(resolution))
@@ -13000,6 +13357,21 @@ mod approval_gate {
         if late_stopped(control) {
             return DispatchResult::NotSent {
                 reason: "late_execution_stopped".into(),
+            };
+        }
+        if let Err(error) = plane
+            .register_dispatch_group(
+                ctx,
+                &[crate::tool_plane::DispatchRegistration {
+                    tool_call_id: call.tool_call_id.clone(),
+                    call_key: key.into(),
+                    approved: true,
+                }],
+            )
+            .await
+        {
+            return DispatchResult::NotSent {
+                reason: error.to_string(),
             };
         }
         plane

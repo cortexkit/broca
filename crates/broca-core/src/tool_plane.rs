@@ -39,6 +39,66 @@ pub struct BatchCtx {
     pub scope: Option<SessionScope>,
 }
 
+/// A durable intent's identity, prepared as part of one dispatch barrier.
+#[derive(Debug, Clone)]
+pub struct DispatchRegistration {
+    pub tool_call_id: ToolCallId,
+    pub call_key: String,
+    pub approved: bool,
+}
+
+/// Ownership needed to find a call's WAL without consulting the run index.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LateResultRegistration {
+    pub lineage: String,
+    pub call_key: String,
+    pub module: String,
+    pub bind: BindIdentity,
+    pub scope: Option<SessionScope>,
+}
+
+/// The intake implementation must commit and sync the entire group before returning success.
+/// Registering calls does not start a feed reader: ordinary calls may never be held.
+#[async_trait]
+pub trait LateResultsIntake: Send + Sync {
+    async fn register_group(&self, calls: &[LateResultRegistration]) -> Result<(), String>;
+}
+
+/// The first reply's durable metadata. Interim content is deliberately not representable here.
+#[derive(Debug, Clone)]
+pub struct ProviderHeldReply {
+    pub tool_call_id: ToolCallId,
+    pub call_key: String,
+    pub module: String,
+    pub reason: String,
+    pub detail_digest: Option<String>,
+}
+
+/// The batch's single WAL writer acknowledges this only after the held record is synced.
+#[async_trait]
+pub trait ProviderHeldRecorder: Send + Sync {
+    async fn sync_held(&self, reply: &ProviderHeldReply) -> Result<(), String>;
+}
+
+/// Installed together with intake before a tool route may declare held-reply support.
+/// Called only after the batch has synced the held record. The implementation owns the
+/// live/paused waiting slot, and returns only the eventual terminal, never interim content.
+#[async_trait]
+pub trait ProviderHeldLifecycle: Send + Sync {
+    async fn wait(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        reply: &ProviderHeldReply,
+    ) -> DispatchResult;
+}
+
+#[derive(Clone, Copy)]
+pub struct DispatchKey<'a> {
+    pub call_key: &'a str,
+    pub held_recorder: Option<&'a dyn ProviderHeldRecorder>,
+}
+
 /// A failure of the tool PLANE itself (transport/route), distinct from a tool
 /// EXECUTION failure (which is a `ToolResult { is_error }`, conversation data).
 /// The loop stays graceful on these — it synthesizes `is_error` results so the
@@ -185,6 +245,37 @@ pub trait ToolPlane: Send + Sync {
     /// (ambiguous — side effect may have applied) so the loop can treat each case
     /// correctly (retry the safe one, stop the run on the ambiguous one).
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult;
+
+    /// Register every eligible key in one synced intake transaction before dispatching
+    /// any member of the group. Adapters without late results keep their existing path.
+    async fn register_dispatch_group(
+        &self,
+        _ctx: &BatchCtx,
+        _calls: &[DispatchRegistration],
+    ) -> Result<(), ToolPlaneError> {
+        Ok(())
+    }
+
+    async fn dispatch_keyed(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        _key: DispatchKey<'_>,
+    ) -> DispatchResult {
+        self.dispatch(ctx, call).await
+    }
+
+    async fn dispatch_approved_keyed(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        args_jcs: &str,
+        key: DispatchKey<'_>,
+        signals: &DispatchSignals,
+    ) -> DispatchResult {
+        self.dispatch_approved(ctx, call, args_jcs, key.call_key, signals)
+            .await
+    }
 
     /// Dispatch approved arguments without parsing and reserializing them. Adapters must
     /// preserve `args_jcs` verbatim and forward the deferred call's `call_key`. Core verifies
