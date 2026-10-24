@@ -496,4 +496,18 @@ fn projected_episode_metadata_equals_a_full_wal_replay() {
         }
     }
     assert!(recorded > 0, "the projection records episode coordinates");
+
+    // Values computed at an older watermark than the transcript are not current: the store
+    // reports them as absent, so a resume replays the WAL instead of rendering them.
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute("UPDATE meta SET episode_metadata_seq=watermark_seq-1", [])
+        .unwrap();
+    assert_eq!(
+        MaterializedStore::read_episode_projection(&store, &session).expect("read"),
+        None,
+        "episode metadata from an older watermark is not reused"
+    );
 }

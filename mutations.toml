@@ -26899,7 +26899,7 @@ package = "broca-store"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-store/src/conformance/model_history.rs"
-expect_red = ["conformance::model_history::stale_episode_metadata_replays_and_repairs_instead_of_reusing_old_counters"]
+expect_red = ["conformance::model_history::projected_episode_metadata_equals_a_full_wal_replay"]
 file = "crates/broca-store/src/lib.rs"
 old = "        json.filter(|_| seq == Some(watermark))"
 new = "        json.filter(|_| { let _ = (seq, watermark); true }) // NON-VACUITY BREAK: accept stale episode values"
