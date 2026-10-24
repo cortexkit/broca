@@ -8026,6 +8026,7 @@ mod tests {
             let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
             let mut records = vec![
                 WalRecord::RunStarted {
+                    written_at_ms: None,
                     tags: None,
                     session_class: None,
                     retention: None,
@@ -8049,6 +8050,7 @@ mod tests {
                     submission_id: None,
                 },
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: broca_protocol::StepId(1),

@@ -27019,6 +27019,21 @@ new = '''#[serde(default)] // NON-VACUITY BREAK
     pub model: Option<cortexkit_role_llm_runner::read::HeadModel>,'''
 
 [[control]]
+id = "head-additions-populated-legacy-bytes"
+select = "expected"
+guards = "populated session heads preserve the pre-addition lineage metadata bytes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_legacy_bytes"
+test_file = "crates/broca-module-serve/tests/head_legacy_bytes.rs"
+expect_red = ["populated_head_preserves_pre_addition_reply_bytes"]
+file = "crates/broca-wire/src/role.rs"
+old = '''#[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_ordinal: Option<u64>,'''
+new = '''#[serde(default, skip_serializing)] // NON-VACUITY BREAK
+    pub first_ordinal: Option<u64>,'''
+
+[[control]]
 id = "message-times-envelope-placement"
 select = "expected"
 guards = "recorded times appear on default read entries and never inside opaque messages"

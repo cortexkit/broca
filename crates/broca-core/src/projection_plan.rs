@@ -368,7 +368,8 @@ pub fn plan_projection(
             })
             .map(|frame| &frame.record),
         time_placement,
-        incremental_seed.as_ref()
+        incremental_seed
+            .as_ref()
             .and_then(|seed| seed.admission_checkpoint.head.as_ref())
             .map(|head| head.queued_times().clone())
             .unwrap_or_default(),
