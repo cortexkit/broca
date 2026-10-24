@@ -710,12 +710,29 @@ mod tests {
     ///
     /// The first pass used to wait a full interval from the process's own start, so a daemon
     /// restarted more often than the interval never ran it and never gained an anchor. The
-    /// short poll must still not fold every time: this runs in real time with a 20 ms poll
-    /// against a 24-hour interval, and exactly one pass may be recorded.
+    /// short poll must still not fold every time: with a 20 ms poll against a 24-hour interval,
+    /// the first pass is awaited as an observed event (a loaded runner can take longer than any
+    /// fixed sleep to finish it), then twenty more polls' worth of time must add no second pass.
     #[tokio::test]
     async fn a_never_folded_tree_folds_once_on_its_first_poll() {
         let root = TempRoot::new().unwrap();
         std::fs::create_dir(root.path().join("wal")).unwrap();
+        let archive = root.path().join("wal-archive");
+        let passes = move || {
+            std::fs::read_dir(&archive)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .path()
+                                .extension()
+                                .is_some_and(|ext| ext == "ark" || ext == "journal")
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
         let task = WalArchiveConfig { days: Some(30) }
             .spawn_every(
                 root.path().to_owned(),
@@ -723,23 +740,22 @@ mod tests {
                 Duration::from_millis(20),
             )
             .unwrap();
+        broca_test_support::wait_until("the first fold pass to be recorded", || {
+            let seen = passes();
+            async move {
+                if seen >= 1 {
+                    Ok(())
+                } else {
+                    Err(format!("{seen} pass(es) recorded"))
+                }
+            }
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         task.abort();
-        let passes = std::fs::read_dir(root.path().join("wal-archive"))
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .is_some_and(|ext| ext == "ark" || ext == "journal")
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
         assert_eq!(
-            passes, 1,
+            passes(),
+            1,
             "a never-folded tree must run exactly one pass, on its first poll"
         );
     }
