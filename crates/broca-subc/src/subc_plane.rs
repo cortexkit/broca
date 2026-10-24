@@ -368,6 +368,19 @@ impl Fence {
 
 #[async_trait]
 trait ToolPlaneConnection: Send + Sync {
+    fn consumer_module_id(&self) -> Option<&str> {
+        None
+    }
+
+    async fn route_open_dispatch(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: Option<&ScopeSelector>,
+        _provider_held_installed: bool,
+    ) -> Result<RouteHandle, ConnError> {
+        self.route_open(module_id, identity, scope).await
+    }
     async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError>;
 
     async fn route_open(
@@ -408,6 +421,7 @@ trait ToolPlaneConnection: Send + Sync {
         call: &ToolCall,
         deadline: Duration,
         preset: Option<&str>,
+        _call_key: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.tool_call(
             route,
@@ -437,12 +451,27 @@ trait ToolPlaneConnection: Send + Sync {
 
 #[async_trait]
 impl ToolPlaneConnection for SubcConnection {
+    fn consumer_module_id(&self) -> Option<&str> {
+        SubcConnection::consumer_module_id(self)
+    }
+
+    async fn route_open_dispatch(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: Option<&ScopeSelector>,
+        provider_held_installed: bool,
+    ) -> Result<RouteHandle, ConnError> {
+        self.route_open_dispatch_single_attempt(module_id, identity, scope, provider_held_installed)
+            .await
+    }
     async fn tool_call_staged(
         &self,
         route: &RouteHandle,
         call: &ToolCall,
         deadline: Duration,
         preset: Option<&str>,
+        call_key: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         let args = serde_json::to_string(&call.input).map_err(|error| {
             crate::connection::ApprovedCallError::BeforePush(
@@ -456,7 +485,7 @@ impl ToolPlaneConnection for SubcConnection {
             Some(&call.tool_call_id.0),
             deadline,
             preset,
-            None,
+            call_key,
             &broca_core::tool_plane::DispatchSignals::default(),
         )
         .await
@@ -573,6 +602,8 @@ impl SendAttempt {
     }
 }
 
+type RegisteredKeys = HashMap<BatchRouteKey, HashMap<ToolCallId, (String, String)>>;
+
 /// The real subc tool plane. A caller can hint a tool's target module, otherwise the
 /// plane resolves a catalog-unique provider and finally falls back to the configured
 /// default module (e.g. "aft").
@@ -599,6 +630,14 @@ pub struct SubcToolPlane {
     batch_routes: Mutex<BatchRouteMap>,
     batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
     approved_args: Mutex<HashMap<BatchRouteKey, HashMap<ToolCallId, ApprovedArgs>>>,
+    provider_held: Option<ProviderHeldSupport>,
+    provider_catalogs: Mutex<
+        HashMap<
+            BatchRouteKey,
+            HashMap<String, cortexkit_role_tool_provider::catalog::CatalogAnswer>,
+        >,
+    >,
+    registered_keys: Mutex<RegisteredKeys>,
     #[cfg(debug_assertions)]
     reply_fallback_ms: u64,
     /// Lives across batches for the plane's lifetime, but is reused only as the source snapshot
@@ -636,7 +675,63 @@ pub struct SubcToolPlane {
     describer: Mutex<Option<Arc<dyn ScopeDescriber>>>,
 }
 
+/// Supplies declarations from the run's frozen provider catalogs, never a live/global
+/// catalog or caller-declared tools. Missing declarations must fail closed.
+#[async_trait]
+pub trait ProviderHeldCatalog: Send + Sync {
+    async fn for_batch(
+        &self,
+        ctx: &BatchCtx,
+    ) -> Result<HashMap<String, cortexkit_role_tool_provider::catalog::CatalogAnswer>, String>;
+}
+
+struct ProviderHeldSupport {
+    intake: Arc<dyn broca_core::tool_plane::LateResultsIntake>,
+    lifecycle: Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>,
+    catalogs: Arc<dyn ProviderHeldCatalog>,
+}
+
 impl SubcToolPlane {
+    /// Install before warming any route. Production must not install these seams until the
+    /// frozen manifest carries the provider declarations and replay understands held WALs.
+    pub fn with_provider_held_support(
+        mut self,
+        intake: Arc<dyn broca_core::tool_plane::LateResultsIntake>,
+        lifecycle: Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>,
+        catalogs: Arc<dyn ProviderHeldCatalog>,
+    ) -> Self {
+        self.provider_held = Some(ProviderHeldSupport {
+            intake,
+            lifecycle,
+            catalogs,
+        });
+        self
+    }
+
+    fn provider_contract(&self, ctx: &BatchCtx, module: &str, tool: &str) -> (bool, bool) {
+        let catalogs = self.provider_catalogs.lock().unwrap();
+        let Some(catalog) = catalogs
+            .get(&Self::batch_route_key(ctx))
+            .and_then(|catalogs| catalogs.get(module))
+        else {
+            return (false, false);
+        };
+        let content = catalog
+            .tools
+            .iter()
+            .find(|entry| entry.name == tool)
+            .is_some_and(|entry| {
+                entry.result_format
+                    == Some(cortexkit_role_tool_provider::result::ResultFormat::ContentV1)
+            });
+        (
+            content,
+            catalog.declares(
+                cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS,
+            ),
+        )
+    }
+
     async fn send_call(
         &self,
         ctx: &BatchCtx,
@@ -644,6 +739,7 @@ impl SubcToolPlane {
         route: &RouteHandle,
         call: &ToolCall,
         deadline: Duration,
+        key: Option<broca_core::tool_plane::DispatchKey<'_>>,
     ) -> SendAttempt {
         let args = self
             .approved_args
@@ -653,6 +749,43 @@ impl SubcToolPlane {
             .and_then(|calls| calls.get(&call.tool_call_id))
             .cloned();
         let preset = self.frozen_preset(ctx, module);
+        if self.provider_held.is_some()
+            && !self
+                .provider_catalogs
+                .lock()
+                .unwrap()
+                .get(&Self::batch_route_key(ctx))
+                .is_some_and(|catalogs| catalogs.contains_key(module))
+        {
+            return SendAttempt::NotSent {
+                reason: "frozen provider catalog declarations missing".into(),
+            };
+        }
+        let (_, late_results) = self.provider_contract(ctx, module, &call.tool_name);
+        let plain_key = key.filter(|_| {
+            self.provider_held.is_some() && late_results && self.conn.consumer_module_id().is_some()
+        });
+        let sent_key = args
+            .as_ref()
+            .map(|args| args.key.as_str())
+            .or(plain_key.map(|key| key.call_key));
+        if self.provider_held.is_some()
+            && late_results
+            && sent_key.is_some_and(|key| {
+                self.registered_keys
+                    .lock()
+                    .unwrap()
+                    .get(&Self::batch_route_key(ctx))
+                    .and_then(|keys| keys.get(&call.tool_call_id))
+                    .is_none_or(|(registered_module, registered_key)| {
+                        registered_module != module || registered_key != key
+                    })
+            })
+        {
+            return SendAttempt::NotSent {
+                reason: "late_results_registration_missing".into(),
+            };
+        }
         if let Some(args) = args {
             // This is after every route, permit and stale-route recovery wait.
             // Only approved calls carry run signals; ordinary dispatch is unchanged.
@@ -669,7 +802,13 @@ impl SubcToolPlane {
         } else {
             SendAttempt::approved_reply(
                 self.conn
-                    .tool_call_staged(route, call, deadline, preset.as_deref())
+                    .tool_call_staged(
+                        route,
+                        call,
+                        deadline,
+                        preset.as_deref(),
+                        plain_key.map(|key| key.call_key),
+                    )
                     .await,
             )
         }
@@ -689,6 +828,9 @@ impl SubcToolPlane {
             batch_routes: Mutex::new(HashMap::new()),
             batch_presets: Mutex::new(HashMap::new()),
             approved_args: Mutex::new(HashMap::new()),
+            provider_held: None,
+            provider_catalogs: Mutex::new(HashMap::new()),
+            registered_keys: Mutex::new(HashMap::new()),
             #[cfg(debug_assertions)]
             reply_fallback_ms: 120_000,
             catalog_memo: Mutex::new(None),
@@ -1198,6 +1340,7 @@ impl SubcToolPlane {
         composed_under: Option<ScopeStamp>,
         patience: RouteOpenPatience,
         fence_key: FenceKey,
+        key: Option<broca_core::tool_plane::DispatchKey<'_>>,
     ) -> DispatchResult {
         let Some(scope) = ctx.scope.as_ref() else {
             unreachable!("only a scoped call is resolved by describing its scope");
@@ -1267,7 +1410,7 @@ impl SubcToolPlane {
         };
         let reply_deadline = self.reply_deadline(ctx, module_id, call);
         let outcome = match self
-            .send_call(ctx, module_id, &fresh, call, reply_deadline)
+            .send_call(ctx, module_id, &fresh, call, reply_deadline, key)
             .await
         {
             SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
@@ -1281,6 +1424,8 @@ impl SubcToolPlane {
             fresh,
             Some(composed_under),
             outcome,
+            key,
+            _permit,
         )
         .await
     }
@@ -1297,11 +1442,98 @@ impl SubcToolPlane {
         sent_on: RouteHandle,
         composed_under: Option<ScopeStamp>,
         outcome: Result<serde_json::Value, ConnError>,
+        key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        permit: tokio::sync::OwnedSemaphorePermit,
     ) -> DispatchResult {
         let scope = ctx.scope.as_ref();
         match outcome {
             Ok(raw) => {
-                let result = map_call_tool_result(&call.tool_call_id, &raw);
+                let (content_v1, late_results) =
+                    self.provider_contract(ctx, module_id, &call.tool_name);
+                let has_held = raw.get("held").is_some();
+                let decoded = (sent_on.reads_held_reply && content_v1)
+                    .then(|| {
+                        serde_json::from_value::<cortexkit_role_tool_provider::result::ToolResult>(
+                            raw.clone(),
+                        )
+                        .ok()
+                        .filter(|reply| {
+                            cortexkit_role_tool_provider::result::validate(reply).is_ok()
+                        })
+                    })
+                    .flatten();
+                if has_held {
+                    let held = decoded.as_ref().and_then(|reply| reply.held());
+                    let eligible_key = key.filter(|key| {
+                        self.registered_keys
+                            .lock()
+                            .unwrap()
+                            .get(&Self::batch_route_key(ctx))
+                            .and_then(|keys| keys.get(&call.tool_call_id))
+                            .is_some_and(|(registered_module, registered_key)| {
+                                registered_module == module_id && registered_key == key.call_key
+                            })
+                    });
+                    if let (Some(support), Some(held), Some(key), Some(_)) = (
+                        self.provider_held.as_ref(),
+                        held,
+                        eligible_key.filter(|_| late_results),
+                        self.conn.consumer_module_id(),
+                    ) {
+                        if let Some(recorder) = key.held_recorder {
+                            use sha2::Digest;
+                            let reply = broca_core::tool_plane::ProviderHeldReply {
+                                tool_call_id: call.tool_call_id.clone(),
+                                call_key: key.call_key.into(),
+                                module: module_id.into(),
+                                reason: held.reason.clone(),
+                                detail_digest: held.detail.as_ref().map(|detail| {
+                                    format!(
+                                        "{:x}",
+                                        sha2::Sha256::digest(
+                                            serde_json::to_vec(detail)
+                                                .expect("JSON object serializes")
+                                        )
+                                    )
+                                }),
+                            };
+                            if let Err(error) = recorder.sync_held(&reply).await {
+                                return DispatchResult::SentButOutcomeUnknown {
+                                    reason: format!("provider-held record not durable: {error}"),
+                                };
+                            }
+                            drop(permit);
+                            let terminal = support.lifecycle.wait(ctx, call, &reply).await;
+                            if let DispatchResult::Completed(result) = &terminal {
+                                self.fence.lock().unwrap().insert(
+                                    &ctx.batch_id,
+                                    fence_key,
+                                    result.clone(),
+                                );
+                            }
+                            return terminal;
+                        }
+                    }
+                }
+                let result = if has_held {
+                    // Never quote the body: even a malformed held reply contains interim text,
+                    // which must not be mistaken for a final answer in a later prompt.
+                    route_failure_result(
+                        call,
+                        "malformed provider-held reply: prerequisites not met".into(),
+                    )
+                } else if sent_on.reads_held_reply && content_v1 {
+                    decoded
+                        .as_ref()
+                        .and_then(|reply| {
+                            crate::content_v1::map_content_v1_result(&call.tool_call_id, reply).ok()
+                        })
+                        .unwrap_or_else(|| {
+                            route_failure_result(call, "malformed content/v1 tool reply".into())
+                        })
+                } else {
+                    map_call_tool_result(&call.tool_call_id, &raw)
+                };
                 // Build the fence copy before taking the process-wide guard. Tool payloads can be
                 // large, while the critical section only needs to update the bounded maps.
                 let fenced_result = result.clone();
@@ -1332,9 +1564,8 @@ impl SubcToolPlane {
                 // A provider that received the call and refuses it with `scope_not_synced` (Plexus
                 // does this on its bot-write legs until the owner has synced) lands here like any
                 // other refusal: recorded as this call's error result, and NOT re-sent. The
-                // provider already has the request, so re-sending it safely needs the durable
-                // cross-party call identity (`call_key`) that lets the provider resume the same
-                // request instead of starting a second one; broca does not send one yet. Only a
+                // provider already has the request. A durable call key correlates late delivery;
+                // it does not authorize a retry after a provider received the call. Only a
                 // route.open refusal, where nothing was sent, is held and retried. A test
                 // (`a_provider_scope_not_synced_refusal_is_recorded_and_never_resent`) pins this.
                 let result = ToolResult {
@@ -1577,7 +1808,8 @@ impl SubcToolPlane {
         };
         let Some(scope) = scope else {
             return retry_route_open(retry(), Some(lifecycle), gate_for, || {
-                self.conn.route_open(module_id, bind, None)
+                self.conn
+                    .route_open_dispatch(module_id, bind, None, self.provider_held.is_some())
             })
             .await
             .map(|handle| (handle, None))
@@ -1633,7 +1865,14 @@ impl SubcToolPlane {
                 Some(hold),
                 Some(lifecycle),
                 gate_for,
-                || self.conn.route_open(module_id, bind, Some(&selector)),
+                || {
+                    self.conn.route_open_dispatch(
+                        module_id,
+                        bind,
+                        Some(&selector),
+                        self.provider_held.is_some(),
+                    )
+                },
             )
             .await
             .map_err(|error| match error {
@@ -1877,6 +2116,14 @@ impl SubcToolPlane {
             .lock()
             .unwrap()
             .retain(|(owner, _), _| owner != &session);
+        self.provider_catalogs
+            .lock()
+            .unwrap()
+            .retain(|(owner, _), _| owner != &session);
+        self.registered_keys
+            .lock()
+            .unwrap()
+            .retain(|(owner, _), _| owner != &session);
         self.batch_presets
             .lock()
             .unwrap()
@@ -1910,9 +2157,8 @@ impl SubcToolPlane {
     }
 }
 
-#[async_trait]
-impl ToolPlane for SubcToolPlane {
-    async fn batch_started(
+impl SubcToolPlane {
+    async fn batch_started_inner(
         &self,
         ctx: &BatchCtx,
         calls: &[ToolCall],
@@ -1954,6 +2200,23 @@ impl ToolPlane for SubcToolPlane {
             .filter_map(ToolRoute::module)
             .map(ToOwned::to_owned)
             .collect::<BTreeSet<_>>();
+
+        if let Some(support) = &self.provider_held {
+            let catalogs = support
+                .catalogs
+                .for_batch(ctx)
+                .await
+                .map_err(ToolPlaneError::Unavailable)?;
+            if modules.iter().any(|module| !catalogs.contains_key(module)) {
+                return Err(ToolPlaneError::Unavailable(
+                    "frozen provider catalog declarations missing".into(),
+                ));
+            }
+            self.provider_catalogs
+                .lock()
+                .unwrap()
+                .insert(Self::batch_route_key(ctx), catalogs);
+        }
 
         self.batch_presets
             .lock()
@@ -1998,7 +2261,7 @@ impl ToolPlane for SubcToolPlane {
         Ok(())
     }
 
-    fn dispatch_target(&self, ctx: &BatchCtx, tool_call_id: &ToolCallId) -> Option<String> {
+    fn dispatch_target_inner(&self, ctx: &BatchCtx, tool_call_id: &ToolCallId) -> Option<String> {
         // The same lookup `dispatch` makes, so the module recorded on the intent is the one the
         // call is then sent to.
         let resolved = self
@@ -2014,7 +2277,12 @@ impl ToolPlane for SubcToolPlane {
         }
     }
 
-    async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+    async fn dispatch_inner(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+    ) -> DispatchResult {
         // Fence: a repeated (session, tool_call_id) returns the prior result (at-most-once).
         // Keyed by session so the same provider id minted by two sessions can't false-dedup.
         let session_key = Self::session_key(&ctx.bind);
@@ -2083,6 +2351,7 @@ impl ToolPlane for SubcToolPlane {
                             Some(stamp),
                             DEFAULT_ROUTE_OPEN_PATIENCE,
                             fence_key,
+                            key,
                         )
                         .await;
                 }
@@ -2171,7 +2440,7 @@ impl ToolPlane for SubcToolPlane {
         // deadline shorter than the work turns a healthy call into an ambiguous one.
         let reply_deadline = self.reply_deadline(ctx, &module_id, call);
         let first = match self
-            .send_call(ctx, &module_id, &route_handle, call, reply_deadline)
+            .send_call(ctx, &module_id, &route_handle, call, reply_deadline, key)
             .await
         {
             SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
@@ -2199,6 +2468,7 @@ impl ToolPlane for SubcToolPlane {
                     composed_under,
                     patience,
                     fence_key,
+                    key,
                 )
                 .await;
         }
@@ -2240,7 +2510,7 @@ impl ToolPlane for SubcToolPlane {
                         }
                     };
                     match self
-                        .send_call(ctx, &module_id, &fresh_handle, call, reply_deadline)
+                        .send_call(ctx, &module_id, &fresh_handle, call, reply_deadline, key)
                         .await
                     {
                         SendAttempt::NotSent { reason } => {
@@ -2267,16 +2537,18 @@ impl ToolPlane for SubcToolPlane {
             sent_on,
             composed_under,
             outcome,
+            key,
+            _stale_permit,
         )
         .await
     }
 
-    async fn dispatch_approved(
+    async fn dispatch_approved_inner(
         &self,
         ctx: &BatchCtx,
         call: &ToolCall,
         args_jcs: &str,
-        call_key: &str,
+        key: broca_core::tool_plane::DispatchKey<'_>,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> DispatchResult {
         // Preserve a completed result even if the route or approved input has
@@ -2312,14 +2584,14 @@ impl ToolPlane for SubcToolPlane {
                 call.tool_call_id.clone(),
                 ApprovedArgs {
                     bytes: args_jcs.into(),
-                    key: call_key.into(),
+                    key: key.call_key.into(),
                     signals: signals.clone(),
                 },
             );
-        self.dispatch(ctx, call).await
+        self.dispatch_inner(ctx, call, Some(key)).await
     }
 
-    async fn recheck_approval_scope(
+    async fn recheck_approval_scope_inner(
         &self,
         ctx: &BatchCtx,
         call: &ToolCall,
@@ -2366,7 +2638,14 @@ impl ToolPlane for SubcToolPlane {
             }),
             Some(&lifecycle),
             || self.conn.module_gate(&module),
-            || self.conn.route_open(&module, &ctx.bind, Some(&selector)),
+            || {
+                self.conn.route_open_dispatch(
+                    &module,
+                    &ctx.bind,
+                    Some(&selector),
+                    self.provider_held.is_some(),
+                )
+            },
         )
         .await
         .map_err(|error| {
@@ -2383,11 +2662,19 @@ impl ToolPlane for SubcToolPlane {
         Ok(())
     }
 
-    async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+    async fn batch_finished_inner(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
         // Evict this batch's fence entries — the at-most-once guarantee only needs to hold
         // within a batch's life (the WAL is the cross-batch durability), so without eviction
         // the fence would grow unbounded over thousands of batches.
         self.fence.lock().unwrap().evict_batch(&ctx.batch_id);
+        self.provider_catalogs
+            .lock()
+            .unwrap()
+            .remove(&Self::batch_route_key(ctx));
+        self.registered_keys
+            .lock()
+            .unwrap()
+            .remove(&Self::batch_route_key(ctx));
         self.approved_args
             .lock()
             .unwrap()
@@ -2404,6 +2691,131 @@ impl ToolPlane for SubcToolPlane {
             .lock()
             .unwrap()
             .remove(&Self::batch_route_key(ctx));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ToolPlane for SubcToolPlane {
+    async fn batch_started(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[ToolCall],
+        manifest: &ToolManifest,
+    ) -> Result<(), ToolPlaneError> {
+        self.batch_started_inner(ctx, calls, manifest).await
+    }
+    fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
+        self.dispatch_target_inner(ctx, id)
+    }
+    async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        self.dispatch_inner(ctx, call, None).await
+    }
+    async fn dispatch_keyed(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        key: broca_core::tool_plane::DispatchKey<'_>,
+    ) -> DispatchResult {
+        self.dispatch_inner(ctx, call, Some(key)).await
+    }
+    async fn dispatch_approved(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        args: &str,
+        key: &str,
+        signals: &broca_core::tool_plane::DispatchSignals,
+    ) -> DispatchResult {
+        self.dispatch_approved_inner(
+            ctx,
+            call,
+            args,
+            broca_core::tool_plane::DispatchKey {
+                call_key: key,
+                held_recorder: None,
+            },
+            signals,
+        )
+        .await
+    }
+    async fn dispatch_approved_keyed(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        args: &str,
+        key: broca_core::tool_plane::DispatchKey<'_>,
+        signals: &broca_core::tool_plane::DispatchSignals,
+    ) -> DispatchResult {
+        self.dispatch_approved_inner(ctx, call, args, key, signals)
+            .await
+    }
+    async fn recheck_approval_scope(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        module: Option<&str>,
+    ) -> Result<(), ToolPlaneError> {
+        self.recheck_approval_scope_inner(ctx, call, module).await
+    }
+    async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
+        self.batch_finished_inner(ctx).await
+    }
+    async fn register_dispatch_group(
+        &self,
+        ctx: &BatchCtx,
+        calls: &[broca_core::tool_plane::DispatchRegistration],
+    ) -> Result<(), ToolPlaneError> {
+        let Some(support) = &self.provider_held else {
+            return Ok(());
+        };
+        let mut registrations = Vec::new();
+        let mut keys = Vec::new();
+        for call in calls {
+            let Some(module) = self.dispatch_target(ctx, &call.tool_call_id) else {
+                continue;
+            };
+            let late_results = self
+                .provider_catalogs
+                .lock()
+                .unwrap()
+                .get(&Self::batch_route_key(ctx))
+                .and_then(|catalogs| catalogs.get(&module))
+                .is_some_and(|catalog| {
+                    catalog.declares(
+                        cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS,
+                    )
+                });
+            if !late_results || (!call.approved && self.conn.consumer_module_id().is_none()) {
+                continue;
+            }
+            let Some((lineage, _)) = call.call_key.rsplit_once(':') else {
+                return Err(ToolPlaneError::Unavailable(
+                    "dispatch call key has no lineage".into(),
+                ));
+            };
+            registrations.push(broca_core::tool_plane::LateResultRegistration {
+                lineage: lineage.into(),
+                call_key: call.call_key.clone(),
+                module: module.clone(),
+                bind: ctx.bind.clone(),
+                scope: ctx.scope.clone(),
+            });
+            keys.push((call.tool_call_id.clone(), (module, call.call_key.clone())));
+        }
+        if !registrations.is_empty() {
+            support
+                .intake
+                .register_group(&registrations)
+                .await
+                .map_err(ToolPlaneError::Unavailable)?;
+            self.registered_keys
+                .lock()
+                .unwrap()
+                .entry(Self::batch_route_key(ctx))
+                .or_default()
+                .extend(keys);
+        }
         Ok(())
     }
 }
@@ -4797,10 +5209,14 @@ mod tests {
             ],
         );
         // The first open (the dispatch's own) succeeds; the re-open after the refusal is
-        // refused eight times, then the module is back.
+        // refused eight times, then the module is back. Each refusal takes a second to arrive,
+        // so the drain lasts at least 8s of paused time whatever the backoff's full jitter
+        // draws: the waits between attempts can be near zero, and without this the total
+        // sometimes fell under the 3s default patience the test exists to outlast.
         let mut sequence = vec![RouteOpenScript::default()];
-        sequence.extend((0..8).map(|_| {
-            RouteOpenScript::rejected("module_reloading \u{2014} module_id 'aft' is reloading")
+        sequence.extend((0..8).map(|_| RouteOpenScript {
+            delay: Duration::from_secs(1),
+            ..RouteOpenScript::rejected("module_reloading \u{2014} module_id 'aft' is reloading")
         }));
         sequence.push(RouteOpenScript::default());
         conn.script_route_open_sequence("aft", sequence);
@@ -6448,6 +6864,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod held_dispatch_tests;
 
 #[cfg(test)]
 mod approval_digest_contract_tests {
