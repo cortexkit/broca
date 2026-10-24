@@ -1930,7 +1930,7 @@ async fn chatgpt_refresh_run_rejecting(
     // not socket negotiation, while retaining its original send-count assertions.
     broca_core::Provider::set_chatgpt_https_policy(&resolved.provider, Arc::new(|| true));
     let session = BindIdentity::new(&root, "chatgpt-refresh", label);
-    let req = broca_core::RunRequest { directives: None, session_class: None, retention: None,
+    let req = broca_core::RunRequest { input_written_at_ms: None, directives: None, session_class: None, retention: None,
     title: None,
     on_restart: None,
     keep_warm: None,

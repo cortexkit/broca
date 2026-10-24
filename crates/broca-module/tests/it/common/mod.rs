@@ -398,6 +398,7 @@ impl FakeExecutor {
 
     async fn write_started(&self, job: &RunJob) {
         let _seq = job.writer.record(broca_wal::WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -605,6 +606,7 @@ fn unique() -> u64 {
 pub fn req(key: &BindIdentity, run: &str) -> RunRequest {
     use broca_protocol::content::{ContentBlock, Message, Role};
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

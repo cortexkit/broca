@@ -41,6 +41,7 @@ pub mod compaction_receipts;
 pub mod export_index;
 mod fold_identities;
 pub mod late_results_store;
+mod retained_head;
 pub mod retention;
 pub mod retention_withdrawals;
 pub mod session_refs;
@@ -331,6 +332,8 @@ impl ProjectionPlan {
 }
 
 struct PreparedProjection {
+    head_json: String,
+    message_times: Vec<Option<u64>>,
     episode_spans: Vec<std::ops::Range<u64>>,
     open_episode_span: Option<u64>,
     /// Every episode's render inputs as JSON, in lineage order (see
@@ -1085,6 +1088,7 @@ impl SqliteStore {
             rows.collect::<Result<std::collections::HashSet<_>, _>>()?
         };
         for (column, sql_type) in [
+            ("head_json", "TEXT"),
             ("lineage_id", "TEXT"),
             ("control_head_wal_seq", "INTEGER"),
             ("control_head_sub_index", "INTEGER"),
@@ -1144,6 +1148,9 @@ impl SqliteStore {
             // message, and on every row written before tags existed: those sessions have none.
             conn.execute("ALTER TABLE message ADD COLUMN tags_json TEXT", [])?;
         }
+        if !message_columns.contains("written_at_ms") {
+            conn.execute("ALTER TABLE message ADD COLUMN written_at_ms INTEGER", [])?;
+        }
         // The one-time index build scans existing messages during upgrade. Thereafter
         // completeness probes visit only this session's unattributed rows, not its bodies.
         conn.execute("CREATE INDEX IF NOT EXISTS message_unattributed_session_idx ON message(session) WHERE run_json IS NULL", [])?;
@@ -1174,6 +1181,11 @@ impl SqliteStore {
             "CREATE INDEX IF NOT EXISTS meta_last_title_idx ON meta(session, last_title)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS meta_head_idx ON meta(session, head_json)",
+            [],
+        )?;
+        retained_head::init(conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS meta_compaction_setup_idx ON meta(session, compaction_setup_seen)",
             [],
@@ -1491,6 +1503,8 @@ impl SqliteStore {
                 },
                 NeutralPlan::Write(prepared) => {
                     ProjectionPlan::Write(Box::new(PreparedProjection {
+                        message_times: prepared.message_times,
+                        head_json: prepared.head_json,
                         episode_spans: prepared.episode_spans,
                         open_episode_span: prepared.open_episode_span,
                         // Serialization of plain JSON values cannot fail; a failure would only
@@ -1650,6 +1664,7 @@ impl SqliteStore {
             )?;
         }
         let mut tags_json = prepared.message_tags_json.into_iter();
+        let mut message_times = prepared.message_times.into_iter();
         for (json, run_json) in prepared
             .message_json
             .into_iter()
@@ -1671,8 +1686,8 @@ impl SqliteStore {
                 }
             }
             tx.execute(
-                "INSERT OR REPLACE INTO message (session, ord, json, run_json, tags_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![key, next_ord, json, run_json, tags_json],
+                "INSERT OR REPLACE INTO message (session, ord, json, run_json, tags_json, written_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![key, next_ord, json, run_json, tags_json, message_times.next().flatten().map(broca_core::projection_plan::u64_to_i64).transpose()?],
             )?;
             next_ord += 1;
         }
@@ -1692,8 +1707,8 @@ impl SqliteStore {
                  retries_used, last_step_usage_json, last_step_finish_reason_json, last_run_id,
                  last_episode_usage_json, prefix_len, admission_checkpoint_json, wal_anchor_file_id,
                  wal_anchor_seq, wal_anchor_byte_end, control_head_wal_seq, control_head_sub_index,
-                 last_title, compaction_setup_seen
-              ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                  last_title, compaction_setup_seen, head_json
+               ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
               ON CONFLICT(session) DO UPDATE SET
                  watermark_seq=?2, lineage_id=?3, completed_steps=?4, usage_json=?5,
                  retries_used=?6, last_step_usage_json=?7, last_step_finish_reason_json=?8,
@@ -1701,7 +1716,7 @@ impl SqliteStore {
                  admission_checkpoint_json=?12, wal_anchor_file_id=?13, wal_anchor_seq=?14,
                  wal_anchor_byte_end=?15, control_head_wal_seq=?16,
                  control_head_sub_index=?17,
-                 last_title=COALESCE(?18, meta.last_title), compaction_setup_seen=?19",
+                  last_title=COALESCE(?18, meta.last_title), compaction_setup_seen=?19, head_json=?20",
             rusqlite::params![
                 key,
                 prepared.new_watermark as i64,
@@ -1728,6 +1743,7 @@ impl SqliteStore {
                 // starts from no title and nothing stale survives.
                 prepared.last_title,
                 prepared.compaction_setup_seen,
+                prepared.head_json,
             ],
         )?;
         tx.execute(
@@ -1838,6 +1854,22 @@ impl SqliteStore {
 }
 
 impl MaterializedStore for SqliteStore {
+    fn read_retained_head(
+        &self,
+        session: &BindIdentity,
+        lineage_id: &str,
+    ) -> Result<Option<broca_core::head::RetainedHeadCheckpoint>, String> {
+        self.read_retained_head_inner(session, lineage_id)
+            .map_err(|error| error.to_string())
+    }
+    fn checkpoint_retained_head(
+        &self,
+        session: &BindIdentity,
+        checkpoint: &broca_core::head::RetainedHeadCheckpoint,
+    ) -> Result<(), String> {
+        self.checkpoint_retained_head_inner(session, checkpoint)
+            .map_err(|error| error.to_string())
+    }
     fn materialized_message_count(&self, session: &BindIdentity) -> Result<Option<u64>, String> {
         let key = Self::key(session);
         let conn = self.conn.lock().unwrap();
@@ -2252,7 +2284,7 @@ impl MaterializedStore for SqliteStore {
         );
         let mut stmt = tx
             .prepare(
-                "SELECT ord, json, run_json, tags_json FROM message
+                "SELECT ord, json, run_json, tags_json, written_at_ms FROM message
                  WHERE session=?1 AND ord>=?2 AND ord<?3 ORDER BY ord ASC",
             )
             .map_err(|e| e.to_string())?;
@@ -2267,12 +2299,13 @@ impl MaterializedStore for SqliteStore {
                             row.get::<_, String>(1)?,
                             row.get::<_, Option<String>>(2)?,
                             row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<u64>>(4)?,
                         ))
                     },
                 )
                 .map_err(|e| e.to_string())?;
             for encoded_row in encoded {
-                let (ordinal, json, run_json, tags_json) =
+                let (ordinal, json, run_json, tags_json, written_at) =
                     encoded_row.map_err(|e| e.to_string())?;
                 let run_json = run_json.ok_or(broca_core::StorePageReadError::AttributionStale)?;
                 let run = serde_json::from_str(&run_json).map_err(|e| e.to_string())?;
@@ -2280,6 +2313,7 @@ impl MaterializedStore for SqliteStore {
                 let mut message = decode_message(json, tags_json).map_err(|e| e.to_string())?;
                 message.ordinal = Some(ordinal);
                 rows.push(StorePageRow {
+                    written_at,
                     ordinal,
                     message,
                     run,
@@ -2328,8 +2362,27 @@ impl MaterializedStore for SqliteStore {
             .transpose()
             .map_err(|e| e.to_string())?
             .flatten();
+        let head_json: Option<String> = tx
+            .query_row(
+                "SELECT head_json FROM meta INDEXED BY meta_head_idx WHERE session=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+        let head = head_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .flatten();
+        if watermark_seq > 0 && head.is_none() {
+            return Err(broca_core::StorePageReadError::AttributionStale);
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(StorePageSnapshot {
+            head,
             compaction_setup_seen,
             model_history,
             deferred_calls,
@@ -2361,6 +2414,15 @@ impl MaterializedStore for SqliteStore {
 }
 
 impl Persister for SqliteStore {
+    fn project_retained_head(
+        &self,
+        session: &BindIdentity,
+        lineage_id: &str,
+        records: &[FramedRecord],
+    ) -> Result<(), String> {
+        self.project_retained_head_inner(session, lineage_id, records)
+            .map_err(|error| error.to_string())
+    }
     fn project_retention_metadata(
         &self,
         session: &BindIdentity,
@@ -2781,7 +2843,7 @@ fn current_projection_position(
 
 /// The `meta.run_attribution_version` a current writer stamps on every projection. Rows with
 /// any other version were written by an older format and are backfilled from the WAL.
-pub(crate) const RUN_ATTRIBUTION_VERSION: i64 = 2;
+pub(crate) const RUN_ATTRIBUTION_VERSION: i64 = 3;
 
 const UNATTRIBUTED_MESSAGE_SQL: &str =
     "SELECT EXISTS(SELECT 1 FROM message WHERE session=?1 AND run_json IS NULL LIMIT 1)";
@@ -2866,7 +2928,9 @@ fn projection_seed_from_complete_tx(
         // Checkpoints that did not capture compaction state lack the earlier setup and
         // replacement records; replaying only records after the watermark cannot recover them.
         .filter(|checkpoint| {
-            checkpoint.at_seq == watermark_seq && checkpoint.compaction_complete()
+            checkpoint.at_seq == watermark_seq
+                && checkpoint.compaction_complete()
+                && checkpoint.head.is_some()
         })
     else {
         return Ok(None);
@@ -3358,7 +3422,7 @@ mod tests {
     fn legacy_prefix_discovery_is_read_only() {
         let store = SqliteStore::open_in_memory().unwrap();
         let mut conn = store.conn.lock().unwrap();
-        conn.execute("INSERT INTO meta(session,watermark_seq,context_epoch,run_attribution_version) VALUES('legacy',7,0,2)", []).unwrap();
+        conn.execute("INSERT INTO meta(session,watermark_seq,context_epoch,run_attribution_version) VALUES('legacy',7,0,?1)", [super::RUN_ATTRIBUTION_VERSION]).unwrap();
         conn.execute(
             "INSERT INTO message(session,ord,json,run_json) VALUES('legacy',0,'{}','null')",
             [],
@@ -4062,6 +4126,105 @@ mod tests {
     #[test]
     fn incremental_projection_resumes_from_watermark() {
         crate::conformance::incremental_projection_resumes_from_watermark(sqlite_store());
+    }
+
+    #[test]
+    fn head_spend_and_entry_times_are_persisted_with_the_exact_watermark() {
+        use crate::conformance::{base_records, run_started, session, text_turn};
+        use broca_core::{context::ReadView, MaterializedStore, Persister};
+        use broca_wal::WalRecord;
+        let store = sqlite_store();
+        let session = session("head-watermark");
+        let mut records = base_records(&session);
+        records.extend(text_turn(2, 1, "one"));
+        if let WalRecord::ModelStepFinished { written_at_ms, .. } = &mut records[1].record {
+            *written_at_ms = Some(42);
+        }
+        store.project(&session, &records).unwrap();
+        let page = MaterializedStore::read_page_with_attribution(
+            &store,
+            &session,
+            None,
+            10,
+            ReadView::Raw,
+        )
+        .unwrap();
+        assert_eq!(page.rows[1].written_at, Some(42));
+        assert_eq!(
+            page.head.unwrap().usage.unwrap().totals.input_tokens,
+            Some(10)
+        );
+
+        let mut checkpoint = MaterializedStore::read_admission_snapshot(&store, &session)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        checkpoint.head = None;
+        let key = SqliteStore::key(&session);
+        store.conn.lock().unwrap().execute("UPDATE meta SET admission_checkpoint_json=?2, head_json=NULL, run_attribution_version=2 WHERE session=?1",
+            rusqlite::params![key, broca_core::encode_admission_checkpoint(&checkpoint).unwrap()]).unwrap();
+        assert!(Persister::projection_seed(&store, &session)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            MaterializedStore::read_page_with_attribution(
+                &store,
+                &session,
+                None,
+                10,
+                ReadView::Raw
+            ),
+            Err(broca_core::StorePageReadError::AttributionStale)
+        ));
+        store.project(&session, &records).unwrap();
+
+        let mut suffix = vec![broca_wal::FramedRecord { seq: 4, fence: 1,
+            record: serde_json::from_value(serde_json::json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0})).unwrap(),
+        }, run_started(
+            5,
+            "r2",
+            &session,
+            "two",
+            broca_protocol::request::ModelHandle::new("stub", "other"),
+        )];
+        suffix.extend(text_turn(6, 1, "two"));
+        if let WalRecord::ModelStepFinished { written_at_ms, .. } = &mut suffix[2].record {
+            *written_at_ms = Some(43);
+        }
+        store.project(&session, &suffix).unwrap();
+        let page = MaterializedStore::read_page_with_attribution(
+            &store,
+            &session,
+            None,
+            10,
+            ReadView::Raw,
+        )
+        .unwrap();
+        assert_eq!(page.watermark_seq, 7);
+        assert_eq!(
+            page.rows
+                .iter()
+                .map(|row| row.written_at)
+                .collect::<Vec<_>>(),
+            vec![None, Some(42), None, Some(43)]
+        );
+        let head = page.head.unwrap();
+        assert_eq!(head.model.unwrap().model, "other");
+        let usage = head.usage.unwrap();
+        assert_eq!(usage.since, "r");
+        assert_eq!(usage.totals.steps, 2);
+        assert_eq!(usage.totals.input_tokens, Some(20));
+        assert_eq!(
+            usage
+                .totals
+                .by_model
+                .iter()
+                .map(|row| row.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m", "other"]
+        );
+        assert!(usage.totals.reasoning_tokens.is_none());
     }
 
     #[test]

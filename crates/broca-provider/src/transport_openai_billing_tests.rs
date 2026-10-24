@@ -58,6 +58,7 @@ async fn run_openai(label: &str, script: Vec<ScriptResponse>) -> OpenAiRun {
     std::fs::create_dir_all(dir.join("project")).unwrap();
     let session = BindIdentity::new(dir.join("project"), "openai", label);
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

@@ -733,6 +733,7 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
             .cloned()
             .enumerate()
             .map(|(i, message)| crate::StorePageRow {
+                written_at: None,
                 run: None,
                 ordinal: i as u64,
                 message,
@@ -1154,6 +1155,59 @@ fn history_request() -> (crate::RunRequest, crate::RunControl, Arc<OneView>) {
         ..Default::default()
     };
     (request, control, views)
+}
+
+#[tokio::test]
+async fn presetless_compaction_setup_omits_the_member_on_the_real_call() {
+    struct DefaultSetup(AtomicUsize);
+    #[async_trait::async_trait]
+    impl CompactionPlane for DefaultSetup {
+        async fn setup(
+            &self,
+            _: &str,
+            _: &BindIdentity,
+            request: SetupRequest,
+        ) -> Result<SetupAnswer, CompactionUnavailable> {
+            assert!(serde_json::to_value(&request)
+                .unwrap()
+                .get("preset")
+                .is_none());
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut answer = ready();
+            answer["request_id"] = json!(request.request_id);
+            Ok(serde_json::from_value(answer).unwrap())
+        }
+    }
+    let shared = Shared::default();
+    let writer = shared.writer();
+    let (request, mut control, _) = history_request();
+    let mut manifest = control.manifest.take().unwrap().as_ref().clone();
+    manifest.plan = OpaqueJson::from_json_text(
+        json!({"compaction_item":{"provider":"provider","params":{}},"composition":{}}).to_string(),
+    )
+    .unwrap();
+    let plane = Arc::new(DefaultSetup(AtomicUsize::new(0)));
+    control.manifest = Some(Arc::new(manifest));
+    control.compaction_plane = Some(plane.clone());
+    control.compaction_views = None;
+    let model = PrefixBound(crate::StubProvider::new(vec![model_events()]));
+    let (out, _events) = tokio::sync::mpsc::channel(256);
+    crate::run_loop_on_writer(
+        request,
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        &shared,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plane.0.load(Ordering::SeqCst), 1);
+    writer.shutdown().await.unwrap();
 }
 
 async fn run_history(shared: &Shared) -> (PrefixBound, Arc<OneView>) {

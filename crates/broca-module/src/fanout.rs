@@ -1346,6 +1346,7 @@ mod tests {
 
     fn run_started(session: &BindIdentity) -> WalRecord {
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -1395,6 +1396,7 @@ mod tests {
 
     fn tool_step() -> WalRecord {
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -1524,6 +1526,7 @@ mod tests {
     #[cfg(unix)]
     fn text_step(step_id: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(step_id),
@@ -2932,6 +2935,7 @@ mod tests {
                 seq: 1,
                 fence: 1,
                 record: WalRecord::RunStarted {
+                    written_at_ms: None,
                     tags: None,
                     session_class: None,
                     retention: None,
@@ -2982,6 +2986,7 @@ mod tests {
                 seq: 2,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: broca_protocol::StepId(1),

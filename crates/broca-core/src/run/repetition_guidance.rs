@@ -165,6 +165,7 @@ mod tests {
                     .iter()
                     .filter(|m| m.ordinal >= from && m.ordinal < from.map(|o| o + limit))
                     .map(|m| StorePageRow {
+                        written_at: None,
                         ordinal: m.ordinal.unwrap(),
                         message: m.clone(),
                         run: None,

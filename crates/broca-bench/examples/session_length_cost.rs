@@ -502,6 +502,7 @@ fn text_message(role: Role, text: String) -> Message {
 
 fn request(session: &BindIdentity, run: &str) -> RunRequest {
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

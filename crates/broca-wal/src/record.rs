@@ -138,6 +138,9 @@ pub enum WalRecord {
     /// into the immutable conversation prefix and opens a new one. It is
     /// run_id-authoritative.
     RunStarted {
+        /// Admission time of the input, preserved across queue drain and restart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         /// Graceful restart policy frozen at admission. Absent means interrupt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_restart: Option<broca_protocol::request::OnRestart>,
@@ -292,6 +295,9 @@ pub enum WalRecord {
     },
     /// The assembled assistant unit for a completed model step.
     ModelStepFinished {
+        /// End of the successful model attempt, before any post-assistant hooks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         step_id: StepId,
         assistant_message: Arc<AssistantMessage>,
         usage: Usage,
@@ -686,6 +692,9 @@ pub enum WalRecord {
     /// dropping path. Consume/retract is unambiguous across a crash: the pending set is
     /// `Queued − Retracted − consumed-by-a-RunStarted`.
     Queued {
+        /// Admission time carried into the input record when this send is delivered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         /// A shortened lineage retention in seconds, when this send changes it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retention: Option<u64>,
@@ -760,6 +769,9 @@ pub enum WalRecord {
     /// gated frame requiring [`crate::framing::STEER_QUEUE_FEATURE`] (see
     /// [`WalRecord::required_features`]), which such a build refuses as a newer writer.
     Steered {
+        /// Admission time of this input, not the later boundary that places it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         /// A shortened lineage retention in seconds, when this send changes it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retention: Option<u64>,
@@ -1183,6 +1195,8 @@ pub enum WalRecord {
     /// A send delivered with `idle_start` has no record of this kind: the `RunStarted` that
     /// consumes it (naming its `submission_id`) is its delivery.
     SendDelivered {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,
         submission_id: SubmissionId,
         run_id: RunId,
         mode: broca_protocol::DeliveryMode,
@@ -1481,6 +1495,31 @@ impl WalRecord {
         };
         let base = if self.carries_google_rpc_error_details() {
             with_feature(base, crate::framing::GOOGLE_RPC_ERROR_DETAILS_FEATURE)
+        } else {
+            base
+        };
+        // Scope, session-class and input-cap helpers accept only their fixed older feature sets.
+        // Add message times afterward, so a timed record cannot reach those tables with a new name.
+        let base = if matches!(
+            self,
+            Self::RunStarted {
+                written_at_ms: Some(_),
+                ..
+            } | Self::ModelStepFinished {
+                written_at_ms: Some(_),
+                ..
+            } | Self::Steered {
+                written_at_ms: Some(_),
+                ..
+            } | Self::Queued {
+                written_at_ms: Some(_),
+                ..
+            } | Self::SendDelivered {
+                written_at_ms: Some(_),
+                ..
+            }
+        ) {
+            with_feature(base, crate::framing::MESSAGE_TIMES_FEATURE)
         } else {
             base
         };
@@ -3026,6 +3065,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -3248,6 +3288,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3302,6 +3343,7 @@ mod schema_tests {
             account_decision: None,
         });
         let record = WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3377,6 +3419,7 @@ mod schema_tests {
         // reported. A step whose response reported no tier must keep exactly these bytes, and
         // these bytes must keep decoding to the same record.
         let full = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(3),
@@ -3398,6 +3441,7 @@ mod schema_tests {
             speed_used: None,
         };
         let bare = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(0),
@@ -3428,6 +3472,7 @@ mod schema_tests {
     #[test]
     fn old_records_default_retries_used_to_zero() {
         let model = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -3468,6 +3513,7 @@ mod schema_tests {
     #[test]
     fn pre_fix_run_started_omits_ts_ms_and_decodes_as_none() {
         let record = WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3521,6 +3567,7 @@ mod schema_tests {
     #[test]
     fn pre_work_class_run_started_bytes_are_pinned() {
         let record = WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3558,6 +3605,7 @@ mod schema_tests {
     #[test]
     fn pre_context_management_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3612,6 +3660,7 @@ mod schema_tests {
     #[test]
     fn pre_variant_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3670,6 +3719,7 @@ mod schema_tests {
     #[test]
     fn pre_service_tier_run_started_bytes_are_pinned() {
         let record = |config: Box<RunConfig>| WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3782,6 +3832,7 @@ mod schema_tests {
             let mut config = min_config();
             config.frozen_render_config = frozen_render_config;
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -3945,6 +3996,7 @@ mod schema_tests {
         };
         let records = vec![
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -3968,6 +4020,7 @@ mod schema_tests {
                 submission_id: Some(SubmissionId("sub1".into())),
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),
@@ -4033,6 +4086,7 @@ mod schema_tests {
                 caller_text: Some("nudge text".into()),
             },
             WalRecord::Queued {
+                written_at_ms: None,
                 retention: None,
                 ts_ms: None,
                 hooks: None,
@@ -4590,6 +4644,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_preserves_signed_tool_call() {
         let rec = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -4633,6 +4688,7 @@ mod schema_tests {
         assert_eq!(decoded_call, call);
 
         let rec = WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),

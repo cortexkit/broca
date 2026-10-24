@@ -142,6 +142,8 @@ impl ProjectionPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedProjection {
+    pub head_json: String,
+    pub message_times: Vec<Option<u64>>,
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
     /// Every episode's render inputs, in lineage order. Read by a resumed run under an applied
@@ -345,6 +347,34 @@ pub fn plan_projection(
                 _ => None,
             })
             == Some(true);
+    let incremental_seed = seed.clone().filter(|seed| {
+        seed.admission_checkpoint.ownership_complete()
+            && seed.admission_checkpoint.head.is_some()
+            && (!budgeted || crate::budget_replay_seed_is_valid(seed))
+    });
+    let time_placement = incremental_seed
+        .as_ref()
+        .and_then(crate::projection::ControlProjectionState::from_projection_seed)
+        .map(|state| state.placement().clone())
+        .unwrap_or_default();
+    let times = crate::message_times::written_times_with_queued(
+        records
+            .iter()
+            .filter(|frame| {
+                frame.seq <= new_watermark
+                    && incremental_seed
+                        .as_ref()
+                        .is_none_or(|seed| seed.prefix_len == 0 || frame.seq > seed.watermark_seq)
+            })
+            .map(|frame| &frame.record),
+        time_placement,
+        incremental_seed
+            .as_ref()
+            .and_then(|seed| seed.admission_checkpoint.head.as_ref())
+            .map(|head| head.queued_times().clone())
+            .unwrap_or_default(),
+    )
+    .map_err(|_| ProjectionPlanError::InconsistentSnapshot("message time placement failed"))?;
     let (
         truncate_prefix_to,
         new_messages,
@@ -359,13 +389,10 @@ pub fn plan_projection(
         episode_spans,
         open_episode_span,
         episode_metadata,
-    ) = if let Some(seed) = seed.clone().filter(|seed| {
+    ) = if let Some(seed) = incremental_seed {
         // A seed stored before the ownership summary existed (or before it recorded the frozen
         // plan manifest) cannot carry it forward: the summary covers every episode, and the
         // seed's earlier ones are not in this tail.
-        seed.admission_checkpoint.ownership_complete()
-            && (!budgeted || crate::budget_replay_seed_is_valid(seed))
-    }) {
         let tail: Vec<FramedRecord> = records
             .iter()
             .filter(|framed| {
@@ -473,6 +500,9 @@ pub fn plan_projection(
         .iter()
         .map(serde_json::to_string)
         .collect::<Result<Vec<_>, _>>()?;
+    let message_times = (0..new_messages.len())
+        .map(|index| times.get(&(next_ord as u64 + index as u64)).copied())
+        .collect();
     let message_run_json = message_runs
         .iter()
         .map(serde_json::to_string)
@@ -551,6 +581,8 @@ pub fn plan_projection(
     let lineage_id = incoming_lineage_id.or_else(|| expected_lineage_id.clone());
 
     Ok(ProjectionPlan::Write(Box::new(PreparedProjection {
+        message_times,
+        head_json: serde_json::to_string(&admission_checkpoint.head)?,
         episode_spans,
         open_episode_span,
         episodes: episode_metadata,

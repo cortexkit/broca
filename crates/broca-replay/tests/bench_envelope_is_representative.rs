@@ -81,6 +81,11 @@ const ACCEPTED: &[[&str; 2]] = &[
     // 0.29.1: adds the flow-scopes/v1 capability name and the terminal route-open code
     // target_flow_unsupported. frame.rs is unchanged.
     ["0.10.0", "0.29.1"],
+    // The cortexkit-role-llm-runner-conformance dev dependency adds 0.33.0. Production and
+    // benchmarks still link 0.32.4. Both published envelopes retain version 2, the same
+    // 21-byte little-endian offsets and flags, and the same Frame::build implementation.
+    // The new framed_body helper is not used by replay.
+    ["0.32.4", "0.33.0"],
 ];
 
 // 0.19.0 admitted 2026-09-06. The ENTIRE crate diff over the bump is `src/manifest.rs`, 208

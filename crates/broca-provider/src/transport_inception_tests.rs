@@ -57,6 +57,7 @@ async fn run_refusal(host: &str, status: u16, body: &'static str) -> RefusalRun 
     std::fs::create_dir_all(dir.join("project")).unwrap();
     let session = BindIdentity::new(dir.join("project"), "inception", "refusal");
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

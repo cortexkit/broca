@@ -30,6 +30,7 @@ async fn live_records(
     let _ = std::fs::remove_dir_all(&dir);
     let session = BindIdentity::new(&dir, "terminal-reason", "s1");
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,

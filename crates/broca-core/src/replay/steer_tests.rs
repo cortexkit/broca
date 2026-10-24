@@ -19,6 +19,7 @@ fn user(text: &str) -> Message {
 
 fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,
@@ -68,6 +69,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
 
 fn steered(text: &str) -> WalRecord {
     WalRecord::Steered {
+        written_at_ms: None,
         tags: None,
         retention: None,
         ts_ms: None,
@@ -88,6 +90,7 @@ fn step_started(step: u64) -> WalRecord {
 
 fn text_step(step: u64, text: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(step),
@@ -105,6 +108,7 @@ fn text_step(step: u64, text: &str) -> WalRecord {
 
 fn call_step(step: u64, call: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(step),

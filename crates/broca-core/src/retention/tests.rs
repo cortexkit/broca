@@ -13,6 +13,7 @@ pub(crate) const MARKER: &str = "retention-content-must-not-be-projected-5d8e7b"
 
 pub(crate) fn started(run: &str, retention: Option<u64>) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention,
@@ -71,6 +72,7 @@ pub(crate) fn frames(retention: Option<u64>) -> Vec<FramedRecord> {
         started("r1", retention),
         WalRecord::StepStarted { step_id: StepId(1) },
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),
@@ -166,6 +168,7 @@ fn retention_last_title_tail_has_no_title() {
     .unwrap();
     let sends = [
         WalRecord::Steered {
+            written_at_ms: None,
             tags: None,
             retention: None,
             ts_ms: Some(1500),
@@ -177,6 +180,7 @@ fn retention_last_title_tail_has_no_title() {
             request_identity_digest: None,
         },
         WalRecord::Queued {
+            written_at_ms: None,
             retention: None,
             ts_ms: Some(1500),
             title: Some(MARKER.into()),

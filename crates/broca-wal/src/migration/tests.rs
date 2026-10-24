@@ -301,6 +301,7 @@ fn existing_writer_rechecks_freeze_before_every_append() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: broca_protocol::StepId(1),

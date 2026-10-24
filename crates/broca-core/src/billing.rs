@@ -899,6 +899,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -934,6 +935,7 @@ mod tests {
         frame(
             seq,
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(id),
@@ -1535,6 +1537,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,

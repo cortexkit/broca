@@ -209,6 +209,7 @@ impl Fixture {
         wal.append(
             1,
             &WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: retained.then_some(3600),

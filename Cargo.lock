@@ -250,7 +250,7 @@ dependencies = [
  "broca-wal",
  "serde",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "subc-transport",
  "tokio",
 ]
@@ -453,7 +453,7 @@ dependencies = [
  "subc-client-rs 0.29.3",
  "subc-control 0.31.0",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "subc-transport",
  "tokio",
  "tokio-util",
@@ -512,7 +512,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "subc-transport",
  "tokio",
  "tokio-tungstenite",
@@ -531,7 +531,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "tokio",
 ]
 
@@ -607,7 +607,7 @@ dependencies = [
  "subc-client-rs 0.29.3",
  "subc-control 0.31.0",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "subc-transport",
  "tokio",
  "tokio-util",
@@ -910,7 +910,7 @@ dependencies = [
  "subc-client-rs 0.30.1",
  "subc-control 0.32.0",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "subc-transport",
  "tempfile",
  "tokio",
@@ -976,9 +976,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-rich-ui-syntax"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edd8791533849a0a58badb9024b33565a6f7e65ebc86bd76f031481ebb61a0d5"
+checksum = "f6a2bee18acb2dd0a8fa2f50b2288490e45ccda92e5f18da11fd4a3a4cfe543d"
 dependencies = [
  "pulldown-cmark",
 ]
@@ -1017,7 +1017,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.32.4",
 ]
 
 [[package]]
@@ -1044,9 +1044,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner"
-version = "0.6.0"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19ed484436a39f48ec3bc8112e7cb4ae4f5f87049709dab9e3c9080d23960cab"
+checksum = "4d9a14a5c449e680e0a331db53d74091e8ea823e4b994ee7b5854c975d1374ab"
 dependencies = [
  "cortexkit-rich-ui-syntax",
  "serde",
@@ -1057,9 +1057,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner-conformance"
-version = "0.11.0"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1079fd1e2ae24ea322ee5009cd6c055303d5d7925cbbfa6e8105dd4b5963d512"
+checksum = "bc5176010500f258939c401be1b3076ccbb4eb41824fa412b1d07922873141e0"
 dependencies = [
  "async-trait",
  "base64",
@@ -1070,7 +1070,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.33.0",
  "tokio",
 ]
 
@@ -1095,7 +1095,7 @@ dependencies = [
  "serde_jcs",
  "serde_json",
  "sha2",
- "subc-protocol",
+ "subc-protocol 0.32.4",
 ]
 
 [[package]]
@@ -1109,7 +1109,7 @@ dependencies = [
  "cortexkit-role-tool-provider",
  "futures-util",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "tokio",
 ]
 
@@ -3163,7 +3163,7 @@ dependencies = [
  "sha2",
  "subc-control 0.31.0",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "subc-transport",
  "tokio",
  "tokio-util",
@@ -3182,7 +3182,7 @@ dependencies = [
  "sha2",
  "subc-control 0.32.0",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "subc-transport",
  "tokio",
  "tokio-util",
@@ -3197,7 +3197,7 @@ checksum = "b2b017b243c6247349195d24385b70b627f81136e1b95ca371b592138d4348fe"
 dependencies = [
  "serde",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.32.4",
 ]
 
 [[package]]
@@ -3208,7 +3208,7 @@ checksum = "66e9da09d60f35c31755ddf4e2fb5733cc1177dd59a663c604ff597c215e6c24"
 dependencies = [
  "serde",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.32.4",
 ]
 
 [[package]]
@@ -3233,6 +3233,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-protocol"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "587cff68a0d5b98eb85a7231ce00e3a117e3e50314ad6823d42b802afa5461a3"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "subc-transport"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3245,7 +3255,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.32.4",
  "subtle",
  "tokio",
 ]

@@ -1236,6 +1236,7 @@ async fn seal_linearization_keeps_answered_slots_until_handover_and_orders_paral
         tool_call_id: "a".into(),
     };
     let model = WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         step_id: StepId(1),
         assistant_message: Arc::new(AssistantMessage {

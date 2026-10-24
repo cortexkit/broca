@@ -600,6 +600,9 @@ impl EffortHistoryV1 {
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
+    /// Missing on older checkpoints: reconstruct from the full WAL before extending totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<crate::head::HeadProjection>,
     /// Whether any deferred call occurred in the complete prefix. Missing means an older
     /// checkpoint cannot show whether a call before its watermark still needs an answer,
     /// a withdrawal, or a late execution report.
@@ -683,6 +686,7 @@ impl AdmissionCheckpointV1 {
 
     pub fn empty() -> Self {
         Self {
+            head: Some(crate::head::HeadProjection::default()),
             has_deferred_calls: Some(false),
             input_budget: Some(crate::input_budget::InputTokenBudget::default()),
             session_class: None,
@@ -702,6 +706,7 @@ impl AdmissionCheckpointV1 {
     pub fn from_frames(records: &[FramedRecord]) -> Result<Self, ReplayError> {
         let mut checkpoint = Self::empty();
         if !records.is_empty() && !crate::retention::starts_at_lineage_origin(records) {
+            checkpoint.head = None;
             checkpoint.has_deferred_calls = None;
             checkpoint.lineage_retention = None;
             checkpoint.tags = None;
@@ -738,6 +743,9 @@ impl AdmissionCheckpointV1 {
 
     /// Fold one WAL record. The mutation is committed only after all corruption checks pass.
     pub fn fold_record(&mut self, seq: u64, record: &WalRecord) -> Result<(), ReplayError> {
+        if let Some(head) = &mut self.head {
+            head.observe(record);
+        }
         if matches!(record, WalRecord::ToolCallDeferred { .. }) {
             self.has_deferred_calls = Some(true);
         }
@@ -940,6 +948,8 @@ impl AdmissionCheckpointV1 {
             }
             WalRecord::Queued {
                 keep_warm,
+                written_at_ms,
+                ts_ms,
                 submission_id,
                 request,
                 request_identity_digest,
@@ -953,6 +963,7 @@ impl AdmissionCheckpointV1 {
             } => crate::queue::insert_in_drain_order(
                 Arc::make_mut(&mut self.pending_fifo),
                 PendingSubmission {
+                    admitted_at_ms: written_at_ms.or(*ts_ms),
                     hooks: hooks.clone(),
                     conversation_key: conversation_key.clone(),
                     submission_id: submission_id.clone(),
@@ -1429,6 +1440,7 @@ mod tests {
         frame(
             seq,
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -1462,6 +1474,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(1),
@@ -1509,6 +1522,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(1),
@@ -1647,6 +1661,7 @@ mod tests {
             frame(
                 1,
                 WalRecord::Queued {
+                    written_at_ms: None,
                     retention: None,
                     ts_ms: None,
                     hooks: None,
@@ -1664,6 +1679,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::Queued {
+                    written_at_ms: None,
                     retention: None,
                     ts_ms: None,
                     hooks: None,
@@ -1719,6 +1735,7 @@ mod tests {
             frame(
                 10,
                 WalRecord::Queued {
+                    written_at_ms: None,
                     retention: None,
                     ts_ms: None,
                     hooks: None,
@@ -1737,6 +1754,7 @@ mod tests {
             frame(
                 12,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(1),
@@ -1827,6 +1845,7 @@ mod tests {
             frame(
                 19,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(2),
@@ -2162,6 +2181,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(1),
@@ -2235,6 +2255,7 @@ mod tests {
         };
         config.budget = Some(budget.clone());
         let step = |id, content| WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(id),
@@ -2354,6 +2375,7 @@ mod tests {
     #[test]
     fn checkpoint_json_with_pending_payload_is_byte_stable() {
         let checkpoint = AdmissionCheckpointV1 {
+            head: None,
             has_deferred_calls: None,
             tags: None,
             pending_order: None,
@@ -2366,6 +2388,7 @@ mod tests {
             at_seq: 7,
             last_episode: None,
             pending_fifo: Arc::new(vec![PendingSubmission {
+                admitted_at_ms: None,
                 order: None,
                 sent_by: None,
                 hooks: None,

@@ -432,6 +432,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    written_at_ms: None,
                     tags: None,
                     session_class: None,
                     retention: None,
@@ -803,6 +804,7 @@ mod identity_tests {
         wal.append(
             1,
             &broca_wal::WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,

@@ -32,6 +32,7 @@ fn fixture() -> (PathBuf, MediaStore, MediaManifest) {
 
 fn record(reference: &MediaRef) -> WalRecord {
     WalRecord::Steered {
+        written_at_ms: None,
         retention: None,
         ts_ms: None,
         send_id: None,

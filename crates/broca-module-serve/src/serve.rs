@@ -3212,7 +3212,10 @@ where
                 return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
                     .await;
             }
-            match handler.head(&session).await {
+            match handler
+                .head_for(&session, bind.principal.as_ref(), &bind.scope)
+                .await
+            {
                 Ok(head) => send_json_response(writer, ver, channel, epoch, corr, &head).await,
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
             }
@@ -4124,7 +4127,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         && parsed
             .tool_items
             .iter()
-            .any(|item| item.preset == broca_fetch_plan::CONFINED_TOOL_PRESET)
+            .any(|item| item.preset.as_deref() == Some(broca_fetch_plan::CONFINED_TOOL_PRESET))
     {
         return Err(SendPlanRefusal::WorkerPresetRequiresScope);
     }
@@ -5148,6 +5151,7 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    written_at: None,
                     delivered_as: None,
                     run: None,
                     ordinal: 0,
@@ -5165,6 +5169,7 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    written_at: None,
                     delivered_as: None,
                     run: None,
                     ordinal: 1,
@@ -5815,6 +5820,7 @@ mod tests {
             let end = (from + 2).min(self.messages.len());
             let messages = (from..end)
                 .map(|ordinal| broca_wire::SessionReadMessage {
+                    written_at: None,
                     delivered_as: None,
                     ordinal: ordinal as u64,
                     mid: format!("m{ordinal}"),
@@ -6630,6 +6636,7 @@ mod tests {
     async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
         let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
         let record = broca_wal::WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,

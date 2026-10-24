@@ -95,6 +95,7 @@ pub enum OutputEvent {
 /// The caller's request to start a run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRequest {
+    pub input_written_at_ms: Option<u64>,
     pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     pub session_class: Option<String>,
     /// Retention accepted for this send, recorded in a new episode's `RunStarted` but never
@@ -238,6 +239,7 @@ impl RunRequest {
         submission_id: broca_protocol::SubmissionId,
     ) -> Self {
         RunRequest {
+            input_written_at_ms: None,
             directives: req.directives,
             session_class: None,
             retention: None,
@@ -366,6 +368,7 @@ where
                 if checkpoint.at_seq == snapshot.watermark_seq
                     && snapshot.watermark_seq <= safe_head
                     && checkpoint.ownership_complete()
+                    && checkpoint.head.is_some()
                     && checkpoint.compaction_complete()
                     && checkpoint.input_budget.is_some()
                 {
@@ -4125,6 +4128,15 @@ where
         // prompt takes its own copy only after the record is durable.
         let episode_input = Arc::new(episode_input);
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
+            written_at_ms: req
+                .input_written_at_ms
+                .or_else(|| {
+                    req.submission_id
+                        .is_none()
+                        .then(|| control.now_ms())
+                        .flatten()
+                })
+                .filter(|at| *at != 0),
             tags: None,
             session_class: req.session_class.clone(),
             retention: req.retention,
@@ -4915,7 +4927,15 @@ where
         // Complete attempts still share the step's existing barrier.
         let session = &req.session;
         let attempt_run_id = &resolved_run_id;
+        let completed_attempt_time = std::sync::Mutex::new(None);
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
+            if matches!(
+                attempt.outcome,
+                broca_protocol::AttemptOutcome::Complete
+                    | broca_protocol::AttemptOutcome::ToolArgsTrailingGarbage
+            ) {
+                *completed_attempt_time.lock().unwrap() = Some(attempt.ts_ms);
+            }
             Box::pin(async move {
                 if let Some(warm) = &control.keep_warm {
                     warm.note_attempt(&attempt);
@@ -4993,6 +5013,11 @@ where
             Ok(step) => step,
             Err(reason) => break reason,
         };
+        let step_written_at_ms = completed_attempt_time
+            .lock()
+            .unwrap()
+            .or_else(|| control.now_ms())
+            .filter(|at| *at != 0);
 
         // Set below when this step's final answer is extended by a steered message.
         let extend_for_steer: bool;
@@ -5095,6 +5120,7 @@ where
                                     false,
                                 );
                                 let mut records = vec![WalRecord::ModelStepFinished {
+                                    written_at_ms: step_written_at_ms,
                                     tags: None,
                                     hooks: metadata,
                                     step_id,
@@ -5200,6 +5226,7 @@ where
                         hooks.is_some(),
                         writer,
                         WalRecord::ModelStepFinished {
+                            written_at_ms: step_written_at_ms,
                             tags: None,
                             hooks: message_hooks,
                             step_id,
@@ -5233,6 +5260,7 @@ where
                 // extraction. The prompt reclaims ownership only after the turn is durable.
                 let message = Arc::new(message);
                 let model_record = WalRecord::ModelStepFinished {
+                    written_at_ms: step_written_at_ms,
                     tags: None,
                     hooks: message_hooks,
                     step_id,
@@ -5977,21 +6005,27 @@ pub(crate) async fn project_committed<W: WalStore>(
             lineage.as_deref(),
             None,
         );
-        let result = match metadata {
-            Ok(Some(metadata)) => {
+        let result = match (metadata, lineage) {
+            (Ok(metadata), Some(lineage)) => {
                 let session = session.clone();
-                spawn_blocking(JobKind::Projection, move || {
-                    store.project_retention_metadata(&session, &metadata)
+                spawn_blocking(JobKind::Projection, move || -> Result<(), String> {
+                    if let broca_wal::WalRangeRecords::Complete(records) = range.records() {
+                        store.project_retained_head(&session, &lineage, records)?;
+                    }
+                    if let Some(metadata) = metadata {
+                        store.project_retention_metadata(&session, &metadata)?;
+                    }
+                    Ok(())
                 })
                 .await
                 .map_err(|_| ())
                 .and_then(|result| result.map_err(|_| ()))
             }
-            Ok(None) => Ok(()),
-            Err(_) => Err(()),
+            (Ok(_), None) => Ok(()),
+            (Err(_), _) => Err(()),
         };
         if result.is_err() {
-            tracing::warn!(target: "store", "retention withdrawal metadata projection failed; the WAL remains authoritative");
+            tracing::warn!(target: "store", "retention head or withdrawal metadata projection failed; the WAL remains authoritative");
             PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             crate::projection_health::record_failure(session);
         } else {
@@ -9470,6 +9504,7 @@ mod tests {
             reply: None,
         };
         let mut req = RunRequest {
+            input_written_at_ms: None,
             directives: None,
             session_class: None,
             retention: None,
@@ -11139,6 +11174,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                head: None,
                 has_deferred_calls: None,
                 tags: Some(crate::tags::LineageTags::Off),
                 pending_order: None,

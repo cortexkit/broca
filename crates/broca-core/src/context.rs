@@ -95,6 +95,7 @@ impl StorePrefix {
 /// One materialized message row, preserving its lineage ordinal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePageRow {
+    pub written_at: Option<u64>,
     pub ordinal: u64,
     pub message: Message,
     pub run: Option<crate::RunAttribution>,
@@ -180,6 +181,7 @@ pub struct ModelHistory {
 /// The metadata and requested rows captured by one store transaction for `session.read`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePageSnapshot {
+    pub head: Option<crate::head::HeadProjection>,
     pub model_history: Option<ModelHistory>,
     pub watermark_seq: u64,
     /// WAL identity represented by the materialized rows. Without a known matching
@@ -217,6 +219,7 @@ pub struct StorePageSnapshot {
 impl StorePageSnapshot {
     pub fn empty() -> Self {
         Self {
+            head: Some(crate::head::HeadProjection::default()),
             model_history: None,
             last_title: None,
             deferred_calls: None,
@@ -296,6 +299,20 @@ pub struct TagLocation {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    fn read_retained_head(
+        &self,
+        _session: &BindIdentity,
+        _lineage_id: &str,
+    ) -> Result<Option<crate::head::RetainedHeadCheckpoint>, String> {
+        Ok(None)
+    }
+    fn checkpoint_retained_head(
+        &self,
+        _session: &BindIdentity,
+        _checkpoint: &crate::head::RetainedHeadCheckpoint,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Look a runner tag up in the store's tag index, without reading any message. `None`
     /// when this store keeps no tag index; the caller then has to read the whole transcript.
     fn tag_location(
@@ -400,6 +417,15 @@ pub trait MaterializedStore: Send + Sync {
 /// The WAL→store projection seam. Defined in the loop crate (so `run_loop` can
 /// drive it without depending on the SQLite impl); `SqliteStore` implements it.
 pub trait Persister: Send + Sync {
+    /// Retained transcripts stay WAL-only; only content-free head facts may be checkpointed.
+    fn project_retained_head(
+        &self,
+        _session: &BindIdentity,
+        _lineage_id: &str,
+        _records: &[FramedRecord],
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Read the complete seed for a suffix-only projection. `None` asks the caller to provide
     /// the full WAL because metadata from an older schema cannot safely seed incremental replay.
     /// The default preserves compatibility for persisters that only support full-prefix replay.
@@ -783,6 +809,7 @@ pub fn emit_lineage_usage_exports(
 /// prompt ordinal, which is kept out of [`Message`]'s serde shape for render byte stability.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionReadMessage {
+    pub written_at: Option<u64>,
     pub ordinal: u64,
     pub message: Message,
     pub run: Option<crate::RunAttribution>,
@@ -909,6 +936,7 @@ pub fn read_session_page(
                 })
                 .cloned()
                 .map(|row| SessionReadMessage {
+                    written_at: row.written_at,
                     ordinal: row.ordinal,
                     message: row.message,
                     run: row.run,
@@ -958,6 +986,7 @@ pub fn read_session_page_owned_with_dispatches(
                     !discard_materialized_seed && row.ordinal >= start && row.ordinal < end
                 })
                 .map(|row| SessionReadMessage {
+                    written_at: row.written_at,
                     ordinal: row.ordinal,
                     message: row.message,
                     run: row.run,
@@ -983,6 +1012,22 @@ fn read_session_page_from_rows(
     let capped_limit = limit
         .unwrap_or(SESSION_READ_DEFAULT_LIMIT)
         .clamp(1, SESSION_READ_MAX_LIMIT);
+    let times = crate::message_times::written_times_with_queued(
+        framed_tail.iter().map(|frame| &frame.record),
+        crate::placement::Placement::new(snapshot.prefix_len),
+        snapshot
+            .head
+            .as_ref()
+            .map(|head| head.queued_times().clone())
+            .unwrap_or_default(),
+    )
+    .map_err(|reason| crate::ReplayError::CorruptLineage {
+        episode_run_id: snapshot
+            .last_run_id
+            .clone()
+            .unwrap_or_else(|| RunId(String::new())),
+        reason,
+    })?;
     let discard_materialized_seed = snapshot.completed_steps == 0
         && crate::replay::first_session_record_is_interrupted(
             framed_tail.iter().map(|framed| &framed.record),
@@ -1038,6 +1083,7 @@ fn read_session_page_from_rows(
                 let ordinal = prefix_len + tail_start + index as u64;
                 message.ordinal = Some(ordinal);
                 SessionReadMessage {
+                    written_at: times.get(&ordinal).copied(),
                     ordinal,
                     message,
                     run: tail_state.message_runs[(tail_start + index as u64) as usize].clone(),
@@ -1301,6 +1347,7 @@ fn read_session_page_full(
         .cloned()
         .enumerate()
         .map(|(index, message)| SessionReadMessage {
+            written_at: None,
             run: runs[(start + index as u64) as usize].clone(),
             ordinal: message.ordinal.unwrap_or(start + index as u64),
             message,
@@ -2071,6 +2118,7 @@ mod tests {
     fn sample_wal() -> Vec<WalRecord> {
         vec![
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -2125,6 +2173,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),
@@ -2184,6 +2233,7 @@ mod tests {
             },
             WalRecord::TurnFinished { step_id: StepId(1) },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(2),
@@ -2435,6 +2485,7 @@ mod tests {
         };
         records.extend([
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -2464,6 +2515,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(3),
@@ -2513,6 +2565,7 @@ mod tests {
             // This naturally terminal no-tool step is durable but has no RunFinished, so the
             // corpus ends with a non-empty, not-yet-materialized tail.
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(4),
@@ -2589,6 +2642,7 @@ mod tests {
                 let ordinal = index as u64;
                 message.ordinal = Some(ordinal);
                 StorePageRow {
+                    written_at: None,
                     ordinal,
                     message,
                     run: runs[index].clone(),
@@ -2596,6 +2650,7 @@ mod tests {
             })
             .collect();
         StorePageSnapshot {
+            head: None,
             model_history: None,
             last_title: None,
             deferred_calls: None,
@@ -2766,6 +2821,7 @@ mod tests {
                 );
                 message.ordinal = Some(ordinal);
                 StorePageRow {
+                    written_at: None,
                     ordinal,
                     message,
                     run: None,
@@ -3145,6 +3201,7 @@ mod episode_merge_regression {
 
     fn start(run: &str, model: &str, text: &str) -> WalRecord {
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3191,6 +3248,7 @@ mod episode_merge_regression {
         let wal = vec![
             start("a", "a-model", "episode a"),
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),

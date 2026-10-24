@@ -1728,12 +1728,8 @@ target = "--test it"
 test_file = "crates/broca-module/tests/it/session_read/run_usage.rs"
 expect_red = ["session_read::run_usage::usage_unreported_only_when_all_fields_absent_golden"]
 file = "crates/broca-core/src/replay.rs"
-old = '''                    if let Some(tokens) = usage.output_tokens {
-                        step_usage = step_usage.with_output_tokens(tokens);
-                    }'''
-new = '''                    if let Some(tokens) = usage.output_tokens.filter(|tokens| *tokens != 0) {
-                        step_usage = step_usage.with_output_tokens(tokens);
-                    } // NON-VACUITY BREAK: treat a reported zero as absent'''
+old = "step.output_tokens = usage.output_tokens;"
+new = "step.output_tokens = usage.output_tokens.filter(|tokens| *tokens != 0); // NON-VACUITY BREAK: drop a reported zero"
 
 [[control]]
 id = "module-run-result-reuses-status-wal"
@@ -2656,8 +2652,8 @@ target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
 expect_red = ["plan_admission::a_worker_preset_plan_requires_a_scoped_route"]
 file = "crates/broca-module-serve/src/serve.rs"
-old = "            .any(|item| item.preset == broca_fetch_plan::CONFINED_TOOL_PRESET)"
-new = "            .any(|item| item.preset == broca_fetch_plan::CONFINED_TOOL_PRESET && false) // NON-VACUITY BREAK"
+old = "            .any(|item| item.preset.as_deref() == Some(broca_fetch_plan::CONFINED_TOOL_PRESET))"
+new = "            .any(|item| item.preset.as_deref() == Some(broca_fetch_plan::CONFINED_TOOL_PRESET) && false) // NON-VACUITY BREAK"
 
 [[control]]
 id = "ordered-first-send-freezes-route-scope"
@@ -5604,7 +5600,7 @@ new = "    // NON-VACUITY BREAK: route private approval content through ordinary
 
 [[control]]
 id = "retention-approval-warning-production"
-guards = "retained withdrawal metadata failures increment their warning counter in production rather than only in test builds"
+guards = "retained head or withdrawal metadata failures increment their warning counter in production rather than only in test builds"
 runner = "cargo"
 package = "broca-core"
 target = "--lib"
@@ -5613,10 +5609,9 @@ test_file = "crates/broca-core/src/run.rs"
 expect_red = ["run::tests::projection_warning_mutations_are_not_test_gated"]
 expect_message = "projection warning counter mutation is test-gated"
 file = "crates/broca-core/src/run.rs"
-old = '            tracing::warn!(target: "store", "retention withdrawal metadata projection failed; the WAL remains authoritative");'
-new = '''            tracing::warn!(target: "store", "retention withdrawal metadata projection failed; the WAL remains authoritative");
-            // NON-VACUITY BREAK: hide the retained metadata counter from release builds.
-            #[cfg(test)]'''
+old = '            tracing::warn!(target: "store", "retention head or withdrawal metadata projection failed; the WAL remains authoritative");'
+new = '''            tracing::warn!(target: "store", "retention head or withdrawal metadata projection failed; the WAL remains authoritative");
+            #[cfg(test)] // NON-VACUITY BREAK: hide the retained metadata counter from release builds.'''
 
 # This proof checks the following behavior: retained Prepared calls are refused when they lack the WAL
 # identity needed to link their approval metadata to the run.
@@ -7206,8 +7201,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-store/src/conformance/compaction.rs"
 expect_red = ["tests::absent_compaction_checkpoint_refolds_complete_wal"]
 file = "crates/broca-store/src/lib.rs"
-old = "checkpoint.at_seq == watermark_seq && checkpoint.compaction_complete()"
-new = "checkpoint.at_seq == watermark_seq // NON-VACUITY BREAK"
+old = "checkpoint.compaction_complete()"
+new = "true /* NON-VACUITY BREAK: accept missing compaction state */"
 
 [[control]]
 id = "compaction-inline-replacement-digest"
@@ -7386,8 +7381,8 @@ test_count_pattern = "running {count} test"
 test_file = "crates/broca-fetch-plan/src/compaction_tests.rs"
 expect_red = ["compaction_tests::admission_rechecks_replace_ownership_independently_of_the_parser"]
 file = "crates/broca-fetch-plan/src/admit.rs"
-old = "&step.subscriptions,\n            reduction_owner,"
-new = "&step.subscriptions,\n            Some(&step.item.provider), // NON-VACUITY BREAK"
+old = "declaration.as_deref(),\n                &step.subscriptions,\n                reduction_owner,"
+new = "declaration.as_deref(),\n                &step.subscriptions,\n                Some(&step.item.provider), // NON-VACUITY BREAK"
 
 [[control]]
 id = "compaction-serve-plane-required-before-fetch"
@@ -25901,20 +25896,6 @@ old = "//! Capability-handle credential reads for foreground developer tools, no
 new = "//! Capability-handle credential reads for foreground developer tools, not the daemon.\n// NON-VACUITY BREAK: opencode/auth.json"
 
 [[control]]
-id = "daemon-no-legacy-vault-handles"
-guards = "Daemon startup and serving never resolve the retired vault-handles file; credentials are read by grant"
-runner = "cargo"
-package = "broca-module-serve"
-target = "--test it"
-select = "expected"
-test_file = "crates/broca-module-serve/tests/it/credential_source_guard.rs"
-expect_red = ["credential_source_guard::daemon_serve_path_never_resolves_a_vault_handles_file"]
-expect_message = "daemon serve path references legacy vault handles: main.rs"
-file = "crates/broca-module-serve/src/main.rs"
-old = "        let credential_ids =\n            broca_module_serve::VaultCredentialIds::load_default_path().map_err(ServeIoError)?;"
-new = "        let _legacy_path = broca_module_serve::config_home::config_file(\"BROCA_VAULT_HANDLES_PATH\", \"vault-handles.json\"); // NON-VACUITY BREAK\n        let credential_ids =\n            broca_module_serve::VaultCredentialIds::load_default_path().map_err(ServeIoError)?;"
-
-[[control]]
 id = "live-credential-read-requires-consent"
 guards = "Live credentials are never read before exact live-test consent"
 runner = "cargo"
@@ -26181,373 +26162,6 @@ old = '''        let api = self
             .filter(|api| !api.value.trim().is_empty())
             .ok_or("missing wire.api")?;'''
 new = '''        let api = self.api.clone().unwrap_or_else(|| WireFact { value: "https://guessed.example/v1".into(), from: "local".into() }); // NON-VACUITY BREAK: guess a route for an unrouted Go row'''
-
-[[control]]
-id = "subc-held-dispatch-capability-installation-gate"
-guards = "The content/v1 and held-reply/v1 pair remains undeclared until every held integration seam is installed"
-runner = "cargo"
-package = "broca-subc"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-subc/src/connection.rs"
-expect_red = ["connection::tests::dispatch_capabilities_are_installed_together_and_role_routes_stay_undeclared"]
-file = "crates/broca-subc/src/connection.rs"
-old = "        let capabilities = provider_held_installed.then(|| {"
-new = "        let capabilities = (provider_held_installed || true).then(|| { // NON-VACUITY BREAK: advertise without installed lifecycle."
-
-[[control]]
-id = "subc-held-dispatch-undeclared-reply-refusal"
-guards = "A held marker on an undeclared route is a protocol refusal, never a final model answer"
-runner = "cargo"
-package = "broca-subc"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
-expect_red = ["subc_plane::held_dispatch_tests::undeclared_held_reply_is_a_protocol_refusal_not_a_final_answer"]
-file = "crates/broca-subc/src/subc_plane.rs"
-old = "                let has_held = raw.get(\"held\").is_some();"
-new = "                let has_held = raw.get(\"held\").is_some() && sent_on.reads_held_reply; // NON-VACUITY BREAK: hide undeclared markers from the refusal."
-
-[[control]]
-id = "subc-held-dispatch-registration-before-key"
-guards = "No key leaves the process before the complete dispatch group's intake transaction has synced"
-runner = "cargo"
-package = "broca-subc"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
-expect_red = ["subc_plane::held_dispatch_tests::no_key_is_sent_until_the_whole_dispatch_group_registration_syncs"]
-file = "crates/broca-subc/src/subc_plane.rs"
-old = "            && sent_key.is_some_and(|key| {"
-new = "            && false /* NON-VACUITY BREAK: bypass the registration acknowledgement. */ && sent_key.is_some_and(|key| {"
-
-[[control]]
-id = "core-provider-held-record-synced-before-action"
-guards = "The batch's ToolCallProviderHeld append is synced before the adapter can enter its held lifecycle"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/run.rs"
-expect_red = ["run::tests::provider_held_dispatch_syncs_its_record_before_acting"]
-file = "crates/broca-core/src/run.rs"
-old = '''        self.writer
-            .sync()
-            .await
-            .map_err(|error| error.to_string())?;'''
-new = "        // NON-VACUITY BREAK: acknowledge the held append without syncing it."
-
-[[control]]
-id = "subc-held-dispatch-interim-never-final"
-guards = "An accepted held reply returns only the eventual terminal, never the provider's interim content"
-runner = "cargo"
-package = "broca-subc"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
-expect_red = ["subc_plane::held_dispatch_tests::held_reply_requires_every_prerequisite_and_never_exposes_interim_content"]
-file = "crates/broca-subc/src/subc_plane.rs"
-old = "                            let terminal = support.lifecycle.wait(ctx, call, &reply).await;"
-new = "                            let terminal = DispatchResult::Completed(map_call_tool_result(&call.tool_call_id, &raw)); // NON-VACUITY BREAK: treat interim content as terminal."
-
-[[control]]
-id = "store-late-results-dispatch-group-atomic"
-guards = "A failed registration rolls back every member of its dispatch group rather than publishing a partial group"
-runner = "cargo"
-package = "broca-store"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-store/src/late_results_store.rs"
-expect_red = ["late_results_store::tests::dispatch_group_is_atomic_and_cannot_retarget_an_issued_key"]
-file = "crates/broca-store/src/late_results_store.rs"
-old = "            if changed != 1 {"
-new = "            if changed != 1 { transaction.commit().unwrap(); // NON-VACUITY BREAK: keep the successful prefix of a failed group."
-
-[[control]]
-id = "store-late-results-full-synchronous-registration"
-guards = "The registration backend uses SQLite FULL synchronous commits before acknowledging provider keys"
-runner = "cargo"
-package = "broca-store"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-store/src/late_results_store.rs"
-expect_red = ["late_results_store::tests::dispatch_group_registrations_survive_reopen"]
-file = "crates/broca-store/src/late_results_store.rs"
-old = "             PRAGMA synchronous = FULL;"
-new = "             PRAGMA synchronous = OFF; -- NON-VACUITY BREAK: acknowledge without durable SQLite commit sync."
-
-[[control]]
-id = "media-capture-detected-mime-wins"
-guards = "Capture records detected PNG even when the tool declares JPEG"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::png_magic_overrides_declared_jpeg_without_changing_bytes"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '        mime: mime.into(),'
-new = '        mime: _declared_mime.into(), // NON-VACUITY BREAK: trust the declaration instead of magic.'
-
-[[control]]
-id = "media-capture-unknown-mime-refused"
-guards = "Unsupported types and unknown signatures cannot become media references"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::outside_table_types_and_unknown_magic_are_mime"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '    let (kind, mime) = detect(bytes).ok_or(MediaMarkerReason::Mime)?;'
-new = '    let (kind, mime) = detect(bytes).unwrap_or((MediaKind::Document, "application/pdf")); // NON-VACUITY BREAK: guess unknown bytes are PDF.'
-
-[[control]]
-id = "media-capture-fixed-store-maximum"
-guards = "An over-maximum payload yields too_large before any reference can be published"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::fixed_store_maxima_reject_oversized_payloads_before_publication"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '    if bytes.len() as u64 > store_max_bytes(kind) {'
-new = '    if false && bytes.len() as u64 > store_max_bytes(kind) { // NON-VACUITY BREAK: remove the store size fence.'
-
-[[control]]
-id = "media-capture-store-maximum-inclusive"
-guards = "The fixed store maximum is inclusive and independent of a profile's smaller limit"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::store_maximum_is_inclusive_and_not_a_profile_limit"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '    if bytes.len() as u64 > store_max_bytes(kind) {'
-new = '    if bytes.len() as u64 >= store_max_bytes(kind) { // NON-VACUITY BREAK: reject the allowed boundary.'
-
-[[control]]
-id = "media-capture-png-container-through-iend"
-guards = "An intact PNG header cannot hide a truncated body"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::png_intact_header_does_not_hide_a_truncated_container"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '                "image/png" => png(bytes),'
-new = '                "image/png" => Some((1, 1)), // NON-VACUITY BREAK: skip the PNG container walk.'
-
-[[control]]
-id = "media-capture-png-crc"
-guards = "Every PNG chunk including IDAT and IEND is protected by its CRC"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::png_crc_covers_body_and_end_chunks"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '        if png_crc(chunk) != crc {'
-new = '        if false && png_crc(chunk) != crc { // NON-VACUITY BREAK: ignore PNG CRC mismatches.'
-
-[[control]]
-id = "media-capture-jpeg-container-through-eoi"
-guards = "JPEG segments and entropy data must reach EOI without overrunning a segment"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::jpeg_walks_segments_and_entropy_to_eoi"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '                "image/jpeg" => jpeg(bytes),'
-new = '                "image/jpeg" => Some((1, 1)), // NON-VACUITY BREAK: skip the JPEG container walk.'
-
-[[control]]
-id = "media-capture-gif-container-through-trailer"
-guards = "GIF tables, extensions and subblocks must fit before the trailer"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::gif_walks_tables_extensions_and_subblocks_to_trailer"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '                "image/gif" => gif(bytes),'
-new = '                "image/gif" => Some((1, 1)), // NON-VACUITY BREAK: skip the GIF container walk.'
-
-[[control]]
-id = "media-capture-valid-webp"
-guards = "A valid WebP is captured with its original dimensions and digest"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::valid_webp_is_accepted_with_original_digest"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '                "image/webp" => webp(bytes),'
-new = '                "image/webp" => None, // NON-VACUITY BREAK: reject all WebP payloads.'
-
-[[control]]
-id = "media-capture-webp-riff-size"
-guards = "WebP RIFF size plus eight must equal the complete received byte size"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::webp_checks_riff_size_and_chunk_boundaries"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '        || u64::from(le32(bytes.get(4..8)?)) + 8 != bytes.len() as u64'
-new = '        || false && u64::from(le32(bytes.get(4..8)?)) + 8 != bytes.len() as u64 // NON-VACUITY BREAK: ignore RIFF size.'
-
-[[control]]
-id = "media-capture-webp-nested-frame"
-guards = "A complete RIFF must not hide a truncated animated WebP frame chunk"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::animated_webp_walks_nested_frame_chunks"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '                if data.len() < 16 || !webp_frame(&data[16..]) {'
-new = '                if data.len() < 16 { // NON-VACUITY BREAK: trust only the outer frame length.'
-
-[[control]]
-id = "media-capture-original-byte-digest"
-guards = "The captured digest describes every received byte, without transformation"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::png_magic_overrides_declared_jpeg_without_changing_bytes"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '        sha256: format!("{:x}", Sha256::digest(bytes)),'
-new = '        sha256: format!("{:x}", Sha256::digest(&bytes[1..])), // NON-VACUITY BREAK: omit the first received byte.'
-
-[[control]]
-id = "media-capture-header-dimensions"
-guards = "Image dimensions describe the actual header rather than a guessed size"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/media_validation/tests.rs"
-expect_red = ["media_validation::tests::image_dimensions_come_from_headers"]
-file = "crates/broca-core/src/media_validation.rs"
-old = '        width: dimensions.map(|(w, _)| w),'
-new = '        width: dimensions.map(|_| 1), // NON-VACUITY BREAK: replace the header width with a guess.'
-
-[[control]]
-id = "core-provider-held-replay-not-indeterminate"
-guards = "A synced held record is a provider-owned obligation, not an ambiguous dispatch"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/replay.rs"
-expect_red = ["replay::provider_held_tests::provider_held_and_sequential_successor_are_not_indeterminate"]
-file = "crates/broca-core/src/replay.rs"
-old = "            if self.provider_held.contains_key(&self.planned[position]) {"
-new = "            if false && self.provider_held.contains_key(&self.planned[position]) { // NON-VACUITY BREAK: forget the durable held record."
-
-[[control]]
-id = "core-provider-held-successor-never-sent"
-guards = "A sequential successor behind an open held call is known never sent"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/replay.rs"
-expect_red = ["replay::provider_held_tests::provider_held_and_sequential_successor_are_not_indeterminate"]
-file = "crates/broca-core/src/replay.rs"
-old = "                        held.sequential"
-new = "                        false && held.sequential // NON-VACUITY BREAK: classify a held successor as ambiguous."
-
-[[control]]
-id = "core-provider-held-delivered-successor-is-indeterminate"
-guards = "A delivered held terminal removes the never-sent proof for its successor at both send kill points"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/replay.rs"
-expect_red = ["replay::provider_held_tests::delivered_held_terminal_makes_both_successor_kill_points_interrupted"]
-file = "crates/broca-core/src/replay.rs"
-old = "                                    DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps,"
-new = "                                    DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps | DispatchOutcome::Completed, // NON-VACUITY BREAK: pretend a delivered predecessor still blocks sending."
-
-[[control]]
-id = "core-provider-held-sequential-terminal-before-send"
-guards = "The held terminal is synced before a sequential successor is sent, including on resume"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/run.rs"
-expect_red = ["run::tests::provider_held_sequential_pause_resume_syncs_before_successor"]
-file = "crates/broca-core/src/run.rs"
-old = "                    sync_held_terminal(&mut result, ctx, plane.writer, hooks).await?;"
-new = "                    // NON-VACUITY BREAK: defer the held terminal to the final batch barrier."
-
-[[control]]
-id = "core-provider-held-mixed-closeout-not-unknown"
-guards = "A mixed-crash close-out keeps the provider-held call known and interrupts only the ambiguous sibling as Unknown"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/replay.rs"
-expect_red = ["replay::provider_held_tests::provider_held_parallel_indeterminate_sibling_uses_full_close_out"]
-file = "crates/broca-core/src/resume.rs"
-old = "                provider_held_interrupted_result(tool_call_id),\n                DispatchOutcome::Interrupted,"
-new = "                outcome_unknown_result(tool_call_id),\n                DispatchOutcome::Unknown, // NON-VACUITY BREAK: lose the provider-held ownership proof."
-
-[[control]]
-id = "core-provider-held-pause-waits-for-approval"
-guards = "An unanswered approval card keeps the live batch and its consent intake running beside a provider-held call"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/run.rs"
-expect_red = ["run::approval_gate::provider_held_pause_waits_for_approval_and_inflight_siblings"]
-file = "crates/broca-core/src/run.rs"
-old = "                .any(|slot| matches!(slot, Slot::Held(call) if !call.approved))"
-new = "                .any(|slot| matches!(slot, Slot::Held(call) if !call.approved) && false) // NON-VACUITY BREAK: pause while an approval card is open."
-
-[[control]]
-id = "module-provider-held-same-run-send-does-not-redrive"
-guards = "A same-run-id send reports the existing tool-held pause without invoking the run executor or writing another pause"
-runner = "cargo"
-package = "broca-module"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-module/src/actor.rs"
-expect_red = ["actor::tests::provider_held_session_activity_is_queued_or_refused_without_redrive"]
-file = "crates/broca-module/src/actor.rs"
-old = "                    reason @ (broca_protocol::PauseReason::Restart\n                    | broca_protocol::PauseReason::ToolHeld),"
-new = "                    reason @ broca_protocol::PauseReason::Restart, // NON-VACUITY BREAK: let a tool-held send re-drive its run."
-
-[[control]]
-id = "core-provider-held-pause-ends-warm-wait"
-guards = "A held-only batch returns to its durable pause and drops owned keep-warm IO rather than warming indefinitely"
-runner = "cargo"
-package = "broca-core"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-core/src/run.rs"
-expect_red = ["run::tests::provider_held_pause_stops_keep_warm_for_a_day"]
-file = "crates/broca-core/src/run.rs"
-old = "            _ = async {}, if !tripped && plane.held.len() > 0 && jobs.len() == plane.held.len() => {"
-new = "            _ = async {}, if false && !tripped && plane.held.len() > 0 && jobs.len() == plane.held.len() => { // NON-VACUITY BREAK: keep warming a held-only batch instead of pausing."
 
 [[control]]
 id = "wal-tool-times-must-understand"
@@ -27027,6 +26641,906 @@ old = '''                            part: Some(part),
 new = '''                            part: Some(part + 1), // NON-VACUITY BREAK: corrupt only the new display coordinate.
                             message_id: mid,
                             tool_call_id: None,'''
+
+[[control]]
+id = "subc-held-dispatch-capability-installation-gate"
+guards = "The content/v1 and held-reply/v1 pair remains undeclared until every held integration seam is installed"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/connection.rs"
+expect_red = ["connection::tests::dispatch_capabilities_are_installed_together_and_role_routes_stay_undeclared"]
+file = "crates/broca-subc/src/connection.rs"
+old = "        let capabilities = provider_held_installed.then(|| {"
+new = "        let capabilities = (provider_held_installed || true).then(|| { // NON-VACUITY BREAK: advertise without installed lifecycle."
+
+[[control]]
+id = "subc-held-dispatch-undeclared-reply-refusal"
+guards = "A held marker on an undeclared route is a protocol refusal, never a final model answer"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
+expect_red = ["subc_plane::held_dispatch_tests::undeclared_held_reply_is_a_protocol_refusal_not_a_final_answer"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "                let has_held = raw.get(\"held\").is_some();"
+new = "                let has_held = raw.get(\"held\").is_some() && sent_on.reads_held_reply; // NON-VACUITY BREAK: hide undeclared markers from the refusal."
+
+[[control]]
+id = "subc-held-dispatch-registration-before-key"
+guards = "No key leaves the process before the complete dispatch group's intake transaction has synced"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
+expect_red = ["subc_plane::held_dispatch_tests::no_key_is_sent_until_the_whole_dispatch_group_registration_syncs"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "            && sent_key.is_some_and(|key| {"
+new = "            && false /* NON-VACUITY BREAK: bypass the registration acknowledgement. */ && sent_key.is_some_and(|key| {"
+
+[[control]]
+id = "core-provider-held-record-synced-before-action"
+guards = "The batch's ToolCallProviderHeld append is synced before the adapter can enter its held lifecycle"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_dispatch_syncs_its_record_before_acting"]
+file = "crates/broca-core/src/run.rs"
+old = '''        self.writer
+            .sync()
+            .await
+            .map_err(|error| error.to_string())?;'''
+new = "        // NON-VACUITY BREAK: acknowledge the held append without syncing it."
+
+[[control]]
+id = "subc-held-dispatch-interim-never-final"
+guards = "An accepted held reply returns only the eventual terminal, never the provider's interim content"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
+expect_red = ["subc_plane::held_dispatch_tests::held_reply_requires_every_prerequisite_and_never_exposes_interim_content"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "                            let terminal = support.lifecycle.wait(ctx, call, &reply).await;"
+new = "                            let terminal = DispatchResult::Completed(map_call_tool_result(&call.tool_call_id, &raw)); // NON-VACUITY BREAK: treat interim content as terminal."
+
+[[control]]
+id = "store-late-results-dispatch-group-atomic"
+guards = "A failed registration rolls back every member of its dispatch group rather than publishing a partial group"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::dispatch_group_is_atomic_and_cannot_retarget_an_issued_key"]
+file = "crates/broca-store/src/late_results_store.rs"
+old = "            if changed != 1 {"
+new = "            if changed != 1 { transaction.commit().unwrap(); // NON-VACUITY BREAK: keep the successful prefix of a failed group."
+
+[[control]]
+id = "store-late-results-full-synchronous-registration"
+guards = "The registration backend uses SQLite FULL synchronous commits before acknowledging provider keys"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::dispatch_group_registrations_survive_reopen"]
+file = "crates/broca-store/src/late_results_store.rs"
+old = "             PRAGMA synchronous = FULL;"
+new = "             PRAGMA synchronous = OFF; -- NON-VACUITY BREAK: acknowledge without durable SQLite commit sync."
+
+[[control]]
+id = "media-capture-detected-mime-wins"
+guards = "Capture records detected PNG even when the tool declares JPEG"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::png_magic_overrides_declared_jpeg_without_changing_bytes"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        mime: mime.into(),'
+new = '        mime: _declared_mime.into(), // NON-VACUITY BREAK: trust the declaration instead of magic.'
+
+[[control]]
+id = "media-capture-unknown-mime-refused"
+guards = "Unsupported types and unknown signatures cannot become media references"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::outside_table_types_and_unknown_magic_are_mime"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '    let (kind, mime) = detect(bytes).ok_or(MediaMarkerReason::Mime)?;'
+new = '    let (kind, mime) = detect(bytes).unwrap_or((MediaKind::Document, "application/pdf")); // NON-VACUITY BREAK: guess unknown bytes are PDF.'
+
+[[control]]
+id = "media-capture-fixed-store-maximum"
+guards = "An over-maximum payload yields too_large before any reference can be published"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::fixed_store_maxima_reject_oversized_payloads_before_publication"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '    if bytes.len() as u64 > store_max_bytes(kind) {'
+new = '    if false && bytes.len() as u64 > store_max_bytes(kind) { // NON-VACUITY BREAK: remove the store size fence.'
+
+[[control]]
+id = "media-capture-store-maximum-inclusive"
+guards = "The fixed store maximum is inclusive and independent of a profile's smaller limit"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::store_maximum_is_inclusive_and_not_a_profile_limit"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '    if bytes.len() as u64 > store_max_bytes(kind) {'
+new = '    if bytes.len() as u64 >= store_max_bytes(kind) { // NON-VACUITY BREAK: reject the allowed boundary.'
+
+[[control]]
+id = "media-capture-png-container-through-iend"
+guards = "An intact PNG header cannot hide a truncated body"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::png_intact_header_does_not_hide_a_truncated_container"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                "image/png" => png(bytes),'
+new = '                "image/png" => Some((1, 1)), // NON-VACUITY BREAK: skip the PNG container walk.'
+
+[[control]]
+id = "media-capture-png-crc"
+guards = "Every PNG chunk including IDAT and IEND is protected by its CRC"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::png_crc_covers_body_and_end_chunks"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        if png_crc(chunk) != crc {'
+new = '        if false && png_crc(chunk) != crc { // NON-VACUITY BREAK: ignore PNG CRC mismatches.'
+
+[[control]]
+id = "media-capture-jpeg-container-through-eoi"
+guards = "JPEG segments and entropy data must reach EOI without overrunning a segment"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::jpeg_walks_segments_and_entropy_to_eoi"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                "image/jpeg" => jpeg(bytes),'
+new = '                "image/jpeg" => Some((1, 1)), // NON-VACUITY BREAK: skip the JPEG container walk.'
+
+[[control]]
+id = "media-capture-gif-container-through-trailer"
+guards = "GIF tables, extensions and subblocks must fit before the trailer"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::gif_walks_tables_extensions_and_subblocks_to_trailer"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                "image/gif" => gif(bytes),'
+new = '                "image/gif" => Some((1, 1)), // NON-VACUITY BREAK: skip the GIF container walk.'
+
+[[control]]
+id = "media-capture-valid-webp"
+guards = "A valid WebP is captured with its original dimensions and digest"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::valid_webp_is_accepted_with_original_digest"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                "image/webp" => webp(bytes),'
+new = '                "image/webp" => None, // NON-VACUITY BREAK: reject all WebP payloads.'
+
+[[control]]
+id = "media-capture-webp-riff-size"
+guards = "WebP RIFF size plus eight must equal the complete received byte size"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::webp_checks_riff_size_and_chunk_boundaries"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        || u64::from(le32(bytes.get(4..8)?)) + 8 != bytes.len() as u64'
+new = '        || false && u64::from(le32(bytes.get(4..8)?)) + 8 != bytes.len() as u64 // NON-VACUITY BREAK: ignore RIFF size.'
+
+[[control]]
+id = "media-capture-webp-nested-frame"
+guards = "A complete RIFF must not hide a truncated animated WebP frame chunk"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::animated_webp_walks_nested_frame_chunks"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '                if data.len() < 16 || !webp_frame(&data[16..]) {'
+new = '                if data.len() < 16 { // NON-VACUITY BREAK: trust only the outer frame length.'
+
+[[control]]
+id = "media-capture-original-byte-digest"
+guards = "The captured digest describes every received byte, without transformation"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::png_magic_overrides_declared_jpeg_without_changing_bytes"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        sha256: format!("{:x}", Sha256::digest(bytes)),'
+new = '        sha256: format!("{:x}", Sha256::digest(&bytes[1..])), // NON-VACUITY BREAK: omit the first received byte.'
+
+[[control]]
+id = "media-capture-header-dimensions"
+guards = "Image dimensions describe the actual header rather than a guessed size"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_validation/tests.rs"
+expect_red = ["media_validation::tests::image_dimensions_come_from_headers"]
+file = "crates/broca-core/src/media_validation.rs"
+old = '        width: dimensions.map(|(w, _)| w),'
+new = '        width: dimensions.map(|_| 1), // NON-VACUITY BREAK: replace the header width with a guess.'
+
+[[control]]
+id = "head-additions-recorded-model"
+select = "expected"
+guards = "head model comes from the recorded run selection"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["recorded_read_times_and_caller_head_grants_match_serve_goldens"]
+file = "crates/broca-core/src/head.rs"
+old = "self.model = Some(model);"
+new = "self.model = None; // NON-VACUITY BREAK"
+
+[[control]]
+id = "head-additions-usage-selection-keys"
+select = "expected"
+guards = "session spend distinguishes variant and absent-variant selections in first-use order"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/head.rs"
+expect_red = ["head::tests::session_spend_keeps_model_keys_partial_counts_and_first_counted_run"]
+file = "crates/broca-core/src/head.rs"
+old = "model.variant.as_deref(),"
+new = "None, // NON-VACUITY BREAK: merge distinct selections"
+
+[[control]]
+id = "head-additions-unknown-usage-absent"
+select = "expected"
+guards = "a token field no session step reported is not fabricated as zero"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/head.rs"
+expect_red = ["head::tests::session_spend_keeps_model_keys_partial_counts_and_first_counted_run"]
+file = "crates/broca-core/src/head.rs"
+old = "crate::replay::reported_step_usage(usage),"
+new = "crate::replay::reported_step_usage(usage).with_reasoning_tokens(0), // NON-VACUITY BREAK"
+
+[[control]]
+id = "head-additions-durable-incremental-spend"
+select = "expected"
+guards = "materialized head spend is committed with the message watermark instead of requiring a history scan"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::head_spend_and_entry_times_are_persisted_with_the_exact_watermark"]
+file = "crates/broca-core/src/projection_plan.rs"
+old = "head_json: serde_json::to_string(&admission_checkpoint.head)?,"
+new = "head_json: serde_json::to_string(&serde_json::Value::Null)?, // NON-VACUITY BREAK"
+
+[[control]]
+id = "head-additions-owner-grant"
+select = "expected"
+guards = "the session owner receives its full sender grant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["recorded_read_times_and_caller_head_grants_match_serve_goldens"]
+file = "crates/broca-core/src/head.rs"
+old = "if crate::scope_admission::decide_owner_access(&self.ownership, principal, scope).is_ok() {"
+new = "if false && crate::scope_admission::decide_owner_access(&self.ownership, principal, scope).is_ok() { // NON-VACUITY BREAK"
+
+[[control]]
+id = "head-additions-idle-start-grant"
+select = "expected"
+guards = "named sender modes exclude idle_start unless its entry grants it"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["recorded_read_times_and_caller_head_grants_match_serve_goldens"]
+file = "crates/broca-core/src/head.rs"
+old = "delivery_order::admit(module_id, Some(&owner), &self.senders, &[**mode]).is_ok()"
+new = "delivery_order::admit(module_id, Some(&owner), &self.senders, &[**mode]).is_ok() || true /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "head-additions-ungranted-caller"
+select = "expected"
+guards = "a caller absent from a protected plan receives no sender member"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["recorded_read_times_and_caller_head_grants_match_serve_goldens"]
+file = "crates/broca-core/src/head.rs"
+old = ".find(|sender| &sender.module == module_id)?;"
+new = ".find(|sender| &sender.module == module_id).or(self.senders.first())?; // NON-VACUITY BREAK"
+
+[[control]]
+id = "head-additions-interrupt-grant"
+select = "expected"
+guards = "head interruption is the named sender entry's actual admission grant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["recorded_read_times_and_caller_head_grants_match_serve_goldens"]
+file = "crates/broca-core/src/head.rs"
+old = "cortexkit_role_llm_runner::send::Delivery::Interrupt,\n        )\n        .is_ok();"
+new = "cortexkit_role_llm_runner::send::Delivery::Interrupt,\n        )\n        .is_ok() || true; // NON-VACUITY BREAK"
+
+[[control]]
+id = "head-additions-incarnation-v4"
+select = "expected"
+guards = "only a verified UUID v4 WAL header can attest an incarnation"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::incarnation_requires_a_uuid_v4_header"]
+file = "crates/broca-wal/src/framing.rs"
+old = "(self.0[6] >> 4 == 4 && self.0[8] >> 6 == 2).then(|| self.to_string())"
+new = "Some(self.to_string()) // NON-VACUITY BREAK: attest arbitrary header bytes"
+
+[[control]]
+id = "head-additions-incarnation-served"
+select = "expected"
+guards = "a known incarnation is served from the existing WAL header"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["recorded_read_times_and_caller_head_grants_match_serve_goldens"]
+file = "crates/broca-module/src/serve.rs"
+old = "incarnation: lineage_id.incarnation(),"
+new = "incarnation: None, // NON-VACUITY BREAK"
+
+[[control]]
+id = "head-additions-default-head-omissions"
+select = "expected"
+guards = "unknown head additions preserve the pinned default reply bytes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["unknown_facts_keep_pre_addition_default_reply_bytes"]
+file = "crates/broca-wire/src/role.rs"
+old = '''#[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<cortexkit_role_llm_runner::read::HeadModel>,'''
+new = '''#[serde(default)] // NON-VACUITY BREAK
+    pub model: Option<cortexkit_role_llm_runner::read::HeadModel>,'''
+
+[[control]]
+id = "head-additions-populated-legacy-bytes"
+select = "expected"
+guards = "populated session heads preserve the pre-addition lineage metadata bytes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_legacy_bytes"
+test_file = "crates/broca-module-serve/tests/head_legacy_bytes.rs"
+expect_red = ["populated_head_preserves_pre_addition_reply_bytes"]
+file = "crates/broca-wire/src/role.rs"
+old = '''#[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_ordinal: Option<u64>,'''
+new = '''#[serde(default, skip_serializing)] // NON-VACUITY BREAK
+    pub first_ordinal: Option<u64>,'''
+
+[[control]]
+id = "message-times-envelope-placement"
+select = "expected"
+guards = "recorded times appear on default read entries and never inside opaque messages"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["recorded_read_times_and_caller_head_grants_match_serve_goldens"]
+file = "crates/broca-wire/src/lib.rs"
+old = "written_at: self.written_at,"
+new = "written_at: None, // NON-VACUITY BREAK"
+
+[[control]]
+id = "message-times-unknown-entry-bytes"
+select = "expected"
+guards = "unknown entry times add no bytes to legacy message envelopes"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["envelope_time_tests::untimed_entries_keep_their_pre_addition_bytes"]
+file = "crates/broca-wire/src/lib.rs"
+old = '''#[serde(skip_serializing_if = "Option::is_none")]
+            written_at: Option<u64>,'''
+new = '''// NON-VACUITY BREAK: encode an unknown time as null
+            written_at: Option<u64>,'''
+
+[[control]]
+id = "message-times-no-invented-history"
+select = "expected"
+guards = "failed or missing historical model attempts never manufacture a message time"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/message_times.rs"
+expect_red = ["message_times::tests::unrecorded_times_and_failed_attempts_stay_absent"]
+file = "crates/broca-core/src/message_times.rs"
+old = "written_at_ms.or_else(|| attempts.remove(step_id))"
+new = "written_at_ms.or_else(|| attempts.remove(step_id)).or(Some(1)) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "message-times-shared-held-placement"
+select = "expected"
+guards = "held steers keep admission times at the ordinals chosen by shared placement"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/message_times.rs"
+expect_red = ["message_times::tests::admission_attempt_and_tool_times_follow_shared_placement"]
+file = "crates/broca-core/src/message_times.rs"
+old = "if let Some(at) = steers.pop_front().flatten() {\n                            times.insert(ordinal, at);"
+new = "if let Some(at) = steers.pop_front().flatten() {\n                            times.insert(ordinal + 1, at); // NON-VACUITY BREAK"
+
+[[control]]
+id = "message-times-understanding-reader"
+select = "expected"
+guards = "new message time records require message-times/v1 before any reader may skip their metadata"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::message_times_require_an_understanding_reader"]
+file = "crates/broca-wal/src/record.rs"
+old = "with_feature(base, crate::framing::MESSAGE_TIMES_FEATURE)"
+new = "base /* NON-VACUITY BREAK: permit time-dropping readers */"
+
+[[control]]
+id = "message-times-old-record-bytes"
+select = "expected"
+guards = "old model-step records preserve their exact payload bytes and ungated framing"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/record/pinned_bytes_tests.rs"
+expect_red = ["record::pinned_bytes_tests::pre_message_times_records_keep_exact_bytes"]
+file = "crates/broca-wal/src/record.rs"
+old = '''/// End of the successful model attempt, before any post-assistant hooks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        written_at_ms: Option<u64>,'''
+new = '''/// End of the successful model attempt, before any post-assistant hooks.
+        #[serde(default)] // NON-VACUITY BREAK: add null to old records
+        written_at_ms: Option<u64>,'''
+
+[[control]]
+id = "message-times-queued-admission"
+select = "expected"
+guards = "drained input records carry the original queue admission time"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["queued_input_and_steer_keep_their_admission_times"]
+file = "crates/broca-module/src/actor.rs"
+old = ".and_then(|pending| pending.admitted_at_ms),"
+new = ".and_then(|_pending| None), // NON-VACUITY BREAK"
+
+[[control]]
+id = "message-times-successful-attempt-end"
+select = "expected"
+guards = "new assistant entries use the producing model attempt's recorded end time"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["newly_written_times_and_session_spend_survive_projection_and_restart"]
+file = "crates/broca-core/src/run.rs"
+old = "*completed_attempt_time.lock().unwrap() = Some(attempt.ts_ms);"
+new = "*completed_attempt_time.lock().unwrap() = Some(attempt.ts_ms.saturating_add(1)); // NON-VACUITY BREAK"
+
+[[control]]
+id = "message-times-stored-envelope-facts"
+select = "expected"
+guards = "materialized entry times survive the projection seam without entering message bytes"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/lib.rs"
+expect_red = ["tests::head_spend_and_entry_times_are_persisted_with_the_exact_watermark"]
+file = "crates/broca-store/src/lib.rs"
+old = "message_times: prepared.message_times,"
+new = "message_times: vec![None; prepared.message_times.len()], // NON-VACUITY BREAK"
+
+[[control]]
+id = "message-times-legacy-queue-watermark"
+select = "expected"
+guards = "a recorded queue admission remains recoverable when its queue record is below a materialized watermark"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/message_times.rs"
+expect_red = ["message_times::tests::recorded_queue_admission_survives_a_projection_watermark"]
+file = "crates/broca-core/src/head.rs"
+old = "self.queued_times.insert(submission_id.0.clone(), at);"
+new = "self.queued_times.insert(submission_id.0.clone(), at.saturating_add(1)); // NON-VACUITY BREAK"
+
+[[control]]
+id = "optional-preset-parser-omission"
+select = "expected"
+guards = "a missing tool preset is a default selection, not a missing required member"
+runner = "cargo"
+package = "broca-fetch-plan"
+target = "--test preset_rules"
+test_file = "crates/broca-fetch-plan/tests/preset_rules.rs"
+expect_red = ["absent_tool_preset_is_left_off_the_catalog_request"]
+file = "crates/broca-fetch-plan/src/plan.rs"
+old = '.map(|_| string_member(object, "preset", at))'
+new = '.map(|_| string_member(object, "preset", at)).or_else(|| Some(Err(Refusal::invalid(format!("{at}.preset"))))) /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "optional-preset-catalog-omission"
+select = "expected"
+guards = "a preset-less tool item sends no preset member to its catalog"
+runner = "cargo"
+package = "broca-fetch-plan"
+target = "--test preset_rules"
+test_file = "crates/broca-fetch-plan/tests/preset_rules.rs"
+expect_red = ["absent_tool_preset_is_left_off_the_catalog_request"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "if let Some(preset) = tool_item.and_then(|item| item.preset.clone()) {"
+new = "if let Some(preset) = tool_item.map(|item| item.preset.clone().unwrap_or_default()) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "optional-preset-system-text-selector"
+select = "expected"
+guards = "system text still refuses an absent selector because tool-provider cannot express a default"
+runner = "cargo"
+package = "broca-fetch-plan"
+target = "--test preset_rules"
+test_file = "crates/broca-fetch-plan/tests/preset_rules.rs"
+expect_red = ["absent_system_text_preset_is_refused_by_name"]
+file = "crates/broca-fetch-plan/src/plan.rs"
+old = ".position(|item| item.preset.is_none())"
+new = ".position(|item| item.preset.is_none() && false) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "optional-preset-default-declaration-omission"
+select = "expected"
+guards = "a default step declaration is requested without a preset member"
+runner = "cargo"
+package = "broca-fetch-plan"
+target = "--lib"
+test_file = "crates/broca-fetch-plan/src/admit.rs"
+expect_red = ["admit::tests::default_declaration_omits_preset_and_preserves_provider_refusal"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "if let Some(preset) = &step.item.preset {"
+new = "if let Some(preset) = Some(step.item.preset.as_deref().unwrap_or_default()) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "optional-preset-default-declaration-refusal"
+select = "expected"
+guards = "a provider refusal of its default declaration preserves its code and field, never an empty preset_missing"
+runner = "cargo"
+package = "broca-fetch-plan"
+target = "--lib"
+test_file = "crates/broca-fetch-plan/src/admit.rs"
+expect_red = ["admit::tests::default_declaration_omits_preset_and_preserves_provider_refusal"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = 'step.item.preset.is_some() && error.refused_field() == Some("preset")'
+new = 'error.refused_field() == Some("preset") /* NON-VACUITY BREAK */'
+
+[[control]]
+id = "optional-preset-default-reduction-owner"
+select = "expected"
+guards = "default declarations independently enforce the compaction reduction owner and subscription bounds"
+runner = "cargo"
+package = "broca-fetch-plan"
+target = "--lib"
+test_file = "crates/broca-fetch-plan/src/admit.rs"
+expect_red = ["admit::tests::default_declaration_rechecks_reduction_and_subscription_bounds"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "check_reduction(subscription, provider, reduction_owner)"
+new = "Ok(()) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "optional-preset-compaction-omission"
+select = "expected"
+guards = "a preset-less compaction item sends no preset on the runner's actual Setup call"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/compaction/tests.rs"
+expect_red = ["compaction::tests::presetless_compaction_setup_omits_the_member_on_the_real_call"]
+file = "crates/broca-core/src/run.rs"
+old = ".with_item(preset.clone(), params.clone())"
+new = ".with_item(Some(preset.clone().unwrap_or_default()), params.clone()) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "retained-head-content-free"
+select = "expected"
+guards = "retained head checkpoints strip prompt-bearing sender templates and never persist caller content"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retained_head.rs"
+expect_red = ["retained_head::tests::retained_checkpoint_is_content_free_lineage_bound_and_deleted_at_expiry"]
+file = "crates/broca-core/src/head.rs"
+old = "sender.templates.clear();"
+new = "sender.templates.retain(|_| true); // NON-VACUITY BREAK"
+
+[[control]]
+id = "retained-head-lineage-bound"
+select = "expected"
+guards = "a recreated retained session cannot read the previous WAL incarnation's spend checkpoint"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retained_head.rs"
+expect_red = ["retained_head::tests::retained_checkpoint_is_content_free_lineage_bound_and_deleted_at_expiry"]
+file = "crates/broca-store/src/retained_head.rs"
+old = "SELECT at_seq,facts_json FROM retained_head WHERE lineage_id=?1 AND session=?2"
+new = "SELECT at_seq,facts_json FROM retained_head WHERE lineage_id=?1 OR session=?2 /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "retained-head-expiry-deletion"
+select = "expected"
+guards = "expiry deletes retained head facts in the same metadata transaction and preserves other incarnations"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retained_head.rs"
+expect_red = ["retained_head::tests::retained_checkpoint_is_content_free_lineage_bound_and_deleted_at_expiry"]
+file = "crates/broca-store/src/retention.rs"
+old = "DELETE FROM retained_head WHERE lineage_id=?1 AND session=?2"
+new = "DELETE FROM retained_head WHERE lineage_id=?1 AND session=?2 AND 0 /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "retained-head-no-late-resurrection"
+select = "expected"
+guards = "a late retained head write cannot resurrect a checkpoint after expiry"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retained_head.rs"
+expect_red = ["retained_head::tests::retained_checkpoint_is_content_free_lineage_bound_and_deleted_at_expiry"]
+file = "crates/broca-store/src/retained_head.rs"
+old = "    if expired {\n        return Ok(());\n    }"
+new = "    if false && expired { // NON-VACUITY BREAK\n        return Ok(());\n    }"
+
+[[control]]
+id = "retained-head-corrupt-fallback"
+select = "expected"
+guards = "a missing or corrupt retained checkpoint cannot be replaced with a suffix-only partial total"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+test_file = "crates/broca-store/src/retained_head.rs"
+expect_red = ["retained_head::tests::corrupt_retained_checkpoint_requires_full_reconstruction"]
+file = "crates/broca-store/src/retained_head.rs"
+old = "if usable.is_none() && !broca_core::retention::starts_at_lineage_origin(records) {"
+new = "if false && usable.is_none() && !broca_core::retention::starts_at_lineage_origin(records) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "retained-head-writer-spend"
+select = "expected"
+guards = "retained run completion durably checkpoints spend without waiting for a future head read"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["retained_head_checkpoint_and_typical_read_cost_through_serve"]
+file = "crates/broca-core/src/run.rs"
+old = "store.project_retained_head(&session, &lineage, records)?;"
+new = "let _ = (&session, &lineage, records); // NON-VACUITY BREAK"
+
+[[control]]
+id = "message-times-admission-feature-composition"
+select = "expected"
+guards = "new message-time requirements are added after fixed scope/class/input-cap feature unions"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::message_times_compose_with_existing_admission_features"]
+file = "crates/broca-wal/src/record.rs"
+old = "input_cap_features(base)"
+new = "input_cap_features(with_feature(base, crate::framing::MESSAGE_TIMES_FEATURE)) /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "head-additions-reasoning-breakdown"
+select = "expected"
+guards = "reasoning tokens are already inside output tokens and are not billed a second time in run or session usage"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test head_read_additions"
+test_file = "crates/broca-module-serve/tests/head_read_additions.rs"
+expect_red = ["reasoning_tokens_are_an_output_breakdown_on_run_and_session_spend"]
+file = "crates/broca-core/src/replay.rs"
+old = "step.output_tokens = usage.output_tokens;"
+new = "step.output_tokens = usage.output_tokens.map(|output| output.saturating_add(usage.reasoning_tokens.unwrap_or(0))); // NON-VACUITY BREAK: double bill reasoning"
+
+[[control]]
+id = "head-additions-conformance-reasoning-report"
+platforms = ["linux", "macos"]
+select = "expected"
+guards = "the native kit model fixture reports scripted reasoning instead of silently omitting the newly exercised breakdown"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["scripted_usage_chunk_preserves_reasoning_as_an_output_breakdown"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = "if let Some(reasoning) = usage.reasoning_tokens {"
+new = "if let Some(reasoning) = usage.reasoning_tokens.filter(|_| false) { // NON-VACUITY BREAK"
+
+[[control]]
+id = "head-additions-conformance-reasoning-bound"
+platforms = ["linux", "macos"]
+select = "expected"
+guards = "a capped fixture completion keeps its reasoning breakdown within the reported output total"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["scripted_usage_chunk_preserves_reasoning_as_an_output_breakdown"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = "reasoning.min(output)"
+new = "reasoning /* NON-VACUITY BREAK */"
+
+[[control]]
+id = "daemon-no-legacy-vault-handles"
+guards = "Daemon startup and serving never resolve the retired vault-handles file; credentials are read by grant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/credential_source_guard.rs"
+expect_red = ["credential_source_guard::daemon_serve_path_never_resolves_a_vault_handles_file"]
+expect_message = "daemon serve path references legacy vault handles: main.rs"
+file = "crates/broca-module-serve/src/main.rs"
+old = "        let credential_ids =\n            broca_module_serve::VaultCredentialIds::load_default_path().map_err(ServeIoError)?;"
+new = "        let _legacy_path = broca_module_serve::config_home::config_file(\"BROCA_VAULT_HANDLES_PATH\", \"vault-handles.json\"); // NON-VACUITY BREAK\n        let credential_ids =\n            broca_module_serve::VaultCredentialIds::load_default_path().map_err(ServeIoError)?;"
+
+[[control]]
+id = "core-provider-held-replay-not-indeterminate"
+guards = "A synced held record is a provider-owned obligation, not an ambiguous dispatch"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::provider_held_and_sequential_successor_are_not_indeterminate"]
+file = "crates/broca-core/src/replay.rs"
+old = "            if self.provider_held.contains_key(&self.planned[position]) {"
+new = "            if false && self.provider_held.contains_key(&self.planned[position]) { // NON-VACUITY BREAK: forget the durable held record."
+
+[[control]]
+id = "core-provider-held-successor-never-sent"
+guards = "A sequential successor behind an open held call is known never sent"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::provider_held_and_sequential_successor_are_not_indeterminate"]
+file = "crates/broca-core/src/replay.rs"
+old = "                        held.sequential"
+new = "                        false && held.sequential // NON-VACUITY BREAK: classify a held successor as ambiguous."
+
+[[control]]
+id = "core-provider-held-delivered-successor-is-indeterminate"
+guards = "A delivered held terminal removes the never-sent proof for its successor at both send kill points"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::delivered_held_terminal_makes_both_successor_kill_points_interrupted"]
+file = "crates/broca-core/src/replay.rs"
+old = "                                    DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps,"
+new = "                                    DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps | DispatchOutcome::Completed, // NON-VACUITY BREAK: pretend a delivered predecessor still blocks sending."
+
+[[control]]
+id = "core-provider-held-sequential-terminal-before-send"
+guards = "The held terminal is synced before a sequential successor is sent, including on resume"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_sequential_pause_resume_syncs_before_successor"]
+file = "crates/broca-core/src/run.rs"
+old = "                    sync_held_terminal(&mut result, ctx, plane.writer, hooks).await?;"
+new = "                    // NON-VACUITY BREAK: defer the held terminal to the final batch barrier."
+
+[[control]]
+id = "core-provider-held-mixed-closeout-not-unknown"
+guards = "A mixed-crash close-out keeps the provider-held call known and interrupts only the ambiguous sibling as Unknown"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::provider_held_parallel_indeterminate_sibling_uses_full_close_out"]
+file = "crates/broca-core/src/resume.rs"
+old = "                provider_held_interrupted_result(tool_call_id),\n                DispatchOutcome::Interrupted,"
+new = "                outcome_unknown_result(tool_call_id),\n                DispatchOutcome::Unknown, // NON-VACUITY BREAK: lose the provider-held ownership proof."
+
+[[control]]
+id = "core-provider-held-pause-waits-for-approval"
+guards = "An unanswered approval card keeps the live batch and its consent intake running beside a provider-held call"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::approval_gate::provider_held_pause_waits_for_approval_and_inflight_siblings"]
+file = "crates/broca-core/src/run.rs"
+old = "                .any(|slot| matches!(slot, Slot::Held(call) if !call.approved))"
+new = "                .any(|slot| matches!(slot, Slot::Held(call) if !call.approved) && false) // NON-VACUITY BREAK: pause while an approval card is open."
+
+[[control]]
+id = "module-provider-held-same-run-send-does-not-redrive"
+guards = "A same-run-id send reports the existing tool-held pause without invoking the run executor or writing another pause"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::provider_held_session_activity_is_queued_or_refused_without_redrive"]
+file = "crates/broca-module/src/actor.rs"
+old = "                    reason @ (broca_protocol::PauseReason::Restart\n                    | broca_protocol::PauseReason::ToolHeld),"
+new = "                    reason @ broca_protocol::PauseReason::Restart, // NON-VACUITY BREAK: let a tool-held send re-drive its run."
+
+[[control]]
+id = "core-provider-held-pause-ends-warm-wait"
+guards = "A held-only batch returns to its durable pause and drops owned keep-warm IO rather than warming indefinitely"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_pause_stops_keep_warm_for_a_day"]
+file = "crates/broca-core/src/run.rs"
+old = "            _ = async {}, if !tripped && plane.held.len() > 0 && jobs.len() == plane.held.len() => {"
+new = "            _ = async {}, if false && !tripped && plane.held.len() > 0 && jobs.len() == plane.held.len() => { // NON-VACUITY BREAK: keep warming a held-only batch instead of pausing."
 
 [[control]]
 id = "media-store-manifest-barrier-before-wal"
