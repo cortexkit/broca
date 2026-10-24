@@ -201,3 +201,24 @@ fn a_media_profile_does_not_change_text_only_request_bytes() {
         );
     }
 }
+
+#[test]
+fn ordinary_run_started_bytes_stay_pinned() {
+    let frozen = frozen_config_for_family(WireFamilyId::OpenAiChat, "ordinary");
+    let started: WalRecord = serde_json::from_value(json!({
+        "type": "run_started", "run_id": "ordinary",
+        "session": {"project_root": "/ordinary", "harness": "test", "session": "ordinary"},
+        "config": {
+            "model": ModelHandle::new("openai", "ordinary"),
+            "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
+            "response_format": {"type": "text"}, "context_epoch": 0,
+            "renderer_version": frozen.renderer_version, "frozen_render_config": frozen
+        },
+        "input": [], "origin": {"kind": "fresh"}
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_string(&started).unwrap(),
+        r#"{"type":"run_started","run_id":"ordinary","session":{"project_root":"/ordinary","harness":"test","session":"ordinary"},"config":{"model":{"provider_module_id":"openai","model_id":"ordinary"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":5,"frozen_render_config":{"family_id":"openai_chat","max_output_tokens":2048,"reasoning":{"mode":"none"},"renderer_version":5,"system_prompt":{"mode":"system_message"},"token_limit_field":"max_tokens","tool_id":"passthrough","usage":"open_ai_usage","wire_model_id":"ordinary"}},"input":[],"origin":{"kind":"fresh"}}"#
+    );
+}
