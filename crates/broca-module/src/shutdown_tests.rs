@@ -77,6 +77,7 @@ impl RunExecutor for DispatchHeld {
             planned_calls,
         });
         job.writer.record(WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
             hooks: None,
             batch_id: batch.clone(),
             tool_call_id: call.clone(),
@@ -89,6 +90,7 @@ impl RunExecutor for DispatchHeld {
         });
         if self.resolved {
             job.writer.record(WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: None,
                 batch_id: batch,

@@ -36,9 +36,11 @@ const VISIBLE: [&str; 3] = ["warn", "info", "error"];
 // enrollment event counts retryable races that are not operator alerts, and request records
 // show which bound sessions still poll. Fast successful websocket summaries are diagnostic;
 // failed or slow attempts still emit at INFO. Losing diagnostics at INFO hides no information
-// that requires immediate action. Only exact literal targets at DEBUG qualify; TRACE and every other target
+// that requires immediate action. Display index corrections have a separate health counter;
+// their per-step details are likewise opt-in diagnostics, not operator alerts.
+// Only exact literal targets at DEBUG qualify; TRACE and every other target
 // stay refused, so this exception cannot silently demote ordinary operational logs.
-const DIAGNOSTIC_TARGETS: [&str; 7] = [
+const DIAGNOSTIC_TARGETS: [&str; 8] = [
     "wire.describe",
     "wire.ingress",
     "wire.egress",
@@ -46,6 +48,7 @@ const DIAGNOSTIC_TARGETS: [&str; 7] = [
     "retention.enrollment",
     "requests",
     "provider.websocket.attempt",
+    "provider.display.indices",
 ];
 
 fn diagnostic_debug_site(invocation: &str) -> bool {
@@ -116,6 +119,8 @@ fn diagnostic_debug_exception_is_not_a_prefix_or_trace_exception() {
         "debug!(target: \"wire.egress.extra\", \"ordinary\");",
         "debug!(target: \"subc.wire.extra\", \"ordinary\");",
         "debug!(target: \"provider.websocket.attempt.extra\", \"ordinary\");",
+        "debug!(target: \"provider.display.indices.extra\", \"ordinary\");",
+        "trace!(target: \"provider.display.indices\", \"ordinary\");",
         "trace!(target: \"provider.websocket.attempt\", \"ordinary\");",
         "trace!(target: \"wire.describe\", \"ordinary\");",
         "debug!(target: dynamic_target, \"ordinary\");",

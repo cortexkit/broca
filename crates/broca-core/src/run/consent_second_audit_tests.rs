@@ -57,10 +57,16 @@ impl ElicitationPlane for SlowHealthyFeed {
 
 fn seed_known_call(rig: &Rig) -> (String, WalRecord) {
     let mut prepared = crate::replay::deferred_tests::prepared("c", "r-b1");
-    let WalRecord::ToolCallDeferred { ask, .. } = &mut prepared else {
+    let WalRecord::ToolCallDeferred {
+        ask,
+        deferred_at_ms,
+        ..
+    } = &mut prepared
+    else {
         unreachable!()
     };
     ask.expires_at_ms = rig.hooks.expires;
+    *deferred_at_ms = epoch_millis();
     let seq = rig.writer.record(prepared.clone()).into_result().unwrap();
     (
         crate::context::call_key(rig.writer.lineage_id().unwrap(), seq),

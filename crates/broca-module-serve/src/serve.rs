@@ -42,7 +42,7 @@ use broca_module::serve::{
 };
 use broca_module::{Delivery, LineageRegistry};
 use broca_protocol::BindIdentity as BrocaBindIdentity;
-use broca_wire::{encode_subscribe_control, encode_subscribe_display};
+use broca_wire::{encode_live_subscribe_control, encode_live_subscribe_display};
 use subc_protocol::session::{
     ModuleControlCommand, ModuleControlRequest, ModuleControlResponse,
     MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -1768,6 +1768,7 @@ async fn handle_control_request(
                     // fleet totals; consumers derive rates by diffing two readings from one launch.
                     // Always emit zero so a quiet process cannot be confused with an unwired counter.
                     "stream_chunks": broca_provider::sse::stream_chunks(),
+                    "display_index_resets": broca_provider::display_index_resets(),
                     // Entries providers listed in input_transformations: for Anthropic, signed
                     // thinking blocks dropped because an earlier part of the conversation changed
                     // between requests. Zero is healthy only over measured attempts; anything
@@ -2078,12 +2079,23 @@ fn prepare_route_request(
     }
 }
 
-fn subscribe_from(params: &serde_json::Value) -> Result<SubscribeFrom, (Option<String>, String)> {
+fn subscribe_from(
+    params: &serde_json::Value,
+) -> Result<
+    (
+        SubscribeFrom,
+        Option<cortexkit_role_llm_runner::display::Limits>,
+    ),
+    (Option<String>, String),
+> {
     let params: SubscribeParams = decode_params(params)?;
-    match params.from {
-        None => Ok(SubscribeFrom::Live),
-        Some(w) => w.to_subscribe_from().map_err(|e| (Some("from".into()), e)),
-    }
+    let from = match params.from {
+        None => SubscribeFrom::Live,
+        Some(w) => w
+            .to_subscribe_from()
+            .map_err(|e| (Some("from".into()), e))?,
+    };
+    Ok((from, params.limits))
 }
 
 /// Dispatch `vault.audit` without acquiring an actor lease or touching the bound session.
@@ -2233,7 +2245,7 @@ where
                     }
                 }
                 PreparedRouteRequest::Subscribe { params, slot } => {
-                    let from = match subscribe_from(&params) {
+                    let (from, limits) = match subscribe_from(&params) {
                         Ok(from) => from,
                         Err((field, message)) => {
                             let refusal = send_invalid_params(
@@ -2267,6 +2279,7 @@ where
                             corr,
                             session,
                             from,
+                            limits,
                             handler,
                             cancel.clone(),
                         ) => result,
@@ -3280,6 +3293,7 @@ async fn start_subscribe_stream<H>(
     corr: u64,
     session: BrocaBindIdentity,
     from: SubscribeFrom,
+    limits: Option<cortexkit_role_llm_runner::display::Limits>,
     handler: Arc<H>,
     cancel: CancellationToken,
 ) -> Result<(), ServeIoError>
@@ -3315,6 +3329,7 @@ where
     // route's GOODBYE, or the connection teardown). `cancel` is what prevents a parked task
     // from holding the egress open forever and hanging the connection on teardown.
     tokio::spawn(async move {
+        let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ;
         loop {
             let delivery = tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -3324,36 +3339,36 @@ where
                 },
             };
             if let Delivery::Expired { expired_at_ms } = &delivery {
-                let _ = send_serve_error(
-                    &writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    &ServeError::Expired {
-                        expired_at_ms: *expired_at_ms,
-                    },
-                )
-                .await;
+                let error = ServeError::Expired {
+                    expired_at_ms: *expired_at_ms,
+                };
+                let body = ErrorBody::new(broca_module::retention::EXPIRED, error.to_string())
+                    .with_detail(
+                        serde_json::to_value(broca_module::retention::ExpiredDetail::new(
+                            *expired_at_ms,
+                        ))
+                        .expect("expiry details serialize"),
+                    );
+                let _ =
+                    send_subscribe_error_body(&writer, (ver, channel, epoch, corr), next_seq, body)
+                        .await;
                 return;
             }
             if let Delivery::Error(message) = &delivery {
                 // A replay failure is a typed stream terminal, not an empty successful stream.
                 // `Error` is already terminal in the existing subc vocabulary, so do not append
                 // a clean `StreamEnd` that could overwrite its meaning for a client.
-                let _ = send_error(
+                let _ = send_subscribe_error_body(
                     &writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "subscribe_replay_failed",
-                    message,
+                    (ver, channel, epoch, corr),
+                    next_seq,
+                    ErrorBody::new("subscribe_replay_failed", message),
                 )
                 .await;
                 return;
             }
-            let (priority, body) = match encode_delivery(&delivery) {
+            let delivery = limit_live_arguments(delivery, limits.as_ref());
+            let (priority, body) = match encode_delivery(&delivery, next_seq) {
                 EncodedDelivery::Data(priority, body) => (priority, body),
                 // A Detached marker: end the stream cleanly; the client resubscribes.
                 EncodedDelivery::Detached => break,
@@ -3362,6 +3377,7 @@ where
                         &writer,
                         (ver, channel, epoch, corr),
                         &delivery,
+                        next_seq,
                         "unencodable",
                         format!("subscribe unit could not be encoded: {error}"),
                         None,
@@ -3379,6 +3395,7 @@ where
                     &writer,
                     (ver, channel, epoch, corr),
                     &delivery,
+                    next_seq,
                     "too_large",
                     "subscribe unit exceeds the transport frame limit".into(),
                     Some(frame_bytes),
@@ -3401,6 +3418,7 @@ where
                         &writer,
                         (ver, channel, epoch, corr),
                         &delivery,
+                        next_seq,
                         "unencodable",
                         format!("subscribe frame could not be built: {error}"),
                         None,
@@ -3417,6 +3435,9 @@ where
                     }
                 }
             }
+            next_seq = next_seq
+                .checked_add(1)
+                .expect("subscription sequence exhausted");
         }
         // Terminal: emit StreamEnd (LAST flag) to release the held credit + close the
         // stream. Best-effort — on egress close this just no-ops.
@@ -3427,7 +3448,11 @@ where
             channel,
             epoch,
             corr,
-            Vec::new(),
+            serde_json::to_vec(&SubscribeEndMetadata {
+                seq: next_seq,
+                event: cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+            })
+            .expect("subscription end metadata serializes"),
         ) {
             tokio::select! {
                 _ = cancel.cancelled() => {}
@@ -3450,18 +3475,50 @@ enum EncodedDelivery {
     Unencodable(serde_json::Error),
 }
 
-fn encode_delivery(delivery: &Delivery) -> EncodedDelivery {
+fn limit_live_arguments(
+    delivery: Delivery,
+    limits: Option<&cortexkit_role_llm_runner::display::Limits>,
+) -> Delivery {
+    if let (Delivery::Control(frame), Some(limits)) = (&delivery, limits) {
+        if let cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event) = &frame.2 {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&event.arguments).expect("projected arguments are JSON");
+            let limited = cortexkit_role_llm_runner::live::ToolStarted::new(
+                &event.mid,
+                &event.tool_call_id,
+                &event.name,
+                &arguments,
+                Some(limits),
+                event.started_at,
+            );
+            return Delivery::Control(Arc::new((
+                frame.0,
+                frame.1.clone(),
+                cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(limited),
+            )));
+        }
+    }
+    delivery
+}
+
+fn encode_delivery(delivery: &Delivery, seq: u64) -> EncodedDelivery {
     let (priority, encoded) = match delivery {
         Delivery::Control(event) => {
-            let (cursor, unit) = event.as_ref();
+            let (cursor, unit, live_event) = event.as_ref();
             (
                 Priority::Interactive,
-                encode_subscribe_control(cursor.wal_seq, cursor.sub_index, unit),
+                encode_live_subscribe_control(
+                    cursor.wal_seq,
+                    cursor.sub_index,
+                    unit,
+                    seq,
+                    live_event,
+                ),
             )
         }
         Delivery::Display(event) => (
             Priority::Background,
-            encode_subscribe_display(event.as_ref()),
+            encode_live_subscribe_display(event.as_ref(), seq),
         ),
         Delivery::Expired { .. } | Delivery::Error(_) | Delivery::Detached => {
             return EncodedDelivery::Detached
@@ -3483,13 +3540,14 @@ async fn send_undeliverable_unit(
     writer: &EgressSender<Frame>,
     (ver, channel, epoch, corr): (u8, u16, u32, u64),
     delivery: &Delivery,
+    seq: u64,
     reason: &str,
     message: String,
     frame_bytes: Option<usize>,
 ) -> Result<(), ServeIoError> {
     let cursor = match delivery {
         Delivery::Control(event) => {
-            let (cursor, _) = event.as_ref();
+            let (cursor, ..) = event.as_ref();
             serde_json::json!({"wal_seq": cursor.wal_seq, "sub_index": cursor.sub_index})
         }
         _ => serde_json::Value::Null,
@@ -3505,7 +3563,35 @@ async fn send_undeliverable_unit(
         "ending subscribe stream on an undeliverable unit: {message}"
     );
     let body = ErrorBody::new(SUBSCRIBE_UNIT_UNDELIVERABLE, message).with_detail(detail);
-    send_error_body(writer, ver, channel, epoch, corr, body).await
+    send_subscribe_error_body(writer, (ver, channel, epoch, corr), seq, body).await
+}
+
+#[derive(serde::Serialize)]
+struct SubscribeEndMetadata {
+    seq: u64,
+    event: cortexkit_role_llm_runner::live::LiveEvent,
+}
+
+async fn send_subscribe_error_body(
+    writer: &EgressSender<Frame>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    seq: u64,
+    body: ErrorBody,
+) -> Result<(), ServeIoError> {
+    #[derive(serde::Serialize)]
+    struct LiveErrorBody {
+        #[serde(flatten)]
+        body: ErrorBody,
+        seq: u64,
+        event: cortexkit_role_llm_runner::live::LiveEvent,
+    }
+    let body = serde_json::to_vec(&LiveErrorBody {
+        body,
+        seq,
+        event: cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
+    })
+    .map_err(|error| ServeIoError(error.to_string()))?;
+    send_error_bytes(writer, ver, channel, epoch, corr, body).await
 }
 
 async fn send_hello(
@@ -5133,6 +5219,7 @@ mod tests {
                 sub_index: 1,
             },
             unit,
+            cortexkit_role_llm_runner::live::LiveEvent::DisplayReset,
         ))))
         .await
         .unwrap();
@@ -5875,6 +5962,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_transport_terminals_keep_stream_sequence_and_event() {
+        for terminal in [
+            Delivery::Detached,
+            Delivery::Error("broken replay".into()),
+            Delivery::Expired {
+                expired_at_ms: 1234,
+            },
+        ] {
+            let detached = matches!(terminal, Delivery::Detached);
+            let (sink_tx, mut sink_rx) = mpsc::channel(1);
+            let handler = Arc::new(MockSubscribeHandler {
+                sink_tx,
+                refuse_session: std::sync::atomic::AtomicBool::new(false),
+                model_reply_too_large: None,
+            });
+            let (writer, mut written) = broca_diagnostics::channel::<Frame>(8, Arc::default());
+            start_subscribe_stream(
+                writer,
+                1,
+                1,
+                1,
+                1,
+                BrocaBindIdentity::new("/tmp/project-a", "runner", "terminal-sequence"),
+                SubscribeFrom::Start,
+                None,
+                handler,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let sink = sink_rx.recv().await.unwrap();
+            sink.send(Delivery::Display(Arc::new(
+                broca_protocol::DisplayEvent::DisplayReset,
+            )))
+            .await
+            .unwrap();
+            sink.send(terminal).await.unwrap();
+            let first = tokio::time::timeout(std::time::Duration::from_secs(2), written.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let end = tokio::time::timeout(std::time::Duration::from_secs(2), written.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.header.ty, FrameType::StreamData);
+            assert_eq!(
+                end.header.ty,
+                if detached {
+                    FrameType::StreamEnd
+                } else {
+                    FrameType::Error
+                }
+            );
+            for (frame, seq) in [(first, 1_u64), (end, 2)] {
+                let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(body["seq"], seq);
+                assert_eq!(body["event"]["type"], "display_reset");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_subscribe_forward_task_cancel_while_blocked() {
         use broca_protocol::display::DisplayEvent;
         use std::time::Duration;
@@ -5900,6 +6050,7 @@ mod tests {
             1, // corr
             session,
             SubscribeFrom::Start,
+            None,
             handler,
             cancel.clone(),
         )

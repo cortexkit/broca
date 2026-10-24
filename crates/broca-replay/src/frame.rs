@@ -213,6 +213,8 @@ mod tests {
     #[test]
     fn encode_peek_decode_round_trips() {
         let payload = DisplayEvent::TextDelta {
+            mid: None,
+            part: None,
             message_id: MessageId("m1".into()),
             tool_call_id: None,
             delta: "hello".into(),

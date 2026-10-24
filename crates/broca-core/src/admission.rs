@@ -1540,6 +1540,7 @@ mod tests {
             frame(
                 4,
                 WalRecord::ToolDispatchIntent {
+                    dispatched_at_ms: None,
                     hooks: None,
                     batch_id,
                     tool_call_id: call_id,
@@ -1772,6 +1773,7 @@ mod tests {
             frame(
                 14,
                 WalRecord::ToolNoDispatch {
+                    dispatched_at_ms: None,
                     tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("batch".into()),
@@ -1784,6 +1786,7 @@ mod tests {
             frame(
                 15,
                 WalRecord::ToolNoDispatch {
+                    dispatched_at_ms: None,
                     tags: None,
                     hooks: None,
                     batch_id: broca_protocol::BatchId("batch".into()),

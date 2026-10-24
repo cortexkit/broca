@@ -1379,13 +1379,12 @@ async fn later_persona_admissions_inherit_the_ordinal_without_reading_wal_bytes(
         *origin = serde_json::from_value(serde_json::json!({"kind": "seeded_from"})).unwrap();
     }
     wal.append(1, &imported, true).unwrap();
-    let tool = |n| broca_wal::WalRecord::ToolResult { tags: None,
+    let tool = |n| broca_wal::WalRecord::ToolResult { finished_at_ms: None, tags: None,
         batch_id: broca_protocol::BatchId("batch".into()),
         result: Arc::new(broca_protocol::ToolResult { tool_call_id: broca_protocol::ToolCallId("tool".into()),
             output: broca_protocol::ToolOutput::Text { text: "x".repeat(n) }, is_error: false }),
         outcome: broca_wal::DispatchOutcome::Completed, hooks: None, reason: None,
-        withdraw_elicitation: None, provider_held: None,
-    };
+        withdraw_elicitation: None, provider_held: None, };
     wal.append(1, &tool(1 << 20), true).unwrap();
     let legacy = serde_json::json!({"claude_code_persona": {"version": "2.1.280"}});
     let mut old = run_started_with_user_text(&req.session, "legacy", "third prompt");

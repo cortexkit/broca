@@ -58,6 +58,8 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
 fn text_step(text: &str) -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Display(DisplayEvent::TextDelta {
+            mid: None,
+            part: Some(0),
             message_id: MessageId("m2".into()),
             tool_call_id: None,
             delta: text.into(),

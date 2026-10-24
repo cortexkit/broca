@@ -12,6 +12,7 @@ mod conformance_catches_bugs;
 mod gemini_conformance;
 mod generation_render;
 mod google_codeassist_conformance;
+mod live_parts;
 mod openai_chat_conformance;
 mod openai_responses_chatgpt_conformance;
 mod openai_responses_conformance;

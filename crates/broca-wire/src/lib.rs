@@ -824,6 +824,8 @@ pub struct CursorWire {
 pub struct SubscribeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<FromWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<cortexkit_role_llm_runner::display::Limits>,
 }
 
 /// `session.read` params. The session comes from the bound route identity.
@@ -2303,7 +2305,7 @@ mod open_state_tests {
     }
 
     #[test]
-    fn unknown_subscribe_envelopes_and_event_types_reset_display_state() {
+    fn unknown_lanes_and_display_reset_while_unknown_control_units_are_named() {
         let envelope: SubscribeEvent =
             serde_json::from_str(r#"{"kind":"future_lane_event"}"#).unwrap();
         assert_eq!(
@@ -2326,10 +2328,12 @@ mod open_state_tests {
         .unwrap();
         assert!(matches!(
             control,
-            SubscribeEvent::Control {
-                unit: broca_protocol::caller::ControlUnit::DisplayReset,
-                ..
-            }
+            SubscribeEvent::UnknownControlUnit {
+                wal_seq: 1,
+                sub_index: 0,
+                unit_type,
+                unit,
+            } if unit_type == "future_control_unit" && unit["payload"] == "ignored"
         ));
     }
 
@@ -2494,6 +2498,14 @@ pub enum SubscribeEvent {
         sub_index: u32,
         state: UnrecognizedRunState,
     },
+    /// A newer control-unit name, retained with its cursor and payload rather than
+    /// confused with a known display reset or rejected as a broken stream.
+    UnknownControlUnit {
+        wal_seq: u64,
+        sub_index: u32,
+        unit_type: String,
+        unit: serde_json::Value,
+    },
 }
 
 /// A run pause or ending whose reason this client does not know, as the subscribe stream
@@ -2617,6 +2629,54 @@ enum SubscribeEventRef<'a> {
     },
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum LiveSubscribeEventRef<'a> {
+    Control {
+        cursor: CursorWire,
+        unit: &'a broca_protocol::caller::ControlUnit,
+        seq: u64,
+        event: &'a cortexkit_role_llm_runner::live::LiveEvent,
+    },
+    Display {
+        event: &'a DisplayEvent,
+        seq: u64,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum UnknownControlEventRef<'a> {
+    Control {
+        cursor: CursorWire,
+        unit: &'a serde_json::Value,
+    },
+}
+
+/// Append live metadata without rebuilding or reordering the existing control payload.
+pub fn encode_live_subscribe_control(
+    wal_seq: u64,
+    sub_index: u32,
+    unit: &broca_protocol::caller::ControlUnit,
+    seq: u64,
+    event: &cortexkit_role_llm_runner::live::LiveEvent,
+) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&LiveSubscribeEventRef::Control {
+        cursor: CursorWire { wal_seq, sub_index },
+        unit,
+        seq,
+        event,
+    })
+}
+
+/// A display frame already has its typed event; its stream sequence follows that payload.
+pub fn encode_live_subscribe_display(
+    event: &DisplayEvent,
+    seq: u64,
+) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&LiveSubscribeEventRef::Display { event, seq })
+}
+
 /// Encode one control-lane subscribe event directly from its borrowed payload.
 ///
 /// This avoids building an owned JSON value before emitting the stream frame while keeping
@@ -2689,6 +2749,19 @@ impl Serialize for SubscribeEvent {
                 unit: state.into(),
             }
             .serialize(serializer),
+            Self::UnknownControlUnit {
+                wal_seq,
+                sub_index,
+                unit,
+                ..
+            } => UnknownControlEventRef::Control {
+                cursor: CursorWire {
+                    wal_seq: *wal_seq,
+                    sub_index: *sub_index,
+                },
+                unit,
+            }
+            .serialize(serializer),
         }
     }
 }
@@ -2701,11 +2774,28 @@ impl<'de> Deserialize<'de> for SubscribeEvent {
         match SubscribeEventOwned::deserialize(deserializer)? {
             SubscribeEventOwned::Control { cursor, unit } => {
                 match broca_protocol::caller::ControlUnit::deserialize(&unit) {
-                    Ok(control) => Ok(Self::Control {
-                        wal_seq: cursor.wal_seq,
-                        sub_index: cursor.sub_index,
-                        unit: control,
-                    }),
+                    Ok(control) => {
+                        let unknown_type =
+                            matches!(control, broca_protocol::caller::ControlUnit::DisplayReset)
+                                .then(|| unit.get("type").and_then(serde_json::Value::as_str))
+                                .flatten()
+                                .filter(|name| *name != "display_reset")
+                                .map(str::to_owned);
+                        if let Some(unit_type) = unknown_type {
+                            Ok(Self::UnknownControlUnit {
+                                wal_seq: cursor.wal_seq,
+                                sub_index: cursor.sub_index,
+                                unit_type,
+                                unit,
+                            })
+                        } else {
+                            Ok(Self::Control {
+                                wal_seq: cursor.wal_seq,
+                                sub_index: cursor.sub_index,
+                                unit: control,
+                            })
+                        }
+                    }
                     Err(error) => match unrecognized_run_state(&unit) {
                         Some(state) => Ok(Self::UnrecognizedRunState {
                             wal_seq: cursor.wal_seq,
@@ -4405,6 +4495,8 @@ mod tests {
 
     fn display_delta() -> DisplayEvent {
         DisplayEvent::TextDelta {
+            mid: None,
+            part: None,
             message_id: MessageId("message-1".into()),
             tool_call_id: None,
             delta: "streamed text".into(),
@@ -5786,4 +5878,56 @@ pub struct RunEventGetParams {
 pub enum RunEventGetResponse {
     Found { event_key: String, jcs: String },
     Absent,
+}
+
+#[cfg(test)]
+mod live_subscribe_tests {
+    use super::*;
+    use broca_protocol::caller::ControlUnit;
+    use cortexkit_role_llm_runner::live::{LiveEvent, MessageEvent};
+
+    #[test]
+    fn unknown_control_units_keep_their_name_cursor_and_payload() {
+        let value = serde_json::json!({"kind":"control","cursor":{"wal_seq":7,"sub_index":9},"unit":{"type":"future_message_boundary","mid":"m8","future":{"kept":true}}});
+        let event = decode_subscribe_event(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            matches!(&event, SubscribeEvent::UnknownControlUnit { wal_seq:7, sub_index:9, unit_type, unit } if unit_type == "future_message_boundary" && unit == &value["unit"])
+        );
+        assert_eq!(serde_json::to_value(&event).unwrap(), value);
+    }
+
+    #[test]
+    fn a_known_reset_is_not_an_unknown_control_unit() {
+        let event = decode_subscribe_event(br#"{"kind":"control","cursor":{"wal_seq":1,"sub_index":0},"unit":{"type":"display_reset"}}"#).unwrap();
+        assert!(matches!(
+            event,
+            SubscribeEvent::Control {
+                unit: ControlUnit::DisplayReset,
+                ..
+            }
+        ));
+        assert!(decode_subscribe_event(br#"{"kind":"control","cursor":{"wal_seq":1,"sub_index":0},"unit":{"type":"step_started","step_id":"not a number"}}"#).is_err());
+    }
+
+    #[test]
+    fn live_members_follow_the_unchanged_borrowed_control_bytes() {
+        let unit = ControlUnit::MessageBoundary { mid: "m3".into() };
+        let old = encode_subscribe_control(4, 2, &unit).unwrap();
+        let event = LiveEvent::MessageFinished(MessageEvent::new("m3"));
+        let live = encode_live_subscribe_control(4, 2, &unit, 12, &event).unwrap();
+        let mut expected = old;
+        assert_eq!(expected.pop(), Some(b'}'));
+        expected.extend_from_slice(br#","seq":12,"event":{"type":"message_finished","mid":"m3"}}"#);
+        assert_eq!(live, expected);
+        let value: serde_json::Value = serde_json::from_slice(&live).unwrap();
+        assert_eq!(value["seq"], 12);
+        assert_eq!(LiveEvent::decode_strict(&value["event"]).unwrap(), event);
+        let display = DisplayEvent::DisplayReset;
+        let old = encode_subscribe_display(&display).unwrap();
+        let live = encode_live_subscribe_display(&display, 13).unwrap();
+        let mut expected = old;
+        expected.pop();
+        expected.extend_from_slice(br#","seq":13}"#);
+        assert_eq!(live, expected);
+    }
 }

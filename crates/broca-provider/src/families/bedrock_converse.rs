@@ -1164,6 +1164,7 @@ impl BedrockStreamNormalizer {
             };
             buffer.extend(bytes);
         } else if delta.get("text").is_some() || delta.get("signature").is_some() {
+            let part_index = self.blocks.range(..idx).count() as u64;
             let block = self
                 .blocks
                 .entry(idx)
@@ -1180,6 +1181,8 @@ impl BedrockStreamNormalizer {
                 text.push_str(part);
                 if !part.is_empty() {
                     out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {
+                        mid: None,
+                        part: Some(part_index),
                         message_id: self.message_id.clone(),
                         delta: part.to_owned(),
                     }));
@@ -1193,6 +1196,7 @@ impl BedrockStreamNormalizer {
     }
 
     fn push_text_delta(&mut self, idx: usize, text_delta: &str, out: &mut Vec<NormalizedEvent>) {
+        let part_index = self.blocks.range(..idx).count() as u64;
         let entry = self.blocks.entry(idx).or_insert_with(|| BlockBuf::Text {
             text: String::new(),
         });
@@ -1201,6 +1205,8 @@ impl BedrockStreamNormalizer {
         }
         if !text_delta.is_empty() {
             out.push(NormalizedEvent::Display(DisplayEvent::TextDelta {
+                mid: None,
+                part: Some(part_index),
                 message_id: self.message_id.clone(),
                 tool_call_id: None,
                 delta: text_delta.to_owned(),
@@ -1214,6 +1220,7 @@ impl BedrockStreamNormalizer {
         input_delta: &str,
         out: &mut Vec<NormalizedEvent>,
     ) {
+        let part_index = self.blocks.range(..idx).count() as u64;
         let entry = self.blocks.entry(idx).or_insert_with(|| BlockBuf::ToolUse {
             id: String::new(),
             name: String::new(),
@@ -1230,6 +1237,8 @@ impl BedrockStreamNormalizer {
                 .stream(idx as u64, id, name, input_json, input_delta);
             if !input_delta.is_empty() {
                 out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
+                    mid: None,
+                    part: Some(part_index),
                     tool_call_id: ToolCallId(id.clone()),
                     delta: input_delta.to_owned(),
                 }));

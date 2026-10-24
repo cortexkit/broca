@@ -65,6 +65,7 @@ impl RunExecutor for TerminalExecutor {
         });
         if self.0 == RunFinishReason::Interrupted {
             job.writer.record(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
                 hooks: None,
                 batch_id: broca_protocol::BatchId("batch".into()),
                 tool_call_id: broca_protocol::ToolCallId("ambiguous-call".into()),

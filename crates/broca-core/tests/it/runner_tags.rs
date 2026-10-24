@@ -27,6 +27,8 @@ fn step(content: Vec<ContentBlock>, reason: FinishReason) -> Vec<NormalizedEvent
     vec![
         NormalizedEvent::Control(ProviderControl::StreamStart { warnings: vec![] }),
         NormalizedEvent::Display(DisplayEvent::TextDelta {
+            mid: None,
+            part: Some(0),
             message_id: MessageId("m".into()),
             tool_call_id: None,
             delta: "x".into(),

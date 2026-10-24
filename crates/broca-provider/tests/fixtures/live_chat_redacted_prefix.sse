@@ -1,0 +1,9 @@
+data: {"id":"chat","choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"opaque"}]}}]}
+
+data: {"id":"chat","choices":[{"delta":{"content":"answer"}}]}
+
+data: {"id":"chat","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+: end of synthetic stream

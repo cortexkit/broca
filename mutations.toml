@@ -14350,8 +14350,8 @@ test_file = "crates/broca-module-serve/src/serve.rs"
 expect_red = ["serve::tests::authorized_invalid_subscribe_preserves_original_stream_correlation"]
 select = "expected"
 file = "crates/broca-module-serve/src/serve.rs"
-old = "                let from = match subscribe_from(&params) {"
-new = "                slot.replace(); // NON-VACUITY BREAK: replace before validation\n                let from = match subscribe_from(&params) {"
+old = "                    let (from, limits) = match subscribe_from(&params) {"
+new = "                    slot.replace(); // NON-VACUITY BREAK: replace before validation\n                    let (from, limits) = match subscribe_from(&params) {"
 
 [[control]]
 id = "core-consent-recorded-id-get-await"
@@ -19957,6 +19957,7 @@ file = "crates/broca-core/src/run.rs"
 old = '''    for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: r.hooks.take(),'''
 new = '''    let early = deliver_ordered_with_results(writer, ordered, run_id, resolutions.iter().map(|r| r.result.as_ref())); // NON-VACUITY BREAK: write the delivered text into the stored results
@@ -19968,6 +19969,7 @@ new = '''    let early = deliver_ordered_with_results(writer, ordered, run_id, r
     for r in &mut resolutions {
         if let Some(outcome) = r.outcome {
             let record = WalRecord::ToolResult {
+                finished_at_ms: None,
                 tags: None,
                 hooks: r.hooks.take(),'''
 
@@ -20119,8 +20121,30 @@ features = ["live"]
 test_file = "crates/broca-provider/src/families/openai_responses.rs"
 expect_red = ["families::openai_responses::tests::reasoning_summary_deltas_reach_the_display_lane_before_the_answer"]
 file = "crates/broca-provider/src/families/openai_responses.rs"
-old = "                    out.push(NormalizedEvent::Display(DisplayEvent::ReasoningDelta {\n                        message_id: mid,\n                        delta: text,"
-new = "                    let _ = (NormalizedEvent::Display(DisplayEvent::ReasoningDelta { // NON-VACUITY BREAK: drop the summary display delta\n                        message_id: mid,\n                        delta: text,"
+old = '''                    self.display_parts.delta(
+                        (part.0, 0),
+                        DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            delta: text,
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        out,
+                    );'''
+new = '''                    self.display_parts.delta(
+                        (part.0, 0),
+                        DisplayEvent::ReasoningDelta {
+                            mid: None,
+                            part: None,
+                            message_id: mid,
+                            delta: text,
+                        },
+                        "openai_responses",
+                        self.step_id,
+                        &mut Vec::new(), // NON-VACUITY BREAK: discard the summary's display events.
+                    );'''
 
 [[control]]
 id = "mode3-ordered-retry-terminal-state"
@@ -22828,7 +22852,7 @@ package = "broca-wire"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-wire/src/lib.rs"
-expect_red = ["open_state_tests::unknown_subscribe_envelopes_and_event_types_reset_display_state"]
+expect_red = ["open_state_tests::unknown_lanes_and_display_reset_while_unknown_control_units_are_named"]
 file = "crates/broca-wire/src/lib.rs"
 old = "    Display {\n        event: DisplayEvent,\n    },\n    #[serde(other)]\n    Unknown,\n}"
 new = "    Display {\n        event: DisplayEvent,\n    },\n    Unknown, // NON-VACUITY BREAK: reject future subscribe lanes\n}"
@@ -24397,8 +24421,8 @@ test_file = "crates/broca-module/src/fanout.rs"
 expect_red = ["fanout::tests::an_attach_builds_only_the_units_it_delivers"]
 expect_message = "a resume near the head must not build the session's whole history"
 file = "crates/broca-module/src/fanout.rs"
-old = "            advance_control_projection_state(&durable_prefix[..skipped], &mut state);\n            let projected = project_control_with_state(&durable_prefix[skipped..], &mut state);"
-new = "            let _ = skipped; // NON-VACUITY BREAK: materialize the whole prefix.\n            let projected = project_control_with_state(&durable_prefix, &mut state);"
+old = "            advance_control_projection_state(&durable_prefix[..skipped], &mut state);\n            let projected = project_events(&durable_prefix[skipped..], &mut state)?;"
+new = "            let _ = skipped; // NON-VACUITY BREAK: materialize the whole prefix.\n            let projected = project_events(&durable_prefix, &mut state)?;"
 
 [[control]]
 id = "serve-request-panic-is-answered"
@@ -24912,7 +24936,6 @@ expect_message = "gpt-6-luna protocol fact"
 file = "crates/broca-catalog/src/runtime.rs"
 old = 'model.wire_family = Some(family);'
 new = 'model.wire_family = Some(WireFamilyId::OpenAiChat); // NON-VACUITY BREAK: discard the published model grammar'
-
 
 [[control]]
 id = "opencode-go-usage-limit-account-wall"
@@ -25494,6 +25517,7 @@ expect_red = ["subc_plane::tests::release_builds_exclude_test_only_hooks"]
 file = "crates/broca-subc/src/subc_plane.rs"
 old = "#[cfg(debug_assertions)]\n    #[doc(hidden)]\n    pub fn with_scope_sync_hold_for_test("
 new = "// NON-VACUITY BREAK: ship the scope hold test override\n    #[doc(hidden)]\n    pub fn with_scope_sync_hold_for_test("
+
 [[control]]
 id = "system-one-scope-required"
 guards = "A classifier route without a daemon work stamp refuses before sending or persisting a batch, even if its body supplies scope fields"
@@ -26078,8 +26102,6 @@ old = '''                Ok(unverifiable_recorded_resolution(
                 ))'''
 new = '''                Err(broca_catalog::live::ResolutionError::Config(error.clone())) // NON-VACUITY BREAK: replace the existing caller refusal code'''
 
-
-
 [[control]]
 id = "catalog-anthropic-served-v1-is-stripped"
 guards = "a served version-included Anthropic root freezes without a duplicate version and renders the exact messages URL"
@@ -26112,3 +26134,412 @@ old = '''        let api = self
             .filter(|api| !api.value.trim().is_empty())
             .ok_or("missing wire.api")?;'''
 new = '''        let api = self.api.clone().unwrap_or_else(|| WireFact { value: "https://guessed.example/v1".into(), from: "local".into() }); // NON-VACUITY BREAK: guess a route for an unrouted Go row'''
+
+[[control]]
+id = "wal-tool-times-must-understand"
+guards = "Timed tool records require tool-times/v1 and older readers refuse them by name"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::tool_times_are_must_understand_and_legacy_records_remain_untimed"]
+file = "crates/broca-wal/src/record.rs"
+old = "            with_feature(base, crate::framing::TOOL_TIMES_FEATURE)"
+new = "            base // NON-VACUITY BREAK: hide recorded tool times from older readers."
+
+[[control]]
+id = "wal-tool-times-publish-floor"
+guards = "The first timed tool record cannot precede publication of the tool-times/v1 feature floor"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::tool_times_publish_the_feature_floor_before_the_first_timed_record"]
+file = "crates/broca-wal/src/record.rs"
+old = "            with_feature(base, crate::framing::TOOL_TIMES_FEATURE)"
+new = "            base // NON-VACUITY BREAK: write tool times without raising the feature floor."
+
+[[control]]
+id = "core-tool-times-observed-before-crash-cut"
+guards = "An intent's observed time survives recovery and a recovery terminal records its own observed finish"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/tool_times_tests.rs"
+expect_red = ["wal_writer::tool_times_tests::crash_cut_preserves_observed_intent_time_and_records_recovery_finish"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "                *at = crate::run::epoch_millis();"
+new = "                *at = None; // NON-VACUITY BREAK: leave newly written tool records untimed."
+
+[[control]]
+id = "wal-deferred-tool-times-must-understand"
+guards = "Deferred and closing-approval observations cannot be discarded by older readers"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/framing.rs"
+expect_red = ["framing::tests::deferred_tool_times_are_must_understand_and_legacy_times_are_absent"]
+file = "crates/broca-wal/src/record.rs"
+old = "            with_feature(base, crate::framing::TOOL_TIMES_FEATURE)"
+new = "            base // NON-VACUITY BREAK: hide deferred tool times from older readers."
+
+[[control]]
+id = "core-declined-approval-records-closing-time"
+guards = "A declined deferred call's durable closing observation survives restart without a replay-time replacement"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_writer/tool_times_tests.rs"
+expect_red = ["wal_writer::tool_times_tests::declined_deferred_call_retains_its_recorded_closing_time_after_restart"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "                *closed_at_ms = crate::run::epoch_millis();"
+new = "                *closed_at_ms = None; // NON-VACUITY BREAK: discard the approval closing observation."
+
+[[control]]
+id = "placement-next-ordinal-replay"
+guards = "Replay validates budget placement against the same absolute next ordinal used by live projection"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::projection_boundary_tests::budgeted_seeded_tail_uses_full_lineage_ordinal_and_fire_time_text"]
+file = "crates/broca-core/src/placement.rs"
+old = "            next,\n            steers: 0,"
+new = "            next: next.saturating_add(1), // NON-VACUITY BREAK: shift every message placement.\n            steers: 0,"
+
+[[control]]
+id = "placement-next-ordinal-live-control"
+guards = "Tool, steer, budget and resumed control coordinates equal the messages returned by real session.read"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::projected_control_mids_match_session_read_tool_steer_budget_and_resume"]
+file = "crates/broca-core/src/placement.rs"
+old = "            next,\n            steers: 0,"
+new = "            next: next.saturating_add(1), // NON-VACUITY BREAK: shift every message placement.\n            steers: 0,"
+
+[[control]]
+id = "unsupported-output-refs-before-plan-overrides"
+guards = "A non-advertiser diagnoses plan.items[].output_refs before tools overrides and writes nothing for send, refresh or adoption"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::unsupported_output_refs_precedes_plan_overrides_and_never_writes"]
+file = "crates/broca-fetch-plan/src/plan.rs"
+old = "    if in_lists || in_compaction {"
+new = "    if in_lists && in_compaction { // NON-VACUITY BREAK: require two unsupported flags before refusing either."
+
+[[control]]
+id = "conformance-release-future-held-call"
+platforms = ["linux", "macos"]
+guards = "A registered scripted hold can be released before provider arrival without fabricating arrival or losing the release"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_runner_conformance"
+features = ["test-clock"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+expect_red = ["held_call_tests::release_registered_future_call_keeps_release_until_arrival"]
+file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
+old = "            Some(gate) => {\n                // Release is a permit for an installed script, not a claim that it arrived."
+new = "            Some(gate) if gate.arrived.load(std::sync::atomic::Ordering::SeqCst) => { // NON-VACUITY BREAK: reject release before provider arrival.\n                // Release is a permit for an installed script, not a claim that it arrived."
+
+[[control]]
+id = "live-stream-sequence-shared-counter"
+guards = "Each real subscribe stream starts at one and counts control and display arrivals together"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::one_stream_sequence_counts_both_lanes_and_restarts_for_each_subscribe"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "        let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ;"
+new = "        let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ + 1; // NON-VACUITY BREAK: skip the first stream position."
+
+[[control]]
+id = "wire-subscribe-unknown-unit-name"
+guards = "An unknown control-unit type retains its name and cursor instead of becoming a known reset"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["live_subscribe_tests::unknown_control_units_keep_their_name_cursor_and_payload"]
+file = "crates/broca-wire/src/lib.rs"
+old = "                        if let Some(unit_type) = unknown_type {"
+new = "                        if let Some(unit_type) = unknown_type.filter(|_| false) { // NON-VACUITY BREAK: erase unknown unit identity."
+
+[[control]]
+id = "live-message-boundaries-complete"
+guards = "Input and held messages receive a finished boundary as well as a started boundary"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/projection/live_tests.rs"
+expect_red = ["projection::live_tests::message_boundaries_complete_every_stored_message_without_moving_old_cursors"]
+file = "crates/broca-core/src/projection.rs"
+old = "        sink.boundary(ordinal, || message_event(Some(ordinal), true));"
+new = "        let _ = ordinal; // NON-VACUITY BREAK: omit the stored input's finished boundary."
+
+[[control]]
+id = "live-existing-payload-cursors-stable"
+guards = "Adding lifecycle units never renumbers existing payload sub_index values"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/projection/live_tests.rs"
+expect_red = ["projection::live_tests::message_boundaries_complete_every_stored_message_without_moving_old_cursors"]
+file = "crates/broca-core/src/projection.rs"
+old = "            next_sub_index: 0,"
+new = "            next_sub_index: 1, // NON-VACUITY BREAK: move every pre-existing payload cursor."
+
+[[control]]
+id = "live-declined-frame-recorded-closing-time"
+guards = "The declined tool_finished frame carries the closing approval's recorded time"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/projection/live_tests.rs"
+expect_red = ["projection::live_tests::declined_deferred_call_finishes_once_with_its_recorded_closing_time"]
+file = "crates/broca-core/src/projection.rs"
+old = "        bytes as u64,\n        observed_at,\n    ))"
+new = "        bytes as u64,\n        observed_at.filter(|_| false), // NON-VACUITY BREAK: discard the recorded closing observation.\n    ))"
+
+[[control]]
+id = "live-unrecorded-frame-time-not-invented"
+guards = "An imported historical call's unrecorded finish remains absent, never a zero stand-in"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/projection/live_tests.rs"
+expect_red = ["projection::live_tests::imported_input_calls_get_lifecycle_events_without_inventing_times"]
+file = "crates/broca-core/src/projection.rs"
+old = "        bytes as u64,\n        observed_at,\n    ))"
+new = "        bytes as u64,\n        observed_at.or(Some(0)), // NON-VACUITY BREAK: invent a historical finish time.\n    ))"
+
+[[control]]
+id = "live-stream-terminal-sequence"
+guards = "The transport StreamEnd keeps the next shared stream sequence and typed reset metadata"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::subscribe_transport_terminals_keep_stream_sequence_and_event"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "                seq: next_seq,"
+new = "                seq: next_seq + 1, // NON-VACUITY BREAK: skip the terminal stream position."
+
+[[control]]
+id = "live-parts-anthropic-hidden-prefix"
+guards = "Anthropic display parts count signature-only stored blocks before streamed text"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::anthropic_delta_less_prefix_keeps_stored_indices_without_reset"]
+file = "crates/broca-provider/src/normalize.rs"
+old = "                let part = self.blocks.range(..idx).count() as u64;"
+new = "                let part = 0; // NON-VACUITY BREAK: ignore delta-less stored prefix blocks."
+
+[[control]]
+id = "live-chat-index-shift-reset"
+guards = "Late Chat reasoning resets and re-streams corrected stored indices but prefix-ordered streams do not reset"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::chat_late_reasoning_resets_only_shifted_indices"]
+file = "crates/broca-provider/src/display_parts.rs"
+old = "        if shifts_emitted {"
+new = "        if shifts_emitted && family != \"openai_chat\" { // NON-VACUITY BREAK: leave already-sent Chat indices stale."
+
+[[control]]
+id = "live-responses-index-shift-reset"
+guards = "Reordered Responses output items correct already-sent stored indices"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::responses_reordered_items_correct_live_indices"]
+file = "crates/broca-provider/src/display_parts.rs"
+old = "        if shifts_emitted {"
+new = "        if shifts_emitted && family != \"openai_responses\" { // NON-VACUITY BREAK: leave already-sent Responses indices stale."
+
+[[control]]
+id = "live-index-shift-health-count"
+guards = "Index-shift corrections increment their own process health counter"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::chat_late_reasoning_resets_only_shifted_indices"]
+file = "crates/broca-provider/src/display_parts.rs"
+old = "        INDEX_RESETS.fetch_add(1, Ordering::Relaxed);"
+new = "        let _ = &INDEX_RESETS; // NON-VACUITY BREAK: hide index-shift corrections from health."
+
+[[control]]
+id = "live-attach-coalesced-snapshot"
+guards = "Attach resets and replays each buffered part exactly once before subsequent live deltas"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/display_replay.rs"
+expect_red = ["fanout::display_replay::tests::attach_coalesces_parts_then_delivers_each_live_delta_once"]
+file = "crates/broca-module/src/display_replay.rs"
+old = "        for value in state.parts.values() {"
+new = "        for value in state.parts.values().take(0) { // NON-VACUITY BREAK: attach forgets the step's accumulated parts."
+
+[[control]]
+id = "live-attach-buffer-byte-cap"
+guards = "An over-cap display part is discarded until reset and an attach reports a gap without losing other parts"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/display_replay.rs"
+expect_red = ["fanout::display_replay::tests::capped_part_is_dropped_until_reset_without_losing_other_parts"]
+file = "crates/broca-module/src/display_replay.rs"
+old = "                if state.bytes.saturating_add(added) > MAX_BYTES {"
+new = "                if state.bytes.saturating_add(added) > usize::MAX { // NON-VACUITY BREAK: disable the per-step replay byte cap."
+
+[[control]]
+id = "live-mid-queued-placement"
+guards = "Real-serve display frames use the assistant ordinal captured at the queued step boundary"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_display_samples_match_stored_parts_and_attach_replays_current_step"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "            .map(|p| p.next_ordinal())"
+new = "            .map(|p| p.next_ordinal() + 1) // NON-VACUITY BREAK: misattribute queued display to the following message."
+
+[[control]]
+id = "live-finalize-filter-corrected-parts"
+guards = "Budget finalize filtering wipes omitted live tool rows and re-streams the stored block indices"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_finalize_filter_restreams_the_stored_block_indices"]
+file = "crates/broca-core/src/run.rs"
+old = "                let message_changed = message.content.len() != unfiltered_blocks"
+new = "                let message_changed = { let _ = unfiltered_blocks; false } // NON-VACUITY BREAK: omit correction after finalize filtering."
+
+[[control]]
+id = "live-subscribe-typed-argument-limits"
+guards = "Subscribe limits clip typed tool arguments without changing the existing authoritative unit"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_subscribe_limits_cut_only_typed_arguments_not_existing_units"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "            let delivery = limit_live_arguments(delivery, limits.as_ref());"
+new = "            let _ = &limits; // NON-VACUITY BREAK: bypass requested typed argument limits."
+
+[[control]]
+id = "placement-next-ordinal-live-display"
+guards = "Actual live display mids agree with stored ordinals and expected transcript positions"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_display_samples_match_stored_parts_and_attach_replays_current_step"]
+file = "crates/broca-core/src/placement.rs"
+old = "            next,\n            steers: 0,"
+new = "            next: next.saturating_add(1), // NON-VACUITY BREAK: shift every message placement.\n            steers: 0,"
+
+[[control]]
+id = "live-hook-restream-stored-part-index"
+guards = "Hook re-streams enumerate stored blocks rather than only blocks with visible deltas"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/hook_tests.rs"
+expect_red = ["run::hook_tests::post_hook_restream_counts_delta_less_stored_blocks"]
+file = "crates/broca-core/src/run/hook_dispatch.rs"
+old = "        event.set_part(index as u64);"
+new = "        let _ = index; event.set_part(0); // NON-VACUITY BREAK: erase stored block positions in a hook re-stream."
+
+[[control]]
+id = "live-display-diagnostics-exact-target"
+guards = "Display index corrections are debug-only opt-in diagnostics under one exact target, never a blanket log-level exemption"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/log_levels_are_deliberate.rs"
+expect_red = ["log_levels_are_deliberate::no_operator_log_site_sits_below_the_unconfigured_default"]
+file = "crates/broca-provider/src/display_parts.rs"
+old = '''        INDEX_RESETS.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            target: "provider.display.indices",'''
+new = '''        INDEX_RESETS.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            target: "provider.display.indices.extra", // NON-VACUITY BREAK: an unapproved target must remain refused.'''
+
+[[control]]
+id = "live-responses-empty-text-has-no-part"
+guards = "An empty Responses text item omitted by assembly reserves no phantom display part and causes no false reset"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::responses_empty_items_reserve_no_phantom_parts_or_resets"]
+file = "crates/broca-provider/src/families/openai_responses.rs"
+old = "                            .any(|(_, text)| !text.is_empty())"
+new = "                            .any(|_| true) // NON-VACUITY BREAK: count empty text parts that assembly omits."
+
+[[control]]
+id = "live-responses-empty-refusal-has-no-part"
+guards = "An empty Responses refusal omitted by assembly reserves no phantom display part and causes no false reset"
+runner = "cargo"
+package = "broca-provider"
+target = "--test conformance"
+select = "expected"
+test_file = "crates/broca-provider/tests/conformance/live_parts.rs"
+expect_red = ["live_parts::responses_empty_items_reserve_no_phantom_parts_or_resets"]
+file = "crates/broca-provider/src/families/openai_responses.rs"
+old = "                                if !self.refusal.is_empty() {"
+new = "                                if true { // NON-VACUITY BREAK: count an empty refusal that assembly omits."
+
+[[control]]
+id = "live-attach-ended-step-cleared"
+guards = "A cancelled or ended run cannot replay an uncommitted old model prefix as a current step"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::live_attach_after_cancel_discards_the_uncommitted_step"]
+file = "crates/broca-module/src/display_replay.rs"
+old = "        *self.state.lock().unwrap() = State::default();"
+new = "        let _ = &self.state; // NON-VACUITY BREAK: keep ended-step replay state alive."
