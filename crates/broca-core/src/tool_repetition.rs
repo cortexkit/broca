@@ -150,7 +150,7 @@ fn is_read_only(tool_name: &str) -> bool {
 ///
 /// Scoped to one episode deliberately: a new turn is a new intent, and carrying counts across turns
 /// would warn about a call the model has legitimately returned to after doing something else.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RepetitionObserver {
     exact_failures: HashMap<CallSignature, u32>,
     tool_failures: HashMap<String, u32>,
@@ -180,34 +180,11 @@ impl RepetitionObserver {
     /// are only step-unique, so an episode-wide ID lookup would attach a later step's result to an
     /// earlier call. A call without a paired result is skipped because its outcome is unknown.
     pub fn from_prompt(prompt: &[Message]) -> Self {
-        let mut observer = Self::new();
-        let mut index = 0;
-        while index + 1 < prompt.len() {
-            if prompt[index].role != Role::Assistant || prompt[index + 1].role != Role::Tool {
-                index += 1;
-                continue;
-            }
-
-            let mut calls = prompt[index]
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolCall(call) => Some(call),
-                    _ => None,
-                });
-            for block in &prompt[index + 1].content {
-                let ContentBlock::ToolResult(result) = block else {
-                    continue;
-                };
-                let Some(call) = calls.next() else {
-                    continue;
-                };
-                let bytes = result_bytes(&result.output);
-                observer.observe(call, bytes.as_ref(), result.is_error);
-            }
-            index += 2;
+        let mut fold = RepetitionFold::default();
+        for message in prompt {
+            fold.push(message);
         }
-        observer
+        fold.into_observer()
     }
 
     /// Record one completed call and report what it means.
@@ -290,6 +267,55 @@ impl RepetitionObserver {
             };
         }
         RepetitionVerdict::Quiet
+    }
+}
+
+/// The episode fold shared by whole-prompt restoration and streamed store reads.
+/// Only the immediately preceding assistant's calls survive a page boundary; no message rows do.
+#[derive(Default)]
+pub(crate) struct RepetitionFold {
+    observer: RepetitionObserver,
+    pending_calls: Option<Vec<ToolCall>>,
+}
+
+impl RepetitionFold {
+    /// Observe raw outputs before a caller decorates its model-visible copies. Block indexes
+    /// identify results within this message, not by provider IDs (which may repeat across steps).
+    pub(crate) fn push(&mut self, message: &Message) -> Vec<(usize, RepetitionVerdict)> {
+        let previous = self.pending_calls.take();
+        let mut verdicts = Vec::new();
+        if message.role == Role::Tool {
+            if let Some(calls) = previous {
+                let mut calls = calls.iter();
+                for (index, block) in message.content.iter().enumerate() {
+                    if let ContentBlock::ToolResult(result) = block {
+                        if let Some(call) = calls.next() {
+                            let bytes = result_bytes(&result.output);
+                            verdicts.push((
+                                index,
+                                self.observer.observe(call, bytes.as_ref(), result.is_error),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else if message.role == Role::Assistant {
+            self.pending_calls = Some(
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolCall(call) => Some(call.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+        }
+        verdicts
+    }
+
+    pub(crate) fn into_observer(self) -> RepetitionObserver {
+        self.observer
     }
 }
 

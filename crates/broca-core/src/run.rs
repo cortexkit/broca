@@ -46,9 +46,11 @@ use crate::{
     provider::Provider,
     replay::{replay, PendingTurn, ReplayResolution, ReplayState},
     tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError},
-    tool_repetition::{result_bytes, RepetitionObserver},
+    tool_repetition::{result_bytes, RepetitionFold, RepetitionObserver},
     wal_writer::{session_addr, WalHandle, WalStore, WalWriteError},
 };
+
+pub mod repetition_guidance;
 
 /// Default safety cap when the caller supplies no `stop_when`.
 ///
@@ -4337,8 +4339,7 @@ where
         episode_history_start,
         originals.as_mut(),
     );
-    let mut repetition_observer = RepetitionObserver::from_prompt(&prompt[episode_history_start..]);
-    restore_guidance_with_originals(
+    let mut repetition_observer = restore_guidance_with_originals(
         &mut prompt[episode_history_start..],
         episode_history_start,
         originals.as_mut(),
@@ -6437,37 +6438,12 @@ fn store_prior_needs_episode_spans(prior: &ReplayState) -> bool {
 
 /// Whether folding `prompt` with a single observer produces guidance for any tool result.
 fn repetition_guidance_fires(prompt: &[Message]) -> bool {
-    let mut observer = RepetitionObserver::new();
-    let mut index = 0;
-    while index + 1 < prompt.len() {
-        if prompt[index].role != Role::Assistant || prompt[index + 1].role != Role::Tool {
-            index += 1;
-            continue;
-        }
-        let mut calls = prompt[index]
-            .content
+    let mut fold = RepetitionFold::default();
+    prompt.iter().any(|message| {
+        fold.push(message)
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall(call) => Some(call),
-                _ => None,
-            });
-        for block in &prompt[index + 1].content {
-            if let ContentBlock::ToolResult(result) = block {
-                if let Some(call) = calls.next() {
-                    let bytes = result_bytes(&result.output);
-                    if observer
-                        .observe(call, bytes.as_ref(), result.is_error)
-                        .guidance()
-                        .is_some()
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        index += 2;
-    }
-    false
+            .any(|(_, verdict)| verdict.guidance().is_some())
+    })
 }
 
 fn append_repetition_guidance(result: &mut ToolResult, guidance: &str) {
@@ -6529,37 +6505,26 @@ fn restore_guidance_with_originals(
     prompt: &mut [Message],
     base: usize,
     mut originals: Option<&mut crate::compaction::OriginalMessages>,
-) {
-    let mut observer = RepetitionObserver::new();
-    let mut index = 0;
-    while index + 1 < prompt.len() {
-        if prompt[index].role != Role::Assistant || prompt[index + 1].role != Role::Tool {
-            index += 1;
-            continue;
-        }
-
-        let calls: Vec<ToolCall> = prompt[index]
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall(call) => Some(call.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut calls = calls.iter();
-        let original = originals.as_ref().map(|_| prompt[index + 1].clone());
-        for block in &mut prompt[index + 1].content {
-            if let ContentBlock::ToolResult(result) = block {
-                if let Some(call) = calls.next() {
-                    attach_repetition_guidance_to_result(&mut observer, call, result);
+) -> RepetitionObserver {
+    let mut fold = RepetitionFold::default();
+    for (index, message) in prompt.iter_mut().enumerate() {
+        let verdicts = fold.push(message);
+        let original = originals
+            .as_ref()
+            .filter(|_| !verdicts.is_empty())
+            .map(|_| message.clone());
+        for (block_index, verdict) in verdicts {
+            if let Some(guidance) = verdict.guidance() {
+                if let ContentBlock::ToolResult(result) = &mut message.content[block_index] {
+                    append_repetition_guidance(result, &guidance);
                 }
             }
         }
         if let (Some(originals), Some(original)) = (originals.as_deref_mut(), original) {
-            originals.retain_change(base + index + 1, original, &prompt[index + 1]);
+            originals.retain_change(base + index, original, message);
         }
-        index += 2;
     }
+    fold.into_observer()
 }
 
 /// On resume, complete an incomplete trailing tool turn WITHOUT re-running the

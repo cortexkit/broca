@@ -27293,3 +27293,94 @@ platforms = ["windows"]
 file = "crates/broca-core/src/media_store.rs"
 old = "        let repair = broca_owner_only::OpenOptions::new()\n            .write(true)\n            .open(path)?;"
 new = "        let repair = broca_owner_only::OpenOptions::new()\n            .append(true) // NON-VACUITY BREAK: append access cannot truncate on Windows.\n            .open(path)?;"
+
+[[control]]
+id = "streamed-guidance-excludes-admitted-input"
+guards = "Guidance starts at the first model step, never the episode's admitted assistant/tool input"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/conformance/streamed_guidance.rs"
+expect_red = ["conformance::streamed_guidance::streamed_guidance_excludes_admitted_input_pairs"]
+file = "crates/broca-core/src/run/repetition_guidance.rs"
+old = "        let start = next;"
+new = "        next = 0; // NON-VACUITY BREAK: count admitted input pairs\n        let start = next;"
+
+[[control]]
+id = "streamed-guidance-carries-store-pages"
+guards = "An assistant at the end of a store page pairs with the tool message on the next page"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/conformance/streamed_guidance.rs"
+expect_red = ["conformance::streamed_guidance::streamed_guidance_carries_pairs_across_store_pages"]
+file = "crates/broca-core/src/run/repetition_guidance.rs"
+old = "        while next < store_end {"
+new = "        while next < store_end {\n            fold = RepetitionFold::default(); // NON-VACUITY BREAK: forget the preceding page"
+
+[[control]]
+id = "streamed-guidance-rebuilds-raw-outputs"
+guards = "Already-guided held tool outputs are rebuilt from raw rows without duplicated warnings or changed digests"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/conformance/streamed_guidance.rs"
+expect_red = ["conformance::streamed_guidance::streamed_guidance_rebuilds_already_guided_held_outputs"]
+file = "crates/broca-core/src/run/repetition_guidance.rs"
+old = "        result.output.clone_from(&original.output);"
+new = "        let _ = original; // NON-VACUITY BREAK: append guidance onto the decorated held output"
+
+[[control]]
+id = "streamed-guidance-known-no-steps"
+guards = "A known-absent first model step needs no reads and is not a projection gap"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/repetition_guidance.rs"
+expect_red = ["run::repetition_guidance::tests::known_no_first_step_needs_no_rows_but_absent_metadata_is_a_gap"]
+file = "crates/broca-core/src/run/repetition_guidance.rs"
+old = "            return Ok(RepetitionObserver::new());"
+new = "            return Err(\"no model step is a gap\".into()); // NON-VACUITY BREAK: confuse known absence with unknown metadata"
+
+[[control]]
+id = "streamed-guidance-carries-store-into-tail"
+guards = "The final store page's assistant is paired with the raw tool output in the WAL tail"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/repetition_guidance.rs"
+expect_red = ["run::repetition_guidance::tests::last_store_assistant_carries_into_the_wal_tail"]
+file = "crates/broca-core/src/run/repetition_guidance.rs"
+old = "        for message in self.tail {"
+new = "        fold = RepetitionFold::default(); // NON-VACUITY BREAK: forget the store before the tail\n        for message in self.tail {"
+
+[[control]]
+id = "streamed-guidance-watermark-must-match"
+guards = "Paged guidance cannot silently mix a newer store projection with the resume's WAL tail"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/repetition_guidance.rs"
+expect_red = ["run::repetition_guidance::tests::store_gaps_and_watermark_drift_require_replay"]
+file = "crates/broca-core/src/run/repetition_guidance.rs"
+old = "            if page.watermark_seq != self.watermark_seq"
+new = "            if page.watermark_seq != page.watermark_seq // NON-VACUITY BREAK: trust a racing store projection"
+
+[[control]]
+id = "repetition-fold-hands-observer-to-live-run"
+guards = "Whole-episode restoration returns its raw-output observer for later live tool calls"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/repetition_guidance.rs"
+expect_red = ["run::repetition_guidance::tests::whole_episode_hands_the_raw_observer_to_live_calls"]
+file = "crates/broca-core/src/run.rs"
+old = "    fold.into_observer()"
+new = "    let _ = fold; RepetitionObserver::new() // NON-VACUITY BREAK: discard restored observer before live calls"
