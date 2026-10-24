@@ -5579,6 +5579,18 @@ where
         ));
         let mut batch = batch_future.await?;
 
+        if batch.interruption == Some(BatchInterruption::ProviderHeldPaused) {
+            // The batch already recorded and synced this pause; only the surface is left.
+            return publish_held_pause(
+                out,
+                control,
+                resolved_run_id.clone(),
+                completed_steps,
+                total_usage,
+                total_retries_used,
+            )
+            .await;
+        }
         if matches!(
             batch.interruption,
             Some(BatchInterruption::RestartPause | BatchInterruption::ProviderHeldPause)
@@ -6606,12 +6618,19 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     .await?;
     if matches!(
         batch.interruption,
-        Some(BatchInterruption::RestartPause | BatchInterruption::ProviderHeldPause)
+        Some(
+            BatchInterruption::RestartPause
+                | BatchInterruption::ProviderHeldPause
+                | BatchInterruption::ProviderHeldPaused
+        )
     ) {
         return Ok((
             None,
             batch.open,
-            batch.interruption == Some(BatchInterruption::ProviderHeldPause),
+            matches!(
+                batch.interruption,
+                Some(BatchInterruption::ProviderHeldPause | BatchInterruption::ProviderHeldPaused)
+            ),
         ));
     }
 
@@ -7228,6 +7247,11 @@ fn tool_args_rejection_records(
 /// remains distinct from shutdown, scope loss, and ambiguous dispatched outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchInterruption {
+    /// The live batch settled on a pause for a provider-held call. Unlike `ProviderHeldPause`,
+    /// which the keep-warm wait reports before barrier 2, this one arrives after the batch
+    /// wrote the closed-out calls' terminals, so the caller must record and sync the pause
+    /// itself before it acts on it.
+    ProviderHeldPaused,
     ProviderHeldPause,
     CallerCancel,
     StopRequested,
@@ -7248,6 +7272,7 @@ impl BatchOutcome {
             Some(BatchInterruption::CallerCancel) => Some(RunFinishReason::Cancelled),
             Some(BatchInterruption::StopRequested) => Some(RunFinishReason::Interrupted),
             Some(BatchInterruption::RestartPause | BatchInterruption::ProviderHeldPause) => None,
+            Some(BatchInterruption::ProviderHeldPaused) => None,
             Some(BatchInterruption::Ambiguous | BatchInterruption::ScopeDrained) => {
                 Some(RunFinishReason::Interrupted)
             }
@@ -7848,9 +7873,22 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
     }
     if provider_held_pause {
         writer.sync().await?;
+        // The pause is durable here, before anyone acts on it: a run killed between the
+        // decision and the caller's own record would otherwise boot with a held record, no
+        // pause, and every call of the batch terminal, which is the owed-barrier state that
+        // would commit the batch and continue as if the call had been answered.
+        writer.record(WalRecord::RunPaused {
+            ts_ms: ordered
+                .and_then(|control| control.clock.as_ref())
+                .map(crate::Clock::now_ms),
+            run_id: ctx.run_id.clone(),
+            reason: PauseReason::ToolHeld,
+            error: None,
+        });
+        writer.sync().await?;
         return Ok(BatchOutcome {
             results: Vec::new(),
-            interruption: Some(BatchInterruption::ProviderHeldPause),
+            interruption: Some(BatchInterruption::ProviderHeldPaused),
             open: Vec::new(),
         });
     }
@@ -10122,7 +10160,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 batch.interruption,
-                Some(BatchInterruption::ProviderHeldPause)
+                Some(BatchInterruption::ProviderHeldPaused)
             );
             assert_eq!(*plane.sent.lock().unwrap(), [ToolCallId("a".into())]);
             let summary = pause_approval(
@@ -10303,6 +10341,92 @@ mod tests {
         }
     }
 
+    /// A live batch that settles on a pause for a held call writes and syncs `RunPaused`
+    /// before it leaves. Without that record a crash right after the batch would boot with a
+    /// held record, no pause, and every call terminal — the owed-barrier state, which would
+    /// commit the batch and continue the run as if the call had been answered.
+    #[tokio::test]
+    async fn a_live_batch_pause_for_a_held_call_is_durable_before_it_returns() {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = WalHandle::spawn(
+            Box::new(LineageRecordingWal(RecordingWal {
+                records: records.clone(),
+            })),
+            1,
+        )
+        .unwrap();
+        writer.seed_lineage_tags(Some(crate::tags::LineageTags::Off));
+        let plane = ParkedPlane {
+            records: records.clone(),
+            head: writer.durable_head(),
+            sent: Default::default(),
+            gate: None,
+        };
+        let manifest = ToolManifest::from_tools(vec![Tool {
+            name: "edit".into(),
+            description: "edit".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            module: Some("tools".into()),
+            execution_mode: ExecutionMode::Parallel,
+            reply: None,
+        }]);
+        let (out, _rx) = mpsc::channel(16);
+        let bind = BindIdentity::new("/project", "broca", "held-batch");
+        let run = RunId("r".into());
+        let call = ToolCall {
+            tool_call_id: ToolCallId("a".into()),
+            tool_name: "edit".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            dispatch_batch(
+                &run,
+                StepId(1),
+                &bind,
+                None,
+                vec![call],
+                &manifest,
+                &plane,
+                &crate::AllowAll,
+                &writer,
+                None,
+                &[],
+                false,
+                None,
+                None,
+                None,
+                &out,
+                None,
+            ),
+        )
+        .await
+        .expect("the batch settles once its only call is held")
+        .unwrap();
+        assert_eq!(
+            outcome.interruption,
+            Some(BatchInterruption::ProviderHeldPaused)
+        );
+        let last = records.lock().unwrap().last().cloned();
+        assert!(
+            matches!(
+                last,
+                Some(WalRecord::RunPaused {
+                    reason: PauseReason::ToolHeld,
+                    ..
+                })
+            ),
+            "the settled pause must be the batch's last, durable record: {last:?}"
+        );
+        assert_eq!(
+            writer.durable_head().load(Ordering::Acquire),
+            records.lock().unwrap().len() as u64,
+            "the pause is synced, not merely appended"
+        );
+        writer.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn provider_held_pause_stops_keep_warm_for_a_day() {
         let records = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -10387,7 +10511,7 @@ mod tests {
         .expect("provider-held batch must pause rather than warm indefinitely");
         assert_eq!(
             result.unwrap().interruption,
-            Some(BatchInterruption::ProviderHeldPause)
+            Some(BatchInterruption::ProviderHeldPaused)
         );
         assert!(
             !probe.active.load(Ordering::Acquire),
@@ -12772,8 +12896,27 @@ mod approval_gate {
                     _ => None,
                 })
                 .collect();
-            if announced && result != Some(BatchInterruption::ProviderHeldPause) {
+            if announced
+                && !matches!(
+                    result,
+                    Some(
+                        BatchInterruption::ProviderHeldPause
+                            | BatchInterruption::ProviderHeldPaused
+                    )
+                )
+            {
                 let _ = plane.batch_finished(&ctx).await;
+            }
+            if result == Some(BatchInterruption::ProviderHeldPaused) {
+                // The closed-out terminals are already durable; the pause is what makes them a
+                // pause a later boot can resume rather than an owed barrier it may commit.
+                writer.record(WalRecord::RunPaused {
+                    ts_ms: control.now_ms(),
+                    run_id: ctx.run_id.clone(),
+                    reason: PauseReason::ToolHeld,
+                    error: None,
+                });
+                writer.sync().await?;
             }
             return Ok(BatchOutcome {
                 results: Vec::new(),
@@ -13151,7 +13294,9 @@ mod approval_gate {
                         prepare_ready(plan, ctx, plane, writer).await?;
                     }
                 }
-                return Ok(Some(BatchInterruption::ProviderHeldPause));
+                // The caller makes this pause durable before it acts on it; the batch only
+                // reports the decision, because a stop request racing it owns the close-out.
+                return Ok(Some(BatchInterruption::ProviderHeldPaused));
             }
             if stopping && dispatched.is_empty() && active.is_empty() {
                 if stopped
@@ -14527,6 +14672,35 @@ async fn pause_run(
     )
     .await
 }
+/// Report a pause the batch already made durable, and hand back the summary a pause gives.
+async fn publish_held_pause(
+    out: &mpsc::Sender<OutputEvent>,
+    control: &RunControl,
+    run_id: RunId,
+    steps: u64,
+    usage: Usage,
+    retries: u32,
+) -> Result<RunSummary, RunError> {
+    control.close_steers();
+    let _ = send(
+        out,
+        OutputEvent::Control(ControlUnit::Paused {
+            run_id,
+            reason: PauseReason::ToolHeld,
+            error: None,
+        }),
+    )
+    .await;
+    Ok(RunSummary {
+        reason: RunFinishReason::Interrupted,
+        paused: Some(PauseReason::ToolHeld),
+        steps,
+        usage,
+        retries_used: retries,
+        final_step_finish_reason: None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pause_approval(
     writer: &WalHandle,
