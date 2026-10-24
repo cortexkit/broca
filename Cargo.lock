@@ -375,6 +375,7 @@ name = "broca-module"
 version = "0.3.253"
 dependencies = [
  "async-trait",
+ "base64",
  "broca-core",
  "broca-diagnostics",
  "broca-fetch-plan",

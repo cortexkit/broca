@@ -81,6 +81,23 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         let write = args.len() == 4;
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(now) => now.as_secs(),
+            Err(error) => {
+                eprintln!("store-maintenance: upload clock failed: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        let uploads_removed =
+            match broca_core::media_uploads::Uploads::at(std::path::Path::new(state_root))
+                .sweep(now, write)
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    eprintln!("store-maintenance: upload sweep failed: {error}");
+                    return ExitCode::from(2);
+                }
+            };
         let result = if write {
             broca_core::media_store::sweep(std::path::Path::new(state_root))
         } else {
@@ -88,6 +105,7 @@ fn main() -> ExitCode {
         };
         return match result {
             Ok(report) => {
+                println!("uploads_removed {uploads_removed}");
                 println!(
                     "mode {}\nleased {}\nreconciled {}\nmanifests_removed {}\nobjects_removed {}\nwal_reads {}\nretained_classes {}",
                     if write { "write" } else { "preview" },

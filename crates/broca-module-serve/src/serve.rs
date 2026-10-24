@@ -2217,7 +2217,8 @@ where
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
-        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE);
+        let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
+        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status");
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2345,6 +2346,24 @@ where
         }
     }
     match req.method.as_str() {
+        "session.upload_begin"
+        | "session.upload_append"
+        | "session.upload_commit"
+        | "session.upload_status" => {
+            match handler
+                .upload(
+                    &session,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                    &req.method,
+                    req.params,
+                )
+                .await
+            {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
         OP_SEND_STATUS => {
             let params: broca_wire::SendStatusRequest =
                 match serde_json::from_value(req.params.clone()) {
@@ -2388,6 +2407,18 @@ where
                     corr,
                     "unsupported_seed_from",
                     "seed_from is reserved for lineage forks and is not supported in v1",
+                )
+                .await;
+            }
+            if let Err(message) = broca_wire::check_upload_references(&req.params) {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("content".into()),
+                    &message,
                 )
                 .await;
             }
@@ -3696,6 +3727,7 @@ async fn send_json_response<T: serde::Serialize>(
 
 fn refused_send_code(error: &ServeError) -> String {
     match error {
+        ServeError::Upload(error) => error.code.into(),
         ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND.into(),
         ServeError::SessionMoving { .. } => "session_moving".into(),
@@ -3812,6 +3844,23 @@ async fn send_serve_error(
         return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
     }
     let code = match err {
+        ServeError::Upload(error) => {
+            let mut detail = serde_json::json!({});
+            if let Some(field) = error.field {
+                detail["field"] = field.into();
+            }
+            if let Some(received) = error.received {
+                detail["received"] = received.into();
+            }
+            if matches!(
+                error.code,
+                "upload_staging_full" | "upload_session_full" | "upload_store_failed"
+            ) {
+                detail["class"] = "transient".into();
+            }
+            let body = ErrorBody::new(error.code, error.to_string()).with_detail(detail);
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::ReplyTooLarge(_) => unreachable!("reply_too_large returned above"),
         ServeError::SessionMoving { cut_id } => {
             let body = ErrorBody::new("session_moving", err.to_string())

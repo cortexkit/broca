@@ -1377,6 +1377,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
 pub enum ServeError {
+    Upload(broca_core::media_uploads::UploadError),
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     UnknownSend,
     SessionMoving {
@@ -1525,6 +1526,7 @@ impl From<OpenError> for ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Upload(error) => error.fmt(f),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
             ServeError::SessionMoved { holder } => write!(f, "session moved to {holder}"),
@@ -1607,6 +1609,19 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
+    async fn upload(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        Err(ServeError::InvalidParams {
+            field: "upload_id".into(),
+            message: "uploads unavailable".into(),
+        })
+    }
     fn backup_classes(&self) -> Vec<String> {
         vec!["head".into()]
     }
@@ -2181,6 +2196,17 @@ impl ServeHandler for crate::LineageRegistry {
         let ownership = self.owner_ownership(session).await?;
         broca_core::scope_admission::decide_owner_access(&ownership, principal, scope)
             .map_err(ServeError::ScopeRefused)
+    }
+
+    async fn upload(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        crate::uploads::upload(self, session, principal, scope, method, params).await
     }
 
     async fn send(&self, req: SendRequest) -> Result<SendResponse, ServeError> {

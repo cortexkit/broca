@@ -955,6 +955,9 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
+        self.inner.reader.as_ref()?.wal_store.uploads()
+    }
     pub fn active_event_sessions(&self) -> Vec<LineageKey> {
         self.inner
             .slots
@@ -1349,6 +1352,18 @@ impl LineageRegistry {
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
         self.check_authorization_expired(key).await?;
         self.durable_session_ownership(key, false)
+            .await
+            .map_err(OwnershipReadError::into_open)
+    }
+
+    /// Upload standing includes plan-named senders, unlike cancel/retract. Read
+    /// the frozen first manifest without retaining its contents in owner caches.
+    pub(crate) async fn upload_ownership(
+        &self,
+        key: &LineageKey,
+    ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+        self.check_authorization_expired(key).await?;
+        self.durable_session_ownership(key, true)
             .await
             .map_err(OwnershipReadError::into_open)
     }

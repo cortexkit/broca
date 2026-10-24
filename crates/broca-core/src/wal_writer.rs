@@ -48,6 +48,11 @@ pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
 pub trait WalStore: Send + Sync {
+    /// File-backed sessions stage uploads beside their WAL trees, never in a
+    /// second host media store. In-memory stores do not offer upload staging.
+    fn uploads(&self) -> Option<crate::media_uploads::Uploads> {
+        None
+    }
     fn backup_classes(&self) -> Vec<String> {
         vec!["head".into()]
     }
@@ -1402,6 +1407,9 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn uploads(&self) -> Option<crate::media_uploads::Uploads> {
+        self.root.parent().map(crate::media_uploads::Uploads::at)
+    }
     fn open_writer(
         &self,
         session: &BindIdentity,
