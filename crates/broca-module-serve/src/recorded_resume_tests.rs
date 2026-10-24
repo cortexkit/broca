@@ -60,13 +60,10 @@ async fn execute_recorded_fixture(
 ) -> (RunSummary, Vec<OutputEvent>, Vec<broca_wal::FramedRecord>) {
     let _ = std::fs::remove_dir_all(root);
     std::fs::create_dir_all(root).unwrap();
-    let (executor, subc) = stand_in_executor(root).await;
-    let auth_path = root.join("auth.json");
-    std::fs::write(&auth_path, serde_json::json!({
-        "anthropic":{"type":"api","key":"refreshed-fixture"},
-        "openai-compatible":{"type":"api","key":"refreshed-fixture"}
-    }).to_string()).unwrap();
-    let executor = executor.with_opencode_auth_path(auth_path);
+    // The resume reads its credential from the vault, as production does; the stand-in serves
+    // `stand-in-token` for the recorded credential id.
+    let vault = CapturingVaultDaemon::start(root).await;
+    let executor = executor_with_capturing_vault(root, &vault).await;
     let mut req = drift_request(root);
     req.model.model_id = "opaque-resume".into();
     req.generation.max_output_tokens = Some(2048);
@@ -96,7 +93,7 @@ async fn execute_recorded_fixture(
     let (out, mut events) = mpsc::channel(128);
     let outcome = tokio::time::timeout(Duration::from_secs(15), executor.execute(job, out)).await;
     Arc::try_unwrap(writer).unwrap_or_else(|_| panic!("executor released the session writer")).shutdown().await.unwrap();
-    subc.abort();
+    drop(vault);
     let summary = outcome.expect("executor resume must terminate").expect("resume must reach core's typed guard");
     let mut emitted = Vec::new();
     while let Some(event) = events.recv().await { emitted.push(event); }
@@ -117,7 +114,7 @@ async fn production_executor_restores_opaque_bearer_auth_from_the_recorded_route
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests.len(), 1, "the resumed run must reach its recorded endpoint");
     let headers = requests[0].headers.to_ascii_lowercase();
-    assert!(headers.contains("authorization: bearer refreshed-fixture"), "opaque resume must preserve Bearer auth: {headers}");
+    assert!(headers.contains("authorization: bearer stand-in-token"), "opaque resume must preserve Bearer auth: {headers}");
     assert!(!headers.contains("x-api-key:"), "model prefix must not select Anthropic auth: {headers}");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["model"], "anthropic/opaque-resume");
