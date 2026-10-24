@@ -24502,6 +24502,19 @@ old = "            Outcome::Answered(_) => true,"
 new = "            Outcome::Answered(_) => false, // NON-VACUITY BREAK: re-ask stored answers."
 
 [[control]]
+id = "system-one-reply-after-awaited-release"
+guards = "classify.run releases the batch's stored hold before it answers, so a caller re-sending the same batch at once is never refused batch_in_progress by the finished call"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/tests.rs"
+expect_red = ["system_one::tests::an_immediate_resend_after_a_reply_finds_the_batch_released"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "    hold.release().await;\n    answer"
+new = "    drop(hold); // NON-VACUITY BREAK: leave the store release to the fire-and-forget drop path.\n    answer"
+
+[[control]]
 id = "system-one-wrong-kind-refused"
 guards = "classify.run refuses a catalog row whose kind is not a decision model with model_not_classifier naming the kind"
 runner = "cargo"

@@ -535,6 +535,35 @@ async fn a_tighter_resend_is_recorded_before_anything_is_sent() {
     assert_eq!(rig.stand_in.calls("x"), 2);
 }
 
+/// A call releases its stored hold (here, successfully) before it answers, so a caller that
+/// re-sends the same batch the moment it is answered is served, not refused
+/// `batch_in_progress` by the finished call.
+/// The release a dropped hold would start is held shut for the whole test: if a normally
+/// ended call left its release to that path, the re-send would find the row still `running`
+/// every time, not only when the release thread happened to lose the race.
+#[tokio::test]
+async fn an_immediate_resend_after_a_reply_finds_the_batch_released() {
+    let rig = rig();
+    rig.stand_in.script(
+        "a",
+        vec![Script::Answer(noul("0.4", None)), Script::Status(500, None)],
+    );
+    rig.stand_in.script(
+        "t",
+        vec![Script::Status(503, None), Script::Answer(noul("0.5", None))],
+    );
+    let (_shut, gate) = std::sync::mpsc::channel::<()>();
+    *rig.service.fallback_release_gate.lock().unwrap() = Some(gate);
+    let body = params("prompt", JEV, &["a", "t"], None);
+    let first = admitted(&rig, body.clone()).await;
+    assert_eq!(items(&first)[1]["error"]["code"], "provider_error");
+    let again = admitted(&rig, body).await;
+    let again = items(&again);
+    assert_eq!(again[0]["answers"], items(&first)[0]["answers"]);
+    assert!(again[1]["answers"].is_object());
+    assert_eq!((rig.stand_in.calls("a"), rig.stand_in.calls("t")), (1, 2));
+}
+
 #[tokio::test]
 async fn stored_permanent_errors_are_served_and_transient_ones_retried() {
     let rig = rig();

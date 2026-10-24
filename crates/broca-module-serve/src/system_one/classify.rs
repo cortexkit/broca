@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use broca_catalog::ModelBatchRow;
 use broca_store::system_one::{BatchClaim, Claimed, Outcome, StoredOutcome};
+use broca_store::SystemOneStore;
 use cortexkit_model_batch::{
     absent::{add_reported, input_cost_nanos},
     estimate::{
@@ -151,12 +152,47 @@ enum Slot {
 }
 
 /// This call's hold on a batch: the in-process claim, and the store's `running` row once it
-/// is written. Dropping it releases both, so a call that ends any way (a reply, a refusal, a
-/// panic, a dropped future) never leaves its batch held.
+/// is written. A call that ends normally (a reply or a refusal) gives it up through
+/// [`Hold::release`], which waits for the store write. Dropping it is the fallback for a call
+/// that panics or whose future is dropped: it removes the in-process claim and starts the
+/// store release in the background, since nothing is left to wait for it. Either way a
+/// failed store release is logged and the row stays held until the next start releases it.
 struct Hold<'a> {
     service: &'a Arc<SystemOne>,
     batch_id: String,
     stored: bool,
+}
+
+/// End this process's store hold on a batch. A failure is only logged: the call is answered
+/// anyway, and the next start releases every hold a previous process left.
+fn release_stored(store: &SystemOneStore, batch_id: &str, owner: &str) {
+    if let Err(error) = store.release(STORE_ROLE, batch_id, owner) {
+        tracing::warn!(target: "system_one", %error, batch_id,
+            "could not release a batch hold; the next start releases it");
+    }
+}
+
+impl Hold<'_> {
+    /// Release the store's row and wait for it, then the in-process claim (by dropping the
+    /// hold). The reply leaves only after this, so once the release succeeds a caller that
+    /// re-sends the same batch the moment it is answered finds the batch free, not
+    /// `batch_in_progress`.
+    async fn release(mut self) {
+        if self.stored {
+            // Cleared first so the drop below does not start a second release. If this future
+            // is dropped mid-wait, the blocking task still runs to completion.
+            self.stored = false;
+            let store = Arc::clone(&self.service.store);
+            let (batch_id, owner) = (self.batch_id.clone(), self.service.owner.clone());
+            let released =
+                tokio::task::spawn_blocking(move || release_stored(&store, &batch_id, &owner))
+                    .await;
+            if let Err(error) = released {
+                tracing::warn!(target: "system_one", %error, batch_id = %self.batch_id,
+                    "could not release a batch hold; the next start releases it");
+            }
+        }
+    }
 }
 
 impl Drop for Hold<'_> {
@@ -164,11 +200,20 @@ impl Drop for Hold<'_> {
         if self.stored {
             let store = Arc::clone(&self.service.store);
             let (batch_id, owner) = (self.batch_id.clone(), self.service.owner.clone());
+            #[cfg(test)]
+            let gate = self
+                .service
+                .fallback_release_gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
             let release = move || {
-                if let Err(error) = store.release(STORE_ROLE, &batch_id, &owner) {
-                    tracing::warn!(target: "system_one", %error, batch_id,
-                        "could not release a batch hold; the next start releases it");
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    // Returns once the test drops the sending side.
+                    let _ = gate.recv();
                 }
+                release_stored(&store, &batch_id, &owner);
             };
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => drop(runtime.spawn_blocking(release)),
@@ -511,7 +556,47 @@ pub(crate) async fn run(
         batch_id: request.batch_id.clone(),
         stored: false,
     };
+    // Everything after the in-process claim runs in `serve_claimed`, so that every way the
+    // call can end normally once the store row may exist (a reply, a scope or reuse refusal,
+    // a failed outcome or usage-export write, a failed outbox flush) passes through the
+    // awaited release below before `run` returns.
+    let answer = serve_claimed(
+        service,
+        scope,
+        &mut hold,
+        &request,
+        &raw,
+        &row,
+        &pin,
+        &identity,
+        &identity_json,
+        &digest,
+        sent_ceiling,
+    )
+    .await;
+    hold.release().await;
+    answer
+}
 
+/// The part of one `classify.run` that runs while this call holds the batch: the store claim,
+/// each item's provider call and outcome write, and the reply. `run` releases `hold` after
+/// it, whatever it returns.
+// The arguments are the request as `run` already checked it; a struct for one call site
+// would only rename them.
+#[allow(clippy::too_many_arguments)]
+async fn serve_claimed(
+    service: &Arc<SystemOne>,
+    scope: &broca_store::system_one::BatchScope,
+    hold: &mut Hold<'_>,
+    request: &ClassifyRequest,
+    raw: &RawParams<'_>,
+    row: &ModelBatchRow,
+    pin: &ModelPin,
+    identity: &BatchIdentity,
+    identity_json: &str,
+    digest: &str,
+    sent_ceiling: Option<u64>,
+) -> Result<Box<RawValue>, Refusal> {
     let live_frozen = FrozenRow {
         input_rate_nanos: row.input_rate_nanos,
         output_rate_nanos: row.output_rate_nanos,
@@ -524,7 +609,7 @@ pub(crate) async fn run(
             request.model.clone(),
             service.owner.clone(),
         );
-        let (identity_json, digest) = (identity_json.clone(), digest.clone());
+        let (identity_json, digest) = (identity_json.to_owned(), digest.to_owned());
         let frozen = serde_json::to_string(&live_frozen).expect("frozen facts encode");
         let scope = scope.clone();
         blocking(move || {
@@ -555,7 +640,7 @@ pub(crate) async fn run(
             let recorded: BatchIdentity = serde_json::from_str(&recorded_identity)
                 .map_err(|_| internal_refusal("a recorded batch identity does not decode"))?;
             let field = recorded
-                .first_difference(&identity)
+                .first_difference(identity)
                 .unwrap_or_else(|| "items".to_owned());
             return Err(Refusal::batch_id_reuse(field));
         }
@@ -594,7 +679,7 @@ pub(crate) async fn run(
         }
     }
     let estimates = (0..request.items.len())
-        .map(|index| estimate(&request, index, rate))
+        .map(|index| estimate(request, index, rate))
         .collect::<Result<Vec<_>, _>>()?;
 
     // CONTRACT §6.9: an estimate of what this call would send above the ceiling is refused
@@ -678,7 +763,7 @@ pub(crate) async fn run(
             serde_json::to_string(&pin.provider_model).expect("a string encodes"),
             raw.items[index].state.get(),
         );
-        let answer = call_provider(service, &pin, body).await;
+        let answer = call_provider(service, pin, body).await;
         if first_provider_call {
             first_provider_call = false;
             if let Err(error) = &answer {
@@ -690,7 +775,7 @@ pub(crate) async fn run(
                         discard_fresh(service, &request.batch_id).await;
                         hold.stored = false;
                     }
-                    return Err(first_call_refusal(error, &request.model, &pin));
+                    return Err(first_call_refusal(error, &request.model, pin));
                 }
             }
             for outcome in std::mem::take(&mut pending) {
@@ -762,8 +847,7 @@ pub(crate) async fn run(
     for outcome in pending {
         record(service, &request.batch_id, &outcome, 0).await?;
     }
-    drop(hold);
-    reply(&request, &frozen, slots)
+    reply(request, &frozen, slots)
 }
 
 async fn record(
