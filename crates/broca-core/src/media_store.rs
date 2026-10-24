@@ -11,6 +11,11 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod lifecycle;
+pub use lifecycle::{
+    preview_sweep, session_media_digests, spawn_startup_sweep, sweep, SweepReport,
+};
+
 /// Stores deduplicate only within a WAL durability class, never across classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaStoreClass {
@@ -65,6 +70,13 @@ impl MediaStore {
     /// The session actor must retain its lease for this handle's lifetime. A
     /// maintenance sweep uses the exclusive store lock and skips leased sessions.
     pub fn session(&self, identity: &BindIdentity) -> io::Result<MediaManifest> {
+        let registration_lock = self.lock()?;
+        registration_lock.lock_shared()?;
+        // The WAL may not exist yet. Persist the identity so maintenance can
+        // still check its writer lease before reclaiming an uncommitted capture.
+        let address = crate::wal_writer::session_addr(identity);
+        let identity_path = self.root.join("identities").join(address);
+        broca_wal::migration::atomic_json(self.root.parent().unwrap(), &identity_path, identity)?;
         let path = self
             .root
             .join("refs")
@@ -304,6 +316,7 @@ enum Step {
     ManifestSynced,
     RefsSynced,
     WalAppended,
+    WalDirectorySynced,
 }
 
 trait StorageSteps {

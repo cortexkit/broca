@@ -263,6 +263,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
     create_state_directories(&state_root)?;
+    if let Err(error) = broca_core::media_store::spawn_startup_sweep(state_root.clone()) {
+        tracing::warn!(target: "media", "could not start media maintenance; continuing to serve: {error}");
+    }
     // The catalog only guides external backup capture; a filesystem refusal must not take
     // session service offline.
     if let Err(error) = write_engram_catalog(&state_root) {

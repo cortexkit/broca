@@ -51,6 +51,48 @@ pub fn lease_key_for(session: &BindIdentity) -> LeaseKey {
     LeaseKey::new(MODULE_ID, BACKEND, scope)
 }
 
+pub(crate) enum LeaseProbe {
+    Held,
+    Free(Option<std::fs::File>),
+}
+
+/// Preview maintenance must not create a lease or change its epoch. The pinned
+/// lease crate exposes no read-only probe, so open its stable FNV-1a filename
+/// without creation and hold a shared OS lock. Tests compare this with a real
+/// FileLeaseStore writer to detect any dependency addressing drift.
+pub(crate) fn probe_writer(
+    state_root: &std::path::Path,
+    session: &BindIdentity,
+) -> std::io::Result<LeaseProbe> {
+    let key = lease_key_for(session);
+    let identity = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        key.module_id, key.backend, key.scope_key
+    );
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in identity.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let path = state_root.join("leases").join(format!("{hash:016x}.lease"));
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LeaseProbe::Free(None))
+        }
+        Err(error) => return Err(error),
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(LeaseProbe::Free(Some(file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(LeaseProbe::Held),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
 /// Hold for the entire mutating fold, resume, or unfold operation. Report-only
 /// callers must not acquire this lease. The OS lock releases on process death;
 /// the persisted epoch is forensic metadata, not a TTL or a stale-file lock.

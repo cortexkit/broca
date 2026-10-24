@@ -221,6 +221,45 @@ struct Rig {
     store: Arc<SqliteStore>,
     leases: Arc<broca_core::FileLeaseStore>,
 }
+
+#[test]
+fn retention_deletion_drops_media_manifest_after_wal_unlink_and_leaves_collection_to_sweep() {
+    let rig = Rig::new();
+    rig.seed(1, 1000, Some(1000));
+    let bytes = b"%PDF-1.7\nretention fixture\n%%EOF";
+    let reference = broca_core::media_validation::validate_media(bytes, "application/pdf").unwrap();
+    let media = broca_core::media_store::MediaStore::open(
+        &rig.root,
+        broca_core::media_store::MediaStoreClass::Ephemeral,
+    )
+    .unwrap();
+    media
+        .session(&rig.key)
+        .unwrap()
+        .register_and_append(&reference, bytes, || Ok(()))
+        .unwrap();
+    let manifest = rig
+        .root
+        .join("media-ephemeral/refs")
+        .join(broca_core::session_addr(&rig.key));
+    assert!(manifest.exists());
+    let _lease = rig.service.lease(&rig.key).unwrap();
+    assert!(rig
+        .service
+        .delete_expired(&rig.key, 2001)
+        .unwrap()
+        .is_some());
+    assert!(!rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+    assert!(!manifest.exists());
+    assert_eq!(media.read_verified(&reference).unwrap(), bytes);
+    drop(_lease);
+    assert_eq!(
+        broca_core::media_store::sweep(&rig.root)
+            .unwrap()
+            .objects_removed,
+        1
+    );
+}
 impl Rig {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);

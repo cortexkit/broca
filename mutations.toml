@@ -27097,3 +27097,159 @@ expect_red = ["media_store::tests::partial_manifest_write_cannot_swallow_a_later
 file = "crates/broca-core/src/media_store.rs"
 old = "        recover_torn_tail(&mut self.file)?;"
 new = "        // NON-VACUITY BREAK: append a retry directly after a torn digest."
+
+[[control]]
+id = "media-sweep-live-lease-keeps-unaccepted-captures"
+guards = "Refused steer captures survive a live lease and are reclaimed only after release"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::live_lease_preserves_refused_entries_then_first_unleased_sweep_frees_only_unaccepted_digest"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = "        if lease.is_none() {"
+new = "        if false { // NON-VACUITY BREAK: reconcile a session while its writer lease is held."
+
+[[control]]
+id = "media-sweep-exclusive-store-lock"
+guards = "Sweeping cannot share the store lock with an in-flight registration"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::sweep_lock_is_exclusive_and_deadline_prevents_unbounded_work"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = "        lock.try_lock().map_err(io::Error::other)?;"
+new = "        lock.try_lock_shared().map_err(io::Error::other)?; // NON-VACUITY BREAK: sweep under a shared lock."
+
+[[control]]
+id = "media-sweep-prunes-unaccepted-manifest-entries"
+guards = "Changed unleased manifests retain only digests named by their WAL"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::unchanged_manifest_is_not_rewritten_but_a_changed_one_is_reconciled"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = '        let canonical: String = named.iter().map(|digest| format!("{digest}\n")).collect();'
+new = '        let canonical: String = manifest.iter().map(|digest| format!("{digest}\n")).collect(); // NON-VACUITY BREAK: trust entries the WAL never named.'
+
+[[control]]
+id = "media-sweep-wal-retains-missing-manifest-objects"
+guards = "A missing manifest cannot turn a WAL-owned object into garbage"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::wal_references_survive_even_if_the_manifest_is_missing"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = "        .flat_map(|(digests, _, _)| digests.iter().cloned())"
+new = "        .flat_map(|(digests, _, _)| digests.iter().take(0).cloned()) // NON-VACUITY BREAK: ignore WAL references missing from manifests."
+
+[[control]]
+id = "media-sweep-reclaims-only-the-owning-class"
+guards = "A WAL in another durability class cannot retain an orphan object copy"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::wal_in_another_class_does_not_keep_an_unreferenced_copy"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = "        .filter(|(_, _, owner)| *owner == Some(class))"
+new = "        .filter(|_| true) // NON-VACUITY BREAK: retain orphan copies in every store."
+
+[[control]]
+id = "media-sweep-drops-orphan-manifest"
+guards = "The first unleased sweep drops a manifest whose WAL exists in no tree"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::orphan_manifest_is_reclaimed_only_after_its_lease_is_released"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = "            migration::unlink(&path)?;\n            migration::unlink(&sidecar)?;"
+new = "            // NON-VACUITY BREAK: leave an orphan manifest behind.\n            migration::unlink(&sidecar)?;"
+
+[[control]]
+id = "media-deletion-wal-directory-barrier-before-manifest-drop"
+guards = "A failed WAL removal directory barrier preserves the manifest for recovery"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::failed_wal_removal_barrier_keeps_manifest_for_retry"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = "        sync_wal_directories_with(state_root, steps)?;"
+new = "        // NON-VACUITY BREAK: drop a manifest before WAL removal is durable."
+
+[[control]]
+id = "media-retention-deletion-drops-manifest"
+guards = "Retention completion removes the expired session's media manifest"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention_tests.rs"
+expect_red = ["retention::tests::retention_deletion_drops_media_manifest_after_wal_unlink_and_leaves_collection_to_sweep"]
+file = "crates/broca-module/src/retention.rs"
+old = "            if media.try_exists().map_err(|error| error.to_string())? {"
+new = "            if false { // NON-VACUITY BREAK: leave the expired session's media manifest."
+
+[[control]]
+id = "media-move-refuses-wal-only-transport-before-prepare"
+guards = "Media moves refuse by feature before any cut intent or freeze is published"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/move_files/tests.rs"
+expect_red = ["move_files::tests::media_move_prepare_refuses_by_feature_before_writing_any_cut_artifact"]
+file = "crates/broca-module/src/move_files.rs"
+old = "                self.driver.prepare_media(&plan.session, &digests)?;"
+new = "                // NON-VACUITY BREAK: prepare a media session for a WAL-only move."
+
+[[control]]
+id = "media-startup-maintenance-never-blocks-admission"
+guards = "Startup dispatch returns while slow maintenance is still running"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::startup_dispatch_returns_before_slow_maintenance_finishes"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = "        .spawn(action)"
+new = "        .spawn({ action(); || {} }) // NON-VACUITY BREAK: run maintenance synchronously before spawning."
+
+[[control]]
+id = "media-sweep-empty-store-skips-wal-inventory"
+guards = "An empty media store needs neither WAL inventory nor the archive pass lock"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::sweep_skips_empty_stores_without_touching_the_wal_corpus"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = '        if !has_objects(&root.join("objects"))? {'
+new = '        if false { // NON-VACUITY BREAK: inventory a class with no objects to reclaim.'
+
+[[control]]
+id = "media-sweep-inventories-only-manifest-candidates"
+guards = "One shared inventory reads only sessions named by manifests or identity sidecars"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/lifecycle/tests.rs"
+expect_red = ["media_store::lifecycle::tests::sweep_reads_each_manifest_candidate_once_and_ignores_other_wals"]
+file = "crates/broca-core/src/media_store/lifecycle.rs"
+old = "    for address in candidates {"
+new = "    for address in &wal.addresses().map_err(io::Error::other)? { // NON-VACUITY BREAK: decode the unrelated WAL corpus."
