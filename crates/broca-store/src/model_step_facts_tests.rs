@@ -654,3 +654,158 @@ fn the_walk_queue_lists_recent_and_live_sessions_once_each_in_bounded_fills() {
     store.save_model_step_walk(&walk).unwrap();
     assert_eq!(store.model_step_walk().unwrap(), Some(walk));
 }
+
+/// `runs` finished two-step runs, one after another in a single session's WAL, each step
+/// finishing at about `t`. One projection call, so the facts commit in a few transactions.
+fn history_runs(store: &SqliteStore, runs: u64, t: u64) {
+    let session = BindIdentity::new("/tmp/steps", "runner", "history");
+    let mut records = Vec::new();
+    for run in 0..runs {
+        for mut frame in two_step_run(&format!("run-{run}"), t) {
+            frame.seq += run * 6;
+            records.push(frame);
+        }
+    }
+    store
+        .project_model_step_facts(&session, LINEAGE, &records, NOW)
+        .unwrap();
+}
+
+#[test]
+fn history_steps_wait_in_the_backlog_and_live_steps_are_written_at_once() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let cutoff = NOW - 1000;
+    assert_eq!(store.begin_model_step_backfill(cutoff).unwrap(), cutoff);
+    // A later start keeps the first cutoff.
+    assert_eq!(store.begin_model_step_backfill(NOW).unwrap(), cutoff);
+    // 3,000 runs of history fill the backlog without touching export_facts.
+    history_runs(&store, 3_000, NOW - DAY_MS);
+    assert_eq!(store.model_step_backlog_len().unwrap(), 6_000);
+    assert!(rows(&store).is_empty());
+    // The pace has room for one burst now, then nothing until time passes.
+    assert_eq!(
+        store.publish_model_step_backlog(NOW).unwrap().published,
+        PUBLISH_BURST
+    );
+    assert_eq!(store.publish_model_step_backlog(NOW).unwrap().published, 0);
+    // A live step (finished after the cutoff) is written at once, ahead of the waiting history.
+    let live = vec![
+        started(1, "run-live", NOW - 100),
+        attempt(2, 1, NOW),
+        step(3, 1),
+    ];
+    let report = store
+        .project_model_step_facts(&session(), LINEAGE, &live, NOW)
+        .unwrap();
+    assert_eq!((report.written, report.queued), (1, 0));
+    assert_eq!(
+        store.model_step_backlog_len().unwrap(),
+        6_000 - PUBLISH_BURST
+    );
+    let newest = rows(&store).pop().unwrap();
+    assert!(newest.3.contains("\"run_id\":\"run-live\""));
+    // Deriving the same history again from scratch (checkpoints lost) queues nothing twice,
+    // whether its row was already published or is still waiting.
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM model_step_projection", [])
+        .unwrap();
+    history_runs(&store, 3_000, NOW - DAY_MS);
+    assert_eq!(
+        store.model_step_backlog_len().unwrap(),
+        6_000 - PUBLISH_BURST
+    );
+}
+
+/// The cap astrocyte asked for, over a backfill that spans many windows, with the publisher
+/// called on a virtual clock every 250 ms (as the daemon does) and the store reopened halfway
+/// (a restart must continue the pace, not start a fresh burst).
+#[test]
+fn the_backlog_never_publishes_more_than_the_cap_in_any_window() {
+    let root = broca_test_support::scratch_root().join(format!(
+        "broca-model-step-pace-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("run-index.db");
+    let mut store = SqliteStore::open(&db).unwrap();
+    store.begin_model_step_backfill(NOW).unwrap();
+    // 12,000 rows: more than two full windows' worth.
+    history_runs(&store, 6_000, NOW - DAY_MS);
+    assert_eq!(store.model_step_backlog_len().unwrap(), 12_000);
+
+    let mut published: Vec<(u64, u64)> = Vec::new();
+    let mut clock = NOW;
+    while store.model_step_backlog_len().unwrap() > 0 {
+        if clock == NOW + 45_000 {
+            drop(store);
+            store = SqliteStore::open(&db).unwrap();
+        }
+        let report = store.publish_model_step_backlog(clock).unwrap();
+        if report.published > 0 {
+            published.push((clock, report.published));
+        }
+        clock += 250;
+        assert!(clock < NOW + 600_000, "the backlog did not drain");
+    }
+    let total: u64 = published.iter().map(|(_, rows)| rows).sum();
+    assert_eq!(total, 12_000);
+    // Every 30 s window (both ends inclusive) that starts at a publish.
+    let worst = published
+        .iter()
+        .map(|(start, _)| {
+            published
+                .iter()
+                .filter(|(at, _)| *at >= *start && *at <= start + BACKFILL_WINDOW_MS)
+                .map(|(_, rows)| rows)
+                .sum::<u64>()
+        })
+        .max()
+        .unwrap();
+    assert!(
+        worst <= BACKFILL_ROWS_PER_WINDOW,
+        "{worst} rows published in one 30 s window"
+    );
+    // And it is a pace, not a trickle: 12,000 rows take about 12,000 * 6.25 ms = 75 s.
+    let elapsed = published.last().unwrap().0 - NOW;
+    assert!(
+        (70_000..=80_000).contains(&elapsed),
+        "drained in {elapsed} ms"
+    );
+    // Every published row is a step fact with an expiry, and the export cursor moved.
+    let published_rows = rows(&store);
+    assert_eq!(published_rows.len(), 12_000);
+    assert!(published_rows
+        .iter()
+        .all(|(_, _, run_id, json)| run_id.is_empty() && json.contains("\"kind\":\"model_step\"")));
+    let expiry_rows: i64 = store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM export_fact_expiry", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(expiry_rows, 12_000);
+    assert_eq!(store.high_water(), 12_000);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_backlog_row_whose_thirty_days_ended_while_waiting_is_dropped() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    store.begin_model_step_backfill(NOW).unwrap();
+    history_runs(&store, 1, NOW - DAY_MS);
+    let later = NOW - DAY_MS + MODEL_STEP_FACT_RETENTION_MS + 5_000;
+    let report = store.publish_model_step_backlog(later).unwrap();
+    assert_eq!((report.published, report.expired), (0, 2));
+    assert_eq!(store.model_step_backlog_len().unwrap(), 0);
+    assert!(rows(&store).is_empty());
+}

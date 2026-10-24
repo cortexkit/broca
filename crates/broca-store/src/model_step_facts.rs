@@ -13,6 +13,12 @@
 //! never derived twice. `fact_id` is the second guard: re-deriving a step always hits the same
 //! row and `INSERT OR IGNORE` keeps the first one.
 //!
+//! PACED BACKFILL. A step that finished before this writer's first start is history: its fact
+//! goes into `model_step_backlog` in that same transaction instead of `export_facts`, and
+//! [`SqliteStore::publish_model_step_backlog`] moves backlog rows into `export_facts` at no more
+//! than [`BACKFILL_ROWS_PER_WINDOW`] per [`BACKFILL_WINDOW_MS`]. A step that finished since is
+//! written straight to `export_facts`, so live steps never wait behind the backfill.
+//!
 //! NEVER SPEND. A step fact leaves the SQL `run_id` column EMPTY. The startup catch-up that finds
 //! terminal runs missing their session facts asks whether ANY row carries the run's id, so a
 //! step row filed under the run would hide a run whose billing facts were lost. The run id stays
@@ -37,6 +43,21 @@ const FACTS_PER_TRANSACTION: usize = 128;
 /// Records folded per transaction even when they hold no step, so a long stretch of other
 /// records still advances the checkpoint in bounded pieces.
 const RECORDS_PER_TRANSACTION: usize = 8192;
+
+/// The publishing cap astrocyte asked for: at most this many backlog rows in any window of
+/// [`BACKFILL_WINDOW_MS`]. Astrocyte reads `export_facts` in `export_seq` order one page per
+/// cycle, so an unpaced backfill would queue live session facts (spend) behind hours of history.
+pub const BACKFILL_ROWS_PER_WINDOW: u64 = 5_000;
+pub const BACKFILL_WINDOW_MS: u64 = 30_000;
+
+/// The pace: one backlog row per 6.25 ms on average, with a burst of at most
+/// [`PUBLISH_BURST`] rows at once. This is the generic cell rate algorithm: a row may be
+/// published at time t when t >= TAT - (BURST - 1) * INTERVAL, and each published row moves TAT
+/// (the theoretical arrival time) on by one INTERVAL. Any window of length L then holds at most
+/// floor((L + (BURST - 1) * INTERVAL) / INTERVAL) + 1 rows: for 30 s that is 4,800 + 128 = 4,928,
+/// under the 5,000 cap, and pinned by `the_backlog_never_publishes_more_than_the_cap_in_any_window`.
+pub const PUBLISH_INTERVAL_US: u64 = 6_250;
+pub const PUBLISH_BURST: u64 = 128;
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
@@ -67,6 +88,23 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          -- The sessions the current walk has yet to visit, by their run_index `session` JSON.
          -- Kept on disk rather than in memory, because a backfill can list every session the
          -- store knows; a visited session is deleted from it.
+         -- Backfilled step facts waiting to be published into export_facts at a capped rate
+         -- (see `publish_model_step_backlog`), in the order they were derived.
+         CREATE TABLE IF NOT EXISTS model_step_backlog (
+             seq          INTEGER PRIMARY KEY,
+             fact_id      TEXT NOT NULL UNIQUE,
+             segment_json TEXT NOT NULL,
+             basis_ms     INTEGER NOT NULL
+         );
+         -- One row, written once by the first start that runs the step-fact writer.
+         -- `backfill_before_ms`: steps that finished before it are history and go through the
+         -- backlog. `publish_tat_us`: the publishing pace's next theoretical publish time, kept
+         -- here so a restart continues the pace rather than starting a new burst.
+         CREATE TABLE IF NOT EXISTS model_step_meta (
+             id                 INTEGER PRIMARY KEY CHECK (id = 1),
+             backfill_before_ms INTEGER NOT NULL,
+             publish_tat_us     INTEGER NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS model_step_walk_queue (
              session TEXT PRIMARY KEY
          ) WITHOUT ROWID;",
@@ -92,8 +130,30 @@ pub struct StepProjectionReport {
     pub expired: u64,
     /// Steps of runs installed from another machine; that machine reports them.
     pub imported: u64,
+    /// History steps (finished before the first start of this writer) added to the backlog,
+    /// which publishes them into `export_facts` at a capped rate.
+    pub queued: u64,
     /// The checkpoint after the call; zero when nothing was projected.
     pub through_seq: u64,
+}
+
+/// What one [`SqliteStore::publish_model_step_backlog`] call did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BacklogPublishReport {
+    /// Rows moved into `export_facts`.
+    pub published: u64,
+    /// Rows dropped because their 30 days ended while they waited.
+    pub expired: u64,
+}
+
+/// How many backlog rows the pace allows at `now_us` given the stored theoretical arrival time:
+/// the largest n with now >= TAT + (n - 1) * INTERVAL - (BURST - 1) * INTERVAL, at most BURST.
+fn publishable_rows(tat_us: u64, now_us: u64) -> u64 {
+    let tolerance = (PUBLISH_BURST - 1) * PUBLISH_INTERVAL_US;
+    match (now_us + tolerance).checked_sub(tat_us) {
+        Some(slack) => (slack / PUBLISH_INTERVAL_US + 1).min(PUBLISH_BURST),
+        None => 0,
+    }
 }
 
 /// The persisted walk state; see `model_step_walk`.
@@ -141,6 +201,9 @@ pub struct ModelStepWriter<'a> {
     /// Records folded since the last commit.
     pending: usize,
     now_ms: u64,
+    /// See `model_step_meta.backfill_before_ms`; `None` before the writer's first start, when
+    /// every fact is published at once.
+    backfill_before_ms: Option<u64>,
     report: StepProjectionReport,
 }
 
@@ -191,6 +254,7 @@ impl ModelStepWriter<'_> {
             &self.fold,
             std::mem::take(&mut self.batch),
             self.now_ms,
+            self.backfill_before_ms,
             &mut self.report,
         )?;
         self.expected = Some(ModelStepCheckpoint {
@@ -298,7 +362,9 @@ impl SqliteStore {
             }
             _ => (0, ModelStepFold::default()),
         };
+        let backfill_before_ms = self.model_step_backfill_before()?;
         Ok(ModelStepWriter {
+            backfill_before_ms,
             store: self,
             session_json: serde_json::to_string(session)?,
             key,
@@ -330,6 +396,7 @@ impl SqliteStore {
         fold: &ModelStepFold,
         batch: Vec<FoldedStep>,
         now_ms: u64,
+        backfill_before_ms: Option<u64>,
         report: &mut StepProjectionReport,
     ) -> Result<(), StoreError> {
         let fold_json = serde_json::to_string(fold)?;
@@ -384,6 +451,26 @@ impl SqliteStore {
                 report.expired += 1;
                 continue;
             }
+            // HISTORY GOES THROUGH THE BACKLOG, whichever path derived it: a step that finished
+            // before this writer's first start (or carries no time at all) is backfill, and is
+            // published later at the capped rate. A step that finished since is live and is
+            // written now, so it never waits behind the backfill.
+            let history = backfill_before_ms
+                .is_some_and(|cutoff| step.age_basis_ms.is_none_or(|basis| basis < cutoff));
+            if history {
+                let queued = tx.execute(
+                    "INSERT OR IGNORE INTO model_step_backlog (fact_id, segment_json, basis_ms)
+                     SELECT ?1, ?2, ?3
+                      WHERE NOT EXISTS (SELECT 1 FROM export_facts WHERE fact_id=?1)",
+                    params![step.fact.fact_id, json, int(basis)?],
+                )?;
+                if queued == 0 {
+                    report.already_present += 1;
+                } else {
+                    report.queued += 1;
+                }
+                continue;
+            }
             // The SQL run_id column stays empty: see the module comment (never spend).
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO export_facts (fact_id, run_id, segment_json)
@@ -435,6 +522,133 @@ impl SqliteStore {
         }
         report.written += written;
         Ok(())
+    }
+
+    /// Record, once, when this writer first started: steps that finished before `now_ms` are
+    /// history from then on. Later calls keep the first value. Returns the value in force.
+    pub fn begin_model_step_backfill(&self, now_ms: u64) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO model_step_meta (id, backfill_before_ms, publish_tat_us)
+             VALUES (1, ?1, 0)",
+            [int(now_ms)?],
+        )?;
+        let before: i64 = conn.query_row(
+            "SELECT backfill_before_ms FROM model_step_meta WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(before.max(0) as u64)
+    }
+
+    fn model_step_backfill_before(&self) -> Result<Option<u64>, StoreError> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT backfill_before_ms FROM model_step_meta WHERE id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|before| before.max(0) as u64))
+    }
+
+    /// Backfilled step facts not yet published.
+    pub fn model_step_backlog_len(&self) -> Result<u64, StoreError> {
+        let count: i64 = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM model_step_backlog",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// Publish as many backlog rows into `export_facts` as the pace allows at `now_ms` (at most
+    /// [`PUBLISH_BURST`]), oldest first, in one short transaction that also moves the stored pace.
+    /// Call it often (the daemon calls it every 250 ms); a call the pace does not allow writes
+    /// nothing. A row past its 30 days is dropped rather than published, and does not count
+    /// against the pace.
+    pub fn publish_model_step_backlog(
+        &self,
+        now_ms: u64,
+    ) -> Result<BacklogPublishReport, StoreError> {
+        let mut report = BacklogPublishReport::default();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(tat_us) = tx
+            .query_row(
+                "SELECT publish_tat_us FROM model_step_meta WHERE id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(report);
+        };
+        let tat_us = tat_us.max(0) as u64;
+        let now_us = now_ms.saturating_mul(1000);
+        let allowed = publishable_rows(tat_us, now_us);
+        if allowed == 0 {
+            return Ok(report);
+        }
+        let due: Vec<(i64, String, String, i64)> = tx
+            .prepare(
+                "SELECT seq, fact_id, segment_json, basis_ms FROM model_step_backlog
+                  ORDER BY seq LIMIT ?1",
+            )?
+            .query_map([int(allowed)?], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (seq, fact_id, json, basis_ms) in due {
+            tx.execute("DELETE FROM model_step_backlog WHERE seq=?1", [seq])?;
+            let basis = basis_ms.max(0) as u64;
+            if model_step_expired(basis, now_ms) {
+                report.expired += 1;
+                continue;
+            }
+            // Empty SQL run_id, as for every step fact: see the module comment (never spend).
+            if tx.execute(
+                "INSERT OR IGNORE INTO export_facts (fact_id, run_id, segment_json)
+                 VALUES (?1, '', ?2)",
+                params![fact_id, json],
+            )? == 0
+            {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO export_fact_expiry (export_seq, expires_at_ms) VALUES (?1, ?2)",
+                params![tx.last_insert_rowid(), int(model_step_expires_at(basis))?],
+            )?;
+            report.published += 1;
+        }
+        let tat_us = tat_us
+            .max(now_us)
+            .saturating_add(report.published.saturating_mul(PUBLISH_INTERVAL_US));
+        tx.execute(
+            "UPDATE model_step_meta SET publish_tat_us=?1 WHERE id=1",
+            [int(tat_us)?],
+        )?;
+        let high_water: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(export_seq), 0) FROM export_facts",
+            [],
+            |row| row.get(0),
+        )?;
+        if report.published > 0 {
+            tx.execute(
+                "UPDATE export_meta SET high_water=?1 WHERE id=1",
+                [high_water],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+        if report.published > 0 {
+            self.export_high_water
+                .fetch_max(high_water.max(0) as u64, Ordering::Release);
+        }
+        Ok(report)
     }
 
     /// Delete at most `limit` model step facts whose lifetime ended at or before `now_ms`, in

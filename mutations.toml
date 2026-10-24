@@ -25622,7 +25622,10 @@ package = "broca-module-serve"
 target = "--lib"
 select = "expected"
 test_file = "crates/broca-module-serve/src/model_step_facts_tests.rs"
-expect_red = ["model_step_facts::tests::a_committed_step_reaches_the_export_on_the_pass_after_its_barrier"]
+expect_red = [
+    "model_step_facts::tests::a_committed_step_reaches_the_export_on_the_pass_after_its_barrier",
+    "model_step_facts::tests::a_live_step_is_never_held_behind_the_paced_backfill",
+]
 file = "crates/broca-module-serve/src/model_step_facts.rs"
 old = "        Arc::new(move |session, seq, _lineage| hints.note(session, seq))"
 new = "        Arc::new(move |session, seq, _lineage| { let _ = (&hints, session, seq); }) // NON-VACUITY BREAK: drop every durable-barrier hint."
@@ -25668,3 +25671,19 @@ old = """                 VALUES (?1, '', ?2)",
                 params![step.fact.fact_id, json],"""
 new = """                 VALUES (?1, ?3, ?2)",
                 params![step.fact.fact_id, json, step.fact.run_id], // NON-VACUITY BREAK: file the step fact under its run's id."""
+
+[[control]]
+id = "model-step-backfill-publishing-is-capped"
+guards = "Backfilled step facts are published at no more than 5,000 rows in any 30 s window, across a restart, so live session facts are never queued behind the backfill"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/model_step_facts_tests.rs"
+expect_red = [
+    "model_step_facts::tests::history_steps_wait_in_the_backlog_and_live_steps_are_written_at_once",
+    "model_step_facts::tests::the_backlog_never_publishes_more_than_the_cap_in_any_window",
+]
+file = "crates/broca-store/src/model_step_facts.rs"
+old = "    match (now_us + tolerance).checked_sub(tat_us) {"
+new = "    match (now_us + tolerance).checked_sub(0 * tat_us) { // NON-VACUITY BREAK: ignore the stored pace, publish a full burst every call."

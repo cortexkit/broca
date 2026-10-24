@@ -803,6 +803,20 @@ began, which covers a crash between a step becoming durable and its fact being w
 `model_step_projection`, `export_fact_expiry`, `model_step_walk` and `model_step_walk_queue` are
 internal bookkeeping.
 
+**Paced backfill.** Astrocyte reads `export_facts` in `export_seq` order, one page per cycle, so
+history is published at a capped rate rather than as fast as it is derived. The first start of a
+build with this writer records its start time in `model_step_meta.backfill_before_ms`. A step that
+finished before it (or has no recorded time) is history: whichever path derives it, its fact goes
+into `model_step_backlog` in the same transaction as the checkpoint, and every 250 ms the daemon
+moves the oldest backlog rows into `export_facts` at **no more than 5,000 rows in any 30 seconds**
+(a generic cell rate algorithm: one row per 6.25 ms with bursts of at most 128, so any 30 s window
+holds at most 4,928). The pace's state (`model_step_meta.publish_tat_us`) is updated in the same
+transaction as the rows it admits, so a restart continues the pace instead of starting a burst. A
+step that finished after that first start is live and is written to `export_facts` at once, never
+behind the backlog. At this rate the production backfill of about 1.67M steps takes about 2.9
+hours to publish; a backlog row whose 30 days end while it waits is dropped.
+`model_step_backlog` and `model_step_meta` are internal bookkeeping.
+
 **Expiry: the boundary between billing and diagnostics.** A model step fact is deleted 30 days
 after `finished_at_ms` (or, when the WAL recorded no attempt time, after its run's
 `run_started.ts_ms`, or after the time it was written when neither exists), at exactly that

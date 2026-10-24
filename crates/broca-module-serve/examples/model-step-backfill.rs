@@ -86,13 +86,25 @@ fn measure(root: &std::path::Path) -> Result<(), String> {
                 break;
             }
         }
-        stop.cancel();
-        let _ = service.await;
+        let backlog = store.model_step_backlog_len().map_err(|e| e.to_string())?;
         println!(
-            "walk finished in {} ms; after the walk: {}",
+            "walk finished in {} ms; backlog waiting to publish: {backlog}; {}",
             began.elapsed().as_millis(),
             memory()
         );
+        // Watch the capped publisher for a while to confirm its rate.
+        let watch = std::time::Duration::from_secs(120);
+        tokio::time::sleep(watch).await;
+        let after = store.model_step_backlog_len().map_err(|e| e.to_string())?;
+        let rate = (backlog - after) as f64 / watch.as_secs_f64();
+        println!(
+            "published {} backlog rows in {} s ({rate:.1} rows/s); {}",
+            backlog - after,
+            watch.as_secs(),
+            memory()
+        );
+        stop.cancel();
+        let _ = service.await;
         let conn =
             rusqlite::Connection::open(root.join("run-index.db")).map_err(|e| e.to_string())?;
         let mut statement = conn

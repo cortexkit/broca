@@ -226,7 +226,8 @@ async fn a_committed_step_reaches_the_export_on_the_pass_after_its_barrier() {
     let now = now_ms();
     let mut wal = rig.wal.open(&s).unwrap();
     wal.append(1, &started(&s, "run-live", now), true).unwrap();
-    wal.append(1, &attempt(1, now + 1), false).unwrap();
+    // Attempt times after the service's start, so these are live steps, not history.
+    wal.append(1, &attempt(1, now + 60_000), false).unwrap();
     wal.append(1, &step(1), true).unwrap();
     broca_test_support::wait_until("the first step fact after its barrier", || async {
         if step_ids(&rig.store).is_empty() {
@@ -241,7 +242,7 @@ async fn a_committed_step_reaches_the_export_on_the_pass_after_its_barrier() {
         [("live".to_string(), "run-live".to_string(), 1)]
     );
     // A step that is written but not yet behind a barrier is not a fact.
-    wal.append(1, &attempt(2, now + 2), false).unwrap();
+    wal.append(1, &attempt(2, now + 60_001), false).unwrap();
     wal.append(1, &step(2), false).unwrap();
     // Absence cannot be awaited as an event: give the service a few passes (it runs every
     // 250 ms) to show it would wrongly write the undurable step, then check it did not.
@@ -346,6 +347,51 @@ fn the_backfill_covers_thirty_days_resumes_after_a_restart_and_is_idempotent() {
             .collect::<Vec<_>>()
     };
     assert_eq!(bytes(&after), bytes(&before));
+}
+
+/// A live step's fact is written at its barrier while thousands of backfilled facts are still
+/// waiting for the capped publisher: live facts never queue behind the backfill.
+#[tokio::test]
+async fn a_live_step_is_never_held_behind_the_paced_backfill() {
+    let rig = rig("live-ahead");
+    let now = now_ms();
+    rig.store.begin_model_step_backfill(now).unwrap();
+    // 3,000 history steps, finished a day ago, go to the backlog.
+    let history = session("history");
+    write_run(&rig, &history, "run-history", now - DAY_MS, 3_000);
+    let Visit::Projected(report) =
+        project_session(&rig.store, &rig.wal, &history, now, None).unwrap()
+    else {
+        panic!("history not projected")
+    };
+    assert_eq!((report.written, report.queued), (0, 3_000));
+    let stop = CancellationToken::new();
+    let service = Service {
+        store: rig.store.clone(),
+        wal: rig.wal.clone(),
+        hints: rig.hints.clone(),
+        stop: stop.clone(),
+    }
+    .spawn();
+    let live = session("live");
+    let mut wal = rig.wal.open(&live).unwrap();
+    wal.append(1, &started(&live, "run-live", now), true)
+        .unwrap();
+    wal.append(1, &attempt(1, now + 60_000), false).unwrap();
+    wal.append(1, &step(1), true).unwrap();
+    broca_test_support::wait_until("the live step's fact", || async {
+        if step_ids(&rig.store).iter().any(|(s, _, _)| s == "live") {
+            Ok(())
+        } else {
+            Err("not yet written".to_string())
+        }
+    })
+    .await;
+    // The cap publishes about 160 rows a second, so most of the backlog is still waiting.
+    let waiting = rig.store.model_step_backlog_len().unwrap();
+    assert!(waiting > 1_000, "only {waiting} history rows left");
+    stop.cancel();
+    service.await.unwrap();
 }
 
 /// A checkpoint too far behind the WAL's end for a bounded tail read is continued by streaming

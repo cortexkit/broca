@@ -1,6 +1,6 @@
 //! Keeps `kind: "model_step"` facts in `export_facts` current, off the request path.
 //!
-//! Three jobs share one background loop:
+//! Four jobs share one background loop:
 //!
 //! - LIVE. Every successful WAL barrier reports its session's durable head (a hint, no record
 //!   bodies). Each pass projects the hinted sessions from their step-fact checkpoint up to that
@@ -11,12 +11,16 @@
 //!   the previous walk began, plus every run still active or paused, which covers a crash between
 //!   a step becoming durable and its fact being written. The walk is resumable (its place is kept
 //!   in `model_step_walk`) and runs in short slices between live passes.
+//! - PACED PUBLISHING. Steps that finished before the writer's first start are history: the
+//!   live projection and the walk both put their facts in the store's backlog, and each pass
+//!   publishes what the cap allows (at most 5,000 rows in any 30 s, astrocyte's request), so
+//!   live session facts are never queued behind hours of history. Live steps skip the backlog.
 //! - EXPIRY. A bounded sweep deletes model step facts 30 days after they finished. It never
 //!   touches session or System One facts.
 //!
-//! Every write is a short transaction on the shared store connection, and every WAL read is a
-//! tail read bounded by what the projection needs, so neither a long session nor the backfill
-//! holds the connection or the runtime for long.
+//! Every write is a short transaction on the shared store connection, and every WAL read is
+//! either a bounded tail or a one-record-at-a-time scan, so neither a long session nor the
+//! backfill holds the connection for long or grows the process with a WAL's size.
 
 use broca_core::model_step_fact::MODEL_STEP_FACT_RETENTION_MS;
 use broca_core::{FileWalStore, WalStore};
@@ -284,6 +288,8 @@ pub struct Walk {
     pub total: u64,
     pub visited: u64,
     pub written: u64,
+    /// History steps handed to the paced backlog rather than written at once.
+    pub queued: u64,
     pub expired: u64,
     pub failed: u64,
     began: Instant,
@@ -358,6 +364,7 @@ impl Walk {
             process_started_ms,
             visited: 0,
             written: 0,
+            queued: 0,
             expired: 0,
             failed: 0,
             began: Instant::now(),
@@ -415,6 +422,7 @@ impl Walk {
                 match project_session(store, wal, &session, now, None) {
                     Ok(Visit::Projected(report)) => {
                         self.written += report.written;
+                        self.queued += report.queued;
                         self.expired += report.expired;
                     }
                     Ok(Visit::Absent) => {}
@@ -477,6 +485,7 @@ impl Walk {
             visited = self.visited,
             total = self.total,
             written = self.written,
+            queued_for_paced_publishing = self.queued,
             older_than_30_days = self.expired,
             failed = self.failed,
             elapsed_ms = self.began.elapsed().as_millis() as u64,
@@ -500,6 +509,45 @@ pub fn sweep_expired(store: &SqliteStore, now: u64) -> Result<u64, String> {
     Ok(deleted)
 }
 
+/// Counts what the paced publisher did and logs it every [`PROGRESS_EVERY`] while it works.
+#[derive(Default)]
+struct PublishProgress {
+    published: u64,
+    expired: u64,
+    logged: Option<Instant>,
+}
+
+impl PublishProgress {
+    async fn record(
+        &mut self,
+        store: &Arc<SqliteStore>,
+        report: broca_store::model_step_facts::BacklogPublishReport,
+    ) {
+        self.published += report.published;
+        self.expired += report.expired;
+        let moved = report.published + report.expired > 0;
+        if !moved || self.logged.is_some_and(|at| at.elapsed() < PROGRESS_EVERY) {
+            return;
+        }
+        self.logged = Some(Instant::now());
+        let s = store.clone();
+        let remaining =
+            broca_diagnostics::spawn_blocking(broca_diagnostics::JobKind::StoreRead, move || {
+                s.model_step_backlog_len()
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+        tracing::info!(
+            target: "export",
+            published = self.published,
+            older_than_30_days = self.expired,
+            remaining,
+            "model step backfill publishing at its capped rate"
+        );
+    }
+}
+
 pub struct Service {
     pub store: Arc<SqliteStore>,
     pub wal: Arc<FileWalStore>,
@@ -521,16 +569,36 @@ impl Service {
             let mut walk_requested = true;
             let mut retry: HashMap<BindIdentity, (u64, u32)> = HashMap::new();
             let mut sweep_at = tokio::time::Instant::now();
+            // Whether the history cutoff is recorded. Until it is, nothing is projected: a fact
+            // written before it would skip the paced backlog.
+            let mut backfill_ready = false;
+            let mut publishing = PublishProgress::default();
             let mut tick = tokio::time::interval(Duration::from_millis(250));
             loop {
                 tokio::select! {_ = stop.cancelled() => break, _ = tick.tick() => {}}
                 let now = now_ms();
+                if !backfill_ready {
+                    let s = store.clone();
+                    match broca_diagnostics::spawn_blocking(
+                        broca_diagnostics::JobKind::StoreWrite,
+                        move || s.begin_model_step_backfill(process_started),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => backfill_ready = true,
+                        _ => {
+                            tracing::warn!(target: "export", "could not record the model step backfill cutoff; retrying");
+                            continue;
+                        }
+                    }
+                }
                 let (mut heads, overflow) = hints.take();
                 walk_requested |= overflow;
                 for (session, (head, _)) in retry.iter() {
                     let entry = heads.entry(session.clone()).or_insert(*head);
                     *entry = (*entry).max(*head);
                 }
+                // Live steps first, unpaced: they never wait behind the backfill below.
                 for (session, head) in heads {
                     let tries = retry.remove(&session).map_or(0, |(_, tries)| tries) + 1;
                     let (s, w, visit) = (store.clone(), wal.clone(), session.clone());
@@ -585,6 +653,20 @@ impl Service {
                         // The slice's task died with the walk it owned; its place is stored.
                         Err(_) => walk_requested = true,
                     }
+                }
+                // Then the paced backfill: publish what the cap allows now.
+                let s = store.clone();
+                match broca_diagnostics::spawn_blocking(
+                    broca_diagnostics::JobKind::StoreWrite,
+                    move || s.publish_model_step_backlog(now),
+                )
+                .await
+                {
+                    Ok(Ok(report)) => publishing.record(&store, report).await,
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "export", %error, "could not publish backfilled model step facts; retrying")
+                    }
+                    Err(_) => {}
                 }
                 if tokio::time::Instant::now() >= sweep_at {
                     sweep_at = tokio::time::Instant::now() + EXPIRY_INTERVAL;
