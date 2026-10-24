@@ -259,6 +259,83 @@ async fn tagged_open_tool_turn_read_bytes_are_pinned() {
     rig.finish().await;
 }
 
+/// A read held between a tool turn's write and its batch commit (the tool provider holds the
+/// call) exposes the turn's text. llm-runner §9.6 lets an exposed part change its number only
+/// on a new lineage, so the number that read shows must be the one the finished run shows: an
+/// unnumbered row there, numbered after commit, is a renumbering on the same lineage.
+#[tokio::test]
+async fn a_held_tool_turns_text_keeps_the_number_a_read_exposed() {
+    let (mut rig, _) = crate::plan_admission::plan_rig("held-turn-text-number").await;
+    rig.script.push(&[
+        Step::Usage {
+            content: vec![
+                ContentBlock::Text {
+                    text: "checking".into(),
+                },
+                ContentBlock::ToolCall(broca_protocol::ToolCall {
+                    tool_call_id: broca_protocol::ToolCallId("call-held".into()),
+                    tool_name: "work".into(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                }),
+            ],
+            usage: Default::default(),
+        },
+        Step::Text("answer"),
+    ]);
+    rig.script.hold_tool(true);
+    let composition = serde_json::json!({"providers": [{"provider": WORK_MODULE, "tools": [
+        {"name": "work", "capabilities": []}
+    ]}], "step_transform_items": []});
+    let plan = serde_json::json!({
+        "tool_items": [{"provider": WORK_MODULE, "preset": "head", "params": {}}],
+        "system_text_items": [], "step_transform_items": [], "render_tags": true,
+        "composition_digest": cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+        "composition": composition,
+    });
+    rig.request(
+        7,
+        serde_json::json!({"method": "session.send", "params": {
+            "send_id": "held-text", "prompt": "hi", "model": {"provider": "fake", "model": "fake"},
+            "plan": plan,
+        }}),
+    )
+    .await;
+    // The tool provider now holds call-held: its dispatch intent is durable, its result is not.
+    rig.wait_entered().await;
+    assert!(!rig.records().iter().any(|record| matches!(record,
+        broca_wal::WalRecord::ToolResult { result, .. } if result.tool_call_id.0 == "call-held")));
+
+    let held = rig
+        .request(
+            7,
+            serde_json::json!({"method": "session.read", "params": {}}),
+        )
+        .await;
+    let held = result(&held).clone();
+    let expected = serde_json::json!([{"part": "m1#0", "tag": "§2§"}, {"part": "m1#1"}]);
+    assert_eq!(
+        held["messages"][1]["tags"], expected,
+        "the held turn's text shows its final number: {held}"
+    );
+
+    rig.script.hold_tool(false);
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let after = rig
+        .request(
+            7,
+            serde_json::json!({"method": "session.read", "params": {}}),
+        )
+        .await;
+    let after = result(&after).clone();
+    assert_eq!(after["lineage_id"], held["lineage_id"]);
+    assert_eq!(
+        after["messages"][1]["tags"], held["messages"][1]["tags"],
+        "a number a read exposed is unchanged on the same lineage"
+    );
+    rig.finish().await;
+}
 // ---- helpers ------------------------------------------------------------------------------
 
 /// Keep the captured frame template, substituting only this run's two WAL observations.

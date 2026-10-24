@@ -272,6 +272,25 @@ impl TagNumbering {
         self.numbered = held;
     }
 
+    /// Number `message` as the next message after everything numbered so far, without
+    /// counting it as numbered. A read exposes a tool turn whose results have not committed
+    /// yet; when they commit, the turn is appended right after the numbered prompt and gets
+    /// exactly these numbers. A part a read has exposed may not change its number within a
+    /// lineage (llm-runner §9.6), so the read must show the final number now rather than none.
+    /// A message that already holds numbers (written under the stored-ledger rules) keeps them.
+    pub fn number_pending(
+        &self,
+        message: &mut broca_protocol::Message,
+    ) -> Result<(), broca_protocol::tags::NumberingOverflow> {
+        match (message.part_tags(), self.rules) {
+            (None, Some(rules)) => {
+                let mut high = self.high;
+                broca_protocol::tags::number_message(message, rules, &mut high)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Number the messages appended to `prompt` since the last call. Refused, with nothing
     /// renumbered, when the numbers would pass `u64::MAX`.
     pub fn number_new(
