@@ -27095,7 +27095,7 @@ select = "expected"
 test_file = "crates/broca-core/src/media_store/tests.rs"
 expect_red = ["media_store::tests::partial_manifest_write_cannot_swallow_a_later_registration"]
 file = "crates/broca-core/src/media_store.rs"
-old = "        recover_torn_tail(&mut self.file)?;"
+old = "        recover_torn_tail(&mut self.file, &self.path)?;"
 new = "        // NON-VACUITY BREAK: append a retry directly after a torn digest."
 
 [[control]]
@@ -27279,3 +27279,17 @@ expect_red = ["conformance::model_history::projected_episode_metadata_equals_a_f
 file = "crates/broca-store/src/lib.rs"
 old = "             episode_metadata_json=?4, episode_metadata_seq=?5 WHERE session=?1"
 new = "             episode_metadata_json=NULL, episode_metadata_seq=?5 WHERE session=?1"
+
+[[control]]
+id = "media-store-windows-tail-repair-uses-write-handle"
+guards = "Windows torn-tail recovery truncates through a writable handle while normal manifest writes retain append semantics"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/tests.rs"
+expect_red = ["media_store::tests::partial_manifest_write_cannot_swallow_a_later_registration"]
+platforms = ["windows"]
+file = "crates/broca-core/src/media_store.rs"
+old = "        let repair = broca_owner_only::OpenOptions::new()\n            .write(true)\n            .open(path)?;"
+new = "        let repair = broca_owner_only::OpenOptions::new()\n            .append(true) // NON-VACUITY BREAK: append access cannot truncate on Windows.\n            .open(path)?;"
