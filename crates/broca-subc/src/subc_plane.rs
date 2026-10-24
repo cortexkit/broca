@@ -47,8 +47,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::{
     retry_route_open, retry_route_open_with_scope_hold, route_failure_is_known_dead, ConnError,
-    RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
-    ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL,
+    GateTarget, ModuleGate, RouteHandle, RouteOpenError, RouteOpenRetry, ScopeHold, SubcConnection,
+    ROUTE_OPEN_RETRY_DEADLINE, ROUTE_OPEN_RETRY_INTERVAL, ROUTE_OPEN_RETRY_MAX_INTERVAL,
 };
 use crate::scope_describe::{DescribedScope, ScopeDescriber};
 use crate::tool_deadline::tool_reply_deadline;
@@ -181,7 +181,7 @@ fn same_agent(a: &ScopeStamp, b: &ScopeStamp) -> bool {
 }
 
 /// How long a route open keeps retrying a temporary refusal, and how widely it spaces the
-/// attempts. The default is exactly the behaviour before this type existed.
+/// attempts. The default matches [`RouteOpenRetry::default_patience`].
 #[derive(Clone, Copy, Debug)]
 struct RouteOpenPatience {
     deadline: Duration,
@@ -190,7 +190,7 @@ struct RouteOpenPatience {
 
 const DEFAULT_ROUTE_OPEN_PATIENCE: RouteOpenPatience = RouteOpenPatience {
     deadline: ROUTE_OPEN_RETRY_DEADLINE,
-    max_interval: ROUTE_OPEN_RETRY_INTERVAL,
+    max_interval: ROUTE_OPEN_RETRY_MAX_INTERVAL,
 };
 
 /// subc's per-route credit window for a declared concurrency class.
@@ -426,6 +426,13 @@ trait ToolPlaneConnection: Send + Sync {
 
     /// Whether `route` is still open (no GOODBYE has closed it and its connection is current).
     fn route_is_open(&self, route: &RouteHandle) -> bool;
+
+    /// The availability gate of `module_id`'s tool routes, shared by every tool route open to
+    /// that module on this connection (see [`ModuleGate`]). Test fakes have none unless a test
+    /// supplies one.
+    fn module_gate(&self, _module_id: &str) -> Option<Arc<ModuleGate>> {
+        None
+    }
 }
 
 #[async_trait]
@@ -497,6 +504,14 @@ impl ToolPlaneConnection for SubcConnection {
 
     fn route_is_open(&self, route: &RouteHandle) -> bool {
         SubcConnection::route_is_open(self, route)
+    }
+
+    fn module_gate(&self, module_id: &str) -> Option<Arc<ModuleGate>> {
+        // The plane opens only tool routes.
+        Some(SubcConnection::module_gate(
+            self,
+            &GateTarget::tool_provider(module_id),
+        ))
     }
 
     async fn route_close(&self, route: &RouteHandle) -> Result<(), ConnError> {
@@ -1542,24 +1557,26 @@ impl SubcToolPlane {
     ) -> Result<(RouteHandle, Option<ScopeStamp>), RouteEnsureError> {
         // One computed deadline keeps the caller budget authoritative while retaining a short
         // per-iteration cap. Using either bound alone would either overshoot a short warm timeout
-        // or let a long timeout turn the flat retry interval into a route.open storm before the
-        // outer exponential backoff can resume.
+        // or let a long timeout keep a module that is down under retry long after the outer
+        // exponential backoff should have taken over.
         let cap = Instant::now() + patience.deadline;
         let deadline = retry_deadline.map_or(cap, |caller| caller.min(cap));
         // The retry loop is the connection layer's, shared with every other route-open
-        // consumer; this plane supplies only the policy. Under DEFAULT_ROUTE_OPEN_PATIENCE the
-        // maximum wait equals the initial 100ms wait, so the interval never grows.
+        // consumer; this plane supplies only the policy. Every attempt also passes the module's
+        // availability gate, so the opens of all sessions and scopes to one module that is down
+        // make one probe per backoff tick between them.
         let retry = || RouteOpenRetry {
             budget: deadline.saturating_duration_since(Instant::now()),
             max_interval: patience.max_interval,
         };
+        let gate_for = || self.conn.module_gate(module_id);
         let cancelled = || {
             RouteEnsureError::Plane(ToolPlaneError::Unavailable(
                 "session closed during route open".into(),
             ))
         };
         let Some(scope) = scope else {
-            return retry_route_open(retry(), Some(lifecycle), || {
+            return retry_route_open(retry(), Some(lifecycle), gate_for, || {
                 self.conn.route_open(module_id, bind, None)
             })
             .await
@@ -1611,18 +1628,21 @@ impl SubcToolPlane {
                     ))
                 }
             };
-            let handle =
-                retry_route_open_with_scope_hold(retry(), Some(hold), Some(lifecycle), || {
-                    self.conn.route_open(module_id, bind, Some(&selector))
-                })
-                .await
-                .map_err(|error| match error {
-                    RouteOpenError::Conn(ConnError::Rejected(message)) => {
-                        scoped_open_refusal(message, self.scope_sync_hold)
-                    }
-                    RouteOpenError::Conn(error) => RouteEnsureError::Connection(error),
-                    RouteOpenError::Cancelled => cancelled(),
-                })?;
+            let handle = retry_route_open_with_scope_hold(
+                retry(),
+                Some(hold),
+                Some(lifecycle),
+                gate_for,
+                || self.conn.route_open(module_id, bind, Some(&selector)),
+            )
+            .await
+            .map_err(|error| match error {
+                RouteOpenError::Conn(ConnError::Rejected(message)) => {
+                    scoped_open_refusal(message, self.scope_sync_hold)
+                }
+                RouteOpenError::Conn(error) => RouteEnsureError::Connection(error),
+                RouteOpenError::Cancelled => cancelled(),
+            })?;
             match self.read_scope(scope, lifecycle, true).await {
                 ScopeReading::Live(after) if may_resend_under(&before, &after) => {
                     return Ok((handle, Some(after)));
@@ -1680,13 +1700,20 @@ impl SubcToolPlane {
             )));
         }
         // Deliberately no in-flight placeholder: two concurrent misses on one key both open
-        // a route, and `cache_route_state` keeps one and closes the loser. The wasteful case
-        // is the detached warm bind racing the first tool dispatch, and dispatch cannot reach
-        // here until a whole model response has completed -- measured across 152 tool-bearing
-        // production runs, the fastest first response was 3.3s and the median 103s, against a
-        // route open that finishes far sooner. A singleflight would coalesce a window this
-        // deployment does not enter, at the cost of an in-flight state that has to be unwound
-        // correctly on failure, lifecycle cancellation, and epoch replacement.
+        // a route, and `cache_route_state` keeps one and closes the loser.
+        //
+        // A per-route single-flight was tried here and removed. When a module is DOWN, every
+        // tool call in flight misses at once, and with each running its own retry loop one
+        // broca connection sent about 80 route.open a second to a module stopped for a minute
+        // (other clients: about 5). Sharing one open per key looked like the fix, but handing
+        // one route to several calls meant one call's cleanup (a scope bracket that did not
+        // confirm, a cancelled session) could close the route another call had just cached,
+        // and the shared outcome had to survive until every waiter had read it. The storm is
+        // fixed below this point instead: every open to a module passes that module's
+        // availability gate (`ModuleGate`), which lets one probe through per backoff tick while
+        // the module is down, whatever route each waiter wants. When the module returns, each
+        // waiting call makes one open of its own: a bounded burst, after which this cache keeps
+        // one route per key as before.
         if let Some(r) = self.routes.lock().unwrap().get(&key) {
             return Ok((r.handle, Arc::clone(&r.sem)));
         }
@@ -2338,6 +2365,7 @@ impl ToolPlane for SubcToolPlane {
                 max_interval: SCOPE_SYNC_HOLD_MAX_INTERVAL,
             }),
             Some(&lifecycle),
+            || self.conn.module_gate(&module),
             || self.conn.route_open(&module, &ctx.bind, Some(&selector)),
         )
         .await
@@ -6702,5 +6730,150 @@ mod approved_queue_contract_tests {
             tokio::task::yield_now().await;
             assert!(module.take_written_for_test().is_empty());
         }
+    }
+}
+
+/// The tool plane's route opens against a module that is down: the opens of every session to
+/// that module are paced by the module's availability gate.
+#[cfg(test)]
+mod module_gate_tests {
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    use super::*;
+
+    /// A daemon whose one module is stopped until `up_at`: every route.open before then is
+    /// refused `target_unavailable`, every one after opens a fresh route. Each open takes 5 ms,
+    /// so opens started together are really in flight together.
+    struct StoppedModuleConnection {
+        up_at: Instant,
+        /// When each route.open started, and for which session.
+        attempts: Mutex<Vec<(Instant, String)>>,
+        next_channel: AtomicU16,
+        gate: Arc<ModuleGate>,
+    }
+
+    #[async_trait]
+    impl ToolPlaneConnection for StoppedModuleConnection {
+        async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
+            Ok(Vec::new())
+        }
+
+        async fn route_open(
+            &self,
+            _module_id: &str,
+            identity: &BindIdentity,
+            _scope: Option<&ScopeSelector>,
+        ) -> Result<RouteHandle, ConnError> {
+            let now = Instant::now();
+            self.attempts
+                .lock()
+                .unwrap()
+                .push((now, identity.session.clone()));
+            sleep(Duration::from_millis(5)).await;
+            if now >= self.up_at {
+                Ok(RouteHandle::synthetic(
+                    self.next_channel.fetch_add(1, Ordering::SeqCst),
+                ))
+            } else {
+                let body = serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                    subc_protocol::error_codes::TARGET_UNAVAILABLE,
+                    "supervised_not_registered".to_owned(),
+                ))
+                .unwrap();
+                Err(ConnError::Rejected(crate::connection::decode_error_body(
+                    &body,
+                )))
+            }
+        }
+
+        async fn route_close(&self, _route: &RouteHandle) -> Result<(), ConnError> {
+            Ok(())
+        }
+
+        async fn tool_call(
+            &self,
+            _route: &RouteHandle,
+            _name: &str,
+            _arguments: &serde_json::Value,
+            _tool_call_id: Option<&str>,
+            _deadline: Duration,
+            _preset: Option<&str>,
+        ) -> Result<serde_json::Value, ConnError> {
+            unreachable!("these tests only open routes")
+        }
+
+        async fn server_capabilities(&self) -> Result<Vec<String>, ConnError> {
+            Ok(Vec::new())
+        }
+
+        fn route_is_open(&self, _route: &RouteHandle) -> bool {
+            true
+        }
+
+        fn module_gate(&self, _module_id: &str) -> Option<Arc<ModuleGate>> {
+            Some(Arc::clone(&self.gate))
+        }
+    }
+
+    /// Fifty sessions, so fifty different routes, to one module stopped for ten seconds. All
+    /// fifty try once at the start, before any refusal is back; after that the module sees one
+    /// route.open per backoff tick in total, through its gate, rather than one per session.
+    /// Every session's route opens once the module is back.
+    #[tokio::test(start_paused = true)]
+    async fn fifty_routes_to_a_stopped_module_are_paced_by_its_gate() {
+        let start = Instant::now();
+        let up_at = start + Duration::from_secs(10);
+        let conn = Arc::new(StoppedModuleConnection {
+            up_at,
+            attempts: Mutex::new(Vec::new()),
+            next_channel: AtomicU16::new(1),
+            // No jitter, so the probe schedule is exact.
+            gate: Arc::new(ModuleGate::with_jitter(
+                |envelope| envelope,
+                CancellationToken::new(),
+            )),
+        });
+        let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+        let lifecycle = CancellationToken::new();
+        let binds: Vec<BindIdentity> = (0..50)
+            .map(|n| BindIdentity::new("/project", "harness", format!("worker-{n}")))
+            .collect();
+        let patience = RouteOpenPatience {
+            deadline: Duration::from_secs(30),
+            max_interval: ROUTE_OPEN_RETRY_MAX_INTERVAL,
+        };
+        let results = join_all(binds.iter().map(|bind| {
+            plane.ensure_route_for_lifecycle_inner(bind, None, "aft", &lifecycle, None, patience)
+        }))
+        .await;
+        let attempts = conn.attempts.lock().unwrap().clone();
+        let first_round = attempts.iter().filter(|(at, _)| *at == start).count();
+        let while_down = attempts
+            .iter()
+            .filter(|(at, _)| *at > start && *at < up_at)
+            .count();
+        assert_eq!(
+            first_round, 50,
+            "each session tries once before anything is known"
+        );
+        assert!(
+            while_down <= 8,
+            "while the module is down, fifty routes must make about one route.open per tick \
+             between them (100 ms doubling to 5 s gives 6 in ten seconds), got {while_down}"
+        );
+        let after_return: BTreeSet<&str> = attempts
+            .iter()
+            .filter(|(at, _)| *at >= up_at)
+            .map(|(_, session)| session.as_str())
+            .collect();
+        assert_eq!(after_return.len(), 50, "each session opens its own route");
+        let channels: BTreeSet<u16> = results
+            .into_iter()
+            .map(|result| match result {
+                Ok((handle, _)) => handle.channel,
+                Err(error) => panic!("the route must open: {}", error.into_plane()),
+            })
+            .collect();
+        assert_eq!(channels.len(), 50);
     }
 }
