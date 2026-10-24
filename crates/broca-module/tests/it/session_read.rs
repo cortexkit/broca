@@ -30,6 +30,8 @@ use tokio::sync::{mpsc, Mutex};
 mod attribution;
 #[path = "session_read/run_usage.rs"]
 mod run_usage;
+#[path = "session_read/tags.rs"]
+mod tags;
 #[path = "session_read/wal_cost.rs"]
 mod wal_cost;
 

@@ -1098,8 +1098,8 @@ pub struct SessionReadMessage {
     /// each call's dispatch. Absent on a message with no tool call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<SessionReadToolCall>,
-    /// The message's runner tags: one row per tagged part, in block order. Absent on a message
-    /// of a session admitted before tags existed.
+    /// One row per exposed part, in block order. A row has a number only when that part has
+    /// been counted by a tag-rendering session; legacy and not-yet-counted parts still have keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<SessionReadTag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1349,26 +1349,26 @@ fn serialize_run_attribution<S: serde::Serializer>(
 
 pub use cortexkit_role_llm_runner::tags::PartTag as SessionReadTag;
 
-/// The tag rows of `message`, the transcript message at `ordinal`; empty when it has no tags.
+/// One row per exposed part, in content order. A message can be read before its parts are
+/// counted, so missing ledger entries omit only the number, never the stable part key.
 pub fn tag_rows(ordinal: u64, message: &broca_protocol::Message) -> Vec<SessionReadTag> {
     message
-        .part_tags()
-        .map(|tags| {
-            tags.parts
-                .iter()
-                .enumerate()
-                .map(|(index, tag)| {
-                    let part = broca_protocol::tags::part_key(ordinal, index);
-                    match tag {
-                        Some(tag) => {
-                            SessionReadTag::tagged(part, broca_protocol::tags::tag_mark(*tag))
-                        }
-                        None => SessionReadTag::untagged(part),
-                    }
-                })
-                .collect()
+        .content
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let part = broca_protocol::tags::part_key(ordinal, index);
+            match message
+                .part_tags()
+                .and_then(|tags| tags.parts.get(index))
+                .copied()
+                .flatten()
+            {
+                Some(tag) => SessionReadTag::tagged(part, broca_protocol::tags::tag_mark(tag)),
+                None => SessionReadTag::untagged(part),
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The lineage state returned beside a `session.read` page.
@@ -5730,9 +5730,8 @@ mod caller_message_tests {
         assert_eq!(serde_json::to_value(&again).unwrap(), inline);
     }
 
-    /// A read entry carries one tag row per tagged part, after `tool_calls`; the message
-    /// itself keeps the exact bytes it had before tags existed, and an untagged entry has no
-    /// `tags` member at all.
+    /// Part rows sit beside the unchanged message. A complete ledger keeps its byte spelling;
+    /// a missing ledger still exposes the same keys without inventing numbers.
     #[test]
     fn tagged_entries_carry_part_tag_rows_beside_an_unchanged_message() {
         let content = vec![
@@ -5743,17 +5742,20 @@ mod caller_message_tests {
                 text: "second".into(),
             },
         ];
-        let plain = read_message(content.clone());
+        let mut plain = read_message(content.clone());
+        plain.tags = tag_rows(plain.ordinal, &plain.message);
         let mut tagged = read_message(content);
         tagged.message.set_tags(Some(std::sync::Arc::new(
             broca_protocol::tags::PartTags::all([7, 8]),
         )));
         tagged.tags = tag_rows(tagged.ordinal, &tagged.message);
-        assert!(tag_rows(plain.ordinal, &plain.message).is_empty());
 
         let plain_json = serde_json::to_value(&plain).unwrap();
         let tagged_json = serde_json::to_value(&tagged).unwrap();
-        assert!(plain_json.get("tags").is_none());
+        assert_eq!(
+            plain_json["tags"],
+            json!([{"part": "m3#0"}, {"part": "m3#1"}])
+        );
         assert_eq!(tagged_json["message"], plain_json["message"]);
         assert_eq!(
             serde_json::to_string(&tagged).unwrap(),
@@ -5761,6 +5763,36 @@ mod caller_message_tests {
         );
         let decoded: SessionReadMessage = serde_json::from_value(tagged_json).unwrap();
         assert_eq!(decoded.tags, tagged.tags);
+    }
+
+    #[test]
+    fn part_rows_cover_short_ledgers_without_using_surplus_numbers() {
+        let mut entry = read_message(vec![
+            ContentBlock::Text {
+                text: "first".into(),
+            },
+            ContentBlock::Text {
+                text: "second".into(),
+            },
+        ]);
+        for (parts, expected) in [
+            (
+                vec![Some(7)],
+                json!([{"part": "m3#0", "tag": "§7§"}, {"part": "m3#1"}]),
+            ),
+            (
+                vec![Some(7), None, Some(9)],
+                json!([{"part": "m3#0", "tag": "§7§"}, {"part": "m3#1"}]),
+            ),
+        ] {
+            entry.message.set_tags(Some(std::sync::Arc::new(
+                broca_protocol::tags::PartTags::new(parts),
+            )));
+            assert_eq!(
+                serde_json::to_value(tag_rows(entry.ordinal, &entry.message)).unwrap(),
+                expected
+            );
+        }
     }
 
     /// A caller reads the transcript's text, never the provider bytes kept to send back. A

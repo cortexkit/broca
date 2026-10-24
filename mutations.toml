@@ -9,6 +9,37 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "session-read-open-batch-part-rows"
+guards = "An exposed open assistant batch has an unnumbered tag row for every part before result commitment"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/tags.rs"
+expect_red = ["session_read::tags::open_batch_has_rows_before_results_commit"]
+expect_message = "every exposed part needs a tag row"
+file = "crates/broca-wire/src/lib.rs"
+old = "pub fn tag_rows(ordinal: u64, message: &broca_protocol::Message) -> Vec<SessionReadTag> {"
+new = """pub fn tag_rows(ordinal: u64, message: &broca_protocol::Message) -> Vec<SessionReadTag> {
+    if message.part_tags().is_none() { return Vec::new(); } // NON-VACUITY BREAK: hide exposed but uncounted parts."""
+
+[[control]]
+id = "session-read-open-committed-part-key-stability"
+guards = "A part exposed before batch commitment keeps exactly the same key after commitment and materialization"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/tags.rs"
+expect_red = ["session_read::tags::open_and_committed_rows_keep_the_same_part_keys"]
+expect_message = "part keys must survive batch commitment"
+file = "crates/broca-wire/src/lib.rs"
+old = """        .map(|(index, _)| {
+            let part = broca_protocol::tags::part_key(ordinal, index);"""
+new = """        .map(|(index, _)| {
+            let part = broca_protocol::tags::part_key(ordinal + u64::from(message.part_tags().is_none()), index); // NON-VACUITY BREAK: rekey uncounted parts."""
+
+[[control]]
 id = "core-admission-rejects-unidentified-checkpoint"
 guards = "An admission checkpoint with missing lineage cannot replace the authoritative full-WAL summary"
 runner = "cargo"
