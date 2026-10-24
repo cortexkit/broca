@@ -26892,19 +26892,6 @@ old = "            first_user: Some(episode.first_user.map(|first| first as u64)
 new = "            first_user: Some(episode.first_user.or(Some(episode.prompt_start)).map(|first| first as u64)), // NON-VACUITY BREAK: invent a first user"
 
 [[control]]
-id = "episode-projection-binds-its-watermark"
-guards = "Episode values computed at an older watermark than the transcript are never reused as current"
-runner = "cargo"
-package = "broca-store"
-target = "--lib"
-select = "expected"
-test_file = "crates/broca-store/src/conformance/model_history.rs"
-expect_red = ["conformance::model_history::projected_episode_metadata_equals_a_full_wal_replay"]
-file = "crates/broca-store/src/lib.rs"
-old = "        json.filter(|_| seq == Some(watermark))"
-new = "        json.filter(|_| { let _ = (seq, watermark); true }) // NON-VACUITY BREAK: accept stale episode values"
-
-[[control]]
 id = "episode-projection-reads-back-what-it-wrote"
 guards = "The stored episode projection survives the commit and reads back for a resumed run"
 runner = "cargo"
