@@ -25868,6 +25868,20 @@ old = "//! Capability-handle credential reads for foreground developer tools, no
 new = "//! Capability-handle credential reads for foreground developer tools, not the daemon.\n// NON-VACUITY BREAK: opencode/auth.json"
 
 [[control]]
+id = "daemon-no-legacy-vault-handles"
+guards = "Daemon startup and serving never resolve the retired vault-handles file; credentials are read by grant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/credential_source_guard.rs"
+expect_red = ["credential_source_guard::daemon_serve_path_never_resolves_a_vault_handles_file"]
+expect_message = "daemon serve path references legacy vault handles: main.rs"
+file = "crates/broca-module-serve/src/main.rs"
+old = "        let credential_ids =\n            broca_module_serve::VaultCredentialIds::load_default_path().map_err(ServeIoError)?;"
+new = "        let _legacy_path = broca_module_serve::config_home::config_file(\"BROCA_VAULT_HANDLES_PATH\", \"vault-handles.json\"); // NON-VACUITY BREAK\n        let credential_ids =\n            broca_module_serve::VaultCredentialIds::load_default_path().map_err(ServeIoError)?;"
+
+[[control]]
 id = "live-credential-read-requires-consent"
 guards = "Live credentials are never read before exact live-test consent"
 runner = "cargo"
