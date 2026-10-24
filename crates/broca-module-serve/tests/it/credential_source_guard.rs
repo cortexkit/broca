@@ -2,6 +2,36 @@
 
 use std::path::{Path, PathBuf};
 
+#[test]
+fn daemon_serve_path_never_resolves_a_vault_handles_file() {
+    // Read only named Rust sources, never a credential file. Startup and serving must use
+    // grant-backed credential IDs; the developer tools retain their separate handle loader.
+    for (path, source) in [
+        ("main.rs", include_str!("../../src/main.rs")),
+        ("serve.rs", include_str!("../../src/serve.rs")),
+        ("config_home.rs", include_str!("../../src/config_home.rs")),
+    ] {
+        for forbidden in ["BROCA_VAULT_HANDLES_PATH", "vault-handles.json"] {
+            assert!(
+                !source.contains(forbidden),
+                "daemon serve path references legacy vault handles: {path}: {forbidden}"
+            );
+        }
+    }
+    // The shared vault module documents the retired file and tests that dev-tools ignore its
+    // override. Check production string literals so those explanations are not mistaken for IO.
+    let vault_config = include_str!("../../src/vault_config.rs")
+        .split_once("\n#[cfg(test)]")
+        .expect("vault configuration unit-test boundary")
+        .0;
+    for forbidden in ["\"BROCA_VAULT_HANDLES_PATH\"", "\"vault-handles.json\""] {
+        assert!(
+            !vault_config.contains(forbidden),
+            "daemon serve path references legacy vault handles: vault_config.rs: {forbidden}"
+        );
+    }
+}
+
 fn source_files(dir: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read source directory") {
         let entry = entry.expect("read source entry");

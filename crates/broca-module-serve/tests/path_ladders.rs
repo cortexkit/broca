@@ -77,7 +77,6 @@ fn config_home_matches_shared_path_golden() {
         for (var, file) in [
             ("BROCA_CONFIG_PATH", "broca.jsonc"),
             ("BROCA_AUTH_METHODS_PATH", "auth-methods.json"),
-            ("BROCA_VAULT_HANDLES_PATH", "vault-handles.json"),
         ] {
             let file_expected = match &expected {
                 ConfigHome::Resolved { path, .. } => ConfigHome::Resolved {
