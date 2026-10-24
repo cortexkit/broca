@@ -96,6 +96,31 @@ pub struct BatchRecord {
     pub outcomes: Vec<StoredOutcome>,
 }
 
+/// A read-only snapshot of a batch and its stored outcomes. Looking it up neither claims the
+/// batch nor changes its state, so a re-sent call can be compared with what was recorded
+/// before anything is written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredBatch {
+    pub model: String,
+    /// The scope the batch was first admitted under. `None` for a row written before batches
+    /// recorded a scope; such a row matches no caller.
+    pub scope: Option<BatchScope>,
+    /// The role's body identity as JSON, as recorded at first admission.
+    pub identity: String,
+    /// The request digest recorded at first admission (the claim's `body_digest`). The
+    /// `llm.classify` tool records its `args_digest` here.
+    pub args_digest: String,
+    /// The catalog facts frozen at first admission, as JSON.
+    pub frozen_row: String,
+    pub ceiling_nanos: Option<u64>,
+    pub spent_nanos: u64,
+    /// The time the batch's seven-day retention runs from.
+    pub admitted_at_ms: i64,
+    /// Whether a call holds the batch right now.
+    pub running: bool,
+    pub outcomes: Vec<StoredOutcome>,
+}
+
 /// How a claim went.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Claimed {
@@ -263,8 +288,21 @@ impl SystemOneStore {
 
     /// Hold a batch for one call. See [`Claimed`] for the outcomes; only `Fresh` and `Resumed`
     /// write, and each in one transaction, so the tightened ceiling is durable before the call
-    /// sends anything.
+    /// sends anything. A fresh batch's retention runs from the claim's `now_ms`.
     pub fn claim(&self, claim: &BatchClaim<'_>) -> Result<Claimed> {
+        self.claim_admitted_at(claim, claim.now_ms)
+    }
+
+    /// [`Self::claim`], with a fresh batch's retention running from `admitted_at_ms` rather
+    /// than the claim time. A call admitted earlier and executed later (one held for the
+    /// person's consent, say) keeps one seven-day window for everything it stored, counted
+    /// from its first admission. A batch already recorded keeps the admission time it was
+    /// first recorded with.
+    pub fn claim_admitted_at(
+        &self,
+        claim: &BatchClaim<'_>,
+        admitted_at_ms: i64,
+    ) -> Result<Claimed> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
@@ -297,7 +335,7 @@ impl SystemOneStore {
                 "INSERT INTO batch (role, batch_id, model, identity, body_digest, frozen_row,
                                     ceiling_nanos, spent_nanos, state, owner, started_at_ms,
                                      admitted_at_ms, scope_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'running', ?8, ?9, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'running', ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     claim.role,
                     claim.batch_id,
@@ -308,6 +346,7 @@ impl SystemOneStore {
                     claim.ceiling_nanos.map(to_i64),
                     claim.owner,
                     claim.now_ms,
+                    admitted_at_ms,
                     scope_json,
                 ],
             )?;
@@ -575,6 +614,59 @@ impl SystemOneStore {
         read_outcomes(&conn, role, batch_id)
     }
 
+    /// A batch as recorded under `role`, with its outcomes, or `None` when there is none.
+    /// Reads only: the batch is not claimed and nothing is written.
+    pub fn lookup(&self, role: &str, batch_id: &str) -> Result<Option<StoredBatch>> {
+        let mut conn = self.lock();
+        // One read transaction, so the row and its outcomes come from the same moment even
+        // when another process shares the file.
+        let tx = conn.transaction()?;
+        let row = tx
+            .query_row(
+                "SELECT model, scope_json, identity, body_digest, frozen_row, ceiling_nanos,
+                        spent_nanos, admitted_at_ms, state
+                   FROM batch WHERE role = ?1 AND batch_id = ?2",
+                rusqlite::params![role, batch_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((model, scope, identity, digest, frozen_row, ceiling, spent, admitted, state)) =
+            row
+        else {
+            return Ok(None);
+        };
+        let scope = scope
+            .map(|json| serde_json::from_str::<BatchScope>(&json))
+            .transpose()
+            .map_err(|error| SystemOneStoreError(format!("a recorded batch scope: {error}")))?;
+        let outcomes = read_outcomes(&tx, role, batch_id)?;
+        tx.commit()?;
+        Ok(Some(StoredBatch {
+            model,
+            scope,
+            identity,
+            args_digest: digest,
+            frozen_row,
+            ceiling_nanos: to_u64(ceiling),
+            spent_nanos: to_u64(Some(spent)).unwrap_or(0),
+            admitted_at_ms: admitted,
+            running: state == "running",
+            outcomes,
+        }))
+    }
+
     /// The recorded ceiling and spend of a batch, when it is recorded.
     pub fn ledger(&self, role: &str, batch_id: &str) -> Result<Option<(Option<u64>, u64)>> {
         let conn = self.lock();
@@ -618,3 +710,119 @@ fn read_outcomes(conn: &Connection, role: &str, batch_id: &str) -> Result<Vec<St
 #[cfg(test)]
 #[path = "system_one_tests.rs"]
 mod tests;
+
+/// The read-only batch lookup and the anchored admission time.
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    fn scope(run_id: &str) -> BatchScope {
+        BatchScope::Run {
+            agent_id: "agent".into(),
+            run_id: run_id.into(),
+        }
+    }
+
+    fn claim<'a>(role: &'a str, scope: &'a BatchScope, now: i64) -> BatchClaim<'a> {
+        BatchClaim {
+            role,
+            batch_id: "d",
+            model: "typesafe/jev-1.13.0",
+            identity: r#"{"items":["x"]}"#,
+            body_digest: "digest-1",
+            frozen_row: r#"{"input_rate_nanos":42}"#,
+            scope,
+            ceiling_nanos: Some(7),
+            owner: "p",
+            now_ms: now,
+        }
+    }
+
+    #[test]
+    fn lookup_returns_the_recorded_batch_by_role_and_writes_nothing() {
+        let store = SystemOneStore::open_in_memory().unwrap();
+        assert_eq!(store.lookup("llm.classify", "d").unwrap(), None);
+        let run = scope("run");
+        assert_eq!(
+            store.claim(&claim("llm.classify", &run, 1_000)).unwrap(),
+            Claimed::Fresh
+        );
+        let outcome = StoredOutcome {
+            index: 0,
+            outcome: Outcome::Answered(r#"{"q":1}"#.into()),
+            input_tokens: Some(5),
+            output_tokens: None,
+        };
+        assert!(store
+            .record("llm.classify", "d", "p", &outcome, 3, 1_001)
+            .unwrap());
+        let running = store.lookup("llm.classify", "d").unwrap().unwrap();
+        assert!(running.running, "a held batch reads as running");
+        store.release("llm.classify", "d", "p").unwrap();
+
+        let found = store.lookup("llm.classify", "d").unwrap().unwrap();
+        assert_eq!(
+            found,
+            StoredBatch {
+                model: "typesafe/jev-1.13.0".into(),
+                scope: Some(run.clone()),
+                identity: r#"{"items":["x"]}"#.into(),
+                args_digest: "digest-1".into(),
+                frozen_row: r#"{"input_rate_nanos":42}"#.into(),
+                ceiling_nanos: Some(7),
+                spent_nanos: 3,
+                admitted_at_ms: 1_000,
+                running: false,
+                outcomes: vec![outcome],
+            }
+        );
+        assert_eq!(
+            store.lookup("classifier", "d").unwrap(),
+            None,
+            "the same batch id under another role is another batch"
+        );
+        // A lookup is not a claim: the batch stays free for the next caller.
+        assert_eq!(store.lookup("llm.classify", "d").unwrap(), Some(found));
+        assert!(matches!(
+            store.claim(&claim("llm.classify", &run, 2_000)).unwrap(),
+            Claimed::Resumed(_)
+        ));
+    }
+
+    #[test]
+    fn an_anchored_claim_dates_retention_from_the_supplied_admission() {
+        let store = SystemOneStore::open_in_memory().unwrap();
+        let run = scope("run");
+        let admitted = 10 * DAY_MS;
+        let executed = admitted + DAY_MS;
+        assert_eq!(
+            store
+                .claim_admitted_at(&claim("llm.classify", &run, executed), admitted)
+                .unwrap(),
+            Claimed::Fresh
+        );
+        store.release("llm.classify", "d", "p").unwrap();
+        let record = store.lookup("llm.classify", "d").unwrap().unwrap();
+        assert_eq!(record.admitted_at_ms, admitted);
+
+        // A later claim with another anchor keeps the first one.
+        let Claimed::Resumed(resumed) = store
+            .claim_admitted_at(&claim("llm.classify", &run, executed + 1), executed + 1)
+            .unwrap()
+        else {
+            panic!("expected the recorded batch");
+        };
+        assert_eq!(resumed.admitted_at_ms, admitted);
+        store.release("llm.classify", "d", "p").unwrap();
+
+        assert_eq!(store.sweep(admitted + RETENTION_MS - 1).unwrap().batches, 0);
+        assert_eq!(
+            store.sweep(admitted + RETENTION_MS).unwrap().batches,
+            1,
+            "retention runs from the supplied admission, not the later claim"
+        );
+        assert_eq!(store.lookup("llm.classify", "d").unwrap(), None);
+    }
+}

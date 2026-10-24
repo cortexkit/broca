@@ -28155,3 +28155,93 @@ expect_red = ["new_roles_are_sessionless_and_answer_only_unknown_method"]
 file = "crates/broca-module-serve/src/serve.rs"
 old = "                && !completed.bind.role.is_sessionless()"
 new = "                && completed.bind.role != RouteRole::Classifier // NON-VACUITY BREAK: read session history for new sessionless roles."
+
+[[control]]
+id = "system-one-tool-role-claims-its-own-batches"
+guards = "A System One service claims batches under its own store role, so an llm.classify tool call and a classifier/v1 batch sharing a batch_id never hold, replay or refuse each other"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/tests.rs"
+expect_red = [
+    "system_one::tests::a_tool_call_and_a_classifier_batch_with_one_batch_id_both_execute",
+    "system_one::tests::an_earlier_admission_anchors_the_batch_retention",
+]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "                    role: &role,"
+new = "                    role: super::STORE_ROLE, // NON-VACUITY BREAK: claim every batch under the classifier role."
+
+[[control]]
+id = "system-one-tool-role-releases-its-own-batches"
+guards = "A System One service releases its batch hold under its own store role, so a finished llm.classify call is replayed instead of refused batch_in_progress"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/tests.rs"
+expect_red = [
+    "system_one::tests::a_tool_call_and_a_classifier_batch_with_one_batch_id_both_execute",
+    "system_one::tests::an_earlier_admission_anchors_the_batch_retention",
+]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = """            let released = tokio::task::spawn_blocking(move || {
+                release_stored(&store, &role, &batch_id, &owner)"""
+new = """            let released = tokio::task::spawn_blocking(move || {
+                release_stored(&store, super::STORE_ROLE, &batch_id, &owner) // NON-VACUITY BREAK: release under the classifier role."""
+
+[[control]]
+id = "system-one-instances-own-their-call-slots"
+guards = "Each System One instance has its own process-call semaphore, so a stuck llm.classify tool call cannot block classifier/v1 calls"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/tests.rs"
+expect_red = ["system_one::tests::a_stuck_tool_call_leaves_classifier_calls_their_own_slots"]
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = "            call_slots: Arc::new(Semaphore::new(config.process_calls.max(1))),"
+new = "            call_slots: { static SHARED: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new(); Arc::clone(SHARED.get_or_init(|| Arc::new(Semaphore::new(config.process_calls.max(1))))) }, // NON-VACUITY BREAK: share one process-call semaphore across instances."
+
+[[control]]
+id = "system-one-instances-own-their-model-slots"
+guards = "Each System One instance has its own per-model semaphores, so a stuck llm.classify tool call cannot block classifier/v1 calls to the same model"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/tests.rs"
+expect_red = ["system_one::tests::a_stuck_tool_call_leaves_classifier_calls_their_own_slots"]
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = "        let mut slots = self.model_slots.lock().unwrap_or_else(|p| p.into_inner());"
+new = "        static SHARED: std::sync::OnceLock<Mutex<HashMap<String, Arc<Semaphore>>>> = std::sync::OnceLock::new(); let mut slots = SHARED.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner()); // NON-VACUITY BREAK: share per-model semaphores across instances."
+
+[[control]]
+id = "system-one-call-passes-its-admission-time"
+guards = "A System One call admitted earlier hands its admission time to the batch claim, so the batch's seven-day retention runs from that admission"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/tests.rs"
+expect_red = ["system_one::tests::an_earlier_admission_anchors_the_batch_retention"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "                admitted_at_ms.unwrap_or(now),"
+new = "                admitted_at_ms.map_or(now, |_| now), // NON-VACUITY BREAK: date retention from execution."
+
+[[control]]
+id = "system-one-store-anchors-retention-to-admission"
+guards = "A fresh batch claimed with a supplied admission time records that time, so its retention runs from the admission rather than the claim"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one.rs"
+expect_red = ["system_one::lookup_tests::an_anchored_claim_dates_retention_from_the_supplied_admission"]
+file = "crates/broca-store/src/system_one.rs"
+old = """                    claim.now_ms,
+                    admitted_at_ms,
+                    scope_json,"""
+new = """                    claim.now_ms,
+                    admitted_at_ms.max(claim.now_ms), // NON-VACUITY BREAK: date retention from the claim.
+                    scope_json,"""
