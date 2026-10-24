@@ -2710,24 +2710,11 @@ fn episode_history_metadata(
 /// ones, for a [`ProjectionSeed`]. An absent projection leaves both empty: the next write then
 /// cannot continue the open episode's metadata, and its own read falls back to the WAL until a
 /// complete projection restores it.
-fn projection_seed_episodes(
+fn episode_projection_from_tx(
     tx: &rusqlite::Transaction<'_>,
     key: &str,
-) -> rusqlite::Result<(
-    Option<broca_core::context::EpisodeRenderProjection>,
-    Vec<broca_core::context::EpisodeRenderProjection>,
-)> {
-    let stored = episode_projection_json(tx, key)?;
-    let Some(stored) = stored else {
-        return Ok((None, Vec::new()));
-    };
-    let Ok(mut episodes) =
-        serde_json::from_str::<Vec<broca_core::context::EpisodeRenderProjection>>(&stored)
-    else {
-        return Ok((None, Vec::new()));
-    };
-    let open = episodes.pop();
-    Ok((open, episodes))
+) -> rusqlite::Result<Option<Vec<broca_core::context::EpisodeRenderProjection>>> {
+    Ok(episode_projection_json(tx, key)?.and_then(|json| serde_json::from_str(&json).ok()))
 }
 
 /// The stored episode render projection, when it was computed at the row's current
@@ -2911,13 +2898,21 @@ fn projection_seed_from_complete_tx(
     let Some(deferred_calls_json) = deferred_calls_json else {
         return Ok(None);
     };
-    // The episode that is open at this seed's watermark, taken from the stored projection rather
-    // than from the span list: a later write must continue its first model step, not forget it.
-    let (open_episode, earlier_episodes) = projection_seed_episodes(tx, key)?;
+    // The episodes the stored projection holds, split into the one open at this watermark and
+    // the earlier ones: a later write continues the open episode and keeps the rest.
+    let projection_episodes = episode_projection_from_tx(tx, key)?;
+    let (open_episode, earlier_episodes) = projection_episodes
+        .clone()
+        .map(|mut episodes| {
+            let open = episodes.pop();
+            (open, episodes)
+        })
+        .unwrap_or_default();
     Ok(Some(ProjectionSeed {
         open_episode_span,
         open_episode,
         earlier_episodes,
+        projection_episodes,
         deferred_calls: serde_json::from_str(&deferred_calls_json)?,
         watermark_seq,
         anchor,

@@ -359,7 +359,7 @@ pub fn plan_projection(
         episode_spans,
         open_episode_span,
         episode_metadata,
-    ) = if let Some(seed) = seed.filter(|seed| {
+    ) = if let Some(seed) = seed.clone().filter(|seed| {
         // A seed stored before the ownership summary existed (or before it recorded the frozen
         // plan manifest) cannot carry it forward: the summary covers every episode, and the
         // seed's earlier ones are not in this tail.
@@ -408,7 +408,20 @@ pub fn plan_projection(
         let prefix_state = replay(&up_to)?;
         let (episode_spans, open_episode_span) =
             crate::replay::projected_episode_spans(&prefix_state, 0, None);
-        let episode_metadata = crate::replay::projected_episode_metadata(&prefix_state);
+        // The stored span list may start mid-episode, so the opened episode's start is the
+        // episode projection's, not the first span's. A store that never recorded one takes its
+        // coordinates from the seed's own open episode, whose start and frozen config are
+        // durable facts of the run that wrote this prefix.
+        let mut episode_metadata = crate::replay::projected_episode_metadata(&prefix_state);
+        if let (Some(seed), Some(open)) = (seed.as_ref(), episode_metadata.last_mut()) {
+            if seed.projection_episodes.is_none() {
+                if let Some(previous) = seed.open_episode.as_ref() {
+                    open.start = previous.start;
+                    open.first_user = previous.first_user;
+                    open.render_config = previous.render_config.clone();
+                }
+            }
+        }
         let admission_checkpoint = AdmissionCheckpointV1::from_frames(&up_to_frames)?;
         let last_run_id = admission_checkpoint
             .last_episode

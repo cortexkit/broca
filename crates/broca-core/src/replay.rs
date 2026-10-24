@@ -1040,6 +1040,9 @@ pub struct ProjectionSeed {
     /// so the successor projection would drop it (see `projected_open_episode`).
     pub open_episode: Option<crate::context::EpisodeRenderProjection>,
     pub earlier_episodes: Vec<crate::context::EpisodeRenderProjection>,
+    /// Every episode the projection holds, when it computed them and its reader may reuse any.
+    /// `None` while they are absent or superseded, which is when a projection refills them.
+    pub projection_episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
     pub watermark_seq: u64,
     pub anchor: Option<WalByteAnchor>,
     pub prefix_len: u64,
@@ -1063,6 +1066,7 @@ impl ProjectionSeed {
             open_episode_span: None,
             open_episode: None,
             earlier_episodes: Vec::new(),
+            projection_episodes: None,
             watermark_seq: 0,
             anchor: None,
             prefix_len: 0,
@@ -1215,6 +1219,10 @@ pub fn replay_projection_tail(
     // it and the tail's own ordinals are already the projection's.
     let open_episode = if truncate_prefix_to.is_some() {
         projected_episode_metadata(&tail_state).pop()
+    } else if seed.projection_episodes.is_none() {
+        // A projection with no reusable episode list cannot be continued from this tail, and
+        // the store fills the whole list from the records it holds at its next write.
+        None
     } else {
         projected_open_episode(&tail_state, seed.prefix_len, seed.open_episode.clone())
     };
@@ -3320,6 +3328,7 @@ pub(crate) mod projection_boundary_tests {
             unreachable!("fixture starts a run")
         };
         ProjectionSeed {
+            projection_episodes: None,
             open_episode_span: Some(1),
             open_episode: None,
             earlier_episodes: Vec::new(),

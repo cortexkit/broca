@@ -1466,7 +1466,7 @@ where
     // An applied view can leave the resumed prompt without the episode coordinates of earlier
     // episodes, which ChatGPT effort updates and per-episode repetition guidance render from.
     // The store projects them, so take them from there instead of replaying the whole WAL.
-    if is_resume && prior.render_episodes.is_none() {
+    if is_resume && !append_episode && prior.render_episodes.is_none() {
         if let Some(store) = store.as_ref() {
             match store_episode_render_history(Arc::clone(store), req.session.clone()).await {
                 Ok(Some(episodes)) => prior.render_episodes = Some(episodes),
@@ -1831,11 +1831,10 @@ async fn store_episode_render_history(
     store: Arc<dyn SessionStore>,
     session: BindIdentity,
 ) -> Result<Option<Vec<broca_protocol::request::EpisodeRenderInput>>, String> {
-    let stored = spawn_blocking(JobKind::Projection, move || {
-        store.read_episode_projection(&session)
-    })
-    .await
-    .map_err(|e| format!("store episode projection task failed: {e}"))??;
+    let stored = store
+        .read_episode_projection_async(&session)
+        .await
+        .map_err(|error| format!("store episode projection read failed: {error}"))?;
     let Some(stored) = stored else {
         return Ok(None);
     };
@@ -10380,6 +10379,7 @@ mod tests {
             open_episode_span: Some(1),
             open_episode: None,
             earlier_episodes: Vec::new(),
+            projection_episodes: None,
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,
