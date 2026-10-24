@@ -1298,7 +1298,7 @@ impl SubcConnection {
         scope: subc_protocol::scope::ScopeSelector,
         retry: RouteOpenRetry,
     ) -> ConnResult<RouteHandle> {
-        retry_route_open(retry, None, || {
+        self.retry_open_through_gate(GateTarget::management_surface(module_id), retry, || {
             self.route_open_target(
                 RouteTarget::ManagementSurface {
                     module_id: module_id.to_owned(),
@@ -1309,7 +1309,6 @@ impl SubcConnection {
             )
         })
         .await
-        .map_err(RouteOpenError::into_conn)
     }
 
     /// `route.open` to a management surface declaring `role_versions`, retrying a temporary
