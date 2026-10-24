@@ -5209,10 +5209,14 @@ mod tests {
             ],
         );
         // The first open (the dispatch's own) succeeds; the re-open after the refusal is
-        // refused eight times, then the module is back.
+        // refused eight times, then the module is back. Each refusal takes a second to arrive,
+        // so the drain lasts at least 8s of paused time whatever the backoff's full jitter
+        // draws: the waits between attempts can be near zero, and without this the total
+        // sometimes fell under the 3s default patience the test exists to outlast.
         let mut sequence = vec![RouteOpenScript::default()];
-        sequence.extend((0..8).map(|_| {
-            RouteOpenScript::rejected("module_reloading \u{2014} module_id 'aft' is reloading")
+        sequence.extend((0..8).map(|_| RouteOpenScript {
+            delay: Duration::from_secs(1),
+            ..RouteOpenScript::rejected("module_reloading \u{2014} module_id 'aft' is reloading")
         }));
         sequence.push(RouteOpenScript::default());
         conn.script_route_open_sequence("aft", sequence);
