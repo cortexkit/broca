@@ -1062,6 +1062,15 @@ fn tool_finished_event(
         ToolOutput::Json { value } => serde_json::to_vec(value)
             .expect("JSON values serialize")
             .len(),
+        // A multi-part result counts its text and the stored size of each media object, so a
+        // screenshot reads as the bytes the tool returned rather than its short marker text.
+        ToolOutput::Parts { parts } => parts
+            .iter()
+            .map(|part| match part {
+                broca_protocol::ToolOutputPart::Text { text } => text.len(),
+                broca_protocol::ToolOutputPart::Media { media } => media.byte_size as usize,
+            })
+            .sum(),
         ToolOutput::Denied { reason } => reason.len(),
         ToolOutput::Error { message } => message.len(),
     };

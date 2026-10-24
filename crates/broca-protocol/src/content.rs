@@ -456,7 +456,7 @@ pub enum ToolOutput {
 }
 
 /// The nested reference keeps a part's discriminator separate from the media modality.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolOutputPart {
     Text { text: String },
