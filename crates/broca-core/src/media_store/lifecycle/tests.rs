@@ -414,14 +414,16 @@ fn damaged_manifest_retains_every_object_in_its_class() {
 
 #[test]
 fn preview_preserves_all_files_and_lease_epochs_and_respects_live_writers() {
-    fn snapshot(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn snapshot(path: &Path, held_lease: Option<&Path>) -> BTreeMap<PathBuf, Vec<u8>> {
         let mut result = BTreeMap::new();
         for entry in fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                result.extend(snapshot(&path));
-            } else {
-                result.insert(path.clone(), fs::read(path).unwrap());
+                result.extend(snapshot(&path, held_lease));
+            } else if Some(path.as_path()) != held_lease {
+                let bytes = fs::read(&path)
+                    .unwrap_or_else(|error| panic!("snapshot {}: {error:?}", path.display()));
+                result.insert(path, bytes);
             }
         }
         result
@@ -429,21 +431,36 @@ fn preview_preserves_all_files_and_lease_epochs_and_respects_live_writers() {
     let (root, store, session) = fixture();
     let leases = FileLeaseStore::new(root.join("leases"));
     let lease = leases.acquire(&lease_key_for(&session)).unwrap();
+    let epoch = lease.epoch();
+    let lease_files: Vec<_> = fs::read_dir(root.join("leases"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(lease_files.len(), 1);
+    let lease_path = &lease_files[0];
     accepted(&root, &store, &session);
     store
         .session(&session)
         .unwrap()
         .register_and_append(&reference(REFUSED), REFUSED, || Ok(()))
         .unwrap();
-    let before = snapshot(&root);
+    // Windows forbids reading through another handle while the writer holds the
+    // lease's byte-range lock. Compare every other file now, then include the
+    // lease bytes after release and check its persisted epoch on reacquisition.
+    let before = snapshot(&root, Some(lease_path));
     let report = preview_sweep(&root).unwrap();
     assert_eq!(report.leased, 1);
     assert_eq!(report.objects_removed, 0);
-    assert_eq!(snapshot(&root), before);
+    assert_eq!(snapshot(&root, Some(lease_path)), before);
     drop(lease);
+    assert_eq!(snapshot(&root, Some(lease_path)), before);
+    let before = snapshot(&root, None);
     let report = preview_sweep(&root).unwrap();
     assert_eq!(report.leased, 0);
     assert_eq!(report.objects_removed, 1);
-    assert_eq!(snapshot(&root), before);
+    assert_eq!(snapshot(&root, None), before);
+    let lease = leases.acquire(&lease_key_for(&session)).unwrap();
+    assert_eq!(lease.epoch(), epoch + 1, "preview changed the lease epoch");
+    drop(lease);
     assert_eq!(sweep(&root).unwrap().objects_removed, 1);
 }

@@ -312,12 +312,21 @@ impl Rig {
     }
 
     async fn reply(&mut self) -> Frame {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+        let provider = self.provider.clone();
+        // File-backed measurement exports can delay classifier replies on slow
+        // disks. wait_for guards against a deadlocked read without making disk
+        // latency part of the route contract.
+        broca_test_support::wait_for(
+            "classifier route reply",
             read_frame(&mut self.daemon),
+            move || {
+                format!(
+                    "provider calls entered={}",
+                    provider.held.load(Ordering::SeqCst)
+                )
+            },
         )
         .await
-        .expect("no reply within 10s")
         .unwrap()
         .unwrap()
     }
