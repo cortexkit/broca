@@ -26373,3 +26373,120 @@ expect_red = ["media_validation::tests::image_dimensions_come_from_headers"]
 file = "crates/broca-core/src/media_validation.rs"
 old = '        width: dimensions.map(|(w, _)| w),'
 new = '        width: dimensions.map(|_| 1), // NON-VACUITY BREAK: replace the header width with a guess.'
+
+[[control]]
+id = "media-store-manifest-barrier-before-wal"
+guards = "A failed manifest fsync refuses the WAL callback"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/tests.rs"
+expect_red = ["media_store::tests::failed_barriers_never_enter_the_wal_callback"]
+file = "crates/broca-core/src/media_store.rs"
+old = "        steps.file_sync(&self.file, Step::ManifestSynced)?;"
+new = "        // NON-VACUITY BREAK: append to the WAL without the manifest barrier."
+
+[[control]]
+id = "media-store-object-directory-barrier"
+guards = "An object publication directory-sync failure refuses the WAL callback"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/tests.rs"
+expect_red = ["media_store::tests::failed_barriers_never_enter_the_wal_callback"]
+file = "crates/broca-core/src/media_store.rs"
+old = "            steps.dir_sync(&directory, Step::ObjectPublished)?;"
+new = "            // NON-VACUITY BREAK: publish without the object directory barrier."
+
+[[control]]
+id = "media-store-refs-sync-stays-pending"
+guards = "A failed refs sync must remain pending until a later successful barrier"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/tests.rs"
+expect_red = ["media_store::tests::failed_refs_sync_is_retried_and_every_open_owes_a_sync"]
+file = "crates/broca-core/src/media_store.rs"
+old = "            steps.dir_sync(&self.store.root.join(\"refs\"), Step::RefsSynced)?;\n            self.refs_synced = true;"
+new = "            self.refs_synced = true; // NON-VACUITY BREAK: discharge even a failed refs barrier.\n            steps.dir_sync(&self.store.root.join(\"refs\"), Step::RefsSynced)?;"
+
+[[control]]
+id = "media-store-reverify-after-manifest"
+guards = "An object lost after manifest fsync is republished before the WAL append"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/tests.rs"
+expect_red = ["media_store::tests::registration_republishes_an_object_lost_after_manifest_fsync"]
+file = "crates/broca-core/src/media_store.rs"
+old = "        if self.store.read_verified(reference).is_err() {"
+new = "        if false { // NON-VACUITY BREAK: trust the earlier object publication."
+
+[[control]]
+id = "media-store-render-reverifies-digest"
+guards = "A same-length corrupt object fails rendering with its digest named"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/tests.rs"
+expect_red = ["media_store::tests::render_rereads_bytes_and_names_missing_or_corrupt_digest"]
+file = "crates/broca-core/src/media_store.rs"
+old = "        if !matches_bytes(reference, &bytes) {"
+new = "        if reference.byte_size != bytes.len() as u64 { // NON-VACUITY BREAK: trust a corrupt same-length object."
+
+[[control]]
+id = "media-store-manifest-full-bind-triple"
+guards = "Equal session names in different projects or harnesses have distinct manifests"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/tests.rs"
+expect_red = ["media_store::tests::manifests_use_the_full_triple_and_classes_have_separate_objects"]
+file = "crates/broca-core/src/media_store.rs"
+old = ".join(crate::wal_writer::session_addr(identity));"
+new = ".join(&identity.session); // NON-VACUITY BREAK: alias different bind triples by session name."
+
+[[control]]
+id = "media-store-registration-shared-lock"
+guards = "Registration excludes maintenance through the WAL callback"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/tests.rs"
+expect_red = ["media_store::tests::registration_holds_shared_store_lock_through_wal_append"]
+file = "crates/broca-core/src/media_store.rs"
+old = "        lock.lock_shared()?;"
+new = "        let _ = lock; // NON-VACUITY BREAK: allow maintenance during registration."
+
+[[control]]
+id = "media-store-startup-before-catalog"
+guards = "All media stores and their structural subdirectories exist before catalog publication"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--bin ck-broca"
+select = "expected"
+test_file = "crates/broca-module-serve/src/main.rs"
+expect_red = ["state_directory_tests::media_trees_exist_before_catalog_and_match_backup_classes"]
+file = "crates/broca-module-serve/src/main.rs"
+old = "    broca_core::media_store::create_media_directories(state_root)\n        .map_err(|error| ServeIoError(error.to_string()))?;"
+new = "    // NON-VACUITY BREAK: publish a catalog before creating media trees."
+
+[[control]]
+id = "media-store-retry-repairs-torn-manifest-tail"
+guards = "A partial digest write cannot swallow the next registered digest"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/media_store/tests.rs"
+expect_red = ["media_store::tests::partial_manifest_write_cannot_swallow_a_later_registration"]
+file = "crates/broca-core/src/media_store.rs"
+old = "        recover_torn_tail(&mut self.file)?;"
+new = "        // NON-VACUITY BREAK: append a retry directly after a torn digest."

@@ -36,6 +36,33 @@
       "reason": "sessions with caller-chosen retention; an immutable backup snapshot would outlive that promise"
     },
     {
+      "entry_id": "broca/durable-media",
+      "class": "portable",
+      "mechanism": "filetree",
+      "path": "media-durable"
+    },
+    {
+      "entry_id": "broca/session-media",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "media",
+      "reason": "non-durable sessions (sidekicks, one-shots, consults, masons, other modules); only sessions marked durable are backed up, and none live in this tree"
+    },
+    {
+      "entry_id": "broca/ephemeral-media",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "media-ephemeral",
+      "reason": "sessions with caller-chosen retention; an immutable backup snapshot would outlive that promise"
+    },
+    {
+      "entry_id": "broca/media-uploads",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "media-uploads",
+      "reason": "staged uploads are temporary input, not durable session data; an immutable backup snapshot would outlive their expiry"
+    },
+    {
       "entry_id": "broca/run-index",
       "class": "rebuild",
       "mechanism": "whole-db",
