@@ -59,7 +59,30 @@ error}` terminal: `session_too_large` for ordinary sessions, or the unchanged
 | `turn_finished{step_id}` | synced after the turn's batch commits/repairs | turn boundary |
 | `steered{send_id?, request_identity_digest?, delivery?, title?, input, hooks?}` | **synced BEFORE the steering send is answered** | a message a caller added to the RUNNING turn. MUST-UNDERSTAND (feature `steer-queue/v1`): always a `ver` 3 frame, and a build without the name refuses the WAL as NewerWriter, because skipping it would drop a user message from the transcript. The writer adds `steer-queue/v1` to `wal-feature-floor` before the first such frame. Placement comes from WAL order alone: the message joins the prompt at the episode's next `step_started`, or at its `run_finished` if no step follows, so it is never between a tool call and its result and nothing earlier changes. A steer acknowledged `active` is guaranteed to be in the transcript; it reaches a model within the same turn only if another step follows. `hooks` optionally records pre-user hook metadata alongside the prepared `input`, which includes any pre-user transformations; a missing `hooks` field decodes as absent. Replay renders `input` exactly as written and never re-runs hooks. |
 | `run_finished{reason, usage}` | **synced BEFORE success + lease release** | run close. A typed `error.provider_details` on `run_finished`, `run_paused` or `retracted.failure.error` is MUST-UNDERSTAND (feature `google-rpc-error-details/v1`): the writer places only those records in a `ver = 3` frame requiring that name, so older readers refuse instead of dropping quota diagnostics. The feature floor is raised before the first such append. |
-| `run_cancel_requested{run_id, at}` | **synced BEFORE cancellation acknowledgement** | pending boundary cancellation, or its escalation to `now`. MUST-UNDERSTAND (`run-cancel-at/v1`): an older reader refuses the WAL rather than silently resume a cancelled run. Does not replace tool dispatch/result evidence or itself publish a terminal; recovery closes the current batch and seals `Cancelled` without another model step. |
+| `run_cancel_requested{run_id, at}` | **synced BEFORE cancellation acknowledgement** | pending boundary cancellation, or its escalation to `now`. MUST-UNDERSTAND (`run-cancel-at/v1`): an older reader refuses the WAL rather than silently resume a cancelled run. Does not replace tool dispatch/result evidence or itself publish a terminal; recovery closes the current batch and seals `Cancelled` without another model step. For a run with an open provider-held call (below), live or paused, it is written and synced for both `at: now` and `at: step_boundary`, and the cancel is answered then, before the seal: no step boundary comes before the held call's delivery, so both mean an immediate close-out. |
+| `tool_call_provider_held{batch_id, tool_call_id, call_key, module, reason, detail_digest?, held_at_ms, sequential}` | **synced BEFORE broca acts on anything else in the held reply** | a tool provider answered the call with a `held` marker (tool-provider contract §4.1, `held-reply/v1`), and the real result arrives later as a `late_results` entry for `call_key` (§7). Follows the call's `tool_dispatch_intent`; the call's eventual terminal is an ordinary `tool_result` under the same `batch_id`. `reason` is the provider's open `held.reason`, informational only; `detail_digest` is the SHA-256 of the held `detail` object, which is not stored; the interim content is never stored and never enters a prompt. `sequential` is true when the batch dispatches one call at a time. MUST-UNDERSTAND (feature `provider-held/v1`): always a `ver` 3 frame, and a build without the name refuses the WAL as NewerWriter, because skipping the record would leave an intent without a terminal, class the call indeterminate and seal the run Interrupted while the provider still owes its result. The writer adds `provider-held/v1` to `wal-feature-floor` before the first such frame, and refuses the append if it cannot. |
+| `run_paused{run_id, reason: tool_held, ts_ms?}` | **synced BEFORE the run's final `Paused` unit** | the run waits only on provider-held calls (and on calls behind them): every call is terminal, provider-held, a held successor, or approved and awaiting dispatch behind the hold, at least one provider-held call is open, and no approval card is open. Not terminal and never a crash orphan; broca resumes the same run itself when a held call's late result arrives, and the caller never resumes it. MUST-UNDERSTAND under the same `provider-held/v1`: `PauseReason` is a closed enum, so an older reader refuses the frame rather than misread the pause. `run_paused` with `auth_required` or `restart` keeps its earlier frame. |
+
+Close-out terminals of a provider-held call carry an ungated `tool_result.reason`, next to the
+`run_cancel_requested` record that may precede them. `run.cancel` writes `outcome: interrupted,
+reason: provider_held_cancelled`; `run.stop` writes `outcome: max_steps, reason:
+provider_held_stopped`; the mixed-crash rule (another call in the batch is indeterminate) writes
+`outcome: interrupted, reason: provider_held_interrupted`, never `unknown`. A delivered late
+result, including a `not_started`, `expired` or reduced entry, is always `outcome: completed`, so
+`interrupted` or `max_steps` on a call with a `tool_call_provider_held` record comes only from a
+close-out, and marks its episode as closing; recognition reads the outcome, never the `reason`.
+
+`provider-held/v1` covers exactly those two values. A run that is never provider-held writes
+the same frames, byte for byte, as before the feature existed, and never raises the floor for
+it; no renderer version changes.
+
+**Status of provider-held calls.** This build defines both values and their gating, but
+omits `provider-held/v1` from its known-feature table: it refuses a WAL carrying either value
+as NewerWriter, and no production path writes them. The two rows above, the close-out reasons,
+the sequential sync rule (§3 step 8) and the provider-held and held-successor rows of §4 are
+the contract the writer, replay and recovery must meet when they ship. The feature joins the
+known-feature table with the replay that classes held calls as §4 says, before any build
+writes one.
 
 Durable **runtime-state** records (not runtime-only queues):
 `queued{submission_id, request,..., title?, delivery?}`, `retracted`, `steered` (above),
@@ -310,6 +333,19 @@ session-specific leases alone do not serialize that machine-wide union.
    fsync — never a result the caller saw that resume reports as lost.
 7. fsync `tool_batch_finished` ONLY after EXACTLY one terminal (`result` /
    `no_dispatch` / `unknown`) per planned call.
+8. **Provider-held calls** (the contract for when they ship; see the status note in §2). A
+   call whose provider answered `held` gets its
+   `tool_call_provider_held` synced before anything else happens; in a parallel batch the
+   other calls run and finish and the batch stays open. **Sequential sync rule:** in a batch
+   that dispatches one call at a time, the calls after a provider-held call keep their
+   step-2 intents but are not sent until it has a terminal. When its late result arrives,
+   the held call's `tool_result` is appended and synced BEFORE any later call is sent, on
+   both the live and the resumed path (an ordinary sequential batch instead writes every
+   result at the commit barrier); the later calls then dispatch in order with their
+   existing keys and no new intent. A crash after that sync, with a later call lacking a
+   terminal, resolves Interrupted: that call gets `unknown` and is never re-sent, and the
+   held call keeps its result. A held call's intake registration is pruned only once
+   `tool_batch_finished` and `turn_finished` are synced, not at its terminal.
 
 **Step boundary**: the loop awaits the cheap `step_committed` ack before starting
 step N+1 (a barrier enqueue off the per-token path) — the one-step crash bound.
@@ -351,6 +387,8 @@ PROVIDER-INVALID (Anthropic rejects it).
    | `tool_result` (Completed) | done, durable | include the result |
    | `tool_no_dispatch` | denied / invalid / never-sent terminal | include the no-dispatch result; **NEVER re-dispatch** |
    | `intent ∧ ¬terminal`, or `unknown_outcome` | INDETERMINATE — side effect may have applied | **NEVER re-dispatch.** The result is written, then the episode is sealed Interrupted: see *Resume close-out* below |
+   | `intent ∧ tool_call_provider_held ∧ ¬terminal` | PROVIDER-HELD — the provider confirmed it holds the call and owes a late result; **not indeterminate**, and excluded from `resume_started.indeterminate` (this and the next row take effect with the replay that lists `provider-held/v1`; until then the WAL is refused, §2) | never re-dispatch; the run stays paused `tool_held` (writing a missing `run_paused`) until the late result is delivered into this batch, or a cancel or stop closes it out. If any other call of the batch is indeterminate, the indeterminate handling wins: the held call is closed `interrupted` with `reason: provider_held_interrupted` and the run is sealed Interrupted |
+   | `intent ∧ ¬terminal` in a `sequential` batch, planned after a call that is PROVIDER-HELD or whose terminal is a close-out (`interrupted` or `max_steps`) | HELD-SUCCESSOR — never sent, because sequential dispatch sends a call only after its predecessor resolves and close-out sends nothing; **not indeterminate** | never re-dispatch on replay; it is sent once, under the sequential sync rule (§3), after the held call's delivered terminal is synced, or closed out with the not-dispatched `interrupted` result. Behind a DELIVERED (`completed`) held terminal the same intent is ordinary INDETERMINATE: nothing durable separates a crash before its send from one after it |
    | `¬intent ∧ ¬no_dispatch ∧ planned-dispatchable` | never left the process | safe to (re-)dispatch by id |
 
    - A batch is COMMITTABLE only when EVERY planned call has exactly one terminal,

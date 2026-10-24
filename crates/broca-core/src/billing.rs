@@ -822,6 +822,9 @@ fn billing_boundary_kind(record: &WalRecord) -> Option<&'static str> {
         | WalRecord::LateApprovalRecorded { .. }
         | WalRecord::LateDispatchIntent { .. }
         | WalRecord::LateResult { .. } => None,
+        // A provider-held call carries no model configuration, so it is no billing boundary;
+        // billing keeps the originating RunStarted's frozen pricing context.
+        WalRecord::ToolCallProviderHeld { .. } => None,
         // An informational record, skipped exactly like `Unknown`.
         WalRecord::InputTokenCapFrozen { .. }
         | WalRecord::InputTokenBudgetExhausted { .. }

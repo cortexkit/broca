@@ -570,6 +570,10 @@ fn project_control_record<S: ControlProjectionSink>(
         | WalRecord::LateApprovalRecorded { .. }
         | WalRecord::LateDispatchIntent { .. }
         | WalRecord::LateResult { .. } => {}
+        // Unreachable in this build: `provider-held/v1` is not in `broca_wal::KNOWN_FEATURES`, so
+        // a WAL carrying this record is refused before projection reads it. The release that
+        // lists the feature decides what a held call shows on the control lane.
+        WalRecord::ToolCallProviderHeld { .. } => {}
         // An informational record, skipped exactly like `Unknown`.
         WalRecord::InputTokenCapFrozen { .. }
         | WalRecord::InputTokenBudgetExhausted { .. }
