@@ -90,6 +90,7 @@ async fn healthy_known_id_feed_longer_than_one_budget_reaches_get_and_await() {
             approval: None,
             elicitation_id: Some("known".into()),
         }],
+        ..Default::default()
     };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(24),
@@ -209,6 +210,7 @@ async fn await_conflict(mode: &'static str) {
             approval: None,
             elicitation_id: Some("new".into()),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("c")], Some(resume), false)
@@ -359,6 +361,7 @@ async fn live_old_approval_proves_recorded_duplicate_withdrawal_before_adoption(
             approval: None,
             elicitation_id: Some("new".into()),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
@@ -597,6 +600,7 @@ async fn live_feed_budget_preserves_prefix_until_later_conflict() {
             approval: None,
             elicitation_id: Some("new".into()),
         }],
+        ..Default::default()
     };
     let result = rig
         .batch(&crate::AllowAll, vec![call("held")], Some(resume), false)

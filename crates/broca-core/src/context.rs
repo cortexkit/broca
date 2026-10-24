@@ -1528,6 +1528,13 @@ fn lineage_state_from_replay_and_records(
             error: None,
             usage: None,
         },
+        crate::ReplayResolution::ProviderHeld { run_id, .. } => SessionReadLineageState {
+            last_run_id: Some(run_id.clone()),
+            state: SessionReadStateKind::Paused,
+            reason: Some(SessionReadReason::Pause(PauseReason::ToolHeld)),
+            error: None,
+            usage: None,
+        },
         crate::ReplayResolution::AuthRequired {
             run_id,
             reason,

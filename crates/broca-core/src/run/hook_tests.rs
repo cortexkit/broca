@@ -272,6 +272,7 @@ async fn mutated_input_is_revalidated_before_validate_and_terminal_is_not_rehook
         batch_already_started: true,
         prepared: Vec::new(),
         existing: [(ToolCallId("c".into()), [output.results[0].clone()].into())].into(),
+        ..Default::default()
     };
     batch(
         vec![call("c")],
@@ -1119,6 +1120,7 @@ async fn excluded_case(kind: &str) {
                     .into(),
                 )]
                 .into(),
+                ..Default::default()
             })
         }
         "not_sent" => {}

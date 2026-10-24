@@ -26373,3 +26373,107 @@ expect_red = ["media_validation::tests::image_dimensions_come_from_headers"]
 file = "crates/broca-core/src/media_validation.rs"
 old = '        width: dimensions.map(|(w, _)| w),'
 new = '        width: dimensions.map(|_| 1), // NON-VACUITY BREAK: replace the header width with a guess.'
+
+[[control]]
+id = "core-provider-held-replay-not-indeterminate"
+guards = "A synced held record is a provider-owned obligation, not an ambiguous dispatch"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::provider_held_and_sequential_successor_are_not_indeterminate"]
+file = "crates/broca-core/src/replay.rs"
+old = "            if self.provider_held.contains_key(&self.planned[position]) {"
+new = "            if false && self.provider_held.contains_key(&self.planned[position]) { // NON-VACUITY BREAK: forget the durable held record."
+
+[[control]]
+id = "core-provider-held-successor-never-sent"
+guards = "A sequential successor behind an open held call is known never sent"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::provider_held_and_sequential_successor_are_not_indeterminate"]
+file = "crates/broca-core/src/replay.rs"
+old = "                        held.sequential"
+new = "                        false && held.sequential // NON-VACUITY BREAK: classify a held successor as ambiguous."
+
+[[control]]
+id = "core-provider-held-delivered-successor-is-indeterminate"
+guards = "A delivered held terminal removes the never-sent proof for its successor at both send kill points"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::delivered_held_terminal_makes_both_successor_kill_points_interrupted"]
+file = "crates/broca-core/src/replay.rs"
+old = "                                    DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps,"
+new = "                                    DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps | DispatchOutcome::Completed, // NON-VACUITY BREAK: pretend a delivered predecessor still blocks sending."
+
+[[control]]
+id = "core-provider-held-sequential-terminal-before-send"
+guards = "The held terminal is synced before a sequential successor is sent, including on resume"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_sequential_pause_resume_syncs_before_successor"]
+file = "crates/broca-core/src/run.rs"
+old = "                    sync_held_terminal(&mut result, ctx, plane.writer, hooks).await?;"
+new = "                    // NON-VACUITY BREAK: defer the held terminal to the final batch barrier."
+
+[[control]]
+id = "core-provider-held-mixed-closeout-not-unknown"
+guards = "A mixed-crash close-out keeps the provider-held call known and interrupts only the ambiguous sibling as Unknown"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::provider_held_parallel_indeterminate_sibling_uses_full_close_out"]
+file = "crates/broca-core/src/resume.rs"
+old = "                provider_held_interrupted_result(tool_call_id),\n                DispatchOutcome::Interrupted,"
+new = "                outcome_unknown_result(tool_call_id),\n                DispatchOutcome::Unknown, // NON-VACUITY BREAK: lose the provider-held ownership proof."
+
+[[control]]
+id = "core-provider-held-pause-waits-for-approval"
+guards = "An unanswered approval card keeps the live batch and its consent intake running beside a provider-held call"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::approval_gate::provider_held_pause_waits_for_approval_and_inflight_siblings"]
+file = "crates/broca-core/src/run.rs"
+old = "                .any(|slot| matches!(slot, Slot::Held(call) if !call.approved))"
+new = "                .any(|slot| matches!(slot, Slot::Held(call) if !call.approved) && false) // NON-VACUITY BREAK: pause while an approval card is open."
+
+[[control]]
+id = "module-provider-held-same-run-send-does-not-redrive"
+guards = "A same-run-id send reports the existing tool-held pause without invoking the run executor or writing another pause"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::provider_held_session_activity_is_queued_or_refused_without_redrive"]
+file = "crates/broca-module/src/actor.rs"
+old = "                    reason @ (broca_protocol::PauseReason::Restart\n                    | broca_protocol::PauseReason::ToolHeld),"
+new = "                    reason @ broca_protocol::PauseReason::Restart, // NON-VACUITY BREAK: let a tool-held send re-drive its run."
+
+[[control]]
+id = "core-provider-held-pause-ends-warm-wait"
+guards = "A held-only batch returns to its durable pause and drops owned keep-warm IO rather than warming indefinitely"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_pause_stops_keep_warm_for_a_day"]
+file = "crates/broca-core/src/run.rs"
+old = "            _ = async {}, if !tripped && plane.held.len() > 0 && jobs.len() == plane.held.len() => {"
+new = "            _ = async {}, if false && !tripped && plane.held.len() > 0 && jobs.len() == plane.held.len() => { // NON-VACUITY BREAK: keep warming a held-only batch instead of pausing."

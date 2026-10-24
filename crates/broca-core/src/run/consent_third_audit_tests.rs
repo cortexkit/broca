@@ -272,6 +272,7 @@ async fn live_expired_older_approval_proves_recorded_duplicate_before_adoption()
             approval: None,
             elicitation_id: Some("waiting-sibling".into()),
         }],
+        ..Default::default()
     };
     let interrupt = async {
         loop {

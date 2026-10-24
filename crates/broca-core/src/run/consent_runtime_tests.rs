@@ -78,6 +78,7 @@ async fn pending_restart_pause_gets_then_awaits_the_same_durable_card() {
             approval: None,
             elicitation_id: Some(id.clone()),
         }],
+        ..Default::default()
     };
     rig.control.stop_requested = None;
     *rig.questions.answer.lock().unwrap() = "approve";
@@ -736,6 +737,7 @@ async fn one_held_and_one_expired_call_use_one_await_one_page_and_drop_settled_w
             approval: None,
             elicitation_id: Some(id),
         }],
+        ..Default::default()
     };
     rig.batch(&crate::AllowAll, vec![call("held")], Some(resume), false)
         .await;

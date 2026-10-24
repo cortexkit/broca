@@ -20,7 +20,7 @@
 //!  - no Prepared, intent or terminal → safe to re-dispatch.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -215,6 +215,10 @@ pub enum OpenCallState {
     Terminated,
     /// A dispatch intent is durable and no terminal is: the call may or may not have run.
     Dispatched,
+    /// The provider durably accepted responsibility for returning a late result.
+    ProviderHeld,
+    /// A sequential intent behind an open or closed-out held call; it was never sent.
+    HeldSuccessor,
     /// Neither Prepared, intent nor terminal is durable: the call never left the process.
     NotSent,
     /// Prepared arguments are durable, but no approval or terminal is durable.
@@ -239,6 +243,13 @@ pub enum ReplayResolution {
     /// A clean resume point. `pending` is the trailing tool-turn that needs
     /// completing (None ⇒ resume re-runs the model from `prompt`).
     Resume { pending: Option<PendingTurn> },
+    /// A provider-held batch, including one whose delivered terminals still owe its barrier.
+    /// This is a runner-owned wait, never an authentication pause.
+    ProviderHeld {
+        run_id: RunId,
+        pending: PendingTurn,
+        open_held: Vec<ToolCallId>,
+    },
     /// The last episode is PAUSED awaiting (re-)auth — a NON-terminal, resumable
     /// state (a `RunPaused` record, distinct from a terminal `RunFinished`). Resume
     /// continues the SAME run_id from the last durable boundary; no new episode starts
@@ -281,6 +292,10 @@ pub struct PendingTurn {
     pub deferred: Vec<PreparedCall>,
     /// Approved calls awaiting second validation, never ordinary redispatch.
     pub approved: Vec<PreparedCall>,
+    /// Durable held replies to rejoin without sending the call again.
+    pub provider_held: Vec<ProviderHeldCall>,
+    /// Intents already written at barrier 1 but kept behind a sequential hold.
+    pub held_successors: Vec<ToolCallId>,
     /// The assistant message's runner tags, when the session has tags.
     pub assistant_tags: Option<broca_protocol::tags::MessageTags>,
     /// The runner tag of each already-durable terminal in `existing`, by call id in planned
@@ -298,6 +313,30 @@ pub struct PreparedCall {
     pub approval: Option<Arc<WalRecord>>,
     /// Latest filing marker's id, if filing returned before the cut.
     pub elicitation_id: Option<String>,
+}
+
+/// The durable metadata needed to rejoin a provider's waiting slot without another send.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderHeldCall {
+    pub tool_call_id: ToolCallId,
+    pub call_key: String,
+    pub module: String,
+    pub reason: String,
+    pub detail_digest: Option<String>,
+    pub held_at_ms: u64,
+    pub sequential: bool,
+}
+
+impl ProviderHeldCall {
+    pub fn reply(&self) -> crate::tool_plane::ProviderHeldReply {
+        crate::tool_plane::ProviderHeldReply {
+            tool_call_id: self.tool_call_id.clone(),
+            call_key: self.call_key.clone(),
+            module: self.module.clone(),
+            reason: self.reason.clone(),
+            detail_digest: self.detail_digest.clone(),
+        }
+    }
 }
 
 /// A closed Prepared call whose unanswered question still needs a withdrawal.
@@ -743,6 +782,7 @@ struct OpenBatch {
     intents: HashSet<ToolCallId>,
     terminals: Vec<Option<Terminal>>,
     prepared: Vec<Option<PreparedCall>>,
+    provider_held: HashMap<ToolCallId, ProviderHeldCall>,
 }
 
 impl OpenBatch {
@@ -753,6 +793,7 @@ impl OpenBatch {
             prepared: vec![None; planned.len()],
             planned,
             intents: HashSet::new(),
+            provider_held: HashMap::new(),
         }
     }
 
@@ -828,6 +869,13 @@ impl OpenBatch {
             .filter(|(position, _)| match &self.terminals[*position] {
                 Some(Terminal::Result(_, DispatchOutcome::Unknown, _)) => true,
                 Some(_) => false,
+                None if matches!(
+                    self.call_state(*position),
+                    OpenCallState::ProviderHeld | OpenCallState::HeldSuccessor
+                ) =>
+                {
+                    false
+                }
                 None => self.has_intent(*position), // intent ∧ ¬terminal
             })
             .map(|(_, id)| id.clone())
@@ -838,7 +886,29 @@ impl OpenBatch {
         if self.terminals[position].is_some() {
             OpenCallState::Terminated
         } else if self.has_intent(position) {
-            OpenCallState::Dispatched
+            if self.provider_held.contains_key(&self.planned[position]) {
+                OpenCallState::ProviderHeld
+            } else if self.planned[..position]
+                .iter()
+                .enumerate()
+                .any(|(index, id)| {
+                    self.provider_held.get(id).is_some_and(|held| {
+                        held.sequential
+                            && matches!(
+                                self.terminals[index],
+                                None | Some(Terminal::Result(
+                                    _,
+                                    DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps,
+                                    _
+                                ))
+                            )
+                    })
+                })
+            {
+                OpenCallState::HeldSuccessor
+            } else {
+                OpenCallState::Dispatched
+            }
         } else if let Some(prepared) = &self.prepared[position] {
             if prepared.approval.is_some() {
                 OpenCallState::Approved
@@ -2092,11 +2162,33 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
-            // Unreachable in this build: `provider-held/v1` is not in `broca_wal::KNOWN_FEATURES`,
-            // so a WAL carrying this record is refused before replay reads it. The release that
-            // lists the feature makes replay class the call as open and provider-held, never
-            // indeterminate; until then this arm must not be read as that behaviour.
-            WalRecord::ToolCallProviderHeld { .. } => {}
+            // The framed reader still refuses provider-held/v1 until runtime intake is installed.
+            // Replay also serves the supplied in-memory lifecycle and must preserve its obligations.
+            WalRecord::ToolCallProviderHeld {
+                tool_call_id,
+                call_key,
+                module,
+                reason,
+                detail_digest,
+                held_at_ms,
+                sequential,
+                ..
+            } => {
+                if let Some(batch) = &mut ep.open_batch {
+                    batch.provider_held.insert(
+                        tool_call_id.clone(),
+                        ProviderHeldCall {
+                            tool_call_id: tool_call_id.clone(),
+                            call_key: call_key.clone(),
+                            module: module.clone(),
+                            reason: reason.clone(),
+                            detail_digest: detail_digest.clone(),
+                            held_at_ms: *held_at_ms,
+                            sequential: *sequential,
+                        },
+                    );
+                }
+            }
             // These metadata records are omitted from prompt construction: they contain no messages.
             WalRecord::InputTokenCapFrozen { .. }
             | WalRecord::InputTokenBudgetExhausted { .. }
@@ -2267,7 +2359,7 @@ fn replay_seeded_with_compaction<'a>(
             ep.hard_stopped = Some(RunFinishReason::BudgetExhausted);
         }
     }
-    let mut resolution = classify(ep);
+    let mut resolution = classify(ep, run_id.as_ref(), cancel_at.is_some());
     if input_budget.exhausted().is_some() {
         match &mut resolution {
             ReplayResolution::Resume {
@@ -2276,7 +2368,8 @@ fn replay_seeded_with_compaction<'a>(
             | ReplayResolution::AuthRequired {
                 pending: Some(pending),
                 ..
-            } => {
+            }
+            | ReplayResolution::ProviderHeld { pending, .. } => {
                 // Recovery still needs the assistant and existing results to close the turn,
                 // but none of its unexecuted calls is authorized for redispatch.
                 pending.redispatch.clear();
@@ -2819,10 +2912,61 @@ pub fn reconcile_run_state<'a>(
 /// effects, so exactly-once execution requires `Interrupted`, never a retry. The producer currently
 /// pauses only at a step-entry boundary after the previous batch finished, but replay enforces this
 /// fail-closed rule as defense in depth.
-fn classify(ep: Episode) -> ReplayResolution {
+fn classify(ep: Episode, run_id: Option<&RunId>, cancelling: bool) -> ReplayResolution {
+    let closing = ep.open_batch.as_ref().is_some_and(|batch| {
+        batch.provider_held.keys().any(|id| {
+            batch
+                .planned
+                .iter()
+                .position(|planned| planned == id)
+                .is_some_and(|position| {
+                    matches!(
+                        batch.terminals[position],
+                        Some(Terminal::Result(
+                            _,
+                            DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps,
+                            _
+                        ))
+                    )
+                })
+        })
+    });
+    if closing && ep.finished.is_none() {
+        return ReplayResolution::Interrupted {
+            indeterminate: ep.indeterminate,
+        };
+    }
+    if ep.finished.is_none() && ep.indeterminate.is_empty() && !cancelling {
+        if let Some(batch) = &ep.open_batch {
+            if !batch.provider_held.is_empty()
+                && (batch.all_terminated()
+                    || batch.planned.iter().enumerate().any(|(position, _)| {
+                        batch.call_state(position) == OpenCallState::ProviderHeld
+                    }))
+            {
+                if let (Some(run_id), Some(pending)) = (run_id, pending_turn(&ep)) {
+                    let open_held = pending
+                        .provider_held
+                        .iter()
+                        .map(|reply| reply.tool_call_id.clone())
+                        .collect();
+                    return ReplayResolution::ProviderHeld {
+                        run_id: run_id.clone(),
+                        pending,
+                        open_held,
+                    };
+                }
+            }
+        }
+    }
     // A non-terminal pause is resumable, not finished — check it FIRST so a paused
     // episode is never read as terminal (which would seal a resumable run).
-    if ep.paused.is_some() && ep.indeterminate.is_empty() {
+    if ep
+        .paused
+        .as_ref()
+        .is_some_and(|(_, reason, _)| *reason != PauseReason::ToolHeld)
+        && ep.indeterminate.is_empty()
+    {
         let pending = pending_turn(&ep);
         let (run_id, reason, error) = match ep.paused {
             Some(paused) => paused,
@@ -2916,6 +3060,23 @@ fn pending_turn(ep: &Episode) -> Option<PendingTurn> {
             redispatch: b.redispatchable(),
             deferred: b.prepared_in_state(OpenCallState::Deferred),
             approved: b.prepared_in_state(OpenCallState::Approved),
+            provider_held: b
+                .planned
+                .iter()
+                .enumerate()
+                .filter_map(|(position, id)| {
+                    (b.call_state(position) == OpenCallState::ProviderHeld)
+                        .then(|| b.provider_held.get(id).cloned())
+                        .flatten()
+                })
+                .collect(),
+            held_successors: b
+                .planned
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| b.call_state(*position) == OpenCallState::HeldSuccessor)
+                .map(|(_, id)| id.clone())
+                .collect(),
             assistant_tags: ep.open_assistant_tags.clone(),
             existing_tags: b.existing_tags(),
         },
@@ -2935,6 +3096,8 @@ fn pending_turn(ep: &Episode) -> Option<PendingTurn> {
                 existing: Vec::new(),
                 deferred: Vec::new(),
                 approved: Vec::new(),
+                provider_held: Vec::new(),
+                held_successors: Vec::new(),
                 assistant_tags: ep.open_assistant_tags.clone(),
                 existing_tags: Vec::new(),
             }
@@ -3912,5 +4075,203 @@ pub(crate) mod deferred_tests {
                 before
             );
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod provider_held_tests {
+    use super::*;
+
+    pub(crate) fn intent(id: &str) -> WalRecord {
+        WalRecord::ToolDispatchIntent {
+            batch_id: BatchId("b".into()),
+            tool_call_id: ToolCallId(id.into()),
+            tool_name: Some("edit".into()),
+            args: Arc::new(serde_json::json!({"n":1})),
+            module_id: Some("tools".into()),
+            schema_pin: None,
+            hooks: None,
+            approval_digest: None,
+            call_key: None,
+        }
+    }
+
+    pub(crate) fn held(sequential: bool) -> WalRecord {
+        WalRecord::ToolCallProviderHeld {
+            batch_id: BatchId("b".into()),
+            tool_call_id: ToolCallId("a".into()),
+            call_key: "lineage:4".into(),
+            module: "tools".into(),
+            reason: "running".into(),
+            detail_digest: None,
+            held_at_ms: 42,
+            sequential,
+        }
+    }
+
+    pub(crate) fn terminal(id: &str, outcome: DispatchOutcome) -> WalRecord {
+        WalRecord::ToolResult {
+            batch_id: BatchId("b".into()),
+            result: deferred_tests::result(id, "answer"),
+            outcome,
+            reason: None,
+            tags: None,
+            hooks: None,
+            withdraw_elicitation: None,
+            provider_held: None,
+        }
+    }
+
+    pub(crate) fn prefix(sequential: bool) -> Vec<WalRecord> {
+        let mut records = deferred_tests::batch(&["a", "b"]);
+        records.extend([intent("a"), intent("b"), held(sequential)]);
+        records
+    }
+
+    #[test]
+    fn provider_held_and_sequential_successor_are_not_indeterminate() {
+        let records = prefix(true);
+        let state = replay(&records).unwrap();
+        assert_eq!(
+            state.open_tool_batch.as_ref().unwrap().calls,
+            vec![
+                (ToolCallId("a".into()), OpenCallState::ProviderHeld),
+                (ToolCallId("b".into()), OpenCallState::HeldSuccessor),
+            ]
+        );
+        let ReplayResolution::ProviderHeld {
+            pending, open_held, ..
+        } = &state.resolution
+        else {
+            panic!("{:?}", state.resolution)
+        };
+        assert_eq!(open_held, &[ToolCallId("a".into())]);
+        assert_eq!(pending.held_successors, [ToolCallId("b".into())]);
+        assert!(pending.redispatch.is_empty());
+        assert!(
+            matches!(crate::resume::resume_started_record(&state, 6, vec![]), WalRecord::ResumeStarted { indeterminate, .. } if indeterminate.is_empty())
+        );
+        for reason in [PauseReason::ToolHeld, PauseReason::Restart] {
+            let mut paused = records.clone();
+            paused.push(WalRecord::RunPaused {
+                run_id: RunId("r".into()),
+                reason,
+                error: None,
+                ts_ms: None,
+            });
+            assert!(matches!(
+                replay(&paused).unwrap().resolution,
+                ReplayResolution::ProviderHeld { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn delivered_held_terminal_makes_both_successor_kill_points_interrupted() {
+        let mut records = prefix(true);
+        records.push(terminal("a", DispatchOutcome::Completed));
+        // No durable boundary separates a successor just before send from one already sent.
+        for _kill_after_send in [false, true] {
+            let state = replay(&records).unwrap();
+            assert_eq!(
+                state.open_tool_batch.as_ref().unwrap().calls[1].1,
+                OpenCallState::Dispatched
+            );
+            assert_eq!(
+                state.resolution,
+                ReplayResolution::Interrupted {
+                    indeterminate: vec![ToolCallId("b".into())]
+                }
+            );
+            let close = crate::resume::close_out_open_batch(&state, |_| {
+                crate::resume::DeferredCloseKind::NotDispatched
+            });
+            assert_eq!(
+                close
+                    .iter()
+                    .filter(|record| matches!(record, WalRecord::ToolResult { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                matches!(&close[0], WalRecord::ToolResult { result, outcome: DispatchOutcome::Unknown, .. } if result.tool_call_id.0 == "b")
+            );
+        }
+        records.push(terminal("b", DispatchOutcome::Completed));
+        assert!(
+            matches!(replay(&records).unwrap().resolution, ReplayResolution::ProviderHeld { open_held, .. } if open_held.is_empty())
+        );
+        records.push(WalRecord::ToolBatchFinished {
+            batch_id: BatchId("b".into()),
+        });
+        assert!(matches!(
+            replay(&records).unwrap().resolution,
+            ReplayResolution::Resume { pending: None }
+        ));
+    }
+
+    #[test]
+    fn provider_held_parallel_indeterminate_sibling_uses_full_close_out() {
+        let state = replay(&prefix(false)).unwrap();
+        assert_eq!(
+            state.resolution,
+            ReplayResolution::Interrupted {
+                indeterminate: vec![ToolCallId("b".into())]
+            }
+        );
+        let close = crate::resume::close_out_open_batch(&state, |_| {
+            crate::resume::DeferredCloseKind::NotDispatched
+        });
+        assert!(
+            matches!(&close[0], WalRecord::ToolResult { outcome: DispatchOutcome::Interrupted, reason: Some(reason), .. } if reason == "provider_held_interrupted")
+        );
+        assert!(matches!(
+            &close[1],
+            WalRecord::ToolResult {
+                outcome: DispatchOutcome::Unknown,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn closed_out_held_predecessor_keeps_successor_never_sent() {
+        for outcome in [DispatchOutcome::Interrupted, DispatchOutcome::MaxSteps] {
+            let mut records = prefix(true);
+            records.push(terminal("a", outcome));
+            let state = replay(&records).unwrap();
+            assert_eq!(
+                state.open_tool_batch.as_ref().unwrap().calls[1].1,
+                OpenCallState::HeldSuccessor
+            );
+            assert!(
+                matches!(state.resolution, ReplayResolution::Interrupted { ref indeterminate } if indeterminate.is_empty())
+            );
+            let close = crate::resume::close_out_open_batch(&state, |_| {
+                crate::resume::DeferredCloseKind::NotDispatched
+            });
+            assert!(
+                matches!(&close[0], WalRecord::ToolResult { result, outcome: DispatchOutcome::Interrupted, .. } if result.tool_call_id.0 == "b")
+            );
+        }
+    }
+
+    #[test]
+    fn provider_held_with_approval_retains_approved_argument_bytes() {
+        let mut records = deferred_tests::batch(&["a", "b"]);
+        records.extend([
+            intent("a"),
+            held(false),
+            deferred_tests::prepared("b", "b"),
+            deferred_tests::approval("b", "lineage:6", DeferredDecision::Approved),
+        ]);
+        let state = replay(&records).unwrap();
+        let ReplayResolution::ProviderHeld { pending, .. } = state.resolution else {
+            panic!("not provider-held")
+        };
+        assert_eq!(pending.approved.len(), 1);
+        assert!(
+            matches!(&*pending.approved[0].prepared, WalRecord::ToolCallDeferred { args_jcs, .. } if args_jcs == "{\"n\":1}")
+        );
     }
 }

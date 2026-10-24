@@ -3905,13 +3905,24 @@ impl LineageRegistry {
                     continue;
                 }
             };
-            if !matches!(
-                prior.resolution,
-                broca_core::ReplayResolution::AuthRequired {
-                    reason: broca_protocol::PauseReason::Restart,
-                    ..
+            let resume = match &prior.resolution {
+                broca_core::ReplayResolution::AuthRequired { reason, .. } => match reason {
+                    broca_protocol::PauseReason::Restart => true,
+                    broca_protocol::PauseReason::AuthRequired
+                    | broca_protocol::PauseReason::ToolHeld => false,
+                },
+                broca_core::ReplayResolution::ProviderHeld {
+                    pending, open_held, ..
+                } => {
+                    open_held.is_empty()
+                        || !pending.deferred.is_empty()
+                        || !pending.approved.is_empty()
                 }
-            ) {
+                broca_core::ReplayResolution::Resume { .. }
+                | broca_core::ReplayResolution::Interrupted { .. }
+                | broca_core::ReplayResolution::LineageIdle { .. } => false,
+            };
+            if !resume {
                 continue;
             }
             let result = async {

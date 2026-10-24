@@ -65,6 +65,17 @@ pub fn not_dispatched_result(tool_call_id: &ToolCallId) -> ToolResult {
     }
 }
 
+/// A provider-held call has a known owner, so crash close-out must not claim an unknown outcome.
+pub fn provider_held_interrupted_result(tool_call_id: &ToolCallId) -> ToolResult {
+    ToolResult {
+        tool_call_id: tool_call_id.clone(),
+        output: ToolOutput::Error {
+            message: "provider_held_interrupted: the run was interrupted while the provider held the call".into(),
+        },
+        is_error: true,
+    }
+}
+
 /// The resume record for the last episode of `prior`, resumed from the record at
 /// `resumed_from_seq`, about to redo `redone`.
 ///
@@ -77,7 +88,10 @@ pub fn resume_started_record(
 ) -> WalRecord {
     let indeterminate = match &prior.resolution {
         ReplayResolution::Interrupted { indeterminate } => indeterminate.clone(),
-        _ => Vec::new(),
+        ReplayResolution::LineageIdle { .. }
+        | ReplayResolution::Resume { .. }
+        | ReplayResolution::AuthRequired { .. }
+        | ReplayResolution::ProviderHeld { .. } => Vec::new(),
     };
     let tool_results = prior.open_tool_batch.as_ref().map_or(0, |batch| {
         batch
@@ -120,7 +134,10 @@ pub fn planned_redo(prior: &ReplayState) -> Vec<ResumeRedo> {
         ReplayResolution::Resume { pending: None } => vec![ResumeRedo::ModelStep {
             step_id: broca_protocol::StepId(prior.completed_steps + 1),
         }],
-        _ => Vec::new(),
+        ReplayResolution::LineageIdle { .. }
+        | ReplayResolution::Interrupted { .. }
+        | ReplayResolution::AuthRequired { .. }
+        | ReplayResolution::ProviderHeld { .. } => Vec::new(),
     }
 }
 
@@ -162,10 +179,15 @@ pub fn close_out_open_batch(
         return Vec::new();
     };
     if !matches!(prior.resolution, ReplayResolution::Interrupted { .. })
-        && !batch
-            .calls
-            .iter()
-            .any(|(_, state)| matches!(state, OpenCallState::Deferred | OpenCallState::Approved))
+        && !batch.calls.iter().any(|(_, state)| {
+            matches!(
+                state,
+                OpenCallState::Deferred
+                    | OpenCallState::Approved
+                    | OpenCallState::ProviderHeld
+                    | OpenCallState::HeldSuccessor
+            )
+        })
     {
         return Vec::new();
     }
@@ -185,7 +207,14 @@ pub fn close_out_open_batch(
                 outcome_unknown_result(tool_call_id),
                 DispatchOutcome::Unknown,
             ),
-            OpenCallState::NotSent | OpenCallState::Deferred | OpenCallState::Approved => (
+            OpenCallState::ProviderHeld => (
+                provider_held_interrupted_result(tool_call_id),
+                DispatchOutcome::Interrupted,
+            ),
+            OpenCallState::NotSent
+            | OpenCallState::Deferred
+            | OpenCallState::Approved
+            | OpenCallState::HeldSuccessor => (
                 not_dispatched_result(tool_call_id),
                 DispatchOutcome::Interrupted,
             ),
@@ -196,7 +225,8 @@ pub fn close_out_open_batch(
             batch_id: batch.batch_id.clone(),
             result: Arc::new(result),
             outcome,
-            reason: None,
+            reason: (*state == OpenCallState::ProviderHeld)
+                .then(|| "provider_held_interrupted".into()),
             withdraw_elicitation,
             provider_held: None,
         });
@@ -238,7 +268,11 @@ pub fn close_out_pending_turn(prior: &ReplayState) -> Vec<WalRecord> {
             pending: Some(pending),
             ..
         } => pending,
-        _ => return Vec::new(),
+        ReplayResolution::ProviderHeld { .. }
+        | ReplayResolution::Interrupted { .. }
+        | ReplayResolution::LineageIdle { .. }
+        | ReplayResolution::Resume { pending: None }
+        | ReplayResolution::AuthRequired { pending: None, .. } => return Vec::new(),
     };
     if !pending.deferred.is_empty() || !pending.approved.is_empty() {
         return Vec::new();
