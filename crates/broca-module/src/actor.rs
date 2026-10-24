@@ -3459,7 +3459,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     reason @ (broca_protocol::PauseReason::Restart
                     | broca_protocol::PauseReason::ToolHeld),
                 ))) => {
-                    if paused == run_id {
+                    if paused == run_id && reason == broca_protocol::PauseReason::ToolHeld {
                         return SendOutcome::Paused {
                             run_id,
                             reason,
