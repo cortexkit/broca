@@ -243,6 +243,7 @@ impl Daemon {
         std::fs::create_dir_all(config_path.parent().unwrap()).expect("create subc config dir");
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
         if let Some(catalog) = catalog {
+            let catalog = super::routing_fixture::with_served_routing(catalog);
             let catalog_path = runtime_dir.join("broca-state/catalog/fusiform-lkg.json");
             std::fs::create_dir_all(catalog_path.parent().unwrap()).expect("create catalog dir");
             std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap())

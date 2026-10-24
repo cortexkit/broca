@@ -1,18 +1,6 @@
 {
   "aliased": [
     {
-      "model": "google/antigravity-claude-sonnet-4-6-thinking",
-      "source_ref": "antigravity-auth@44eb8fa0ddd93e236942b9b36f9bb10fa2abde6d packages/core/src/model-registry.ts (RESOLVER_ALIASES), resolved by packages/core/src/transform/model-resolver.ts (resolveModelWithTier)",
-      "target_model_id": "claude-sonnet-4-6",
-      "target_provider_id": "anthropic"
-    },
-    {
-      "model": "google/antigravity-gemini-3.5-flash",
-      "source_ref": "broca test row (not a Fusiform row): exercise the live Antigravity 3.5-flash route's catalog-defined minimal level against its low/high backend tiers",
-      "target_model_id": "gemini-3.5-flash",
-      "target_provider_id": "google"
-    },
-    {
       "model": "google/antigravity-gemini-3.6-flash",
       "source_ref": "antigravity-auth@44eb8fa0ddd93e236942b9b36f9bb10fa2abde6d packages/core/src/model-registry.ts (GEMINI_36_FLASH_ROUTES), resolved by packages/core/src/transform/model-resolver.ts (resolveModelWithTier)",
       "target_model_id": "gemini-3.6-flash",
@@ -21,18 +9,6 @@
     {
       "model": "google/antigravity-gemini-3.8-flash",
       "source_ref": "antigravity-auth@44eb8fa0ddd93e236942b9b36f9bb10fa2abde6d packages/core/src/model-registry.ts (GEMINI_38_FLASH_ROUTES), resolved by packages/core/src/transform/model-resolver.ts (resolveModelWithTier)",
-      "target_model_id": "gemini-3.8-flash",
-      "target_provider_id": "google"
-    },
-    {
-      "model": "google/antigravity-claude-opus-4-6-thinking",
-      "source_ref": "broca test row (not a Fusiform row): exercise the live non-Gemini Antigravity Claude Opus route, which has no Code Assist backend tiers",
-      "target_model_id": "claude-opus-4-6",
-      "target_provider_id": "anthropic"
-    },
-    {
-      "model": "google/gemini-3.8-flash-high",
-      "source_ref": "broca test row (not a Fusiform row): tier-id row derived from the served Antigravity 3.8-flash alias options",
       "target_model_id": "gemini-3.8-flash",
       "target_provider_id": "google"
     }
@@ -63,7 +39,15 @@
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 1000000,
-      "limit.output": 128000
+      "limit.output": 128000,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/anthropic"
+      },
+      "wire.api": {
+        "value": "https://api.anthropic.com",
+        "from": "provider"
+      }
     },
     "anthropic/claude-sonnet-4-5": {
       "capability.attachment": true,
@@ -77,7 +61,15 @@
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 200000,
-      "limit.output": 64000
+      "limit.output": 64000,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/anthropic"
+      },
+      "wire.api": {
+        "value": "https://api.anthropic.com",
+        "from": "provider"
+      }
     },
     "anyapi/anthropic/claude-opus-4-6": {
       "capability.attachment": true,
@@ -103,7 +95,15 @@
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 1000000,
-      "limit.output": 128000
+      "limit.output": 128000,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.anyapi.ai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
     },
     "google/gemini-2.5-flash": {
       "capability.attachment": true,
@@ -121,7 +121,15 @@
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 1048576,
-      "limit.output": 65536
+      "limit.output": 65536,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      },
+      "wire.api": {
+        "value": "https://generativelanguage.googleapis.com/v1beta",
+        "from": "provider"
+      }
     },
     "google/gemini-3.5-flash": {
       "capability.attachment": true,
@@ -140,7 +148,15 @@
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 1048576,
-      "limit.output": 65536
+      "limit.output": 65536,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/google"
+      },
+      "wire.api": {
+        "value": "https://generativelanguage.googleapis.com/v1beta",
+        "from": "provider"
+      }
     },
     "google/gemini-3.6-flash-high": {
       "capability.attachment": true,
@@ -159,7 +175,15 @@
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 1048576,
-      "limit.output": 65536
+      "limit.output": 65536,
+      "wire.npm": {
+        "value": "@ai-sdk/google",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://generativelanguage.googleapis.com/v1beta",
+        "from": "provider"
+      }
     },
     "nebius/Qwen/Qwen3-Next-80B-A3B-Thinking": {
       "capability.attachment": false,
@@ -168,7 +192,15 @@
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": null,
-      "limit.output": null
+      "limit.output": null,
+      "wire.npm": {
+        "value": "@ai-sdk/openai-compatible",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://api.tokenfactory.nebius.com/v1",
+        "from": "provider"
+      }
     },
     "openai/gpt-5.6-luna": {
       "capability.attachment": true,
@@ -188,7 +220,15 @@
       ],
       "capability.tool_call": true,
       "existence": "present",
-      "limit.context": 1050000
+      "limit.context": 1050000,
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      },
+      "wire.api": {
+        "value": "https://api.openai.com/v1",
+        "from": "provider"
+      }
     },
     "sarvam/sarvam-30b": {
       "capability.attachment": false,
@@ -223,7 +263,15 @@
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 65536,
-      "limit.output": 8192
+      "limit.output": 8192,
+      "wire.api": {
+        "from": "provider",
+        "value": "https://api.sarvam.ai/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai-compatible"
+      }
     },
     "synthetic/unknown-reasoning": {
       "capability.attachment": null,
@@ -232,7 +280,15 @@
       "capability.tool_call": null,
       "existence": "present",
       "limit.context": 128000,
-      "limit.output": 8192
+      "limit.output": 8192,
+      "wire.npm": {
+        "value": "@ai-sdk/openai-compatible",
+        "from": "provider"
+      },
+      "wire.api": {
+        "value": "https://api.synthetic.new/openai/v1",
+        "from": "provider"
+      }
     },
     "google/antigravity-gemini-4-argon": {
       "capability.attachment": true,
@@ -240,13 +296,23 @@
       "capability.reasoning_options": [
         {
           "type": "effort",
-          "values": ["low", "medium", "high"]
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
         }
       ],
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 1048576,
-      "limit.output": 65536
+      "limit.output": 65536,
+      "route.reasoning_default": "medium",
+      "route.reasoning_wire_ids": {
+        "high": "gemini-4-argon-high",
+        "low": "gemini-4-argon-low",
+        "medium": "gemini-4-argon-medium"
+      }
     },
     "google/antigravity-gemini-3.8-flash": {
       "capability.attachment": true,
@@ -324,23 +390,22 @@
           "policy": "models-dev-usd-v1"
         },
         "units": 3750000000
+      },
+      "route.reasoning_default": "medium",
+      "route.reasoning_wire_ids": {
+        "high": "gemini-3.8-flash-high",
+        "low": "gemini-3.8-flash-low",
+        "medium": "gemini-3.8-flash-medium"
       }
     },
-    "google/antigravity-gemini-3.5-flash": {
-      "capability.attachment": true,
-      "capability.reasoning": true,
-      "capability.reasoning_options": [
-        {
-          "type": "effort",
-          "values": ["minimal", "low", "medium", "high"]
-        }
-      ],
-      "capability.tool_call": true,
-      "existence": "present",
-      "limit.context": 1048576,
-      "limit.output": 65536
-    },
     "google/antigravity-gemini-3.6-flash": {
+      "existence": "absent",
+      "successor": "google/antigravity-gemini-3.8-flash"
+    },
+    "google/antigravity-claude-sonnet-4-6-thinking": {
+      "existence": "absent"
+    },
+    "google/antigravity-fixture-tier-model": {
       "capability.attachment": true,
       "capability.reasoning": true,
       "capability.reasoning_options": [
@@ -357,23 +422,14 @@
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 1048576,
-      "limit.output": 65536
+      "limit.output": 65536,
+      "route.reasoning_wire_ids": {
+        "low": "gemini-3.8-flash-low",
+        "high": "gemini-3.8-flash-high"
+      },
+      "route.reasoning_default": "low"
     },
-    "google/antigravity-claude-opus-4-6-thinking": {
-      "capability.attachment": true,
-      "capability.reasoning": true,
-      "capability.reasoning_options": [
-        {
-          "type": "effort",
-          "values": ["low", "medium", "high", "max"]
-        }
-      ],
-      "capability.tool_call": true,
-      "existence": "present",
-      "limit.context": 1000000,
-      "limit.output": 128000
-    },
-    "google/antigravity-claude-sonnet-4-6-thinking": {
+    "google/antigravity-fixture-no-tiers": {
       "capability.attachment": true,
       "capability.reasoning": true,
       "capability.reasoning_options": [
@@ -385,32 +441,15 @@
             "high",
             "max"
           ]
-        },
-        {
-          "type": "budget_tokens",
-          "min": 1024
         }
       ],
       "capability.tool_call": true,
       "existence": "present",
       "limit.context": 1000000,
       "limit.output": 128000
-    },
-    "google/gemini-3.8-flash-high": {
-      "capability.attachment": true,
-      "capability.reasoning": true,
-      "capability.reasoning_options": [
-        {
-          "type": "effort",
-          "values": ["low", "medium", "high"]
-        }
-      ],
-      "capability.tool_call": true,
-      "existence": "present",
-      "limit.context": 1048576,
-      "limit.output": 65536
     }
   },
   "resolved_at_ms": 1,
-  "source": "models.dev"
+  "source": "models.dev",
+  "_comment": "Synthetic reasoning-admission fixture. Native endpoint facts keep renderer tests independent of provider SDK defaults; opaque fixture aliases exercise missing tiers without claiming that an upstream model exists."
 }

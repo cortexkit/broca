@@ -17,8 +17,8 @@ mod gated {
     use std::sync::Arc;
 
     use broca_catalog::live::{
-        AuthMethod, AuthMode, EpisodeRenderConfig, FrozenRenderConfig, FrozenVariant,
-        ResolutionError, ResolveOptions, WireFamilyId,
+        AuthMethod, AuthMode, EpisodeRenderConfig, FrozenRenderConfig, ResolutionError,
+        ResolveOptions, WireFamilyId,
     };
     use broca_catalog::{CatalogCache, CatalogSource, FusiformCatalogResponse};
     use broca_protocol::{
@@ -49,7 +49,7 @@ mod gated {
 
     fn resolve(
         variant: Option<&str>,
-        restored: Option<&FrozenVariant>,
+        restored: Option<&FrozenRenderConfig>,
     ) -> Result<FrozenRenderConfig, ResolutionError> {
         let options = ResolveOptions {
             auth_method: Some(AuthMethod::Antigravity),
@@ -59,11 +59,12 @@ mod gated {
             ..ResolveOptions::default()
         };
         let render = EpisodeRenderConfig {
+            recorded_config: restored,
             codeassist_identity: None,
             claude_code_persona: Default::default(),
             base_url: None,
             max_output_tokens: None,
-            variant: restored,
+            variant: None,
             service_tier: None,
             thinking_echo_scope: None,
             thinking_cross_model: None,
@@ -116,7 +117,7 @@ mod gated {
         install(true);
         let admitted = resolve(Some("high"), None).expect("variant admitted with a catalog row");
         assert_eq!(admitted.wire_model_id, "gemini-3.8-flash-high");
-        let frozen_variant = admitted.variant.clone().expect("the variant is frozen");
+        assert!(admitted.variant.is_some(), "the variant is frozen");
 
         install(false);
         // Fresh variants require a catalog row, but resume uses the variant frozen at admission.
@@ -127,7 +128,7 @@ mod gated {
         assert!(refusal.reason.contains("the catalog has no row"));
         assert!(refusal.defined.is_empty());
 
-        let resumed = resolve(None, Some(&frozen_variant)).expect("frozen variant resumes");
+        let resumed = resolve(None, Some(&admitted)).expect("frozen variant resumes");
         assert_eq!(resumed.wire_model_id, "gemini-3.8-flash-high");
         assert_eq!(resumed.variant, admitted.variant);
         assert_eq!(

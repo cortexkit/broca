@@ -6,7 +6,15 @@
       "capability.reasoning": false,
       "capability.tool_call": true,
       "existence": "present",
-      "limit.context": 128000
+      "limit.context": 128000,
+      "wire.api": {
+        "from": "curated",
+        "value": "https://api.openai.com/v1"
+      },
+      "wire.npm": {
+        "from": "provider",
+        "value": "@ai-sdk/openai"
+      }
     }
   },
   "resolved_at_ms": 1786627685419,

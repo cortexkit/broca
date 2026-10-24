@@ -1,0 +1,861 @@
+[
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-6-luna"
+    },
+    "usage": {
+      "last_run_ms": 1792755481720,
+      "model": "openai/gpt-6-luna",
+      "runs_30d": 133735
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.meta.ai/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "muse-spark-1.3-contributor"
+    },
+    "usage": {
+      "last_run_ms": 1792749638316,
+      "model": "meta/muse-spark-1.3-contributor",
+      "runs_30d": 38087
+    }
+  },
+  {
+    "route": {
+      "base_url": "",
+      "family": "gemini",
+      "tiers": {},
+      "wire_model_id": "gemini-3.8-flash"
+    },
+    "usage": {
+      "last_run_ms": 1791687585883,
+      "model": "google/gemini-3.8-flash",
+      "runs_30d": 22115
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-6.1-sol"
+    },
+    "usage": {
+      "last_run_ms": 1792755397954,
+      "model": "openai/gpt-6.1-sol",
+      "runs_30d": 15896
+    }
+  },
+  {
+    "route": {
+      "base_url": "",
+      "family": "anthropic_messages",
+      "tiers": {},
+      "wire_model_id": "claude-opus-5-5"
+    },
+    "usage": {
+      "last_run_ms": 1792755400776,
+      "model": "anthropic/claude-opus-5-5",
+      "runs_30d": 10211
+    }
+  },
+  {
+    "route": {
+      "base_url": "<family default>",
+      "family": "google_codeassist",
+      "tiers": {
+        "high": "gemini-3.8-flash-high",
+        "low": "gemini-3.8-flash-low",
+        "medium": "gemini-3.8-flash-medium"
+      },
+      "wire_model_id": "gemini-3.8-flash-medium"
+    },
+    "usage": {
+      "last_run_ms": 1792521296231,
+      "model": "google/antigravity-gemini-3.8-flash",
+      "runs_30d": 2108
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-6-astra"
+    },
+    "usage": {
+      "last_run_ms": 1792755391052,
+      "model": "openai/gpt-6-astra",
+      "runs_30d": 1626
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-6-sol"
+    },
+    "usage": {
+      "last_run_ms": 1790872572755,
+      "model": "openai/gpt-6-sol",
+      "runs_30d": 1060
+    }
+  },
+  {
+    "route": {
+      "base_url": "",
+      "family": "anthropic_messages",
+      "tiers": {},
+      "wire_model_id": "claude-fable-5-1"
+    },
+    "usage": {
+      "last_run_ms": 1792164561535,
+      "model": "anthropic/claude-fable-5-1",
+      "runs_30d": 824
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.x.ai/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "grok-4.7"
+    },
+    "usage": {
+      "last_run_ms": 1792241687398,
+      "model": "xai/grok-4.7",
+      "runs_30d": 592
+    }
+  },
+  {
+    "route": {
+      "base_url": "",
+      "family": "anthropic_messages",
+      "tiers": {},
+      "wire_model_id": "claude-opus-5"
+    },
+    "usage": {
+      "last_run_ms": 1792748631673,
+      "model": "anthropic/claude-opus-5",
+      "runs_30d": 517
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://ollama.com/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "glm-5.3-flash"
+    },
+    "usage": {
+      "last_run_ms": 1790958160336,
+      "model": "ollama-cloud/glm-5.3-flash",
+      "runs_30d": 498
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "openai/gpt-6-luna"
+    },
+    "usage": {
+      "last_run_ms": 1792266304749,
+      "model": "openrouter/openai/gpt-6-luna",
+      "runs_30d": 498
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.kimi.ai/coding/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "k3"
+    },
+    "usage": {
+      "last_run_ms": 1792286246972,
+      "model": "kimi-code-plan-global/k3",
+      "runs_30d": 443
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.deepseek.com",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "deepseek-flash"
+    },
+    "usage": {
+      "last_run_ms": 1792276444145,
+      "model": "deepseek/deepseek-flash",
+      "runs_30d": 405
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.meta.ai/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "muse-wonder-full-1.0"
+    },
+    "usage": {
+      "last_run_ms": 1792694413248,
+      "model": "meta/muse-wonder-full-1.0",
+      "runs_30d": 313
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-5.6"
+    },
+    "usage": {
+      "last_run_ms": 1792708023928,
+      "model": "openai/gpt-5.6",
+      "runs_30d": 176
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-daybreak-blue-latest"
+    },
+    "usage": {
+      "last_run_ms": 1792663221022,
+      "model": "openai/gpt-daybreak-blue-latest",
+      "runs_30d": 151
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.meta.ai/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "muse-wonder-1.0"
+    },
+    "usage": {
+      "last_run_ms": 1792141700359,
+      "model": "meta/muse-wonder-1.0",
+      "runs_30d": 137
+    }
+  },
+  {
+    "route": {
+      "base_url": "<family default>",
+      "family": "google_codeassist",
+      "tiers": {
+        "high": "gemini-4-argon-high",
+        "low": "gemini-4-argon-low",
+        "medium": "gemini-4-argon-medium"
+      },
+      "wire_model_id": "gemini-4-argon-medium"
+    },
+    "usage": {
+      "last_run_ms": 1792508628576,
+      "model": "google/antigravity-gemini-4-argon",
+      "runs_30d": 128
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "deepseek/deepseek-v4.1-flash"
+    },
+    "usage": {
+      "last_run_ms": 1791283776825,
+      "model": "openrouter/deepseek/deepseek-v4.1-flash",
+      "runs_30d": 90
+    }
+  },
+  {
+    "route": {
+      "refused": "no served catalog row"
+    },
+    "usage": {
+      "last_run_ms": 1791292250918,
+      "model": "import/import",
+      "runs_30d": 71
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://ollama.com/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "deepseek-v4.1-flash"
+    },
+    "usage": {
+      "last_run_ms": 1790957371891,
+      "model": "ollama-cloud/deepseek-v4.1-flash",
+      "runs_30d": 42
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.kimi.ai/coding/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "k3-256k"
+    },
+    "usage": {
+      "last_run_ms": 1792755384496,
+      "model": "kimi-code-plan-global/k3-256k",
+      "runs_30d": 36
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-5.6-sol"
+    },
+    "usage": {
+      "last_run_ms": 1790952200761,
+      "model": "openai/gpt-5.6-sol",
+      "runs_30d": 35
+    }
+  },
+  {
+    "route": {
+      "base_url": "<family default>",
+      "family": "google_codeassist",
+      "tiers": {
+        "high": null,
+        "low": null,
+        "medium": null
+      },
+      "wire_model_id": "gemini-4-argon-low"
+    },
+    "usage": {
+      "last_run_ms": 1792254604440,
+      "model": "google/antigravity-gemini-4-argon-low",
+      "runs_30d": 31
+    }
+  },
+  {
+    "route": {
+      "base_url": "",
+      "family": "anthropic_messages",
+      "tiers": {},
+      "wire_model_id": "claude-sonnet-5"
+    },
+    "usage": {
+      "last_run_ms": 1790699287450,
+      "model": "anthropic/claude-sonnet-5",
+      "runs_30d": 17
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://opencode.ai/zen/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "muse-spark-1.3-contributor-free"
+    },
+    "usage": {
+      "last_run_ms": 1792258174609,
+      "model": "opencode/muse-spark-1.3-contributor-free",
+      "runs_30d": 12
+    }
+  },
+  {
+    "route": {
+      "base_url": "<family default>",
+      "family": "google_codeassist",
+      "tiers": {
+        "high": null,
+        "low": null,
+        "medium": null
+      },
+      "wire_model_id": "gemini-4-argon-high"
+    },
+    "usage": {
+      "last_run_ms": 1792255518439,
+      "model": "google/antigravity-gemini-4-argon-high",
+      "runs_30d": 12
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "openai/gpt-5.6-luna"
+    },
+    "usage": {
+      "last_run_ms": 1792265719933,
+      "model": "openrouter/openai/gpt-5.6-luna",
+      "runs_30d": 10
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.x.ai/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "grok-4.6"
+    },
+    "usage": {
+      "last_run_ms": 1790952965617,
+      "model": "xai/grok-4.6",
+      "runs_30d": 8
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-5.6-terra"
+    },
+    "usage": {
+      "last_run_ms": 1790952715626,
+      "model": "openai/gpt-5.6-terra",
+      "runs_30d": 8
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.meta.ai/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "muse-spark-1.3"
+    },
+    "usage": {
+      "last_run_ms": 1792465467475,
+      "model": "meta/muse-spark-1.3",
+      "runs_30d": 7
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "google/gemini-3.8-flash"
+    },
+    "usage": {
+      "last_run_ms": 1792266329272,
+      "model": "openrouter/google/gemini-3.8-flash",
+      "runs_30d": 7
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://ollama.com/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "minimax-m3"
+    },
+    "usage": {
+      "last_run_ms": 1790693481964,
+      "model": "ollama-cloud/minimax-m3",
+      "runs_30d": 6
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "openai/gpt-5.6-luna-pro"
+    },
+    "usage": {
+      "last_run_ms": 1792265712520,
+      "model": "openrouter/openai/gpt-5.6-luna-pro",
+      "runs_30d": 6
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://opencode.ai/zen/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "deepseek-v4-flash"
+    },
+    "usage": {
+      "last_run_ms": 1790699283619,
+      "model": "opencode/deepseek-v4-flash",
+      "runs_30d": 5
+    }
+  },
+  {
+    "route": {
+      "base_url": "",
+      "family": "anthropic_messages",
+      "tiers": {},
+      "wire_model_id": "claude-haiku-4-5"
+    },
+    "usage": {
+      "last_run_ms": 1792589968031,
+      "model": "anthropic/claude-haiku-4-5",
+      "runs_30d": 4
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://ollama.com/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "glm-5.3"
+    },
+    "usage": {
+      "last_run_ms": 1790958284023,
+      "model": "ollama-cloud/glm-5.3",
+      "runs_30d": 4
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.fireworks.ai/inference/v1/",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "accounts/fireworks/models/glm-5p3-flash"
+    },
+    "usage": {
+      "last_run_ms": 1792266837094,
+      "model": "fireworks-ai/accounts/fireworks/models/glm-5p3-flash",
+      "runs_30d": 4
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.fireworks.ai/inference/v1/",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "accounts/fireworks/routers/glm-flash-latest"
+    },
+    "usage": {
+      "last_run_ms": 1792266838958,
+      "model": "fireworks-ai/accounts/fireworks/routers/glm-flash-latest",
+      "runs_30d": 4
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.fireworks.ai/inference/v1/",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "accounts/fireworks/models/deepseek-v4p1-flash"
+    },
+    "usage": {
+      "last_run_ms": 1792266884401,
+      "model": "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+      "runs_30d": 4
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://opencode.ai/zen/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "deepseek-v4.1-flash"
+    },
+    "usage": {
+      "last_run_ms": 1792752380343,
+      "model": "opencode/deepseek-v4.1-flash",
+      "runs_30d": 4
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.fireworks.ai/inference/v1/",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "accounts/fireworks/routers/deepseek-flash-latest"
+    },
+    "usage": {
+      "last_run_ms": 1792266886669,
+      "model": "fireworks-ai/accounts/fireworks/routers/deepseek-flash-latest",
+      "runs_30d": 3
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.fireworks.ai/inference/v1/",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "accounts/fireworks/models/qwen3p8-max"
+    },
+    "usage": {
+      "last_run_ms": 1792266967626,
+      "model": "fireworks-ai/accounts/fireworks/models/qwen3p8-max",
+      "runs_30d": 3
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.fireworks.ai/inference/v1/",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "accounts/fireworks/routers/qwen-max-latest"
+    },
+    "usage": {
+      "last_run_ms": 1792266970070,
+      "model": "fireworks-ai/accounts/fireworks/routers/qwen-max-latest",
+      "runs_30d": 3
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.cline.bot/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "cline-pass/muse-spark-1.3-contributor"
+    },
+    "usage": {
+      "last_run_ms": 1792747968989,
+      "model": "cline-pass/cline-pass/muse-spark-1.3-contributor",
+      "runs_30d": 3
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.cline.bot/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "cline-pass/glm-5.3-flash"
+    },
+    "usage": {
+      "last_run_ms": 1792747972107,
+      "model": "cline-pass/cline-pass/glm-5.3-flash",
+      "runs_30d": 3
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "@cf/zai-org/glm-5.3-flash"
+    },
+    "usage": {
+      "last_run_ms": 1792747972951,
+      "model": "cloudflare-workers-ai/@cf/zai-org/glm-5.3-flash",
+      "runs_30d": 3
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.cline.bot/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "cline-pass/deepseek-v4.1-flash"
+    },
+    "usage": {
+      "last_run_ms": 1792747991570,
+      "model": "cline-pass/cline-pass/deepseek-v4.1-flash",
+      "runs_30d": 3
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-5.4-mini"
+    },
+    "usage": {
+      "last_run_ms": 1790370288717,
+      "model": "openai/gpt-5.4-mini",
+      "runs_30d": 2
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "openai/gpt-6-sol"
+    },
+    "usage": {
+      "last_run_ms": 1792266092657,
+      "model": "openrouter/openai/gpt-6-sol",
+      "runs_30d": 2
+    }
+  },
+  {
+    "route": {
+      "refused": "no served catalog row"
+    },
+    "usage": {
+      "last_run_ms": 1790275000321,
+      "model": "openai/gpt-5.6-luna-pro",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "refused": "no served catalog row"
+    },
+    "usage": {
+      "last_run_ms": 1790348823550,
+      "model": "openai/gpt-6-luna-pro",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "refused": "no served catalog row"
+    },
+    "usage": {
+      "last_run_ms": 1790370259231,
+      "model": "openai/gpt-6-luna-fast",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.openai.com/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-5.4"
+    },
+    "usage": {
+      "last_run_ms": 1790463383802,
+      "model": "openai/gpt-5.4",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "refused": "model 'google/antigravity-gemini-3.7-flash' is unservable: Google withdrew this Antigravity route; use 'google/antigravity-gemini-3.8-flash' (medium) instead"
+    },
+    "usage": {
+      "last_run_ms": 1792190286521,
+      "model": "google/antigravity-gemini-3.7-flash",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "openai/gpt-6.1-sol"
+    },
+    "usage": {
+      "last_run_ms": 1792265076164,
+      "model": "openrouter/openai/gpt-6.1-sol",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://opencode.ai/zen/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "deepseek-v4.1-flash-free"
+    },
+    "usage": {
+      "last_run_ms": 1792285902886,
+      "model": "opencode/deepseek-v4.1-flash-free",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.inceptionlabs.ai/v1/",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "mercury-2"
+    },
+    "usage": {
+      "last_run_ms": 1792630181804,
+      "model": "inception/mercury-2",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://opencode.ai/inference/go/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "minimax-m3.1-flash-free"
+    },
+    "usage": {
+      "last_run_ms": 1792680282554,
+      "model": "opencode-go/minimax-m3.1-flash-free",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://opencode.ai/inference/go/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "kimi-k2.7-code"
+    },
+    "usage": {
+      "last_run_ms": 1792680282752,
+      "model": "opencode-go/kimi-k2.7-code",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://opencode.ai/inference/go/v1",
+      "family": "openai_responses",
+      "tiers": {},
+      "wire_model_id": "gpt-6-luna"
+    },
+    "usage": {
+      "last_run_ms": 1792680283493,
+      "model": "opencode-go/gpt-6-luna",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.cline.bot/api/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "cline-pass/glm-5.3"
+    },
+    "usage": {
+      "last_run_ms": 1792747992541,
+      "model": "cline-pass/cline-pass/glm-5.3",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "@cf/zai-org/glm-5.2"
+    },
+    "usage": {
+      "last_run_ms": 1792747992919,
+      "model": "cloudflare-workers-ai/@cf/zai-org/glm-5.2",
+      "runs_30d": 1
+    }
+  },
+  {
+    "route": {
+      "base_url": "https://opencode.ai/inference/go/v1",
+      "family": "openai_chat",
+      "tiers": {},
+      "wire_model_id": "deepseek-v4.1-flash"
+    },
+    "usage": {
+      "last_run_ms": 1792752210586,
+      "model": "opencode-go/deepseek-v4.1-flash",
+      "runs_30d": 1
+    }
+  }
+]

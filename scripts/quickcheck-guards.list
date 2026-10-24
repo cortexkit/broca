@@ -32,10 +32,10 @@ broca-module-serve|it|transform_route_removed::|broca-module-serve/test-clock|cr
 broca-provider|it|fixture_coverage::|broca-provider/live,broca-provider/test-harness|crates/broca-provider/tests/it/fixture_coverage.rs|every_fixture_is_read_by_some_test|Inventories provider fixtures without starting a provider or daemon.
 # Pins the embedded served-payload fixture's wire shape.
 broca-catalog|it|fusiform_wire_fixture::|broca-catalog/live|crates/broca-catalog/tests/it/fusiform_wire_fixture.rs|the_served_shape_carries_the_facts_broca_consumes|Checks local catalog payload fixture data without network access.
-# Pins catalog endpoint values and their origin in embedded snapshot and overlay data.
-broca-catalog|it|base_url_pins::|broca-catalog/live|crates/broca-catalog/tests/it/base_url_pins.rs|every_overlay_base_url_pin_declares_its_source_and_is_nonempty|Checks catalog snapshot and overlay data from local fixtures only.
-# Pins the source and family for generated wire-family overlay entries.
-broca-catalog|it|wire_family_pins::|broca-catalog/live|crates/broca-catalog/tests/it/wire_family_pins.rs|every_overlay_wire_family_pin_declares_its_source|Keeps catalog family pins explicit rather than silently inherited.
+# Checks row endpoints and refusal of withheld routing facts.
+broca-catalog|it|base_url_pins::|broca-catalog/live|crates/broca-catalog/tests/it/base_url_pins.rs|served_apis_freeze_to_equivalent_full_request_urls|Checks served full URLs under SDK/renderer conventions and named missing-fact refusals.
+# Checks authored renderer exceptions rather than copied provider inventories.
+broca-catalog|it|wire_family_pins::|broca-catalog/live|crates/broca-catalog/tests/it/wire_family_pins.rs|overlay_cannot_restore_local_model_format_tables|Prevents a local model-format table from reappearing.
 # Checks test rigs use development-linked binaries rather than shipped names.
 broca-test-support|ckdev_guard|-|-|crates/broca-test-support/tests/ckdev_guard.rs|test_code_never_spawns_ck_binaries_under_production_names|Checks test rig launches use development-linked binaries rather than shipped names.
 # Checks long-lived test rigs use owned output files instead of runner stdio.

@@ -31,6 +31,8 @@
 mod common;
 #[path = "../delivery_rig/mod.rs"]
 mod delivery_rig;
+#[path = "../common/routing_fixture.rs"]
+mod routing_fixture;
 #[path = "../step_transform_rig/mod.rs"]
 mod step_transform_rig;
 

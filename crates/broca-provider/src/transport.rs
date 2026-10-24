@@ -875,13 +875,11 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         self.frozen.renderer_version
     }
 
-    /// The family's declared table decides, and only while this provider renders at its
-    /// family's current version: the declaration is about what the current code reproduces.
+    /// Only the current implementation's compatibility table can vouch for old bytes.
+    /// A version copied into the frozen config is not evidence that this code reproduces it.
     fn reproduces_renderer_version(&self, recorded: u32) -> bool {
         let family = self.frozen.family_id;
-        recorded == self.frozen.renderer_version
-            || (self.frozen.renderer_version == crate::families::renderer_version_for(family)
-                && crate::families::reproduces_renderer_version(family, recorded))
+        crate::families::reproduces_renderer_version(family, recorded)
     }
 
     /// The frozen config carries its renderer version, so a run recorded at an earlier version
@@ -10480,5 +10478,49 @@ mod windows_acl_tests {
         assert_private(&dir);
         assert_private(&path);
         assert_eq!(std::fs::read(&path).unwrap(), b"request body");
+    }
+}
+
+#[cfg(test)]
+mod recorded_version_authority_tests {
+    use crate::families::{
+        earlier_renderer_versions, frozen_config_for_family, EarlierRendererVersion,
+    };
+    use crate::spec::WireFamilyId;
+    use crate::wire::AuthHandle;
+    use broca_core::Provider;
+
+    #[test]
+    fn a_frozen_version_cannot_vouch_for_unsupported_renderer_bytes() {
+        let mut rejected = 0;
+        for family in [
+            WireFamilyId::OpenAiChat,
+            WireFamilyId::AnthropicMessages,
+            WireFamilyId::BedrockConverse,
+            WireFamilyId::OpenAiResponses,
+            WireFamilyId::OpenAiResponsesChatgpt,
+            WireFamilyId::GoogleCodeAssist,
+        ] {
+            for &(version, disposition) in earlier_renderer_versions(family) {
+                if !matches!(disposition, EarlierRendererVersion::NotReproducible(_)) {
+                    continue;
+                }
+                let mut frozen = frozen_config_for_family(family, "recorded-model");
+                frozen.renderer_version = version;
+                if family == WireFamilyId::GoogleCodeAssist {
+                    frozen.project_id = Some("fixture-project".into());
+                }
+                let provider = crate::factory::live_provider(frozen, AuthHandle::None).unwrap();
+                assert!(
+                    !provider.reproduces_renderer_version(version),
+                    "{family:?} cannot vouch for recorded version {version}"
+                );
+                rejected += 1;
+            }
+        }
+        assert!(
+            rejected >= 20,
+            "the guard must exercise every family's non-reproducible versions"
+        );
     }
 }

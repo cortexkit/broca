@@ -2183,146 +2183,64 @@ mod executor {
         Some((frozen_cache_policy(config), frozen_prompt_cache_key(config)))
     }
 
-    /// The output cap the episode froze at start. Read straight off the blob, like the recorded
-    /// host, so a blob the typed config cannot parse still restores the number it carries.
-    fn frozen_max_output_tokens(config: &broca_wal::RunConfig) -> Option<u32> {
-        config
-            .frozen_render_config
-            .get("max_output_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-    }
-
-    /// The reasoning variant the episode froze at start, re-applied as recorded on resume. Read
-    /// off the blob like the output cap, so a resume never re-derives it from the catalog.
-    fn frozen_variant(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::FrozenVariant> {
-        config
-            .frozen_render_config
-            .get("variant")
-            .and_then(|variant| serde_json::from_value(variant.clone()).ok())
-    }
-
-    /// The Anthropic thinking-echo scope the episode froze at start, re-applied on resume. A blob
-    /// recorded before the scope existed has no `echo_scope` key and reads back as the legacy
-    /// last-assistant-message scope, which is exactly what that episode rendered with.
-    fn frozen_thinking_echo_scope(
+    /// Decode the whole admission bundle so upstream routing changes cannot move a resumed run.
+    fn decode_recorded_render_config(
         config: &broca_wal::RunConfig,
-    ) -> Option<broca_catalog::live::ThinkingEchoScope> {
-        let reasoning = config.frozen_render_config.get("reasoning")?;
-        match serde_json::from_value(reasoning.clone()).ok()? {
-            broca_provider::policy::ReasoningPolicy::AnthropicInterleaved {
-                echo_scope, ..
-            } => Some(echo_scope),
-            _ => None,
+    ) -> Result<broca_provider::wire::FrozenRenderConfig, String> {
+        serde_json::from_value(config.frozen_render_config.clone())
+            .map_err(|error| format!("recorded provider render config cannot be decoded: {error}"))
+    }
+
+    /// An unreadable bundle has no renderer or transport. Passing this null identity to
+    /// core preserves its durable, permanent frozen_render_config_unverifiable refusal.
+    struct UnverifiableRecordedProvider;
+
+    #[async_trait]
+    impl broca_core::Provider for UnverifiableRecordedProvider {
+        async fn step(
+            &self,
+            _: broca_protocol::StepId,
+            _: &broca_protocol::CallOptions,
+        ) -> mpsc::Receiver<broca_protocol::NormalizedEvent> {
+            let (_, rx) = mpsc::channel(1);
+            rx
+        }
+        fn render_request(&self, _: &broca_protocol::CallOptions) -> Vec<u8> {
+            Vec::new()
+        }
+        fn renderer_version(&self) -> u32 {
+            0
+        }
+        fn reproduces_renderer_version(&self, _: u32) -> bool {
+            false
+        }
+        fn render_config_blob(&self) -> serde_json::Value {
+            serde_json::Value::Null
         }
     }
 
-    /// The Anthropic cross-model thinking rule the episode froze at start, re-applied on resume.
-    /// A blob recorded before the rule existed has no `cross_model` key and reads back as the
-    /// legacy same-model-only rule, which is exactly what that episode rendered with.
-    fn frozen_thinking_cross_model(
-        config: &broca_wal::RunConfig,
-    ) -> Option<broca_catalog::live::CrossModelThinking> {
-        let reasoning = config.frozen_render_config.get("reasoning")?;
-        match serde_json::from_value(reasoning.clone()).ok()? {
-            broca_provider::policy::ReasoningPolicy::AnthropicInterleaved {
-                cross_model, ..
-            } => Some(cross_model),
-            _ => None,
+    fn unverifiable_recorded_resolution(
+        model: &str,
+        method: Option<AuthMethod>,
+        family_override: Option<WireFamilyId>,
+    ) -> broca_catalog::live::ProviderResolution {
+        // This family value satisfies the executor's auth-method consistency check only;
+        // the null provider cannot render or send a request for any family.
+        let family = family_override.unwrap_or(WireFamilyId::OpenAiChat);
+        broca_catalog::live::ProviderResolution {
+            provider: Box::new(UnverifiableRecordedProvider),
+            auth_method: method,
+            family_id: family,
+            family: format!("{family:?}"),
+            base_url: "<unverifiable>".into(),
+            wire_model: model.into(),
+            auth_desc: "no transport for an unverifiable render config".into(),
+            provider_tag: model
+                .split_once('/')
+                .map_or("openai-compatible", |(provider, _)| provider)
+                .into(),
+            context_limit: None,
         }
-    }
-
-    /// The Claude Code persona the episode froze at start, re-applied on resume. A blob recorded
-    /// before the persona existed has no `claude_code_persona` key and reads back as `None`,
-    /// the shape that episode rendered with.
-    fn frozen_claude_code_persona(
-        config: &broca_wal::RunConfig,
-    ) -> Option<broca_catalog::live::ClaudeCodePersona> {
-        config
-            .frozen_render_config
-            .get("claude_code_persona")
-            .and_then(|persona| serde_json::from_value(persona.clone()).ok())
-    }
-
-    fn frozen_opencode_go_qwen_thinking(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("opencode_go_qwen_thinking")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_opencode_go_deepseek_thinking(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("opencode_go_deepseek_thinking")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_opencode_go_long_cache_retention_unsupported(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("opencode_go_long_cache_retention_unsupported")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_opencode_go_reasoning_signature(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("opencode_go_reasoning_signature")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_wire_family(config: &broca_wal::RunConfig) -> Option<WireFamilyId> {
-        serde_json::from_value(config.frozen_render_config.get("family_id")?.clone()).ok()
-    }
-
-    fn frozen_responses_tools_non_strict(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("responses_tools_non_strict")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    /// Whether the episode froze the DeepSeek reasoning echo. A config recorded before DeepSeek
-    /// was opted in has no field and reads as false, so its resume keeps the bytes it was sending.
-    fn frozen_reasoning_content_required(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("reasoning_content_required")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    fn frozen_reasoning_echo(
-        config: &broca_wal::RunConfig,
-    ) -> Option<broca_provider::policy::ReasoningEchoPolicy> {
-        config
-            .frozen_render_config
-            .get("reasoning_echo")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-    }
-
-    /// Whether the episode froze provider text state (Responses message phases and Gemini text
-    /// signatures). A config recorded before the flag existed has no field and reads as false.
-    fn frozen_provider_text_state(config: &broca_wal::RunConfig) -> bool {
-        config
-            .frozen_render_config
-            .get("provider_text_state")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
-    /// The service tier the episode was admitted with, re-applied on resume from the durable
-    /// `RunConfig` rather than the resuming send, and without re-checking the catalog's rates.
-    fn frozen_service_tier(
-        config: &broca_wal::RunConfig,
-    ) -> Option<broca_catalog::live::ServiceTier> {
-        config.service_tier
     }
 
     fn context_limit_for_episode(
@@ -3722,10 +3640,6 @@ mod executor {
                 }
                 _ => None,
             };
-            let restored_persona = prior_run
-                .as_ref()
-                .filter(|_| !fresh_episode)
-                .and_then(|prior| frozen_claude_code_persona(&prior.config));
             let opencode_go_session_id =
                 if job.req.model.provider_module_id.as_str() == "opencode-go" {
                     Some(broca_module_serve::opencode_go_identity::for_session(
@@ -3734,35 +3648,24 @@ mod executor {
                 } else {
                     None
                 };
-            let opencode_go_reasoning_signature = prior_run
-                .as_ref()
-                .filter(|_| {
-                    !fresh_episode && job.req.model.provider_module_id.as_str() == "opencode-go"
-                })
-                .map(|prior| frozen_opencode_go_reasoning_signature(&prior.config));
-            let opencode_go_wire_family = prior_run
-                .as_ref()
-                .filter(|_| {
-                    !fresh_episode && job.req.model.provider_module_id.as_str() == "opencode-go"
-                })
-                .and_then(|prior| frozen_wire_family(&prior.config));
-            let codeassist_identity = match broca_module_serve::codeassist_identity::for_episode(
-                &job.req.session,
-                prior_run
-                    .as_ref()
-                    .filter(|_| !fresh_episode)
-                    .map(|prior| &prior.config.frozen_render_config),
-                prior_snapshot.head_seq,
-                epoch_millis().max(0) as u64,
-            ) {
-                Ok(identity) => identity,
-                Err(error) => {
-                    let error = format!("invalid recorded Code Assist identity: {error}");
-                    if let Some(ack) = job.on_admitted {
-                        let _ = ack.send(Err(RunError::Config(error.clone())));
+            let codeassist_identity = if fresh_episode {
+                match broca_module_serve::codeassist_identity::for_episode(
+                    &job.req.session,
+                    None,
+                    prior_snapshot.head_seq,
+                    epoch_millis().max(0) as u64,
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        let error = format!("Code Assist identity unavailable: {error}");
+                        if let Some(ack) = job.on_admitted {
+                            let _ = ack.send(Err(RunError::Config(error.clone())));
+                        }
+                        return Err(RunError::Config(error));
                     }
-                    return Err(RunError::Config(error));
                 }
+            } else {
+                None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
                 claude_code_persona: fresh_persona.as_ref(),
@@ -3774,13 +3677,8 @@ mod executor {
                 account_id: resolution.account_id.as_deref(),
                 cache_policy: cache_policy.clone(),
                 prompt_cache_key: prompt_cache_key.as_deref(),
-                // Only a fresh episode resolves the caller's requested variant. A resume ignores
-                // the resuming send's variant and re-applies the one frozen in the episode's
-                // render config (`restored_variant` below), matching core, which keeps the
-                // recorded `RunConfig.variant` on resume.
+                // Only fresh admissions resolve caller render choices; resume uses the bundle.
                 variant: job.req.variant.as_deref().filter(|_| fresh_episode),
-                // The same rule for the service tier: only a fresh episode checks and freezes
-                // the caller's tier; a resume re-applies the recorded one (below).
                 service_tier: job.req.service_tier.filter(|_| fresh_episode),
                 clock: Some(&self.clock),
                 frozen_account_ref: if fresh_episode {
@@ -3798,16 +3696,11 @@ mod executor {
                     .in_run_refresh
                     .as_ref()
                     .map(|refresh| refresh.refresher.clone()),
-                // Structured output is per run: only a fresh episode decides it from its own
-                // send. A resume re-applies the decision frozen in the episode (below).
                 structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
             };
             let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
-                family_override,
-                prior_run
-                    .as_ref()
-                    .filter(|_| !fresh_episode)
-                    .map(|prior| &prior.config.frozen_render_config),
+                family_override.filter(|_| fresh_episode),
+                None,
                 || {
                     let seed = match &self.claude_code_install_id {
                         Some(seed) => seed.clone(),
@@ -3840,150 +3733,54 @@ mod executor {
                     return Err(RunError::Config(error));
                 }
             };
-            let restored_structured_output = prior_run
+            // Endpoint, renderer and backend ids are admission inputs. Re-reading today's
+            // catalog would move or refuse an already admitted run after an upstream change.
+            let recorded_render_config = prior_run
                 .as_ref()
                 .filter(|_| !fresh_episode)
-                .and_then(|prior| {
-                    broca_protocol::structured_output::FrozenStructuredOutput::from_frozen_render_config(
-                        Some(&prior.config.frozen_render_config),
-                    )
-                });
-            let restored_variant = prior_run
-                .as_ref()
-                .filter(|_| !fresh_episode)
-                .and_then(|prior| frozen_variant(&prior.config));
+                .map(|prior| decode_recorded_render_config(&prior.config));
             // For a ChatGPT auth-at-start pause, this provider exists solely to satisfy the
             // core's provider type until resume rebuilds real credentials and runs the pre-call
             // refreeze check. The core durably writes RunStarted and RunPaused without rendering or
-            // calling the pause-only provider; every non-pause attempt, including repaired resume,
-            // takes the strict auth path.
-            let resolved = match resolve_provider_for_episode(
-                &model_id,
-                self.provider_base_url.as_deref(),
-                // Renderers use u32 caps; saturation preserves the caller's u64 in the
-                // admitted identity while never raising the effective request bound.
-                job.req
-                    .generation
-                    .max_output_tokens
-                    .map(|limit| limit.min(u64::from(u32::MAX)) as u32),
-                &resolution,
-                &resolve_options,
-                self.provider_client.clone(),
-                broca_catalog::live::EpisodeRenderConfig {
-                    wire_family: opencode_go_wire_family,
-                    opencode_go_session_id: opencode_go_session_id.as_deref(),
-                    opencode_go_reasoning_signature,
-                    opencode_go_qwen_thinking: prior_run
-                        .as_ref()
-                        .filter(|_| {
-                            !fresh_episode
-                                && job.req.model.provider_module_id.as_str() == "opencode-go"
-                        })
-                        .map(|prior| frozen_opencode_go_qwen_thinking(&prior.config)),
-                    opencode_go_deepseek_thinking: prior_run
-                        .as_ref()
-                        .filter(|_| {
-                            !fresh_episode
-                                && job.req.model.provider_module_id.as_str() == "opencode-go"
-                        })
-                        .map(|prior| frozen_opencode_go_deepseek_thinking(&prior.config)),
-                    opencode_go_long_cache_retention_unsupported: prior_run
-                        .as_ref()
-                        .filter(|_| {
-                            !fresh_episode
-                                && job.req.model.provider_module_id.as_str() == "opencode-go"
-                        })
-                        .map(|prior| {
-                            frozen_opencode_go_long_cache_retention_unsupported(&prior.config)
-                        }),
-                    codeassist_identity: codeassist_identity.as_ref(),
-                    chatgpt_wire: chatgpt_wire.as_ref(),
-                    // Only the host and the output cap are restored. Re-resolve other catalog
-                    // fields so core's frozen_render_config_drift guard remains a real
-                    // comparison on resume. Changing the operator override must not move an
-                    // existing episode.
-                    base_url: if let Some(prior) = prior_run.as_ref().filter(|_| !fresh_episode) {
-                        prior
-                            .config
-                            .frozen_render_config
-                            .get("base_url")
-                            .and_then(|value| value.as_str())
-                    } else {
-                        self.provider_overrides
-                            .base_url(job.req.model.provider_module_id.as_str())
-                    },
-                    // A send with no cap takes its default from the catalog's limit.output,
-                    // which moves with ordinary upstream churn. The default is an episode input
-                    // frozen once: a resume reuses the recorded number instead of re-deriving it,
-                    // so a moved catalog value cannot refuse the resume. A caller's explicit cap
-                    // still wins over this inside the resolver.
-                    max_output_tokens: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .and_then(|prior| frozen_max_output_tokens(&prior.config)),
-                    // The frozen variant is restored as recorded, never re-derived from a
-                    // catalog that may have changed since the episode was admitted.
-                    variant: restored_variant.as_ref(),
-                    // The admitted tier, from the durable RunConfig, never the resuming send.
-                    service_tier: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .and_then(|prior| frozen_service_tier(&prior.config)),
-                    // The thinking-echo scope is restored as recorded, so an episode admitted
-                    // before the tool-loop scope became the default resumes with its old bytes.
-                    thinking_echo_scope: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .and_then(|prior| frozen_thinking_echo_scope(&prior.config)),
-                    // The cross-model thinking rule is restored as recorded, so an episode
-                    // admitted while signed thinking was echoed only to the model that produced
-                    // it resumes with its old bytes.
-                    thinking_cross_model: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .and_then(|prior| frozen_thinking_cross_model(&prior.config)),
-                    chatgpt_effort_updates: prior_run.as_ref().filter(|_| !fresh_episode).map(
-                        |prior| {
-                            prior.config.frozen_render_config["chatgpt_effort_updates"]
-                                .as_bool()
-                                .unwrap_or(false)
+            // calling the pause-only provider. Verifiable non-pause attempts use strict auth;
+            // an unreadable bundle uses an inert identity solely for core's refusal path.
+            let resolved = match if let Some(Err(error)) = &recorded_render_config {
+                tracing::warn!(%error, "recorded render config is unverifiable");
+                Ok(unverifiable_recorded_resolution(
+                    &model_id,
+                    resolution.method,
+                    family_override,
+                ))
+            } else {
+                resolve_provider_for_episode(
+                    &model_id,
+                    self.provider_base_url.as_deref(),
+                    // Renderers use u32 caps; saturation preserves the caller's u64 in the
+                    // admitted identity while never raising the effective request bound.
+                    job.req
+                        .generation
+                        .max_output_tokens
+                        .map(|limit| limit.min(u64::from(u32::MAX)) as u32),
+                    &resolution,
+                    &resolve_options,
+                    self.provider_client.clone(),
+                    broca_catalog::live::EpisodeRenderConfig {
+                        recorded_config: recorded_render_config
+                            .as_ref()
+                            .and_then(|config| config.as_ref().ok()),
+                        opencode_go_session_id: opencode_go_session_id.as_deref(),
+                        codeassist_identity: codeassist_identity.as_ref(),
+                        chatgpt_wire: chatgpt_wire.as_ref(),
+                        base_url: if fresh_episode {
+                            self.provider_overrides
+                                .base_url(job.req.model.provider_module_id.as_str())
+                        } else {
+                            None
                         },
-                    ),
-                    // Restored as recorded: an absent field (an episode admitted before DeepSeek
-                    // was opted into the reasoning echo) reads back as false and keeps its bytes.
-                    reasoning_content_required: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .map(|prior| frozen_reasoning_content_required(&prior.config)),
-                    reasoning_echo: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .map(|prior| frozen_reasoning_echo(&prior.config)),
-                    // Restored as recorded. `provider_text_state` makes the Responses and Gemini
-                    // families echo message phases and text signatures. An episode admitted
-                    // before the flag existed has no such field in its frozen config; it reads
-                    // back as false, so the episode resumes without the echo and sends the bytes
-                    // its own renderer version sent.
-                    provider_text_state: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .map(|prior| frozen_provider_text_state(&prior.config)),
-                    // Older episodes omitted strict; only a fresh episode takes the new default.
-                    responses_tools_non_strict: prior_run
-                        .as_ref()
-                        .filter(|_| !fresh_episode)
-                        .map(|prior| frozen_responses_tools_non_strict(&prior.config)),
-                    // Restored as recorded, never re-decided from a catalog that may have moved.
-                    structured_output: restored_structured_output.as_ref(),
-                    // Restored as recorded, including a recorded absence: an OAuth episode
-                    // admitted before the persona existed resumes with its old bytes.
-                    claude_code_persona: if fresh_episode {
-                        broca_catalog::live::EpisodePersona::Fresh
-                    } else {
-                        broca_catalog::live::EpisodePersona::Recorded(restored_persona.as_ref())
+                        ..Default::default()
                     },
-                },
-            ) {
+                )
+            } {
                 Ok(r) => r,
                 Err(e) => {
                     // Pre-loop resolution failure → fire the admission ack with the error and
@@ -4236,6 +4033,7 @@ mod executor {
     mod tests {
         use super::*;
         include!("provider_override_tests.rs");
+        include!("recorded_resume_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
 

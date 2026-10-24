@@ -1,31 +1,50 @@
-//! Wire-family selection — the SINGLE place a provider's renderer is chosen.
+//! Map upstream wire packages and API shapes to Broca's implemented renderers.
 //!
-//! Family selection picks the RENDERER (the exact request bytes), so it is a
-//! byte-correctness decision and must be OUR call — never sourced from a
-//! catalog-controlled field that an upstream edit could silently change to re-route a
-//! native-grammar provider to the wrong renderer.
-//!
-//! The resolver order (first match wins):
-//!   1. an explicit `wire_family` in our overlay (the ultimate override);
-//!   2. a known provider id in our hand-table;
-//!   3. Pending, NEVER blind-defaulted (defaulting a native grammar to OpenAiChat
-//!      would mis-render).
-//!
-//! Overlay pins carry `wire_family_source`: `authored` means a person chose the
-//! family; `generated` means the retired npm/api inference produced it on one
-//! snapshot. The mark exists because a bare `wire_family` value cannot tell those
-//! apart, and treating an inherited inference as a human decision would make every
-//! pin look equally authoritative.
+//! Runtime admission requires a row's routing facts, except for credential-owned client
+//! personas. The provider-id resolver is compatibility metadata for old documents that
+//! did not contain packages; it is never permission to send when live wire facts are missing.
 
 use broca_provider::spec::WireFamilyId;
 
-/// Providers with a NATIVE grammar, mapped by provider id (rule 2). The renderer
-/// choice is ours; a provider appears here only once the listed family handles it.
+/// Meta subscription credentials require the Meta Responses client. This endpoint is
+/// credential policy, including for curated rows that have no models.dev wire metadata.
+pub(crate) fn credential_persona_route(
+    provider: &str,
+    method: &str,
+) -> Option<(WireFamilyId, &'static str)> {
+    (provider == "meta" && method == "oauth")
+        .then_some((WireFamilyId::OpenAiResponses, "https://api.meta.ai/v1"))
+}
+
+/// Translate an upstream SDK package and API shape into a renderer Broca implements.
+/// Package names describe the upstream protocol, not an endpoint or a model alias.
+/// Unknown shapes must not silently fall back to a different request grammar.
+pub fn wire_family(npm: &str, shape: Option<&str>) -> Option<WireFamilyId> {
+    use WireFamilyId::*;
+    match (npm, shape) {
+        ("@ai-sdk/openai", None | Some("responses")) => Some(OpenAiResponses),
+        ("@ai-sdk/xai", None | Some("responses")) => Some(OpenAiResponses),
+        ("@ai-sdk/openai" | "@ai-sdk/openai-compatible", Some("completions")) => Some(OpenAiChat),
+        ("@ai-sdk/openai-compatible" | "@ai-sdk/amazon-bedrock/mantle", Some("responses")) => {
+            Some(OpenAiResponses)
+        }
+        ("@ai-sdk/anthropic", None) => Some(AnthropicMessages),
+        ("@ai-sdk/google", None) => Some(Gemini),
+        ("@ai-sdk/amazon-bedrock", None) => Some(BedrockConverse),
+        (
+            "@ai-sdk/openai-compatible" | "@openrouter/ai-sdk-provider" | "@ai-sdk/cerebras",
+            None,
+        ) => Some(OpenAiChat),
+        _ => None,
+    }
+}
+
+/// Compatibility metadata for legacy documents with no package field. Published packages
+/// take precedence, and live admission still requires complete row routing facts.
 const NATIVE_FAMILIES: &[(&str, WireFamilyId)] = &[
     ("anthropic", WireFamilyId::AnthropicMessages),
     ("openai", WireFamilyId::OpenAiChat),
     ("google", WireFamilyId::Gemini),
-    ("amazon-bedrock", WireFamilyId::BedrockConverse),
 ];
 
 /// Which rule resolved a provider's family — recorded so the per-provider refresh
@@ -33,6 +52,10 @@ const NATIVE_FAMILIES: &[(&str, WireFamilyId)] = &[
 /// reclassification surfaces as a reviewed row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolutionSource {
+    /// A credential-owned client persona, independent of model metadata.
+    CredentialPersona,
+    /// An upstream wire package and API shape mapped to a Broca renderer.
+    WireFacts,
     /// An explicit `wire_family` in our overlay.
     Overlay,
     /// Our provider-id hand-table.
@@ -43,6 +66,8 @@ impl ResolutionSource {
     /// A stable lowercase tag for the report artifact.
     pub fn tag(self) -> &'static str {
         match self {
+            ResolutionSource::CredentialPersona => "credential_persona",
+            ResolutionSource::WireFacts => "wire_facts",
             ResolutionSource::Overlay => "overlay",
             ResolutionSource::ProviderId => "provider_id",
         }
@@ -81,11 +106,8 @@ pub fn resolve_provider_family(
             source: ResolutionSource::ProviderId,
         };
     }
-    // The npm allowlist (old rule 3) and `@ai-sdk/openai-compatible` fallback
-    // (old rule 4) were removed deliberately. 145 of 184 providers carried that
-    // single openai-compatible string, so one upstream repackaging would silently
-    // reclassify thousands of models. Family is overlay pin, then this hand-table,
-    // then Pending — an unpinned provider fails closed until someone pins it.
+    // This compatibility resolver does not inspect wire facts. Its callers must explicitly
+    // map a published package and shape; an unknown provider id alone names no renderer.
     FamilyResolution::Pending {
         reason: format!(
             "{provider_id}: no overlay wire_family pin and no provider-id hand-table entry"

@@ -1,0 +1,1204 @@
+{
+  "models": {
+    "anthropic/claude-fable-5-1": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000
+    },
+    "anthropic/claude-haiku-4-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "min": 1024,
+          "type": "budget_tokens"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 64000
+    },
+    "anthropic/claude-opus-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000
+    },
+    "anthropic/claude-opus-5-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000
+    },
+    "anthropic/claude-sonnet-5": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 128000
+    },
+    "cline-pass/cline-pass/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000
+    },
+    "cline-pass/cline-pass/glm-5.3": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072
+    },
+    "cline-pass/cline-pass/glm-5.3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072
+    },
+    "cline-pass/cline-pass/muse-spark-1.3-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072
+    },
+    "cloudflare-workers-ai/@cf/zai-org/glm-5.2": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 256000
+    },
+    "cloudflare-workers-ai/@cf/zai-org/glm-5.3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 1048576
+    },
+    "deepseek/deepseek-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 393216
+    },
+    "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000
+    },
+    "fireworks-ai/accounts/fireworks/models/glm-5p3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048573,
+      "limit.output": 131072
+    },
+    "fireworks-ai/accounts/fireworks/models/qwen3p8-max": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 131072
+    },
+    "fireworks-ai/accounts/fireworks/routers/deepseek-flash-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000
+    },
+    "fireworks-ai/accounts/fireworks/routers/glm-flash-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048573,
+      "limit.output": 131072
+    },
+    "fireworks-ai/accounts/fireworks/routers/qwen-max-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 131072
+    },
+    "google/antigravity-gemini-3.7-flash": {
+      "existence": "absent"
+    },
+    "google/antigravity-gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536
+    },
+    "google/antigravity-gemini-4-argon": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 32768
+    },
+    "google/gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536
+    },
+    "inception/mercury-2": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 128000,
+      "limit.output": 50000
+    },
+    "kimi-code-plan-global/k3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072
+    },
+    "kimi-code-plan-global/k3-256k": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 131072
+    },
+    "meta/muse-spark-1.3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072
+    },
+    "meta/muse-spark-1.3-contributor": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072
+    },
+    "meta/muse-wonder-1.0": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072
+    },
+    "meta/muse-wonder-full-1.0": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": null
+    },
+    "ollama-cloud/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 384000
+    },
+    "ollama-cloud/glm-5.3": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072
+    },
+    "ollama-cloud/glm-5.3-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 131072
+    },
+    "ollama-cloud/minimax-m3": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": false,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 512000,
+      "limit.output": 131072
+    },
+    "openai/gpt-5.4": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openai/gpt-5.4-mini": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 400000,
+      "limit.output": 128000
+    },
+    "openai/gpt-5.6": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openai/gpt-5.6-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openai/gpt-5.6-terra": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openai/gpt-6-astra": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openai/gpt-6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openai/gpt-6-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openai/gpt-6.1-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openai/gpt-daybreak-blue-latest": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "opencode-go/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000
+    },
+    "opencode-go/gpt-6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "opencode-go/kimi-k2.7-code": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 262144,
+      "limit.output": 262144
+    },
+    "opencode-go/minimax-m3.1-flash-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 512000
+    },
+    "opencode/deepseek-v4-flash": {
+      "capability.attachment": false,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000
+    },
+    "opencode/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1000000,
+      "limit.output": 384000
+    },
+    "opencode/deepseek-v4.1-flash-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 200000,
+      "limit.output": 32000
+    },
+    "opencode/muse-spark-1.3-contributor-free": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 131072
+    },
+    "openrouter/deepseek/deepseek-v4.1-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 943718
+    },
+    "openrouter/google/gemini-3.8-flash": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1048576,
+      "limit.output": 65536
+    },
+    "openrouter/openai/gpt-5.6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openrouter/openai/gpt-5.6-luna-pro": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openrouter/openai/gpt-6-luna": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openrouter/openai/gpt-6-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "openrouter/openai/gpt-6.1-sol": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 1050000,
+      "limit.output": 128000
+    },
+    "xai/grok-4.6": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 500000,
+      "limit.output": 500000
+    },
+    "xai/grok-4.7": {
+      "capability.attachment": true,
+      "capability.reasoning": true,
+      "capability.reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "capability.structured_output": true,
+      "capability.tool_call": true,
+      "existence": "present",
+      "limit.context": 500000,
+      "limit.output": 500000
+    }
+  },
+  "source": "models.dev",
+  "catalog_version": 1792752185906,
+  "resolved_at_ms": 1792753938487
+}

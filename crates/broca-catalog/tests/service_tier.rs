@@ -338,7 +338,7 @@ mod gated {
     #[test]
     fn code_assist_offers_no_tier() {
         let error = refusal(
-            "google/gemini-3.5-flash",
+            "google/antigravity-gemini-3.8-flash",
             AuthMethod::Antigravity,
             ServiceTier::Default,
         );

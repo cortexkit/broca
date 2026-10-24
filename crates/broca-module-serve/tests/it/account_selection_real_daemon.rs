@@ -886,7 +886,7 @@ impl Rig {
         // falls back to when the catalog module is unreachable, as on a cold start.
         std::fs::write(
             state_root.join("catalog").join("fusiform-lkg.json"),
-            serde_json::to_vec_pretty(&json!({
+            serde_json::to_vec_pretty(&super::routing_fixture::with_served_routing(json!({
                 "catalog_version": 1,
                 "models": {
                     format!("anthropic/{MODEL}"): {
@@ -931,7 +931,7 @@ impl Rig {
                         "limit.context": 1047576,
                         "limit.output": 32768,
                     },
-                    "google/gemini-3.8-flash-high": {
+                    "google/antigravity-gemini-3.8-flash": {
                         "capability.attachment": false,
                         "capability.reasoning": true,
                         "capability.tool_call": true,
@@ -942,7 +942,7 @@ impl Rig {
                 },
                 "resolved_at_ms": 1,
                 "source": "models.dev",
-            }))
+            })))
             .unwrap(),
         )
         .unwrap();

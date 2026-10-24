@@ -1,0 +1,937 @@
+{
+  "patch": {
+    "302ai": {
+      "base_url": "https://api.302.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "abacus": {
+      "base_url": "https://routellm.abacus.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "abliteration-ai": {
+      "base_url": "https://api.abliteration.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "above": {
+      "base_url": "https://api.above.dev/v1",
+      "wire_family": "openai_chat"
+    },
+    "agentrouter": {
+      "base_url": "https://agentrouter.org/v1",
+      "wire_family": "openai_chat"
+    },
+    "agnes": {
+      "base_url": "https://apihub.agnes-ai.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "ai-router": {
+      "base_url": "https://api.ai-router.dev/v1",
+      "wire_family": "openai_chat"
+    },
+    "ai21": {
+      "base_url": "https://api.ai21.com/studio/v1",
+      "wire_family": "openai_chat"
+    },
+    "aiand": {
+      "base_url": "https://api.aiand.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "ainetcafe": {
+      "base_url": "https://microquickjs.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "aixy": {
+      "base_url": "https://api.aixy-gateway.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "aki-io": {
+      "base_url": "https://aki.io/v1",
+      "wire_family": "openai_chat"
+    },
+    "alibaba": {
+      "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "wire_family": "openai_chat"
+    },
+    "alibaba-cn": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "wire_family": "openai_chat"
+    },
+    "alibaba-coding-plan": {
+      "base_url": "https://coding-intl.dashscope.aliyuncs.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "alibaba-coding-plan-cn": {
+      "base_url": "https://coding.dashscope.aliyuncs.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "alibaba-token-plan": {
+      "base_url": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+      "wire_family": "openai_chat"
+    },
+    "alibaba-token-plan-cn": {
+      "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "wire_family": "openai_chat"
+    },
+    "ambient": {
+      "base_url": "https://api.ambient.xyz/v1",
+      "wire_family": "openai_chat"
+    },
+    "amd": {
+      "base_url": "https://developer.amd.com.cn/radeon/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "anyapi": {
+      "base_url": "https://api.anyapi.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "arcee": {
+      "base_url": "https://api.arcee.ai/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "atomic-chat": {
+      "base_url": "http://127.0.0.1:1337/v1",
+      "wire_family": "openai_chat"
+    },
+    "auriko": {
+      "base_url": "https://api.auriko.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "bailing": {
+      "base_url": "https://api.tbox.cn/api/llm/v1/chat/completions",
+      "wire_family": "openai_chat"
+    },
+    "baseten": {
+      "base_url": "https://inference.baseten.co/v1",
+      "wire_family": "openai_chat"
+    },
+    "berget": {
+      "base_url": "https://api.berget.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "blueclaw": {
+      "base_url": "https://openai.blueclaw.network/v1",
+      "wire_family": "openai_chat"
+    },
+    "bothub": {
+      "base_url": "https://openai.bothub.ru/v1",
+      "wire_family": "openai_chat"
+    },
+    "cerebras": {
+      "base_url": "https://api.cerebras.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "chutes": {
+      "base_url": "https://llm.chutes.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "clarifai": {
+      "base_url": "https://api.clarifai.com/v2/ext/openai/v1",
+      "wire_family": "openai_chat"
+    },
+    "claudinio": {
+      "base_url": "https://api.claudin.io/v1",
+      "wire_family": "openai_chat"
+    },
+    "cline-pass": {
+      "base_url": "https://api.cline.bot/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "cloudferro-sherlock": {
+      "base_url": "https://api-sherlock.cloudferro.com/openai/v1/",
+      "wire_family": "openai_chat"
+    },
+    "cloudflare-workers-ai": {
+      "base_url": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "coralbricks": {
+      "base_url": "https://inference.coralbricks.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "cortecs": {
+      "base_url": "https://api.cortecs.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "crof": {
+      "base_url": "https://crof.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "crossmodel": {
+      "base_url": "https://api.crossmodel.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "crusoe": {
+      "base_url": "https://api.inference.crusoecloud.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "daoxe": {
+      "base_url": "https://daoxe.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "databricks": {
+      "base_url": "https://${DATABRICKS_HOST}/ai-gateway/mlflow/v1",
+      "wire_family": "openai_chat"
+    },
+    "deepseek": {
+      "base_url": "https://api.deepseek.com",
+      "wire_family": "openai_chat"
+    },
+    "digitalocean": {
+      "base_url": "https://inference.do-ai.run/v1",
+      "wire_family": "openai_chat"
+    },
+    "dinference": {
+      "base_url": "https://api.dinference.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "drun": {
+      "base_url": "https://chat.d.run/v1",
+      "wire_family": "openai_chat"
+    },
+    "ebcloud": {
+      "base_url": "https://maas-api.ebcloud.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "echo": {
+      "base_url": "https://echo.tracerml.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "edenai": {
+      "base_url": "https://api.edenai.run/v3",
+      "wire_family": "openai_chat"
+    },
+    "empiriolabs": {
+      "base_url": "https://api.empiriolabs.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "evroc": {
+      "base_url": "https://models.think.evroc.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "fastrouter": {
+      "base_url": "https://go.fastrouter.ai/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "fireworks-ai": {
+      "base_url": "https://api.fireworks.ai/inference/v1/",
+      "wire_family": "openai_chat"
+    },
+    "freemodel": {
+      "base_url": "https://cc.freemodel.dev/v1",
+      "wire_family": "anthropic_messages"
+    },
+    "friendli": {
+      "base_url": "https://api.friendli.ai/serverless/v1",
+      "wire_family": "openai_chat"
+    },
+    "frogbot": {
+      "base_url": "https://app.frogbot.ai/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "github-copilot": {
+      "base_url": "https://api.githubcopilot.com",
+      "wire_family": "openai_chat"
+    },
+    "gmicloud": {
+      "base_url": "https://api.gmi-serving.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "greenpt": {
+      "base_url": "https://api.greenpt.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "helicone": {
+      "base_url": "https://ai-gateway.helicone.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "hetzner": {
+      "base_url": "https://inference.hetzner.com/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "hpc-ai": {
+      "base_url": "https://api.hpc-ai.com/inference/v1",
+      "wire_family": "openai_chat"
+    },
+    "huggingface": {
+      "base_url": "https://router.huggingface.co/v1",
+      "wire_family": "openai_chat"
+    },
+    "hyper": {
+      "base_url": "https://hyper.charm.land/v1",
+      "wire_family": "openai_chat"
+    },
+    "iflowcn": {
+      "base_url": "https://apis.iflow.cn/v1",
+      "wire_family": "openai_chat"
+    },
+    "impossibl": {
+      "base_url": "https://api.impossibl.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "inception": {
+      "base_url": "https://api.inceptionlabs.ai/v1/",
+      "wire_family": "openai_chat"
+    },
+    "inceptron": {
+      "base_url": "https://api.inceptron.io/v1",
+      "wire_family": "openai_chat"
+    },
+    "inco": {
+      "base_url": "https://api.inco.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "infer": {
+      "base_url": "https://infer.flow7.org/v1",
+      "wire_family": "openai_chat"
+    },
+    "inference": {
+      "base_url": "https://inference.net/v1",
+      "wire_family": "openai_chat"
+    },
+    "inferx": {
+      "base_url": "https://model.inferx.net/endpoints/v1",
+      "wire_family": "openai_chat"
+    },
+    "infomaniak": {
+      "base_url": "https://api.infomaniak.com/2/ai/${INFOMANIAK_PRODUCT_ID}/openai/v1",
+      "wire_family": "openai_chat"
+    },
+    "io-net": {
+      "base_url": "https://api.intelligence.io.solutions/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "iteracompute": {
+      "base_url": "https://api.iteracompute.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "jalapeno": {
+      "base_url": "https://api.jalapeno-cloud.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "jiekou": {
+      "base_url": "https://api.jiekou.ai/openai",
+      "wire_family": "openai_chat"
+    },
+    "kenari": {
+      "base_url": "https://kenari.id/v1",
+      "wire_family": "openai_chat"
+    },
+    "kilo": {
+      "base_url": "https://api.kilo.ai/api/gateway",
+      "wire_family": "openai_chat"
+    },
+    "kimi-code-plan-cn": {
+      "base_url": "https://api.kimi.com/coding/v1",
+      "wire_family": "openai_chat"
+    },
+    "kimi-code-plan-global": {
+      "base_url": "https://api.kimi.ai/coding/v1",
+      "wire_family": "openai_chat"
+    },
+    "klokintegration": {
+      "base_url": "https://api-gw.klok.ipaas.se/proxy/kloker-key/v1",
+      "wire_family": "openai_chat"
+    },
+    "kosmik": {
+      "base_url": "https://api.koscompute.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "kuae-cloud-coding-plan": {
+      "base_url": "https://coding-plan-endpoint.kuaecloud.net/v1",
+      "wire_family": "openai_chat"
+    },
+    "lilac": {
+      "base_url": "https://api.getlilac.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "llama": {
+      "base_url": "https://api.llama.com/compat/v1/",
+      "wire_family": "openai_chat"
+    },
+    "llmgateway": {
+      "base_url": "https://api.llmgateway.io/v1",
+      "wire_family": "openai_chat"
+    },
+    "llmgateway-providers": {
+      "base_url": "https://api.llmgateway.io/v1",
+      "wire_family": "openai_chat"
+    },
+    "llmtech": {
+      "base_url": "https://api.llmtech.eu/v1",
+      "wire_family": "openai_chat"
+    },
+    "llmtr": {
+      "base_url": "https://llmtr.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "lmstudio": {
+      "base_url": "http://127.0.0.1:1234/v1",
+      "wire_family": "openai_chat"
+    },
+    "longcat": {
+      "base_url": "https://api.longcat.chat/openai",
+      "wire_family": "openai_chat"
+    },
+    "lucidquery": {
+      "base_url": "https://api.lucidquery.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "lynkr": {
+      "base_url": "http://127.0.0.1:8081/v1",
+      "wire_family": "openai_chat"
+    },
+    "meganova": {
+      "base_url": "https://api.meganova.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "melious": {
+      "base_url": "https://api.melious.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "merge-gateway": {
+      "base_url": "https://api-gateway.merge.dev/v1/ai-sdk"
+    },
+    "meta": {
+      "base_url": "https://api.meta.ai/v1",
+      "wire_family": "openai_responses"
+    },
+    "minimax": {
+      "base_url": "https://api.minimax.io/anthropic/v1",
+      "wire_family": "anthropic_messages"
+    },
+    "minimax-cn": {
+      "base_url": "https://api.minimaxi.com/anthropic/v1",
+      "wire_family": "anthropic_messages"
+    },
+    "minimax-cn-coding-plan": {
+      "base_url": "https://api.minimaxi.com/anthropic/v1",
+      "wire_family": "anthropic_messages"
+    },
+    "minimax-coding-plan": {
+      "base_url": "https://api.minimax.io/anthropic/v1",
+      "wire_family": "anthropic_messages"
+    },
+    "mixlayer": {
+      "base_url": "https://models.mixlayer.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "moark": {
+      "base_url": "https://moark.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "modal": {
+      "base_url": "https://inference.us-west.modal.direct/v1",
+      "wire_family": "openai_chat"
+    },
+    "model-oracle-ai": {
+      "base_url": "https://api.modeloracle.com/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "modelis": {
+      "base_url": "https://modelishub.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "modelscope": {
+      "base_url": "https://api-inference.modelscope.cn/v1",
+      "wire_family": "openai_chat"
+    },
+    "moonshotai": {
+      "base_url": "https://api.moonshot.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "moonshotai-cn": {
+      "base_url": "https://api.moonshot.cn/v1",
+      "wire_family": "openai_chat"
+    },
+    "morph": {
+      "base_url": "https://api.morphllm.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "nan": {
+      "base_url": "https://api.nan.builders/v1",
+      "wire_family": "openai_chat"
+    },
+    "nano-gpt": {
+      "base_url": "https://nano-gpt.com/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "nearai": {
+      "base_url": "https://cloud-api.near.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "nebius": {
+      "base_url": "https://api.tokenfactory.nebius.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "neon": {
+      "base_url": "${NEON_AI_GATEWAY_BASE_URL}/v1",
+      "wire_family": "openai_chat"
+    },
+    "neosmith": {
+      "base_url": "https://router.neosmith.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "neuralwatt": {
+      "base_url": "https://api.neuralwatt.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "nova": {
+      "base_url": "https://api.nova.amazon.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "novita-ai": {
+      "base_url": "https://api.novita.ai/openai",
+      "wire_family": "openai_chat"
+    },
+    "nvidia": {
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "oci": {
+      "base_url": "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/openai/v1",
+      "wire_family": "openai_chat"
+    },
+    "ofox": {
+      "base_url": "https://api.ofox.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "ollama-cloud": {
+      "base_url": "https://ollama.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "wire_family": "openai_responses",
+      "models": {
+        "chatgpt-image-latest": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-3.5-turbo": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4-turbo": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4.1": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4.1-mini": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4.1-nano": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o-2024-05-13": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o-2024-08-06": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o-2024-11-20": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-4o-mini": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-5.3-chat-latest": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-image-1": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-image-1-mini": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-image-1.5": {
+          "wire_family": "openai_chat"
+        },
+        "gpt-image-2": {
+          "wire_family": "openai_chat"
+        },
+        "text-embedding-3-large": {
+          "wire_family": "openai_chat"
+        },
+        "text-embedding-3-small": {
+          "wire_family": "openai_chat"
+        },
+        "text-embedding-ada-002": {
+          "wire_family": "openai_chat"
+        }
+      }
+    },
+    "opencode": {
+      "base_url": "https://opencode.ai/zen/v1",
+      "wire_family": "openai_chat"
+    },
+    "opencode-go": {
+      "base_url": "https://opencode.ai/inference/go/v1",
+      "wire_family": "openai_chat",
+      "models": {
+        "claude-haiku-5-5": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "gemini-4-argon-contributor": {
+          "base_url": "https://opencode.ai/inference/go/v1",
+          "wire_family": "gemini"
+        },
+        "gpt-5.6-luna": {
+          "wire_family": "openai_responses"
+        },
+        "gpt-6-luna": {
+          "wire_family": "openai_responses"
+        },
+        "grok-4.6": {
+          "wire_family": "openai_responses"
+        },
+        "grok-4.7": {
+          "wire_family": "openai_responses"
+        },
+        "minimax-m2.5": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "minimax-m2.7": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "minimax-m3": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "muse-spark-1.2-contributor": {
+          "wire_family": "openai_responses"
+        },
+        "muse-spark-1.3-contributor": {
+          "wire_family": "openai_responses"
+        },
+        "qwen3.5-plus": {
+          "wire_family": "openai_chat"
+        },
+        "qwen3.6-plus": {
+          "wire_family": "openai_chat"
+        },
+        "qwen3.7-plus": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "qwen3.8-flash": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        },
+        "qwen3.8-max": {
+          "base_url": "https://opencode.ai/inference/go",
+          "wire_family": "anthropic_messages"
+        }
+      }
+    },
+    "openreason": {
+      "base_url": "https://api.openreason.app/v1",
+      "wire_family": "openai_chat"
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "opper": {
+      "base_url": "https://api.opper.ai/v3/compat",
+      "wire_family": "openai_chat"
+    },
+    "orcarouter": {
+      "base_url": "https://api.orcarouter.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "ovhcloud": {
+      "base_url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+      "wire_family": "openai_chat"
+    },
+    "pendra": {
+      "base_url": "https://api.pendra.ai/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "perplexity-agent": {
+      "base_url": "https://api.perplexity.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "pioneer": {
+      "base_url": "https://api.pioneer.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "poe": {
+      "base_url": "https://api.poe.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "poolside": {
+      "base_url": "https://inference.poolside.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "privatemode-ai": {
+      "base_url": "http://localhost:8080/v1",
+      "wire_family": "openai_chat"
+    },
+    "qihang-ai": {
+      "base_url": "https://api.qhaigc.net/v1",
+      "wire_family": "openai_chat"
+    },
+    "qiniu-ai": {
+      "base_url": "https://api.qnaigc.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "regolo-ai": {
+      "base_url": "https://api.regolo.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "requesty": {
+      "base_url": "https://router.requesty.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "routing-run": {
+      "base_url": "https://api.routing.run/v1",
+      "wire_family": "openai_chat"
+    },
+    "runinfra": {
+      "base_url": "https://api.runinfra.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "sakana": {
+      "base_url": "https://api.sakana.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "sarvam": {
+      "base_url": "https://api.sarvam.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "scaleway": {
+      "base_url": "https://api.scaleway.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "scnet-token-plan": {
+      "base_url": "https://api.scnet.cn/api/llm/v1",
+      "wire_family": "openai_chat"
+    },
+    "scx-ai": {
+      "base_url": "https://api.scx.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "sensenova": {
+      "base_url": "https://token.sensenova.cn/v1",
+      "wire_family": "openai_chat"
+    },
+    "siliconflow": {
+      "base_url": "https://api.siliconflow.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "siliconflow-cn": {
+      "base_url": "https://api.siliconflow.cn/v1",
+      "wire_family": "openai_chat"
+    },
+    "snowflake-cortex": {
+      "base_url": "https://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com/api/v2/cortex/v1",
+      "wire_family": "openai_chat"
+    },
+    "stackit": {
+      "base_url": "https://api.openai-compat.model-serving.eu01.onstackit.cloud/v1",
+      "wire_family": "openai_chat"
+    },
+    "standardcompute": {
+      "base_url": "https://api.stdcmpt.com/v1"
+    },
+    "stepfun": {
+      "base_url": "https://api.stepfun.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "stepfun-ai": {
+      "base_url": "https://api.stepfun.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "stepfun-ai-step-plan": {
+      "base_url": "https://api.stepfun.ai/step_plan/v1",
+      "wire_family": "openai_chat"
+    },
+    "stepfun-step-plan": {
+      "base_url": "https://api.stepfun.com/step_plan/v1",
+      "wire_family": "openai_chat"
+    },
+    "subconscious": {
+      "base_url": "https://api.subconscious.dev/v1",
+      "wire_family": "anthropic_messages"
+    },
+    "submodel": {
+      "base_url": "https://llm.submodel.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "synthetic": {
+      "base_url": "https://api.synthetic.new/openai/v1",
+      "wire_family": "openai_chat"
+    },
+    "tencent-coding-plan": {
+      "base_url": "https://api.lkeap.cloud.tencent.com/coding/v3",
+      "wire_family": "openai_chat"
+    },
+    "tencent-token-plan": {
+      "base_url": "https://api.lkeap.cloud.tencent.com/plan/v3",
+      "wire_family": "openai_chat"
+    },
+    "tencent-tokenhub": {
+      "base_url": "https://tokenhub.tencentmaas.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "tensorx": {
+      "base_url": "https://api.tensorx.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "the-grid-ai": {
+      "base_url": "https://api.thegrid.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "thinkingmachines": {
+      "base_url": "https://tinker.thinkingmachines.dev/services/tinker-prod/anthropic/api/v1",
+      "wire_family": "anthropic_messages"
+    },
+    "tinfoil": {
+      "base_url": "https://inference.tinfoil.sh/v1",
+      "wire_family": "openai_chat"
+    },
+    "tokengo": {
+      "base_url": "https://api.tokengo.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "tokenrouter": {
+      "base_url": "https://api.tokenrouter.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "trustedrouter": {
+      "base_url": "https://api.trustedrouter.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "umans-ai": {
+      "base_url": "https://api.code.umans.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "umans-ai-coding-plan": {
+      "base_url": "https://api.code.umans.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "unorouter": {
+      "base_url": "https://api.unorouter.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "upstage": {
+      "base_url": "https://api.upstage.ai/v1/solar",
+      "wire_family": "openai_chat"
+    },
+    "vancine": {
+      "base_url": "https://vancine.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "vispark": {
+      "base_url": "https://api.lab.vispark.in/v1",
+      "wire_family": "openai_chat"
+    },
+    "vivgrid": {
+      "base_url": "https://api.vivgrid.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "volcengine": {
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "wire_family": "openai_chat"
+    },
+    "volcengine-coding-plan": {
+      "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+      "wire_family": "openai_chat"
+    },
+    "vultr": {
+      "base_url": "https://api.vultrinference.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "wafer.ai": {
+      "base_url": "https://pass.wafer.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "wallaby": {
+      "base_url": "https://api.wallabytoken.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "wandb": {
+      "base_url": "https://api.inference.wandb.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "xai": {
+      "base_url": "https://api.x.ai/v1",
+      "wire_family": "openai_responses",
+      "models": {
+        "grok-4.20-0309-non-reasoning": {
+          "wire_family": "openai_chat"
+        },
+        "grok-composer-2.5-fast": {
+          "wire_family": "openai_chat"
+        },
+        "grok-imagine-image": {
+          "wire_family": "openai_chat"
+        },
+        "grok-imagine-video": {
+          "wire_family": "openai_chat"
+        },
+        "grok-imagine-video-1.5": {
+          "wire_family": "openai_chat"
+        }
+      }
+    },
+    "xiaomi": {
+      "base_url": "https://api.xiaomimimo.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "xiaomi-token-plan-ams": {
+      "base_url": "https://token-plan-ams.xiaomimimo.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "xiaomi-token-plan-cn": {
+      "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "xiaomi-token-plan-sgp": {
+      "base_url": "https://token-plan-sgp.xiaomimimo.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "xpersona": {
+      "base_url": "https://www.xpersona.co/v1",
+      "wire_family": "openai_chat"
+    },
+    "zai": {
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "wire_family": "openai_chat"
+    },
+    "zai-coding-plan": {
+      "base_url": "https://api.z.ai/api/coding/paas/v4",
+      "wire_family": "openai_chat"
+    },
+    "zeldoc": {
+      "base_url": "https://api.zeldoc.ai/v1",
+      "wire_family": "openai_chat"
+    },
+    "zenifra": {
+      "base_url": "https://ai.zenifra.com/v1",
+      "wire_family": "openai_chat"
+    },
+    "zenmux": {
+      "base_url": "https://zenmux.ai/api/v1",
+      "wire_family": "openai_chat"
+    },
+    "zhipuai": {
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "wire_family": "openai_chat"
+    },
+    "zhipuai-coding-plan": {
+      "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+      "wire_family": "openai_chat"
+    }
+  },
+  "add": {},
+  "remove": {}
+}

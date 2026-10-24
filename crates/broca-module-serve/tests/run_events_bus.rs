@@ -5,6 +5,9 @@
 //! in its config file, and checks that one ordinary turn reaches the stream with nothing but the
 //! process's own wiring in between. The ck-bus credential service is a stand-in registered from
 //! this process; it mints user credentials from the private broker's own trust chain.
+#[path = "common/routing_fixture.rs"]
+mod routing_fixture;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use broca_core::{FileWalStore, WalStore};
 use broca_module_serve::{bus_events::now_ms, bus_events_nats::NatsPublisher};
@@ -1010,7 +1013,7 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
     seed_history(&state_root, &project, history_sessions());
     std::fs::write(
         state_root.join("catalog/fusiform-lkg.json"),
-        serde_json::to_vec_pretty(&json!({
+        serde_json::to_vec_pretty(&routing_fixture::with_served_routing(json!({
             "source": "run-events-bus",
             "resolved_at_ms": 1,
             "catalog_version": 1,
@@ -1024,7 +1027,7 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
                     "limit.output": 8192
                 }
             }
-        }))
+        })))
         .unwrap(),
     )
     .unwrap();

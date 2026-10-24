@@ -198,11 +198,15 @@ fn seed_catalog(state_root: &Path, served: Served) {
             "model.kind": "chat",
             "limit.context": 128000,
             "capability.tool_call": true,
+            "wire.npm": {"value":"@ai-sdk/openai-compatible", "from":"fixture"},
+            "wire.api": {"value":"https://conformance.invalid/v1", "from":"fixture"},
         },
         KINDLESS_ROW: {
             "existence": "present",
             "limit.context": 128000,
             "capability.tool_call": true,
+            "wire.npm": {"value":"@ai-sdk/openai-compatible", "from":"fixture"},
+            "wire.api": {"value":"https://conformance.invalid/v1", "from":"fixture"},
         },
     });
     if matches!(served, Served::Jev | Served::All) {

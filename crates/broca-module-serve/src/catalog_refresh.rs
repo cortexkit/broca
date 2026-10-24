@@ -513,6 +513,7 @@ fn merge_page(
     }
     assembled.withheld.extend(page.withheld);
     assembled.uncertain.extend(page.uncertain);
+    assembled.wire_corrections.extend(page.wire_corrections);
     validate_qualifications(assembled)
 }
 
@@ -595,6 +596,7 @@ mod tests {
             ]),
             withheld: Vec::new(),
             uncertain: Vec::new(),
+            wire_corrections: Vec::new(),
         }
     }
 
