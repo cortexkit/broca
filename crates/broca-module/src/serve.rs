@@ -44,7 +44,7 @@ pub struct SessionReadRequest {
     pub lineage_id: Option<String>,
     /// The page's byte cap; `None` is the default cap.
     pub max_bytes: Option<u64>,
-    /// `descriptors` serves large payloads as refs and every entry's content identities.
+    /// `blocks` exposes stored media; `descriptors` serves payload refs and content identities.
     pub media: cortexkit_role_llm_runner::read::MediaMode,
 }
 
@@ -2923,6 +2923,11 @@ impl ServeHandler for crate::LineageRegistry {
         }
         self.attribute_tool_calls(&req.session, &mut response, &dispatches, prompt_len)
             .await?;
+        if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {
+            for entry in &mut response.messages {
+                entry.show_media_blocks();
+            }
+        }
         if req.media == cortexkit_role_llm_runner::read::MediaMode::Descriptors {
             for entry in &mut response.messages {
                 // Only structure that is not payload can outgrow the per-message budget.
