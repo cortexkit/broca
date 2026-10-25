@@ -1260,7 +1260,15 @@ enum RunState {
         /// Set as soon as this run's `RunFinished` is synced, before the actor has processed the
         /// run's completion. See [`DurableFinish`].
         durable_finish: Arc<std::sync::OnceLock<DurableFinish>>,
+        provider_held: Option<Arc<std::sync::Mutex<broca_core::run::ProviderHeldCloseOut>>>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderHeldPresence {
+    Held,
+    NotHeld,
+    Unknown,
 }
 
 /// A run terminal that is already durable in the WAL while the actor still holds the run as
@@ -2009,16 +2017,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 false
             }
             LineageCmd::Cancel { run_id, at, reply } => {
-                let outcome = self.on_cancel_at(&run_id, at).await;
+                let held = self.provider_held_episode(&run_id);
+                let outcome = self.on_cancel_at(&run_id, at, held).await;
                 let acknowledged = matches!(outcome, CancelOutcome::Ack);
                 let _ = reply.send(outcome);
-                if acknowledged && self.pending_cancels.contains_key(&run_id) {
-                    if let Ok(true) = self.has_provider_held_episode(&run_id).await {
-                        if let RunState::Active { cancel, .. } = &self.state {
-                            cancel.cancel();
-                        } else if let Err(error) = self.retry_pending_cancels().await {
-                            tracing::warn!(%error, "provider-held cancel finalizer failed");
-                        }
+                if acknowledged
+                    && self.pending_cancels.contains_key(&run_id)
+                    && held != ProviderHeldPresence::NotHeld
+                {
+                    if let RunState::Active { cancel, .. } = &self.state {
+                        cancel.cancel();
+                    } else if let Err(error) = self.retry_pending_cancels().await {
+                        tracing::warn!(%error, "provider-held cancel finalizer failed");
                     }
                 }
                 false
@@ -4587,6 +4597,25 @@ impl<W: WalStore + 'static> LineageActor<W> {
             compaction_views: self.executor.compaction_views(),
             ..Default::default()
         };
+        let provider_held = control.provider_held_close_out.clone();
+        if prior_snapshot
+            .checkpoint_at_head
+            .last_episode
+            .as_ref()
+            .is_some_and(|episode| {
+                episode.run_id == run_id && episode.disposition != EpisodeDisposition::Finished
+            })
+        {
+            // Recovery already decoded this tail before serving commands. An empty tail is
+            // not proof of absence until core reconstructs the continuing episode.
+            let held = broca_core::resume::closing_held_replies(
+                prior_snapshot.tail.iter().map(|frame| &frame.record),
+            );
+            provider_held
+                .lock()
+                .expect("provider-held close-out")
+                .restore_held((!held.is_empty()).then_some(held));
+        }
         let (admit_tx, admit_rx) = oneshot::channel::<Result<RunId, broca_core::RunError>>();
         let restart_resuming = prior_snapshot
             .checkpoint_at_head
@@ -4693,6 +4722,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             step_progress,
             handle,
             durable_finish,
+            provider_held: Some(provider_held),
         });
         if restart_resuming {
             // This episode is already durably admitted. Keep its actor responsive while its
@@ -6049,25 +6079,61 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
     }
 
-    async fn has_provider_held_episode(&self, run_id: &RunId) -> Result<bool, String> {
-        let records = self.read_wal_records().await?;
-        let held = !broca_core::resume::closing_held_replies(records.iter()).is_empty();
-        for record in records.iter().rev() {
-            match record {
-                WalRecord::RunStarted {
-                    run_id: started, ..
-                } => return Ok(held && started == run_id),
-                WalRecord::RunFinished { .. } => return Ok(false),
-                _ => {}
+    /// Active runs publish held transitions through their shared batch state. Paused runs
+    /// use the admission checkpoint rebuilt during open-time recovery, before commands run.
+    /// Missing, contended or poisoned state is uncertainty, never evidence of absence.
+    fn provider_held_episode(&self, run_id: &RunId) -> ProviderHeldPresence {
+        match &self.state {
+            RunState::Active {
+                run_id: active,
+                durable_finish,
+                provider_held,
+                ..
+            } => {
+                if active != run_id || durable_finish.get().is_some() {
+                    return ProviderHeldPresence::NotHeld;
+                }
+                match provider_held.as_ref().and_then(|provider_held| {
+                    provider_held
+                        .try_lock()
+                        .ok()
+                        .and_then(|held| held.held_presence())
+                }) {
+                    Some(true) => ProviderHeldPresence::Held,
+                    Some(false) => ProviderHeldPresence::NotHeld,
+                    None => ProviderHeldPresence::Unknown,
+                }
+            }
+            RunState::Idle => {
+                let Some(snapshot) = &self.prior_snapshot else {
+                    return ProviderHeldPresence::Unknown;
+                };
+                let Some(episode) = &snapshot.checkpoint_at_head.last_episode else {
+                    return ProviderHeldPresence::NotHeld;
+                };
+                if &episode.run_id != run_id || episode.disposition == EpisodeDisposition::Finished
+                {
+                    ProviderHeldPresence::NotHeld
+                } else if episode.pause_reason == Some(broca_protocol::PauseReason::ToolHeld) {
+                    ProviderHeldPresence::Held
+                } else if episode.disposition == EpisodeDisposition::Paused
+                    && self.writer.as_ref().is_some_and(|writer| {
+                        writer.durable_head().load(Ordering::Acquire) == snapshot.head_seq
+                    })
+                {
+                    ProviderHeldPresence::NotHeld
+                } else {
+                    ProviderHeldPresence::Unknown
+                }
             }
         }
-        Ok(false)
     }
 
     async fn on_cancel_at(
         &mut self,
         run_id: &RunId,
         at: broca_wal::record::RunCancelAt,
+        held_state: ProviderHeldPresence,
     ) -> CancelOutcome {
         if let Err(error) = self.wal_store.check_move(&self.key, true) {
             return match error.into_move_refusal() {
@@ -6080,11 +6146,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Err(error) => CancelOutcome::Error(error.to_string()),
             };
         }
-        let provider_held = match self.has_provider_held_episode(run_id).await {
-            Ok(held) => held,
-            Err(error) => return CancelOutcome::Error(error),
-        };
+        let provider_held = held_state != ProviderHeldPresence::NotHeld;
         if provider_held {
+            let known_active = matches!(&self.state, RunState::Active { run_id: active, durable_finish, .. } if active == run_id && durable_finish.get().is_none());
+            let known_paused = self
+                .prior_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.checkpoint_at_head.last_episode.as_ref())
+                .is_some_and(|episode| {
+                    &episode.run_id == run_id && episode.disposition == EpisodeDisposition::Paused
+                });
+            if !known_active && !known_paused {
+                match self.resolve_run_state(run_id).await {
+                    Ok(Some(state)) if state.state == RunIndexState::Paused => {}
+                    Ok(_) => return CancelOutcome::NotActive,
+                    Err(error) => return CancelOutcome::Error(error),
+                }
+            }
             let writer = self.writer.as_ref().expect("an open actor owns its writer");
             if let Err(error) = writer
                 .record(WalRecord::RunCancelRequested {
@@ -8928,6 +9006,7 @@ mod tests {
     struct CancelSyncStore {
         inner: Arc<FileWalStore>,
         gate: Arc<CancelSyncGate>,
+        reads: Arc<AtomicUsize>,
     }
 
     impl WalStore for CancelSyncStore {
@@ -8945,6 +9024,7 @@ mod tests {
             &self,
             key: &BindIdentity,
         ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.inner.read_records(key)
         }
         fn read_records_range(
@@ -8954,9 +9034,86 @@ mod tests {
             through_seq: Option<u64>,
             anchor: Option<&broca_wal::WalByteAnchor>,
         ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .read_records_range(key, after_seq, through_seq, anchor)
         }
+    }
+
+    struct CancelPresenceExecutor {
+        gate: RecoveryGate,
+        unknown: bool,
+    }
+
+    #[async_trait]
+    impl RunExecutor for CancelPresenceExecutor {
+        async fn execute(
+            &self,
+            job: RunJob,
+            out: mpsc::Sender<OutputEvent>,
+        ) -> Result<RunSummary, RunError> {
+            if self.unknown {
+                let state = job.control.provider_held_close_out.clone();
+                // A poisoned state cannot prove there are no held calls. The fake executor
+                // leaves it poisoned so cancellation must choose the conservative barrier.
+                assert!(std::thread::spawn(move || {
+                    let _state = state.lock().unwrap();
+                    panic!("injected unavailable provider-held state");
+                })
+                .join()
+                .is_err());
+            }
+            self.gate.execute(job, out).await
+        }
+    }
+
+    async fn cancel_presence_uses_no_wal_reads(unknown: bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = broca_test_support::scratch_root().join(format!("cancel-presence-{}-{unknown}", std::process::id()));
+            std::fs::create_dir_all(root.join("project")).unwrap();
+            let key = BindIdentity::new(root.join("project"), "broca", "cancel-presence");
+            let store = Arc::new(FileWalStore::new(root.join("wal")));
+            let sync = Arc::new(CancelSyncGate::default());
+            let _release_on_failure = ReleaseCancelSync(sync.clone());
+            let reads = Arc::new(AtomicUsize::new(0));
+            let executor = Arc::new(CancelPresenceExecutor { gate: RecoveryGate::new(), unknown });
+            let registry = LineageRegistry::new(Arc::new(SeamOpener {
+                lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))),
+                wal_store: Arc::new(CancelSyncStore { inner: store.clone(), gate: sync.clone(), reads: reads.clone() }),
+                idle_ttl: Duration::from_secs(60), executor: executor.clone(),
+            }));
+            let admitted = registry.route_send(&key, text_req(&key, "ordinary"), RunKind::FreshOrResume).await.unwrap();
+            assert!(matches!(admitted, SendOutcome::Active { .. }), "{admitted:?}");
+            executor.gate.wait_for_start().await;
+            let before = reads.load(Ordering::SeqCst);
+            let mut cancel = Box::pin(registry.route_cancel_at(&key, RunId("ordinary".into()), broca_wal::record::RunCancelAt::Now));
+            if unknown {
+                tokio::select! {
+                    _ = sync.synced.notified() => {},
+                    result = &mut cancel => panic!("uncertain held state answered before its durable request: {result:?}"),
+                }
+                sync.release();
+            }
+            assert!(matches!(cancel.await.unwrap(), CancelOutcome::Ack));
+            assert_eq!(reads.load(Ordering::SeqCst), before, "cancel must classify held state without reading the WAL");
+            let raw = store.read_records(&key).unwrap();
+            assert_eq!(raw.iter().any(|frame| matches!(frame.record, WalRecord::RunCancelRequested { .. })), unknown,
+                "unknown presence needs the durable request; an ordinary immediate cancel keeps its existing path");
+            executor.gate.release_first.notify_one();
+            executor.gate.wait_for_finish().await;
+            assert!(registry.stop_and_seal().await);
+            let _ = std::fs::remove_dir_all(root);
+        }).await.expect("cancel state lookup must not wait on a WAL reader");
+    }
+
+    #[tokio::test]
+    async fn ordinary_cancel_uses_live_held_state_without_wal_reads() {
+        cancel_presence_uses_no_wal_reads(false).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_held_state_requires_a_durable_cancel_without_wal_reads() {
+        cancel_presence_uses_no_wal_reads(true).await;
     }
 
     struct CancelSyncWal {
@@ -9059,7 +9216,10 @@ mod tests {
                 });
                 let gate = Arc::new(CancelSyncGate::default());
                 let _release_on_failure = ReleaseCancelSync(gate.clone());
-                let registry = LineageRegistry::new(Arc::new(SeamOpener { lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))), wal_store: Arc::new(CancelSyncStore { inner: store.clone(), gate: gate.clone() }), idle_ttl: Duration::from_secs(60), executor: executor.clone() }));
+                let reads = Arc::new(AtomicUsize::new(0));
+                let registry = LineageRegistry::new(Arc::new(SeamOpener { lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))), wal_store: Arc::new(CancelSyncStore { inner: store.clone(), gate: gate.clone(), reads: reads.clone() }), idle_ttl: Duration::from_secs(60), executor: executor.clone() }));
+                registry.route_status(&key).await.unwrap();
+                let before_cancel = reads.load(Ordering::SeqCst);
                 let mut ack = Box::pin(registry.route_cancel_at(&key, RunId("held".into()), at));
                 tokio::select! {
                     _ = gate.synced.notified() => {},
@@ -9070,6 +9230,7 @@ mod tests {
                     _ = &mut ack => panic!("cancel acknowledgement must wait for the sync barrier"),
                     _ = tokio::task::yield_now() => {},
                 }
+                assert_eq!(reads.load(Ordering::SeqCst), before_cancel, "restarted held cancellation uses the recovered pause, not another WAL read");
                 gate.release();
                 let ack = ack.await.unwrap();
                 assert!(matches!(ack, CancelOutcome::Ack));

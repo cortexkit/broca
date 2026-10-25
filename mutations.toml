@@ -30116,3 +30116,29 @@ old = '''            if let Err(error) = writer.sync().await {
             self.pending_cancels.insert('''
 new = '''            // NON-VACUITY BREAK: acknowledge the appended cancel before its sync barrier.
             self.pending_cancels.insert('''
+
+[[control]]
+id = "module-cancel-held-presence-does-not-read-wal"
+guards = "An ordinary immediate cancellation classifies held state from actor memory without decoding the session WAL"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::ordinary_cancel_uses_live_held_state_without_wal_reads"]
+file = "crates/broca-module/src/actor.rs"
+old = "        let provider_held = held_state != ProviderHeldPresence::NotHeld;"
+new = "        let _ = self.read_wal_records().await; // NON-VACUITY BREAK: decode the full session log on ordinary cancel.\n        let provider_held = held_state != ProviderHeldPresence::NotHeld;"
+
+[[control]]
+id = "module-cancel-unknown-held-presence-is-durable"
+guards = "Unavailable held state takes the durable cancellation path instead of being treated as no held call"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::unknown_held_state_requires_a_durable_cancel_without_wal_reads"]
+file = "crates/broca-module/src/actor.rs"
+old = "        let provider_held = held_state != ProviderHeldPresence::NotHeld;"
+new = "        let provider_held = held_state == ProviderHeldPresence::Held; // NON-VACUITY BREAK: collapse unavailable state into not held."

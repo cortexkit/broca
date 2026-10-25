@@ -655,6 +655,29 @@ pub struct ProviderHeldCloseOut {
     batch: Option<crate::replay::OpenToolBatch>,
     calls: Vec<crate::tool_plane::ProviderHeldReply>,
     results: Vec<ToolResult>,
+    registering: std::collections::HashSet<ToolCallId>,
+    unknown: bool,
+}
+
+impl ProviderHeldCloseOut {
+    /// Cancellation reads this shared state without reading the WAL. A held-record sync in
+    /// progress, or recovery not yet reconstructed, must not look like an ordinary call.
+    pub fn held_presence(&self) -> Option<bool> {
+        if self.unknown || !self.registering.is_empty() {
+            None
+        } else {
+            Some(!self.calls.is_empty())
+        }
+    }
+
+    /// Restore from the already-decoded recovery snapshot before serving run commands.
+    /// `None` keeps cancellation conservative until core finishes reconstructing the episode.
+    pub fn restore_held(&mut self, calls: Option<Vec<crate::tool_plane::ProviderHeldReply>>) {
+        self.unknown = calls.is_none();
+        if let Some(calls) = calls {
+            self.calls = calls;
+        }
+    }
 }
 
 fn warm_wait<'a>(
@@ -3011,6 +3034,29 @@ where
             None => Vec::new(),
         }),
     };
+    if is_resume && !append_episode {
+        let mut held =
+            crate::resume::closing_held_replies(approval_frames.iter().map(|frame| &frame.record));
+        if let ReplayResolution::ProviderHeld { pending, .. } = &prior.resolution {
+            for call in &pending.provider_held {
+                if !held.iter().any(|known| known.call_key == call.call_key) {
+                    held.push(call.reply());
+                }
+            }
+        }
+        let incomplete = held.is_empty()
+            && prior.open_tool_batch.as_ref().is_some_and(|batch| {
+                batch
+                    .calls
+                    .iter()
+                    .any(|(_, state)| *state == crate::replay::OpenCallState::ProviderHeld)
+            });
+        control
+            .provider_held_close_out
+            .lock()
+            .expect("provider-held close-out")
+            .restore_held((!incomplete).then_some(held));
+    }
     let cut_pending_step = match &prior.resolution {
         ReplayResolution::Resume {
             pending: Some(pending),
@@ -8803,6 +8849,7 @@ async fn resolve_provider_held_batch<T: ToolPlane>(
                     sync_held_terminal(&mut result, ctx, plane.writer, hooks).await?;
                     plane.held.complete(&result.result.tool_call_id);
                     plane.terminal_synced(&result.result.tool_call_id).await;
+                    plane.delivered(&result);
                 }
                 results.insert(index, result);
             }
@@ -8891,15 +8938,18 @@ impl<T> ProviderHeldPlane<'_, T> {
                     closing.calls.push(held.reply());
                 }
             }
-            return;
         }
-        if let Some(control) = self.control {
-            control
-                .provider_held_close_out
-                .lock()
-                .expect("provider-held close-out")
-                .calls
-                .retain(|call| call.tool_call_id != result.result.tool_call_id);
+    }
+    fn delivered(&self, result: &CallResolution) {
+        if !result.stopped {
+            if let Some(control) = self.control {
+                control
+                    .provider_held_close_out
+                    .lock()
+                    .expect("provider-held close-out")
+                    .calls
+                    .retain(|call| call.tool_call_id != result.result.tool_call_id);
+            }
         }
     }
     /// Tell the lifecycle a held call's terminal is now durable, so the late result that
@@ -8914,6 +8964,14 @@ impl<T> ProviderHeldPlane<'_, T> {
 #[async_trait::async_trait]
 impl<T: ToolPlane> crate::tool_plane::ProviderHeldRecorder for ProviderHeldPlane<'_, T> {
     async fn sync_held(&self, reply: &crate::tool_plane::ProviderHeldReply) -> Result<(), String> {
+        if let Some(control) = self.control {
+            control
+                .provider_held_close_out
+                .lock()
+                .expect("provider-held close-out")
+                .registering
+                .insert(reply.tool_call_id.clone());
+        }
         let held_at_ms = self
             .clock
             .map_or_else(|| epoch_millis().unwrap_or(0), crate::Clock::now_ms);
@@ -8960,6 +9018,7 @@ impl<T: ToolPlane> crate::tool_plane::ProviderHeldRecorder for ProviderHeldPlane
             {
                 closing.calls.push(reply.clone());
             }
+            closing.registering.remove(&reply.tool_call_id);
         }
         Ok(())
     }
@@ -14320,6 +14379,7 @@ mod approval_gate {
                             if was_held {
                                 plane.settled(&result);
                                 plane.terminal_synced(&result.result.tool_call_id).await;
+                                plane.delivered(&result);
                             }
                             if let (Some(held), Some(elicitation)) = (approved_calls.remove(&index), control.elicitation_plane.as_ref()) {
                                 feedback.push(Box::pin(async move { if let Some(id) = &held.id { crate::consent::report(elicitation.as_ref(), &held.ctx(ctx), id, value, None).await; } Feedback::Reported }));
