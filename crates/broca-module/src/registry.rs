@@ -3966,6 +3966,69 @@ impl LineageRegistry {
         }
     }
 
+    /// Let a session's run take a late result just deposited for one of its provider-held
+    /// calls: open the session if it is closed (its open-time recovery runs first), then ask its
+    /// actor to resume a run paused on held calls. A live run needs nothing more.
+    pub async fn resume_held_run(&self, session: &LineageKey) -> Result<(), String> {
+        for _ in 0..3 {
+            let handle = self
+                .actor_for(session)
+                .await
+                .map_err(|error| error.to_string())?;
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if handle
+                .send(crate::actor::LineageCmd::ResumeHeld { reply })
+                .await
+                .is_err()
+            {
+                // The actor began closing: re-route through a fresh open.
+                continue;
+            }
+            return rx
+                .await
+                .map_err(|_| "session actor dropped the held-run reply".to_owned())?;
+        }
+        Err("session actor kept closing while a late result waited".into())
+    }
+
+    /// Boot recovery for provider-held calls: open every session that has an intake
+    /// registration, so its open-time recovery runs (a missing `RunPaused`, an owed batch commit,
+    /// a crash-orphan seal) before any late result is pulled for it. At most `concurrency`
+    /// sessions open at once. Returns how many opened and the sessions that could not be.
+    pub async fn open_registered_sessions(
+        &self,
+        sessions: Vec<LineageKey>,
+        concurrency: usize,
+    ) -> (usize, Vec<(LineageKey, String)>) {
+        use futures::stream::{self, StreamExt};
+        let mut seen = HashSet::new();
+        let sessions: Vec<LineageKey> = sessions
+            .into_iter()
+            .filter(|session| seen.insert(session.clone()))
+            .collect();
+        let outcomes: Vec<(LineageKey, Result<(), String>)> = stream::iter(sessions)
+            .map(|session| async move {
+                let opened = self
+                    .actor_for(&session)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                (session, opened)
+            })
+            .buffer_unordered(concurrency.max(1))
+            .collect()
+            .await;
+        let mut opened = 0;
+        let mut failed = Vec::new();
+        for (session, outcome) in outcomes {
+            match outcome {
+                Ok(()) => opened += 1,
+                Err(error) => failed.push((session, error)),
+            }
+        }
+        (opened, failed)
+    }
+
     /// Resume WAL-confirmed restart pauses after dependency routes are registered. Candidate
     /// index rows may lag the WAL; only a latest durable restart pause authorizes a resume.
     pub async fn resume_restart_pauses(

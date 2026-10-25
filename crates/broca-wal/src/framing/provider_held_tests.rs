@@ -102,24 +102,24 @@ fn a_never_held_run_writes_todays_frames_and_never_raises_the_floor() {
 }
 
 /// In a held run only the held record and the `tool_held` pause need `provider-held/v1`:
-/// every other frame, the held call's late `ToolResult` included, stays an ordinary frame
-/// that a build without the feature (this one included) still reads.
+/// every other frame, the held call's late `ToolResult` included, stays an ordinary frame that
+/// a build without the feature still reads. This build lists the feature, so it reads the two
+/// gated frames too, and a reader whose table lacks the name refuses exactly those two.
 #[test]
 fn a_held_run_gates_only_the_held_record_and_its_pause() {
-    assert!(!KNOWN_FEATURES.contains(&PROVIDER_HELD_FEATURE));
+    assert!(KNOWN_FEATURES.contains(&PROVIDER_HELD_FEATURE));
     let mut gated = Vec::new();
     for (seq, record) in records(HELD_RUN).iter().enumerate() {
         let bytes = encode(seq as u64 + 1, 3, record).unwrap();
         match decode_next(&bytes) {
-            DecodeStep::NewerWriter { missing, .. } => {
-                assert_eq!(missing, [PROVIDER_HELD_FEATURE]);
-                gated.push(seq);
-            }
-            DecodeStep::Record { framed, .. } => {
-                assert_eq!(&framed.record, record);
-                assert_eq!(bytes[4], FRAMING_VERSION);
-            }
-            _ => panic!("frame {seq} must decode or be refused as a newer writer's"),
+            DecodeStep::Record { framed, .. } => assert_eq!(&framed.record, record),
+            _ => panic!("frame {seq} must decode in a build that lists the feature"),
+        }
+        if bytes[4] == GATED_FRAMING_VERSION {
+            assert_eq!(record.required_features(), [PROVIDER_HELD_FEATURE]);
+            gated.push(seq);
+        } else {
+            assert_eq!(bytes[4], FRAMING_VERSION);
         }
     }
     let kinds: Vec<&str> = gated.iter().map(|at| HELD_RUN[*at]).collect();
@@ -128,8 +128,8 @@ fn a_held_run_gates_only_the_held_record_and_its_pause() {
 
 /// The floor names `provider-held/v1` before the first gated frame is on disk: with no floor
 /// configured, or a floor that cannot be raised, the append is refused and the file is left
-/// exactly as it was. Once the floor is raised the frame is written, and this build, which
-/// does not list the feature yet, refuses the WAL as a newer writer's.
+/// exactly as it was. Once the floor is raised the frame is written and this build, which
+/// lists the feature, reads it back.
 #[test]
 fn the_floor_is_raised_before_the_first_provider_held_frame() {
     use crate::{FileWal, Wal, WalError};
@@ -174,8 +174,11 @@ fn the_floor_is_raised_before_the_first_provider_held_frame() {
     );
     let after = std::fs::read(&path).unwrap();
     assert!(after.len() > before.len() && after.starts_with(&before));
-    match wal.replay() {
-        Err(WalError::NewerWriter { missing, .. }) => assert_eq!(missing, [PROVIDER_HELD_FEATURE]),
-        other => panic!("the held frame must be on disk and refused here: {other:?}"),
-    }
+    let replayed: Vec<WalRecord> = wal
+        .replay()
+        .unwrap()
+        .into_iter()
+        .map(|framed| framed.record)
+        .collect();
+    assert_eq!(replayed.last(), Some(held));
 }

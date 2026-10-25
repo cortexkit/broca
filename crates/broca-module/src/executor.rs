@@ -138,6 +138,14 @@ pub trait RunExecutor: Send + Sync + 'static {
         None
     }
 
+    /// Where a provider-held call waits for its late result (see `crate::held_slots`). Without
+    /// it a run that resumes on a held call stays paused, because nothing can deliver to it.
+    fn provider_held_lifecycle(
+        &self,
+    ) -> Option<Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>> {
+        None
+    }
+
     /// The adapter that calls the compaction provider's Setup. Its presence enables
     /// compaction writes; the actor supplies it through `RunControl`.
     fn compaction_plane(&self) -> Option<Arc<dyn broca_core::CompactionPlane>> {

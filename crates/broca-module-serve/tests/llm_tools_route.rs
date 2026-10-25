@@ -267,6 +267,8 @@ impl Rig {
         *self.provider.calls.lock().unwrap()
     }
 
+    // Only the Unix cross-process claim test starts a second daemon.
+    #[cfg(unix)]
     fn spawn_peer(&self, id: &str) -> broca_test_support::RigChild {
         let config = self.root.join("config/cortexkit/broca.jsonc");
         let settings: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
@@ -700,7 +702,7 @@ fn direct_tools(
 }
 
 fn direct_body(arguments: Value, key: Option<&str>) -> Vec<u8> {
-    let mut body = json!({"name":"llm.classify/v1","arguments":arguments});
+    let mut body = json!({"name":"llm_classify","arguments":arguments});
     if let Some(key) = key {
         body["call_key"] = json!(key);
     }
@@ -1205,15 +1207,12 @@ async fn memory_schema_pins_are_checked_before_provider_execution() {
         ("0".repeat(64), 1, "tool_schema_changed"),
         (digest, 2, "tool_semantics_changed"),
     ] {
-        let pin = cortexkit_role_tool_provider::call::SchemaPin::new(
-            "llm.classify/v1",
-            digest,
-            semantics,
-        )
-        .encode()
-        .unwrap();
+        let pin =
+            cortexkit_role_tool_provider::call::SchemaPin::new("llm_classify", digest, semantics)
+                .encode()
+                .unwrap();
         let body =
-            json!({"name":"llm.classify/v1","arguments":args(),"call_key":"pin","schema_pin":pin})
+            json!({"name":"llm_classify","arguments":args(),"call_key":"pin","schema_pin":pin})
                 .to_string();
         let failure: Value = serde_json::from_slice(
             &tools
@@ -1265,8 +1264,7 @@ async fn memory_seven_day_boundary_replays_before_and_bills_at_expiry() {
         store.clone(),
         export.clone(),
     );
-    let body =
-        json!({"name":"llm.classify/v1","arguments":args(),"call_key":"boundary"}).to_string();
+    let body = json!({"name":"llm_classify","arguments":args(),"call_key":"boundary"}).to_string();
     let principal = broca_protocol::BindPrincipal::Reserved {
         module_id: "owner".into(),
     };
@@ -1309,7 +1307,7 @@ async fn memory_derived_keys_separate_principals_owners_and_scope_epochs_and_sto
         store.clone(),
         Arc::new(broca_store::SqliteStore::open_in_memory().unwrap()),
     );
-    let body = json!({"name":"llm.classify/v1","arguments":args(),"call_key":"opaque"}).to_string();
+    let body = json!({"name":"llm_classify","arguments":args(),"call_key":"opaque"}).to_string();
     for (caller, owner, epoch) in [
         ("owner", "owner", 1),
         ("other", "owner", 1),
@@ -1361,7 +1359,7 @@ impl Route {
             .map_err(|bytes| serde_json::from_slice(&bytes).unwrap())
     }
     async fn call(&self, arguments: Value, key: Option<&str>) -> Result<Vec<u8>, Value> {
-        self.request("llm.classify/v1", arguments, key).await
+        self.request("llm_classify", arguments, key).await
     }
 }
 
@@ -1476,7 +1474,20 @@ async fn catalog_and_every_declared_tool_operation_answer_on_real_daemon() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(catalog["tools"][0]["name"], "llm.classify/v1");
+    assert_eq!(catalog["tools"][0]["name"], "llm_classify");
+    // Codemode calls a tool as `tools.<name>`, so every catalog name must be a plain identifier;
+    // the contract tag belongs in `capabilities`.
+    for tool in catalog["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let mut chars = name.chars();
+        assert!(
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "catalog tool name {name:?} is not a plain identifier"
+        );
+    }
     assert_eq!(
         catalog["tools"][0]["input_schema"],
         cortexkit_llm_tools::classify::input_schema()
@@ -1759,7 +1770,7 @@ async fn memory_question_order_and_raw_json_survive_the_tool_adapter() {
         },
         Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
     ));
-    let body = br#"{"name":"llm.classify/v1","arguments":{"model":"typesafe/jev-1.13.0","questions":{"z":{"type":"noul","instructions":"last alphabetically, first in the request"},"a":{"type":"noul","instructions":"second in the request"}},"item":{"state":{"huge":123456789012345678901234567890}},"max_cost_usd":0.01},"call_key":"raw"}"#;
+    let body = br#"{"name":"llm_classify","arguments":{"model":"typesafe/jev-1.13.0","questions":{"z":{"type":"noul","instructions":"last alphabetically, first in the request"},"a":{"type":"noul","instructions":"second in the request"}},"item":{"state":{"huge":123456789012345678901234567890}},"max_cost_usd":0.01},"call_key":"raw"}"#;
     let result = tools
         .answer(body, Some(&owner()), &stamped(1, "owner"))
         .await

@@ -340,8 +340,8 @@ const PROVIDER_HELD_PINNED: &[&str] = &[
 /// Each provider-held value keeps its bytes and is written only in a gated frame whose payload
 /// is exactly `{"requires":["provider-held/v1"],"record":...}`. The requirement comes from the
 /// record itself, so no writer can put either value in a frame an older build reads unchecked.
-/// This build does not list the feature yet, so it refuses such a frame as a newer writer's;
-/// the framing tests read it back with the feature known.
+/// This build lists the feature, so it reads such a frame back unchanged; a reader without the
+/// name refuses it as a newer writer's (`framing::provider_held_tests`).
 #[test]
 fn provider_held_records_keep_their_bytes_and_require_only_provider_held() {
     use crate::framing::{decode_next, encode, DecodeStep, GATED_FRAMING_VERSION, HEADER_LEN};
@@ -361,13 +361,10 @@ fn provider_held_records_keep_their_bytes_and_require_only_provider_held() {
             &frame[HEADER_LEN..],
             format!(r#"{{"requires":["provider-held/v1"],"record":{pinned}}}"#).as_bytes()
         );
-        assert!(
-            matches!(
-                decode_next(&frame),
-                DecodeStep::NewerWriter { ref missing, .. } if missing == &["provider-held/v1"]
-            ),
-            "{pinned}"
-        );
+        match decode_next(&frame) {
+            DecodeStep::Record { framed, .. } => assert_eq!(framed.record, record, "{pinned}"),
+            _ => panic!("this build reads its own provider-held frame: {pinned}"),
+        }
     }
 }
 

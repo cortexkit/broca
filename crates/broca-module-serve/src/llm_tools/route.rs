@@ -10,7 +10,7 @@ use subc_protocol::tool_call::ToolCallRequest;
 use tokio::sync::watch;
 
 use super::admission::{admit, hash, refusal, Admission};
-use super::private_content::{PrivateContent, Verdict};
+use super::private_content::PrivateContent;
 
 /// The private-content answer for a route with no cerebellum or Basal behind it, which is what
 /// a test that drives this route directly gets: the scope counts as marked and its sources are
@@ -36,13 +36,13 @@ impl super::Asks for NoPrivateContent {
             "no Basal behind this route".into(),
         ))
     }
-
-    async fn run_live(&self, _owner: subc_protocol::Principal, _scope_ref: &str) -> Option<bool> {
-        None
-    }
 }
 
 type Answer = Result<Box<RawValue>, Vec<u8>>;
+
+/// The classify tool's catalog name. Codemode programs call tools as `tools.<name>`, so a name
+/// must be a plain identifier; the contract's tag `llm.classify/v1` goes in `capabilities`.
+pub const CLASSIFY_TOOL_NAME: &str = "llm_classify";
 
 #[derive(serde::Deserialize)]
 struct RawEnvelope<'a> {
@@ -123,7 +123,7 @@ impl LlmTools {
                 }
                 raw(json!({}))
             }
-            "llm.classify/v1" => {
+            CLASSIFY_TOOL_NAME => {
                 let envelope: RawEnvelope<'_> = serde_json::from_slice(body)
                     .map_err(|e| error(Refusal::invalid_params("arguments", e.to_string())))?;
                 let admission = admit(
@@ -181,7 +181,7 @@ impl LlmTools {
         }
         let schema = classify::input_schema();
         let mut tool = json!({
-            "name":"llm.classify/v1", "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).expect("contract schema has a digest"),
+            "name":CLASSIFY_TOOL_NAME, "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).expect("contract schema has a digest"),
             "semantics":1, "capabilities":[], "description":"Classify one item with a decision model.",
             "input_schema":schema,
             "modes":cortexkit_llm_tools::MODES,
@@ -268,11 +268,9 @@ impl LlmTools {
         // a repeat must return the bytes it already paid for even after the operator's list
         // changed or cerebellum started marking the scope.
         if stored.is_none() {
-            match self.private_content.admit(scope, &admission.provider).await {
-                Ok(Verdict::Admitted) => {}
-                Ok(Verdict::Refused(body)) => return Err(body),
-                Err(body) => return Err(body),
-            }
+            self.private_content
+                .admit(scope, &admission.provider)
+                .await?;
         }
         let receiver = {
             let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());

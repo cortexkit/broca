@@ -1382,12 +1382,14 @@ async fn appended_episode_keeps_one_decoded_copy_of_the_prior_conversation() {
         "tracked live bytes at the appended episode's first step: {live}; prior text bytes: \
          {PRIOR_TEXT_BYTES}"
     );
-    // Without a session store the run keeps two transcript-sized owners on purpose: the WAL
-    // records it replayed (kept for late-approval checks) and the decoded conversation, which
-    // is the run's prompt. A clone of the reconstructed conversation into the episode prefix
-    // would add a third, so anything at or above two and a half copies is that duplicate.
+    // The decoded conversation, which is the run's prompt, is the only transcript-sized owner
+    // left by the first model call: this run has no deferred or approved calls, so it releases
+    // the WAL frames it replayed for approval checks before entering the turn loop (see
+    // `drop(approval_frames)` in run.rs). A clone of the reconstructed conversation into the
+    // episode prefix would add a second copy, so anything at or above one and a half copies is
+    // that duplicate. Measured: about 1.02 copies with the move, about 2.02 with a clone.
     assert!(
-        live < (PRIOR_TEXT_BYTES * 5 / 2) as isize,
+        live < (PRIOR_TEXT_BYTES * 3 / 2) as isize,
         "the appended episode retained a second decoded prior conversation: {live} tracked \
          bytes for {PRIOR_TEXT_BYTES} prior text bytes"
     );

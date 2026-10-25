@@ -1,4 +1,4 @@
-//! Private-content admission for the `llm.classify/v1` tool.
+//! Private-content admission for the model-tools classify route.
 //!
 //! Before this route calls a third-party provider it has to know whether the call may carry the
 //! person's private content, and it has to be right the first time: a run that read the person's
@@ -23,10 +23,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use broca_protocol::SendScope;
-use broca_subc::ScopeDescriber;
 use cortexkit_role_classifier::errors::{ErrorClass, Refusal, RefusalDetail};
 use serde::Serialize;
 use subc_protocol::Principal;
@@ -39,10 +37,6 @@ pub const CONSENT_REQUIRED: &str = "consent_required";
 
 /// `detail.consent` for a scope broca counts as marked but cannot name a source for.
 pub const PRIVATE_CONTENT_UNKNOWN: &str = "private_content_unknown";
-
-/// How long one `scope.describe` may wait before broca keeps treating a scope as live. The
-/// daemon answers from memory, so a slower reply means it is in trouble.
-const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The scope identity an answer belongs to. Owner, reference and epoch together: an answer for
 /// one epoch says nothing about the next run under the same reference.
@@ -113,29 +107,22 @@ pub trait Asks: Send + Sync {
         owner: Principal,
         flow_id: &str,
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError>;
-
-    /// Whether the daemon still holds the run this identity names, or `None` when it could
-    /// not be asked.
-    async fn run_live(&self, owner: Principal, scope_ref: &str) -> Option<bool>;
 }
 
-/// The real asks: cerebellum, Basal and `scope.describe` over broca's module connection.
+/// The real asks: cerebellum and Basal over broca's module connection.
 pub struct SubcAsks {
     private_content: Arc<broca_subc::PrivateContentClient>,
     flow_providers: Arc<broca_subc::FlowProvidersClient>,
-    describer: Arc<broca_subc::ModuleScopeDescriber>,
 }
 
 impl SubcAsks {
     pub fn new(
         private_content: Arc<broca_subc::PrivateContentClient>,
         flow_providers: Arc<broca_subc::FlowProvidersClient>,
-        describer: Arc<broca_subc::ModuleScopeDescriber>,
     ) -> Self {
         Self {
             private_content,
             flow_providers,
-            describer,
         }
     }
 }
@@ -166,28 +153,6 @@ impl Asks for SubcAsks {
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
         self.flow_providers.query(&owner, flow_id).await
     }
-
-    async fn run_live(&self, owner: Principal, scope_ref: &str) -> Option<bool> {
-        let describe =
-            tokio::time::timeout(DESCRIBE_TIMEOUT, self.describer.describe(&owner, scope_ref))
-                .await
-                .ok()?
-                .ok()?;
-        Some(matches!(
-            describe.status,
-            subc_protocol::scope::ScopeStatus::Live
-        ))
-    }
-}
-
-/// What the policy said about one admitted call.
-#[allow(dead_code)] // `Refused` is unused until callers can act on a policy refusal other than by failing.
-pub(super) enum Verdict {
-    /// Call this provider now.
-    Admitted,
-    /// The scope may not call this provider. The call ends with this encoded refusal and wrote
-    /// nothing.
-    Refused(Vec<u8>),
 }
 
 /// The refusals only this policy returns. They use the same `{code, message, detail}` shape as
@@ -227,11 +192,7 @@ impl PrivateContent {
 
     /// Whether the call may reach `provider`. Runs once per admitted call, before any provider
     /// attempt, after replay and pricing.
-    pub(super) async fn admit(
-        &self,
-        scope: &SendScope,
-        provider: &str,
-    ) -> Result<Verdict, Vec<u8>> {
+    pub(super) async fn admit(&self, scope: &SendScope, provider: &str) -> Result<(), Vec<u8>> {
         let Some(identity) = ScopeIdentity::of(scope) else {
             // Admission refuses an unstamped scope before this point.
             return Err(encoded_refusal(
@@ -241,7 +202,7 @@ impl PrivateContent {
             ));
         };
         if is_local(provider) || self.listed(provider) {
-            return Ok(Verdict::Admitted);
+            return Ok(());
         }
         match identity.flow_id.clone() {
             Some(flow_id) => self.admit_flow(&identity, &flow_id, provider).await,
@@ -256,11 +217,7 @@ impl PrivateContent {
             .any(|listed| listed == provider)
     }
 
-    async fn admit_run(
-        &self,
-        identity: &ScopeIdentity,
-        provider: &str,
-    ) -> Result<Verdict, Vec<u8>> {
+    async fn admit_run(&self, identity: &ScopeIdentity, provider: &str) -> Result<(), Vec<u8>> {
         // A cached "marked" still counts as marked until cerebellum answers again; a cached
         // "unmarked" is never trusted, because a mark written between two calls must be seen.
         let marked = match self.cached(identity) {
@@ -268,7 +225,7 @@ impl PrivateContent {
             None => self.ask(identity).await,
         };
         if !marked.marked {
-            return Ok(Verdict::Admitted);
+            return Ok(());
         }
         // A live grant would also admit here; this code does not consult grants yet.
         if marked.sources.is_empty() {
@@ -282,7 +239,7 @@ impl PrivateContent {
         identity: &ScopeIdentity,
         flow_id: &str,
         provider: &str,
-    ) -> Result<Verdict, Vec<u8>> {
+    ) -> Result<(), Vec<u8>> {
         let allowed = match self.cached_flow(identity) {
             Some(allowed) => allowed,
             None => match self
@@ -315,7 +272,7 @@ impl PrivateContent {
             },
         };
         if allowed.iter().any(|listed| listed == provider) {
-            return Ok(Verdict::Admitted);
+            return Ok(());
         }
         // A flow broca asked about is one cerebellum may have marked. An unmarked flow may call
         // any provider; Basal's list adds providers to the base set for a marked one.
@@ -324,7 +281,7 @@ impl PrivateContent {
             None => self.ask(identity).await,
         };
         if !marked.marked {
-            return Ok(Verdict::Admitted);
+            return Ok(());
         }
         Err(encoded_refusal(
             "provider_not_allowed",
@@ -450,7 +407,6 @@ mod tests {
         flow: Mutex<Option<Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError>>>,
         marked_asks: AtomicUsize,
         flow_asks: AtomicUsize,
-        live: Mutex<Option<bool>>,
     }
 
     impl Stub {
@@ -495,10 +451,6 @@ mod tests {
             self.flow.lock().unwrap().clone().unwrap_or(Err(
                 broca_subc::FlowProvidersError::Unanswered("no answer".into()),
             ))
-        }
-
-        async fn run_live(&self, _owner: Principal, _scope_ref: &str) -> Option<bool> {
-            *self.live.lock().unwrap()
         }
     }
 
@@ -571,18 +523,15 @@ mod tests {
         serde_json::from_slice(&body).expect("a refusal is JSON")
     }
 
-    fn refused(verdict: Result<Verdict, Vec<u8>>) -> Value {
+    fn refused(verdict: Result<(), Vec<u8>>) -> Value {
         match verdict {
             Ok(_) => panic!("the call must be refused"),
             Err(body) => error_of(body),
         }
     }
 
-    fn admitted(verdict: Result<Verdict, Vec<u8>>) {
-        assert!(
-            matches!(verdict, Ok(Verdict::Admitted)),
-            "the call must be admitted"
-        );
+    fn admitted(verdict: Result<(), Vec<u8>>) {
+        assert!(verdict.is_ok(), "the call must be admitted");
     }
 
     #[tokio::test]

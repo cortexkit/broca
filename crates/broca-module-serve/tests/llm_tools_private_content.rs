@@ -457,6 +457,74 @@ fn build_dir(relative: &str) -> PathBuf {
         .join(relative)
 }
 
+/// The workspaces the stand-in's build could resolve against. They must pin the same crate
+/// versions, or the stand-in would build against a wire this build never speaks: the offline
+/// build fails on a moved pin, and a fully resolved lock would quietly link another release.
+#[test]
+fn the_stand_in_pins_the_daemon_wire_versions() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let helper = workspace.join("crates/broca-module-serve/tests/support/fake-surface");
+    for crate_name in ["subc-protocol", "subc-transport"] {
+        let built_against = pinned_version(&workspace.join("Cargo.lock"), crate_name);
+        let declared = pinned_version(&helper.join("Cargo.lock"), crate_name);
+        assert_eq!(
+            declared, built_against,
+            "the stand-in speaks {crate_name} {declared}, but the broker links {built_against}; \
+             update tests/support/fake-surface/Cargo.toml (and its lock) with the workspace pin"
+        );
+        assert_eq!(
+            required_version(&helper.join("Cargo.toml"), crate_name),
+            built_against,
+            "tests/support/fake-surface/Cargo.toml must require exactly {crate_name} \
+             {built_against}, the release the workspace links"
+        );
+    }
+}
+
+/// The version a lock file resolved for `crate_name`, which is the one the build links.
+fn pinned_version(lock: &Path, crate_name: &str) -> String {
+    let text = std::fs::read_to_string(lock).unwrap_or_else(|error| {
+        panic!("cannot read {}: {error}", lock.display());
+    });
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != "[[package]]" {
+            continue;
+        }
+        let name = lines
+            .next()
+            .and_then(|line| line.strip_prefix("name = "))
+            .map(|name| name.trim_matches('"'));
+        if name != Some(crate_name) {
+            continue;
+        }
+        return lines
+            .next()
+            .and_then(|line| line.strip_prefix("version = "))
+            .map(|version| version.trim_matches('"').to_owned())
+            .unwrap_or_else(|| panic!("{} entry has no version", lock.display()));
+    }
+    panic!("{} does not resolve {crate_name}", lock.display());
+}
+
+/// The exact version a manifest requires for `crate_name` (`crate = "=x.y.z"`).
+fn required_version(manifest: &Path, crate_name: &str) -> String {
+    let text = std::fs::read_to_string(manifest).unwrap_or_else(|error| {
+        panic!("cannot read {}: {error}", manifest.display());
+    });
+    let prefix = format!("{crate_name} = \"");
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix(&prefix) {
+            let requirement = rest.trim_end_matches('"');
+            return requirement
+                .strip_prefix('=')
+                .unwrap_or_else(|| panic!("{crate_name} must be pinned with =, not {requirement}"))
+                .to_owned();
+        }
+    }
+    panic!("{} does not require {crate_name}", manifest.display());
+}
+
 /// Whether `binary` is newer than the stand-in's sources.
 fn built_after_source(binary: &Path) -> bool {
     let source =
@@ -490,7 +558,8 @@ struct Route {
 
 impl Route {
     async fn call(&self, arguments: Value, key: Option<&str>) -> Result<Vec<u8>, Value> {
-        let mut body = json!({"name":"llm.classify/v1","arguments":arguments});
+        let mut body =
+            json!({"name":broca_module_serve::llm_tools::CLASSIFY_TOOL_NAME,"arguments":arguments});
         if let Some(key) = key {
             body["call_key"] = json!(key);
         }

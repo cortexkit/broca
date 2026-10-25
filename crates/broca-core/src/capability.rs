@@ -47,6 +47,10 @@ pub struct ToolManifest {
     provider_presets: HashMap<String, String>,
     provider_replies:
         HashMap<String, HashMap<String, cortexkit_role_tool_provider::catalog::Reply>>,
+    /// Per-tool result formats and session capabilities, frozen from the plan at admission.
+    /// Empty for a session admitted without one, and never filled from a live catalog: a
+    /// resumed run must read replies by what its session actually admitted.
+    provider_declarations: HashMap<String, broca_wal::FrozenProviderDeclarations>,
 }
 
 impl ToolManifest {
@@ -80,6 +84,7 @@ impl ToolManifest {
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             provider_presets: HashMap::new(),
             provider_replies: HashMap::new(),
+            provider_declarations: HashMap::new(),
         }
     }
 
@@ -96,6 +101,18 @@ impl ToolManifest {
                 {
                     self.provider_presets
                         .insert(provider.to_owned(), preset.to_owned());
+                }
+            }
+        }
+        for fetch in &manifest.fetches {
+            if let broca_wal::FetchOutcome::Answered {
+                declarations_frozen: Some(declarations),
+                ..
+            } = &fetch.outcome
+            {
+                if !declarations.is_empty() {
+                    self.provider_declarations
+                        .insert(fetch.provider.clone(), declarations.clone());
                 }
             }
         }
@@ -118,6 +135,15 @@ impl ToolManifest {
             }
         }
         Ok(self)
+    }
+
+    /// The declarations `provider` froze into the session's plan, or `None` when it froze none
+    /// (including a session admitted without a plan manifest).
+    pub fn provider_declarations(
+        &self,
+        provider: &str,
+    ) -> Option<&broca_wal::FrozenProviderDeclarations> {
+        self.provider_declarations.get(provider)
     }
 
     /// The frozen tool item's preset for the provider a call actually routes to.

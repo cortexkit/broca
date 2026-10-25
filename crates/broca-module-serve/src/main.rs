@@ -241,15 +241,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    let plane = Arc::new(SubcToolPlane::new(
-        tool_conn,
-        consumer_routes.tool_module.clone(),
-    ));
-    // The plane asks the daemon about a scope (`scope.describe`) over broca's own MODULE
-    // connection, because the daemon answers it only on a registered module's connection. The
-    // serve loop below attaches the describer once that connection has registered.
-    let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
-    plane.set_scope_describer(scope_describer.clone());
+    let plane = SubcToolPlane::new(tool_conn, consumer_routes.tool_module.clone());
 
     // The coordinator: a registry over file-backed lease + WAL stores + the durable run
     // index, driving the real agentic loop. The module owns its state_root -- the lease, WAL,
@@ -285,6 +277,46 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let wal_store = Arc::new(wal_store);
     let crash_orphan_wal = wal_store.clone();
+
+    // The provider-held runtime: the slots a held call waits in, and the intake that pulls each
+    // provider's late results under broca's own principal and hands them to the run's batch.
+    // Its feeds ride a consumer connection of their own, apart from the tool routes. Release
+    // builds leave `held-reply/v1` undeclared, so no call can be held and nothing is registered
+    // (see `held_runtime`).
+    let feed_conn = Arc::new(
+        SubcConnection::connect(&conn_path)
+            .await
+            .map_err(|e| ServeIoError(format!("late-results consumer connect: {e}")))?,
+    );
+    let held_resumer = Arc::new(broca_module_serve::held_runtime::LateBoundResumer::default());
+    let held_runtime = broca_module_serve::held_runtime::HeldRuntime::build(
+        &state_root,
+        wal_store.clone(),
+        feed_conn
+            .consumer_module_id()
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        Arc::new(broca_module_serve::held_runtime::FeedRoutes::new(
+            Arc::clone(&feed_conn),
+            broca_module::late_results_puller::LateResultsIntake::feed_identity(&state_root),
+        )),
+        held_resumer.clone(),
+    )
+    .map_err(|e| ServeIoError(format!("open late-results store: {e}")))?;
+    let plane =
+        plane.with_provider_held_support(held_runtime.store.clone(), held_runtime.slots.clone());
+    #[cfg(debug_assertions)]
+    let plane = if broca_module_serve::held_runtime::declare_held_reply_for_tests() {
+        plane.declaring_held_reply_for_tests()
+    } else {
+        plane
+    };
+    let plane = Arc::new(plane);
+    // The plane asks the daemon about a scope (`scope.describe`) over broca's own MODULE
+    // connection, because the daemon answers it only on a registered module's connection. The
+    // serve loop below attaches the describer once that connection has registered.
+    let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
+    plane.set_scope_describer(scope_describer.clone());
     let run_index = Arc::new(
         broca_store::SqliteStore::open(state_root.join("run-index.db"))
             .map_err(|e| ServeIoError(format!("open run index: {e}")))?,
@@ -349,6 +381,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         plane,
         provider_base_url,
     )
+    .with_provider_held_lifecycle(held_runtime.slots.clone())
     .with_hook_plane(Arc::new(broca_subc::SubcHookPlane::new(plan_conn.clone())))
     .with_elicitation_plane(Arc::new(broca_subc::consent::ScopedConsentPlane::new(
         plan_conn.clone(),
@@ -681,9 +714,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let _system_one_sweep = system_one.spawn_sweeper(registry.stopping_signal());
     // Private-content admission asks cerebellum whether a scope read the person's private
-    // content, Basal which providers a flow's approved version allows, and the daemon whether a
-    // run has ended. All three questions ride the module connection `plan_conn` presents under
-    // broca's own principal; cerebellum and Basal admit only `reserved:broca`.
+    // content and Basal which providers a flow's approved version allows. Both questions ride
+    // the module connection `plan_conn` presents under broca's own principal; cerebellum and
+    // Basal admit only `reserved:broca`.
     let llm_tools_identity = broca_protocol::BindIdentity::new(
         state_root.to_string_lossy().to_string(),
         "broca",
@@ -698,7 +731,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             plan_conn.clone(),
             llm_tools_identity,
         )),
-        Arc::clone(&scope_describer),
     ));
     let llm_tools = Arc::new(broca_module_serve::llm_tools::LlmTools::new(
         Arc::new(system_one.fork_for_tools()),
@@ -808,6 +840,21 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
+    // Late results reach a run through its session's actor, so delivery waits for the registry.
+    held_resumer.bind(registry.clone());
+    // Boot recovery for provider-held calls runs off the startup path, once the dependency
+    // routes are registered: a lost intake store is rebuilt from the live WALs first, every
+    // registered session is opened so its open-time recovery runs, and then each module that
+    // still needs its feed gets its puller.
+    let _held_recovery = {
+        let registry = registry.clone();
+        let describer = scope_describer.clone();
+        let runtime = held_runtime.clone();
+        tokio::spawn(async move {
+            describer.wait_registered().await;
+            runtime.recover(registry).await;
+        })
+    };
     let _restart_resume = {
         let registry = registry.clone();
         let index = run_index.clone();
@@ -2594,6 +2641,8 @@ mod executor {
         compaction_plane: Option<Arc<broca_subc::SubcCompactionPlane>>,
         compaction_views: Arc<broca_core::ViewReadyInbox>,
         elicitation_plane: Option<Arc<broca_subc::consent::ScopedConsentPlane>>,
+        /// Where provider-held calls wait for their late results; see `held_runtime`.
+        provider_held_lifecycle: Option<Arc<broca_module::held_slots::HeldSlots>>,
         /// One process-long HTTP client. Every per-run provider gets a cheap clone so sequential
         /// episodes retain the same DNS, TCP, TLS, and HTTP connection pool.
         provider_client: ProviderHttpClient,
@@ -2653,6 +2702,7 @@ mod executor {
                 compaction_plane: None,
                 compaction_views: Arc::default(),
                 elicitation_plane: None,
+                provider_held_lifecycle: None,
                 provider_client: build_provider_http_client(),
                 clock: broca_core::clock::Clock::default(),
                 provider_base_url,
@@ -2821,6 +2871,16 @@ mod executor {
             elicitation: Arc<broca_subc::consent::ScopedConsentPlane>,
         ) -> Self {
             self.elicitation_plane = Some(elicitation);
+            self
+        }
+
+        /// Install the slots provider-held calls wait in, so a run resumed for a late result
+        /// can take it (the same slots the tool plane's held replies wait in).
+        pub fn with_provider_held_lifecycle(
+            mut self,
+            slots: Arc<broca_module::held_slots::HeldSlots>,
+        ) -> Self {
+            self.provider_held_lifecycle = Some(slots);
             self
         }
 
@@ -3339,6 +3399,14 @@ mod executor {
             self.elicitation_plane
                 .as_ref()
                 .map(|plane| plane.clone() as Arc<dyn broca_core::tool_plane::ElicitationPlane>)
+        }
+
+        fn provider_held_lifecycle(
+            &self,
+        ) -> Option<Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>> {
+            self.provider_held_lifecycle.as_ref().map(|slots| {
+                slots.clone() as Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>
+            })
         }
 
         fn hook_plane(&self) -> Option<Arc<dyn broca_core::HookPlane>> {

@@ -113,12 +113,12 @@ pub use render::{
     canonical_request_bytes, request_digest, request_digest_hex, CANONICAL_RENDERER_VERSION,
 };
 pub use replay::{
-    budget_replay_seed_is_valid, deferred_call_obligations, latest_projection_boundary,
-    no_dispatch_result, reconcile_run_state, replay, replay_projection_tail,
-    DeferredCallObligations, DeferredCallProjection, LateApprovalView, OpenCallState,
-    OpenToolBatch, OwedWithdrawal, PendingTurn, PreparedCall, ProjectedDeferredCall,
-    ProjectionDelta, ProjectionSeed, ReconciledRunState, ReplayError, ReplayResolution,
-    ReplayState, RunUsageProjection,
+    budget_replay_seed_is_valid, deferred_call_obligations, held_call_facts,
+    latest_projection_boundary, no_dispatch_result, reconcile_run_state, replay,
+    replay_projection_tail, DeferredCallObligations, DeferredCallProjection, HeldCallFacts,
+    LateApprovalView, OpenCallState, OpenToolBatch, OwedWithdrawal, PendingTurn, PreparedCall,
+    ProjectedDeferredCall, ProjectionDelta, ProjectionSeed, ReconciledRunState, ReplayError,
+    ReplayResolution, ReplayState, RunUsageProjection,
 };
 pub use resume::{
     close_out_open_batch, close_out_pending_turn, not_dispatched_result, outcome_unknown_result,
