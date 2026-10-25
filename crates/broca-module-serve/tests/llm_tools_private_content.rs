@@ -97,6 +97,15 @@ struct Rig {
 
 impl Rig {
     async fn start(name: &str, cerebellum: Stub, basal: Stub) -> Option<Self> {
+        Self::start_with_handoff_hold(name, cerebellum, basal, false).await
+    }
+
+    async fn start_with_handoff_hold(
+        name: &str,
+        cerebellum: Stub,
+        basal: Stub,
+        hold: bool,
+    ) -> Option<Self> {
         let subc = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
         if !subc.exists() {
             assert!(
@@ -169,7 +178,9 @@ impl Rig {
             std::fs::write(
                 &handoff,
                 format!(
-                    "#!/bin/sh\n# The daemon names our connection file on the command line.\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --subc) SUBC_CONNECTION=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nexport SUBC_CONNECTION\n# A daemon spawns a module before it is ready to acknowledge the module's HELLO, so a\n# registration that ends early is not a failure: register again until one is answered.\nattempt=0\nwhile [ \"$attempt\" -lt 20 ]; do\n  attempt=$((attempt + 1))\n  SURFACE_MODULE_ID={module_id} {surface} --module-id {module_id} --SURFACE_FIXTURES={fixtures} --SURFACE_REQUESTS={requests} >> {ready} 2>> {stderr}\n  status=$?\n  [ $status -eq 0 ] && exit 0\n  sleep 0.1\ndone\necho \"the stand-in for {module_id} never registered\" >> {stderr}\nexit 1\n",
+                    "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --subc) SUBC_CONNECTION=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nexport SUBC_CONNECTION\nexport PRIVATE_CONTENT_ROOT='{root}'\nexport SURFACE_MODULE_ID={module_id}\nexport PRIVATE_CONTENT_SURFACE='{surface}'\nexport PRIVATE_CONTENT_FIXTURES={fixtures}\nexport PRIVATE_CONTENT_REQUESTS={requests}\nexec '{helper}' --exact private_content_handoff --nocapture >> '{ready}' 2>> '{stderr}'\n",
+                    root = root.display(),
+                    helper = broca_test_support::ckdev_binary(std::env::current_exe().unwrap(), broca_test_support::scratch_root()).display(),
                     surface = fake_surface_bin().display(),
                     module_id = module_id,
                     fixtures = hex(&fixture),
@@ -212,6 +223,7 @@ impl Rig {
             .env_remove("BROCA_STATE_ROOT")
             .env("HOME", root.join("home"))
             .env("SUBC_PORT", "0")
+            .env("PRIVATE_CONTENT_HOLD_HANDOFF", if hold { "1" } else { "0" })
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("SUBC_LAUNCH_NONCE_FD")
             .env_remove("SUBC_MODULE_ID")
@@ -219,6 +231,8 @@ impl Rig {
             .spawn()
         })
         .unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        record_process(&root, "daemon", child.id().unwrap());
         let rig = Self {
             _daemon: broca_test_support::RigChild::new(child, &root, "daemon"),
             root,
@@ -842,4 +856,248 @@ async fn a_marked_run_with_an_unknown_source_files_no_card() {
     let error = refused_once_the_route_is_served(&rig, &route, "unknown-source").await;
     assert_eq!(error["detail"]["consent"], "private_content_unknown");
     assert_eq!(rig.calls(), 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_lock(root: &Path) -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("processes.lock"))
+        .unwrap()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn record_process(root: &Path, role: &str, pid: u32) {
+    use std::io::Write;
+    let process = broca_test_support::RecordedProcess::capture(pid).unwrap();
+    // Callers serialize spawning and publication with processes.lock. One append
+    // publishes the complete identity before the helper waits for its child.
+    let line = format!("{role} {} {}\n", process.pid, process.start_time);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("processes.txt"))
+        .unwrap()
+        .write_all(line.as_bytes())
+        .unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recorded_processes(root: &Path) -> Vec<(String, broca_test_support::RecordedProcess)> {
+    let mut processes: Vec<_> = std::fs::read_to_string(root.join("processes.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.to_owned(),
+                broca_test_support::RecordedProcess {
+                    pid: fields.next()?.parse().ok()?,
+                    start_time: fields.next()?.parse().ok()?,
+                },
+            ))
+        })
+        .collect();
+    // The daemon records the identity of every directly supervised module. Its
+    // start-time units are microseconds on macOS and kernel clock ticks on Linux.
+    if let Ok(bytes) = std::fs::read(root.join("data/cortexkit/run/live-children.json")) {
+        let ledger: Value = serde_json::from_slice(&bytes).unwrap();
+        for child in ledger["children"].as_array().unwrap() {
+            processes.push((
+                "module".into(),
+                broca_test_support::RecordedProcess {
+                    pid: child["pid"].as_u64().unwrap().try_into().unwrap(),
+                    start_time: child["start_time"].as_u64().unwrap(),
+                },
+            ));
+        }
+    }
+    processes
+}
+
+/// Run the registration retry loop in a Rust helper so each stand-in's identity
+/// survives even if the daemon kills the helper before the stand-in exits.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn private_content_handoff() {
+    let Some(root) = std::env::var_os("PRIVATE_CONTENT_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let module = std::env::var("SURFACE_MODULE_ID").unwrap();
+    let mut recorded_helper = false;
+    broca_test_support::wait_until_sync(&format!("{module} stand-in registration"), || {
+        let lock = spawn_lock(&root);
+        lock.lock().unwrap();
+        if root.join("stopping").exists() {
+            return Ok(());
+        }
+        if !recorded_helper {
+            record_process(&root, "helper", std::process::id());
+            recorded_helper = true;
+        }
+        let mut child =
+            std::process::Command::new(std::env::var_os("PRIVATE_CONTENT_SURFACE").unwrap())
+                .env("BROCA_STATE_ROOT", root.join("state"))
+                .args(["--module-id", &module])
+                .arg(format!(
+                    "--SURFACE_FIXTURES={}",
+                    std::env::var("PRIVATE_CONTENT_FIXTURES").unwrap()
+                ))
+                .arg(format!(
+                    "--SURFACE_REQUESTS={}",
+                    std::env::var("PRIVATE_CONTENT_REQUESTS").unwrap()
+                ))
+                .spawn()
+                .unwrap();
+        record_process(&root, "stand-in", child.id());
+        if std::env::var("PRIVATE_CONTENT_HOLD_HANDOFF").as_deref() == Ok("1") {
+            broca_test_support::RecordedProcess::capture(child.id())
+                .unwrap()
+                .stop()
+                .unwrap();
+        }
+        drop(lock);
+        let status = child.wait().unwrap();
+        // A daemon may launch a module before it can acknowledge HELLO. Retry
+        // an early exit under the shared registration hang guard.
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{module} stand-in exited with {status}"))
+        }
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct CleanupProbe {
+    root: PathBuf,
+    lookalike: std::process::Child,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for CleanupProbe {
+    fn drop(&mut self) {
+        // A broken cleanup must fail without making the regression test itself
+        // leak processes. Observe survivors before this independent backstop runs.
+        for (_, process) in recorded_processes(&self.root) {
+            let _ = process.kill();
+        }
+        let _ = self.lookalike.kill();
+        let _ = self.lookalike.wait();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
+    use broca_test_support::RecordedProcess;
+    use std::os::unix::fs::PermissionsExt;
+    let Some(rig) =
+        Rig::start_with_handoff_hold(name, Stub::Unreachable, Stub::Unreachable, true).await
+    else {
+        return;
+    };
+    let root = rig.root.clone();
+    let other_root = root.with_extension("lookalike");
+    std::fs::create_dir_all(&other_root).unwrap();
+    let script = other_root.join("cerebellum.handoff.sh");
+    std::fs::write(&script, "#!/bin/sh\nexec sleep 300\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut probe = CleanupProbe {
+        root: root.clone(),
+        lookalike: std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .spawn()
+            .unwrap(),
+    };
+    let lookalike = RecordedProcess::capture(probe.lookalike.id()).unwrap();
+    broca_test_support::wait_until("recorded stand-ins", || async {
+        let count = recorded_processes(&root)
+            .iter()
+            .filter(|(role, process)| role == "stand-in" && process.is_running())
+            .count();
+        if count >= 2 {
+            Ok(())
+        } else {
+            Err(format!("only {count} live stand-ins"))
+        }
+    })
+    .await;
+    if orphan {
+        let helpers: Vec<_> = recorded_processes(&root)
+            .into_iter()
+            .filter(|(role, _)| role == "helper")
+            .map(|(_, process)| process)
+            .collect();
+        for helper in &helpers {
+            helper.kill().unwrap();
+        }
+        broca_test_support::wait_until("helpers killed before rig drop", || async {
+            if helpers.iter().all(|process| !process.is_running()) {
+                Ok(())
+            } else {
+                Err("helper still running".to_owned())
+            }
+        })
+        .await;
+        assert!(
+            recorded_processes(&root)
+                .iter()
+                .any(|(role, process)| role == "stand-in" && process.is_running()),
+            "stand-ins must survive their helpers to exercise orphan cleanup"
+        );
+    }
+    let task = tokio::spawn(async move {
+        let _rig = rig;
+        if timeout {
+            // Readiness uses real time; pause only the deliberately stuck wait.
+            tokio::time::pause();
+            broca_test_support::wait_until("deliberately stuck private-content rig", || async {
+                std::future::pending::<Result<(), String>>().await
+            })
+            .await;
+        }
+        panic!("deliberate private-content rig failure");
+    });
+    let failure = task.await.expect_err("the rig owner must unwind");
+    if timeout {
+        tokio::time::resume();
+    }
+    assert!(failure.is_panic());
+    let survivors: Vec<_> = recorded_processes(&root)
+        .into_iter()
+        .filter(|(_, process)| process.is_running())
+        .collect();
+    let unrelated_survived =
+        lookalike.is_running() && probe.lookalike.try_wait().unwrap().is_none();
+    drop(probe);
+    assert!(
+        unrelated_survived,
+        "rig cleanup killed the unrelated look-alike"
+    );
+    assert!(
+        survivors.is_empty(),
+        "rig processes survived unwinding drop: {survivors:?}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn private_content_rig_cleans_up_on_panic_and_preserves_lookalikes() {
+    cleanup_probe("cleanup-panic", false, false).await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn private_content_rig_cleans_up_after_wait_until_times_out() {
+    cleanup_probe("cleanup-timeout", true, false).await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn private_content_rig_cleans_up_standins_orphaned_before_drop() {
+    cleanup_probe("cleanup-orphan", false, true).await;
 }
