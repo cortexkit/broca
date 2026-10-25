@@ -5858,6 +5858,11 @@ impl RegistryHandle {
         self.inner.repairs.insert(key);
     }
 
+    #[cfg(test)]
+    pub(crate) fn retention_repairs_pending(&self) -> usize {
+        self.inner.repairs.len()
+    }
+
     /// Publish `handle` as the open generation for `key`, so an actor a test builds directly
     /// can claim and commit its own close through the real slot state machine.
     #[cfg(test)]

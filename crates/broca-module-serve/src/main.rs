@@ -306,9 +306,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     broca_catalog::install_global_catalog_cache(Arc::clone(&catalog_cache));
-    for notice in provider_overrides.notices(broca_catalog::catalog().ok().as_ref()) {
-        tracing::warn!(target: "catalog", "{notice}");
-    }
     let catalog_conn = Arc::new(
         SubcConnection::connect(&conn_path)
             .await
@@ -319,11 +316,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         "broca",
         "catalog-refresh",
     );
-    let _catalog_poll = spawn_catalog_poll(Arc::new(CatalogPoller::new(
-        catalog_conn,
-        catalog_identity,
-        Arc::clone(&catalog_cache),
-    )));
+    // Overrides the catalog does not serve are named once, against a loaded catalog: now when
+    // a last-known-good copy is loaded, otherwise after the first successful refresh.
+    let catalog_poller = provider_overrides.report_unserved(
+        &catalog_cache,
+        CatalogPoller::new(catalog_conn, catalog_identity, Arc::clone(&catalog_cache)),
+        |notice| tracing::warn!(target: "catalog", "{notice}"),
+    );
+    let _catalog_poll = spawn_catalog_poll(Arc::new(catalog_poller));
 
     // Provider→method defaults name the vault credential
     // selected for a run. The mock path deliberately skips this load; see the rule on

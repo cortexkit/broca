@@ -10182,8 +10182,10 @@ features = ["test-clock"]
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::failed_enrollment_and_active_write_are_repaired_without_a_read_or_restart"]
 file = "crates/broca-module/src/registry.rs"
-old = "self.inner.repairs.len()"
-new = "0 // NON-VACUITY BREAK: hide outstanding retention repairs"
+old = """    pub fn retention_repairs_pending(&self) -> usize {
+        self.inner.repairs.len()"""
+new = """    pub fn retention_repairs_pending(&self) -> usize {
+        0 // NON-VACUITY BREAK: hide outstanding retention repairs"""
 
 [[control]]
 id = "health-retention-repair-backlog-always-present"
@@ -28768,3 +28770,45 @@ expect_red = ["compaction::tests::held_history::a_later_view_whose_released_mess
 file = "crates/broca-core/src/compaction/runtime.rs"
 old = "                                view::Decision::Refuse(view::HISTORY_UNAVAILABLE)"
 new = "                                view::decide_stored_at(fetched, ready, state, lineage_id, prompt, stored, prefix_bound, run_start) // NON-VACUITY BREAK: decide over the released prompt"
+
+[[control]]
+id = "actor-retention-sync-unstarted-lineage-quiet"
+guards = "An actor's retention sync before its first RunStarted succeeds without writing a sidecar or enrolling repair, even on a fresh state root with no ephemeral directory"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::retention_sync_before_the_first_run_is_a_quiet_no_op_on_a_fresh_state_root"]
+expect_message = "unstarted lineage sync must not fail"
+file = "crates/broca-module/src/actor.rs"
+old = '            Ok(0) => return Ok(()),'
+new = '            // NON-VACUITY BREAK: sync an unstarted lineage as if it had started.'
+
+[[control]]
+id = "retention-boot-discovers-sidecarless-retained-wal"
+guards = "A retained WAL cut before its post-admission index sync, with no session sidecar, index row or writer hints, is discovered from its RunStarted at boot and gets its deadline"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::retained_first_send_cut_before_its_index_sync_is_recovered_at_boot"]
+file = "crates/broca-module/src/retention.rs"
+old = '        let read = self.read_enrollment_path(path)?;'
+new = '        let read = self.read_enrollment_path(path)?; if !path.as_os_str().is_empty() { return Ok((None, true)); } // NON-VACUITY BREAK: never discover a session from the WAL itself.'
+
+[[control]]
+id = "serve-provider-override-notice-waits-for-catalog"
+guards = "With no catalog loaded at boot, provider base_url override notices wait for the first successful refresh, so a provider that refresh serves is never reported unused"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
+expect_red = ["catalog_refresh::tests::provider_override_notices_wait_for_the_first_refresh"]
+expect_message = "no notice before a catalog loads"
+file = "crates/broca-module-serve/src/provider_overrides.rs"
+old = '                let overrides = self.clone();'
+new = '''                self.0.keys().for_each(|provider| report(format!("provider base_url override for '{provider}' is inert: provider is not currently catalog-served"))); // NON-VACUITY BREAK: judge overrides before any catalog loads.
+                let overrides = self.clone();'''
