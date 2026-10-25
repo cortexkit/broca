@@ -272,6 +272,13 @@ impl TagNumbering {
         self.numbered = held;
     }
 
+    /// Continue numbering after `high` when the prompt this numbering was built from holds only
+    /// part of a transcript whose highest number is `high`.
+    pub(crate) fn continue_after(&mut self, high: u64) {
+        self.high = self.high.max(high);
+        self.seed_high = self.seed_high.max(high);
+    }
+
     /// Number `message` as the next message after everything numbered so far, without
     /// counting it as numbered. A read exposes a tool turn whose results have not committed
     /// yet; when they commit, the turn is appended right after the numbered prompt and gets

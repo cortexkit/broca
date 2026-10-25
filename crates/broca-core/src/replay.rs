@@ -198,6 +198,10 @@ pub struct ReplayState {
     pub pending_steers: Vec<Message>,
     /// What to do next.
     pub resolution: ReplayResolution,
+    /// Set only by a resume that loaded the held set of an applied compaction view instead of
+    /// the whole transcript: `prompt` then holds only those messages, already in prompt form,
+    /// and this carries what the run loop would otherwise derive from the whole prompt.
+    pub(crate) held: Option<Box<crate::run::held_prompt::HeldResume>>,
 }
 
 /// An opened, uncommitted tool batch as the WAL left it.
@@ -1101,8 +1105,7 @@ pub struct ProjectionSeed {
     /// First model-produced message of the episode open at the watermark, if it has one.
     pub open_episode_span: Option<u64>,
     /// The episode open at the watermark, as the projection holds it, and every earlier
-    /// episode's render inputs. A seed without them cannot continue an open episode's metadata,
-    /// so the successor projection would drop it (see `projected_open_episode`).
+    /// episode's render inputs.
     pub open_episode: Option<crate::context::EpisodeRenderProjection>,
     pub earlier_episodes: Vec<crate::context::EpisodeRenderProjection>,
     /// Every episode the projection holds, when it computed them and its reader may reuse any.
@@ -1154,7 +1157,9 @@ impl ProjectionSeed {
 pub struct ProjectionDelta {
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
-    pub open_episode: Option<crate::context::EpisodeRenderProjection>,
+    /// Every episode's render inputs after the tail, in lineage order; `None` while the seed's
+    /// projection holds none (see [`ProjectionSeed::projection_episodes`]).
+    pub episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
     pub messages: Vec<Message>,
     pub message_runs: Vec<Option<RunAttribution>>,
     pub run_finals: BTreeMap<u64, RunAttribution>,
@@ -1282,15 +1287,19 @@ pub fn replay_projection_tail(
     );
     // A truncation restarts the transcript from ordinal zero, so no earlier episode survives
     // it and the tail's own ordinals are already the projection's.
-    let open_episode = if truncate_prefix_to.is_some() {
-        projected_episode_metadata(&tail_state).pop()
+    let episodes = if truncate_prefix_to.is_some() {
+        Some(projected_episode_metadata(&tail_state))
     } else {
-        projected_open_episode(&tail_state, seed.prefix_len, seed.open_episode.clone())
+        projected_episodes_after_tail(
+            &tail_state,
+            seed.prefix_len,
+            seed.projection_episodes.as_deref(),
+        )
     };
     Ok(ProjectionDelta {
         episode_spans,
         open_episode_span,
-        open_episode,
+        episodes,
         messages: tail_state.prompt,
         message_runs: tail_state.message_runs,
         run_finals: tail_state.run_finals,
@@ -1323,27 +1332,90 @@ pub fn replay_projection_tail(
 pub fn projected_episode_metadata(
     state: &ReplayState,
 ) -> Vec<crate::context::EpisodeRenderProjection> {
-    let episodes = state.render_episodes.as_deref().unwrap_or_default();
-    let step_starts: Vec<usize> = state
+    let step_starts: Vec<u64> = state
         .episode_step_spans
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|span| span.start)
+        .map(|span| span.start as u64)
         .collect();
+    episodes_with_first_steps(
+        state.render_episodes.as_deref().unwrap_or_default(),
+        &step_starts,
+    )
+}
+
+/// Each episode's projected render inputs, with its first model step found among `step_starts`
+/// (absolute ordinals) inside the episode itself. Spans exist only for episodes that committed a
+/// model step, so they are matched by position, never by index: an episode without one would
+/// otherwise take the next episode's step and shift every later episode's.
+fn episodes_with_first_steps(
+    episodes: &[broca_protocol::request::EpisodeRenderInput],
+    step_starts: &[u64],
+) -> Vec<crate::context::EpisodeRenderProjection> {
     episodes
         .iter()
         .enumerate()
-        .map(|(index, episode)| crate::context::EpisodeRenderProjection {
-            start: Some(episode.prompt_start as u64),
-            first_user: Some(episode.first_user.map(|first| first as u64)),
-            // Episode spans list only the episodes that committed a model step, in episode
-            // order, so once an episode has no span every later one shifts: an episode at or
-            // past that point records an unknown first step rather than another episode's.
-            first_step: Some(step_starts.get(index).map(|start| *start as u64)),
-            render_config: Some(episode.frozen_config.clone()),
+        .map(|(index, episode)| {
+            let start = episode.prompt_start as u64;
+            let end = episodes
+                .get(index + 1)
+                .map_or(u64::MAX, |next| next.prompt_start as u64);
+            crate::context::EpisodeRenderProjection {
+                start: Some(start),
+                first_user: Some(episode.first_user.map(|first| first as u64)),
+                first_step: Some(
+                    step_starts
+                        .iter()
+                        .copied()
+                        .find(|first| start <= *first && *first < end),
+                ),
+                render_config: Some(episode.frozen_config.clone()),
+            }
         })
         .collect()
+}
+
+/// The projection's episodes after a replay tail continued them: `previous` (the projection
+/// the seed holds) with its open episode taking its first model step from the tail if it took
+/// none before, followed by every episode the tail starts. `None` while `previous` is absent,
+/// so a store that never computed its episodes keeps reading as "replay the WAL" rather than
+/// claiming only the tail's.
+fn projected_episodes_after_tail(
+    state: &ReplayState,
+    base: u64,
+    previous: Option<&[crate::context::EpisodeRenderProjection]>,
+) -> Option<Vec<crate::context::EpisodeRenderProjection>> {
+    let mut episodes = match previous {
+        Some(previous) => previous.to_vec(),
+        // Nothing is materialized yet, so there is no earlier episode to know.
+        None if base == 0 => Vec::new(),
+        None => return None,
+    };
+    let tail = state.render_episodes.as_deref().unwrap_or_default();
+    let step_starts: Vec<u64> = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|span| base + span.start as u64)
+        .collect();
+    let tail_start = tail
+        .first()
+        .map_or(u64::MAX, |episode| episode.prompt_start as u64);
+    if let Some(open) = episodes.last_mut() {
+        if open.first_step == Some(None) {
+            if let Some(first) = step_starts
+                .iter()
+                .copied()
+                .find(|first| *first < tail_start)
+            {
+                open.first_step = Some(Some(first));
+            }
+        }
+    }
+    episodes.extend(episodes_with_first_steps(tail, &step_starts));
+    Some(episodes)
 }
 
 /// Continue the materialized episode across a replay seam, closing it before the next
@@ -1378,57 +1450,6 @@ pub(crate) fn projected_episode_spans(
         None => previous_open.or_else(|| spans.last().map(|span| span.start)),
     };
     (spans, open)
-}
-
-/// The episode that is open after a replay tail, in the coordinates of the projection this seed
-/// produces. Seeding hands the tail's own episode boundaries forward only for replay; this is the
-/// metadata the store keeps, and it must describe the same episode so a later read continues its
-/// first model step instead of losing it.
-pub(crate) fn projected_open_episode(
-    state: &ReplayState,
-    base: u64,
-    previous: Option<crate::context::EpisodeRenderProjection>,
-) -> Option<crate::context::EpisodeRenderProjection> {
-    let episodes = state.render_episodes.as_deref().unwrap_or_default();
-    let first_boundary = episodes.first().map_or(state.prompt.len(), |episode| {
-        episode.prompt_start - base as usize
-    });
-    // Episodes that committed a model step, in episode order.
-    let spanned = state
-        .episode_step_spans
-        .as_deref()
-        .unwrap_or_default()
-        .len();
-    let first_step = state
-        .episode_step_spans
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|span| base + span.start as u64)
-        .find(|start| episodes.is_empty() || *start >= base + first_boundary as u64);
-    let previous = previous.filter(|previous| previous.start.is_some());
-    match episodes.last() {
-        // A tail whose first record opens an episode shows nothing of the projection's open
-        // episode, so the projection's open episode keeps its own facts and takes the tail
-        // episode's first step only if it had none. Otherwise the tail's last episode is open,
-        // and it is the episode every one of its records belongs to.
-        Some(_) if first_boundary == 0 && episodes.len() > 1 => {
-            let metadata = projected_episode_metadata(state);
-            let mut last = metadata.last().cloned()?;
-            last.first_step = Some(first_step);
-            Some(last)
-        }
-        _ => {
-            let previous = previous?;
-            let tail_first_step = (spanned == 0).then_some(first_step).flatten();
-            Some(crate::context::EpisodeRenderProjection {
-                start: previous.start,
-                first_user: previous.first_user,
-                first_step: previous.first_step.or(Some(tail_first_step)),
-                render_config: previous.render_config,
-            })
-        }
-    }
 }
 
 /// Validate a budgeted projection/admission seed before it can affect replay.
@@ -2608,6 +2629,7 @@ fn replay_seeded_with_compaction<'a>(
         open_tool_batch,
         pending_steers,
         resolution,
+        held: None,
     })
 }
 
@@ -4518,6 +4540,30 @@ pub(crate) mod provider_held_tests {
         assert_eq!(pending.approved.len(), 1);
         assert!(
             matches!(&*pending.approved[0].prepared, WalRecord::ToolCallDeferred { args_jcs, .. } if args_jcs == "{\"n\":1}")
+        );
+    }
+}
+
+#[cfg(test)]
+mod projected_episode_tests {
+    use super::episodes_with_first_steps;
+    use broca_protocol::request::EpisodeRenderInput;
+
+    #[test]
+    fn an_episode_without_a_model_step_takes_no_other_episodes_step() {
+        let render = |start: usize| EpisodeRenderInput {
+            prompt_start: start,
+            first_user: Some(start),
+            frozen_config: serde_json::json!({}),
+        };
+        // The first episode ended before any model step; only the second has one.
+        let projected = episodes_with_first_steps(&[render(0), render(3)], &[4]);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|episode| episode.first_step)
+                .collect::<Vec<_>>(),
+            vec![Some(None), Some(Some(4))]
         );
     }
 }
