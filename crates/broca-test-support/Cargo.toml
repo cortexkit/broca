@@ -20,5 +20,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
-[target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.30.1", default-features = false }
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30.1", default-features = false, features = ["signal"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "=0.14.11"

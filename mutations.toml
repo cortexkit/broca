@@ -10436,8 +10436,8 @@ test_file = "scripts/verify-windows-mutations.py"
 expect_red = ["CoverageTests.test_requires_observed_expected_red_test"]
 platforms = ["windows"]
 file = "scripts/verify-windows-mutations.py"
-old = '        if not set(row["expect_red"]) <= set(red):'
-new = '        if False and not set(row["expect_red"]) <= set(red):  # NON-VACUITY BREAK'
+old = '        if not set(expected_red_names(row)) <= set(red):'
+new = '        if False and not set(expected_red_names(row)) <= set(red):  # NON-VACUITY BREAK'
 
 [[control]]
 id = "windows-mutations-pin-shard-rule"
@@ -31011,3 +31011,18 @@ expect_red = ["session_read::media::served_tool_result_numbering_matches_runner_
 file = "crates/broca-protocol/src/tags.rs"
 old = "    (tool_result_kind(&blocks), numbered_block_index(&blocks))"
 new = "    (tool_result_kind(&blocks), blocks.iter().rposition(|block| matches!(block, ToolResultBlock::Text(text) if !text.is_empty()))) // NON-VACUITY BREAK: number the last text block."
+
+[[control]]
+id = "private-content-rig-drop-reaps-recorded-processes"
+guards = "Unwinding a private-content rig ends its recorded children without touching an unrelated handoff look-alike"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_private_content"
+platforms = ["linux", "macos"]
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_private_content.rs"
+expect_red = ["private_content_rig_cleans_up_on_panic_and_preserves_lookalikes"]
+expect_message = "rig processes survived unwinding drop"
+file = "crates/broca-module-serve/tests/llm_tools_private_content.rs"
+old = "            let cleanup = cleanup_recorded_processes(&self.root);"
+new = "            let cleanup: std::io::Result<()> = Ok(()); // NON-VACUITY BREAK: leave recorded rig descendants running."
