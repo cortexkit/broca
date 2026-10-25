@@ -9,6 +9,21 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "store-nonadvancing-projection-preserves-wal-anchor"
+platforms = ["linux", "macos"]
+guards = "A terminal-only projection preserves the byte anchor at the unchanged watermark so the next admission reads only the WAL tail"
+runner = "cargo"
+package = "broca-store"
+target = "--test nonadvancing_anchor"
+select = "expected"
+test_file = "crates/broca-store/tests/nonadvancing_anchor.rs"
+expect_red = ["nonadvancing_projection_preserves_anchor_and_tail_read_cost"]
+expect_message = "non-advancing projection must preserve the WAL anchor"
+file = "crates/broca-core/src/projection_plan.rs"
+old = ".filter(|anchor| anchor.seq == new_watermark)"
+new = ".filter(|_| false) // NON-VACUITY BREAK: write NULL over the unchanged boundary's anchor."
+
+[[control]]
 id = "session-read-open-batch-part-rows"
 guards = "An exposed open assistant batch has an unnumbered tag row for every part before result commitment"
 runner = "cargo"
