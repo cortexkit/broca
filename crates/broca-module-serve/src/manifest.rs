@@ -497,7 +497,7 @@ pub fn manifest_configured(
             operations: broca_wire::agent_data::REQUIRED_OPS.iter().map(|op| op.to_string()).collect(),
         }, ProviderRole::ToolProvider {
             tools: vec![subc_protocol::manifest::Tool {
-                name: "llm.classify/v1".into(),
+                name: crate::llm_tools::CLASSIFY_TOOL_NAME.into(),
                 description: Some("Classify one item with a decision model.".into()),
                 execution_mode: subc_protocol::manifest::ExecutionMode::Pure,
                 schema: cortexkit_llm_tools::classify::input_schema(),

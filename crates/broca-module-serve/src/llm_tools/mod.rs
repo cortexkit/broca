@@ -4,7 +4,7 @@
 mod admission;
 mod route;
 
-pub use route::LlmTools;
+pub use route::{LlmTools, CLASSIFY_TOOL_NAME};
 
 /// No answer is released when its price cannot be measured. The contract tells the caller
 /// to charge its request ceiling against its budget rather than pretending the call was free.

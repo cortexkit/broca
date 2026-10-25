@@ -13,6 +13,10 @@ use super::admission::{admit, hash, refusal, Admission};
 
 type Answer = Result<Box<RawValue>, Vec<u8>>;
 
+/// The classify tool's catalog name. Codemode programs call tools as `tools.<name>`, so a name
+/// must be a plain identifier; the contract's tag `llm.classify/v1` goes in `capabilities`.
+pub const CLASSIFY_TOOL_NAME: &str = "llm_classify";
+
 #[derive(serde::Deserialize)]
 struct RawEnvelope<'a> {
     #[serde(borrow)]
@@ -88,7 +92,7 @@ impl LlmTools {
                 }
                 raw(json!({}))
             }
-            "llm.classify/v1" => {
+            CLASSIFY_TOOL_NAME => {
                 let envelope: RawEnvelope<'_> = serde_json::from_slice(body)
                     .map_err(|e| error(Refusal::invalid_params("arguments", e.to_string())))?;
                 let admission = admit(
@@ -146,7 +150,7 @@ impl LlmTools {
         }
         let schema = classify::input_schema();
         let mut tool = json!({
-            "name":"llm.classify/v1", "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).expect("contract schema has a digest"),
+            "name":CLASSIFY_TOOL_NAME, "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).expect("contract schema has a digest"),
             "semantics":1, "capabilities":[], "description":"Classify one item with a decision model.",
             "input_schema":schema,
             "modes":cortexkit_llm_tools::MODES,
