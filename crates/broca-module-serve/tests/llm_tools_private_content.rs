@@ -904,15 +904,20 @@ fn recorded_processes(root: &Path) -> Vec<(String, broca_test_support::RecordedP
     // The daemon records the identity of every directly supervised module. Its
     // start-time units are microseconds on macOS and kernel clock ticks on Linux.
     if let Ok(bytes) = std::fs::read(root.join("data/cortexkit/run/live-children.json")) {
-        let ledger: Value = serde_json::from_slice(&bytes).unwrap();
-        for child in ledger["children"].as_array().unwrap() {
-            processes.push((
-                "module".into(),
-                broca_test_support::RecordedProcess {
-                    pid: child["pid"].as_u64().unwrap().try_into().unwrap(),
-                    start_time: child["start_time"].as_u64().unwrap(),
-                },
-            ));
+        if let Ok(ledger) = serde_json::from_slice::<Value>(&bytes) {
+            for child in ledger["children"].as_array().into_iter().flatten() {
+                if let (Some(pid), Some(start_time)) = (
+                    child["pid"]
+                        .as_u64()
+                        .and_then(|pid| u32::try_from(pid).ok()),
+                    child["start_time"].as_u64(),
+                ) {
+                    processes.push((
+                        "module".into(),
+                        broca_test_support::RecordedProcess { pid, start_time },
+                    ));
+                }
+            }
         }
     }
     processes
@@ -939,9 +944,17 @@ fn private_content_handoff() {
             record_process(&root, "helper", std::process::id());
             recorded_helper = true;
         }
-        let mut child =
-            std::process::Command::new(std::env::var_os("PRIVATE_CONTENT_SURFACE").unwrap())
-                .env("BROCA_STATE_ROOT", root.join("state"))
+        let hold = std::env::var("PRIVATE_CONTENT_HOLD_HANDOFF").as_deref() == Ok("1");
+        let mut command = if hold {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "private_content_held_standin", "--nocapture"])
+                .env("PRIVATE_CONTENT_HELD_STANDIN", "1");
+            command
+        } else {
+            let mut command =
+                std::process::Command::new(std::env::var_os("PRIVATE_CONTENT_SURFACE").unwrap());
+            command
                 .args(["--module-id", &module])
                 .arg(format!(
                     "--SURFACE_FIXTURES={}",
@@ -950,16 +963,14 @@ fn private_content_handoff() {
                 .arg(format!(
                     "--SURFACE_REQUESTS={}",
                     std::env::var("PRIVATE_CONTENT_REQUESTS").unwrap()
-                ))
-                .spawn()
-                .unwrap();
+                ));
+            command
+        };
+        let mut child = command
+            .env("BROCA_STATE_ROOT", root.join("state"))
+            .spawn()
+            .unwrap();
         record_process(&root, "stand-in", child.id());
-        if std::env::var("PRIVATE_CONTENT_HOLD_HANDOFF").as_deref() == Ok("1") {
-            broca_test_support::RecordedProcess::capture(child.id())
-                .unwrap()
-                .stop()
-                .unwrap();
-        }
         drop(lock);
         let status = child.wait().unwrap();
         // A daemon may launch a module before it can acknowledge HELLO. Retry
@@ -970,6 +981,19 @@ fn private_content_handoff() {
             Err(format!("{module} stand-in exited with {status}"))
         }
     });
+}
+
+/// Keep the cleanup probes independent of registration and connection-close timing.
+/// Unlike SIGSTOP, parking does not trigger orphaned-process-group HUP/CONT rules
+/// when a helper is killed, so the stand-in really remains alive until cleanup.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn private_content_held_standin() {
+    if std::env::var_os("PRIVATE_CONTENT_HELD_STANDIN").is_some() {
+        loop {
+            std::thread::park();
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1001,6 +1025,7 @@ async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
         return;
     };
     let root = rig.root.clone();
+    eprintln!("cleanup probe root: {}", root.display());
     let other_root = root.with_extension("lookalike");
     std::fs::create_dir_all(&other_root).unwrap();
     let script = other_root.join("cerebellum.handoff.sh");
@@ -1044,12 +1069,20 @@ async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
             }
         })
         .await;
-        assert!(
-            recorded_processes(&root)
+        broca_test_support::wait_until("stand-ins reparented before rig drop", || async {
+            let orphaned = recorded_processes(&root)
                 .iter()
-                .any(|(role, process)| role == "stand-in" && process.is_running()),
-            "stand-ins must survive their helpers to exercise orphan cleanup"
-        );
+                .filter(|(role, process)| {
+                    role == "stand-in" && process.parent_pid().is_ok_and(|pid| pid == 1)
+                })
+                .count();
+            if orphaned >= 2 {
+                Ok(())
+            } else {
+                Err(format!("only {orphaned} stand-ins reparented to pid 1"))
+            }
+        })
+        .await;
     }
     let task = tokio::spawn(async move {
         let _rig = rig;

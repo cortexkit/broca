@@ -10,7 +10,15 @@ pub struct RecordedProcess {
 
 impl RecordedProcess {
     pub fn capture(pid: u32) -> io::Result<Self> {
-        start_time(pid).map(|start_time| Self { pid, start_time })
+        process_info(pid).map(|(start_time, _)| Self { pid, start_time })
+    }
+
+    pub fn parent_pid(self) -> io::Result<u32> {
+        let (start_time, parent) = process_info(self.pid)?;
+        if start_time != self.start_time {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        Ok(parent)
     }
 
     pub fn is_running(self) -> bool {
@@ -37,7 +45,7 @@ impl RecordedProcess {
 }
 
 #[cfg(target_os = "macos")]
-fn start_time(pid: u32) -> io::Result<u64> {
+fn process_info(pid: u32) -> io::Result<(u64, u32)> {
     use libproc::libproc::bsd_info::BSDInfo;
     use libproc::libproc::proc_pid::pidinfo;
     let info = pidinfo::<BSDInfo>(pid as i32, 0).map_err(io::Error::other)?;
@@ -45,11 +53,14 @@ fn start_time(pid: u32) -> io::Result<u64> {
     if info.pbi_status == 5 {
         return Err(io::ErrorKind::NotFound.into());
     }
-    Ok(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    Ok((
+        info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        info.pbi_ppid,
+    ))
 }
 
 #[cfg(target_os = "linux")]
-fn start_time(pid: u32) -> io::Result<u64> {
+fn process_info(pid: u32) -> io::Result<(u64, u32)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     // The process command-name field may contain spaces and ')'; the last ')'
     // ends it. Field 22 is kernel start time in ticks, not rounded wall-clock time.
@@ -62,10 +73,15 @@ fn start_time(pid: u32) -> io::Result<u64> {
     if matches!(fields.first(), Some(&"Z" | &"X")) {
         return Err(io::ErrorKind::NotFound.into());
     }
-    fields
+    let start = fields
         .get(19)
         .and_then(|time| time.parse().ok())
-        .ok_or_else(|| io::Error::other("process stat has no start time"))
+        .ok_or_else(|| io::Error::other("process stat has no start time"))?;
+    let parent = fields
+        .get(1)
+        .and_then(|parent| parent.parse().ok())
+        .ok_or_else(|| io::Error::other("process stat has no parent pid"))?;
+    Ok((start, parent))
 }
 
 #[cfg(test)]
