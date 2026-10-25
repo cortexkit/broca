@@ -26780,7 +26780,7 @@ test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
 expect_red = ["subc_plane::held_dispatch_tests::held_reply_requires_every_prerequisite_and_never_exposes_interim_content"]
 file = "crates/broca-subc/src/subc_plane.rs"
 old = "                            let terminal = support.lifecycle.wait(ctx, call, &reply).await;"
-new = "                            let terminal = DispatchResult::Completed(map_call_tool_result(&call.tool_call_id, &raw)); // NON-VACUITY BREAK: treat interim content as terminal."
+new = "                            let terminal = DispatchResult::Completed(map_call_tool_result(&call.tool_call_id, &raw).0); // NON-VACUITY BREAK: treat interim content as terminal."
 
 [[control]]
 id = "store-late-results-dispatch-group-atomic"
@@ -30251,3 +30251,95 @@ expect_red = ["actor::tests::unknown_held_state_requires_a_durable_cancel_withou
 file = "crates/broca-module/src/actor.rs"
 old = "        let provider_held = held_state != ProviderHeldPresence::NotHeld;"
 new = "        let provider_held = held_state == ProviderHeldPresence::Held; // NON-VACUITY BREAK: collapse unavailable state into not held."
+
+[[control]]
+id = "tool-media-capture-before-fence"
+guards = "Tool media is validated, published and registered before a completed dispatch is fenced"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+features = ["test-attachments"]
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/tests/tool_capture_tests.rs"
+expect_red = ["subc_plane::tests::tool_capture_tests::text_image_text_captures_before_fencing_and_repeat_publishes_nothing"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "let result = tool_capture::capture(ctx, result, captures).await;"
+new = "let _ = captures; // NON-VACUITY BREAK: expose the classifier without capture."
+
+[[control]]
+id = "tool-media-fence-keeps-captured-references"
+guards = "A repeated call id returns exactly the captured references and never publishes again"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+features = ["test-attachments"]
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/tests/tool_capture_tests.rs"
+expect_red = ["subc_plane::tests::tool_capture_tests::text_image_text_captures_before_fencing_and_repeat_publishes_nothing"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "let fenced_result = result.clone();"
+new = "let fenced_result = map_call_tool_result(&call.tool_call_id, &raw).0; // NON-VACUITY BREAK: fence the uncaptured shape."
+
+[[control]]
+id = "tool-media-registration-before-reference"
+guards = "Capture cannot expose a reference before object publication and manifest registration complete"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+features = ["test-attachments"]
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/tests/tool_capture_tests.rs"
+expect_red = ["subc_plane::tests::tool_capture_tests::text_image_text_captures_before_fencing_and_repeat_publishes_nothing"]
+file = "crates/broca-core/src/tool_media.rs"
+old = """            state
+                .manifest
+                .as_mut()
+                .expect("manifest opened above")
+                .register_and_append(&reference, &bytes, || Ok(()))
+                .map_err(|_| store_failed())?;"""
+new = "let _ = &bytes; // NON-VACUITY BREAK: return a reference without publishing or registering."
+
+[[control]]
+id = "tool-media-hook-provenance-exact-metadata"
+guards = "Hook metadata may name only field-for-field references captured for the tool call"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-attachments"]
+select = "expected"
+test_file = "crates/broca-core/src/run/hook_tests.rs"
+expect_red = ["run::hook_tests::tool_reference_provenance_is_enforced_before_hook_payloads_are_stored"]
+file = "crates/broca-core/src/tool_media.rs"
+old = "if !captured.contains(media) {"
+new = "if !captured.iter().any(|known| known.sha256 == media.sha256) { // NON-VACUITY BREAK: trust altered reference metadata."
+
+[[control]]
+id = "tool-media-late-admission-capture-handle"
+guards = "Admission-created late execution carries the session capture handle into the tool plane"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock", "test-attachments"]
+select = "expected"
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::late_admission_carries_capture_and_records_registered_media"]
+file = "crates/broca-core/src/run.rs"
+old = """            let ctx = call.ctx(&BatchCtx {
+                media_capture: writer.media_capture(),
+                batch_id: BatchId(format!("late:{key}")),"""
+new = """            let ctx = call.ctx(&BatchCtx {
+                media_capture: None, // NON-VACUITY BREAK: detach late execution from capture.
+                batch_id: BatchId(format!("late:{key}")),"""
+
+[[control]]
+id = "tool-media-disabled-without-debug-attachments"
+guards = "Without the non-shipping attachment opt-in, an MCP image keeps legacy result bytes and writes neither media files nor a media-content/v1 frame"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/tests/release_tool_capture_tests.rs"
+expect_red = ["subc_plane::tests::release_tool_capture_tests::capture_off_image_result_preserves_legacy_wal_and_writes_no_media"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "self.media_capture = if broca_protocol::attachments_enabled() {"
+new = "self.media_capture = if true { // NON-VACUITY BREAK: bind tool capture in shipping builds."

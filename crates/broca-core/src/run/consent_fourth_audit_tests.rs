@@ -28,6 +28,7 @@ async fn capability_for(
         .unwrap()
         .unwrap();
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("scope-test".into()),
         bind: BindIdentity::new("/project", "test", "scope"),
         run_id: RunId("r".into()),

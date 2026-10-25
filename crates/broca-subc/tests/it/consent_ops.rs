@@ -332,6 +332,7 @@ async fn approved_raw_dispatch_reaches_a_real_provider_without_reserializing_sav
     let serve = tokio::spawn(async move { serve.await.expect("raw approval provider serve loop") });
     let plane = broca_subc::SubcToolPlane::new(conn, "approval-tools");
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("b".into()),
         run_id: RunId("r".into()),
         bind: BindIdentity::new(&rig.dir, "broca", "raw"),

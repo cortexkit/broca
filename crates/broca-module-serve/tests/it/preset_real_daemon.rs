@@ -252,6 +252,7 @@ pub(super) async fn dispatch(
     call: &ToolCall,
 ) -> broca_protocol::ToolResult {
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: broca_protocol::BatchId(format!("batch-{}", call.tool_call_id.0)),
         bind: session,
         run_id: broca_protocol::RunId("preset-run".into()),

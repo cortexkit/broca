@@ -11,6 +11,7 @@ use std::{
 
 fn ctx() -> BatchCtx {
     BatchCtx {
+        media_capture: None,
         batch_id: BatchId("b".into()),
         bind: BindIdentity::new("/p", "test", "s"),
         run_id: RunId("r".into()),

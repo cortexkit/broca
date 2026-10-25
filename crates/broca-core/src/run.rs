@@ -2077,11 +2077,12 @@ where
     // acquires the session). The coordinator uses `run_loop_on_writer` instead with a
     // session-scoped writer it shuts down once at session close.
     let wal = wal_store.open(&req.session).map_err(RunError::from)?;
-    let writer = match owned_lease {
+    let mut writer = match owned_lease {
         Some(lease) => WalHandle::spawn_with_lease(wal, lease),
         None => WalHandle::spawn(wal, lease_epoch),
     }
     .map_err(|error| RunError::Wal(error.to_string()))?;
+    writer.bind_media_capture(wal_store, &req.session);
 
     let mode = if append_episode {
         StartMode::AppendEpisode
@@ -7930,6 +7931,7 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
 ) -> Result<BatchOutcome, RunError> {
     let batch_id = BatchId(format!("{}-b{}", run_id.0, step_id.0));
     let ctx = BatchCtx {
+        media_capture: writer.media_capture(),
         batch_id: batch_id.clone(),
         bind: session.clone(),
         run_id: run_id.clone(),
@@ -9221,7 +9223,13 @@ async fn resolve<T: ToolPlane>(
                 },
             };
             match result {
-                DispatchResult::Completed(result) => {
+                DispatchResult::Completed(mut result) => {
+                    let captured = ctx
+                        .media_capture
+                        .as_ref()
+                        .map(|capture| capture.captured_for(&ctx.batch_id, &result.tool_call_id))
+                        .unwrap_or_default();
+                    crate::tool_media::enforce_provenance(&mut result, &captured);
                     let malformed_held = matches!(&result.output, ToolOutput::Error { message } if message.starts_with("malformed provider-held reply:"));
                     let mut resolution =
                         CallResolution::plain(result, Some(DispatchOutcome::Completed));
@@ -10633,6 +10641,7 @@ mod tests {
         .unwrap();
         writer.seed_lineage_tags(Some(crate::tags::LineageTags::Off));
         let ctx = BatchCtx {
+            media_capture: None,
             batch_id: BatchId("batch".into()),
             bind: BindIdentity::new("/project", "broca", "session"),
             run_id: RunId("run".into()),
@@ -13236,6 +13245,7 @@ mod approval_gate {
                 }
                 if let (Some(id), Some(run_id)) = (&call.elicitation_id, &call.run_id) {
                     let ctx = BatchCtx {
+                        media_capture: None,
                         batch_id: batch_id.clone(),
                         bind: bind.clone(),
                         run_id: run_id.clone(),
@@ -13677,6 +13687,7 @@ mod approval_gate {
             .await;
         }
         let ctx = BatchCtx {
+            media_capture: writer.media_capture(),
             batch_id: BatchId(format!("{}-b{}", run_id.0, step.0)),
             bind: session.clone(),
             run_id: run_id.clone(),
@@ -15030,6 +15041,7 @@ mod approval_gate {
                     &projected.run_id,
                 ) {
                     let ctx = BatchCtx {
+                        media_capture: writer.media_capture(),
                         batch_id: batch_id.clone(),
                         bind: bind.clone(),
                         run_id: run_id.clone(),
@@ -15107,6 +15119,7 @@ mod approval_gate {
                 backoff: 50,
             };
             let ctx = BatchCtx {
+                media_capture: writer.media_capture(),
                 batch_id: BatchId(format!("late:{key}")),
                 bind: session.clone(),
                 run_id: projected
@@ -15250,6 +15263,7 @@ mod approval_gate {
                 );
                 writer.sync().await?;
                 let ctx = call.ctx(&BatchCtx {
+                    media_capture: writer.media_capture(),
                     batch_id: BatchId(format!("late:{}", call.key)),
                     bind: session.clone(),
                     run_id: projected.run_id.clone().expect("originating run"),
@@ -15293,6 +15307,7 @@ mod approval_gate {
                 })
                 .ok_or_else(|| RunError::Wal("late execution lacks RunStarted".into()))?;
             let ctx = call.ctx(&BatchCtx {
+                media_capture: writer.media_capture(),
                 batch_id: BatchId(format!("late:{key}")),
                 bind: session.clone(),
                 run_id: originating.0,
@@ -15454,7 +15469,7 @@ mod approval_gate {
                 reason: error.to_string(),
             };
         }
-        plane
+        let mut outcome = plane
             .dispatch_approved(
                 ctx,
                 call,
@@ -15465,7 +15480,16 @@ mod approval_gate {
                     control.stop_requested.as_ref(),
                 ),
             )
-            .await
+            .await;
+        if let DispatchResult::Completed(result) = &mut outcome {
+            let captured = ctx
+                .media_capture
+                .as_ref()
+                .map(|capture| capture.captured_for(&ctx.batch_id, &result.tool_call_id))
+                .unwrap_or_default();
+            crate::tool_media::enforce_provenance(result, &captured);
+        }
+        outcome
     }
     fn late_stopped(control: &RunControl) -> bool {
         is_cancelled(control) || stop_is_requested(control.stop_requested.as_ref())
@@ -15683,6 +15707,7 @@ async fn pause_approval(
         _ => return Err(RunError::Wal("approval pause lacks open calls".into())),
     };
     let ctx = BatchCtx {
+        media_capture: writer.media_capture(),
         batch_id,
         bind: session.clone(),
         run_id: run.clone(),
