@@ -78,6 +78,7 @@ impl SendParamsExt for SendParams {
         run_id: RunId,
     ) -> Result<SendRequest, broca_core::RunError> {
         let SendParams {
+            content,
             directives,
             session_class,
             on_restart,
@@ -185,6 +186,8 @@ impl SendParamsExt for SendParams {
         user_message.cache_prefix_blocks = cache_prefix_blocks;
         input.push(user_message);
         let submission = SubmissionRequest {
+            staged_uploads: None,
+            content,
             directives,
             on_restart,
             keep_warm,
@@ -365,6 +368,7 @@ mod tests {
 
     fn make_send_params(system: Option<String>, prompt: &str) -> SendParams {
         SendParams {
+            content: Vec::new(),
             directives: None,
             session_class: None,
             title: None,

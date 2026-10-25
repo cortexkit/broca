@@ -14,6 +14,7 @@ broca-memory-relief = { path = "../broca-memory-relief" }
 broca-protocol = { path = "../broca-protocol" }
 broca-wire = { path = "../broca-wire" }
 broca-core = { path = "../broca-core" }
+broca-provider = { path = "../broca-provider" }
 broca-wal = { path = "../broca-wal" }
 broca-store = { path = "../broca-store" }
 # Fetch-plan admission: the refusals a plan meets and the baseline a frozen manifest answers.
@@ -48,3 +49,4 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [features]
 test-clock = ["broca-core/test-clock"]
+test-attachments = ["broca-protocol/test-attachments"]

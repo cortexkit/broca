@@ -63,6 +63,12 @@ impl OriginalMessages {
         }
     }
 
+    /// Treat every role as one that may carry a model origin. A resume that holds only part of
+    /// the transcript cannot see which roles its released messages had, so it assumes all.
+    pub(crate) fn assume_model_origins(&mut self) {
+        self.origin_roles = [true; 4];
+    }
+
     /// Tags and guidance never change a message's role or model origin. Remember which roles
     /// can have a model origin so plain summaries of other roles need no copy search at all.
     pub(crate) fn index_origins(&mut self, prompt: &[Message]) {

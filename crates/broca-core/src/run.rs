@@ -51,6 +51,7 @@ use crate::{
 };
 
 pub(crate) mod held_prompt;
+mod held_resume;
 pub(crate) mod released_history;
 pub mod repetition_guidance;
 use held_prompt::PromptPosition;
@@ -197,6 +198,8 @@ impl RunRequest {
     /// [`from_submission`]: RunRequest::from_submission
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
+            staged_uploads: None,
+            content: Vec::new(),
             directives: self.directives.clone(),
             on_restart: self.on_restart,
             keep_warm: self.keep_warm,
@@ -782,6 +785,8 @@ pub enum RunError {
     /// error and writes NOTHING durable (no ghost run). Distinct from a mid-run failure
     /// (which is a normal short terminal run).
     Config(String),
+    /// Person media failed admission before a record could name it.
+    MediaUnsupported(String),
     /// Unsupported reasoning variant, refused before durable admission.
     VariantUnsupported(VariantRefusal),
     /// Admission failed because a required dependency is temporarily unavailable. Nothing
@@ -841,6 +846,7 @@ impl RunError {
     pub fn admission_error_class(&self) -> ErrorClass {
         match self {
             Self::Config(_)
+            | Self::MediaUnsupported(_)
             | Self::VariantUnsupported(_)
             | Self::SendIdReuse { .. }
             | Self::SystemPromptChanged
@@ -879,6 +885,7 @@ impl std::fmt::Display for RunError {
             RunError::TagNumbering(overflow) => write!(f, "{overflow}"),
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
+            RunError::MediaUnsupported(s) => write!(f, "{s}"),
             RunError::Transient(s) => write!(f, "run admission temporarily unavailable: {s}"),
             RunError::SendIdReuse { differing } => write!(
                 f,
@@ -1678,7 +1685,55 @@ where
                 )
             });
 
+    // A session with an applied compaction view holds only the view's held set, so a resume
+    // loads only that set's stored rows, never the discarded range (see `held_resume`).
+    let held_view = snapshot
+        .checkpoint_at_head
+        .compaction
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.state())
+        .and_then(|state| state.view.as_ref())
+        .map(|applied| applied.view.clone());
+    let mut held_prior = None;
+    let mut held_needs_replay = false;
+    if let (Some(store), Some(view)) = (store.as_ref(), held_view) {
+        if is_resume && (!budgeted || budget_seed_valid) {
+            let input = held_resume::HeldInput {
+                store: Arc::clone(store),
+                session: req.session.clone(),
+                view,
+                tail: Arc::clone(&snapshot.tail),
+                base_watermark: snapshot.base_watermark,
+                head_seq: snapshot.head_seq,
+                writer_lineage: writer.lineage_id().map(|lineage| lineage.to_string()),
+                budgeted,
+                run_config: run_config.clone(),
+                run_id: run_id.clone(),
+                budget_state: budget_state.clone(),
+            };
+            let loaded = spawn_blocking(JobKind::Projection, move || held_resume::load(input))
+                .await
+                .map_err(|error| format!("held resume task failed: {error}"));
+            match loaded {
+                Ok(held_resume::HeldLoad::Prior(prior)) => held_prior = Some(*prior),
+                Ok(held_resume::HeldLoad::Merge) => {}
+                Ok(held_resume::HeldLoad::Replay(reason)) | Err(reason) => {
+                    tracing::info!(
+                        target: "store",
+                        %reason,
+                        "held resume falls back to a full WAL replay"
+                    );
+                    held_needs_replay = true;
+                }
+            }
+        }
+    }
+
     let mut prior = match store {
+        _ if held_prior.is_some() => held_prior.take().expect("checked held prior"),
+        _ if held_needs_replay => {
+            replay_complete_snapshot_or_wal(&snapshot, wal_store, &req.session)?
+        }
         Some(store) if is_resume && (!budgeted || budget_seed_valid) => {
             match read_store_prefix_blocking(store, req.session.clone()).await {
                 Ok(prefix)
@@ -3176,7 +3231,10 @@ where
         let ledger_high = writer
             .lineage_tags()
             .unwrap_or(crate::tags::LineageTags::unstarted())
-            .ledger_high();
+            .ledger_high()
+            // A held resume's prompt shows only part of the transcript's numbers; it carries
+            // the highest the whole transcript shows.
+            .max(prior.held.as_ref().map_or(0, |held| held.tag_high));
         (
             control
                 .manifest
@@ -4389,8 +4447,10 @@ where
     // model-only repetition guidance in memory. Rebuild the observer from only this episode's
     // completed steps, then reproduce that guidance before either path renders another request.
     drop(last_input);
+    // A held resume loaded only the view's held set, already in prompt form, and folded its
+    // episodes' repetition guidance from their stored and tail model steps (`held_resume`).
+    let held_resume = prior.held.take();
     let committed_episode_steps = completed_steps.saturating_sub(u64::from(pending_turn.is_some()));
-    let episode_history_start = episode_history_start(&prompt, committed_episode_steps);
     let mut originals = compaction_runtime
         .as_ref()
         .map(|_| crate::compaction::OriginalMessages::default());
@@ -4401,21 +4461,58 @@ where
     // Index their positions once as the append-only prompt grows instead of rescanning history.
     let mut system_positions = Vec::new();
     let mut system_indexed_len = 0;
-    // Earlier episodes' tool results were sent with the guidance their own episode produced.
-    // Every later request must render them the same way, or it edits a message the provider has
-    // already seen (a cache miss everywhere, and a rejected request where signed thinking is bound
-    // to its prefix). Each episode folds with its own fresh observer, as it did live.
-    restore_earlier_episode_guidance(
-        &mut prompt,
-        episode_step_spans.as_deref(),
-        episode_history_start,
-        originals.as_mut(),
-    );
-    let mut repetition_observer = restore_guidance_with_originals(
-        &mut prompt[episode_history_start..],
-        episode_history_start,
-        originals.as_mut(),
-    );
+    let (episode_history_start, mut repetition_observer, held_episodes, held_tag_high) =
+        match held_resume {
+            Some(held) => {
+                let held = *held;
+                if let Some(originals) = originals.as_mut() {
+                    originals.insert_originals(held.originals, &prompt);
+                    // Messages of every role may have been released with a model origin, and
+                    // the run no longer holds them to tell. Judging a later view's bytes then
+                    // checks every role, which a run holding everything would only skip for a
+                    // role it never saw from the model.
+                    originals.assume_model_origins();
+                }
+                // An appended episode starts its own repetition counters.
+                let observer = if append_episode {
+                    RepetitionObserver::new()
+                } else {
+                    held.observer
+                };
+                // The resumed episode's first model step, or where its next one will land.
+                let active_start = held
+                    .episodes
+                    .last()
+                    .and_then(|episode| episode.first_step)
+                    .unwrap_or(raw_extent);
+                (
+                    active_start as usize,
+                    observer,
+                    Some(held.episodes),
+                    Some(held.tag_high),
+                )
+            }
+            None => {
+                let episode_history_start = episode_history_start(&prompt, committed_episode_steps);
+                // Earlier episodes' tool results were sent with the guidance their own episode
+                // produced. Every later request must render them the same way, or it edits a
+                // message the provider has already seen (a cache miss everywhere, and a rejected
+                // request where signed thinking is bound to its prefix). Each episode folds with
+                // its own fresh observer, as it did live.
+                restore_earlier_episode_guidance(
+                    &mut prompt,
+                    episode_step_spans.as_deref(),
+                    episode_history_start,
+                    originals.as_mut(),
+                );
+                let observer = restore_guidance_with_originals(
+                    &mut prompt[episode_history_start..],
+                    episode_history_start,
+                    originals.as_mut(),
+                );
+                (episode_history_start, observer, None, None)
+            }
+        };
 
     if let Some(history) = approval_history.as_mut() {
         Box::pin(approval_gate::admission(
@@ -4551,11 +4648,30 @@ where
         crate::tags::rules_for(computed_tags, render_tags, &provider.render_config_blob()),
         computed_tags,
     );
-    let mut guidance_episodes = held_prompt::GuidanceEpisodes::new(
-        &render_episodes,
-        episode_step_spans.as_deref(),
-        stamped_len.extent(&prompt),
-    );
+    if let Some(high) = held_tag_high {
+        // The held prompt shows only some of the transcript's numbers; numbering continues
+        // after the highest the whole transcript shows.
+        tag_numbering.continue_after(high);
+    }
+    let mut guidance_episodes = match held_episodes {
+        Some(mut episodes) => {
+            // An appended episode follows the resumed lineage's own.
+            let extent = stamped_len.extent(&prompt);
+            for render in render_episodes.iter().skip(episodes.len()) {
+                episodes.push(held_prompt::GuidanceEpisode {
+                    render: render.clone(),
+                    first_step: None,
+                    end: extent,
+                });
+            }
+            held_prompt::GuidanceEpisodes::known(episodes)
+        }
+        None => held_prompt::GuidanceEpisodes::new(
+            &render_episodes,
+            episode_step_spans.as_deref(),
+            stamped_len.extent(&prompt),
+        ),
+    };
     if completed_steps > 0 {
         guidance_episodes.active_step(episode_history_start as u64);
     }
@@ -4755,9 +4871,10 @@ where
         // first possible mode is `steer` joins this step after the steered messages, and one that
         // expired ends. Their records precede `StepStarted`, exactly where replay places them.
         let mut steered = match &control.steer {
-            Some(inbox) => match inbox.try_take_at_step_ordered(
+            Some(inbox) => match inbox.try_take_at_step_ordered_for(
                 &resolved_run_id,
                 control.now_ms().unwrap_or(0),
+                step_id,
                 |records| {
                     let assigned = records
                         .into_iter()

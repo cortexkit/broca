@@ -10182,8 +10182,10 @@ features = ["test-clock"]
 test_file = "crates/broca-module/src/retention_tests.rs"
 expect_red = ["retention::tests::failed_enrollment_and_active_write_are_repaired_without_a_read_or_restart"]
 file = "crates/broca-module/src/registry.rs"
-old = "self.inner.repairs.len()"
-new = "0 // NON-VACUITY BREAK: hide outstanding retention repairs"
+old = """    pub fn retention_repairs_pending(&self) -> usize {
+        self.inner.repairs.len()"""
+new = """    pub fn retention_repairs_pending(&self) -> usize {
+        0 // NON-VACUITY BREAK: hide outstanding retention repairs"""
 
 [[control]]
 id = "health-retention-repair-backlog-always-present"
@@ -28847,3 +28849,788 @@ expect_red = ["output_refs::a_call_without_opt_in_has_no_set", "output_refs::dec
 file = "crates/broca-fetch-plan/src/admit.rs"
 old = "        .filter(|item| item.output_refs)?;"
 new = "        .filter(|item| item.output_refs || !item.output_refs)?; // NON-VACUITY BREAK: freeze every provider's slots."
+
+[[control]]
+id = "actor-retention-sync-unstarted-lineage-quiet"
+guards = "An actor's retention sync before its first RunStarted succeeds without writing a sidecar or enrolling repair, even on a fresh state root with no ephemeral directory"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::retention_sync_before_the_first_run_is_a_quiet_no_op_on_a_fresh_state_root"]
+expect_message = "unstarted lineage sync must not fail"
+file = "crates/broca-module/src/actor.rs"
+old = '            Ok(0) => return Ok(()),'
+new = '            // NON-VACUITY BREAK: sync an unstarted lineage as if it had started.'
+
+[[control]]
+id = "retention-boot-discovers-sidecarless-retained-wal"
+guards = "A retained WAL cut before its post-admission index sync, with no session sidecar, index row or writer hints, is discovered from its RunStarted at boot and gets its deadline"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/wal_proof_tests.rs"
+expect_red = ["actor::wal_proof_tests::retained_first_send_cut_before_its_index_sync_is_recovered_at_boot"]
+file = "crates/broca-module/src/retention.rs"
+old = '        let read = self.read_enrollment_path(path)?;'
+new = '        let read = self.read_enrollment_path(path)?; if !path.as_os_str().is_empty() { return Ok((None, true)); } // NON-VACUITY BREAK: never discover a session from the WAL itself.'
+
+[[control]]
+id = "serve-provider-override-notice-waits-for-catalog"
+guards = "With no catalog loaded at boot, provider base_url override notices wait for the first successful refresh, so a provider that refresh serves is never reported unused"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/catalog_refresh.rs"
+expect_red = ["catalog_refresh::tests::provider_override_notices_wait_for_the_first_refresh"]
+expect_message = "no notice before a catalog loads"
+file = "crates/broca-module-serve/src/provider_overrides.rs"
+old = '                let overrides = self.clone();'
+new = '''                self.0.keys().for_each(|provider| report(format!("provider base_url override for '{provider}' is inert: provider is not currently catalog-served"))); // NON-VACUITY BREAK: judge overrides before any catalog loads.
+                let overrides = self.clone();'''
+
+[[control]]
+id = "person-send-catalog-modality"
+guards = "Person PDF refusal names its catalog modality, model and modality reason"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::pdf_without_catalog_modality_names_pdf_model_and_reason"]
+file = "crates/broca-provider/src/person_media.rs"
+old = "profile.filter(|profile| profile.accepts_modality(media.kind))"
+new = "profile.filter(|_| true) /* NON-VACUITY BREAK: ignore the catalog modality */"
+
+[[control]]
+id = "person-send-chatgpt-audio-carrier"
+guards = "ChatGPT audio without a live-gated carrier is refused with the carrier reason"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::chatgpt_audio_without_live_flag_is_carrier_refusal"]
+file = "crates/broca-provider/src/person_media.rs"
+old = "if kind.user_message == MediaCarrier::Marker {"
+new = "if false { // NON-VACUITY BREAK: accept a missing user carrier"
+
+[[control]]
+id = "person-send-protected-payload-boundary"
+guards = "The temporary encoded-payload bound admits equality without an envelope reserve"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::protected_encoded_payload_bound_omits_text_and_envelope_bytes"]
+file = "crates/broca-provider/src/person_media.rs"
+old = "if encoded > profile.request_cap_bytes"
+new = "if encoded >= profile.request_cap_bytes // NON-VACUITY BREAK: falsely refuse the fitting payload"
+
+[[control]]
+id = "person-send-protected-count"
+guards = "Every occurrence of a protected media reference consumes the per-request count"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::request_cap_counts_every_protected_input_and_duplicate_reference"]
+file = "crates/broca-provider/src/person_media.rs"
+old = ".is_some_and(|max| counts[index] > max)"
+new = ".is_some_and(|_| false) /* NON-VACUITY BREAK: omit protected media counts */"
+
+[[control]]
+id = "person-send-steer-per-item-before-publish"
+guards = "A text-only run refuses an image steer before publication as well as before Steered sync"
+runner = "cargo"
+package = "broca-module"
+features = ["test-attachments"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/pre_user_tests.rs"
+expect_red = ["actor::pre_user_tests::person_send_gate::text_only_steer_refuses_image_before_publication_or_steered_sync"]
+file = "crates/broca-module/src/actor.rs"
+old = "crate::person_media::check(media_profile.as_deref(), &media_model, &request.input)"
+new = "Ok::<(), RunError>(()) /* NON-VACUITY BREAK: publish a steer before its per-item gate */"
+
+[[control]]
+id = "person-send-inbox-atomic-protected-budget"
+guards = "Two steers share one protected-input budget under their Steered append lock"
+runner = "cargo"
+package = "broca-module"
+features = ["test-attachments"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/pre_user_tests.rs"
+expect_red = ["actor::pre_user_tests::person_send_gate::later_steer_cap_refusal_leaves_only_lease_protected_manifest_entries"]
+file = "crates/broca-core/src/steer.rs"
+old = """        check(&protected)?;
+        if let Some(tags) = record() {"""
+new = """        let _ = (&check, &protected); // NON-VACUITY BREAK: append without the atomic budget check
+        if let Some(tags) = record() {"""
+
+[[control]]
+id = "person-send-queued-admission-recheck"
+guards = "A queued media input is rechecked against admission's frozen provider and ends with the same refusal"
+runner = "cargo"
+package = "broca-module"
+features = ["test-attachments"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/pre_user_tests.rs"
+expect_red = ["actor::pre_user_tests::person_send_gate::queued_media_is_checked_again_at_admission_and_keeps_the_same_refusal"]
+file = "crates/broca-module/src/executor.rs"
+old = """        crate::person_media::check(
+            frozen.as_ref().and_then(|frozen| frozen.media.as_ref()),
+            &model,
+            &protected,
+        )?;"""
+new = """        let _ = (frozen, model); // NON-VACUITY BREAK: trust the enqueue profile at admission"""
+
+[[control]]
+id = "person-send-fresh-refusal-before-wal-open"
+guards = "A PDF refusal happens on held staged bytes before a fresh actor can create its WAL"
+runner = "cargo"
+package = "broca-module-serve"
+features = ["test-attachments"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::debug_pdf_send_is_refused_before_any_session_write"]
+file = "crates/broca-module/src/serve.rs"
+old = "if !req.request.content.is_empty() && !self.session_written(&req.session)? {"
+new = "if false && !req.request.content.is_empty() && !self.session_written(&req.session)? { // NON-VACUITY BREAK: open the actor before media preflight"
+
+[[control]]
+id = "person-send-default-read-media-marker"
+guards = "Default transcript reads keep media grammar away from strict text-only readers"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::default_media_read_uses_text_markers_without_changing_the_stored_message"]
+file = "crates/broca-wire/src/lib.rs"
+old = "if exposed.content.iter().any(|block| {"
+new = "if false && exposed.content.iter().any(|block| { // NON-VACUITY BREAK: expose stored media on default reads"
+
+[[control]]
+id = "person-send-frozen-profile-feature"
+guards = "A RunStarted that freezes a media profile requires media-content/v1 even without a media block"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/media_profile_frozen.rs"
+expect_red = ["media_profile_frozen::a_frozen_media_profile_requires_the_media_content_feature"]
+file = "crates/broca-wal/src/record.rs"
+old = """                config
+                    .frozen_render_config
+                    .get("media")"""
+new = """                config
+                    .frozen_render_config
+                    .get("unrecognized_media") /* NON-VACUITY BREAK: omit the frozen profile's feature */"""
+
+[[control]]
+id = "person-send-nonshipping-marker-staging"
+platforms = ["linux", "macos"]
+guards = "Release staging rejects a binary carrying debug-only attachment admission"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["RetryMarkerStaging.test_test_attachments_marker_refuses_artifact"]
+file = "scripts/nonshipping-markers.sh"
+old = "test-attachments broca-nonshipping-attachments-v1"
+new = "# NON-VACUITY BREAK: forget the attachment ingress marker"
+
+[[control]]
+id = "person-send-prequeued-steer-initial-budget"
+guards = "A new episode checks its initial media with prequeued ordered steers before publishing its own bytes"
+runner = "cargo"
+package = "broca-module"
+features = ["test-attachments"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/pre_user_tests.rs"
+expect_red = ["actor::pre_user_tests::person_send_gate::fresh_input_is_checked_with_prequeued_ordered_steers_before_publication"]
+file = "crates/broca-module/src/executor.rs"
+old = "|inbox| inbox.protected_inputs()"
+new = "|_| self.req.input.clone() /* NON-VACUITY BREAK: omit prequeued steers from initial admission */"
+
+[[control]]
+id = "person-send-family-mime"
+guards = "Per-family MIME checks use detected M4A and WMV spellings without admitting undocumented containers"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::per_family_mime_gate_uses_detected_container_spellings"]
+file = "crates/broca-provider/src/person_media.rs"
+old = "if !accepts_mime(profile, media) {"
+new = "if false { // NON-VACUITY BREAK: bypass family MIME support"
+
+[[control]]
+id = "held-resume-folds-guidance-episodes"
+guards = "A resume holding only an applied view's held set still folds every guidance episode's repetition guidance into the held messages"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_is_byte_identical_at_every_crash_cut"]
+file = "crates/broca-core/src/run/held_resume.rs"
+old = "            source.restore_episode(Some(episode.first_step), episode.end, &mut state.prompt)?;"
+new = "            RepetitionObserver::new(); // NON-VACUITY BREAK: skip the guidance fold"
+
+[[control]]
+id = "held-resume-uses-the-held-prior"
+guards = "A resume under an applied view builds its state from the held rows and the WAL tail, never a whole-WAL replay"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_reads_only_the_held_set_and_the_wal_tail"]
+file = "crates/broca-core/src/run.rs"
+old = "                Ok(held_resume::HeldLoad::Prior(prior)) => held_prior = Some(*prior),"
+new = "                Ok(held_resume::HeldLoad::Prior(_)) => held_needs_replay = true, // NON-VACUITY BREAK: replay the whole WAL"
+
+[[control]]
+id = "held-resume-reports-the-whole-replayed-transcript"
+guards = "A held resume's ResumeStarted record reports the whole reconstructed transcript, as a full replay's does"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_reads_only_the_held_set_and_the_wal_tail"]
+file = "crates/broca-core/src/resume.rs"
+old = "                .map_or(prior.prompt.len() as u64, |held| held.replayed_messages),"
+new = "                .map_or(prior.prompt.len() as u64, |_| prior.prompt.len() as u64), // NON-VACUITY BREAK: report the held count"
+
+[[control]]
+id = "held-store-reads-every-system-message"
+guards = "The store's held read returns every system message below its prefix, including ones in a replaced range"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_is_byte_identical_at_every_crash_cut"]
+file = "crates/broca-store/src/lib.rs"
+old = "             WHERE session=?1 AND ord<?2 AND {SYSTEM_ROW_SQL} ORDER BY ord ASC\""
+new = "             WHERE session=?1 AND ord<?2 AND ord<0 AND {SYSTEM_ROW_SQL} ORDER BY ord ASC\" // NON-VACUITY BREAK: no system rows"
+
+[[control]]
+id = "projection-continues-every-tail-episode"
+guards = "An incremental projection records every episode its WAL tail starts, not only the one open at the watermark"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_is_byte_identical_at_every_crash_cut"]
+file = "crates/broca-core/src/replay.rs"
+old = "    episodes.extend(episodes_with_first_steps(tail, &step_starts));"
+new = "    let _ = (tail, &step_starts); // NON-VACUITY BREAK: forget the tail's episodes"
+
+[[control]]
+id = "projected-first-step-stays-in-its-episode"
+guards = "A projected episode's first model step lies inside that episode, so an episode without one never takes the next one's"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::projected_episode_tests::an_episode_without_a_model_step_takes_no_other_episodes_step"]
+file = "crates/broca-core/src/replay.rs"
+old = "                        .find(|first| start <= *first && *first < end),"
+new = "                        .find(|first| start <= *first && end > 0), // NON-VACUITY BREAK: take a later episode's step"
+
+[[control]]
+id = "held-episodes-refuse-a-misaligned-step-list"
+guards = "A stored episode projection whose first model step lies past its episode is distrusted, sending the resume to the WAL"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/context.rs"
+expect_red = ["context::held_resume_tests::a_first_step_outside_its_episode_distrusts_the_whole_projection"]
+file = "crates/broca-core/src/context.rs"
+old = "            if first_step < starts[index] || first_step >= end {"
+new = "            if first_step < starts[index] && first_step >= end { // NON-VACUITY BREAK: trust a shifted step"
+
+[[control]]
+id = "episode-projection-stores-a-known-absence"
+guards = "A known absent first user or first model step survives the stored JSON instead of reading back as uncomputed"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/context.rs"
+expect_red = ["context::held_resume_tests::a_known_absence_survives_the_stored_json_and_an_old_null_reads_as_uncomputed"]
+file = "crates/broca-core/src/context.rs"
+old = "            Some(None) => serializer.serialize_str(KNOWN_NONE),"
+new = "            Some(None) => serializer.serialize_none(), // NON-VACUITY BREAK: write a known absence as null"
+
+[[control]]
+id = "absent-episode-projection-is-refilled"
+guards = "A store whose episode projection was never computed is refilled by one complete projection, not continued from a suffix"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::an_absent_episode_projection_is_filled_by_the_next_projection"]
+file = "crates/broca-store/src/lib.rs"
+old = "    if projection_episodes.is_none() && prefix_len > 0 {"
+new = "    if projection_episodes.is_none() && prefix_len > 0 && false { // NON-VACUITY BREAK: continue an absent projection"
+
+[[control]]
+id = "llm-tool-bind-target-is-narrow"
+guards = "Only a configured tool-provider role widens the former management and agent-data target set"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::tool_bind_target_does_not_widen_management_or_internal_service_admission"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "role == RouteRole::ToolProvider && tools,"
+new = "role == RouteRole::ToolProvider || tools, // NON-VACUITY BREAK: accept unrelated roles on a tool target."
+
+[[control]]
+id = "llm-tool-tags-are-opt-in"
+guards = "Production catalogs omit llm tags unless the operator explicitly enables them"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_catalog_tag_switch_is_opt_in_and_preserves_invocation_modes"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "if self.config.advertise_tags {"
+new = "if true || self.config.advertise_tags { // NON-VACUITY BREAK: advertise tags without opt-in."
+
+[[control]]
+id = "llm-tool-flow-scope-before-arguments"
+guards = "A flow carrier without a flow stamp is refused before argument or catalog admission"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_scope_guards_run_before_argument_and_catalog_admission"]
+file = "crates/broca-module-serve/src/llm_tools/admission.rs"
+old = "if broca_core::scope_admission::is_flow_only(principal)"
+new = "if false && broca_core::scope_admission::is_flow_only(principal) // NON-VACUITY BREAK: bypass flow admission."
+
+[[control]]
+id = "llm-tool-unknown-argument-is-named"
+guards = "Unknown model-visible arguments name their own field rather than an opaque decode error"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_unknown_argument_refusal_names_the_field_before_any_execution"]
+file = "crates/broca-module-serve/src/llm_tools/admission.rs"
+old = "if ![\"model\", \"questions\", \"item\", \"max_cost_usd\"].contains(&field.as_str()) {"
+new = "if false && ![\"model\", \"questions\", \"item\", \"max_cost_usd\"].contains(&field.as_str()) { // NON-VACUITY BREAK: lose the named unknown-field refusal."
+
+[[control]]
+id = "llm-tool-batch-key-includes-owner"
+guards = "Opaque call keys are qualified by caller and full stamped scope identity"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_derived_keys_separate_principals_owners_and_scope_epochs_and_store_argument_digest"]
+file = "crates/broca-module-serve/src/llm_tools/admission.rs"
+old = '"owner": stamped.owner.as_owner_string(),'
+new = '"owner": "shared", // NON-VACUITY BREAK: collapse different scope owners.'
+
+[[control]]
+id = "llm-tool-stores-validated-argument-digest"
+guards = "The durable digest covers validated tool arguments including the caller ceiling"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_derived_keys_separate_principals_owners_and_scope_epochs_and_store_argument_digest"]
+file = "crates/broca-module-serve/src/llm_tools/admission.rs"
+old = "let args_digest = hash(&value);"
+new = "let args_digest = hash(&json!({})); // NON-VACUITY BREAK: record a digest unrelated to arguments."
+
+[[control]]
+id = "llm-tool-keyless-batches-are-random"
+guards = "Identical keyless calls execute and bill independently rather than sharing replay"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_keyless_calls_get_random_independent_batches"]
+file = "crates/broca-module-serve/src/llm_tools/admission.rs"
+old = "getrandom::fill(&mut random)"
+new = "Ok::<(), getrandom::Error>(random.fill(0)) // NON-VACUITY BREAK: reuse a constant keyless batch."
+
+[[control]]
+id = "llm-tool-replay-before-live-catalog"
+guards = "A paid tool replay does not depend on a live catalog or its current input rate"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_frozen_replay_does_not_depend_on_a_live_catalog_row"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "let stored = if keyed {"
+new = "let stored = if false && keyed { // NON-VACUITY BREAK: omit the read-only replay lookup."
+
+[[control]]
+id = "llm-tool-replay-retention-boundary"
+guards = "A keyed tool call is new work at its exact seven-day admission boundary"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_seven_day_boundary_replays_before_and_bills_at_expiry"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "< broca_store::system_one::RETENTION_MS"
+new = "<= broca_store::system_one::RETENTION_MS // NON-VACUITY BREAK: replay at the expiry boundary."
+
+[[control]]
+id = "llm-tool-final-replay-scope-fence"
+guards = "A final stored tool result never bypasses stamped scope attribution checks"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_final_replay_checks_argument_digest_and_scope_before_returning_data"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "if stored.scope.as_ref() != Some(&admission.scope) {"
+new = "if false && stored.scope.as_ref() != Some(&admission.scope) { // NON-VACUITY BREAK: return a result under the wrong scope."
+
+[[control]]
+id = "llm-tool-final-replay-argument-fence"
+guards = "Reusing a final tool key with changed arguments or ceiling refuses instead of replaying"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_final_replay_checks_argument_digest_and_scope_before_returning_data"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "if stored.args_digest != admission.args_digest {"
+new = "if false && stored.args_digest != admission.args_digest { // NON-VACUITY BREAK: replay changed arguments."
+
+[[control]]
+id = "llm-tool-input-only-pricing"
+guards = "Only input-priced per-token rows without positive output rates may execute"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_tool_pricing_rejects_missing_input_and_positive_output_rates"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "if frozen.charge_basis != Some(broca_core::ChargeBasis::MeteredApi)\n        || frozen.input_rate_nanos.is_none_or(|rate| rate < 0)\n        || frozen.output_rate_nanos.is_some_and(|rate| rate > 0)\n    {"
+new = "if false && (frozen.charge_basis != Some(broca_core::ChargeBasis::MeteredApi)\n        || frozen.input_rate_nanos.is_none_or(|rate| rate < 0)\n        || frozen.output_rate_nanos.is_some_and(|rate| rate > 0)) { // NON-VACUITY BREAK: execute unpriceable input/output rates."
+
+[[control]]
+id = "llm-tool-private-unknown-denies-unlisted-provider"
+guards = "The conservative private-content fallback never sends content to an unlisted provider"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_private_unknown_provider_is_not_dispatched"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "if stored.is_none()"
+new = "if false && stored.is_none() // NON-VACUITY BREAK: execute an unlisted provider."
+
+[[control]]
+id = "llm-tool-single-flight-joins-waiters"
+guards = "Concurrent keyed tool calls join one detached execution instead of surfacing batch_in_progress"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_in_process_single_flight_waiters_receive_the_same_answer"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "flights.insert(\n                    admission.batch_id.clone(),"
+new = "flights.insert(\n                    format!(\"unjoinable-{}\", admission.batch_id), // NON-VACUITY BREAK: hide the execution from its waiters."
+
+[[control]]
+id = "llm-tool-unmeasured-cost-is-stored-failure"
+guards = "A paid answer without measured input cost is persisted as a permanent failure and never reused as success"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_unmeasured_cost_is_a_stored_permanent_failure_without_an_answer"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "if is_tool && !measured {"
+new = "if false && is_tool && !measured { // NON-VACUITY BREAK: persist an unmeasured answer as successful."
+
+[[control]]
+id = "llm-tool-ceiling-reaches-execution"
+guards = "The caller's max_cost_usd is the actual execution ceiling, not just part of its digest"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_cost_ceiling_prevents_provider_execution"]
+file = "crates/broca-module-serve/src/llm_tools/admission.rs"
+old = "raw.max_cost_usd.get(),"
+new = '"1", // NON-VACUITY BREAK: ignore the caller ceiling.'
+
+[[control]]
+id = "llm-tool-schema-pin-is-enforced"
+guards = "A stale schema pin cannot execute a tool with another schema"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_schema_pins_are_checked_before_provider_execution"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "if pin.schema_digest != digest {"
+new = "if false && pin.schema_digest != digest { // NON-VACUITY BREAK: execute a stale schema pin."
+
+[[control]]
+id = "llm-tool-semantics-pin-is-enforced"
+guards = "A stale semantics pin cannot execute a tool with another semantics version"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_schema_pins_are_checked_before_provider_execution"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "if pin.semantics != 1 {"
+new = "if false && pin.semantics != 1 { // NON-VACUITY BREAK: execute a stale semantics pin."
+
+[[control]]
+id = "llm-tool-late-read-cursor-fence"
+guards = "An empty late-result feed rejects foreign-incarnation and future cursors"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_late_results_refuse_foreign_and_future_cursors"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "if !since.is_null()"
+new = "if false && !since.is_null() // NON-VACUITY BREAK: accept an invalid late-read cursor."
+
+[[control]]
+id = "llm-tool-late-ack-cursor-fence"
+guards = "Late-result acknowledgement rejects foreign-incarnation and future cursors"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_late_results_refuse_foreign_and_future_cursors"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "if through[\"provider_incarnation\"] != crate::serve::process_launch_id()"
+new = "if false && through[\"provider_incarnation\"] != crate::serve::process_launch_id() // NON-VACUITY BREAK: accept foreign acknowledgement cursors."
+
+[[control]]
+id = "llm-tool-requires-daemon-stamp"
+guards = "An unscoped model call cannot invent a run scope before executing"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_scope_guards_run_before_argument_and_catalog_admission"]
+file = "crates/broca-module-serve/src/llm_tools/admission.rs"
+old = "    let stamp = match scope {\n        SendScope::Stamped(bind) => Some(&bind.scope),\n        _ => None,\n    };"
+new = "    let forged = broca_protocol::SessionScope { owner: BindPrincipal::Direct, scope_ref: \"forged\".into(), scope_epoch: 1, flow_id: None, sender: None, agent_id: Some(\"agent\".into()), run_id: Some(\"run\".into()) }; // NON-VACUITY BREAK: invent a missing stamp.\n    let stamp = match scope {\n        SendScope::Stamped(bind) => Some(&bind.scope),\n        _ => Some(&forged),\n    };"
+
+[[control]]
+id = "llm-tool-requires-both-agent-and-run"
+guards = "A stamped scope missing its run id cannot execute as an agent run"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_scope_guards_run_before_argument_and_catalog_admission"]
+file = "crates/broca-module-serve/src/llm_tools/admission.rs"
+old = "    } else {\n        return Err(refusal(\n            \"scope_required\",\n            \"model tools require a daemon-stamped agent and run or flow\",\n        ));\n    };"
+new = "    } else {\n        BatchScope::Run { agent_id: \"forged\".into(), run_id: \"forged\".into() } // NON-VACUITY BREAK: execute a stamp missing its run.\n    };"
+
+[[control]]
+id = "llm-tool-recovery-never-steals-live-owner"
+guards = "Startup recovery tests an OS lifetime lock before releasing another process's live claim"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one.rs"
+expect_red = ["system_one::owner_lifetime_tests::owner_recovery_never_steals_a_live_process_claim"]
+file = "crates/broca-store/src/system_one.rs"
+old = "file.try_lock().ok()?;"
+new = "let _ = file.try_lock(); // NON-VACUITY BREAK: mistake a live owner for an abandoned one."
+
+[[control]]
+id = "llm-tool-recovery-needs-existing-owner-proof"
+guards = "A missing owner marker is unknown and must not be manufactured into proof of abandonment"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one.rs"
+expect_red = ["system_one::owner_lifetime_tests::an_unidentifiable_owner_is_not_assumed_dead"]
+file = "crates/broca-store/src/system_one.rs"
+old = "let file = options.open(path).ok()?;"
+new = "let file = options.create(true).open(path).ok()?; // NON-VACUITY BREAK: invent a missing owner marker."
+
+[[control]]
+id = "llm-tool-owner-lock-lasts-through-execution"
+guards = "A claimant keeps its OS owner lock for the lifetime of its executing store"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one.rs"
+expect_red = ["system_one::owner_lifetime_tests::owner_recovery_never_steals_a_live_process_claim"]
+file = "crates/broca-store/src/system_one.rs"
+old = "held.insert(owner.into(), file);"
+new = "let _ = file.unlock(); // NON-VACUITY BREAK: abandon the owner lock while execution is live.\n        held.insert(owner.into(), file);"
+
+[[control]]
+id = "llm-tool-dead-owner-markers-are-reclaimed"
+guards = "Dead owner marker files are reclaimed across normal and crashed process restarts"
+runner = "cargo"
+package = "broca-store"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-store/src/system_one.rs"
+expect_red = ["system_one::owner_lifetime_tests::owner_markers_do_not_accumulate_across_three_restarts"]
+file = "crates/broca-store/src/system_one.rs"
+old = "match std::fs::remove_file(path) {"
+new = "let _ = &path; // NON-VACUITY BREAK: retain every dead owner marker.\n            match Ok::<(), std::io::Error>(()) {"
+
+[[control]]
+id = "llm-tool-nonfinal-outcome-resumes-frozen-admission"
+guards = "A retriable stored item failure resumes execution under its earlier frozen admission"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_nonfinal_transient_outcome_resumes_under_its_frozen_admission"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "if has_final_outcome(stored) {"
+new = "if !stored.outcomes.is_empty() { // NON-VACUITY BREAK: freeze a retriable failure forever."
+
+[[control]]
+id = "llm-tool-request-json-remains-verbatim"
+guards = "The tool adapter preserves caller question order and structured state JSON rather than normalizing them through Value"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_question_order_and_raw_json_survive_the_tool_adapter"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "let envelope: RawEnvelope<'_> = serde_json::from_slice(body)"
+new = "let normalized_body = serde_json::to_vec(&call).unwrap(); // NON-VACUITY BREAK: normalize caller JSON before dispatch.\n                let envelope: RawEnvelope<'_> = serde_json::from_slice(&normalized_body)"
+
+[[control]]
+id = "llm-tool-provider-answer-json-remains-verbatim"
+guards = "Provider answer number spellings and unknown fields survive result validation and replay without normalization"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_question_order_and_raw_json_survive_the_tool_adapter"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "let result = serde_json::value::to_raw_value(&ToolResult {"
+new = "let normalized_answers = serde_json::value::to_raw_value(&serde_json::from_str::<Value>(answers.get()).unwrap()).unwrap(); // NON-VACUITY BREAK: normalize provider answer JSON.\n    let answers = normalized_answers.as_ref();\n    let result = serde_json::value::to_raw_value(&ToolResult {"
+
+[[control]]
+id = "llm-tool-catalog-digest-covers-composition"
+guards = "The catalog digest covers composition while generation tracks only advertised definitions"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_catalog_digest_covers_composition_and_refusals_name_catalog_fields"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "let digest = hash(&answer);"
+new = "let digest = hash(&answer[\"tools\"]); // NON-VACUITY BREAK: omit composition from the catalog digest."
+
+[[control]]
+id = "llm-tool-flow-scope-is-not-an-agent-run"
+guards = "A flow carrier with a flow stamp executes under flow attribution without requiring or inventing an agent run"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["memory_flow_scope_is_admitted_without_inventing_an_agent_run"]
+file = "crates/broca-module-serve/src/llm_tools/admission.rs"
+old = "let scope = if let Some(flow_id) = &stamped.flow_id {"
+new = "let scope = if let Some(flow_id) = stamped.flow_id.as_ref().filter(|_| false) { // NON-VACUITY BREAK: refuse flow-only scope attribution."
+
+[[control]]
+id = "llm-tool-bare-response-is-call-local"
+guards = "An oversized bare tool-provider response refuses only that call and preserves its sibling response"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::oversized_tool_response_is_call_local"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "async fn send_response_bytes(\n    writer: &EgressSender<Frame>,\n    ver: u8,\n    channel: u16,\n    epoch: u32,\n    corr: u64,\n    body: Vec<u8>,\n) -> Result<(), ServeIoError> {\n    let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);\n    if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {"
+new = "async fn send_response_bytes(\n    writer: &EgressSender<Frame>,\n    ver: u8,\n    channel: u16,\n    epoch: u32,\n    corr: u64,\n    body: Vec<u8>,\n) -> Result<(), ServeIoError> {\n    let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);\n    if false && frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize { // NON-VACUITY BREAK: allow an oversized tool frame to escape its call."
+
+[[control]]
+id = "llm-tool-execution-keeps-admitted-pricing"
+guards = "Tool execution uses the catalog snapshot accepted before private-content admission, not a later live row"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/mod.rs"
+expect_red = ["system_one::tool_admission_tests::frozen_admission_and_original_time_survive_delayed_execution"]
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "let row = if let Some((_, admission)) = tool {"
+new = "let row = if let Some((_, admission)) = tool.filter(|_| false) { // NON-VACUITY BREAK: reread the live catalog after admission."
+
+[[control]]
+id = "llm-tool-execution-keeps-original-admission-time"
+guards = "A delayed authorized execution keeps the first admission time as its retention anchor"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/system_one/mod.rs"
+expect_red = ["system_one::tool_admission_tests::frozen_admission_and_original_time_survive_delayed_execution"]
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = "            admitted_at_ms,\n            Some((&args_digest, &admission)),"
+new = "            None, // NON-VACUITY BREAK: date retention from delayed execution.\n            Some((&args_digest, &admission)),"

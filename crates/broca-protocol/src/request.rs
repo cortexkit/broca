@@ -490,6 +490,12 @@ pub enum KeepWarm {
 /// as the identical request sent when idle).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmissionRequest {
+    /// Held by the server after read-only preflight; never supplied by a client or persisted.
+    #[serde(skip)]
+    pub staged_uploads: Option<Arc<StagedUploads>>,
+    /// Committed upload references, in the attachments contract's order after the prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<cortexkit_role_llm_runner::attachments::ContentPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     /// The restart policy applies only to this send. If omitted, a graceful daemon stop interrupts the run.
@@ -583,6 +589,19 @@ pub struct SubmissionRequest {
     /// the request, so a queued record's request bytes do not change.
     #[serde(skip)]
     pub client_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedUploads {
+    pub identity: crate::BindIdentity,
+    pub items: Vec<StagedUpload>,
+    pub profile: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedUpload {
+    pub reference: crate::MediaRef,
+    pub bytes: Arc<Vec<u8>>,
 }
 
 /// A runner parameter a send may leave to the session's frozen value; see
@@ -811,6 +830,8 @@ mod tests {
     #[test]
     fn submission_request_tool_module_round_trips_when_present() {
         let request = SubmissionRequest {
+            staged_uploads: None,
+            content: Vec::new(),
             directives: None,
             on_restart: None,
             keep_warm: None,
@@ -901,6 +922,8 @@ mod budget_compat_tests {
     #[test]
     fn absent_submission_budget_is_omitted_and_defaults_to_none() {
         let request = SubmissionRequest {
+            staged_uploads: None,
+            content: Vec::new(),
             directives: None,
             on_restart: None,
             keep_warm: None,

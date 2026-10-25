@@ -15,6 +15,7 @@ pub mod executor;
 pub mod fanout;
 pub mod opener;
 pub mod output_refs;
+pub mod person_media;
 pub mod registry;
 pub mod retention;
 pub mod retention_withdrawals;

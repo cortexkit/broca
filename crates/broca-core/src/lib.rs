@@ -83,12 +83,12 @@ pub use context::{
     call_key, catch_up_usage_exports, dispatches_of_turns, effective_context,
     emit_lineage_usage_exports, read_session_page, read_session_page_owned,
     read_session_page_owned_with_dispatches, record_time_ms, replay_transcript,
-    resume_state_from_store, tool_call_dispatches, AdmissionStoreSnapshot, ExportCursor,
-    ExportError, ExportFact, ExportIndex, ExportPage, MaterializedStore, MissingExportRun,
-    Persister, RunIndex, RunIndexRow, RunIndexState, SessionReadLineageState, SessionReadMessage,
-    SessionReadPage, SessionReadReason, SessionReadStateKind, SessionStore, StorePageRow,
-    StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
-    SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
+    resume_state_from_store, select_held_episodes, tool_call_dispatches, AdmissionStoreSnapshot,
+    ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage, HeldEpisode, HeldPrefix,
+    HeldRowsRequest, MaterializedStore, MissingExportRun, Persister, RunIndex, RunIndexRow,
+    RunIndexState, SessionReadLineageState, SessionReadMessage, SessionReadPage, SessionReadReason,
+    SessionReadStateKind, SessionStore, StorePageRow, StorePageSnapshot, StorePrefix, TagLocation,
+    ToolCallDispatch, WithdrawalRun, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{
     read_session_model_page, ModelEntry, ModelPage, ModelPageError, ModelPageRequest, ReadView,

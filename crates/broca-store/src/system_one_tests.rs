@@ -300,11 +300,27 @@ fn the_store_is_owner_only_and_keeps_no_wal_sidecar() {
         .unwrap();
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    let siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+    let mut siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(siblings, vec!["system-one.db".to_string()], "{siblings:?}");
+    siblings.sort();
+    let owner_file = store.owner_path("p1").unwrap();
+    let mut expected = vec![
+        "system-one.db".to_string(),
+        owner_file
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    expected.sort();
+    assert_eq!(siblings, expected, "{siblings:?}");
+    assert!(std::fs::read(&owner_file).unwrap().is_empty());
+    assert_eq!(
+        std::fs::metadata(owner_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 fn test_scope() -> &'static BatchScope {

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
-use super::{internal_refusal, ModelPin, ProviderReply, SystemOne};
+use super::{internal_refusal, ModelPin, ProviderReply, SystemOne, ToolAdmission};
 
 /// The catalog kind fusiform gives a decision model. `classifier/v1` calls the same kind
 /// `classifier`; a row stating either is a classifier.
@@ -71,6 +71,8 @@ struct FrozenRow {
     input_rate_nanos: Option<i64>,
     #[serde(default)]
     output_rate_nanos: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charge_basis: Option<broca_core::ChargeBasis>,
 }
 
 impl FrozenRow {
@@ -511,6 +513,90 @@ pub(crate) async fn run(
     scope: &broca_store::system_one::BatchScope,
     admitted_at_ms: Option<i64>,
 ) -> Result<Box<RawValue>, Refusal> {
+    run_inner(service, params, scope, admitted_at_ms, None).await
+}
+
+pub(super) fn admit_tool(
+    service: &SystemOne,
+    params: &str,
+    stored: Option<&broca_store::system_one::StoredBatch>,
+) -> Result<ToolAdmission, Refusal> {
+    let request = parse_request(params)?;
+    let frozen = if let Some(stored) = stored {
+        serde_json::from_str::<FrozenRow>(&stored.frozen_row)
+            .map_err(|_| internal_refusal("the stored tool price does not decode"))?
+    } else {
+        check_request_bytes(
+            params.len(),
+            &cortexkit_role_classifier::describe::Limits::new(
+                service.config.max_items,
+                service.config.max_request_bytes,
+            ),
+        )?;
+        let row = service.catalog.row(&request.model);
+        check_catalog_row(&request.model, catalog_row(row.as_ref()))?;
+        let row = row.expect("catalog admission checked presence");
+        let pin = service
+            .pin(&request.model)
+            .ok_or_else(|| Refusal::model_unavailable(&request.model))?;
+        check_request(&request, &service.model_entry(pin, &row))?;
+        use broca_core::ChargeBasisResolver;
+        FrozenRow {
+            input_rate_nanos: row.input_rate_nanos,
+            output_rate_nanos: row.output_rate_nanos,
+            charge_basis: Some(
+                service
+                    .charge_basis
+                    .resolve_charge_basis(
+                        request.model.split('/').next().unwrap_or_default(),
+                        "apikey",
+                    )
+                    .0,
+            ),
+        }
+    };
+    if frozen.charge_basis != Some(broca_core::ChargeBasis::MeteredApi)
+        || frozen.input_rate_nanos.is_none_or(|rate| rate < 0)
+        || frozen.output_rate_nanos.is_some_and(|rate| rate > 0)
+    {
+        return Err(Refusal::new(
+            "cost_unpriceable",
+            "the model requires a per-token input price and no positive output price",
+        ));
+    }
+    Ok(ToolAdmission {
+        frozen_row: serde_json::to_string(&frozen).expect("admitted pricing encodes"),
+    })
+}
+
+pub(super) fn replay_tool(
+    params: &str,
+    stored: &broca_store::system_one::StoredBatch,
+) -> Result<Box<RawValue>, Refusal> {
+    let request = parse_request(params)?;
+    let frozen: FrozenRow = serde_json::from_str(&stored.frozen_row)
+        .map_err(|_| internal_refusal("the stored tool price does not decode"))?;
+    reply(
+        &request,
+        &frozen,
+        stored
+            .outcomes
+            .iter()
+            .cloned()
+            .map(|outcome| Some(Slot::Stored(outcome)))
+            .collect(),
+    )
+}
+
+/// The tool supplies its argument digest and a read-only replay snapshot. Classifier callers
+/// retain their identity digest and live-catalog admission, including their original bytes.
+pub(super) async fn run_inner(
+    service: &Arc<SystemOne>,
+    params: &str,
+    scope: &broca_store::system_one::BatchScope,
+    admitted_at_ms: Option<i64>,
+    tool: Option<(&str, &ToolAdmission)>,
+) -> Result<Box<RawValue>, Refusal> {
     let flush = Arc::clone(service);
     tokio::task::spawn_blocking(move || flush.flush_facts())
         .await
@@ -525,7 +611,19 @@ pub(crate) async fn run(
     let request = parse_request(params)?;
     let raw: RawParams<'_> = serde_json::from_str(params)
         .map_err(|e| Refusal::invalid_params("params", e.to_string()))?;
-    let row = service.catalog.row(&request.model);
+    let row = if let Some((_, admission)) = tool {
+        let frozen: FrozenRow = serde_json::from_str(&admission.frozen_row)
+            .map_err(|_| internal_refusal("the stored tool price does not decode"))?;
+        Some(broca_catalog::ModelBatchRow {
+            kind: Some(DECISION_KIND.into()),
+            context_tokens: None,
+            attachment: false,
+            input_rate_nanos: frozen.input_rate_nanos,
+            output_rate_nanos: frozen.output_rate_nanos,
+        })
+    } else {
+        service.catalog.row(&request.model)
+    };
     check_catalog_row(&request.model, catalog_row(row.as_ref()))?;
     let row = row.expect("check_catalog_row refuses an absent row");
     // A classifier row broca has no route to: the catalog knows it, broca cannot serve it.
@@ -534,12 +632,17 @@ pub(crate) async fn run(
         .ok_or_else(|| Refusal::model_unavailable(&request.model))?
         .clone();
     let entry = service.model_entry(&pin, &row);
-    check_request(&request, &entry)?;
+    if tool.is_none() {
+        check_request(&request, &entry)?;
+    }
 
     let identity =
         BatchIdentity::of(&request).map_err(|e| Refusal::invalid_params("items", e.0))?;
     let identity_json = serde_json::to_string(&identity).expect("an identity encodes");
-    let digest = sha256_hex(&identity_json);
+    let digest = tool.map_or_else(
+        || sha256_hex(&identity_json),
+        |(digest, _)| digest.to_owned(),
+    );
     // A ceiling too large for the arithmetic is no ceiling at all in practice.
     let sent_ceiling = request
         .max_cost_usd
@@ -584,6 +687,7 @@ pub(crate) async fn run(
         &digest,
         sent_ceiling,
         admitted_at_ms,
+        tool.map(|(_, admission)| admission.frozen_row.as_str()),
     )
     .await;
     hold.release().await;
@@ -609,10 +713,18 @@ async fn serve_claimed(
     digest: &str,
     sent_ceiling: Option<u64>,
     admitted_at_ms: Option<i64>,
+    tool_frozen: Option<&str>,
 ) -> Result<Box<RawValue>, Refusal> {
-    let live_frozen = FrozenRow {
-        input_rate_nanos: row.input_rate_nanos,
-        output_rate_nanos: row.output_rate_nanos,
+    let is_tool = tool_frozen.is_some();
+    let live_frozen = if let Some(frozen) = tool_frozen {
+        serde_json::from_str(frozen)
+            .map_err(|_| internal_refusal("the admitted tool price does not decode"))?
+    } else {
+        FrozenRow {
+            input_rate_nanos: row.input_rate_nanos,
+            output_rate_nanos: row.output_rate_nanos,
+            charge_basis: None,
+        }
     };
     let now = (service.clock)();
     let claimed = {
@@ -806,10 +918,27 @@ async fn serve_claimed(
                 auth_selection,
                 account_ref,
             }) => {
+                if is_tool {
+                    tool_answer_cut().await;
+                }
                 let cost = spend_of(&frozen, usage.as_ref(), &estimates[index]);
+                let measured = usage
+                    .as_ref()
+                    .and_then(|usage| usage.input_tokens)
+                    .is_some();
+                let result = if is_tool && !measured {
+                    let refusal = crate::llm_tools::unmeasured_cost_refusal();
+                    Outcome::Failed(item_error_json(&ItemError::new(
+                        refusal.code,
+                        refusal.detail.class,
+                        refusal.message,
+                    )))
+                } else {
+                    Outcome::Answered(answers)
+                };
                 let outcome = StoredOutcome {
                     index: index as u64,
-                    outcome: Outcome::Answered(answers),
+                    outcome: result,
                     input_tokens: usage.and_then(|u| u.input_tokens),
                     output_tokens: usage.and_then(|u| u.output_tokens),
                 };
@@ -865,6 +994,28 @@ async fn serve_claimed(
         record(service, &request.batch_id, &outcome, 0).await?;
     }
     reply(request, &frozen, slots)
+}
+
+/// The debug test hook can stop after a provider answer, before the atomic outcome/fact write.
+/// The create-once marker prevents the restarted process from stopping at the same cut.
+async fn tool_answer_cut() {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("BROCA_PROVIDER_BASE_URL").is_some() {
+        if let Some(path) = std::env::var_os("BROCA_TEST_SYSTEM_ONE_ANSWER_GATE") {
+            use std::io::Write;
+            let path = std::path::PathBuf::from(path);
+            if let Ok(mut marker) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                let _ = writeln!(marker, "{}", std::process::id());
+                while !path.with_extension("release").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
 }
 
 async fn record(

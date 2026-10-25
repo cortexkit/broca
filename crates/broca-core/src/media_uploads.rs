@@ -94,6 +94,48 @@ pub struct Uploads {
 }
 
 impl Uploads {
+    /// Read a committed upload without changing staging, stores or WALs. Ownership,
+    /// expiry and the committed hash are checked again at the send boundary.
+    pub fn read_committed(
+        &self,
+        identity: &BindIdentity,
+        id: &str,
+        now: u64,
+    ) -> Result<(String, Vec<u8>), UploadError> {
+        let _lock = self.lock()?;
+        let meta = self.load(identity, id, now)?;
+        if !meta.committed {
+            return Err(UploadError::new("upload_not_committed", id));
+        }
+        let bytes = fs::read(self.data_path(id))?;
+        wire::verify_commit(meta.bytes, &meta.sha256, &bytes)
+            .map_err(|code| UploadError::new(code, id))?;
+        Ok((meta.mime, bytes))
+    }
+
+    /// Publication chooses the store alongside the already selected WAL durability class.
+    pub fn media_store(
+        &self,
+        class: crate::media_store::MediaStoreClass,
+    ) -> io::Result<crate::media_store::MediaStore> {
+        crate::media_store::MediaStore::open(
+            self.root.parent().expect("uploads have a state root"),
+            class,
+        )
+    }
+
+    pub fn session_media_store(
+        &self,
+        identity: &BindIdentity,
+    ) -> io::Result<crate::media_store::MediaStore> {
+        let state = self.root.parent().expect("uploads have a state root");
+        let wal = crate::FileWalStore::new(state.join("wal"));
+        let class = wal
+            .media_store_class(&crate::wal_writer::session_addr(identity))
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("session WAL has no media store class"))?;
+        self.media_store(class)
+    }
     /// Startup creates the lock and directories. Opening for a refused operation
     /// must not create even an empty staging file.
     pub fn at(state_root: &Path) -> Self {

@@ -782,7 +782,10 @@ async fn startup_replays_committed_measurement_intents_before_serving() {
         rig.export.clone(),
         Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
     );
-    assert_eq!(restarted.release_abandoned().unwrap(), 1);
+    // An in-memory store cannot prove an owner is dead, so it keeps the claim. Dead-owner release is
+    // covered by a_batch_a_dead_process_held_is_released_at_startup_and_resumed and the real
+    // subprocess test owner_recovery_never_steals_a_live_process_claim.
+    assert_eq!(restarted.release_abandoned().unwrap(), 0);
     assert_eq!(
         rig.export.read_export_page(None, 100).unwrap().facts.len(),
         1

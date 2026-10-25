@@ -434,6 +434,13 @@ enum Entry {
 /// executor) so the admission concurrency is deterministically testable.
 #[async_trait]
 pub trait LineageOpener: Send + Sync {
+    async fn media_profile(
+        &self,
+        _request: &broca_protocol::request::SubmissionRequest,
+    ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, broca_core::RunError>
+    {
+        Ok(None)
+    }
     /// Read-only access to the derived run index, without acquiring a session writer.
     fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
         None
@@ -959,6 +966,14 @@ pub struct RegistryHandle {
 impl LineageRegistry {
     pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
         self.inner.reader.as_ref()?.wal_store.uploads()
+    }
+
+    pub(crate) async fn media_profile(
+        &self,
+        request: &broca_protocol::request::SubmissionRequest,
+    ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, broca_core::RunError>
+    {
+        self.inner.opener.media_profile(request).await
     }
     pub fn active_event_sessions(&self) -> Vec<LineageKey> {
         self.inner
@@ -5856,6 +5871,11 @@ impl RegistryHandle {
     }
     pub(crate) fn repair_retention(&self, key: &LineageKey) {
         self.inner.repairs.insert(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retention_repairs_pending(&self) -> usize {
+        self.inner.repairs.len()
     }
 
     /// Publish `handle` as the open generation for `key`, so an actor a test builds directly

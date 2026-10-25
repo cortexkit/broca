@@ -30,5 +30,6 @@ broca_refuse_nonshipping_markers() { # <artifact> <diagnostic prefix>
     done <<'MARKERS'
 test-clock BROCA_TEST_CLOCK_RETENTION_CLOCK_OVERRIDE_V1
 test-harness BROCA_TEST_HARNESS_VIRTUAL_RETRY_WAITS_V1
+test-attachments broca-nonshipping-attachments-v1
 MARKERS
 }

@@ -229,6 +229,21 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             ),
         },
         ManagementOperation {
+            name: "tool.catalog".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("List the sessionless model tools and their invocation modes.".into()),
+        },
+        ManagementOperation {
+            name: "late_results".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read late model-tool results belonging to the stamped caller.".into()),
+        },
+        ManagementOperation {
+            name: "late_results.ack".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Acknowledge the stamped caller's late model-tool results.".into()),
+        },
+        ManagementOperation {
             name: OP_RESOLVE.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some(
@@ -432,6 +447,7 @@ pub fn manifest_configured(
             // `classifier` role. A caller finds broca by this entry, then picks it for a model
             // its classifier `role.describe` lists.
             cortexkit_role_classifier::PROVIDES.to_string(),
+            "tool-provider/v1".to_string(),
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
         ],
@@ -479,6 +495,17 @@ pub fn manifest_configured(
             transport: subc_protocol::manifest::InternalTransport::Bulk,
             agent_facing: false,
             operations: broca_wire::agent_data::REQUIRED_OPS.iter().map(|op| op.to_string()).collect(),
+        }, ProviderRole::ToolProvider {
+            tools: vec![subc_protocol::manifest::Tool {
+                name: "llm.classify/v1".into(),
+                description: Some("Classify one item with a decision model.".into()),
+                execution_mode: subc_protocol::manifest::ExecutionMode::Pure,
+                schema: cortexkit_llm_tools::classify::input_schema(),
+            }],
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: false,
+            sub_supervises: false,
         }])
     // WHAT BROCA OPENS ROUTES TO, built from the same resolved values the serve binary dials,
     // so the declaration follows the configuration rather than a second list of names.
@@ -540,11 +567,11 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
+                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),
-            "broca declares runner, agent-data and classifier roles, flow and agent-run scope handling, and requires or denies nothing"
+            "broca declares runner, agent-data, classifier and model-tool roles, flow and agent-run scope handling, and requires or denies nothing"
         );
         //
         // `consumes` has skip_serializing_if = "Vec::is_empty" since subc-protocol 0.19.0, so

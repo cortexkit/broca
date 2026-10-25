@@ -41,6 +41,9 @@ cortexkit-role-llm-runner = { workspace = true }
 # System One classification (classifier/v1) and the batch rules it implements.
 cortexkit-role-classifier = { workspace = true }
 cortexkit-model-batch = { workspace = true }
+cortexkit-llm-tools = { workspace = true }
+cortexkit-role-tool-provider = { workspace = true }
+serde_jcs.workspace = true
 # System One's provider calls. The same release and TLS backend broca-provider builds, so the
 # lockfile gains no crate.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -93,11 +96,11 @@ clap = { version = "4", features = ["derive"] }
 signal-hook = "0.4"
 
 [dev-dependencies]
+cortexkit-llm-tools = { workspace = true, features = ["test-vectors"] }
 broca-catalog = { path = "../broca-catalog", features = ["test-support"] }
 futures.workspace = true
 cortexkit-bus-testkit = "=0.1.3"
 nkeys = "0.4.5"
-serde_jcs.workspace = true
 cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
 broca-owner-only = { workspace = true, features = ["test-support"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.
@@ -141,5 +144,6 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 libc = "0.2"
 
 [features]
+test-attachments = ["broca-protocol/test-attachments"]
 heap-profile = ["dep:broca-heap-profile"]
 test-clock = ["broca-module/test-clock", "broca-core/test-clock"]

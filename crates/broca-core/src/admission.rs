@@ -14,6 +14,19 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{PendingSubmission, ReplayError};
 
+fn logical_input(request: &SubmissionRequest) -> std::borrow::Cow<'_, [Message]> {
+    if request.content.is_empty() {
+        return std::borrow::Cow::Borrowed(&request.input);
+    }
+    let mut input = request.input.clone();
+    for message in &mut input {
+        message
+            .content
+            .retain(|block| !matches!(block, broca_protocol::ContentBlock::Media(_)));
+    }
+    std::borrow::Cow::Owned(input)
+}
+
 /// Return the first caller-payload field that differs between two deterministic sends.
 ///
 /// The exhaustive destructuring is intentional: adding a submission field cannot silently
@@ -23,6 +36,8 @@ pub fn submission_difference(
     requested: &SubmissionRequest,
 ) -> Option<&'static str> {
     let SubmissionRequest {
+        staged_uploads: _,
+        content: existing_content,
         directives: existing_directives,
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
@@ -30,7 +45,7 @@ pub fn submission_difference(
         on_restart: existing_on_restart,
         keep_warm: existing_keep_warm,
         model: existing_model,
-        input: existing_input,
+        input: _,
         tools: existing_tools,
         policy_allowed: existing_policy_allowed,
         tool_choice: existing_tool_choice,
@@ -51,6 +66,8 @@ pub fn submission_difference(
         client_message_id: _,
     } = existing;
     let SubmissionRequest {
+        staged_uploads: _,
+        content: requested_content,
         directives: requested_directives,
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
@@ -58,7 +75,7 @@ pub fn submission_difference(
         on_restart: requested_on_restart,
         keep_warm: requested_keep_warm,
         model: requested_model,
-        input: requested_input,
+        input: _,
         tools: requested_tools,
         policy_allowed: requested_policy_allowed,
         tool_choice: requested_tool_choice,
@@ -78,6 +95,7 @@ pub fn submission_difference(
     } = requested;
 
     [
+        (existing_content != requested_content, "content"),
         (existing_directives != requested_directives, "directives"),
         (
             existing_on_restart.unwrap_or_default() != requested_on_restart.unwrap_or_default(),
@@ -88,7 +106,7 @@ pub fn submission_difference(
             "keep_warm",
         ),
         (existing_model != requested_model, "model"),
-        (existing_input != requested_input, "input"),
+        (logical_input(existing) != logical_input(requested), "input"),
         (existing_tools != requested_tools, "tools"),
         (
             existing_policy_allowed != requested_policy_allowed,
@@ -194,6 +212,8 @@ struct SubmissionIdentityDigestV1 {
     /// `client-message-id/v1` (`WalRecord::required_features`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
 }
 
 /// The `client_message_id` a stored identity digest carries, or `None` when it carries none
@@ -242,6 +262,8 @@ fn identity_digest_v1(
     conversation_key: Option<&str>,
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
+        staged_uploads: _,
+        content,
         directives,
         project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
@@ -249,7 +271,7 @@ fn identity_digest_v1(
         on_restart,
         keep_warm,
         model,
-        input,
+        input: _,
         tools,
         policy_allowed,
         tool_choice,
@@ -270,6 +292,7 @@ fn identity_digest_v1(
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
     SubmissionIdentityDigestV1 {
+        content: (!content.is_empty()).then(|| digest_json(serde_json::json!(content))),
         directives: directives
             .as_ref()
             .map(|names| digest_json(serde_json::json!(names))),
@@ -279,7 +302,7 @@ fn identity_digest_v1(
         keep_warm: (*keep_warm == Some(broca_protocol::request::KeepWarm::Auto))
             .then(|| "auto".to_owned()),
         model: digest_json(serde_json::json!(model)),
-        input: digest_json(serde_json::json!(input)),
+        input: digest_json(serde_json::json!(logical_input(request))),
         tools: digest_json(serde_json::json!(tools)),
         policy_allowed: digest_json(serde_json::json!(policy_allowed)),
         tool_choice: digest_json(serde_json::json!(tool_choice)),
@@ -347,6 +370,7 @@ pub fn send_identity_difference_with_conversation_key(
             stored.client_message_id != requested.client_message_id,
             "client_message_id",
         ),
+        (stored.content != requested.content, "content"),
         (stored.directives != requested.directives, "directives"),
         (stored.keep_warm != requested.keep_warm, "keep_warm"),
         (stored.delivery != requested.delivery, "delivery"),
@@ -1401,6 +1425,8 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            staged_uploads: None,
+            content: Vec::new(),
             directives: None,
             on_restart: None,
             keep_warm: None,

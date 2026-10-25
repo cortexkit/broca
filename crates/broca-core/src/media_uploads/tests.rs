@@ -353,3 +353,45 @@ fn maintenance_reclaims_abandoned_bodies_but_missing_state_fails_closed() {
     assert!(uploads.sweep(RETENTION_SECONDS + 1, true).is_err());
     assert_eq!(snapshot(&root), before);
 }
+
+#[test]
+fn committed_reads_verify_identity_expiry_state_and_bytes_without_writes() {
+    let (root, uploads) = fixture();
+    let id = uploads
+        .begin(&identity(), &request(b"abc"), 0)
+        .unwrap()
+        .upload_id;
+    let before = snapshot(&root);
+    assert_eq!(
+        uploads
+            .read_committed(&identity(), &id, 0)
+            .unwrap_err()
+            .code,
+        "upload_not_committed"
+    );
+    assert_eq!(snapshot(&root), before);
+    uploads.append(&identity(), &id, 0, b"abc", 1).unwrap();
+    uploads.commit(&identity(), &id, 2).unwrap();
+    let before = snapshot(&root);
+    assert_eq!(
+        uploads.read_committed(&identity(), &id, 3).unwrap(),
+        ("application/pdf".into(), b"abc".to_vec())
+    );
+    let foreign = BindIdentity {
+        harness: "foreign".into(),
+        ..identity()
+    };
+    assert!(uploads
+        .read_committed(&foreign, &id, 3)
+        .unwrap_err()
+        .subject
+        .contains(&id));
+    assert!(uploads
+        .read_committed(&identity(), &id, 2 + RETENTION_SECONDS)
+        .is_err());
+    assert_eq!(snapshot(&root), before);
+    std::fs::write(uploads.data_path(&id), b"abd").unwrap();
+    let before = snapshot(&root);
+    assert!(uploads.read_committed(&identity(), &id, 3).is_err());
+    assert_eq!(snapshot(&root), before);
+}

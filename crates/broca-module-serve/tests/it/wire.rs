@@ -125,6 +125,8 @@ impl Provider for ResolvedStubProvider {
 
 fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
     ResolveOptions {
+        media: false,
+        media_profile: None,
         claude_code_persona: None,
         auth_method: Some(broca_catalog::live::AuthMethod::Chatgpt),
         family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -624,6 +626,8 @@ fn chatgpt_send(session: BindIdentity, run_id: &str, prompt: &str) -> SendReques
         run_id: RunId(run_id.into()),
         send_id: Some(format!("send-{run_id}")),
         request: Box::new(SubmissionRequest {
+            staged_uploads: None,
+            content: Vec::new(),
             directives: None,
             on_restart: None,
             keep_warm: None,

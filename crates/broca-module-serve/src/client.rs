@@ -436,6 +436,7 @@ fn request_body<P: serde::Serialize>(method: &str, params: &P) -> Result<Vec<u8>
 
 fn send_params(spec: SendSpec<'_>) -> SendParams {
     SendParams {
+        content: Vec::new(),
         directives: None,
         session_class: None,
         title: None,
@@ -783,6 +784,7 @@ mod tests {
         assert_request_preserves_legacy_shape("session.import", &import);
 
         let send = SendParams {
+            content: Vec::new(),
             directives: None,
             session_class: None,
             title: None,
