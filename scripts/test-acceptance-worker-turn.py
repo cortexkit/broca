@@ -33,6 +33,13 @@ class WorkerAcceptance(unittest.TestCase):
         self.models.write_text("first/model\nsecond/model\n")
         self.start = {"type": "run_started", "run_id": "run-under-test", "session_class": "acceptance",
                       "manifest": {"fetches": [{"declarations_frozen": {"late_results": True}}]}}
+        self.composed = {"tool_items": [{"provider": "aft", "preset": "reader", "params": {}}],
+                         "system_text_items": [], "step_transform_items": [],
+                         "composition": {"providers": [{"provider": "aft", "tools": [
+                             {"name": "read", "capabilities": ["code.read/v1"]},
+                             {"name": "search", "capabilities": ["code.search/v1"]}]}],
+                             "step_transform_items": []}, "composition_digest": "live-digest"}
+        self.sent_plans = []
 
     def write_wal(self, requires=acceptance.REQUIRED, reason="completed"):
         self.path.write_bytes(frame(self.start, requires) + frame({"type": "run_finished", "reason": reason}))
@@ -101,12 +108,26 @@ class WorkerAcceptance(unittest.TestCase):
         with self.assertRaisesRegex(acceptance.ArchiveRefusal, "digest mismatch"):
             acceptance.check_wal(self.path, "run-under-test")
 
-    def run_main(self, answers, *, env=None, wal_results=None):
+    def run_main(self, answers, *, env=None, wal_results=None, compose_answers=None, extra_args=()):
         output = io.StringIO()
-        argv = ["acceptance-worker-turn.py", "--project-root", self.tmp.name, "--state-root", self.tmp.name]
+        argv = ["acceptance-worker-turn.py", "--project-root", self.tmp.name, "--state-root", self.tmp.name, *extra_args]
+        answers = iter(answers)
+        compose_answers = iter(compose_answers) if compose_answers is not None else None
+
+        def answer(command, timeout):
+            if "compose-plan" in command:
+                result = next(compose_answers) if compose_answers is not None else json.dumps(self.composed)
+            else:
+                if "run" in command:
+                    self.sent_plans.append(json.loads(Path(command[command.index("--plan") + 1]).read_text()))
+                result = next(answers)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
         with patch.dict(acceptance.os.environ, env or {}, clear=True), \
                 patch.object(acceptance, "MODELS_FILE", self.models), \
-                patch.object(acceptance.sys, "argv", argv), patch.object(acceptance, "invoke", side_effect=answers) as invoke, \
+                patch.object(acceptance.sys, "argv", argv), patch.object(acceptance, "invoke", side_effect=answer) as invoke, \
                 patch.object(acceptance, "checked_run", return_value=(acceptance.REQUIRED, self.error_terminal()),
                              side_effect=wal_results) as check, \
                 redirect_stdout(output), redirect_stderr(output):
@@ -126,10 +147,13 @@ class WorkerAcceptance(unittest.TestCase):
             '{"event":"send","state":"active","run_id":"new-run"}',
         ])
         self.assertEqual(result, 0, output)
-        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(invoke.call_count, 3)
         command = invoke.call_args.args[0]
         self.assertEqual(command[command.index("--session-class") + 1], "acceptance")
-        self.assertEqual(command[command.index("--plan") + 1], str(acceptance.PLAN))
+        self.assertNotEqual(command[command.index("--plan") + 1], str(acceptance.PLAN))
+        self.assertEqual(self.sent_plans, [self.composed])
+        compose = invoke.call_args_list[1].args[0]
+        self.assertEqual(compose[-3:], ["compose-plan", "--items", str(acceptance.PLAN)])
         self.assertEqual(command[command.index("--max-output-tokens") + 1], "32")
         self.assertEqual(check.call_args.args[1], "new-run")
         self.assertIn("PASS -- admitted, completed", output)
@@ -159,8 +183,8 @@ class WorkerAcceptance(unittest.TestCase):
             '{"event":"send","state":"active","run_id":"new-run"}',
         ])
         self.assertEqual(result, 0, output)
-        self.assertEqual(invoke.call_count, 3)
-        commands = [call.args[0] for call in invoke.call_args_list[1:]]
+        self.assertEqual(invoke.call_count, 5)
+        commands = [call.args[0] for call in invoke.call_args_list if "run" in call.args[0]]
         self.assertEqual([command[command.index("--model") + 1] for command in commands], ["first/model", "second/model"])
         self.assertNotEqual(commands[0][commands[0].index("--session") + 1], commands[1][commands[1].index("--session") + 1])
         self.assertEqual(check.call_count, 2)
@@ -178,7 +202,7 @@ class WorkerAcceptance(unittest.TestCase):
             '{"event":"send","state":"active","run_id":"would-hide-refusal"}',
         ])
         self.assertEqual(result, 1, output)
-        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(invoke.call_count, 3)
         self.assertIn("invalid_params", output)
         self.assertNotIn("trying next candidate", output)
         check.assert_not_called()
@@ -196,7 +220,7 @@ class WorkerAcceptance(unittest.TestCase):
                     '{"event":"send","state":"active","run_id":"would-hide-timeout"}',
                 ])
                 self.assertEqual(result, 1, output)
-                self.assertEqual(invoke.call_count, 2)
+                self.assertEqual(invoke.call_count, 3)
                 check.assert_not_called()
 
     def test_wal_failure_does_not_rotate_even_after_provider_refusal(self):
@@ -208,7 +232,7 @@ class WorkerAcceptance(unittest.TestCase):
                 ], wal_results=[ValueError("RunStarted missing required WAL feature(s): session-class/v1")])
                 self.assertEqual(result, 1, output)
                 self.assertIn("missing required WAL feature", output)
-                self.assertEqual(invoke.call_count, 2)
+                self.assertEqual(invoke.call_count, 3)
                 self.assertEqual(check.call_count, 1)
 
     def test_worker_model_override_pins_one_candidate(self):
@@ -217,7 +241,7 @@ class WorkerAcceptance(unittest.TestCase):
             '{"event":"send","state":"active","run_id":"would-ignore-pin"}',
         ], env={"ACCEPTANCE_WORKER_MODEL": "pinned/model"})
         self.assertEqual(result, 2, output)
-        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(invoke.call_count, 3)
         self.assertIn("attempt 1/1 model=pinned/model", output)
         self.assertIn("CANNOT COMPARE", output)
 
@@ -292,7 +316,7 @@ class WorkerAcceptance(unittest.TestCase):
             '{"event":"send","state":"active","run_id":"would-hide-client-crash"}',
         ])
         self.assertEqual(result, 1, output)
-        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(invoke.call_count, 3)
         check.assert_not_called()
 
     def test_shared_candidates_and_common_override_keep_order(self):
@@ -313,11 +337,91 @@ class WorkerAcceptance(unittest.TestCase):
             '{"result":{"session_class":{"backup_classes":[]}}}', self.provider_failure(), self.provider_failure(),
         ])
         self.assertEqual(result, 2, output)
-        self.assertEqual(invoke.call_count, 3)
+        self.assertEqual(invoke.call_count, 5)
         self.assertEqual(check.call_count, 2)
         self.assertIn("model=second/model retryable provider error", output)
         self.assertIn("no candidates remain", output)
         self.assertIn("CANNOT COMPARE", output)
+
+    @staticmethod
+    def admission_failure(code="plan_stale"):
+        return acceptance.ClientFailure(subprocess.CompletedProcess(
+            ["broca-session"], 1, json.dumps({"event": "error", "operation": "session.send", "code": code, "msg":
+                f"send: {code}: the plan no longer matches what its providers answer: "
+                '[{"kind":"tools","provider":"aft","missing":[],"unexpected":["zoom"]}]'}), ""))
+
+    def test_stale_plan_recomposes_once_without_rotating_model(self):
+        refreshed = dict(self.composed, composition_digest="refreshed-digest")
+        result, output, invoke, check = self.run_main([
+            '{"result":{"session_class":{"backup_classes":[]}}}', self.admission_failure(),
+            '{"event":"send","state":"active","run_id":"new-run"}',
+        ], compose_answers=[json.dumps(self.composed), json.dumps(refreshed)])
+        self.assertEqual(result, 0, output)
+        self.assertEqual(self.sent_plans, [self.composed, refreshed])
+        commands = [call.args[0] for call in invoke.call_args_list if "run" in call.args[0]]
+        self.assertEqual(commands[0], commands[1])
+        self.assertIn("recomposing once", output)
+        self.assertEqual(invoke.call_count, 5)
+        self.assertEqual(check.call_count, 1)
+
+    def test_second_stale_plan_fails_and_names_provider_and_tools(self):
+        result, output, invoke, check = self.run_main([
+            '{"result":{"session_class":{"backup_classes":[]}}}',
+            self.admission_failure(), self.admission_failure(),
+        ])
+        self.assertEqual(result, 1, output)
+        self.assertEqual(invoke.call_count, 5)
+        self.assertEqual(len(self.sent_plans), 2)
+        self.assertIn("aft", output)
+        self.assertIn("zoom", output)
+        self.assertNotIn("trying next candidate", output)
+        check.assert_not_called()
+
+    def test_other_admission_refusals_do_not_recompose_or_rotate(self):
+        for code in ("fetch_unavailable", "invalid_params", "plan_changed", "session_class_invalid"):
+            with self.subTest(code=code):
+                result, output, invoke, check = self.run_main([
+                    '{"result":{"session_class":{"backup_classes":[]}}}', self.admission_failure(code),
+                ])
+                self.assertEqual(result, 1, output)
+                self.assertEqual(invoke.call_count, 3)
+                self.assertIn(code, output)
+                check.assert_not_called()
+
+    def test_compose_only_prints_live_summary_and_never_sends(self):
+        result, output, invoke, check = self.run_main([
+            '{"result":{"session_class":{"backup_classes":[]}}}',
+        ], extra_args=["--compose-only"])
+        self.assertEqual(result, 0, output)
+        self.assertIn("provider=aft tools=2 digest=live-digest", output)
+        self.assertIn("COMPOSE ONLY -- no send", output)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(self.sent_plans, [])
+        check.assert_not_called()
+
+    def test_composition_failure_never_sends_or_rotates(self):
+        result, output, invoke, check = self.run_main([
+            '{"result":{"session_class":{"backup_classes":[]}}}',
+        ], compose_answers=[self.admission_failure("fetch_unavailable")])
+        self.assertEqual(result, 1, output)
+        self.assertIn("fetch_unavailable", output)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(self.sent_plans, [])
+        check.assert_not_called()
+
+    def test_stale_text_from_admitted_run_or_other_errors_is_not_retried(self):
+        for failure in (self.provider_failure(message="send: plan_stale: catalog changed"),
+                        self.admission_failure("invalid_params (plan_stale)")):
+            self.assertFalse(acceptance.stale_admission(failure))
+        failure = self.admission_failure()
+        event = json.loads(failure.result.stdout)
+        for change in ({"code": None}, {"operation": "subscribe"}):
+            failure.result.stdout = json.dumps(dict(event, **change))
+            self.assertFalse(acceptance.stale_admission(failure))
+
+    def test_fixture_keeps_only_items_not_catalogs_or_digests(self):
+        self.assertEqual(set(json.loads(acceptance.PLAN.read_text())),
+                         {"tool_items", "system_text_items", "step_transform_items"})
 
 
 if __name__ == "__main__":

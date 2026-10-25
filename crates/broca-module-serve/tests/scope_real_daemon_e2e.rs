@@ -38,7 +38,10 @@ const SCOPE_EPOCH: u64 = 7;
 /// out with corr `SCOPE_SYNC_CORR_BASE + n`, and its reply is recorded under that corr.
 const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 
-struct AcceptanceCatalog;
+#[derive(Default)]
+struct AcceptanceCatalog {
+    fetched: std::sync::atomic::AtomicBool,
+}
 
 #[async_trait::async_trait]
 impl subc_client_rs::ModuleHandler for AcceptanceCatalog {
@@ -53,10 +56,9 @@ impl subc_client_rs::ModuleHandler for AcceptanceCatalog {
         assert_eq!(request["arguments"]["preset"], "reader");
         let composition = &request["arguments"]["composition"];
         let schema = serde_json::json!({"type": "object"});
-        let answer = serde_json::json!({
+        let mut answer = serde_json::json!({
             "generation": "1",
             "catalog_digest": format!("{:x}", Sha256::digest(b"acceptance-catalog")),
-            "composition_digest": cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap(),
             "capabilities": {"late_results": true},
             "tools": [{
                 "name": "read", "description": "Read a file",
@@ -66,6 +68,24 @@ impl subc_client_rs::ModuleHandler for AcceptanceCatalog {
                 "result_format": "content/v1"
             }]
         });
+        // A provider release between preflight and admission must recompose the plan, not
+        // rotate models or bypass the WAL feature checks.
+        if self.fetched.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            answer["catalog_digest"] = serde_json::json!(format!(
+                "{:x}",
+                Sha256::digest(b"acceptance-catalog-updated")
+            ));
+            answer["tools"].as_array_mut().unwrap().push(serde_json::json!({
+                "name": "search", "description": "Search files", "input_schema": schema,
+                "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
+                "semantics": 1, "capabilities": ["code.search/v1"], "result_format": "content/v1"
+            }));
+        }
+        if !composition.is_null() {
+            answer["composition_digest"] = serde_json::json!(
+                cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap()
+            );
+        }
         subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap())
     }
 }
@@ -92,10 +112,13 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
                 sub_supervises: false,
             }])
             .build();
-    let (_, serve) =
-        subc_client_rs::serve_with_handle(&rig.connection_file, manifest, AcceptanceCatalog)
-            .await
-            .expect("register declaring AFT catalog on private daemon");
+    let (_, serve) = subc_client_rs::serve_with_handle(
+        &rig.connection_file,
+        manifest,
+        AcceptanceCatalog::default(),
+    )
+    .await
+    .expect("register declaring AFT catalog on private daemon");
     let serving = tokio::spawn(serve);
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -139,6 +162,7 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         output.status.success(),
         "worker admission acceptance failed"
     );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("recomposing once"));
 }
 
 fn sibling_bin(name: &str, env_key: &str) -> PathBuf {

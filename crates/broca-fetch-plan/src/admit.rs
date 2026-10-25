@@ -469,15 +469,7 @@ pub fn catalog_request(
     tool_item: Option<&Item>,
     text_item: Option<&Item>,
 ) -> CatalogRequest {
-    let mut request = CatalogRequest::new(
-        tool_item
-            .map(|item| item.params.clone())
-            .unwrap_or_default(),
-    )
-    .with_composition(plan.composition.clone());
-    if let Some(preset) = tool_item.and_then(|item| item.preset.clone()) {
-        request = request.with_preset(preset);
-    }
+    let mut request = tool_catalog_request(tool_item).with_composition(plan.composition.clone());
     if let Some(item) = text_item {
         request = request.with_system_text(SystemTextItem {
             preset: item
@@ -488,6 +480,106 @@ pub fn catalog_request(
         });
     }
     request
+}
+
+fn tool_catalog_request(tool_item: Option<&Item>) -> CatalogRequest {
+    let mut request = CatalogRequest::new(
+        tool_item
+            .map(|item| item.params.clone())
+            .unwrap_or_default(),
+    );
+    if let Some(preset) = tool_item.and_then(|item| item.preset.clone()) {
+        request = request.with_preset(preset);
+    }
+    request
+}
+
+/// Compose a tool-only plan by preflighting and decoding each provider's live catalog.
+/// Admission fetches again with the resulting composition and validates it before a send.
+/// Text and transform items are not served by this operator helper. No model request or
+/// durable write is made.
+pub async fn compose(
+    items: &Value,
+    fetcher: &dyn Fetcher,
+    budget: Duration,
+) -> Result<Value, Refusal> {
+    let object = items.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
+    for field in ["composition", "composition_digest", "compaction_item"] {
+        if object.contains_key(field) {
+            return Err(Refusal::invalid(format!("plan.{field}")));
+        }
+    }
+    for field in ["system_text_items", "step_transform_items"] {
+        if !object
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(Refusal::invalid(format!("plan.{field}")));
+        }
+    }
+    let tools = crate::plan::items(object, "tool_items", true)?;
+    let mut providers: BTreeMap<_, Value> = tools
+        .iter()
+        .map(|item| {
+            (
+                item.provider.clone(),
+                serde_json::json!({"provider": item.provider, "tools": []}),
+            )
+        })
+        .collect();
+    let mut plan = items.clone();
+    let set_composition =
+        |plan: &mut Value, providers: &BTreeMap<String, Value>| -> Result<(), Refusal> {
+            plan["composition"] = serde_json::json!({
+                "providers": providers.values().collect::<Vec<_>>(), "step_transform_items": []
+            });
+            plan["composition_digest"] = serde_json::json!(
+                cortexkit_role_tool_provider::catalog::composition_digest(&plan["composition"])
+                    .map_err(|_| Refusal::invalid("plan.composition"))?
+            );
+            Ok(())
+        };
+    set_composition(&mut plan, &providers)?;
+    let parsed = crate::parse_plan(&plan, crate::CompactionSupport::Unsupported)?;
+    let deadline = Instant::now() + budget;
+    for item in &parsed.tool_items {
+        // Preflight omits composition and system text: tools establish the composition that
+        // admission will send back to the provider when it freezes the catalog.
+        let request = tool_catalog_request(Some(item));
+        let fetched = within_deadline(deadline, || fetcher.catalog(&item.provider, &request))
+            .await
+            .map_err(FetchMiss::from_error)
+            .and_then(|value| decode_answer(value, false))
+            .and_then(|fetched| {
+                if fetched.answer.composition_digest.is_some() {
+                    Err(FetchMiss::invalid_answer(None))
+                } else {
+                    Ok(fetched)
+                }
+            })
+            .map_err(|miss| Refusal::FetchUnavailable {
+                provider: item.provider.clone(),
+                provider_detail: miss.provider_detail(CATALOG_OP),
+                unanswered: miss.unanswered,
+            })?;
+        let mut composed: Vec<_> = fetched
+            .answer
+            .tools
+            .iter()
+            .map(|tool| {
+                let capabilities: BTreeSet<_> = tool.capabilities.iter().collect();
+                serde_json::json!({"name": tool.name, "capabilities": capabilities})
+            })
+            .collect();
+        composed.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        providers
+            .get_mut(&item.provider)
+            .expect("parsed provider is composed")["tools"] = Value::Array(composed);
+    }
+    set_composition(&mut plan, &providers)?;
+    crate::parse_plan(&plan, crate::CompactionSupport::Unsupported)?;
+    Ok(plan)
 }
 
 /// Check every item carrying `params.model` before opening or calling any provider.
@@ -1622,6 +1714,122 @@ mod tests {
 
         async fn describe_compaction(&self, _provider: &str) -> Result<DescribeAnswer, FetchError> {
             panic!("these plans carry no compaction item")
+        }
+    }
+
+    struct Preflight {
+        answer: Result<Value, FetchError>,
+        requests: std::sync::Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl Fetcher for Preflight {
+        async fn catalog(
+            &self,
+            provider: &str,
+            request: &CatalogRequest,
+        ) -> Result<Value, FetchError> {
+            assert_eq!(provider, "aft");
+            self.requests
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(request).unwrap());
+            self.answer.clone()
+        }
+        async fn declare(&self, _: &str, _: &DeclareRequest) -> Result<Value, FetchError> {
+            panic!("tool-only composition must not declare transforms")
+        }
+        async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
+            panic!("tool-only composition must not describe a compactor")
+        }
+    }
+
+    fn composition_items() -> Value {
+        json!({"tool_items": [{"provider": "aft", "preset": "reader", "params": {"scope": "read"}}],
+               "system_text_items": [], "step_transform_items": []})
+    }
+
+    fn preflight_answer() -> Value {
+        json!({"generation": "live", "catalog_digest": "opaque", "tools": [
+            {"name": "zoom", "description": "Zoom", "input_schema": {}, "schema_digest": "z",
+             "semantics": 1, "capabilities": ["z/v1", "a/v1"]},
+            {"name": "read", "description": "Read", "input_schema": {}, "schema_digest": "r",
+             "semantics": 1, "capabilities": ["code.read/v1"]}
+        ]})
+    }
+
+    #[tokio::test]
+    async fn composition_preflights_live_tools_and_canonical_digest() {
+        let fetcher = Preflight {
+            answer: Ok(preflight_answer()),
+            requests: Default::default(),
+        };
+        let plan = compose(&composition_items(), &fetcher, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            *fetcher.requests.lock().unwrap(),
+            vec![json!({"preset": "reader", "params": {"scope": "read"}})]
+        );
+        assert_eq!(plan["tool_items"], composition_items()["tool_items"]);
+        assert_eq!(
+            plan["composition"],
+            json!({"providers": [{"provider": "aft", "tools": [
+            {"name": "read", "capabilities": ["code.read/v1"]},
+            {"name": "zoom", "capabilities": ["a/v1", "z/v1"]}
+        ]}], "step_transform_items": []})
+        );
+        assert_eq!(
+            plan["composition_digest"],
+            "9881838597e87f35274e5d544969fb8f626aeee745ea81057a2f03909bf25fd8"
+        );
+    }
+
+    #[tokio::test]
+    async fn composition_refuses_invalid_items_before_fetching() {
+        let fetcher = Preflight {
+            answer: Ok(preflight_answer()),
+            requests: Default::default(),
+        };
+        for (field, value) in [
+            ("composition", json!({})),
+            ("composition_digest", json!("old")),
+            ("system_text_items", json!([{"provider": "persona"}])),
+            ("step_transform_items", json!([{"provider": "transform"}])),
+            ("compaction_item", json!({"provider": "compactor"})),
+            ("tool_items", json!([{"provider": "aft", "params": []}])),
+        ] {
+            let mut items = composition_items();
+            items[field] = value;
+            assert_eq!(
+                compose(&items, &fetcher, Duration::from_secs(1))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                "invalid_params"
+            );
+        }
+        assert!(fetcher.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn composition_fetch_failures_and_invalid_answers_name_the_provider() {
+        let mut answered_composition = preflight_answer();
+        answered_composition["composition_digest"] = json!("not-a-preflight");
+        for answer in [
+            Err(FetchError::UnknownModule),
+            Ok(json!({"tools": "not-an-array"})),
+            Ok(answered_composition),
+        ] {
+            let fetcher = Preflight {
+                answer,
+                requests: Default::default(),
+            };
+            let refusal = compose(&composition_items(), &fetcher, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert_eq!(refusal.code(), "fetch_unavailable");
+            assert_eq!(refusal.detail()["provider"], "aft");
         }
     }
 

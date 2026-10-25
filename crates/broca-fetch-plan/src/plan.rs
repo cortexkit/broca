@@ -264,7 +264,7 @@ fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal>
     })
 }
 
-fn items(
+pub(crate) fn items(
     plan: &Map<String, Value>,
     list: &str,
     may_be_optional: bool,

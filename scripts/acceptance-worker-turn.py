@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import uuid
 
 from lib.archive_read import ArchiveRefusal, read_records
@@ -89,6 +90,39 @@ def events_from(output):
     return events
 
 
+def compose_plan(base, timeout, path):
+    output = invoke(base + ["compose-plan", "--items", str(PLAN)], timeout)
+    plan = json.loads(output)
+    digest = plan["composition_digest"]
+    for provider in plan["composition"]["providers"]:
+        print(f"acceptance-worker-turn: provider={provider['provider']} "
+              f"tools={len(provider['tools'])} digest={digest}", flush=True)
+    path.write_text(output)
+
+
+def stale_admission(failure):
+    if failure.result.returncode != 1:
+        return False
+    events = events_from(failure.result.stdout)
+    errors = [event for event in events if event.get("event") == "error"]
+    # Only a send refusal may be retried, never an error from an admitted run or its stream.
+    return (len(errors) == 1 and all(event.get("event") in ("bound", "error") for event in events)
+            and errors[0].get("operation") == "session.send"
+            and errors[0].get("code") == "plan_stale")
+
+
+def composed_turn(base, command, timeout, path):
+    for attempt in range(2):
+        compose_plan(base, timeout, path)
+        try:
+            return invoke(command + ["--plan", str(path)], timeout)
+        except ClientFailure as error:
+            if not stale_admission(error) or attempt == 1:
+                raise
+            print("acceptance-worker-turn: catalog changed after composition; recomposing once: "
+                  + error.result.stdout.strip(), flush=True)
+
+
 def failed_run(output):
     events = events_from(output)
     if any(event.get("event") in ("error", "run_paused") for event in events):
@@ -144,11 +178,12 @@ def main():
     parser.add_argument("--model", default=os.environ.get("ACCEPTANCE_WORKER_MODEL"),
                         help="pin one model instead of rotating the shared acceptance candidates")
     parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--compose-only", action="store_true",
+                        help="fetch the live composition and print provider/tool counts and digest; send nothing")
     args = parser.parse_args()
     try:
         state_root = args.state_root or default_state_root()
         project_root = args.project_root.resolve(strict=True)
-        models = candidates(args.model)
         base = [str(args.session_bin), "--subc", str(args.subc), "--project-root", str(project_root),
                 "--json-events"]
         # The class exercises the WAL gate without adding acceptance transcripts to Engram's backup.
@@ -161,44 +196,56 @@ def main():
         if CLASS in backup_classes:
             raise ValueError(f"class {CLASS} is in the daemon's backup_classes; refusing a backed-up acceptance turn")
         print(f"acceptance-worker-turn: class={CLASS}, daemon backup_classes={backup_classes}", flush=True)
-        # The reader fetch-plan preset is legal unscoped; worker requires a daemon-attested session scope.
-        # No tool call is needed: declarations freeze during admission, before the model turn.
-        for index, model in enumerate(models, 1):
-            session = "acceptance-plan-" + uuid.uuid4().hex
-            path = state_root / "wal" / wal_name(project_root, "broca", session)
-            print(f"acceptance-worker-turn: attempt {index}/{len(models)} model={model}", flush=True)
-            try:
-                output = invoke(base + ["--session", session, "run", "--model", model,
-                                        "--session-class", CLASS, "--plan", str(PLAN),
-                                        "--max-output-tokens", "32",
-                                        "--prompt", "Reply only OK. Do not call tools."], args.timeout)
-            except ClientFailure as error:
-                if error.result.returncode != 1:
-                    raise
-                failed = failed_run(error.result.stdout)
-                if failed is None:
-                    raise
-                run_id, observed_class = failed
-                # A provider refusal does not excuse a broken admission/WAL feature path.
-                _, terminal = checked_run(path, run_id, finish_reason="error")
-                reason = provider_refusal(terminal, observed_class)
-                if reason is None:
-                    raise
-                next_step = "trying next candidate" if index < len(models) else "no candidates remain"
-                print(f"acceptance-worker-turn: model={model} retryable provider error: {reason}; {next_step}", flush=True)
-                continue
-            sends = [event for event in events_from(output) if event.get("event") == "send"]
-            if len(sends) != 1 or sends[0].get("state") != "active":
-                raise ValueError(f"send was not admitted as a new active run:\n{output}")
-            run_id = sends[0]["run_id"]
-            requires = check_wal(path, run_id)
-            print(f"acceptance-worker-turn: PASS -- admitted, completed; model={model}; {path} RunStarted requires {', '.join(requires)}")
-            return 0
-        print("acceptance-worker-turn: CANNOT COMPARE -- every candidate hit a retryable provider error", file=sys.stderr)
-        return 2
+        with tempfile.TemporaryDirectory(prefix="broca-acceptance-plan-") as scratch:
+            plan_path = Path(scratch) / "plan.json"
+            if args.compose_only:
+                compose_plan(base + ["--session", "acceptance-plan-" + uuid.uuid4().hex], args.timeout, plan_path)
+                print("acceptance-worker-turn: COMPOSE ONLY -- no send", flush=True)
+                return 0
+            return run_models(base, args, state_root, project_root, plan_path)
     except (ArchiveRefusal, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         print(f"acceptance-worker-turn: FAILED -- {error}", file=sys.stderr)
         return 1
+
+
+def run_models(base, args, state_root, project_root, plan_path):
+    models = candidates(args.model)
+    # The reader fetch-plan preset is legal unscoped; worker requires a daemon-attested session scope.
+    # No tool call is needed: declarations freeze during admission, before the model turn.
+    for index, model in enumerate(models, 1):
+        session = "acceptance-plan-" + uuid.uuid4().hex
+        path = state_root / "wal" / wal_name(project_root, "broca", session)
+        print(f"acceptance-worker-turn: attempt {index}/{len(models)} model={model}", flush=True)
+        try:
+            output = composed_turn(base + ["--session", session],
+                                   base + ["--session", session, "run", "--model", model,
+                                           "--session-class", CLASS, "--max-output-tokens", "32",
+                                           "--prompt", "Reply only OK. Do not call tools."],
+                                   args.timeout, plan_path)
+        except ClientFailure as error:
+            if error.result.returncode != 1:
+                raise
+            failed = failed_run(error.result.stdout)
+            if failed is None:
+                raise
+            run_id, observed_class = failed
+            # A provider refusal does not excuse a broken admission/WAL feature path.
+            _, terminal = checked_run(path, run_id, finish_reason="error")
+            reason = provider_refusal(terminal, observed_class)
+            if reason is None:
+                raise
+            next_step = "trying next candidate" if index < len(models) else "no candidates remain"
+            print(f"acceptance-worker-turn: model={model} retryable provider error: {reason}; {next_step}", flush=True)
+            continue
+        sends = [event for event in events_from(output) if event.get("event") == "send"]
+        if len(sends) != 1 or sends[0].get("state") != "active":
+            raise ValueError(f"send was not admitted as a new active run:\n{output}")
+        run_id = sends[0]["run_id"]
+        requires = check_wal(path, run_id)
+        print(f"acceptance-worker-turn: PASS -- admitted, completed; model={model}; {path} RunStarted requires {', '.join(requires)}")
+        return 0
+    print("acceptance-worker-turn: CANNOT COMPARE -- every candidate hit a retryable provider error", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
