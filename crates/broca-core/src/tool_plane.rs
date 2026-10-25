@@ -62,6 +62,14 @@ pub struct LateResultRegistration {
 #[async_trait]
 pub trait LateResultsIntake: Send + Sync {
     async fn register_group(&self, calls: &[LateResultRegistration]) -> Result<(), String>;
+
+    /// Forget registrations whose calls are settled for good: called once the batch commit
+    /// barrier that wrote their terminals is synced. Each pair is `(module, call_key)`. A late
+    /// entry for a forgotten key is then a no-op that is acked, which is safe because nothing of
+    /// that call can still be delivered.
+    async fn prune(&self, _calls: &[(String, String)]) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The first reply's durable metadata. Interim content is deliberately not representable here.
@@ -91,6 +99,11 @@ pub trait ProviderHeldLifecycle: Send + Sync {
         call: &ToolCall,
         reply: &ProviderHeldReply,
     ) -> DispatchResult;
+
+    /// The batch has synced the terminal `wait` returned for this held call. Whoever handed the
+    /// late result over may now treat it as delivered (and so let the provider's entry be
+    /// acked); before this point a crash could still lose it.
+    async fn terminal_synced(&self, _ctx: &BatchCtx, _tool_call_id: &ToolCallId) {}
 }
 
 #[derive(Clone, Copy)]

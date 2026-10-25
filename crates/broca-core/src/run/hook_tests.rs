@@ -139,6 +139,7 @@ pub(super) fn frozen(
                         .into_iter()
                         .collect()
                 }),
+                declarations_frozen: None,
             },
         }],
         declarations: subscriptions
@@ -2592,4 +2593,143 @@ async fn post_hook_restream_counts_delta_less_stored_blocks() {
         })
         .collect();
     assert_eq!(parts, vec![1, 2]);
+}
+
+/// Records the `late_results` declaration each batch's manifest carries for the tool's
+/// provider, and answers every call at once.
+struct DeclarationProbe {
+    seen: Mutex<Vec<Option<bool>>>,
+}
+
+#[async_trait::async_trait]
+impl ToolPlane for DeclarationProbe {
+    async fn batch_started(
+        &self,
+        _: &BatchCtx,
+        _: &[ToolCall],
+        manifest: &ToolManifest,
+    ) -> Result<(), ToolPlaneError> {
+        self.seen.lock().unwrap().push(
+            manifest
+                .provider_declarations("aft")
+                .and_then(|declarations| declarations.late_results),
+        );
+        Ok(())
+    }
+
+    async fn batch_finished(&self, _: &BatchCtx) -> Result<(), ToolPlaneError> {
+        Ok(())
+    }
+
+    async fn dispatch(&self, _: &BatchCtx, call: &ToolCall) -> DispatchResult {
+        DispatchResult::Completed(ToolResult {
+            tool_call_id: call.tool_call_id.clone(),
+            output: ToolOutput::Text { text: "ok".into() },
+            is_error: false,
+        })
+    }
+}
+
+/// A plan manifest whose provider froze the `late_results` capability, or froze nothing.
+fn declaring(late_results: bool) -> broca_wal::PlanManifest {
+    let mut manifest = frozen(Vec::new(), None, false);
+    if let broca_wal::FetchOutcome::Answered {
+        declarations_frozen,
+        ..
+    } = &mut manifest.fetches[0].outcome
+    {
+        *declarations_frozen = late_results.then_some(broca_wal::FrozenProviderDeclarations {
+            result_formats: None,
+            late_results: Some(true),
+        });
+    }
+    manifest
+}
+
+/// A batch routes by the provider declarations its session froze, never by whatever manifest a
+/// later admission offers: a fresh run reads the admitted manifest, and a resume reads the
+/// manifest its own `RunStarted` recorded, even when the resuming caller brings a different
+/// one.
+#[tokio::test]
+async fn a_batch_reads_provider_declarations_only_from_the_frozen_manifest() {
+    let control = RunControl {
+        manifest: Some(Arc::new(declaring(true))),
+        ..Default::default()
+    };
+    let (seed_writer, seed) = writer();
+    let (out, _rx) = mpsc::channel(128);
+    let fresh = DeclarationProbe {
+        seen: Mutex::new(Vec::new()),
+    };
+    run_body(
+        &mut request(),
+        crate::replay::replay(&[]).unwrap(),
+        None,
+        false,
+        false,
+        false,
+        &control,
+        &Messages {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        },
+        &fresh,
+        &crate::AllowAll,
+        &seed_writer,
+        || Ok(false),
+        None,
+        &out,
+        None,
+    )
+    .await
+    .unwrap();
+    let _ = seed_writer.shutdown().await;
+    assert_eq!(*fresh.seen.lock().unwrap(), [Some(true)]);
+
+    // Resume from the durable model step, with a caller that offers a manifest declaring
+    // nothing: the resumed batch still routes by what the session froze.
+    let mut prefix = Vec::new();
+    for record in seed.lock().unwrap().iter() {
+        prefix.push(record.clone());
+        if matches!(record, WalRecord::ModelStepFinished { .. }) {
+            break;
+        }
+    }
+    let mut prior = crate::replay::replay(&prefix).unwrap();
+    prior.manifest = prefix.iter().find_map(|record| match record {
+        WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } => Some(Arc::new(manifest.as_ref().clone())),
+        _ => None,
+    });
+    let resumed = DeclarationProbe {
+        seen: Mutex::new(Vec::new()),
+    };
+    let (writer, _records) = writer();
+    run_body(
+        &mut request(),
+        prior,
+        None,
+        true,
+        false,
+        false,
+        &RunControl {
+            manifest: Some(Arc::new(declaring(false))),
+            ..Default::default()
+        },
+        &Messages {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        },
+        &resumed,
+        &crate::AllowAll,
+        &writer,
+        || Ok(false),
+        None,
+        &out,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*resumed.seen.lock().unwrap(), [Some(true)]);
+    let _ = writer.shutdown().await;
 }

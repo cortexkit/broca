@@ -349,6 +349,7 @@ pub fn frozen(state: &State) -> Arc<broca_wal::PlanManifest> {
                 catalog_digest: "catalog".into(),
                 tools: vec![tool].into(),
                 text: None,
+                declarations_frozen: None,
                 result_ops: Some(
                     [(
                         "work".into(),

@@ -25,6 +25,18 @@ CALL = re.compile(r"\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*(?:<[^;{}]*>)?\s*\(")
 FN = re.compile(r"\bfn\s+([A-Za-z_]\w*)\b")
 MODULE = re.compile(r"\bmod\s+([A-Za-z_]\w*)\s*([;{])")
 TEST_ATTRIBUTE = re.compile(r"(?:^|::)(?:test|rstest|test_case)(?:\s|\(|,|$)")
+# The features the portable preflight builds with (scripts/linux-preflight.sh), and so the ones the
+# nextest inventory is listed with.
+PREFLIGHT_FEATURE_FLAGS = (
+    "broca-provider/live",
+    "broca-provider/test-harness",
+    "broca-catalog/live",
+    "broca-module-serve/test-clock",
+)
+PREFLIGHT_FEATURES = {flag.split("/", 1)[1] for flag in PREFLIGHT_FEATURE_FLAGS}
+# A plain `cfg(feature = "x")` gate. Compound cfg expressions are not parsed, so a test behind one
+# is still checked.
+FEATURE_GATE = re.compile(r'^\s*cfg\s*\(\s*feature\s*=\s*"([^"]+)"\s*\)\s*$')
 GENERIC_HELPERS = {
     "build", "check", "connect", "default", "drop", "from", "get", "new",
     "required", "resolve", "run", "setup", "start", "wait", "with",
@@ -213,11 +225,19 @@ def _body_open(mask: str, match: re.Match[str], pairs: dict[int, int]) -> int | 
     return open_at
 
 
-def _is_test_attribute(mask: str, scope_start: int, item_start: int) -> bool:
+def _is_test_attribute(mask: str, scope_start: int, item_start: int, source: str) -> bool:
     prefix = mask[scope_start:item_start]
     boundary = max(prefix.rfind("}"), prefix.rfind(";"))
     preamble = prefix[boundary + 1:]
     attributes = re.findall(r"#\s*\[([^\]]*)\]", preamble)
+    # A test gated on a feature the preflight does not enable is never compiled there, so it cannot
+    # be selected and is absent from the inventory by construction. The mask blanks string
+    # literals, so the feature name is read from the source.
+    unmasked = source[scope_start + boundary + 1:item_start]
+    for attr in re.findall(r"#\s*\[([^\]]*)\]", unmasked):
+        gate = FEATURE_GATE.match(attr)
+        if gate and gate.group(1) not in PREFLIGHT_FEATURES:
+            return False
     return any(TEST_ATTRIBUTE.search(attr) for attr in attributes)
 
 
@@ -272,7 +292,7 @@ def discover_rig_tests(target: Target, root: Path) -> tuple[list[RigTest], list[
                 # Ignore functions nested in blocks; inline modules are scanned recursively.
                 if not _is_top_level(mask, start, match.start()):
                     continue
-                if not _is_test_attribute(mask, start, match.start()):
+                if not _is_test_attribute(mask, start, match.start(), source):
                     continue
                 open_at = _body_open(mask, match, pairs)
                 if open_at is None:
@@ -405,9 +425,8 @@ def _portable_filter(root: Path) -> str:
 def _nextest_inventory(root: Path, expression: str) -> dict:
     command = [
         "cargo", "nextest", "list", "--locked", "--workspace",
-        "-F", "broca-provider/live", "-F", "broca-provider/test-harness",
-        "-F", "broca-catalog/live",
-        "-F", "broca-module-serve/test-clock", "-E", expression, "-T", "json",
+        *(arg for flag in PREFLIGHT_FEATURE_FLAGS for arg in ("-F", flag)),
+        "-E", expression, "-T", "json",
     ]
     result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
     if result.returncode:

@@ -37,12 +37,13 @@ broca-module = { path = "../broca-module" }
 # Fetch-plan admission: checks a send's plan and builds the manifest its first episode freezes.
 broca-fetch-plan = { path = "../broca-fetch-plan" }
 cortexkit-role-step-transform-provider = { workspace = true }
+# The tool-provider contract's catalog, result and late-results wire types.
+cortexkit-role-tool-provider = { workspace = true }
 cortexkit-role-llm-runner = { workspace = true }
 # System One classification (classifier/v1) and the batch rules it implements.
 cortexkit-role-classifier = { workspace = true }
 cortexkit-model-batch = { workspace = true }
 cortexkit-llm-tools = { workspace = true }
-cortexkit-role-tool-provider = { workspace = true }
 serde_jcs.workspace = true
 # System One's provider calls. The same release and TLS backend broca-provider builds, so the
 # lockfile gains no crate.
