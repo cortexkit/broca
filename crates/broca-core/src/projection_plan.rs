@@ -565,7 +565,20 @@ pub fn plan_projection(
         .transpose()?;
     let control_head =
         last_control_cursor_through(records, Some(new_watermark)).or(previous_control_head);
-    let anchor = range.and_then(|range| range.anchor_at(new_watermark));
+    let anchor = range
+        .and_then(|range| range.anchor_at(new_watermark))
+        .or_else(|| {
+            // A terminal-only tail updates final-message metadata without advancing the
+            // boundary. The range omits that old boundary, not its valid stored anchor.
+            // Advancing or resetting without a fresh anchor must still clear the old one.
+            if new_watermark == watermark {
+                seed.as_ref()
+                    .and_then(|seed| seed.anchor)
+                    .filter(|anchor| anchor.seq == new_watermark)
+            } else {
+                None
+            }
+        });
     // Both stores use signed 64-bit columns. Reject out-of-range values before
     // returning a batch, rather than letting a spawned projector panic or wrap.
     u64_to_i64(new_watermark)?;

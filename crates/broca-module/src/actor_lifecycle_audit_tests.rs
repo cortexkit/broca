@@ -414,6 +414,8 @@ impl Fixture {
             step_progress: Arc::new(std::sync::Mutex::new(None)),
             handle,
             durable_finish: Arc::default(),
+            // This fixture deliberately takes the durable cancellation path when held state is unknown.
+            provider_held: None,
         });
     }
 

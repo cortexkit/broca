@@ -55,6 +55,7 @@ mod launch_nonce_e2e;
 mod llm_runner_role;
 mod log_levels_are_deliberate;
 mod meta_prompt_cache_key_render;
+mod output_refs;
 #[cfg(unix)]
 mod placed_aft_preset;
 mod plan_admission;

@@ -35,6 +35,7 @@ async fn one_batch_routes_each_call_to_its_hinted_module_and_fences_redispatch()
     let plane = ready_plane(&rig).await;
     let bind = BindIdentity::new(&rig.dir, "multi-module-spine", "s1");
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("batch-1".into()),
         bind: bind.clone(),
         run_id: broca_protocol::RunId("r1".into()),
@@ -75,6 +76,7 @@ async fn close_session_routes_sweeps_all_module_routes() {
     let plane = ready_plane(&rig).await;
     let bind = BindIdentity::new(&rig.dir, "multi-module-spine", "s-close");
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("batch-close".into()),
         bind: bind.clone(),
         run_id: broca_protocol::RunId("r1".into()),

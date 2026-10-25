@@ -422,6 +422,7 @@ fn head(scope_ref: &str) -> serde_json::Value {
 
 fn ctx(bind: &BindIdentity, batch: &str, run: &str, scope: &SessionScope) -> BatchCtx {
     BatchCtx {
+        media_capture: None,
         batch_id: BatchId(batch.into()),
         bind: bind.clone(),
         run_id: RunId(run.into()),

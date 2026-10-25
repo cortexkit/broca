@@ -625,6 +625,7 @@ async fn module_restart_between_dispatches_is_one_transparent_retry() {
     // Dispatch on the stale route: the daemon rejects unknown_channel; the plane must
     // evict, re-open, and complete against the respawned module.
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("b-restart".into()),
         bind: bind.clone(),
         run_id: broca_protocol::RunId("r1".into()),
@@ -799,6 +800,7 @@ async fn check_route_refusal(code: &str, refusals: usize, retry: bool, unknown: 
         // require review of the prior unknown side effect before another run can proceed.
         use broca_core::{BatchCtx, DispatchResult, ToolManifest, ToolPlane};
         let next_ctx = BatchCtx {
+            media_capture: None,
             batch_id: broca_protocol::BatchId("next-batch".into()),
             bind: bind.clone(),
             run_id: RunId("next-run".into()),

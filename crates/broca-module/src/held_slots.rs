@@ -276,6 +276,7 @@ mod tests {
             bind: BindIdentity::new("/p", "h", "s"),
             run_id: RunId("r".into()),
             scope: None,
+            media_capture: None,
         }
     }
 
