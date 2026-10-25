@@ -201,11 +201,13 @@ UTF-8 tool-payload `limits`. Newest pages and `before_*` seeks page backward; `f
 seeks page forward. Entries are always oldest first, and opaque `older`/`newer` cursors
 are session-lineage bound. Broca has no unnumbered host history or history rewrites;
 its surviving history is the full append-only lineage and its history version is zero.
-If the shared `session.read` timestamp derivation has no creation time, or a display
-assistant has no recorded producing model, history refuses the whole page with
+If the shared `session.read` timestamp derivation has no creation time, history refuses the whole page with
 `history_unrepresentable`, class `permanent`, and `detail: {ordinal, field}` naming
-the first unrepresentable row and `written_at` or `model`. It never substitutes an
+the first unrepresentable row and `written_at`. It never substitutes an
 invented value or returns a partial page. Raw `session.read` remains the recovery path.
+Under llm-runner 0.6.13 §4.7, assistant rows carry their recorded producing model.
+Imported or adopted messages without one omit `model` (unknown); the projection
+never guesses or copies the session's current model. Messages written by a run keep theirs.
 Display rows alone expose the output-reference descriptors from §9.13: the reply
 set on `row.output_refs`, and each opted-in call's set on its tool-call part.
 Default `session.read`, `run.status`, stored messages and subscribe bytes are unchanged.

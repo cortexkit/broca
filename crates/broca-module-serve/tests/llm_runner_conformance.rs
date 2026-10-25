@@ -55,6 +55,24 @@ const HEAD_SENDER_MODULE: &str = "conformance-head-sender";
 const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
+
+/// Only the kit's dedicated history/display families omit the extra stored system entry.
+/// Match complete minted names, not arbitrary sessions whose labels contain those words.
+fn history_display_kit_session(session: &str) -> bool {
+    let counter = |value: &str| {
+        value
+            .parse::<u64>()
+            .is_ok_and(|number| number > 0 && number.to_string() == value)
+    };
+    if let Some(tail) = session.strip_prefix("cf-cf-history-") {
+        return tail
+            .split_once('-')
+            .is_some_and(|(label, session)| counter(label) && counter(session));
+    }
+    ["cf-display-", "cf-display-sender-", "cf-display-model-"]
+        .iter()
+        .any(|prefix| session.strip_prefix(*prefix).is_some_and(counter))
+}
 /// The harness every session the suite opens is bound under.
 const HARNESS: &str = "conformance";
 /// The member of a scripted tool result that holds the content blocks the scripted tool
@@ -177,6 +195,7 @@ struct Shared {
     read_mids: Mutex<HashMap<String, String>>,
     plan_sessions: Mutex<BTreeSet<String>>,
     output_refs_sessions: Mutex<BTreeSet<String>>,
+    model_id_marker_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
     stream_holds: Mutex<HashMap<String, usize>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
@@ -2180,9 +2199,14 @@ impl LlmRunnerSubject for BrocaSubject {
             return fields;
         }
         // Legacy cases name tools directly; compaction cases use the plan-aware catalogue.
-        let fields = json!({
-            // The model id routes the script without adding an extra system message to history.
-            "model": {"provider": "mock", "model": format!("{PLAN_MODEL_PREFIX}{session}")},
+        let markerless = self
+            .shared
+            .model_id_marker_sessions
+            .lock()
+            .unwrap()
+            .contains(session);
+        let mut fields = json!({
+            "model": {"provider": "mock", "model": if markerless { format!("{PLAN_MODEL_PREFIX}{session}") } else { "mock-model".into() }},
             "tools": [{
                 "name": SCRIPTED_TOOL,
                 "description": "Answers each call with its scripted result.",
@@ -2190,6 +2214,11 @@ impl LlmRunnerSubject for BrocaSubject {
                 "module": TOOL_MODULE,
             }],
         });
+        // Native durability, reader-identity and retention fixtures depend on this original
+        // system marker, including error sessions that never install a model script.
+        if !markerless {
+            fields["system"] = json!(format!("{SESSION_MARKER}{session}"));
+        }
         fields.as_object().cloned().expect("an object")
     }
 
@@ -2374,6 +2403,13 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     async fn install_script(&self, session: &str, script: Script) -> Result<(), HarnessError> {
+        if history_display_kit_session(session) {
+            self.shared
+                .model_id_marker_sessions
+                .lock()
+                .unwrap()
+                .insert(session.into());
+        }
         let mut results = self.shared.results.lock().unwrap();
         let mut holds = self.shared.holds.lock().unwrap();
         for call in script.tool_calls() {
@@ -2890,6 +2926,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "display_limits_cut_on_a_utf8_boundary",
         "display_without_limits_is_whole",
         "display_pages_carry_finished_messages_only",
+        "display_own_run_records_model",
         "client_message_id_on_display_rows_never_in_read",
         "display_row_names_the_sender_never_in_read",
         "output_refs_scanning",
@@ -2897,6 +2934,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "output_refs_descriptor_digest",
         "output_refs_session_isolation",
         "output_refs_slots",
+        "output_refs_shared_samples",
         "output_refs_reference_limit",
         "output_refs_read_limits",
         "output_refs_snapshot_budget",
@@ -4559,6 +4597,87 @@ mod held_call_tests {
             bus: None,
             #[cfg(feature = "test-clock")]
             mc: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_fixture_fields_keep_legacy_system_marker() {
+        let shared = Arc::new(Shared::default());
+        let subject = subject(shared.clone());
+        for session in ["step-cut", "mc-e2e"] {
+            subject
+                .install_script(session, Script::default())
+                .await
+                .unwrap();
+        }
+        for session in [
+            "step-cut",
+            "mc-e2e",
+            "provider-error-retained",
+            "provider-error-forever",
+        ] {
+            let fields = subject.send_fields(session, true);
+            assert_eq!(
+                fields["system"],
+                format!("{SESSION_MARKER}{session}"),
+                "{session}"
+            );
+            assert_eq!(fields["model"]["model"], "mock-model", "{session}");
+        }
+        assert!(
+            !shared
+                .scripts
+                .lock()
+                .unwrap()
+                .contains_key("provider-error-forever"),
+            "provider-error fixtures must route by their system marker even without a script"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_registered_history_and_display_fixture_names_use_model_routing() {
+        let subject = subject(Arc::new(Shared::default()));
+        for session in [
+            "cf-cf-history-3-4",
+            "cf-display-5",
+            "cf-display-sender-6",
+            "cf-display-model-7",
+        ] {
+            assert!(
+                subject.send_fields(session, true).contains_key("system"),
+                "unregistered {session}"
+            );
+            subject
+                .install_script(session, Script::default())
+                .await
+                .unwrap();
+            let fields = subject.send_fields(session, true);
+            assert!(!fields.contains_key("system"), "{session}");
+            assert_eq!(
+                fields["model"]["model"],
+                format!("{PLAN_MODEL_PREFIX}{session}")
+            );
+        }
+        for session in [
+            "cf-cf-history-3-4-extra",
+            "cf-display-ish-5",
+            "prefix-cf-display-5",
+            "cf-display-0",
+            "cf-display-05",
+            "cf-cf-history-0-7",
+        ] {
+            assert!(!history_display_kit_session(session), "{session}");
+            subject
+                .install_script(session, Script::default())
+                .await
+                .unwrap();
+            let fields = subject.send_fields(session, true);
+            assert_eq!(
+                fields["system"],
+                format!("{SESSION_MARKER}{session}"),
+                "{session}"
+            );
+            assert_eq!(fields["model"]["model"], "mock-model", "{session}");
         }
     }
 

@@ -418,15 +418,6 @@ pub async fn read<H: ServeHandler + ?Sized>(
             ordinal: entry.ordinal,
             field: "written_at",
         })?);
-        if request.form() == HistoryForm::Display
-            && entry.message.role == Role::Assistant
-            && entry.message.origin.is_none()
-        {
-            return Err(HistoryError::Unrepresentable {
-                ordinal: entry.ordinal,
-                field: "model",
-            });
-        }
     }
     let records = if request.form() == HistoryForm::Display {
         match entries.iter().find_map(|entry| entry.run.as_ref()) {

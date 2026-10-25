@@ -360,7 +360,7 @@ async fn history_display_recovers_send_identity_without_changing_read_bodies() {
 }
 
 #[tokio::test]
-async fn imported_history_refuses_the_first_assistant_without_a_model() {
+async fn imported_history_omits_unknown_model_without_guessing() {
     let (mut rig, _) = plan_rig("history-imported-model").await;
     let imported = call(&mut rig, 7, "session.import", json!({
         "import_id":"imported-tool-episode", "origin":{"kind":"import","source_ref":"fixture:imported-tool-episode"},
@@ -387,31 +387,35 @@ async fn imported_history_refuses_the_first_assistant_without_a_model() {
         })
         .count();
     assert_eq!((messages.len(), missing_times, missing_models), (4, 0, 1));
-    println!("HISTORY_REPRESENTABILITY imported: rows=4 missing_written_at=0 missing_model=1 display_refusals=1");
-    let before = rig.wal_bytes();
-    let display = call(&mut rig, 7, "session.history", json!({"form":"display"})).await;
-    let error = refusal(&display);
-    assert_eq!(error["code"], "history_unrepresentable");
-    assert_eq!(error["class"], "permanent");
-    assert_eq!(error["detail"], json!({"ordinal":1,"field":"model"}));
-    assert!(
-        error.get("messages").is_none(),
-        "no partial page accompanies a refusal"
-    );
-    assert_eq!(rig.wal_bytes(), before);
     let history = call(&mut rig, 7, "session.history", json!({})).await;
     assert_eq!(result(&history)["messages"], raw["messages"]);
-    let known = call(
-        &mut rig,
-        7,
-        "session.history",
-        json!({"form":"display","from_ordinal":2}),
-    )
-    .await;
+    rig.script.push(&[Step::Text("native answer")]);
+    let native = call(&mut rig, 7, "session.send", json!({"send_id":"native-after-import","prompt":"native question","model":{"provider":"fake","model":"fake"}})).await;
+    assert!(result(&native)["run_id"].is_string());
+    rig.wait_for_finished(2).await;
+    rig.wait_idle().await;
+    let head = call(&mut rig, 7, "session.head", json!({})).await;
+    assert_eq!(result(&head)["model"]["model"], "fake");
+    let before = rig.wal_bytes();
+    let display = call(&mut rig, 7, "session.history", json!({"form":"display"})).await;
+    let display = result(&display);
+    assert_eq!(display["messages"].as_array().unwrap().len(), 6);
+    assert!(
+        display["messages"][1]["row"].get("model").is_none(),
+        "an unknown imported producer is omitted, never copied from the current model"
+    );
     assert_eq!(
-        result(&known)["messages"][1]["row"]["model"],
+        display["messages"][3]["row"]["model"],
         "anthropic/recorded-model"
     );
+    assert_eq!(display["messages"][5]["row"]["model"], "fake/fake");
+    assert_eq!(rig.wal_bytes(), before, "display projection writes nothing");
+    let raw_after = call(&mut rig, 7, "session.read", json!({})).await;
+    assert_eq!(
+        &result(&raw_after)["messages"].as_array().unwrap()[..4],
+        messages.as_slice()
+    );
+    println!("HISTORY_REPRESENTABILITY imported: rows=4 missing_written_at=0 missing_model=1 display_refusals=0; recorded native model preserved");
     rig.finish().await;
 }
 
