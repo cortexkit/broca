@@ -77,6 +77,7 @@ suites=(
     scripts/test-ci-pipeline.py
     scripts/test-gated-commit.py
     scripts/test-deploy.py
+    scripts/test-acceptance-worker-turn.py
     scripts/test-turn-harnesses.py
     scripts/test-repro-vanished-bind-root.py
     scripts/test-script-options.py

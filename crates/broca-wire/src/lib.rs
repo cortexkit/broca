@@ -1673,6 +1673,7 @@ mod approval_wire_tests {
     #[test]
     fn active_awaiting_approval_golden() {
         let response = RunStatusResponse::Active {
+            held_calls: Vec::new(),
             auth_selection: None,
             reason: None,
             deadline_ms: None,
@@ -1907,6 +1908,9 @@ pub enum RunStatusResponse {
         /// WAL marker may supply filing IDs but cannot keep an approved or closed call pending.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         awaiting_approval: Option<AwaitingApproval>,
+        /// Open provider-held calls are a runner-owned wait, independent of `reason`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
     },
     Paused {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1932,6 +1936,9 @@ pub enum RunStatusResponse {
         error: Option<SharedProviderError>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<PausedRunAuth>,
+        /// Only open provider-held calls are reported; an empty list is omitted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
         /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4492,6 +4499,7 @@ mod tests {
         assert_eq!(
             decoded,
             RunStatusResponse::Paused {
+                held_calls: Vec::new(),
                 auth_selection: None,
                 title: None,
                 pause_reason: None,
@@ -5071,6 +5079,7 @@ mod restart_wire_tests {
     fn restart_pause_status_and_invalid_policy_match_goldens() {
         scope_refusal_golden::assert_golden(
             RunStatusResponse::Paused {
+                held_calls: Vec::new(),
                 auth_selection: None,
                 title: None,
                 pause_reason: Some(broca_protocol::PauseReason::Restart.into()),
@@ -5295,6 +5304,7 @@ mod title_wire_tests {
         // A live run's status carries the title too, and an untitled one keeps its bare shape.
         assert_eq!(
             serde_json::to_value(RunStatusResponse::Active {
+                held_calls: Vec::new(),
                 auth_selection: None,
                 reason: None,
                 deadline_ms: None,
@@ -5312,6 +5322,7 @@ mod title_wire_tests {
             )
             .unwrap(),
             RunStatusResponse::Active {
+                held_calls: Vec::new(),
                 auth_selection: None,
                 reason: None,
                 deadline_ms: None,

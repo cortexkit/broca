@@ -9,6 +9,7 @@ description = "broca core: the agentic loop and its seams (provider, tool-plane,
 
 [features]
 test-clock = []
+test-attachments = ["broca-protocol/test-attachments"]
 
 [dependencies]
 broca-owner-only.workspace = true

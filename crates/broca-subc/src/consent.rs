@@ -679,6 +679,7 @@ mod tests {
 
     fn scoped_ctx() -> BatchCtx {
         BatchCtx {
+            media_capture: None,
             batch_id: broca_protocol::BatchId("b".into()),
             run_id: broca_protocol::RunId("r".into()),
             bind: BindIdentity::new("/p", "broca", "s"),
@@ -1125,6 +1126,7 @@ mod tests {
         let plane =
             ScopedConsentPlane::new(client.conn.clone(), RouteOpenRetry::default_patience());
         let ctx = BatchCtx {
+            media_capture: None,
             batch_id: broca_protocol::BatchId("b".into()),
             run_id: broca_protocol::RunId("r".into()),
             bind: BindIdentity::new("/p", "broca", "s"),

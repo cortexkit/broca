@@ -110,6 +110,7 @@ class WalFrame:
     fence: int
     record: dict
     payload: bytes
+    requires: tuple[str, ...] = ()
 
 
 def _skip_json_space(text: str, offset: int) -> int:
@@ -235,11 +236,13 @@ def read_records(wal: pathlib.Path | ArchivedWal) -> list[WalFrame]:
         if version == 2:
             continue
         try:
+            requires = ()
             if version == wal_gate.GATED_FRAMING_VERSION:
                 missing, envelope = wal_gate.open_gated(payload)
                 if missing:
                     raise ArchiveRefusal(f"{where}: newer-writer, missing features: {', '.join(missing)}")
                 record = envelope["record"]
+                requires = tuple(envelope["requires"])
                 payload = _record_payload(payload)
             else:
                 record = json.loads(payload)
@@ -251,7 +254,7 @@ def read_records(wal: pathlib.Path | ArchivedWal) -> list[WalFrame]:
             raise ArchiveRefusal(f"{where}: invalid record JSON: {error}") from error
         if not isinstance(record, dict) or not isinstance(record.get("type"), str):
             raise ArchiveRefusal(f"{where}: no tagged WAL record")
-        frames.append(WalFrame(seq, fence, record, payload))
+        frames.append(WalFrame(seq, fence, record, payload, requires))
     return frames
 
 

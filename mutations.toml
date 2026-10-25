@@ -9,6 +9,21 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "store-nonadvancing-projection-preserves-wal-anchor"
+platforms = ["linux", "macos"]
+guards = "A terminal-only projection preserves the byte anchor at the unchanged watermark so the next admission reads only the WAL tail"
+runner = "cargo"
+package = "broca-store"
+target = "--test nonadvancing_anchor"
+select = "expected"
+test_file = "crates/broca-store/tests/nonadvancing_anchor.rs"
+expect_red = ["nonadvancing_projection_preserves_anchor_and_tail_read_cost"]
+expect_message = "non-advancing projection must preserve the WAL anchor"
+file = "crates/broca-core/src/projection_plan.rs"
+old = ".filter(|anchor| anchor.seq == new_watermark)"
+new = ".filter(|_| false) // NON-VACUITY BREAK: write NULL over the unchanged boundary's anchor."
+
+[[control]]
 id = "session-read-open-batch-part-rows"
 guards = "An exposed open assistant batch has an unnumbered tag row for every part before result commitment"
 runner = "cargo"
@@ -7016,8 +7031,8 @@ test_count_pattern = "Ran {count} test"
 test_file = "scripts/test-archive-read.py"
 expect_red = ["ArchiveReadTests.test_compaction_records_decode_and_scan_live_and_archived"]
 file = "scripts/lib/archive_read.py"
-old = "frames.append(WalFrame(seq, fence, record, payload))"
-new = "if record['type'] != 'compaction_wait':  # NON-VACUITY BREAK\n            frames.append(WalFrame(seq, fence, record, payload))"
+old = "frames.append(WalFrame(seq, fence, record, payload, requires))"
+new = "if record['type'] != 'compaction_wait':  # NON-VACUITY BREAK\n            frames.append(WalFrame(seq, fence, record, payload, requires))"
 
 [[control]]
 id = "wal-tools-newer-writer-refusal"
@@ -26765,7 +26780,7 @@ test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
 expect_red = ["subc_plane::held_dispatch_tests::held_reply_requires_every_prerequisite_and_never_exposes_interim_content"]
 file = "crates/broca-subc/src/subc_plane.rs"
 old = "                            let terminal = support.lifecycle.wait(ctx, call, &reply).await;"
-new = "                            let terminal = DispatchResult::Completed(map_call_tool_result(&call.tool_call_id, &raw)); // NON-VACUITY BREAK: treat interim content as terminal."
+new = "                            let terminal = DispatchResult::Completed(map_call_tool_result(&call.tool_call_id, &raw).0); // NON-VACUITY BREAK: treat interim content as terminal."
 
 [[control]]
 id = "store-late-results-dispatch-group-atomic"
@@ -28774,6 +28789,85 @@ old = "                                view::Decision::Refuse(view::HISTORY_UNAV
 new = "                                view::decide_stored_at(fetched, ready, state, lineage_id, prompt, stored, prefix_bound, run_start) // NON-VACUITY BREAK: decide over the released prompt"
 
 [[control]]
+id = "output-refs-access-follows-session-read"
+guards = "session.output_refs and session.output_ref_read admit exactly the callers session.read admits"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::ids_are_session_bound_and_access_follows_session_read"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if matches!(method, OP_CANCEL | OP_RETRACT) {"
+new = """    if matches!(method, cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ) { return Ok(()); } // NON-VACUITY BREAK: serve output references to a caller session.read refuses.
+    if matches!(method, OP_CANCEL | OP_RETRACT) {"""
+
+[[control]]
+id = "output-refs-read-offset-bound"
+guards = "session.output_ref_read refuses an offset past the content as invalid_params naming offset"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::refusals_carry_the_contract_codes_and_write_nothing"]
+file = "crates/broca-module/src/output_refs.rs"
+old = "    if let Err(field) = request.check(size) {"
+new = "    if let Err(field) = request.check(u64::MAX) { // NON-VACUITY BREAK: accept offsets past the content."
+
+[[control]]
+id = "output-refs-read-length-bound"
+guards = "session.output_ref_read refuses a length over the read cap as invalid_params naming length, before any lookup"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::refusals_carry_the_contract_codes_and_write_nothing"]
+file = "crates/broca-module/src/output_refs.rs"
+old = "    if request.length > MAX_READ_BYTES {"
+new = "    if request.length > MAX_READ_BYTES && false { // NON-VACUITY BREAK: look the reference up before bounding the length."
+
+[[control]]
+id = "output-refs-ids-are-session-bound"
+guards = "A set or reference id minted under another lineage answers unknown_ref, never this session's record at the same position"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::refusals_carry_the_contract_codes_and_write_nothing"]
+file = "crates/broca-module/src/output_refs.rs"
+old = "    if lineage.is_some_and(|lineage| lineage != current) {"
+new = "    if lineage.is_some_and(|lineage| lineage != current) && false { // NON-VACUITY BREAK: answer another lineage's ids from this session."
+
+[[control]]
+id = "output-refs-folded-part-not-in-request"
+guards = "A reference to a part the compaction view in effect at the writing step folded out of the request stays unknown_tag"
+runner = "cargo"
+package = "broca-module"
+target = "--test output_refs_cost"
+select = "expected"
+test_file = "crates/broca-module/tests/output_refs_cost.rs"
+expect_red = ["a_folded_part_was_not_in_the_writing_request"]
+file = "crates/broca-module/src/output_refs.rs"
+old = "    if ordinal > view.covers_through.ordinal {"
+new = "    if ordinal > view.covers_through.ordinal || ordinal < u64::MAX { // NON-VACUITY BREAK: treat every part as shown in the request."
+
+[[control]]
+id = "output-refs-slots-frozen-only-on-opt-in"
+guards = "A provider's catalog reference slots are frozen, and its calls scanned, only when its plan item opts into output references"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::a_call_without_opt_in_has_no_set", "output_refs::declared_slots_without_opt_in_keep_the_manifest_bytes"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "        .filter(|item| item.output_refs)?;"
+new = "        .filter(|item| item.output_refs || !item.output_refs)?; // NON-VACUITY BREAK: freeze every provider's slots."
+
+[[control]]
 id = "actor-retention-sync-unstarted-lineage-quiet"
 guards = "An actor's retention sync before its first RunStarted succeeds without writing a sidecar or enrolling repair, even on a fresh state root with no ephemeral directory"
 runner = "cargo"
@@ -29128,6 +29222,22 @@ expect_red = ["serve::tests::tool_bind_target_does_not_widen_management_or_inter
 file = "crates/broca-module-serve/src/serve.rs"
 old = "role == RouteRole::ToolProvider && tools,"
 new = "role == RouteRole::ToolProvider || tools, // NON-VACUITY BREAK: accept unrelated roles on a tool target."
+
+[[control]]
+id = "llm-tool-target-selects-role-without-declaration"
+guards = "A run-scoped BASAL tool-provider target serves the model-tool catalog without role_versions"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["basal_tool_provider_target_without_role_versions_serves_catalog_on_real_daemon"]
+expect_message = "broca does not serve this route target"
+file = "crates/broca-module-serve/src/serve.rs"
+old = """    bind_role(role_versions, serves_classifier)?;
+    Ok(RouteRole::ToolProvider)"""
+new = """    // NON-VACUITY BREAK: restore declaration-only role selection on tool-provider targets.
+    bind_role(role_versions, serves_classifier)"""
 
 [[control]]
 id = "llm-tool-tags-are-opt-in"
@@ -30180,3 +30290,338 @@ expect_red = ["wal_writer::tests::a_panic_inside_an_append_fails_the_writer_clos
 file = "crates/broca-core/src/wal_writer.rs"
 old = "Err(std::sync::TryLockError::Poisoned(poisoned)) => self.recover_enqueue_lock(poisoned),"
 new = "Err(std::sync::TryLockError::Poisoned(poisoned)) => { drop(poisoned); self.enqueue_lock.lock().unwrap() } // NON-VACUITY BREAK: panic on the poisoned lock, as the production path did."
+
+[[control]]
+id = "core-provider-held-closing-without-open-sibling"
+guards = "A held close-out terminal marks the episode closing even after the last open held call is terminal"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/resume.rs"
+expect_red = ["resume::tests::provider_held_close_out_survives_every_terminal_prefix"]
+file = "crates/broca-core/src/resume.rs"
+old = "    if held.is_empty() || prior.run_finished_durable {"
+new = "    if held.is_empty() || prior.run_finished_durable || !prior.open_tool_batch.as_ref().is_some_and(|batch| batch.calls.iter().any(|(_, state)| *state == OpenCallState::ProviderHeld)) { // NON-VACUITY BREAK: forget closing once no held call remains open."
+
+[[control]]
+id = "core-provider-held-closeout-covers-successors"
+guards = "Full-batch close-out supplies a definite not-dispatched terminal to every held successor"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/resume.rs"
+expect_red = ["resume::tests::provider_held_close_out_survives_every_terminal_prefix"]
+file = "crates/broca-core/src/resume.rs"
+old = "    for (tool_call_id, state) in &batch.calls {"
+new = "    for (tool_call_id, state) in &batch.calls {\n        if *state == OpenCallState::HeldSuccessor { continue; } // NON-VACUITY BREAK: strand the never-sent planned successor."
+
+[[control]]
+id = "module-provider-held-cancel-durable-before-answer"
+guards = "Both immediate and boundary cancellation of a paused provider hold sync RunCancelRequested before answering"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::provider_held_paused_cancel_ack_is_durable_before_finalizer_and_seal"]
+file = "crates/broca-module/src/actor.rs"
+old = "        if provider_held {"
+new = "        if provider_held && false { // NON-VACUITY BREAK: acknowledge immediate cancellation without durable intent."
+
+[[control]]
+id = "core-provider-held-live-closeout-does-not-wait-for-delivery"
+guards = "Cancel closes held calls at once while already-sent siblings remain in flight"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_live_cancel_closes_before_sibling_and_withdraws_after_seal"]
+file = "crates/broca-core/src/run.rs"
+old = "        result = closing => result,"
+new = "        result = std::future::pending::<CallResolution>() => result, // NON-VACUITY BREAK: leave a closing call waiting for delivery."
+
+[[control]]
+id = "core-provider-held-shutdown-does-not-close"
+guards = "Graceful shutdown leaves a live provider-held call without a terminal so it can resume after restart"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_live_shutdown_preserves_obligation_until_restart_resume"]
+file = "crates/broca-core/src/run.rs"
+old = "        approval_gate::cancelled_token(cancel).await;"
+new = "        tokio::select! { _ = approval_gate::cancelled_token(cancel) => {}, _ = approval_gate::cancelled_token(stop) => {} } // NON-VACUITY BREAK: treat shutdown as a request to close a held call."
+
+[[control]]
+id = "module-provider-held-cancel-answer-waits-for-fsync"
+guards = "A provider-held cancel answer waits for the actual file-sync barrier acknowledgement, not merely the cancel record append"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::provider_held_paused_cancel_ack_is_durable_before_finalizer_and_seal"]
+file = "crates/broca-module/src/actor.rs"
+old = '''            if let Err(error) = writer.sync().await {
+                return CancelOutcome::Error(error.to_string());
+            }
+            self.pending_cancels.insert('''
+new = '''            // NON-VACUITY BREAK: acknowledge the appended cancel before its sync barrier.
+            self.pending_cancels.insert('''
+
+[[control]]
+id = "module-cancel-held-presence-does-not-read-wal"
+guards = "An ordinary immediate cancellation classifies held state from actor memory without decoding the session WAL"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::ordinary_cancel_uses_live_held_state_without_wal_reads"]
+file = "crates/broca-module/src/actor.rs"
+old = "        let provider_held = held_state != ProviderHeldPresence::NotHeld;"
+new = "        let _ = self.read_wal_records().await; // NON-VACUITY BREAK: decode the full session log on ordinary cancel.\n        let provider_held = held_state != ProviderHeldPresence::NotHeld;"
+
+[[control]]
+id = "module-cancel-unknown-held-presence-is-durable"
+guards = "Unavailable held state takes the durable cancellation path instead of being treated as no held call"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::unknown_held_state_requires_a_durable_cancel_without_wal_reads"]
+file = "crates/broca-module/src/actor.rs"
+old = "        let provider_held = held_state != ProviderHeldPresence::NotHeld;"
+new = "        let provider_held = held_state == ProviderHeldPresence::Held; // NON-VACUITY BREAK: collapse unavailable state into not held."
+
+[[control]]
+id = "tool-media-capture-before-fence"
+guards = "Tool media is validated, published and registered before a completed dispatch is fenced"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+features = ["test-attachments"]
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/tests/tool_capture_tests.rs"
+expect_red = ["subc_plane::tests::tool_capture_tests::text_image_text_captures_before_fencing_and_repeat_publishes_nothing"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "let result = tool_capture::capture(ctx, result, captures).await;"
+new = "let _ = captures; // NON-VACUITY BREAK: expose the classifier without capture."
+
+[[control]]
+id = "tool-media-fence-keeps-captured-references"
+guards = "A repeated call id returns exactly the captured references and never publishes again"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+features = ["test-attachments"]
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/tests/tool_capture_tests.rs"
+expect_red = ["subc_plane::tests::tool_capture_tests::text_image_text_captures_before_fencing_and_repeat_publishes_nothing"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = "let fenced_result = result.clone();"
+new = "let fenced_result = map_call_tool_result(&call.tool_call_id, &raw).0; // NON-VACUITY BREAK: fence the uncaptured shape."
+
+[[control]]
+id = "tool-media-registration-before-reference"
+guards = "Capture cannot expose a reference before object publication and manifest registration complete"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+features = ["test-attachments"]
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/tests/tool_capture_tests.rs"
+expect_red = ["subc_plane::tests::tool_capture_tests::text_image_text_captures_before_fencing_and_repeat_publishes_nothing"]
+file = "crates/broca-core/src/tool_media.rs"
+old = """            state
+                .manifest
+                .as_mut()
+                .expect("manifest opened above")
+                .register_and_append(&reference, &bytes, || Ok(()))
+                .map_err(|_| store_failed())?;"""
+new = "let _ = &bytes; // NON-VACUITY BREAK: return a reference without publishing or registering."
+
+[[control]]
+id = "tool-media-hook-provenance-exact-metadata"
+guards = "Hook metadata may name only field-for-field references captured for the tool call"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-attachments"]
+select = "expected"
+test_file = "crates/broca-core/src/run/hook_tests.rs"
+expect_red = ["run::hook_tests::tool_reference_provenance_is_enforced_before_hook_payloads_are_stored"]
+file = "crates/broca-core/src/tool_media.rs"
+old = "if !captured.contains(media) {"
+new = "if !captured.iter().any(|known| known.sha256 == media.sha256) { // NON-VACUITY BREAK: trust altered reference metadata."
+
+[[control]]
+id = "tool-media-late-admission-capture-handle"
+guards = "Admission-created late execution carries the session capture handle into the tool plane"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+features = ["test-clock", "test-attachments"]
+select = "expected"
+test_file = "crates/broca-core/src/run/approval_tests.rs"
+expect_red = ["run::approval_tests::late_admission_carries_capture_and_records_registered_media"]
+file = "crates/broca-core/src/run.rs"
+old = """            let ctx = call.ctx(&BatchCtx {
+                media_capture: writer.media_capture(),
+                batch_id: BatchId(format!("late:{key}")),"""
+new = """            let ctx = call.ctx(&BatchCtx {
+                media_capture: None, // NON-VACUITY BREAK: detach late execution from capture.
+                batch_id: BatchId(format!("late:{key}")),"""
+
+[[control]]
+id = "tool-media-disabled-without-debug-attachments"
+guards = "Without the non-shipping attachment opt-in, an MCP image keeps legacy result bytes and writes neither media files nor a media-content/v1 frame"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/tests/release_tool_capture_tests.rs"
+expect_red = ["subc_plane::tests::release_tool_capture_tests::capture_off_image_result_preserves_legacy_wal_and_writes_no_media"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "self.media_capture = if broca_protocol::attachments_enabled() {"
+new = "self.media_capture = if true { // NON-VACUITY BREAK: bind tool capture in shipping builds."
+
+[[control]]
+id = "held-status-omits-empty-list"
+platforms = ["linux", "macos"]
+guards = "An ordinary active status omits held_calls instead of emitting an empty wait list"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::held_status_tests::active_and_paused_status_omit_empty_held_calls"]
+expect_message = "empty held_calls must be omitted"
+file = "crates/broca-wire/src/lib.rs"
+old = '''        /// Open provider-held calls are a runner-owned wait, independent of `reason`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]'''
+new = '''        /// Open provider-held calls are a runner-owned wait, independent of `reason`.
+        #[serde(default)] // NON-VACUITY BREAK: emit an empty held list on ordinary runs.'''
+
+[[control]]
+id = "held-status-live-list-present"
+platforms = ["linux", "macos"]
+guards = "A live run reports its open provider-held calls as well as a paused run"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::held_status_tests::active_and_paused_status_map_open_provider_held_calls"]
+expect_message = "open held calls must be reported on live and paused runs"
+file = "crates/broca-module/src/serve.rs"
+old = '''            awaiting_approval: None,
+            held_calls: state.held_calls,'''
+new = '''            awaiting_approval: None,
+            held_calls: Vec::new(), // NON-VACUITY BREAK: hide the live held wait.'''
+
+[[control]]
+id = "held-status-terminal-removes-call"
+platforms = ["linux", "macos"]
+guards = "WAL reconciliation removes each provider-held call at its terminal before the batch barrier"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::held_calls_status_rebuilds_live_and_paused_calls_and_drops_each_terminal"]
+file = "crates/broca-core/src/replay.rs"
+old = '''                    held_calls.retain(|(batch, call, _)| {
+                        batch != batch_id || call != &result.tool_call_id
+                    });'''
+new = '''                    let _ = batch_id;
+                    held_calls.retain(|_| true); // NON-VACUITY BREAK: retain a terminal held call.'''
+
+
+[[control]]
+id = "fold-keeps-terminal-held-range-during-intake-rebuild"
+guards = "An incomplete intake store is not evidence that a terminal held range has no registration"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_fold.rs"
+expect_red = ["wal_fold::provider_held_store_tests::incomplete_intake_keeps_a_terminal_held_range_live"]
+file = "crates/broca-core/src/wal_fold.rs"
+old = '''    if matches!(
+        held_ranges,
+        HeldRanges::Store(StoreHeld { complete: false })
+    ) && held.needs_intake()
+    {'''
+new = '''    if false && matches!(
+        held_ranges,
+        HeldRanges::Store(StoreHeld { complete: false })
+    ) && held.needs_intake()
+    { // NON-VACUITY BREAK: trust an incomplete intake.'''
+
+[[control]]
+id = "retention-keeps-shared-late-result-feed"
+guards = "Deleting one lineage preserves its module feed cursor and ack debt for other sessions"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::retention_cleanup_keeps_shared_feed_and_other_lineages"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = '''        transaction
+            .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])'''
+new = '''        transaction.execute("DELETE FROM feeds", []).unwrap(); // NON-VACUITY BREAK: erase a shared feed during lineage cleanup.
+        transaction
+            .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])'''
+
+[[control]]
+id = "retention-unreadable-intake-refuses-deletion"
+guards = "An unreadable intake store cannot silently authorize retention deletion of an uncertain lineage"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention.rs"
+expect_red = ["retention::provider_held_tests::unreadable_intake_refuses_retention_and_counts_health"]
+file = "crates/broca-module/src/retention.rs"
+old = '''            Err(_) => {
+                self.mark_unreadable(key);
+                tracing::warn!(target: "retention", session = %broca_core::session_addr(key), reason = "provider_held_intake_unknown",
+                    "retention deletion skipped: intake store cannot be read");
+                return Ok(None);
+            }'''
+new = '''            Err(_) => {} // NON-VACUITY BREAK: delete despite unreadable intake ownership.'''
+
+[[control]]
+id = "retention-missing-intake-keeps-held-history"
+guards = "Losing the intake projection does not erase durable registration history or the provider-held feature floor"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention.rs"
+expect_red = ["retention::provider_held_tests::absent_intake_with_held_history_refuses_retention"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = '''        return Ok((prior_registration || floor.contains("provider-held/v1"))
+            .then_some("provider_held_intake_unknown"));'''
+new = '''        return Ok((false && (prior_registration || floor.contains("provider-held/v1")))
+            .then_some("provider_held_intake_unknown")); // NON-VACUITY BREAK: forget intake history after projection loss.'''
+
+[[control]]
+id = "retention-tombstones-prune-intake-before-actor-open"
+guards = "A retention tombstone removes intake ownership at boot without needing the deleted WAL or a session actor"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::boot_prunes_tombstoned_registrations_without_a_wal_or_actor"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = "            self.remove_lineage(&row.call.lineage)?;"
+new = "            let _ = &row.call.lineage; // NON-VACUITY BREAK: retain tombstoned intake ownership."

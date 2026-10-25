@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use broca_subc::{RouteHandle, SubcConnection};
 use serde_json::{json, Value};
+use subc_control::{ClientControlRequest, ClientControlResponse};
+use subc_protocol::{Flags, Frame, FrameType, Priority};
+use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MODEL: &str = "typesafe/jev-1.13.0";
@@ -261,6 +264,78 @@ impl Rig {
         })
         .await;
         Route { connection, route }
+    }
+
+    async fn basal_tool_bind(
+        &self,
+        roles: Option<&[(&str, &str)]>,
+    ) -> (tokio::net::TcpStream, Frame) {
+        let nonce = self.root.join("basal.nonce");
+        let nonce = broca_test_support::wait_until("basal nonce", || async {
+            std::fs::read_to_string(&nonce).map_err(|e| e.to_string())
+        })
+        .await;
+        let request = ClientControlRequest::RouteOpen {
+            target: subc_protocol::RouteTarget::ToolProvider {
+                module_id: "broca".into(),
+            },
+            identity: subc_protocol::BindIdentity::new(
+                self.root.join("project").canonicalize().unwrap(),
+                "runner",
+                "catalog",
+            ),
+            consumer_identity: Some(subc_control::ConsumerIdentity {
+                module_id: "basal".into(),
+                launch_nonce: nonce.trim().into(),
+            }),
+            scope: Some(subc_protocol::scope::ScopeSelector::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "owner".into(),
+                },
+                "run",
+                Some(1),
+            )),
+            role_versions: roles.map(|roles| {
+                roles
+                    .iter()
+                    .map(|(role, version)| (role.to_string(), version.to_string()))
+                    .collect()
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+        };
+        // The regular tool-provider client declares a role; use the wire request to also
+        // exercise callers that select their role solely through the route target.
+        broca_test_support::wait_until("basal tool-provider bind", || async {
+            let conn =
+                connection_file::read(self.root.join("runtime/subc-connection.json")).unwrap();
+            let endpoint = &conn.endpoints[0];
+            let mut stream =
+                tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+                    .await
+                    .unwrap();
+            authenticate_client(&mut stream, &conn, Duration::from_secs(2))
+                .await
+                .unwrap();
+            let reply =
+                wire_request(&mut stream, 0, 0, 1, serde_json::to_vec(&request).unwrap()).await;
+            if reply.header.ty == FrameType::Error {
+                let error: Value = serde_json::from_slice(&reply.body).unwrap();
+                if matches!(
+                    error["code"].as_str(),
+                    Some(
+                        "target_unavailable"
+                            | "module_warming"
+                            | "module_reloading"
+                            | "module_timeout"
+                    )
+                ) {
+                    return Err(error.to_string());
+                }
+            }
+            Ok((stream, reply))
+        })
+        .await
     }
 
     fn calls(&self) -> usize {
@@ -1338,6 +1413,32 @@ struct Route {
     route: RouteHandle,
 }
 
+async fn wire_request(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    body: Vec<u8>,
+) -> Frame {
+    let frame = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .unwrap();
+    write_frame(stream, &frame).await.unwrap();
+    broca_test_support::event_timeout(
+        "tool-provider wire reply",
+        async { read_frame(stream).await.unwrap().unwrap() },
+        || format!("no reply on channel {channel}, epoch {epoch}, correlation {corr}"),
+    )
+    .await
+    .expect("tool-provider wire request timed out")
+}
+
 impl Route {
     async fn request(
         &self,
@@ -1452,6 +1553,80 @@ async fn refused_without_writes(
     );
     assert_eq!(rig.calls(), calls, "{expected} called the provider");
     error
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn basal_tool_provider_target_without_role_versions_serves_catalog_on_real_daemon() {
+    let Some(rig) = Rig::start("basal-catalog", true, false, Some(42_000_000), 0, false).await
+    else {
+        return;
+    };
+    let (mut stream, reply) = rig.basal_tool_bind(None).await;
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let ClientControlResponse::RouteOpen {
+        route_channel,
+        route_epoch,
+    } = serde_json::from_slice(&reply.body).unwrap()
+    else {
+        panic!("unexpected route.open reply");
+    };
+    let catalog = wire_request(
+        &mut stream,
+        route_channel,
+        route_epoch,
+        2,
+        serde_json::to_vec(&json!({"name":"tool.catalog","arguments":{"params":{}}})).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        catalog.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&catalog.body)
+    );
+    let catalog: cortexkit_role_tool_provider::catalog::CatalogAnswer =
+        serde_json::from_slice(&catalog.body).unwrap();
+    assert!(catalog.tools.iter().any(|tool| tool.name == "llm_classify"));
+    assert_eq!(rig.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_provider_target_refuses_conflicting_declared_roles_on_real_daemon() {
+    let Some(rig) = Rig::start(
+        "conflicting-tool-role",
+        true,
+        false,
+        Some(42_000_000),
+        0,
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+    for role in ["llm-runner", "classifier", "permissions", "unrelated-role"] {
+        for roles in [
+            vec![(role, "v1")],
+            vec![("tool-provider", "v1"), (role, "v1")],
+        ] {
+            let (_stream, reply) = rig.basal_tool_bind(Some(&roles)).await;
+            assert_eq!(reply.header.ty, FrameType::Error, "{role}");
+            let error: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(
+                error["code"], "role_versions_unsupported",
+                "{role}: {error}"
+            );
+            let message = error["message"].as_str().unwrap();
+            assert!(message.contains("tool-provider"), "{error}");
+            assert!(message.contains(role), "{error}");
+        }
+    }
+    assert_eq!(rig.calls(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

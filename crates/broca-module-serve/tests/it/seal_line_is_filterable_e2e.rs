@@ -364,6 +364,8 @@ async fn time_first_send(
             auth: None,
             one_shot: None,
             context_management: None,
+            session_class: None,
+            plan: None,
         })
         .await;
     (started.elapsed(), outcome)

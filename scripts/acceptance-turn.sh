@@ -81,7 +81,9 @@ trap 'rm -f "$OUT"' EXIT
 # DELIBERATELY SPANS THREE WIRE FAMILIES (Anthropic, Google Code-Assist, OpenAI-compatible)
 # rather than three models on one provider, so a single upstream outage cannot wall the whole
 # list. Order is by how much of the render path each exercises, not by cost.
-MODELS="${ACCEPTANCE_MODELS:-anthropic/claude-opus-5 google/antigravity-gemini-3.8-flash deepseek/deepseek-v4-flash}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The tool and worker acceptance legs share defaults and the ACCEPTANCE_MODELS override.
+MODELS="${ACCEPTANCE_MODELS:-$(<"$SCRIPT_DIR/lib/acceptance-models.txt")}"
 
 served=0
 refused=""

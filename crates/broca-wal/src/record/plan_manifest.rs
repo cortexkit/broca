@@ -94,6 +94,14 @@ impl OpaqueJson {
     }
 }
 
+/// One reference slot a catalog tool declared, as frozen: the argument's top-level name and its
+/// kind (`token`, or `source:<dialect>`). Kinds stay open strings, as the catalog sends them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenReferenceSlot {
+    pub name: String,
+    pub kind: String,
+}
+
 /// What one provider's fetch at admission came back with.
 ///
 /// An answered fetch with no `text` (no system-text item was asked of the provider), one whose
@@ -123,6 +131,13 @@ pub enum FetchOutcome {
         /// declared some. Absent keeps manifests from providers without declarations
         /// byte-compatible.
         declarations_frozen: Option<FrozenProviderDeclarations>,
+        /// The catalog's reference slots by tool name: the top-level string arguments in which
+        /// output references are read (llm-runner §9.13). Frozen only when the provider's plan
+        /// item opts into output references and one of its tools declares slots; absent
+        /// otherwise, which keeps every other manifest's bytes. Must-understand (feature
+        /// `plan-reference-slots/v1`): a reader that dropped it would re-freeze later episodes
+        /// without the slots.
+        reference_slots: Option<BTreeMap<String, Vec<FrozenReferenceSlot>>>,
     },
     /// An optional tool or system-text provider that gave no usable answer, so the session was
     /// admitted without it. Written as `"absent": "<reason>"`. The reason is an open string
@@ -167,6 +182,8 @@ struct ProviderFetchOut<'a> {
     reply: Option<&'a BTreeMap<String, FrozenReply>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     declarations_frozen: Option<&'a FrozenProviderDeclarations>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_slots: Option<&'a BTreeMap<String, Vec<FrozenReferenceSlot>>>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +203,8 @@ struct ProviderFetchIn {
     reply: Option<BTreeMap<String, FrozenReply>>,
     #[serde(default)]
     declarations_frozen: Option<FrozenProviderDeclarations>,
+    #[serde(default)]
+    reference_slots: Option<BTreeMap<String, Vec<FrozenReferenceSlot>>>,
 }
 
 impl Serialize for ProviderFetch {
@@ -199,6 +218,7 @@ impl Serialize for ProviderFetch {
             result_ops: None,
             reply: None,
             declarations_frozen: None,
+            reference_slots: None,
         };
         match &self.outcome {
             FetchOutcome::Answered {
@@ -208,6 +228,7 @@ impl Serialize for ProviderFetch {
                 result_ops,
                 reply,
                 declarations_frozen,
+                reference_slots,
             } => {
                 out.catalog_digest = Some(catalog_digest);
                 out.tools = Some(tools.as_slice());
@@ -215,6 +236,7 @@ impl Serialize for ProviderFetch {
                 out.result_ops = result_ops.as_ref();
                 out.reply = reply.as_ref();
                 out.declarations_frozen = declarations_frozen.as_ref();
+                out.reference_slots = reference_slots.as_ref();
             }
             FetchOutcome::Absent { reason } => out.absent = Some(reason),
             FetchOutcome::Unknown => {
@@ -247,6 +269,7 @@ impl<'de> Deserialize<'de> for ProviderFetch {
                 result_ops: fetch.result_ops,
                 reply: fetch.reply,
                 declarations_frozen: fetch.declarations_frozen,
+                reference_slots: fetch.reference_slots,
             },
             (None, Some(reason)) => {
                 if fetch.tools.is_some() || fetch.text.is_some() {
@@ -328,6 +351,90 @@ mod tests {
         let bytes = FIXTURE.trim_end();
         let record: WalRecord = serde_json::from_str(bytes).unwrap();
         assert_eq!(serde_json::to_string(&record).unwrap(), bytes);
+    }
+
+    /// Frozen reference slots round-trip through a whole `RunStarted`, written after `reply`,
+    /// and make the record require `plan-reference-slots/v1`; the fixture without them requires
+    /// no such feature.
+    #[test]
+    fn frozen_reference_slots_round_trip_and_are_must_understand() {
+        let mut record: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
+        assert!(!record
+            .required_features()
+            .contains(&crate::framing::PLAN_REFERENCE_SLOTS_FEATURE));
+        let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &mut record
+        else {
+            panic!("fixture must carry a manifest")
+        };
+        let FetchOutcome::Answered {
+            reference_slots, ..
+        } = &mut manifest.fetches[0].outcome
+        else {
+            panic!("fixture must carry an answered fetch")
+        };
+        *reference_slots = Some(
+            [(
+                "read".into(),
+                vec![FrozenReferenceSlot {
+                    name: "data".into(),
+                    kind: "token".into(),
+                }],
+            )]
+            .into(),
+        );
+        let bytes = serde_json::to_string(&record).unwrap();
+        assert!(bytes.contains(r#""reference_slots":{"read":[{"name":"data","kind":"token"}]}"#));
+        let decoded: WalRecord = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), bytes);
+        assert!(record
+            .required_features()
+            .contains(&crate::framing::PLAN_REFERENCE_SLOTS_FEATURE));
+    }
+
+    /// A manifest that froze both reference slots and provider declarations writes both members,
+    /// declarations first, round-trips byte for byte, and requires both features.
+    #[test]
+    fn reference_slots_and_provider_declarations_together_require_both_features() {
+        let mut record: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
+        let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &mut record
+        else {
+            panic!("fixture must carry a manifest")
+        };
+        let FetchOutcome::Answered {
+            reference_slots,
+            declarations_frozen,
+            ..
+        } = &mut manifest.fetches[0].outcome
+        else {
+            panic!("fixture must carry an answered fetch")
+        };
+        *reference_slots = Some(BTreeMap::from([(
+            "read".to_owned(),
+            vec![FrozenReferenceSlot {
+                name: "data".into(),
+                kind: "token".into(),
+            }],
+        )]));
+        *declarations_frozen = Some(FrozenProviderDeclarations {
+            result_formats: None,
+            late_results: Some(true),
+        });
+        let bytes = serde_json::to_string(&record).unwrap();
+        assert!(bytes.contains(
+            r#""declarations_frozen":{"late_results":true},"reference_slots":{"read":[{"name":"data","kind":"token"}]}"#
+        ));
+        let decoded: WalRecord = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), bytes);
+        let features = record.required_features();
+        assert!(features.contains(&crate::framing::PLAN_REFERENCE_SLOTS_FEATURE));
+        assert!(features.contains(&crate::framing::PROVIDER_DECLARATIONS_FEATURE));
     }
 
     #[test]
@@ -412,6 +519,7 @@ mod tests {
             result_ops: None,
             reply: None,
             declarations_frozen: None,
+            reference_slots: None,
         }
     }
 
@@ -424,6 +532,7 @@ mod tests {
                 result_ops,
                 reply,
                 declarations_frozen,
+                reference_slots,
                 ..
             } => FetchOutcome::Answered {
                 catalog_digest: String::new(),
@@ -432,6 +541,7 @@ mod tests {
                 result_ops: result_ops.clone(),
                 reply: reply.clone(),
                 declarations_frozen: declarations_frozen.clone(),
+                reference_slots: reference_slots.clone(),
             },
             other => other.clone(),
         }
@@ -626,6 +736,7 @@ mod tests {
                     )])),
                     late_results: Some(true),
                 }),
+                reference_slots: None,
             },
         };
         let bytes = serde_json::to_string(&declared).unwrap();

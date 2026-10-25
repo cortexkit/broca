@@ -675,6 +675,8 @@ async fn service_pass_cancellable<W: WalStore + 'static>(
                 break 'attempt Attempt::Step(WithdrawalStep::Retry("no_originating_run".into()));
             };
             let ctx = BatchCtx {
+                // Approval operations do not capture tool media.
+                media_capture: None,
                 batch_id: batch_id.clone(),
                 bind: key.clone(),
                 run_id,

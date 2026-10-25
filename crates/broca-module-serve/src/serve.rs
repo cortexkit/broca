@@ -1599,7 +1599,11 @@ async fn handle_control_request(
             ..
         } => {
             stall::method_context(1);
-            let role = match bind_role(role_versions.as_ref(), routes.system_one.is_some()) {
+            let role = match bind_target_role(
+                &target,
+                role_versions.as_ref(),
+                routes.system_one.is_some(),
+            ) {
                 Ok(role) => role,
                 Err(message) => {
                     return send_error(
@@ -2331,7 +2335,7 @@ where
         }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
-        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status");
+        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ);
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -3410,6 +3414,60 @@ where
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
             }
         }
+        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS => {
+            type Request = cortexkit_role_llm_runner::output_refs::ListRequest;
+            let request: Request = match serde_json::from_value(req.params.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let field = broca_wire::failing_field::<Request>(&req.params, &error);
+                    return send_invalid_params(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        field,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            };
+            match handler.output_refs(&session, &request).await {
+                Ok(Ok(page)) => send_json_response(writer, ver, channel, epoch, corr, &page).await,
+                Ok(Err(refusal)) => {
+                    send_output_ref_refusal(writer, ver, channel, epoch, corr, refusal).await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
+        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ => {
+            type Request = cortexkit_role_llm_runner::output_refs::ReadRequest;
+            let request: Request = match serde_json::from_value(req.params.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    let field = broca_wire::failing_field::<Request>(&req.params, &error);
+                    return send_invalid_params(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        field,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
+            };
+            match handler.output_ref_read(&session, &request).await {
+                Ok(Ok(reply)) => {
+                    send_json_response(writer, ver, channel, epoch, corr, &reply).await
+                }
+                Ok(Err(refusal)) => {
+                    send_output_ref_refusal(writer, ver, channel, epoch, corr, refusal).await
+                }
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
         OP_SUBSCRIBE => unreachable!("prepare_route_request handles session.subscribe"),
         other => {
             send_error(
@@ -4231,15 +4289,25 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     scope: Option<&broca_protocol::SessionScope>,
     model: Option<&crate::wire::ModelParams>,
 ) -> Result<broca_module::actor::SendPlan, SendPlanRefusal> {
+    // A plan item's `output_refs` member is refused unless the admitter can freeze sessions
+    // that opt into output references (llm-runner §9.13: a runner without the group refuses it).
+    let output_refs = if handler
+        .plan_admitter()
+        .is_some_and(|admitter| admitter.admits_output_refs())
+    {
+        broca_fetch_plan::OutputRefsSupport::Supported
+    } else {
+        broca_fetch_plan::OutputRefsSupport::Unsupported
+    };
     if let Some(params) = params.as_object() {
-        broca_fetch_plan::check_send_members(params)?;
+        broca_fetch_plan::check_send_members_with(params, output_refs)?;
     }
     let support = if handler.compaction_supported() {
         broca_fetch_plan::CompactionSupport::Supported
     } else {
         broca_fetch_plan::CompactionSupport::Unsupported
     };
-    let parsed = broca_fetch_plan::parse_plan(plan, support)?;
+    let parsed = broca_fetch_plan::parse_plan_with(plan, support, output_refs)?;
     // Filing an approval question and executing its tool call must use the scope
     // identity supplied by the daemon on the inbound route, never a caller's payload.
     // Check before fetching providers or opening an actor, so refusal writes no WAL.
@@ -4367,6 +4435,27 @@ impl RouteRole {
     fn is_sessionless(self) -> bool {
         self != Self::LlmRunner
     }
+}
+
+/// Tool-provider targets identify their role without a declaration. A declaration may pin
+/// that role's version, but cannot switch the target to another operation namespace.
+fn bind_target_role(
+    target: &subc_protocol::RouteTarget,
+    role_versions: Option<&std::collections::BTreeMap<String, String>>,
+    serves_classifier: bool,
+) -> Result<RouteRole, String> {
+    if !matches!(target, subc_protocol::RouteTarget::ToolProvider { .. }) {
+        return bind_role(role_versions, serves_classifier);
+    }
+    if let Some(roles) = role_versions {
+        if let Some(other) = roles.keys().find(|role| role.as_str() != "tool-provider") {
+            return Err(format!(
+                "a route serves one role; the tool-provider target conflicts with declared role {other}"
+            ));
+        }
+    }
+    bind_role(role_versions, serves_classifier)?;
+    Ok(RouteRole::ToolProvider)
 }
 
 /// Select a supported role, retaining llm-runner for legacy or unrelated declarations.
@@ -4532,6 +4621,56 @@ fn delivery_list_refusal(
         )
         .with_detail(serde_json::json!({"delivery":modes})),
     )
+}
+
+/// An output-reference refusal (llm-runner §9.13) under its error code.
+async fn send_output_ref_refusal(
+    writer: &EgressSender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    refusal: broca_module::output_refs::OutputRefRefusal,
+) -> Result<(), ServeIoError> {
+    use broca_module::output_refs::OutputRefRefusal;
+    match refusal {
+        OutputRefRefusal::UnknownRef(message) => {
+            send_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                cortexkit_role_llm_runner::errors::UNKNOWN_REF,
+                &message,
+            )
+            .await
+        }
+        OutputRefRefusal::InvalidParams { field, message } => {
+            send_invalid_params(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                Some(field.into()),
+                &message,
+            )
+            .await
+        }
+        OutputRefRefusal::ReplyTooLarge(message) => {
+            send_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                cortexkit_role_llm_runner::errors::REPLY_TOO_LARGE,
+                &message,
+            )
+            .await
+        }
+    }
 }
 
 async fn send_error(

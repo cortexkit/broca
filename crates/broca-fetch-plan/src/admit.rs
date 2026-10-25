@@ -446,6 +446,14 @@ pub trait PlanAdmitter: Send + Sync {
         session: &broca_protocol::BindIdentity,
         scope: Option<&broca_protocol::SessionScope>,
     ) -> Result<Admitted, Refusal>;
+
+    /// Whether sessions this admitter freezes may carry plan items opting into output
+    /// references (llm-runner §9.13), so a send's `output_refs` member is accepted rather than
+    /// refused. It must hold exactly when `role.describe` declares the `output_refs` group;
+    /// broca does not declare it yet, so every production admitter answers false.
+    fn admits_output_refs(&self) -> bool {
+        false
+    }
 }
 
 /// An admitted plan: the manifest to freeze.
@@ -685,6 +693,53 @@ fn decode_answer(value: Value, text_asked: bool) -> Result<Fetched, FetchMiss> {
         None
     };
     Ok(Fetched { answer, text })
+}
+
+/// Refuse a catalog whose reference slots break the catalog's own rules
+/// (`check_reference_slots`), naming the tool and member, when the provider's tool item opts
+/// into output references. A provider that does not opt in is not checked: its slots are never
+/// read or frozen, so its admission is exactly what it was before slots existed.
+fn check_opted_in_slots(fetched: Fetched, tool_item: Option<&Item>) -> Result<Fetched, FetchMiss> {
+    if tool_item.is_some_and(|item| item.output_refs) {
+        for tool in &fetched.answer.tools {
+            cortexkit_role_tool_provider::catalog::check_reference_slots(&tool.reference_slots)
+                .map_err(|problem| FetchMiss::invalid_reply(&tool.name, problem.field))?;
+        }
+    }
+    Ok(fetched)
+}
+
+/// The reference slots to freeze for `provider`: every tool's declared slots by tool name, when
+/// the provider's tool item opts into output references and some tool declares any. `None`
+/// otherwise, which writes no bytes.
+fn frozen_reference_slots(
+    plan: &Plan,
+    provider: &str,
+    fetched: &Fetched,
+) -> Option<BTreeMap<String, Vec<broca_wal::FrozenReferenceSlot>>> {
+    plan.tool_items
+        .iter()
+        .find(|item| item.provider == provider)
+        .filter(|item| item.output_refs)?;
+    let slots: BTreeMap<_, _> = fetched
+        .answer
+        .tools
+        .iter()
+        .filter(|tool| !tool.reference_slots.is_empty())
+        .map(|tool| {
+            (
+                tool.name.clone(),
+                tool.reference_slots
+                    .iter()
+                    .map(|slot| broca_wal::FrozenReferenceSlot {
+                        name: slot.name.clone(),
+                        kind: slot.kind.clone(),
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    (!slots.is_empty()).then_some(slots)
 }
 
 /// The tool a fetched catalog tool becomes in the session: routed to `provider`, with the
@@ -1028,7 +1083,8 @@ pub async fn admit(
     let mut absent_tools = BTreeSet::new();
     for (fetch, outcome) in catalog_fetches.iter().zip(&catalogs) {
         let mut decoded = match outcome {
-            Ok(answer) => decode_answer(answer.clone(), fetch.text_item.is_some()),
+            Ok(answer) => decode_answer(answer.clone(), fetch.text_item.is_some())
+                .and_then(|fetched| check_opted_in_slots(fetched, fetch.tool_item)),
             Err(_) => continue,
         };
         if let Ok(answer) = outcome {
@@ -1071,7 +1127,8 @@ pub async fn admit(
             if let Some(answer) = raw_answers.get(fetch.provider) {
                 // Ignore first-round text validation after the tool set changes. Required
                 // tool catalogs still have to match the original planned tool set.
-                let tools = decode_answer(answer.clone(), false);
+                let tools = decode_answer(answer.clone(), false)
+                    .and_then(|fetched| check_opted_in_slots(fetched, fetch.tool_item));
                 if let Ok(fetched) = &tools {
                     differences.extend(differences_of(plan, fetch.provider, fetched));
                 }
@@ -1368,6 +1425,7 @@ pub async fn admit(
                             .collect();
                         (!replies.is_empty()).then_some(replies)
                     },
+                    reference_slots: frozen_reference_slots(plan, provider, fetched),
                     // Resolve the catalog's omitted-means-all default now. An absent frozen
                     // permission is deliberately ungranted on legacy/non-catalog tools.
                     result_ops: Some(
@@ -1614,6 +1672,7 @@ mod tests {
                     preset: Some("worker".into()),
                     params: serde_json::Map::new(),
                     optional: false,
+                    output_refs: false,
                 },
                 subscriptions: Vec::new(),
             }],
