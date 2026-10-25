@@ -23,10 +23,13 @@
 //! nothing, and a rollback journal leaves no `-wal` sidecar that could be mistaken for a
 //! session log.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use sha2::{Digest, Sha256};
 
 /// How long a batch and its outcomes are kept after the batch was first admitted. A re-send
 /// after this is a new batch and is sent to the provider (and billed) again.
@@ -70,14 +73,16 @@ pub struct BatchClaim<'a> {
     pub model: &'a str,
     /// The role's body identity as JSON, recorded at first admission.
     pub identity: &'a str,
-    /// A digest of `identity`; equal digests mean the same body.
+    /// The role's replay digest: classifier hashes `identity`, while `llm.classify` hashes
+    /// its validated arguments, including the caller's ceiling.
     pub body_digest: &'a str,
     /// The catalog facts the batch is priced and checked by, frozen at first admission.
     pub frozen_row: &'a str,
     pub scope: &'a BatchScope,
     /// The ceiling this call sent, in nanodollars (rounded down). `None` sends no ceiling.
     pub ceiling_nanos: Option<u64>,
-    /// The process holding the batch while this call runs.
+    /// The process holding the batch while this call runs. Use a fresh launch identity, never
+    /// a PID alone or an identity reused by a later process.
     pub owner: &'a str,
     pub now_ms: i64,
 }
@@ -189,6 +194,11 @@ pub struct SweepCounts {
 
 pub struct SystemOneStore {
     conn: Mutex<Connection>,
+    owner_dir: Option<PathBuf>,
+    owner_prefix: String,
+    /// Each owner keeps its OS lock until the owning store is dropped. An executing call
+    /// holds the store alive; killing its process releases the lock without requiring Drop.
+    owner_lifetimes: Mutex<HashMap<String, File>>,
 }
 
 fn to_i64(value: u64) -> i64 {
@@ -214,14 +224,27 @@ impl SystemOneStore {
                 .map_err(|e| SystemOneStoreError(format!("create {}: {e}", path.display())))?;
         }
         super::sqlite_open_observed();
-        Self::from_connection(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| SystemOneStoreError(error.to_string()))?;
+        let name = canonical.file_name().expect("a database file has a name");
+        let owner_dir = canonical
+            .parent()
+            .expect("a canonical path has a parent")
+            .to_path_buf();
+        let owner_prefix = format!("{}.owner-", name.to_string_lossy());
+        Self::from_connection(conn, Some((owner_dir, owner_prefix)))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(Connection::open_in_memory()?, None)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
+    fn from_connection(
+        conn: Connection,
+        owner_location: Option<(PathBuf, String)>,
+    ) -> Result<Self> {
         crate::busy::configure_writer_connection(&conn)?;
         conn.execute_batch(
             "PRAGMA journal_mode=DELETE;
@@ -263,8 +286,15 @@ impl SystemOneStore {
         if !has_scope {
             conn.execute("ALTER TABLE batch ADD COLUMN scope_json TEXT", [])?;
         }
+        let (owner_dir, owner_prefix) = match owner_location {
+            Some((dir, prefix)) => (Some(dir), prefix),
+            None => (None, String::new()),
+        };
         Ok(Self {
             conn: Mutex::new(conn),
+            owner_dir,
+            owner_prefix,
+            owner_lifetimes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -274,16 +304,126 @@ impl SystemOneStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Release every batch a previous process left `running`. Called once at startup, before
-    /// any call is served: the process that held them is gone, so no call holds them now, and
-    /// their unanswered items are asked again on the next re-send. Returns how many it released.
+    fn owner_path(&self, owner: &str) -> Option<PathBuf> {
+        self.owner_dir.as_ref().map(|dir| {
+            dir.join(format!(
+                "{}{:x}.lock",
+                self.owner_prefix,
+                Sha256::digest(owner.as_bytes())
+            ))
+        })
+    }
+
+    fn hold_owner_lifetime(&self, owner: &str) -> Result<()> {
+        let Some(path) = self.owner_path(owner) else {
+            return Ok(());
+        };
+        let mut held = self
+            .owner_lifetimes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if held.contains_key(owner) {
+            return Ok(());
+        }
+        broca_owner_only::create_dir_all(path.parent().expect("an owner lock has a parent"))
+            .map_err(|error| {
+                SystemOneStoreError(format!("create batch-owner lock directory: {error}"))
+            })?;
+        let mut options = broca_owner_only::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        let file = options
+            .open(&path)
+            .map_err(|error| SystemOneStoreError(format!("open batch-owner lock: {error}")))?;
+        file.try_lock()
+            .map_err(|error| SystemOneStoreError(format!("hold batch-owner lifetime: {error}")))?;
+        held.insert(owner.into(), file);
+        Ok(())
+    }
+
+    /// A pre-existing marker with an acquirable OS lock proves that its owner no longer
+    /// executes. Missing/unreadable markers and failed lock attempts are unknown, never dead.
+    fn dead_owner_proof(path: &Path) -> Option<File> {
+        let mut options = broca_owner_only::OpenOptions::new();
+        options.read(true).write(true);
+        let file = options.open(path).ok()?;
+        file.try_lock().ok()?;
+        Some(file)
+    }
+
+    /// Release only batches whose owner-lifetime locks prove they are abandoned. A live or
+    /// unidentifiable owner keeps its claim, so another process receives the transient refusal.
     pub fn release_abandoned(&self) -> Result<usize> {
-        let conn = self.lock();
-        Ok(conn.execute(
-            "UPDATE batch SET state = 'idle', owner = NULL, started_at_ms = NULL
-              WHERE state = 'running'",
-            [],
-        )?)
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owners = {
+            let mut statement = tx.prepare(
+                "SELECT DISTINCT owner FROM batch WHERE state='running' AND owner IS NOT NULL",
+            )?;
+            let owners = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            owners
+        };
+        let owners = owners
+            .into_iter()
+            .filter_map(|owner| self.owner_path(&owner).map(|path| (path, owner)))
+            .collect::<HashMap<_, _>>();
+        let mut paths = owners.keys().cloned().collect::<Vec<_>>();
+        // Also collect dead owners whose calls finished normally. Those markers have no
+        // running row left, but must be reclaimed just like markers left by a crash.
+        if let Some(entries) = self
+            .owner_dir
+            .as_ref()
+            .and_then(|dir| std::fs::read_dir(dir).ok())
+        {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(digest) = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(&self.owner_prefix))
+                    .and_then(|name| name.strip_suffix(".lock"))
+                else {
+                    continue;
+                };
+                if digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && !owners.contains_key(&entry.path())
+                {
+                    paths.push(entry.path());
+                }
+            }
+        }
+        let mut proofs = Vec::new();
+        let mut released = 0;
+        for path in paths {
+            if let Some(proof) = Self::dead_owner_proof(&path) {
+                if let Some(owner) = owners.get(&path) {
+                    released += tx.execute(
+                        "UPDATE batch SET state='idle', owner=NULL, started_at_ms=NULL WHERE state='running' AND owner=?1",
+                        [owner],
+                    )?;
+                }
+                proofs.push((path, proof));
+            }
+        }
+        tx.commit()?;
+        for (path, proof) in proofs {
+            // Close before unlinking for Windows. Launch identities are never reused, so no
+            // future owner can acquire this abandoned identity between close and removal.
+            drop(proof);
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(SystemOneStoreError(format!(
+                        "remove abandoned batch-owner marker: {error}"
+                    )))
+                }
+            }
+        }
+        Ok(released)
     }
 
     /// Hold a batch for one call. See [`Claimed`] for the outcomes; only `Fresh` and `Resumed`
@@ -303,6 +443,7 @@ impl SystemOneStore {
         claim: &BatchClaim<'_>,
         admitted_at_ms: i64,
     ) -> Result<Claimed> {
+        self.hold_owner_lifetime(claim.owner)?;
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
@@ -824,5 +965,197 @@ mod lookup_tests {
             "retention runs from the supplied admission, not the later claim"
         );
         assert_eq!(store.lookup("llm.classify", "d").unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod owner_lifetime_tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn claim_for<'a>(owner: &'a str, scope: &'a BatchScope) -> BatchClaim<'a> {
+        BatchClaim {
+            role: "llm.classify",
+            batch_id: "live",
+            model: "typesafe/jev-1.13.0",
+            identity: "{}",
+            body_digest: "digest",
+            frozen_row: "{}",
+            scope,
+            ceiling_nanos: Some(1),
+            owner,
+            now_ms: 1,
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture launched by owner_recovery_never_steals_a_live_process_claim"]
+    fn owner_process_fixture() {
+        let path =
+            PathBuf::from(std::env::var_os("BROCA_BATCH_OWNER_FIXTURE").expect("fixture path"));
+        let store = SystemOneStore::open(&path).unwrap();
+        let owner = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let scope = BatchScope::Run {
+            agent_id: "agent".into(),
+            run_id: "run".into(),
+        };
+        assert_eq!(
+            store.claim(&claim_for(&owner, &scope)).unwrap(),
+            Claimed::Fresh
+        );
+        std::fs::write(path.with_extension("ready"), owner).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn owner_recovery_never_steals_a_live_process_claim() {
+        let root =
+            broca_test_support::scratch_root().join(format!("owner-proof-{}", std::process::id()));
+        broca_owner_only::create_dir_all(&root).unwrap();
+        let path = root.join("system-one.db");
+        let mut child = Reap(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "system_one::owner_lifetime_tests::owner_process_fixture",
+                ])
+                .env("BROCA_BATCH_OWNER_FIXTURE", &path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !path.with_extension("ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "owner fixture exited before claiming"
+            );
+            assert!(Instant::now() < deadline, "owner fixture never claimed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let store = SystemOneStore::open(&path).unwrap();
+        let scope = BatchScope::Run {
+            agent_id: "agent".into(),
+            run_id: "run".into(),
+        };
+        assert_eq!(
+            store.release_abandoned().unwrap(),
+            0,
+            "live owner was released"
+        );
+        assert_eq!(
+            store.claim(&claim_for("other-process", &scope)).unwrap(),
+            Claimed::InProgress
+        );
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert_eq!(
+            store.release_abandoned().unwrap(),
+            1,
+            "dead owner was not released"
+        );
+        assert_eq!(
+            store.release_abandoned().unwrap(),
+            0,
+            "dead owner was released twice"
+        );
+        assert!(matches!(
+            store.claim(&claim_for("other-process", &scope)).unwrap(),
+            Claimed::Resumed(_)
+        ));
+    }
+
+    #[test]
+    fn owner_markers_do_not_accumulate_across_three_restarts() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("owner-cleanup-{}", std::process::id()));
+        broca_owner_only::create_dir_all(&root).unwrap();
+        let path = root.join("system-one.db");
+        let unrelated = root.join("unrelated.lock");
+        std::fs::write(&unrelated, b"unchanged").unwrap();
+        let marker_count = || {
+            std::fs::read_dir(&root)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("system-one.db.owner-")
+                })
+                .count()
+        };
+        let scope = BatchScope::Run {
+            agent_id: "agent".into(),
+            run_id: "run".into(),
+        };
+        let mut abandoned = 0;
+        for generation in 0..3 {
+            let store = SystemOneStore::open(&path).unwrap();
+            assert_eq!(store.release_abandoned().unwrap(), abandoned);
+            assert_eq!(marker_count(), 0, "dead owner markers accumulated");
+            let owner = format!("generation-{generation}");
+            store.claim(&claim_for(&owner, &scope)).unwrap();
+            assert_eq!(marker_count(), 1);
+            let observer = SystemOneStore::open(&path).unwrap();
+            assert_eq!(observer.release_abandoned().unwrap(), 0);
+            assert_eq!(marker_count(), 1, "a live owner's marker was removed");
+            if generation % 2 == 0 {
+                store.release("llm.classify", "live", &owner).unwrap();
+                abandoned = 0;
+            } else {
+                abandoned = 1;
+            }
+        }
+        let store = SystemOneStore::open(&path).unwrap();
+        assert_eq!(store.release_abandoned().unwrap(), abandoned);
+        assert_eq!(marker_count(), 0);
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn an_unidentifiable_owner_is_not_assumed_dead() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("owner-unknown-{}", std::process::id()));
+        broca_owner_only::create_dir_all(&root).unwrap();
+        let store = SystemOneStore::open(root.join("system-one.db")).unwrap();
+        let scope = BatchScope::Run {
+            agent_id: "agent".into(),
+            run_id: "run".into(),
+        };
+        store.claim(&claim_for("known", &scope)).unwrap();
+        store
+            .lock()
+            .execute("UPDATE batch SET owner='unknown-without-marker'", [])
+            .unwrap();
+        assert_eq!(store.release_abandoned().unwrap(), 0);
+        assert!(
+            store
+                .lookup("llm.classify", "live")
+                .unwrap()
+                .unwrap()
+                .running
+        );
     }
 }

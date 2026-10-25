@@ -680,6 +680,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         service
     };
     let _system_one_sweep = system_one.spawn_sweeper(registry.stopping_signal());
+    let llm_tools = Arc::new(broca_module_serve::llm_tools::LlmTools::new(
+        Arc::new(system_one.fork_for_tools()),
+        broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?,
+    ));
     let agent_data = Arc::new(broca_module_serve::agent_data::AgentDataService::new(
         state_root.clone(),
         registry.as_ref().clone(),
@@ -874,7 +878,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let stream = connect(&conn_path).await?;
     let (read_half, write_half) = tokio::io::split(stream);
-    let serving = broca_module_serve::serve::serve_connection_with_services(
+    let serving = broca_module_serve::serve::serve_connection_with_llm_tools(
         read_half,
         write_half,
         &module_id,
@@ -889,6 +893,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(scope_describer),
         Some(agent_data),
         Some(system_one),
+        Some(llm_tools),
     );
     tokio::pin!(serving);
     tokio::select! {
