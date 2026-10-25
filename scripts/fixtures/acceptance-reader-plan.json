@@ -12,17 +12,5 @@
     }
   ],
   "system_text_items": [],
-  "step_transform_items": [],
-  "composition": {
-    "providers": [
-      {
-        "provider": "aft",
-        "tools": [
-          { "name": "read", "capabilities": ["code.read/v1"] }
-        ]
-      }
-    ],
-    "step_transform_items": []
-  },
-  "composition_digest": "68fa6823e306547d9d060502d70f2a2e7855533a6e819d65c1f6d3609f1d11be"
+  "step_transform_items": []
 }

@@ -177,6 +177,13 @@ impl From<CliCacheRole> for CacheRole {
 enum Cmd {
     /// Export digest-verified request bodies directly from live or archived WALs (no daemon).
     CacheDump(CacheDumpArgs),
+    /// Compose a tool-only fetch plan from live provider catalogs, without sending a turn.
+    ComposePlan {
+        /// JSON with tool_items and empty system_text_items/step_transform_items; omit
+        /// composition, composition_digest, and compaction_item.
+        #[arg(long)]
+        items: PathBuf,
+    },
     /// The combined single-turn flow: subscribe, send a prompt, drain the control stream to
     /// the run's terminal. This is the single-client/single-turn proof.
     Run {
@@ -589,6 +596,9 @@ async fn run(args: Args) -> Result<i32, String> {
     if let Cmd::CredentialAudit { .. } = &args.cmd {
         return Ok(credential_audit(&args, json).await);
     }
+    if let Cmd::ComposePlan { items } = &args.cmd {
+        return compose_plan(&args, items).await;
+    }
     let session =
         broca_protocol::BindIdentity::new(&args.project_root, &args.harness, &args.session);
     session
@@ -673,6 +683,9 @@ async fn run(args: Args) -> Result<i32, String> {
     }
 
     match args.cmd {
+        Cmd::ComposePlan { .. } => {
+            unreachable!("compose-plan is dispatched before the management-surface bind")
+        }
         Cmd::CacheDump(_) => Err("cache-dump must be invoked without daemon arguments".into()),
         Cmd::Run {
             admission,
@@ -767,8 +780,14 @@ async fn run(args: Args) -> Result<i32, String> {
                         session_class: admission.session_class.as_deref(),
                         plan: plan.clone(),
                     })
-                    .await
-                    .map_err(|e| format!("send: {e}"))?;
+                    .await;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        emit_send_error(json, &error);
+                        return Ok(1);
+                    }
+                };
                 emit_send_outcome(json, &outcome);
             }
             Ok(0)
@@ -1009,6 +1028,29 @@ async fn run(args: Args) -> Result<i32, String> {
             Ok(0)
         }
     }
+}
+
+async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("read --items {}: {error}", path.display()))?;
+    let items = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse --items {}: {error}", path.display()))?;
+    let identity =
+        broca_protocol::BindIdentity::new(&args.project_root, &args.harness, &args.session);
+    identity
+        .validate_keyable()
+        .map_err(|error| format!("invalid bind identity: {error}"))?;
+    let conn = SubcConnection::connect(&args.subc)
+        .await
+        .map_err(|error| format!("connect subc ({}): {error}", args.subc.display()))?;
+    let fetcher = broca_subc::SubcPlanFetcher::new(std::sync::Arc::new(conn), identity, None);
+    let result =
+        broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE).await;
+    fetcher.close().await;
+    let plan =
+        result.map_err(|error| format!("compose-plan: {}: {}", error.code(), error.message()))?;
+    println!("{plan}");
+    Ok(0)
 }
 
 // -- credential-audit ------------------------------------------------------------------------
@@ -1496,8 +1538,14 @@ async fn run_turn(
             session_class: session_class.as_deref(),
             plan,
         })
-        .await
-        .map_err(|e| format!("send: {e}"))?;
+        .await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            emit_send_error(json, &error);
+            return Ok(1);
+        }
+    };
     emit_send_outcome(json, &outcome);
     if let SendOutcome::Finished { reason, .. } = &outcome {
         return Ok(
@@ -1568,6 +1616,17 @@ async fn run_turn(
     // Preserve the finish-reason classification here: reporting success for a failed run silently
     // turns an automation failure into a passing step, which is worse than crashing.
     Ok(tracker.exit_code())
+}
+
+fn send_error_event(error: &broca_subc::ConnError) -> serde_json::Value {
+    serde_json::json!({"event": "error", "operation": "session.send", "code": error.code(),
+                      "msg": format!("send: {error}")})
+}
+
+fn emit_send_error(json: bool, error: &broca_subc::ConnError) {
+    emit(json, &send_error_event(error), || {
+        format!("ERROR send: {error}")
+    });
 }
 
 /// One display-lane event for an operator: its arrival time, type and text length. The text
@@ -2543,6 +2602,39 @@ mod tests {
             assert_eq!(admission.session_class.as_deref(), Some("acceptance"));
             assert_eq!(admission.plan, Some(PathBuf::from("plan.json")));
             assert_eq!(max_output_tokens, Some(32));
+        }
+    }
+
+    #[test]
+    fn compose_plan_accepts_items_without_a_model_or_prompt() {
+        let args = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "connection.json",
+            "--project-root",
+            ".",
+            "--session",
+            "compose-probe",
+            "compose-plan",
+            "--items",
+            "items.json",
+        ])
+        .unwrap();
+        assert!(
+            matches!(args.cmd, Cmd::ComposePlan { items } if items == std::path::Path::new("items.json"))
+        );
+    }
+
+    #[test]
+    fn send_error_code_is_never_inferred_from_message_text() {
+        for error in [
+            broca_subc::ConnError::Transport("plan_stale".into()),
+            broca_subc::ConnError::Rejected("plan_stale — legacy refusal".into()),
+        ] {
+            let event = super::send_error_event(&error);
+            assert_eq!(event["operation"], "session.send");
+            assert!(event["code"].is_null());
+            assert!(event["msg"].as_str().unwrap().contains("plan_stale"));
         }
     }
 
