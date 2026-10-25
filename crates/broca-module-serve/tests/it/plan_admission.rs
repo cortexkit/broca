@@ -156,11 +156,18 @@ pub(super) struct CountingAdmitter {
     stale_digest: Mutex<Option<String>>,
     reply: Mutex<Option<Value>>,
     reply_schema: Mutex<Option<Value>>,
+    /// A catalog `reference_slots` member every answered tool carries, when set.
+    reference_slots: Mutex<Option<Value>>,
 }
 
 impl CountingAdmitter {
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Make every answered catalog tool declare `slots` as its `reference_slots`.
+    pub(super) fn answer_reference_slots(&self, slots: Value) {
+        *self.reference_slots.lock().unwrap() = Some(slots);
     }
 }
 
@@ -209,6 +216,9 @@ impl Fetcher for Answering<'_> {
                 });
                 if let Some(reply) = self.admitter.reply.lock().unwrap().clone() {
                     answer["reply"] = reply;
+                }
+                if let Some(slots) = self.admitter.reference_slots.lock().unwrap().clone() {
+                    answer["reference_slots"] = slots;
                 }
                 answer
             })
