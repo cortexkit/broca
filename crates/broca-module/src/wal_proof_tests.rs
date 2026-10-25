@@ -252,6 +252,13 @@ impl Fixture {
     }
 
     async fn with_retention(history: bool, retained: bool) -> Self {
+        Self::with_placement(history, retained, retained).await
+    }
+
+    /// `service` installs the retention service; `retained` also places the WAL under the
+    /// ephemeral root, as a retained first send does. A service without a retained WAL
+    /// models a fresh state root whose first session is not (yet) retained.
+    async fn with_placement(history: bool, service: bool, retained: bool) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = broca_test_support::scratch_root().join(format!(
             "broca-wal-proof-{}-{}",
@@ -331,7 +338,7 @@ impl Fixture {
             idle_ttl: Duration::from_secs(60),
             executor: executor.clone(),
         }));
-        if retained {
+        if service {
             let store = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
             registry.set_retention_service(Arc::new(
                 crate::retention::RetentionService::new(
@@ -680,6 +687,46 @@ async fn long_retention_sync_is_bounded_and_repair_survives_restart() {
             .len()
     );
     fixture.close().await;
+}
+
+#[tokio::test]
+async fn retention_sync_before_the_first_run_is_a_quiet_no_op_on_a_fresh_state_root() {
+    // An actor syncs the retention index when it starts, before its first send has
+    // appended RunStarted. On a fresh state root the ephemeral directory does not exist
+    // yet, and an unstarted lineage has no retention policy to project, so the sync must
+    // succeed without touching the ephemeral root or enrolling repair.
+    let mut fixture = Fixture::with_placement(false, true, false).await;
+    let service = fixture.actor.registry.retention_service().unwrap();
+    let ephemeral = service.wal.ephemeral_root();
+    assert!(!ephemeral.exists(), "fixture must model a fresh state root");
+    for _ in 0..2 {
+        let result = fixture.actor.sync_retention_index().await;
+        assert_eq!(result, Ok(()), "unstarted lineage sync must not fail");
+    }
+    assert!(fixture.actor.retention_deadline.is_none());
+    assert!(
+        !ephemeral.exists(),
+        "an unstarted lineage must not be remembered as a retained session"
+    );
+    assert!(service.index.live(&fixture.actor.key).unwrap().is_none());
+    assert_eq!(
+        fixture.actor.registry.retention_repairs_pending(),
+        0,
+        "nothing is unprojected, so nothing needs repair"
+    );
+    fixture.close().await;
+}
+
+#[test]
+fn retention_warning_errors_keep_their_reason_and_drop_paths() {
+    assert_eq!(
+        content_free_error("No such file or directory (os error 2)"),
+        "No such file or directory (os error 2)"
+    );
+    assert_eq!(
+        content_free_error("conflicting live WALs: /home/u/.local/wal/ab.wal and C:\\s\\ab.wal"),
+        "conflicting live WALs: <path> and <path>"
+    );
 }
 
 #[tokio::test]

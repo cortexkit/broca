@@ -11551,6 +11551,24 @@ mod crash_orphan_tests;
 #[path = "cache_warm_tests.rs"]
 mod cache_warm_tests;
 
+/// Retention warnings name the session only by its address. Store and filesystem errors can
+/// embed absolute paths, and a conflicting-WAL error names both files, so every
+/// whitespace-separated token holding a path separator is replaced before the error is
+/// logged. The rest of the message, such as an OS error kind, stays readable.
+fn content_free_error(error: &str) -> String {
+    error
+        .split_whitespace()
+        .map(|token| {
+            if token.contains(['/', '\\']) {
+                "<path>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl<W: WalStore + 'static> LineageActor<W> {
     fn message_timestamp(&self) -> Option<u64> {
         Some(self.ordered_now_ms()).filter(|at| *at != 0)
@@ -11585,6 +11603,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // A failed sync or a missing identity leaves the row unprojected exactly as a failed
         // index write does, so it enrolls the same repair rather than waiting for a reopen.
         let identified = match writer.sync().await {
+            // An actor syncs when it starts, before its first send appends RunStarted. With
+            // no durable record the lineage has no retention policy and nothing to project,
+            // so there is nothing to repair either. Going on would ask the service to remember
+            // the session under the ephemeral root, which a fresh state root has not created
+            // yet, and would fail with a spurious warning (and wrongly remember a session whose
+            // first send may never be retained). The send that starts the lineage syncs again.
+            Ok(0) => return Ok(()),
             Ok(_) => writer
                 .lineage_id()
                 .ok_or_else(|| "retention WAL has no identity".to_owned()),
@@ -11594,7 +11619,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             Ok(id) => id,
             Err(error) => {
                 self.registry.repair_retention(&self.key);
-                tracing::warn!(target: "retention", "retention sync could not read the durable head; repair enrolled");
+                tracing::warn!(target: "retention", session = %broca_core::session_addr(&self.key),
+                    error = %content_free_error(&error),
+                    "retention sync could not read the durable head; repair enrolled");
                 return Err(error);
             }
         };
@@ -11610,9 +11637,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
         .await
         .map_err(|e| e.to_string())
         .and_then(|result| result);
-        if result.is_err() {
+        if let Err(error) = &result {
             self.registry.repair_retention(&self.key);
-            tracing::warn!(target: "retention", "content-free index write failed; repair enrolled");
+            tracing::warn!(target: "retention", session = %broca_core::session_addr(&self.key),
+                error = %content_free_error(error),
+                "content-free index write failed; repair enrolled");
         }
         self.retention_deadline = result?;
         Ok(())
