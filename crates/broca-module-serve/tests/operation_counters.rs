@@ -47,6 +47,9 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "session.upload_append",
     "session.upload_commit",
     "session.upload_status",
+    "session.history",
+    "session.output_refs",
+    "session.output_ref_read",
 ];
 
 #[derive(Clone, Debug)]

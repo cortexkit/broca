@@ -1086,9 +1086,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-llm-runner-conformance"
-version = "0.12.6"
+version = "0.12.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f05bba6819b911c7a6dfa8efdb2181981559fb49f0e0765bc02facec04d5939"
+checksum = "7c478634e08033d55f05d06c51fdb1abdd31dcb4a8856a035e0b2a0d244f2d96"
 dependencies = [
  "async-trait",
  "base64",

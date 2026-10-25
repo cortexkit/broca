@@ -84,6 +84,8 @@ mod evidence;
 mod held_late_results;
 #[path = "llm_runner_conformance/optional_tools.rs"]
 mod optional_tools;
+#[path = "llm_runner_conformance/output_refs.rs"]
+mod output_refs;
 #[path = "llm_runner_conformance/reader_identity.rs"]
 mod reader_identity;
 /// Retention deletion scenarios on the same real-daemon rig. They move the daemon's clock
@@ -174,6 +176,7 @@ struct Shared {
     /// keys a part `<mid>#<index>`, so naming a message's parts needs the message's `mid`.
     read_mids: Mutex<HashMap<String, String>>,
     plan_sessions: Mutex<BTreeSet<String>>,
+    output_refs_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
     stream_holds: Mutex<HashMap<String, usize>>,
     raw_bodies: Mutex<HashMap<String, Vec<Vec<u8>>>>,
@@ -267,7 +270,7 @@ impl Shared {
 
 // ---- the scripted model -------------------------------------------------------------------------
 
-/// Serve OpenAI-compatible chat completions on a loopback port; returns the base URL.
+/// Serve scripted Chat and Messages responses on a loopback port; returns the base URL.
 async fn start_model(shared: Arc<Shared>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -299,9 +302,9 @@ fn structured_output_model(support: Option<bool>) -> &'static str {
     }
 }
 
-/// Write the catalog the structured-output sessions resolve against into broca's state root,
-/// as its last-known-good fusiform answer: one row per route support, differing only in
-/// `capability.structured_output` (true, false, and not stated). broca reaches these rows at
+/// Seed the scripted catalog in broca's state root: Chat rows with tri-state structured-output
+/// support, plus the Messages route that preserves independent output-reference samples.
+/// broca reaches these rows at
 /// the scripted model's address, because `BROCA_PROVIDER_BASE_URL` overrides the endpoint of
 /// a catalog model. Kept across restarts of the same root.
 fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
@@ -339,6 +342,10 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
             row(support),
         );
     }
+    models.insert(
+        format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
+        output_refs::catalog_row(),
+    );
     let lkg = json!({
         "catalog_version": 1,
         "models": models,
@@ -504,10 +511,10 @@ async fn serve_model_request(
     let model = model.strip_prefix("mock/").unwrap_or(model);
     let session = if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
         shared
-            .plan_sessions
+            .scripts
             .lock()
             .unwrap()
-            .contains(session)
+            .contains_key(session)
             .then(|| session.to_owned())
     } else if let Some(session) = request["model"].as_str().and_then(|model| {
         model
@@ -517,11 +524,15 @@ async fn serve_model_request(
     }) {
         self::compaction::known_session(&shared, session).then(|| session.to_owned())
     } else {
-        messages
-            .iter()
-            .filter(|message| message["role"] == "system" || message["role"] == "user")
+        std::iter::once(&request["system"])
+            .chain(
+                messages
+                    .iter()
+                    .filter(|message| message["role"] == "system" || message["role"] == "user")
+                    .map(|message| &message["content"]),
+            )
             .find_map(|message| {
-                let text = message["content"].to_string();
+                let text = message.to_string();
                 let at = text.find(SESSION_MARKER)? + SESSION_MARKER.len();
                 let name: String = text[at..]
                     .chars()
@@ -653,6 +664,13 @@ async fn serve_model_request(
 
     *shared.last_session.lock().unwrap() = Some(session.clone());
     let id = format!("chatcmpl-{session}-{turn_index}");
+    if model.ends_with(output_refs::MODEL) {
+        let body = output_refs::stream(&id, &turn);
+        let headers = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(body.as_bytes()).await?;
+        return stream.shutdown().await;
+    }
     let chunk = |delta: Value, finish: Option<&str>| {
         json!({"id": id, "object": "chat.completion.chunk", "model": "mock-model",
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
@@ -823,7 +841,10 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
         }
         let text = result.map_or_else(
             || format!("no scripted result for arguments {arguments}"),
-            |result| result.to_string(),
+            |result| match result {
+                Value::String(text) => text,
+                value => value.to_string(),
+            },
         );
         subc_client_rs::HandlerOutcome::Response(
             serde_json::to_vec(&json!({"content": [{"type": "text", "text": text}]})).unwrap(),
@@ -2019,6 +2040,8 @@ impl LlmRunnerSubject for BrocaSubject {
     fn capabilities(&self) -> BTreeSet<Capability> {
         let mut capabilities: BTreeSet<_> = [
             Capability::TranscriptReads,
+            Capability::HostHistory,
+            Capability::HistoryDisplay,
             Capability::RunOps,
             Capability::RunToolCalls,
             Capability::InputTokenCap,
@@ -2137,6 +2160,18 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if self
+            .shared
+            .output_refs_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            return json!({"model":{"provider":output_refs::PROVIDER,"model":output_refs::MODEL}})
+                .as_object()
+                .unwrap()
+                .clone();
+        }
         if self.shared.plan_sessions.lock().unwrap().contains(session) {
             return json!({"model":{"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")}})
                 .as_object().unwrap().clone();
@@ -2146,8 +2181,8 @@ impl LlmRunnerSubject for BrocaSubject {
         }
         // Legacy cases name tools directly; compaction cases use the plan-aware catalogue.
         let fields = json!({
-            "model": {"provider": "mock", "model": "mock-model"},
-            "system": format!("{SESSION_MARKER}{session}"),
+            // The model id routes the script without adding an extra system message to history.
+            "model": {"provider": "mock", "model": format!("{PLAN_MODEL_PREFIX}{session}")},
             "tools": [{
                 "name": SCRIPTED_TOOL,
                 "description": "Answers each call with its scripted result.",
@@ -2214,6 +2249,26 @@ impl LlmRunnerSubject for BrocaSubject {
         TOOL_MODULE.into()
     }
 
+    fn output_refs_fields(&self, session: &str) -> Result<Map<String, Value>, HarnessError> {
+        let mut fields = self
+            .send_fields_with_plan(
+                session,
+                true,
+                json!({"render_tags": true}).as_object().unwrap(),
+            )
+            .ok_or_else(|| HarnessError::new("output references need a scripted tool plan"))?;
+        fields["plan"]["tool_items"][0]["output_refs"] = json!(true);
+        fields["model"] = json!({"provider":output_refs::PROVIDER,"model":output_refs::MODEL});
+        self.shared
+            .output_refs_sessions
+            .lock()
+            .unwrap()
+            .insert(session.into());
+        fields["plan"]["system_text_items"] =
+            json!([{"provider":TOOL_MODULE,"preset":"conformance","params":{"session":session}}]);
+        Ok(fields)
+    }
+
     fn send_fields_with_tools(
         &self,
         session: &str,
@@ -2268,6 +2323,12 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap()
             .get(session)
         {
+            // These fixed catalog rows cannot carry a session-specific model id.
+            if fields.get("plan").is_none_or(Value::is_null) {
+                fields.insert("system".into(), json!(format!("{SESSION_MARKER}{session}")));
+            } else {
+                fields["plan"]["system_text_items"] = json!([{"provider":TOOL_MODULE,"preset":"conformance","params":{"session":session}}]);
+            }
             fields.insert(
                 "model".into(),
                 json!({"provider": STRUCTURED_OUTPUT_PROVIDER, "model": structured_output_model(*support)}),
@@ -2822,6 +2883,23 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     // a case that drifts to skipped or inapplicable would otherwise pass this test without
     // checking anything.
     for name in [
+        "history_pages_back_to_the_first_message",
+        "history_mid_matches_read",
+        "history_from_ordinal_and_before_ordinal",
+        "history_unknown_ordinal_refused",
+        "display_limits_cut_on_a_utf8_boundary",
+        "display_without_limits_is_whole",
+        "display_pages_carry_finished_messages_only",
+        "client_message_id_on_display_rows_never_in_read",
+        "display_row_names_the_sender_never_in_read",
+        "output_refs_scanning",
+        "output_refs_target_reasons",
+        "output_refs_descriptor_digest",
+        "output_refs_session_isolation",
+        "output_refs_slots",
+        "output_refs_reference_limit",
+        "output_refs_read_limits",
+        "output_refs_snapshot_budget",
         "compaction_setup_durable_once",
         "model_view_half_open_ranges_and_travel",
         "compaction_unavailable_distinct_from_refuse",
@@ -2896,6 +2974,25 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             CaseOutcome::Passed,
             "{name}\n{}",
             report.render()
+        );
+    }
+    for name in [
+        "output_refs_unsupported_plan",
+        "output_refs_writing_request",
+        "output_refs_held_placeholder",
+        "output_refs_snapshot_size",
+        "output_refs_rewind",
+        "output_refs_compaction",
+    ] {
+        let case = report
+            .cases
+            .iter()
+            .find(|case| case.case == name)
+            .unwrap_or_else(|| panic!("the suite has no case {name}"));
+        assert!(
+            matches!(case.outcome, CaseOutcome::Inapplicable { .. }),
+            "{name}: {:?}",
+            case.outcome
         );
     }
     let cap_cases: Vec<_> = report

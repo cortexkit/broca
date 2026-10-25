@@ -334,6 +334,9 @@ pub fn broca_role_describe_with_writers(
         OP_ROLE_DESCRIBE,
         OP_SESSION_BASELINE,
         "session.read",
+        cortexkit_role_llm_runner::ops::SESSION_HISTORY,
+        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS,
+        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ,
         OP_SESSION_HEAD,
         OP_RUN_RESULT,
         OP_RUN_TOOL_CALLS,
@@ -351,6 +354,9 @@ pub fn broca_role_describe_with_writers(
     // max_output_tokens group across all of its model routes.
     let mut capabilities = [
         "transcript_reads",
+        cortexkit_role_llm_runner::capabilities::HOST_HISTORY,
+        cortexkit_role_llm_runner::capabilities::HISTORY_DISPLAY,
+        cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
         cortexkit_role_llm_runner::capabilities::RUN_STATUS,
         cortexkit_role_llm_runner::capabilities::RUN_USAGE,
@@ -380,9 +386,7 @@ pub fn broca_role_describe_with_writers(
         // Ordered sends can land beside tool results, at a running step boundary, or when an
         // idle session starts. `turn_system` has no renderer and is deliberately not advertised.
         DELIVERY_ORDER_GROUP,
-        // A send's `client_message_id` is validated, kept in its identity and stored durably
-        // (WAL feature `client-message-id/v1`). It shows on a display row once broca serves
-        // `history_display`, which it does not declare yet; no other surface carries it.
+        // A send's client_message_id lives beside its body and is exposed only on display rows.
         cortexkit_role_llm_runner::capabilities::CLIENT_MESSAGE_ID,
     ]
     .map(String::from)
@@ -1013,7 +1017,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "92063b9c9713f00291f1d0083d3adbbb56bd8a6c9d17c2cc8e9c60346be28e58",
+            "ff1b6e72adf5f2d9745a08cf054b0661adb221adbfa50c72f2a69c2cfea9dcf2",
         );
     }
 
@@ -1174,7 +1178,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "56dc44341e12dee5fbfbba7824ebc49bfab447319e66aa5766332c9fc66911ec";
+        "a19a4a824b08f5d56be33fbcd6e06f3a21d1333c2f3741e13616de605b25ba38";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

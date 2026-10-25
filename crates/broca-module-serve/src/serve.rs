@@ -2335,7 +2335,7 @@ where
         }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
         let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
-        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ);
+        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status" | cortexkit_role_llm_runner::ops::SESSION_HISTORY | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ);
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -3137,6 +3137,36 @@ where
                     send_json_response(writer, ver, channel, epoch, corr, &response).await
                 }
                 Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
+        cortexkit_role_llm_runner::ops::SESSION_HISTORY => {
+            let request = match decode_params::<cortexkit_role_llm_runner::history::HistoryRequest>(
+                &req.params,
+            ) {
+                Ok(request) => request,
+                Err((field, message)) => {
+                    return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
+                        .await
+                }
+            };
+            match broca_module::history::read(handler.as_ref(), &session, &request).await {
+                Ok(page) => send_json_response(writer, ver, channel, epoch, corr, &page).await,
+                Err(broca_module::history::HistoryError::Serve(error)) => {
+                    send_serve_error(writer, ver, channel, epoch, corr, &error).await
+                }
+                Err(broca_module::history::HistoryError::Unrepresentable { ordinal, field }) => {
+                    let body = serde_json::json!({
+                        "code":"history_unrepresentable", "class":"permanent",
+                        "message":format!("session.history cannot represent message {ordinal}: no retained {field}; use session.read for raw recovery"),
+                        "detail":{"ordinal":ordinal,"field":field},
+                    });
+                    let bytes = serde_json::to_vec(&body)
+                        .map_err(|error| ServeIoError(error.to_string()))?;
+                    send_error_bytes(writer, ver, channel, epoch, corr, bytes).await
+                }
+                Err(broca_module::history::HistoryError::Refused { code, message }) => {
+                    send_error(writer, ver, channel, epoch, corr, code, &message).await
+                }
             }
         }
         OP_READ => {

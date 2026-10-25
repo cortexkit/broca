@@ -155,7 +155,14 @@ session.read { from_ordinal?, limit?, include_tools?, after_mid?, lineage_id?, m
                      tool_calls?: [{ tool_call_id, call_key?, dispatched_to?, indeterminate }] }],
         next_from_ordinal?, head?, lineage_id?, lineage_state,
         tools?: [{ name, description, input_schema, module? }], tools_run_id? }
-                                                                     (OBSERVER; §15)
+                                                                      (OBSERVER; §15)
+
+session.history { cursor?, from_mid?, before_mid?, from_ordinal?, before_ordinal?,
+                  limit?, max_bytes?, media?, include_originals?, view?, form?, limits? }
+    → { messages: [{ ordinal, mid, written_at, message | row, tags?, ... }],
+        lineage_id?, history_version?, older?, newer? }
+session.output_refs { set_id, after? } → { records, next? }
+session.output_ref_read { ref_id, offset, length } → { format, size, data }
 
 session.head {} → { lineage_id?, last_ordinal?, head?, last_run_state?, updated_at?,
                        cache?: { last_sent_at_ms, ttl_ms?, expires_at_ms?, expiry_basis },
@@ -187,6 +194,21 @@ run.status { run_id | session }
 send.status { send_id }
     → { state, run_id?, step?, last_error?, head: cursor, title?, usage } (state enum §14)
 ```
+
+`session.history` follows llm-runner §4.6 and §4.7 (`host_history`, `history_display`):
+absent `form` serves raw entries; `form: "display"` serves canonical rows with optional
+UTF-8 tool-payload `limits`. Newest pages and `before_*` seeks page backward; `from_*`
+seeks page forward. Entries are always oldest first, and opaque `older`/`newer` cursors
+are session-lineage bound. Broca has no unnumbered host history or history rewrites;
+its surviving history is the full append-only lineage and its history version is zero.
+If the shared `session.read` timestamp derivation has no creation time, or a display
+assistant has no recorded producing model, history refuses the whole page with
+`history_unrepresentable`, class `permanent`, and `detail: {ordinal, field}` naming
+the first unrepresentable row and `written_at` or `model`. It never substitutes an
+invented value or returns a partial page. Raw `session.read` remains the recovery path.
+Display rows alone expose the output-reference descriptors from §9.13: the reply
+set on `row.output_refs`, and each opted-in call's set on its tool-call part.
+Default `session.read`, `run.status`, stored messages and subscribe bytes are unchanged.
 
 Read-entry `written_at` is an optional Unix-millisecond time in the **entry envelope**, never
 inside the opaque `message`. It is part of default reads, with no request opt-in. New input

@@ -30438,3 +30438,224 @@ expect_red = ["subc_plane::tests::release_tool_capture_tests::capture_off_image_
 file = "crates/broca-core/src/wal_writer.rs"
 old = "self.media_capture = if broca_protocol::attachments_enabled() {"
 new = "self.media_capture = if true { // NON-VACUITY BREAK: bind tool capture in shipping builds."
+
+[[control]]
+id = "history-request-mode-is-strict"
+guards = "History refuses conflicting positions and display-only members outside display form"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors"]
+file = "crates/broca-module/src/history.rs"
+old = "let mode = request.mode().map_err(|field| ServeError::InvalidParams {"
+new = "let mode = request.mode().or(Ok::<_, &'static str>(HistoryMode::Newest)).map_err(|field| ServeError::InvalidParams { // NON-VACUITY BREAK: accept invalid history positions and mode combinations."
+
+[[control]]
+id = "history-cursors-are-session-bound"
+guards = "A history cursor minted for another session expires before it can reveal that session's position"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors"]
+file = "crates/broca-module/src/history.rs"
+old = "if position.lineage != lineage || position.boundary > end {"
+new = "if position.boundary > end { // NON-VACUITY BREAK: accept another session's cursor."
+
+[[control]]
+id = "history-unknown-ordinal-is-refused"
+guards = "Ordinal seeks name retained messages, not arbitrary empty ranges"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors"]
+file = "crates/broca-module/src/history.rs"
+old = "if at >= end {"
+new = "if at >= end && false { // NON-VACUITY BREAK: read a never-assigned ordinal as an empty page."
+
+[[control]]
+id = "history-page-budget-keeps-requested-end"
+guards = "History byte budgets retain the newest end of a backward page and the oldest end of a forward page"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::history_display_limits_and_page_budgets_keep_the_requested_end"]
+file = "crates/broca-module/src/history.rs"
+old = "if messages.len() <= 1"
+new = "if messages.len() <= usize::MAX // NON-VACUITY BREAK: ignore history page byte caps."
+
+[[control]]
+id = "history-display-tool-limits"
+guards = "Canonical display projection applies distinct UTF-8 arguments, result and error-result limits"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/history.rs"
+expect_red = ["history::tests::projection_preserves_native_part_order_keys_media_and_utf8_limits"]
+file = "crates/broca-module/src/history.rs"
+old = "pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRow {"
+new = "pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRow { let limits = limits.filter(|_| false); // NON-VACUITY BREAK: ignore display tool payload limits."
+
+[[control]]
+id = "history-display-reference-descriptors"
+guards = "A served display row carries both its reply descriptor and its opted-in tool-call descriptor"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::an_opted_in_call_scans_only_its_declared_slots"]
+file = "crates/broca-module/src/history.rs"
+old = "row = refs.attach(row);"
+new = "let _ = refs; // NON-VACUITY BREAK: omit display output-reference descriptors."
+
+[[control]]
+id = "history-display-client-message-id"
+guards = "The display row recovers the durable client message identity while default reads remain unchanged"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::history_display_recovers_send_identity_without_changing_read_bodies"]
+file = "crates/broca-module/src/history.rs"
+old = "row.client_message_id = metadata.client_message_id.clone();"
+new = "row.client_message_id = None; // NON-VACUITY BREAK: lose the send's display identity."
+
+[[control]]
+id = "history-display-attested-sender"
+guards = "The display row names the attested module whose send produced the user message"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::history_display_recovers_send_identity_without_changing_read_bodies"]
+file = "crates/broca-module/src/history.rs"
+old = "row.sender = metadata.sender.clone();"
+new = "row.sender = None; // NON-VACUITY BREAK: omit the recorded sender."
+
+[[control]]
+id = "history-creation-times-are-not-invented"
+guards = "History refuses a legacy message without a retained creation timestamp rather than inventing one"
+runner = "cargo"
+package = "broca-module"
+target = "--test output_refs_cost"
+select = "expected"
+test_file = "crates/broca-module/tests/output_refs_cost.rs"
+expect_red = ["history_never_invents_creation_times_for_legacy_records"]
+file = "crates/broca-module/src/history.rs"
+old = "entry.written_at"
+new = "entry.written_at.or(Some(0)) /* NON-VACUITY BREAK: invent an unrecorded history creation time */"
+
+[[control]]
+id = "output-refs-display-page-shares-message-reads"
+guards = "Deriving a display page reads each distinct referenced output and containing call only once"
+runner = "cargo"
+package = "broca-module"
+target = "--test output_refs_cost"
+select = "expected"
+test_file = "crates/broca-module/tests/output_refs_cost.rs"
+expect_red = ["a_display_page_reads_each_shared_target_and_manifest_once"]
+file = "crates/broca-module/src/output_refs.rs"
+old = "if !self.cache.contains_key(&ordinal) {"
+new = "if ordinal <= u64::MAX { // NON-VACUITY BREAK: reread cached messages for each display row."
+
+[[control]]
+id = "output-refs-display-page-shares-tag-lookups"
+guards = "Deriving a display page looks up each distinct referenced number only once"
+runner = "cargo"
+package = "broca-module"
+target = "--test output_refs_cost"
+select = "expected"
+test_file = "crates/broca-module/tests/output_refs_cost.rs"
+expect_red = ["a_display_page_reads_each_shared_target_and_manifest_once"]
+file = "crates/broca-module/src/output_refs.rs"
+old = "if !messages.locations.contains_key(&number) {"
+new = "if number <= u64::MAX { // NON-VACUITY BREAK: repeat the index lookup for every display row."
+
+[[control]]
+id = "output-refs-display-distinguishes-reused-call-ids"
+guards = "A display descriptor stays on its own stored tool call even when a provider reused the call id"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/output_refs.rs"
+expect_red = ["output_refs::tests::attach_puts_each_descriptor_on_its_row_or_call"]
+file = "crates/broca-module/src/output_refs.rs"
+old = "key.call == Some(index)"
+new = "(key.call == Some(index) || key.call != Some(index)) /* NON-VACUITY BREAK: attach to every repeated id */"
+
+[[control]]
+id = "production-admitter-declares-output-refs"
+guards = "The production subc plan admitter enables the output-reference plan members advertised in discovery"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/plan_fetch.rs"
+expect_red = ["plan_fetch::preset_tests::production_admitter_enables_output_reference_plans"]
+file = "crates/broca-subc/src/plan_fetch.rs"
+old = "    fn admits_output_refs(&self) -> bool {\n        true\n    }"
+new = "    fn admits_output_refs(&self) -> bool {\n        false // NON-VACUITY BREAK: refuse advertised output-reference plans.\n    }"
+
+[[control]]
+id = "history-access-follows-session-read"
+guards = "Display history admits exactly the callers session.read admits before reading content or send metadata"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::ids_are_session_bound_and_access_follows_session_read"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "    if matches!(method, OP_CANCEL | OP_RETRACT) {"
+new = "    if method == cortexkit_role_llm_runner::ops::SESSION_HISTORY { return Ok(()); } // NON-VACUITY BREAK: bypass history authorization.\n    if matches!(method, OP_CANCEL | OP_RETRACT) {"
+
+[[control]]
+id = "history-display-never-invents-imported-model"
+guards = "Display history refuses the first imported assistant without a producing model, naming its ordinal and field without changing the WAL"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::imported_history_refuses_the_first_assistant_without_a_model"]
+file = "crates/broca-module/src/history.rs"
+old = "&& entry.message.origin.is_none()"
+new = "&& entry.message.origin.is_none() && false /* NON-VACUITY BREAK: serve an imported assistant with no producing model */"
+
+[[control]]
+id = "output-refs-dispatch-matches-call-occurrence"
+guards = "A repeated provider call id never borrows a preceding occurrence's dispatch key or provider"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::repeated_ids_within_a_message_keep_unknown_dispatch_metadata_null"]
+file = "crates/broca-module/src/output_refs.rs"
+old = "if call_occurrence != 0 {"
+new = "if call_occurrence != 0 && false { // NON-VACUITY BREAK: let a later refused occurrence borrow the first id's attribution."
+
+[[control]]
+id = "output-refs-target-matches-call-occurrence"
+guards = "A repeated result id resolves the tool name from its own call occurrence rather than the first same-id call"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/output_refs.rs"
+expect_red = ["output_refs::tests::a_repeated_result_id_keeps_its_own_tool_name"]
+file = "crates/broca-module/src/output_refs.rs"
+old = ".nth(occurrence)"
+new = ".nth(occurrence.min(0)) /* NON-VACUITY BREAK: borrow the preceding same-id call's tool name */"
