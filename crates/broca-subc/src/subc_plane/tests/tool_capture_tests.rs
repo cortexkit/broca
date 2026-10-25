@@ -24,6 +24,7 @@ fn media_block(kind: &str, mime: &str, bytes: &[u8]) -> serde_json::Value {
 }
 
 fn capture_ctx(batch: &str) -> (PathBuf, BatchCtx, MediaStore) {
+    assert!(broca_protocol::attachments_enabled());
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = broca_test_support::scratch_root().join(format!(
         "tool-capture-{}-{}",
@@ -350,13 +351,11 @@ async fn negotiated_image_slots_capture_without_losing_error_code_or_text() {
 }
 
 #[tokio::test]
-async fn missing_capture_handle_is_a_completed_store_failed_marker() {
+async fn missing_capture_handle_marks_an_explicit_capture_request_store_failed() {
     let ctx = batch_ctx("no-store");
-    let (_, _, _, result) = dispatch_reply(
-        &ctx,
-        json!({"content":[media_block("image", "image/jpeg", &png())]}),
-    )
-    .await;
+    let raw = json!({"content":[media_block("image", "image/jpeg", &png())]});
+    let (result, captures) = map_call_tool_result(&ToolCallId("capture-call".into()), &raw);
+    let result = tool_capture::capture(&ctx, result, captures).await;
     assert_eq!(parts(&result)[0], ToolOutputPart::Text { text: "[media not shown: kind=image mime=image/png bytes=69 sha256=b1ff9c8ea3a7 reason=store_failed]".into() });
 }
 
@@ -383,4 +382,15 @@ async fn over_store_maximum_is_a_marker_and_publishes_nothing() {
         std::fs::read_dir(root.join("media/refs")).unwrap().count(),
         0
     );
+}
+
+#[test]
+fn image_classifier_returns_decoded_bytes_awaiting_capture() {
+    assert!(broca_protocol::attachments_enabled());
+    let (result, pending) = map_call_tool_result(
+        &ToolCallId("capture-call".into()),
+        &json!({"content":[media_block("image", "image/png", &png())]}),
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(parts(&result).len(), 1);
 }

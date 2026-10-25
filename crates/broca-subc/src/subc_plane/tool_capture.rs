@@ -90,7 +90,10 @@ pub(super) fn classify(
     let content = raw.get("content").and_then(serde_json::Value::as_array);
     let Some(content) = content.filter(|blocks| blocks.iter().any(|block| blob(block).is_some()))
     else {
-        return (super::map_legacy_call_tool_result(id, raw), Vec::new());
+        return (
+            super::map_text_call_tool_result(id, raw, non_text_tool_content_placeholder),
+            Vec::new(),
+        );
     };
     let mut captures = Vec::new();
     let parts = content

@@ -2883,7 +2883,7 @@ async fn boundary_cancel_preserves_active_approval_wait_until_immediate_escalati
     rig.finish().await;
 }
 
-#[cfg(feature = "test-clock")]
+#[cfg(all(feature = "test-clock", feature = "test-attachments"))]
 #[tokio::test]
 async fn late_admission_carries_capture_and_records_registered_media() {
     let mut rig = expired_run("pass").await;

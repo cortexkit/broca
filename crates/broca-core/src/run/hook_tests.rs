@@ -2594,6 +2594,7 @@ async fn post_hook_restream_counts_delta_less_stored_blocks() {
 }
 
 #[tokio::test]
+#[cfg(feature = "test-attachments")]
 async fn tool_reference_provenance_is_enforced_before_hook_payloads_are_stored() {
     use broca_protocol::{MediaMarkerReason, ToolOutputPart};
     let bind = BindIdentity::new("/project", "caller", "media-hooks");

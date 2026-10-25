@@ -615,6 +615,7 @@ async fn approved_provider_held_reply_keeps_its_deferred_anchor() {
 }
 
 #[tokio::test]
+#[cfg(feature = "test-attachments")]
 async fn negotiated_media_dispatch_captures_with_nullable_error_code() {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use broca_core::{

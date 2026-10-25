@@ -1534,10 +1534,19 @@ impl SubcToolPlane {
                         .unwrap_or_else(|| {
                             route_failure_result(call, "malformed content/v1 tool reply".into())
                         });
-                    let captures = tool_capture::content_v1_captures(&mut result, &raw);
+                    let captures = if ctx.media_capture.is_some() {
+                        tool_capture::content_v1_captures(&mut result, &raw)
+                    } else {
+                        Vec::new()
+                    };
                     (result, captures)
-                } else {
+                } else if ctx.media_capture.is_some() {
                     map_call_tool_result(&call.tool_call_id, &raw)
+                } else {
+                    (
+                        map_legacy_call_tool_result(&call.tool_call_id, &raw),
+                        Vec::new(),
+                    )
                 };
                 let result = tool_capture::capture(ctx, result, captures).await;
                 // Build the fence copy before taking the process-wide guard. Tool payloads can be
@@ -3032,6 +3041,14 @@ fn map_call_tool_result(
 
 // Keep the no-capture mapping unchanged, including structuredContent and malformed replies.
 fn map_legacy_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
+    map_text_call_tool_result(id, raw, legacy_non_text_tool_content_placeholder)
+}
+
+fn map_text_call_tool_result(
+    id: &ToolCallId,
+    raw: &serde_json::Value,
+    placeholder: fn(&serde_json::Value) -> String,
+) -> ToolResult {
     let is_error = raw
         .get("isError")
         .and_then(serde_json::Value::as_bool)
@@ -3058,7 +3075,7 @@ fn map_legacy_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> Tool
                         .get("text")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned)
-                        .unwrap_or_else(|| non_text_tool_content_placeholder(block))
+                        .unwrap_or_else(|| placeholder(block))
                 })
                 .collect::<Vec<_>>()
                 .join("")
@@ -3136,6 +3153,10 @@ fn non_text_tool_content_placeholder(block: &serde_json::Value) -> String {
             broca_protocol::MediaMarkerReason::Provenance,
         );
     }
+    legacy_non_text_tool_content_placeholder(block)
+}
+
+fn legacy_non_text_tool_content_placeholder(block: &serde_json::Value) -> String {
     broca_protocol::content::non_text_tool_content_placeholder(
         block
             .get("type")
@@ -3163,6 +3184,9 @@ mod tests {
 
     use super::*;
 
+    #[cfg(not(feature = "test-attachments"))]
+    mod release_tool_capture_tests;
+    #[cfg(feature = "test-attachments")]
     mod tool_capture_tests;
 
     #[derive(Clone)]
@@ -4360,6 +4384,18 @@ mod tests {
                 include_str!("../tests/fixtures/content_v1/legacy_text.json"),
             ),
             (
+                serde_json::json!({
+                    "content": [
+                        {"type": "text", "text": "before"},
+                        {"type": "image", "mimeType": "image/png", "data": "aGVsbG8=", "width": 1, "height": 1},
+                        {"type": "text", "text": "after"}
+                    ],
+                    "isError": true,
+                    "errorCode": "provider_error"
+                }),
+                include_str!("../tests/fixtures/content_v1/legacy_image_error.json"),
+            ),
+            (
                 serde_json::json!({"structuredContent": {"program_facing": "still visible on legacy path"}}),
                 include_str!("../tests/fixtures/content_v1/legacy_structured.json"),
             ),
@@ -4388,8 +4424,8 @@ mod tests {
         }
     }
 
-    fn classified_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
-        map_call_tool_result(id, raw).0
+    fn uncaptured_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
+        map_legacy_call_tool_result(id, raw)
     }
 
     fn legacy_map_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
@@ -4421,7 +4457,7 @@ mod tests {
     }
 
     #[test]
-    fn image_only_tool_result_classifies_as_parts_awaiting_capture() {
+    fn image_only_tool_result_maps_to_a_compact_placeholder() {
         let id = ToolCallId("t1".into());
         let raw = serde_json::json!({
             "content": [{
@@ -4436,10 +4472,15 @@ mod tests {
             legacy_map_call_tool_result(&id, &raw).output,
             ToolOutput::Text { text } if text.is_empty()
         ));
-        let result = classified_result(&id, &raw);
+        let result = uncaptured_result(&id, &raw);
         assert!(!result.is_error);
-        assert!(matches!(result.output, ToolOutput::Parts { parts } if parts.len() == 1));
-        assert_eq!(map_call_tool_result(&id, &raw).1.len(), 1);
+        assert_eq!(
+            result.output,
+            ToolOutput::Text {
+                text: "[non-text tool content omitted: type=image mimeType=image/png data≈8 bytes]"
+                    .into()
+            }
+        );
     }
 
     #[test]
@@ -4453,23 +4494,10 @@ mod tests {
             "isError": false
         });
 
-        let result = classified_result(&ToolCallId("t1".into()), &raw);
-        let ToolOutput::Parts { parts } = result.output else {
-            panic!("capture needs Parts")
-        };
-        assert_eq!(parts.len(), 3);
-        assert_eq!(
-            parts[0],
-            broca_protocol::ToolOutputPart::Text {
-                text: "before".into()
-            }
-        );
-        assert_eq!(
-            parts[2],
-            broca_protocol::ToolOutputPart::Text {
-                text: "after".into()
-            }
-        );
+        let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
+        assert_eq!(result.output, ToolOutput::Text {
+            text: "before[non-text tool content omitted: type=image mimeType=image/jpeg data≈4 bytes]after".into()
+        });
     }
 
     #[test]
@@ -4480,7 +4508,7 @@ mod tests {
             "isError": false
         });
 
-        let result = classified_result(&ToolCallId("t1".into()), &raw);
+        let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(!result.is_error);
         assert_eq!(result.output, ToolOutput::Json { value: structured });
     }
@@ -4498,21 +4526,26 @@ mod tests {
         });
 
         let legacy = serde_json::to_vec(&legacy_map_call_tool_result(&id, &raw)).unwrap();
-        let mapped = serde_json::to_vec(&classified_result(&id, &raw)).unwrap();
+        let mapped = serde_json::to_vec(&uncaptured_result(&id, &raw)).unwrap();
         assert_eq!(mapped, legacy);
     }
 
     #[test]
-    fn error_with_invalid_media_keeps_error_and_marker_parts() {
+    fn error_with_non_text_content_keeps_error_and_placeholder() {
         let raw = serde_json::json!({
             "content": [{ "type": "audio", "mimeType": "audio/wav", "data": "123456" }],
             "isError": true
         });
 
-        let result = classified_result(&ToolCallId("t1".into()), &raw);
+        let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
-        assert!(
-            matches!(result.output, ToolOutput::Parts { parts } if matches!(&parts[0], broca_protocol::ToolOutputPart::Text { text } if text.ends_with("reason=undecodable]")))
+        assert_eq!(
+            result.output,
+            ToolOutput::Error {
+                message:
+                    "[non-text tool content omitted: type=audio mimeType=audio/wav data≈6 bytes]"
+                        .into()
+            }
         );
     }
 
@@ -4522,7 +4555,7 @@ mod tests {
             "result": { "hits": ["a", "b"] }
         });
 
-        let result = classified_result(&ToolCallId("t1".into()), &raw);
+        let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
         let ToolOutput::Error { message } = result.output else {
             panic!("expected an error output, got {:?}", result.output);
@@ -4541,7 +4574,7 @@ mod tests {
     fn empty_content_array_stays_an_empty_success() {
         let raw = serde_json::json!({ "content": [] });
 
-        let result = classified_result(&ToolCallId("t1".into()), &raw);
+        let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(!result.is_error);
         assert_eq!(
             result.output,
@@ -4556,7 +4589,7 @@ mod tests {
         let structured = serde_json::json!({"answer": 42});
         let raw = serde_json::json!({ "structuredContent": structured.clone() });
 
-        let result = classified_result(&ToolCallId("t1".into()), &raw);
+        let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(!result.is_error);
         assert_eq!(result.output, ToolOutput::Json { value: structured });
     }
@@ -4569,7 +4602,7 @@ mod tests {
             serde_json::json!({ "result": "é".repeat(10 * MALFORMED_TOOL_REPLY_QUOTE_MAX_BYTES) });
         let full_len = serde_json::to_string(&raw).unwrap().len();
 
-        let result = classified_result(&ToolCallId("t1".into()), &raw);
+        let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
         let ToolOutput::Error { message } = result.output else {
             panic!("expected an error output");
@@ -4591,7 +4624,7 @@ mod tests {
             "content": [{ "type": "text", "text": "boom" }],
             "isError": true
         });
-        let r = classified_result(&ToolCallId("t1".into()), &raw);
+        let r = uncaptured_result(&ToolCallId("t1".into()), &raw);
         assert!(r.is_error);
         assert!(matches!(r.output, ToolOutput::Error { message } if message == "boom"));
     }

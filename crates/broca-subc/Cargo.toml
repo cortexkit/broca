@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "The real subc tool-plane: a SubcToolPlane (2nd ToolPlane impl) that dispatches the loop's tool calls runner->subc->AFT over an authenticated direct consumer connection."
 
+[features]
+test-attachments = ["broca-core/test-attachments", "broca-protocol/test-attachments"]
+
 [dependencies]
 broca-diagnostics = { path = "../broca-diagnostics" }
 broca-core = { path = "../broca-core" }
