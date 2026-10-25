@@ -93,6 +93,22 @@ def load_selected(catalogue_path, base=None):
     )
 
 
+def expected_red_names(row):
+    """The row's expected red tests as libtest names them.
+
+    A row may qualify a name with its own integration-test target (`it::module::test` for
+    `target = "--test it"`), which ckdev-mutate accepts. The replay report holds libtest's
+    names, which carry no target, so only that row's own target prefix is removed. A name
+    qualified with any other target stays as written and still has to be observed.
+    """
+    parts = row.get("target", "").split()
+    prefix = f"{parts[1]}::" if len(parts) == 2 and parts[0] == "--test" else None
+    return [
+        name[len(prefix):] if prefix and name.startswith(prefix) else name
+        for name in row["expect_red"]
+    ]
+
+
 def verify(controls, results):
     eligible = eligible_windows(controls)
     known = {row["id"] for row in controls}
@@ -113,7 +129,7 @@ def verify(controls, results):
         red = result["red"]
         if not isinstance(red, list) or not all(isinstance(name, str) for name in red):
             raise ValueError(f"invalid red test names for {row_id}")
-        if not set(row["expect_red"]) <= set(red):
+        if not set(expected_red_names(row)) <= set(red):
             raise ValueError(f"expected red tests not observed for {row_id}")
         replayed.append({"id": row_id, "red": red})
     return replayed
@@ -208,6 +224,17 @@ class CoverageTests(unittest.TestCase):
 
     def test_requires_observed_expected_red_test(self):
         self.results[1]["red"] = ["tests::unrelated"]
+        with self.assertRaisesRegex(ValueError, "expected red tests not observed for native"):
+            verify(self.controls, self.results)
+
+    def test_accepts_expected_names_qualified_with_the_rows_own_target(self):
+        self.controls[1]["target"] = "--test it"
+        self.controls[1]["expect_red"] = ["it::tests::native"]
+        self.assertEqual(verify(self.controls, self.results)[1], {"id": "native", "red": ["tests::native"]})
+
+    def test_another_targets_prefix_is_not_removed(self):
+        self.controls[1]["target"] = "--test it"
+        self.controls[1]["expect_red"] = ["other::tests::native"]
         with self.assertRaisesRegex(ValueError, "expected red tests not observed for native"):
             verify(self.controls, self.results)
 
