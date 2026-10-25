@@ -892,6 +892,13 @@ async fn the_store_never_touches_the_run_index_or_any_wal() {
     std::fs::create_dir_all(root.join("wal/ab")).unwrap();
     std::fs::write(root.join("run-index.db"), b"run index bytes").unwrap();
     std::fs::write(root.join("wal/ab/session.wal"), b"wal bytes").unwrap();
+    use sha2::{Digest, Sha256};
+    let owner_file = root.join(format!(
+        "system-one.db.owner-{:x}.lock",
+        Sha256::digest(b"this-process")
+    ));
+    // The live store holds an OS lock on its owner file, and Windows refuses to read a locked
+    // range, so the snapshot never reads that file; its emptiness is checked by length below.
     let snapshot = |root: &std::path::Path| {
         let mut files = Vec::new();
         let mut stack = vec![root.to_path_buf()];
@@ -900,7 +907,7 @@ async fn the_store_never_touches_the_run_index_or_any_wal() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     stack.push(path);
-                } else {
+                } else if path != owner_file {
                     let meta = std::fs::metadata(&path).unwrap();
                     files.push((
                         path.clone(),
@@ -924,15 +931,10 @@ async fn the_store_never_touches_the_run_index_or_any_wal() {
     admitted(&rig, params("files", JEV, &["a", "b"], None)).await;
     admitted(&rig, params("files", JEV, &["a", "b"], None)).await;
     rig.service.sweep().await.unwrap();
-    use sha2::{Digest, Sha256};
-    let owner_file = root.join(format!(
-        "system-one.db.owner-{:x}.lock",
-        Sha256::digest(b"this-process")
-    ));
-    assert!(std::fs::read(&owner_file).unwrap().is_empty());
+    assert_eq!(std::fs::metadata(&owner_file).unwrap().len(), 0);
     let after: Vec<_> = snapshot(&root)
         .into_iter()
-        .filter(|(path, _, _)| path != &root.join("system-one.db") && path != &owner_file)
+        .filter(|(path, _, _)| path != &root.join("system-one.db"))
         .collect();
     assert_eq!(
         after, before,
