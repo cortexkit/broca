@@ -104,6 +104,12 @@ pub trait ProviderHeldLifecycle: Send + Sync {
     /// late result over may now treat it as delivered (and so let the provider's entry be
     /// acked); before this point a crash could still lose it.
     async fn terminal_synced(&self, _ctx: &BatchCtx, _tool_call_id: &ToolCallId) {}
+
+    /// Best-effort provider withdrawal after the run's seal is durable. A transport failure
+    /// cannot reopen the call; late entries for it are already no-ops.
+    async fn withdraw_held(&self, _call: &ProviderHeldReply) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]

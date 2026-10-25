@@ -67,12 +67,124 @@ pub fn not_dispatched_result(tool_call_id: &ToolCallId) -> ToolResult {
 
 /// A provider-held call has a known owner, so crash close-out must not claim an unknown outcome.
 pub fn provider_held_interrupted_result(tool_call_id: &ToolCallId) -> ToolResult {
-    ToolResult {
-        tool_call_id: tool_call_id.clone(),
-        output: ToolOutput::Error {
-            message: "provider_held_interrupted: the run was interrupted while the provider held the call".into(),
+    provider_held_close_result(tool_call_id, broca_protocol::RunFinishReason::Interrupted).0
+}
+
+/// Close a provider's known obligation without pretending that its outcome is unknown.
+pub fn provider_held_close_result(
+    tool_call_id: &ToolCallId,
+    reason: broca_protocol::RunFinishReason,
+) -> (ToolResult, DispatchOutcome, &'static str) {
+    let (code, text, outcome) = match reason {
+        broca_protocol::RunFinishReason::Cancelled => (
+            "provider_held_cancelled",
+            "cancelled",
+            DispatchOutcome::Interrupted,
+        ),
+        _ => (
+            "provider_held_interrupted",
+            "interrupted",
+            DispatchOutcome::Interrupted,
+        ),
+    };
+    (
+        ToolResult {
+            tool_call_id: tool_call_id.clone(),
+            output: ToolOutput::Error {
+                message: format!("{code}: the run was {text} while the provider held the call"),
+            },
+            is_error: true,
         },
-        is_error: true,
+        outcome,
+        code,
+    )
+}
+
+/// Closing is episode-wide, even after the last held call has its terminal. Only outcomes,
+/// not provider-controlled result text, identify a close-out. Ignore earlier episodes.
+pub fn provider_held_closing_reason<'a>(
+    prior: &ReplayState,
+    records: impl DoubleEndedIterator<Item = &'a WalRecord>,
+) -> Option<broca_protocol::RunFinishReason> {
+    use broca_protocol::RunFinishReason;
+    let episode: Vec<_> = records
+        .rev()
+        .take_while(|record| !matches!(record, WalRecord::RunStarted { .. }))
+        .collect();
+    let held: Vec<_> = episode
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::ToolCallProviderHeld { tool_call_id, .. } => Some(tool_call_id),
+            _ => None,
+        })
+        .collect();
+    if held.is_empty() || prior.run_finished_durable {
+        return None;
+    }
+    if prior.cancel_at.is_some() {
+        return Some(RunFinishReason::Cancelled);
+    }
+    episode.iter().find_map(|record| match record {
+        WalRecord::ToolResult {
+            result, outcome, ..
+        } if held.contains(&&result.tool_call_id)
+            && matches!(
+                outcome,
+                DispatchOutcome::Interrupted | DispatchOutcome::MaxSteps
+            ) =>
+        {
+            Some(*outcome)
+        }
+        _ => None,
+    })?;
+    Some(RunFinishReason::Interrupted)
+}
+
+/// Provider obligations in the last episode that have not delivered a result. Include durable
+/// close-out terminals so a crash before the seal does not lose their best-effort withdrawal.
+pub fn closing_held_replies<'a>(
+    records: impl DoubleEndedIterator<Item = &'a WalRecord>,
+) -> Vec<crate::tool_plane::ProviderHeldReply> {
+    let episode: Vec<_> = records
+        .rev()
+        .take_while(|record| !matches!(record, WalRecord::RunStarted { .. }))
+        .collect();
+    episode.iter().filter_map(|record| match record {
+        WalRecord::ToolCallProviderHeld { tool_call_id, call_key, module, reason, detail_digest, .. }
+            if !episode.iter().any(|record| matches!(record, WalRecord::ToolResult { result, outcome: DispatchOutcome::Completed, .. } if result.tool_call_id == *tool_call_id)) => {
+            Some(crate::tool_plane::ProviderHeldReply { tool_call_id: tool_call_id.clone(), call_key: call_key.clone(), module: module.clone(), reason: reason.clone(), detail_digest: detail_digest.clone() })
+        },
+        _ => None,
+    }).collect()
+}
+
+/// Spawn only after syncing the seal; a failed or hanging withdrawal cannot postpone it.
+pub fn withdraw_provider_held(
+    lifecycle: Option<std::sync::Arc<dyn crate::tool_plane::ProviderHeldLifecycle>>,
+    calls: Vec<crate::tool_plane::ProviderHeldReply>,
+) {
+    let Some(lifecycle) = lifecycle else {
+        return;
+    };
+    for call in calls {
+        let lifecycle = lifecycle.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                lifecycle.withdraw_held(&call),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(call_key = call.call_key, %error, "provider-held withdrawal failed")
+                }
+                Err(_) => tracing::warn!(
+                    call_key = call.call_key,
+                    "provider-held withdrawal timed out"
+                ),
+            }
+        });
     }
 }
 
@@ -198,6 +310,11 @@ pub fn close_out_open_batch(
     {
         return Vec::new();
     }
+    let reason = if prior.cancel_at.is_some() {
+        broca_protocol::RunFinishReason::Cancelled
+    } else {
+        broca_protocol::RunFinishReason::Interrupted
+    };
     let mut records = Vec::with_capacity(batch.calls.len() + 2);
     for (tool_call_id, state) in &batch.calls {
         let withdraw_elicitation = if *state == OpenCallState::Deferred {
@@ -214,6 +331,12 @@ pub fn close_out_open_batch(
                 outcome_unknown_result(tool_call_id),
                 DispatchOutcome::Unknown,
             ),
+            OpenCallState::ProviderHeld
+                if matches!(reason, broca_protocol::RunFinishReason::Cancelled) =>
+            {
+                let (result, outcome, _) = provider_held_close_result(tool_call_id, reason);
+                (result, outcome)
+            }
             OpenCallState::ProviderHeld => (
                 provider_held_interrupted_result(tool_call_id),
                 DispatchOutcome::Interrupted,
@@ -234,7 +357,7 @@ pub fn close_out_open_batch(
             result: Arc::new(result),
             outcome,
             reason: (*state == OpenCallState::ProviderHeld)
-                .then(|| "provider_held_interrupted".into()),
+                .then(|| provider_held_close_result(tool_call_id, reason).2.into()),
             withdraw_elicitation,
             provider_held: None,
         });
@@ -246,6 +369,23 @@ pub fn close_out_open_batch(
         step_id: batch.step_id,
     });
     records
+}
+
+/// Close a known closing episode even when every held terminal survived but the batch markers
+/// or seal did not. Only the batch is copied: close-out needs no reconstructed conversation.
+pub fn close_out_open_batch_for(
+    prior: &ReplayState,
+    reason: broca_protocol::RunFinishReason,
+    deferred_close: impl FnMut(&ToolCallId) -> DeferredCloseKind,
+) -> Vec<WalRecord> {
+    let mut closing = crate::replay::replay(&[]).expect("empty WAL has a valid replay");
+    closing.open_tool_batch = prior.open_tool_batch.clone();
+    closing.resolution = ReplayResolution::Interrupted {
+        indeterminate: Vec::new(),
+    };
+    closing.cancel_at = (reason == broca_protocol::RunFinishReason::Cancelled)
+        .then_some(broca_wal::record::RunCancelAt::Now);
+    close_out_open_batch(&closing, deferred_close)
 }
 
 /// The records that keep a tool turn whose remaining calls were never dispatched, written when a
@@ -447,6 +587,156 @@ mod tests {
         if let ReplayResolution::Resume { pending } = &prior.resolution {
             assert!(refuse_prepared_resume(pending.as_ref()).is_ok());
         }
+    }
+
+    #[test]
+    fn provider_held_close_out_survives_every_terminal_prefix() {
+        use crate::replay::provider_held_tests::{held, intent};
+        for sequential in [false, true] {
+            for cancel in [false, true] {
+                let mut records = batch(&["a", "b"]);
+                records.extend([intent("a"), intent("b"), held(sequential)]);
+                if !sequential {
+                    let mut second = held(false);
+                    if let WalRecord::ToolCallProviderHeld {
+                        tool_call_id,
+                        call_key,
+                        ..
+                    } = &mut second
+                    {
+                        *tool_call_id = ToolCallId("b".into());
+                        *call_key = "lineage:5".into();
+                    }
+                    records.push(second);
+                }
+                if cancel {
+                    records.push(WalRecord::RunCancelRequested {
+                        run_id: broca_protocol::RunId("r".into()),
+                        at: broca_wal::record::RunCancelAt::StepBoundary,
+                    });
+                }
+                let reason = if cancel {
+                    RunFinishReason::Cancelled
+                } else {
+                    RunFinishReason::Interrupted
+                };
+                let close = close_out_open_batch_for(&replay(&records).unwrap(), reason, |_| {
+                    DeferredCloseKind::NotDispatched
+                });
+                for cut in 1..=close.len() {
+                    let mut cut_records = records.clone();
+                    cut_records.extend_from_slice(&close[..cut]);
+                    let prior = replay(&cut_records).unwrap();
+                    assert_eq!(
+                        provider_held_closing_reason(&prior, cut_records.iter()),
+                        Some(reason),
+                        "closed held terminals mark the episode even without an open held sibling"
+                    );
+                    let repair = close_out_open_batch_for(&prior, reason, |_| {
+                        DeferredCloseKind::NotDispatched
+                    });
+                    cut_records.extend(repair);
+                    cut_records.push(WalRecord::RunFinished {
+                        ts_ms: None,
+                        interrupt_reason: None,
+                        reason: if cancel {
+                            RunFinishReason::Cancelled
+                        } else {
+                            RunFinishReason::Interrupted
+                        },
+                        usage: prior.usage,
+                        retries_used: 0,
+                        error: None,
+                    });
+                    for id in ["a", "b"] {
+                        let results: Vec<_> = cut_records
+                            .iter()
+                            .filter_map(|record| match record {
+                                WalRecord::ToolResult {
+                                    result,
+                                    outcome,
+                                    reason,
+                                    ..
+                                } if result.tool_call_id.0 == id => Some((result, outcome, reason)),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(
+                            results.len(),
+                            1,
+                            "every planned call gets exactly one terminal"
+                        );
+                        let (result, outcome, code) = results[0];
+                        if sequential && id == "b" {
+                            assert_eq!(**result, not_dispatched_result(&ToolCallId("b".into())));
+                            assert_eq!(
+                                *outcome,
+                                DispatchOutcome::Interrupted,
+                                "closed-out held successors are never Unknown"
+                            );
+                        } else {
+                            let expected_code = if cancel {
+                                "provider_held_cancelled"
+                            } else {
+                                "provider_held_interrupted"
+                            };
+                            assert_eq!(code.as_deref(), Some(expected_code));
+                            assert_eq!(*outcome, DispatchOutcome::Interrupted);
+                            assert_eq!(result.output, ToolOutput::Error { message: format!("{expected_code}: the run was {} while the provider held the call", if cancel { "cancelled" } else { "interrupted" }) });
+                        }
+                    }
+                    let repaired = replay(&cut_records).unwrap();
+                    assert!(repaired.open_tool_batch.is_none());
+                    assert_eq!(
+                        provider_held_closing_reason(&repaired, cut_records.iter()),
+                        None
+                    );
+                    assert!(repaired.prompt.iter().any(|message| message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, broca_protocol::ContentBlock::ToolCall(_)))));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_held_closing_precedence_uses_outcomes_not_reasons() {
+        use crate::replay::provider_held_tests::{prefix, terminal};
+        let mut records = prefix(false);
+        let mut stopped = terminal("a", DispatchOutcome::MaxSteps);
+        if let WalRecord::ToolResult { reason, .. } = &mut stopped {
+            *reason = Some("unrelated text".into());
+        }
+        records.push(stopped);
+        let prior = replay(&records).unwrap();
+        assert_eq!(
+            provider_held_closing_reason(&prior, records.iter()),
+            Some(RunFinishReason::Interrupted)
+        );
+        records.push(WalRecord::RunCancelRequested {
+            run_id: broca_protocol::RunId("r".into()),
+            at: broca_wal::record::RunCancelAt::Now,
+        });
+        assert_eq!(
+            provider_held_closing_reason(&replay(&records).unwrap(), records.iter()),
+            Some(RunFinishReason::Cancelled)
+        );
+        records.retain(|record| {
+            !matches!(
+                record,
+                WalRecord::RunCancelRequested { .. } | WalRecord::ToolResult { .. }
+            )
+        });
+        let mut delivered = terminal("a", DispatchOutcome::Completed);
+        if let WalRecord::ToolResult { reason, .. } = &mut delivered {
+            *reason = Some("provider_held_stopped".into());
+        }
+        records.push(delivered);
+        assert_eq!(
+            provider_held_closing_reason(&replay(&records).unwrap(), records.iter()),
+            None
+        );
     }
 
     /// A sealed tool turn keeps every written message: the step whose batch never opened gets a

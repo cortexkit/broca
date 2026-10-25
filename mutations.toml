@@ -30034,3 +30034,85 @@ file = "crates/broca-module/src/late_results_store.rs"
 old = '''        broca_store::create_private_sqlite(&path)
             .map_err(|error| format!("create {} owner-only: {error}", path.display()))?;'''
 new = "        // NON-VACUITY BREAK: let SQLite create the store through the umask."
+
+[[control]]
+id = "core-provider-held-closing-without-open-sibling"
+guards = "A held close-out terminal marks the episode closing even after the last open held call is terminal"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/resume.rs"
+expect_red = ["resume::tests::provider_held_close_out_survives_every_terminal_prefix"]
+file = "crates/broca-core/src/resume.rs"
+old = "    if held.is_empty() || prior.run_finished_durable {"
+new = "    if held.is_empty() || prior.run_finished_durable || !prior.open_tool_batch.as_ref().is_some_and(|batch| batch.calls.iter().any(|(_, state)| *state == OpenCallState::ProviderHeld)) { // NON-VACUITY BREAK: forget closing once no held call remains open."
+
+[[control]]
+id = "core-provider-held-closeout-covers-successors"
+guards = "Full-batch close-out supplies a definite not-dispatched terminal to every held successor"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/resume.rs"
+expect_red = ["resume::tests::provider_held_close_out_survives_every_terminal_prefix"]
+file = "crates/broca-core/src/resume.rs"
+old = "    for (tool_call_id, state) in &batch.calls {"
+new = "    for (tool_call_id, state) in &batch.calls {\n        if *state == OpenCallState::HeldSuccessor { continue; } // NON-VACUITY BREAK: strand the never-sent planned successor."
+
+[[control]]
+id = "module-provider-held-cancel-durable-before-answer"
+guards = "Both immediate and boundary cancellation of a paused provider hold sync RunCancelRequested before answering"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::provider_held_paused_cancel_ack_is_durable_before_finalizer_and_seal"]
+file = "crates/broca-module/src/actor.rs"
+old = "        if provider_held {"
+new = "        if provider_held && false { // NON-VACUITY BREAK: acknowledge immediate cancellation without durable intent."
+
+[[control]]
+id = "core-provider-held-live-closeout-does-not-wait-for-delivery"
+guards = "Cancel closes held calls at once while already-sent siblings remain in flight"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_live_cancel_closes_before_sibling_and_withdraws_after_seal"]
+file = "crates/broca-core/src/run.rs"
+old = "        result = closing => result,"
+new = "        result = std::future::pending::<CallResolution>() => result, // NON-VACUITY BREAK: leave a closing call waiting for delivery."
+
+[[control]]
+id = "core-provider-held-shutdown-does-not-close"
+guards = "Graceful shutdown leaves a live provider-held call without a terminal so it can resume after restart"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_live_shutdown_preserves_obligation_until_restart_resume"]
+file = "crates/broca-core/src/run.rs"
+old = "        approval_gate::cancelled_token(cancel).await;"
+new = "        tokio::select! { _ = approval_gate::cancelled_token(cancel) => {}, _ = approval_gate::cancelled_token(stop) => {} } // NON-VACUITY BREAK: treat shutdown as a request to close a held call."
+
+[[control]]
+id = "module-provider-held-cancel-answer-waits-for-fsync"
+guards = "A provider-held cancel answer waits for the actual file-sync barrier acknowledgement, not merely the cancel record append"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::provider_held_paused_cancel_ack_is_durable_before_finalizer_and_seal"]
+file = "crates/broca-module/src/actor.rs"
+old = '''            if let Err(error) = writer.sync().await {
+                return CancelOutcome::Error(error.to_string());
+            }
+            self.pending_cancels.insert('''
+new = '''            // NON-VACUITY BREAK: acknowledge the appended cancel before its sync barrier.
+            self.pending_cancels.insert('''

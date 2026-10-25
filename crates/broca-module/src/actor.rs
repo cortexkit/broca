@@ -2009,7 +2009,18 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 false
             }
             LineageCmd::Cancel { run_id, at, reply } => {
-                let _ = reply.send(self.on_cancel_at(&run_id, at).await);
+                let outcome = self.on_cancel_at(&run_id, at).await;
+                let acknowledged = matches!(outcome, CancelOutcome::Ack);
+                let _ = reply.send(outcome);
+                if acknowledged && self.pending_cancels.contains_key(&run_id) {
+                    if let Ok(true) = self.has_provider_held_episode(&run_id).await {
+                        if let RunState::Active { cancel, .. } = &self.state {
+                            cancel.cancel();
+                        } else if let Err(error) = self.retry_pending_cancels().await {
+                            tracing::warn!(%error, "provider-held cancel finalizer failed");
+                        }
+                    }
+                }
                 false
             }
             LineageCmd::Retract {
@@ -2448,9 +2459,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .iter()
             .map(|frame| frame.record.clone())
             .collect();
-        let tail_resolution = broca_core::replay(&tail)
-            .map_err(|error| error.to_string())?
-            .resolution;
+        let tail_prior = broca_core::replay(&tail).map_err(|error| error.to_string())?;
+        if broca_core::resume::provider_held_closing_reason(&tail_prior, tail.iter()).is_some() {
+            self.write_interrupted_seal(None, SealCause::CrashOrphan)
+                .await?;
+            self.refresh_admission_view().await?;
+            return self.drain_queue_one().await;
+        }
+        let tail_resolution = tail_prior.resolution;
 
         // The terminal run index cannot identify a crash that happened before its own update.
         // Reopening the affected lineage closes that earlier WAL-to-index window directly from
@@ -6033,6 +6049,21 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
     }
 
+    async fn has_provider_held_episode(&self, run_id: &RunId) -> Result<bool, String> {
+        let records = self.read_wal_records().await?;
+        let held = !broca_core::resume::closing_held_replies(records.iter()).is_empty();
+        for record in records.iter().rev() {
+            match record {
+                WalRecord::RunStarted {
+                    run_id: started, ..
+                } => return Ok(held && started == run_id),
+                WalRecord::RunFinished { .. } => return Ok(false),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     async fn on_cancel_at(
         &mut self,
         run_id: &RunId,
@@ -6048,6 +6079,32 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 Err(error) => CancelOutcome::Error(error.to_string()),
             };
+        }
+        let provider_held = match self.has_provider_held_episode(run_id).await {
+            Ok(held) => held,
+            Err(error) => return CancelOutcome::Error(error),
+        };
+        if provider_held {
+            let writer = self.writer.as_ref().expect("an open actor owns its writer");
+            if let Err(error) = writer
+                .record(WalRecord::RunCancelRequested {
+                    run_id: run_id.clone(),
+                    at,
+                })
+                .into_result()
+            {
+                return CancelOutcome::Error(error.to_string());
+            }
+            if let Err(error) = writer.sync().await {
+                return CancelOutcome::Error(error.to_string());
+            }
+            self.pending_cancels.insert(
+                run_id.clone(),
+                self.skip_materialization_runs.contains(run_id),
+            );
+            // Acknowledge the synced request before cancelling the active run's token or
+            // starting a task to close a paused run. Neither cancel point waits for a late result.
+            return CancelOutcome::Ack;
         }
         if let RunState::Active {
             run_id: active,
@@ -7393,7 +7450,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // both the shutdown seal's five-second limit and the global exit deadline remain
         // enforceable.
         let lineage = writer.lineage_id();
-        let (prior, attempts_already_recorded, projection) =
+        let (prior, attempts_already_recorded, projection, closing, held_replies) =
             spawn_blocking(JobKind::WalRead, move || {
                 let frames = wal_store
                     .read_records_range(&key, 0, Some(head), None)
@@ -7404,7 +7461,14 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 let recorded =
                     sealed_step.map(|step| attempts_recorded_for_latest_step(&records, step));
                 broca_core::replay(&records)
-                    .map(|prior| (prior, recorded, projection))
+                    .map(|prior| {
+                        let closing = broca_core::resume::provider_held_closing_reason(
+                            &prior,
+                            records.iter(),
+                        );
+                        let held_replies = broca_core::resume::closing_held_replies(records.iter());
+                        (prior, recorded, projection, closing, held_replies)
+                    })
                     .map_err(|e| e.to_string())
             })
             .await
@@ -7418,10 +7482,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
             } => {
                 // With no indeterminate sibling, shutdown must leave the provider's obligation
                 // live, including open approval cards, regardless of the restart policy.
-                if !open_held.is_empty() {
+                if closing.is_none() && !open_held.is_empty() {
                     self.park_provider_held(run_id, false).await?;
                 }
-                return Ok(false);
+                if closing.is_none() {
+                    return Ok(false);
+                }
             }
             broca_core::ReplayResolution::Resume { .. }
             | broca_core::ReplayResolution::Interrupted { .. }
@@ -7450,8 +7516,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 );
             }
         }
-        let close_out =
-            broca_core::close_out_open_batch(&prior, |id| {
+        let held_close_reason = closing.unwrap_or(broca_protocol::RunFinishReason::Interrupted);
+        let seal_reason = held_close_reason;
+        let deferred_close =
+            |id: &broca_protocol::ToolCallId| {
                 if self.executor.elicitation_plane().is_some() {
                     if let Some(owed) = projection.calls.iter().find_map(|(key, call)| match &*call
                         .prepared
@@ -7475,12 +7543,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                 }
                 broca_core::DeferredCloseKind::NotDispatched
-            });
+            };
+        let close_out = if closing.is_some() {
+            broca_core::resume::close_out_open_batch_for(&prior, held_close_reason, deferred_close)
+        } else {
+            broca_core::close_out_open_batch(&prior, deferred_close)
+        };
         let resuming = cause == SealCause::CrashOrphan;
         if resuming {
             writer.record(broca_core::resume_started_record(&prior, head, Vec::new()));
         }
-        if !close_out.is_empty() {
+        if !held_replies.is_empty() {
+            // Held close-out records share the terminal's barrier: a committed synthetic batch
+            // without its seal could otherwise read as a natural ending after a crash.
+            for record in close_out {
+                writer.record(record);
+            }
+        } else if !close_out.is_empty() {
             for record in close_out {
                 writer.record(record);
             }
@@ -7489,9 +7568,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // through its reserved space. Recovery only deduplicates records present on disk.
             writer.sync_for_seal().await.map_err(|e| e.to_string())?;
         } else {
-            // A durable tool turn whose calls were never dispatched is kept, not dropped: each
-            // such call gets a never-executed result. No barrier here, so these records commit
-            // with the terminal below; on their own they would read as a finished run.
+            // Keep a durable tool turn whose calls were never dispatched as well, sharing
+            // the seal's barrier so it cannot look like a natural ending on its own.
             for record in broca_core::close_out_pending_turn(&prior) {
                 writer.record(record);
             }
@@ -7505,7 +7583,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     }
                     .into(),
                 ),
-                reason: broca_protocol::RunFinishReason::Interrupted,
+                reason: seal_reason,
                 // Timestamp this terminal so exported spend belongs to its billing period.
                 // A missing ts_ms becomes NULL occurred_at_ms and is omitted from period totals.
                 ts_ms: self
@@ -7517,6 +7595,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
             })
             .map_err(|error| error.to_string())?;
         writer.sync().await.map_err(|e| e.to_string())?;
+        broca_core::resume::withdraw_provider_held(
+            self.executor.provider_held_lifecycle(),
+            held_replies,
+        );
         if let Some(run_id) = prior.run_id.clone() {
             self.executor.on_run_sealed(crate::executor::SealedRun {
                 session: self.key.clone(),
@@ -7555,7 +7637,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
             let written = self
                 .index_terminal_from_wal(
                     &run_id,
-                    RunIndexState::Interrupted,
+                    if seal_reason == broca_protocol::RunFinishReason::Cancelled {
+                        RunIndexState::Cancelled
+                    } else {
+                        RunIndexState::Interrupted
+                    },
                     usage,
                     None,
                     retries_used,
@@ -8699,6 +8785,429 @@ mod tests {
                 .any(|frame| matches!(frame.record, WalRecord::RunFinished { .. })));
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    fn held_close_seed(key: &BindIdentity, sequential: bool) -> Vec<WalRecord> {
+        use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
+        use broca_protocol::{BatchId, MessageId, StepId, ToolCallId};
+        let request = text_req(key, "held");
+        let calls: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|id| ToolCall {
+                tool_call_id: ToolCallId(id.into()),
+                tool_name: "ask".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            })
+            .collect();
+        let mut records = vec![
+            WalRecord::RunStarted {
+                written_at_ms: None,
+                tags: None,
+                session_class: None,
+                retention: None,
+                hooks: None,
+                title: None,
+                on_restart: None,
+                keep_warm: None,
+                marker_order_version: None,
+                manifest: None,
+                scope: None,
+                send_id: None,
+                request_identity_digest: Some(broca_core::submission_identity_digest(
+                    &request.to_submission(),
+                )),
+                project_id: None,
+                principal: None,
+                ts_ms: Some(1),
+                run_id: RunId("held".into()),
+                session: key.clone(),
+                config: Box::new(min_config()),
+                input: request.input.into(),
+                origin: broca_wal::RunOrigin::Fresh,
+                submission_id: None,
+            },
+            WalRecord::ModelStepFinished {
+                written_at_ms: None,
+                tags: None,
+                hooks: None,
+                step_id: StepId(1),
+                assistant_message: Arc::new(AssistantMessage {
+                    message_id: MessageId("m".into()),
+                    content: calls.iter().cloned().map(ContentBlock::ToolCall).collect(),
+                }),
+                usage: Usage::default(),
+                retries_used: 0,
+                finish_reason: None,
+                service_tier_used: None,
+                speed_used: None,
+            },
+            WalRecord::ToolBatchStarted {
+                batch_id: BatchId("held-b1".into()),
+                step_id: StepId(1),
+                planned_calls: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+            },
+        ];
+        for call in calls {
+            records.push(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                batch_id: BatchId("held-b1".into()),
+                tool_call_id: call.tool_call_id,
+                tool_name: Some(call.tool_name),
+                args: Arc::new(call.input),
+                module_id: Some("tools".into()),
+                schema_pin: None,
+                hooks: None,
+                approval_digest: None,
+                call_key: None,
+            });
+        }
+        records.push(WalRecord::ToolCallProviderHeld {
+            batch_id: BatchId("held-b1".into()),
+            tool_call_id: ToolCallId("a".into()),
+            call_key: "lineage:4".into(),
+            module: "tools".into(),
+            reason: "running".into(),
+            detail_digest: None,
+            held_at_ms: 42,
+            sequential,
+        });
+        records
+    }
+
+    fn seed_held_wal(store: &FileWalStore, key: &BindIdentity, records: &[WalRecord]) {
+        // Raw WAL frames exercise recovery from held records that the WAL writer cannot yet
+        // emit while held-reply support remains disabled.
+        let path = store.wal_path(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes: Vec<_> = records
+            .iter()
+            .enumerate()
+            .flat_map(|(index, record)| {
+                broca_wal::framing::encode_payload(
+                    index as u64 + 1,
+                    1,
+                    &serde_json::to_vec(record).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    struct HeldCancelCoreExecutor {
+        wal_store: Arc<FileWalStore>,
+        provider: broca_core::StubProvider,
+        plane: StubToolPlane,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+    }
+
+    #[derive(Default)]
+    struct CancelSyncGate {
+        synced: tokio::sync::Notify,
+        released: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    impl CancelSyncGate {
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct ReleaseCancelSync(Arc<CancelSyncGate>);
+    impl Drop for ReleaseCancelSync {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    struct CancelSyncStore {
+        inner: Arc<FileWalStore>,
+        gate: Arc<CancelSyncGate>,
+    }
+
+    impl WalStore for CancelSyncStore {
+        fn open(
+            &self,
+            key: &BindIdentity,
+        ) -> Result<Box<dyn broca_wal::Wal + Send>, broca_wal::WalError> {
+            Ok(Box::new(CancelSyncWal {
+                inner: self.inner.open(key)?,
+                gate: self.gate.clone(),
+                cancel_written: AtomicBool::new(false),
+            }))
+        }
+        fn read_records(
+            &self,
+            key: &BindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.inner.read_records(key)
+        }
+        fn read_records_range(
+            &self,
+            key: &BindIdentity,
+            after_seq: u64,
+            through_seq: Option<u64>,
+            anchor: Option<&broca_wal::WalByteAnchor>,
+        ) -> Result<broca_wal::WalRangeRead, broca_wal::WalError> {
+            self.inner
+                .read_records_range(key, after_seq, through_seq, anchor)
+        }
+    }
+
+    struct CancelSyncWal {
+        inner: Box<dyn broca_wal::Wal + Send>,
+        gate: Arc<CancelSyncGate>,
+        cancel_written: AtomicBool,
+    }
+
+    impl broca_wal::Wal for CancelSyncWal {
+        fn append(
+            &mut self,
+            fence: u64,
+            record: &WalRecord,
+            sync: bool,
+        ) -> Result<u64, broca_wal::WalError> {
+            let seq = self.inner.append(fence, record, sync)?;
+            if matches!(record, WalRecord::RunCancelRequested { .. }) {
+                self.cancel_written.store(true, Ordering::Release);
+            }
+            Ok(seq)
+        }
+        fn sync(&self) -> Result<(), broca_wal::WalError> {
+            self.inner.sync()?;
+            if self.cancel_written.swap(false, Ordering::AcqRel) {
+                // The file has synced, but the writer's barrier acknowledgement is still held.
+                self.gate.synced.notify_one();
+                let released = self.gate.released.lock().unwrap();
+                let (released, _) = self
+                    .gate
+                    .changed
+                    .wait_timeout_while(released, Duration::from_secs(5), |released| !*released)
+                    .unwrap();
+                assert!(
+                    *released,
+                    "test did not release the cancel sync acknowledgement"
+                );
+            }
+            Ok(())
+        }
+        fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.inner.replay()
+        }
+        fn tail_after_seq(
+            &self,
+            seq: u64,
+        ) -> Result<Vec<broca_wal::FramedRecord>, broca_wal::WalError> {
+            self.inner.tail_after_seq(seq)
+        }
+        fn last_seq(&self) -> u64 {
+            self.inner.last_seq()
+        }
+        fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
+            self.inner.lineage_id()
+        }
+    }
+
+    #[async_trait]
+    impl RunExecutor for HeldCancelCoreExecutor {
+        async fn execute(
+            &self,
+            job: RunJob,
+            out: mpsc::Sender<OutputEvent>,
+        ) -> Result<RunSummary, RunError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            let result = run_loop_on_writer_admitted_with_prior_snapshot(
+                job.req,
+                job.writer.as_ref(),
+                StartMode::FreshOrResume,
+                &self.provider,
+                &self.plane,
+                &AllowAll,
+                self.wal_store.as_ref(),
+                None,
+                job.control,
+                &out,
+                job.on_admitted,
+                Some(&job.prior_snapshot),
+            )
+            .await;
+            self.finished.notify_one();
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_held_paused_cancel_ack_is_durable_before_finalizer_and_seal() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for at in [broca_wal::record::RunCancelAt::Now, broca_wal::record::RunCancelAt::StepBoundary] {
+                let root = broca_test_support::scratch_root().join(format!("held-cancel-{}-{at:?}", std::process::id()));
+                std::fs::create_dir_all(root.join("project")).unwrap();
+                let key = BindIdentity::new(root.join("project"), "broca", "held-cancel");
+                let store = Arc::new(FileWalStore::new(root.join("wal")));
+                let mut records = held_close_seed(&key, true);
+                records.push(WalRecord::RunPaused { run_id: RunId("held".into()), reason: broca_protocol::PauseReason::ToolHeld, error: None, ts_ms: Some(43) });
+                seed_held_wal(&store, &key, &records);
+                let executor = Arc::new(HeldCancelCoreExecutor {
+                    wal_store: store.clone(), provider: broca_core::StubProvider::new(vec![]), plane: StubToolPlane::new(),
+                    entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new(), finished: tokio::sync::Notify::new(),
+                });
+                let gate = Arc::new(CancelSyncGate::default());
+                let _release_on_failure = ReleaseCancelSync(gate.clone());
+                let registry = LineageRegistry::new(Arc::new(SeamOpener { lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))), wal_store: Arc::new(CancelSyncStore { inner: store.clone(), gate: gate.clone() }), idle_ttl: Duration::from_secs(60), executor: executor.clone() }));
+                let mut ack = Box::pin(registry.route_cancel_at(&key, RunId("held".into()), at));
+                tokio::select! {
+                    _ = gate.synced.notified() => {},
+                    outcome = &mut ack => panic!("cancel acknowledgement preceded its sync barrier: {outcome:?}"),
+                }
+                tokio::select! {
+                    biased;
+                    _ = &mut ack => panic!("cancel acknowledgement must wait for the sync barrier"),
+                    _ = tokio::task::yield_now() => {},
+                }
+                gate.release();
+                let ack = ack.await.unwrap();
+                assert!(matches!(ack, CancelOutcome::Ack));
+                executor.entered.notified().await;
+                let before: Vec<_> = store.read_records(&key).unwrap().into_iter().map(|frame| frame.record).collect();
+                assert!(before.iter().any(|record| matches!(record, WalRecord::RunCancelRequested { at: requested, .. } if *requested == at)), "cancel acknowledgement requires the durable RunCancelRequested");
+                assert!(!before.iter().any(|record| matches!(record, WalRecord::RunFinished { .. })), "cancel is answered before its finalizer seals");
+                executor.release.notify_one();
+                executor.finished.notified().await;
+                let raw: Vec<_> = store.read_records(&key).unwrap().into_iter().map(|frame| frame.record).collect();
+                assert!(raw.iter().any(|record| matches!(record, WalRecord::RunFinished { reason: broca_protocol::RunFinishReason::Cancelled, .. })));
+                assert!(executor.provider.calls().is_empty());
+                assert_eq!(executor.plane.exec_count(&broca_protocol::ToolCallId("b".into())), 0);
+                let terminals: Vec<_> = raw.iter().filter_map(|record| match record { WalRecord::ToolResult { result, outcome, .. } => Some((result, outcome)), _ => None }).collect();
+                assert_eq!(terminals.len(), 2);
+                assert!(terminals.iter().all(|(_, outcome)| **outcome == broca_wal::DispatchOutcome::Interrupted));
+                assert!(registry.stop_and_seal().await);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }).await.expect("cancel of a closed held actor must not wait for delivery");
+    }
+
+    #[tokio::test]
+    async fn provider_held_open_recovery_finishes_closing_prefixes_without_execution() {
+        use broca_protocol::RunFinishReason;
+        use broca_wal::DispatchOutcome;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for sequential in [false, true] {
+                for cancelled in [false, true] {
+                    for paused in [false, true] {
+                        let root = broca_test_support::scratch_root().join(format!(
+                            "held-close-{}-{sequential}-{cancelled}-{paused}",
+                            std::process::id()
+                        ));
+                        std::fs::create_dir_all(root.join("project")).unwrap();
+                        let key = BindIdentity::new(root.join("project"), "broca", "held-close");
+                        let wal_store = Arc::new(FileWalStore::new(root.join("wal")));
+                        let mut records = held_close_seed(&key, sequential);
+                        if paused {
+                            records.push(WalRecord::RunPaused {
+                                run_id: RunId("held".into()),
+                                reason: broca_protocol::PauseReason::ToolHeld,
+                                error: None,
+                                ts_ms: Some(43),
+                            });
+                        }
+                        if cancelled {
+                            records.push(WalRecord::RunCancelRequested {
+                                run_id: RunId("held".into()),
+                                at: broca_wal::record::RunCancelAt::Now,
+                            });
+                        }
+                        let prior = broca_core::replay(&records).unwrap();
+                        let close_reason = if cancelled {
+                            RunFinishReason::Cancelled
+                        } else {
+                            RunFinishReason::Interrupted
+                        };
+                        let close = broca_core::resume::close_out_open_batch_for(
+                            &prior,
+                            close_reason,
+                            |_| broca_core::DeferredCloseKind::NotDispatched,
+                        );
+                        records.push(close[0].clone());
+                        seed_held_wal(&wal_store, &key, &records);
+                        let executor = Arc::new(RecoveryGate::new());
+                        let registry = LineageRegistry::new(Arc::new(SeamOpener {
+                            lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))),
+                            wal_store: wal_store.clone(),
+                            idle_ttl: Duration::from_secs(60),
+                            executor: executor.clone(),
+                        }));
+                        registry.resume_held_run(&key).await.unwrap();
+                        assert!(
+                            executor.started().is_empty(),
+                            "closing recovery never invokes the model or dispatches a successor"
+                        );
+                        let raw: Vec<_> = wal_store
+                            .read_records(&key)
+                            .unwrap()
+                            .into_iter()
+                            .map(|frame| frame.record)
+                            .collect();
+                        let finished = raw
+                            .iter()
+                            .find_map(|record| match record {
+                                WalRecord::RunFinished { reason, .. } => Some(*reason),
+                                _ => None,
+                            })
+                            .expect("closing recovery syncs the seal before taking commands");
+                        assert_eq!(
+                            finished,
+                            if cancelled {
+                                RunFinishReason::Cancelled
+                            } else {
+                                RunFinishReason::Interrupted
+                            }
+                        );
+                        let results: Vec<_> = raw
+                            .iter()
+                            .filter_map(|record| match record {
+                                WalRecord::ToolResult {
+                                    result, outcome, ..
+                                } => Some((result, outcome)),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(results.len(), 2);
+                        let successor = results
+                            .iter()
+                            .find(|(result, _)| result.tool_call_id.0 == "b")
+                            .unwrap();
+                        assert_eq!(
+                            *successor.1,
+                            if sequential {
+                                DispatchOutcome::Interrupted
+                            } else {
+                                DispatchOutcome::Unknown
+                            }
+                        );
+                        if sequential {
+                            assert_eq!(
+                                successor.0.output,
+                                broca_protocol::ToolOutput::Error {
+                                    message: broca_core::resume::NOT_DISPATCHED_TEXT.into()
+                                }
+                            );
+                        }
+                        let prior = broca_core::replay(&raw).unwrap();
+                        assert!(prior.open_tool_batch.is_none());
+                        assert!(registry.stop_and_seal().await);
+                        let _ = std::fs::remove_dir_all(root);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("closing recovery must not wait for a provider");
     }
 
     #[test]
