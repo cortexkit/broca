@@ -7016,8 +7016,8 @@ test_count_pattern = "Ran {count} test"
 test_file = "scripts/test-archive-read.py"
 expect_red = ["ArchiveReadTests.test_compaction_records_decode_and_scan_live_and_archived"]
 file = "scripts/lib/archive_read.py"
-old = "frames.append(WalFrame(seq, fence, record, payload))"
-new = "if record['type'] != 'compaction_wait':  # NON-VACUITY BREAK\n            frames.append(WalFrame(seq, fence, record, payload))"
+old = "frames.append(WalFrame(seq, fence, record, payload, requires))"
+new = "if record['type'] != 'compaction_wait':  # NON-VACUITY BREAK\n            frames.append(WalFrame(seq, fence, record, payload, requires))"
 
 [[control]]
 id = "wal-tools-newer-writer-refusal"

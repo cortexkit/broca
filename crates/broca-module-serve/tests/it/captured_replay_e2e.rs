@@ -805,6 +805,8 @@ async fn send_anthropic_turn(
             auth: None,
             one_shot: None,
             context_management: None,
+            session_class: None,
+            plan: None,
         })
         .await
         .map_err(|error| error.to_string())?;
