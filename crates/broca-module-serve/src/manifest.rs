@@ -133,6 +133,21 @@ pub fn manifest_with_archive(
 pub(crate) fn management_operations() -> Vec<ManagementOperation> {
     vec![
         ManagementOperation {
+            name: cortexkit_role_llm_runner::ops::SESSION_HISTORY.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Page surviving session history as stored entries or display rows.".into()),
+        },
+        ManagementOperation {
+            name: cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read the records of a session-owned output reference set.".into()),
+        },
+        ManagementOperation {
+            name: cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read retained bytes of a session-owned output reference.".into()),
+        },
+        ManagementOperation {
             name: "session.upload_begin".into(),
             kind: ManagementOperationKind::Mutate,
             description: Some("Reserve session-owned attachment staging.".into()),

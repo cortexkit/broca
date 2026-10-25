@@ -74,16 +74,44 @@ pub struct MessageOutputRefs {
 }
 
 impl MessageOutputRefs {
+    fn descriptors(&self) -> MessageOutputDescriptors {
+        MessageOutputDescriptors {
+            reply: self.reply.descriptor.clone(),
+            calls: self
+                .calls
+                .iter()
+                .map(|(id, set)| (id.clone(), set.descriptor.clone()))
+                .collect(),
+        }
+    }
+
     /// `row` with this message's descriptors: the reply set's on the row, and each call set's on
-    /// the tool-call part with the same `tool_call_id`. A display read of this message's row calls
+    /// the tool-call part with the same `tool_call_id` at its stored position. A display read of this message's row calls
     /// this; nothing else carries descriptors (llm-runner §9.13: never the default `session.read`
     /// entry or a stored body).
+    pub fn attach(&self, row: DisplayRow) -> DisplayRow {
+        self.descriptors().attach(row)
+    }
+}
+
+/// A display page retains descriptors only, not a copy of every row's resolved snapshots.
+pub struct MessageOutputDescriptors {
+    pub reply: Descriptor,
+    pub calls: Vec<(String, Descriptor)>,
+}
+
+impl MessageOutputDescriptors {
     pub fn attach(&self, mut row: DisplayRow) -> DisplayRow {
-        row.output_refs = Some(self.reply.descriptor.clone());
-        for part in &mut row.parts {
+        row.output_refs = Some(self.reply.clone());
+        for (index, part) in row.parts.iter_mut().enumerate() {
             if let DisplayPart::ToolCall(call) = part {
-                if let Some((_, set)) = self.calls.iter().find(|(id, _)| *id == call.tool_call_id) {
-                    call.output_refs = Some(set.descriptor.clone());
+                // A provider may reuse a call id. Canonical rows retain every stored part in
+                // order, so the set's block index disambiguates without interpreting part keys.
+                if let Some((_, set)) = self.calls.iter().find(|(id, set)| {
+                    *id == call.tool_call_id
+                        && parse_set(&set.set_id).is_some_and(|(_, key)| key.call == Some(index))
+                }) {
+                    call.output_refs = Some(set.clone());
                 }
             }
         }
@@ -159,6 +187,8 @@ struct Messages<'a, H: ?Sized> {
     session: &'a LineageKey,
     lineage: String,
     cache: BTreeMap<u64, Option<SessionReadMessage>>,
+    locations: BTreeMap<u64, Option<broca_core::TagLocation>>,
+    records: Option<Vec<broca_wal::WalRecord>>,
 }
 
 impl<H: ServeHandler + ?Sized> Messages<'_, H> {
@@ -260,6 +290,25 @@ fn stored_output(output: &ToolOutput) -> (String, Option<String>, Vec<u8>) {
 /// tool name or module id is empty.
 const UNKNOWN: &str = "";
 
+/// Dispatch attribution is per occurrence within one assistant message. A repeated provider
+/// id can name a later synthetic refusal, and a later message can legitimately reuse the id.
+fn call_attribution<'a>(
+    entry: &'a SessionReadMessage,
+    id: &str,
+    call_occurrence: usize,
+) -> Option<&'a broca_wire::SessionReadToolCall> {
+    // Core refuses later same-id calls within a model message before dispatch. The legacy
+    // read projection can repeat the first id's attribution; that is not a second dispatch.
+    if call_occurrence != 0 {
+        return None;
+    }
+    entry
+        .tool_calls
+        .iter()
+        .filter(|call| call.tool_call_id == id)
+        .nth(call_occurrence)
+}
+
 /// The target part `index` of `entry` is, as the writing request numbered it. `call_entry` is
 /// the message before it, which holds a tool result's call.
 fn target_of(
@@ -271,16 +320,20 @@ fn target_of(
     Some(match entry.message.content.get(index)? {
         ContentBlock::ToolResult(result) => {
             let id = &result.tool_call_id.0;
+            let occurrence = entry.message.content[..index].iter().filter(|block| matches!(block, ContentBlock::ToolResult(result) if result.tool_call_id.0 == *id)).count();
             let tool = call_entry.and_then(|call| {
-                call.message.content.iter().find_map(|block| match block {
-                    ContentBlock::ToolCall(call) if call.tool_call_id.0 == *id => {
-                        Some(call.tool_name.clone())
-                    }
-                    _ => None,
-                })
+                call.message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolCall(call) if call.tool_call_id.0 == *id => {
+                            Some(call.tool_name.clone())
+                        }
+                        _ => None,
+                    })
+                    .nth(occurrence)
             });
-            let dispatch =
-                call_entry.and_then(|call| call.tool_calls.iter().find(|c| c.tool_call_id == *id));
+            let dispatch = call_entry.and_then(|call| call_attribution(call, id, occurrence));
             let (format, mime, content) = stored_output(&result.output);
             let mut target = Target::text(key, content).with_tool(
                 dispatch
@@ -458,10 +511,14 @@ async fn writing_request<H: ServeHandler + ?Sized>(
     let mut missing = BTreeSet::new();
     let mut scan_from = ordinal;
     for &number in wanted {
-        let location = messages
-            .handler
-            .tag_location(messages.session, number)
-            .await?;
+        if !messages.locations.contains_key(&number) {
+            let location = messages
+                .handler
+                .tag_location(messages.session, number)
+                .await?;
+            messages.locations.insert(number, location);
+        }
+        let location = messages.locations[&number];
         match location {
             Some(broca_core::TagLocation {
                 found: Some((at, index)),
@@ -522,19 +579,26 @@ async fn writing_request<H: ServeHandler + ?Sized>(
         from = last + 1;
     }
     let view = if compacts && !found.is_empty() {
-        let records = messages
-            .handler
-            .session_log(messages.session, run_id)
-            .await?
-            .ok_or_else(|| {
-                ServeError::Open(
+        if messages.records.is_none() {
+            messages.records = Some(
+                messages
+                    .handler
+                    .session_log(messages.session, run_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServeError::Open(
                     "the session log is not readable here, so output references cannot tell \
                      which parts a compaction view left out"
                         .into(),
                     Some(broca_protocol::ErrorClass::Transient),
                 )
-            })?;
-        view_at_writing_step(&records, ordinal)?
+                    })?,
+            );
+        }
+        view_at_writing_step(
+            messages.records.as_deref().expect("loaded session log"),
+            ordinal,
+        )?
     } else {
         None
     };
@@ -594,14 +658,66 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
     if !has_sets(&entry) {
         return Ok(None);
     }
+    let mut messages = Messages {
+        handler,
+        session,
+        lineage: lineage.clone(),
+        cache: BTreeMap::new(),
+        locations: BTreeMap::new(),
+        records: None,
+    };
+    let manifest = handler.frozen_manifest(session).await?;
+    let refs = derive_message(&mut messages, &entry, manifest.as_deref()).await?;
+    Ok(Some((lineage, refs)))
+}
+
+/// Derive a display page's sets with one manifest read and a shared message cache. Page entries
+/// seed the cache, so references to another row and repeated targets do not reread that message.
+pub async fn page_output_refs<H: ServeHandler + ?Sized>(
+    handler: &H,
+    session: &LineageKey,
+    lineage: &str,
+    entries: &[SessionReadMessage],
+    records: Option<Vec<broca_wal::WalRecord>>,
+) -> Result<BTreeMap<u64, MessageOutputDescriptors>, ServeError> {
+    let mut messages = Messages {
+        handler,
+        session,
+        lineage: lineage.to_owned(),
+        cache: entries
+            .iter()
+            .map(|entry| (entry.ordinal, Some(entry.clone())))
+            .collect(),
+        locations: BTreeMap::new(),
+        records,
+    };
+    let manifest = handler.frozen_manifest(session).await?;
+    let mut sets = BTreeMap::new();
+    for entry in entries.iter().filter(|entry| has_sets(entry)) {
+        sets.insert(
+            entry.ordinal,
+            derive_message(&mut messages, entry, manifest.as_deref())
+                .await?
+                .descriptors(),
+        );
+    }
+    Ok(sets)
+}
+
+async fn derive_message<H: ServeHandler + ?Sized>(
+    messages: &mut Messages<'_, H>,
+    entry: &SessionReadMessage,
+    manifest: Option<&broca_wal::PlanManifest>,
+) -> Result<MessageOutputRefs, ServeError> {
+    let ordinal = entry.ordinal;
+    let lineage = messages.lineage.clone();
     let run_id = entry
         .run
         .as_ref()
         .map(|run| run.run_id.clone())
         .unwrap_or_default();
-    let manifest = handler.frozen_manifest(session).await?;
     let texts = reply_texts(&entry.message);
-    let calls = call_scans(&entry, manifest.as_deref());
+    let calls = call_scans(entry, manifest);
     let mut wanted = named_numbers(|probe, empty| {
         for text in &texts {
             probe.reply(text, empty, &mut String::new);
@@ -612,23 +728,10 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
             probe.call(&call.arguments, &call.slots, true, empty, &mut String::new)
         }));
     }
-    let mut messages = Messages {
-        handler,
-        session,
-        lineage: lineage.clone(),
-        cache: BTreeMap::new(),
-    };
     let request = if wanted.is_empty() {
         BTreeMap::new()
     } else {
-        writing_request(
-            &mut messages,
-            ordinal,
-            &run_id,
-            &wanted,
-            plan_compacts(manifest.as_deref()),
-        )
-        .await?
+        writing_request(messages, ordinal, &run_id, &wanted, plan_compacts(manifest)).await?
     };
     let mid = format!("m{ordinal}");
     let reply = resolve_set(
@@ -669,7 +772,7 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
             (call.tool_call_id, set)
         })
         .collect();
-    Ok(Some((lineage, MessageOutputRefs { reply, calls })))
+    Ok(MessageOutputRefs { reply, calls })
 }
 
 /// The set `id` names in the caller's session, or why there is none.
@@ -825,12 +928,10 @@ fn call_scans(
             };
             let slots = slots_of(&call.tool_name)?;
             let id = call.tool_call_id.0.clone();
+            let occurrence = entry.message.content[..index].iter().filter(|block| matches!(block, ContentBlock::ToolCall(call) if call.tool_call_id.0 == id)).count();
             Some(CallScan {
                 index,
-                call_key: entry
-                    .tool_calls
-                    .iter()
-                    .find(|dispatch| dispatch.tool_call_id == id)
+                call_key: call_attribution(entry, &id, occurrence)
                     .and_then(|dispatch| dispatch.call_key.clone()),
                 tool_call_id: id,
                 arguments: call.input.clone(),
@@ -944,7 +1045,7 @@ mod tests {
     }
 
     /// The display seam puts the reply set's descriptor on the row and each call set's on the
-    /// tool-call part with the same id, leaving every other part as it was.
+    /// tool-call part at its stored position, even when a provider reused the call id.
     #[test]
     fn attach_puts_each_descriptor_on_its_row_or_call() {
         let refs = MessageOutputRefs {
@@ -957,7 +1058,7 @@ mod tests {
                 DisplayPart::Text(TextPart::new("m3#0", "see")),
                 DisplayPart::ToolCall(ToolCallPart::new(
                     "m3#1",
-                    "call-a",
+                    "call-b",
                     "work",
                     &json!({}),
                     None,
@@ -985,6 +1086,34 @@ mod tests {
         let attached = calls[1].as_ref().unwrap();
         assert_eq!(attached.set_id, "l/m3/c2");
         assert_eq!(attached.call_key.as_deref(), Some("l:9"));
+    }
+
+    #[test]
+    fn a_repeated_result_id_keeps_its_own_tool_name() {
+        let calls: SessionReadMessage = serde_json::from_value(json!({"ordinal":1,"mid":"m1","message":{"role":"assistant","content":[
+            {"type":"tool_call","tool_call_id":"repeat","tool_name":"first","input":{}},
+            {"type":"tool_call","tool_call_id":"repeat","tool_name":"second","input":{}}
+        ]},"tool_calls":[
+            {"tool_call_id":"repeat","call_key":"l:1","dispatched_to":"first-provider","indeterminate":false},
+            {"tool_call_id":"repeat","indeterminate":false}
+        ]})).unwrap();
+        let results: SessionReadMessage = serde_json::from_value(json!({"ordinal":2,"mid":"m2","message":{"role":"tool","content":[
+            {"type":"tool_result","tool_call_id":"repeat","output":{"kind":"text","text":"first output"}},
+            {"type":"tool_result","tool_call_id":"repeat","output":{"kind":"error","message":"duplicate refused"},"is_error":true}
+        ]}})).unwrap();
+        let target = target_of(&results, 1, Some(&calls)).unwrap();
+        let set = resolve_set(
+            "l/m3".into(),
+            "m3",
+            None,
+            &BTreeMap::from([(1, target)]),
+            |resolution, request, mut mint| {
+                resolution.reply("$$tc(1)", request, &mut mint);
+            },
+        );
+        assert_eq!(set.records[0].tool.as_deref(), Some("second"));
+        assert_eq!(set.records[0].call_key, None);
+        assert_eq!(set.records[0].provider, None);
     }
 
     #[test]

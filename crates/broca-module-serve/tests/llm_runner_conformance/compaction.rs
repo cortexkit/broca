@@ -908,7 +908,8 @@ pub(super) fn catalog(request: &Value) -> Value {
         json!([])
     } else {
         json!([{"name":SCRIPTED_TOOL,"schema_digest":cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
-            "semantics":1,"capabilities":[],"description":"Answers each call with its scripted result.","input_schema":schema}])
+            "semantics":1,"capabilities":[],"description":"Answers each call with its scripted result.","input_schema":schema,
+            "reference_slots":[{"name":"data","kind":"token"},{"name":"program","kind":"source:rich-ui/1"}]}])
     };
     let mut answer = json!({"generation":"1","catalog_digest":"conformance",
         "composition_digest":digest,"tools":tools});

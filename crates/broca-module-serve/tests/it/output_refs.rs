@@ -167,6 +167,385 @@ async fn referencing_session(tag: &str, reply: &'static str) -> (Rig, String, St
     (rig, run_id, lineage)
 }
 
+#[tokio::test]
+async fn history_pages_seek_both_ways_without_gaps_and_expire_foreign_cursors() {
+    let (mut rig, _, _) = referencing_session("history-pages", "answer").await;
+    let newest = call(&mut rig, 7, "session.history", json!({"limit": 2})).await;
+    let newest = result(&newest);
+    assert_eq!(
+        newest["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["ordinal"].clone())
+            .collect::<Vec<_>>(),
+        [json!(2), json!(3)]
+    );
+    assert!(newest.get("newer").is_none());
+    let zero = call(&mut rig, 7, "session.history", json!({"limit":0})).await;
+    assert_eq!(result(&zero)["messages"], json!([]));
+    assert!(result(&zero)["older"].is_string());
+    assert!(result(&zero).get("newer").is_none());
+    let older = call(
+        &mut rig,
+        7,
+        "session.history",
+        json!({"cursor": newest["older"], "limit": 2}),
+    )
+    .await;
+    let older = result(&older);
+    assert_eq!(
+        older["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["ordinal"].clone())
+            .collect::<Vec<_>>(),
+        [json!(0), json!(1)]
+    );
+    assert!(older.get("older").is_none());
+    let newer = call(
+        &mut rig,
+        7,
+        "session.history",
+        json!({"cursor": older["newer"], "limit": 2}),
+    )
+    .await;
+    assert_eq!(result(&newer), newest);
+    let raw = call(
+        &mut rig,
+        7,
+        "session.read",
+        json!({"from_ordinal": 0, "limit": 100}),
+    )
+    .await;
+    let all = call(
+        &mut rig,
+        7,
+        "session.history",
+        json!({"from_mid": "m0", "limit": 100}),
+    )
+    .await;
+    assert_eq!(result(&all)["messages"], result(&raw)["messages"]);
+    for params in [json!({"before_mid":"m2"}), json!({"before_ordinal":2})] {
+        let page = call(&mut rig, 7, "session.history", params).await;
+        assert_eq!(result(&page)["messages"], older["messages"]);
+    }
+    for (params, code, field) in [
+        (json!({"cursor":"bad"}), "invalid_params", Some("cursor")),
+        (json!({"from_mid":"missing"}), "unknown_mid", None),
+        (json!({"from_ordinal":999}), "unknown_ordinal", None),
+        (
+            json!({"from_mid":"m0", "before_ordinal":1}),
+            "invalid_params",
+            Some("before_ordinal"),
+        ),
+        (json!({"view":"model"}), "invalid_params", Some("view")),
+        (json!({"form":"bogus"}), "invalid_params", Some("form")),
+        (
+            json!({"form":"display", "media":"inline"}),
+            "invalid_params",
+            Some("media"),
+        ),
+        (
+            json!({"form":"display", "include_originals":true}),
+            "invalid_params",
+            Some("include_originals"),
+        ),
+        (
+            json!({"limits":{"arguments_bytes":1,"result_bytes":1,"error_result_bytes":1}}),
+            "invalid_params",
+            Some("limits"),
+        ),
+        (json!({"unknown":true}), "invalid_params", Some("unknown")),
+    ] {
+        let reply = call(&mut rig, 7, "session.history", params).await;
+        let error = refusal(&reply);
+        assert_eq!(error["code"], code, "{error}");
+        if let Some(field) = field {
+            assert_eq!(error["detail"]["field"], field, "{error}");
+        }
+    }
+    let (mut other, _, _) = referencing_session("history-foreign", "answer").await;
+    let foreign = call(
+        &mut other,
+        7,
+        "session.history",
+        json!({"cursor": newest["older"]}),
+    )
+    .await;
+    assert_eq!(refusal(&foreign)["code"], "cursor_expired");
+    other.finish().await;
+    let (mut empty, _) = plan_rig("history-empty").await;
+    for params in [json!({}), json!({"form":"display"})] {
+        let page = call(&mut empty, 7, "session.history", params).await;
+        assert_eq!(result(&page), json!({"messages":[]}));
+    }
+    for (params, code) in [
+        (json!({"cursor":newest["older"]}), "cursor_expired"),
+        (json!({"from_mid":"m0"}), "unknown_mid"),
+        (json!({"from_ordinal":0}), "unknown_ordinal"),
+    ] {
+        let page = call(&mut empty, 7, "session.history", params).await;
+        assert_eq!(refusal(&page)["code"], code);
+    }
+    empty.finish().await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn history_display_limits_and_page_budgets_keep_the_requested_end() {
+    let (mut rig, _, _) = referencing_session("history-limits", "answer").await;
+    let display = call(&mut rig, 7, "session.history", json!({"form":"display", "limits":{"arguments_bytes":1,"result_bytes":3,"error_result_bytes":5}})).await;
+    let page = result(&display);
+    assert_eq!(page["messages"][1]["row"]["parts"][0]["arguments"], "{");
+    assert_eq!(
+        page["messages"][1]["row"]["parts"][0]["arguments_truncated"],
+        true
+    );
+    assert_eq!(page["messages"][2]["row"]["parts"][0]["content"], "wor");
+    assert_eq!(page["messages"][2]["row"]["parts"][0]["truncated"], true);
+    assert_eq!(page["messages"][3]["row"]["text"], "answer");
+    assert_eq!(page["messages"][3]["row"]["model"], "fake/fake");
+    assert!(page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["written_at"].is_u64()));
+    let newest = call(
+        &mut rig,
+        7,
+        "session.history",
+        json!({"form":"display", "max_bytes":1}),
+    )
+    .await;
+    assert_eq!(result(&newest)["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(result(&newest)["messages"][0]["ordinal"], 3);
+    let first = call(
+        &mut rig,
+        7,
+        "session.history",
+        json!({"from_ordinal":0, "max_bytes":1}),
+    )
+    .await;
+    assert_eq!(result(&first)["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(result(&first)["messages"][0]["ordinal"], 0);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn history_display_recovers_send_identity_without_changing_read_bodies() {
+    let (mut rig, _) = plan_rig("history-send-identity").await;
+    rig.bind_as(
+        7,
+        Some(subc_protocol::Principal::Reserved {
+            module_id: "core".into(),
+        }),
+    )
+    .await;
+    rig.script.push(&[Step::Text("answer")]);
+    let sent = call(&mut rig, 7, "session.send", json!({"send_id":"turn-1", "client_message_id":"phone-1", "prompt":"hi", "model":{"provider":"fake","model":"fake"}, "plan":tagged_plan(json!({}))})).await;
+    assert!(result(&sent)["run_id"].is_string());
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let display = call(&mut rig, 7, "session.history", json!({"form":"display"})).await;
+    let row = &result(&display)["messages"][0]["row"];
+    assert_eq!(row["client_message_id"], "phone-1");
+    assert_eq!(row["sender"], "core");
+    let raw = call(&mut rig, 7, "session.read", json!({})).await;
+    let raw = String::from_utf8(raw.body).unwrap();
+    assert!(!raw.contains("client_message_id"));
+    assert!(!raw.contains("\"sender\""));
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn imported_history_omits_unknown_model_without_guessing() {
+    let (mut rig, _) = plan_rig("history-imported-model").await;
+    let imported = call(&mut rig, 7, "session.import", json!({
+        "import_id":"imported-tool-episode", "origin":{"kind":"import","source_ref":"fixture:imported-tool-episode"},
+        "messages":[
+            {"role":"user","content":[{"type":"text","text":"inspect the project"}]},
+            {"role":"assistant","content":[{"type":"tool_call","tool_call_id":"imported-call","tool_name":"work","input":{}}]},
+            {"role":"tool","content":[{"type":"tool_result","tool_call_id":"imported-call","is_error":false,"output":{"kind":"text","text":"worked"}}]},
+            {"role":"assistant","origin":{"provider_module_id":"anthropic","model_id":"recorded-model"},"content":[{"type":"text","text":"imported answer"}]}
+        ]
+    })).await;
+    assert!(result(&imported)["run_id"].is_string());
+    rig.wait_idle().await;
+    let raw = call(&mut rig, 7, "session.read", json!({})).await;
+    let raw = result(&raw);
+    let messages = raw["messages"].as_array().unwrap();
+    let missing_times = messages
+        .iter()
+        .filter(|entry| !entry["written_at"].is_u64())
+        .count();
+    let missing_models = messages
+        .iter()
+        .filter(|entry| {
+            entry["message"]["role"] == "assistant" && entry["message"]["origin"].is_null()
+        })
+        .count();
+    assert_eq!((messages.len(), missing_times, missing_models), (4, 0, 1));
+    let history = call(&mut rig, 7, "session.history", json!({})).await;
+    assert_eq!(result(&history)["messages"], raw["messages"]);
+    rig.script.push(&[Step::Text("native answer")]);
+    let native = call(&mut rig, 7, "session.send", json!({"send_id":"native-after-import","prompt":"native question","model":{"provider":"fake","model":"fake"}})).await;
+    assert!(result(&native)["run_id"].is_string());
+    rig.wait_for_finished(2).await;
+    rig.wait_idle().await;
+    let head = call(&mut rig, 7, "session.head", json!({})).await;
+    assert_eq!(result(&head)["model"]["model"], "fake");
+    let before = rig.wal_bytes();
+    let display = call(&mut rig, 7, "session.history", json!({"form":"display"})).await;
+    let display = result(&display);
+    assert_eq!(display["messages"].as_array().unwrap().len(), 6);
+    assert!(
+        display["messages"][1]["row"].get("model").is_none(),
+        "an unknown imported producer is omitted, never copied from the current model"
+    );
+    assert_eq!(
+        display["messages"][3]["row"]["model"],
+        "anthropic/recorded-model"
+    );
+    assert_eq!(display["messages"][5]["row"]["model"], "fake/fake");
+    assert_eq!(rig.wal_bytes(), before, "display projection writes nothing");
+    let raw_after = call(&mut rig, 7, "session.read", json!({})).await;
+    assert_eq!(
+        &result(&raw_after)["messages"].as_array().unwrap()[..4],
+        messages.as_slice()
+    );
+    println!("HISTORY_REPRESENTABILITY imported: rows=4 missing_written_at=0 missing_model=1 display_refusals=0; recorded native model preserved");
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn repeated_ids_within_a_message_keep_unknown_dispatch_metadata_null() {
+    let (mut rig, admitter) = plan_rig("refs-duplicate-occurrences").await;
+    admitter.admit_output_refs();
+    admitter.answer_reference_slots(json!([{"name":"data","kind":"token"}]));
+    let call_block = |marker: &str| {
+        broca_protocol::ContentBlock::ToolCall(broca_protocol::ToolCall {
+            tool_call_id: broca_protocol::ToolCallId("repeat".into()),
+            tool_name: "work".into(),
+            input: json!({"data":"$$tc(99)","marker":marker}),
+            thought_signature: None,
+        })
+    };
+    rig.script.push(&[
+        Step::Usage {
+            content: vec![call_block("first"), call_block("second")],
+            usage: Default::default(),
+        },
+        Step::Text("see $$tc(2) and $$tc(3)"),
+    ]);
+    send_plan(
+        &mut rig,
+        "turn-1",
+        "hi",
+        &tagged_plan(json!({"output_refs":true})),
+    )
+    .await;
+    let records = rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ToolDispatchIntent { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, WalRecord::ToolResult { result, .. } if matches!(&result.output, broca_protocol::content::ToolOutput::Error { message } if message == "duplicate tool_call_id from provider")))
+            .count(),
+        1
+    );
+    let raw = call(&mut rig, 7, "session.read", json!({})).await;
+    let raw = result(&raw);
+    let lineage = raw["lineage_id"].as_str().unwrap();
+    let first_key = raw["messages"][1]["tool_calls"][0]["call_key"].clone();
+    assert!(first_key.is_string());
+    let refs = call(
+        &mut rig,
+        7,
+        "session.output_refs",
+        json!({"set_id":format!("{lineage}/m3")}),
+    )
+    .await;
+    let refs = result(&refs);
+    assert_eq!(refs["records"].as_array().unwrap().len(), 2);
+    assert_eq!(refs["records"][0]["call_key"], first_key);
+    assert_eq!(refs["records"][0]["provider"], WORK_MODULE);
+    assert!(refs["records"][1]["call_key"].is_null());
+    assert!(refs["records"][1]["provider"].is_null());
+    assert_eq!(refs["records"][1]["tool"], "work");
+    let display = call(&mut rig, 7, "session.history", json!({"form":"display"})).await;
+    let display = result(&display);
+    let parts = &display["messages"][1]["row"]["parts"];
+    assert_eq!(parts[0]["output_refs"]["call_key"], first_key);
+    assert!(parts[1]["output_refs"]["call_key"].is_null());
+    assert_eq!(
+        parts[1]["output_refs"]["set_id"],
+        format!("{lineage}/m1/c1")
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn repeated_ids_across_messages_keep_each_messages_own_dispatch() {
+    let (mut rig, admitter) = plan_rig("refs-reused-id-messages").await;
+    admitter.admit_output_refs();
+    admitter.answer_reference_slots(json!([{"name":"data","kind":"token"}]));
+    rig.script.push(&[
+        Step::Call("repeat"),
+        Step::Call("repeat"),
+        Step::Text("see $$tc(2) and $$tc(3)"),
+    ]);
+    send_plan(
+        &mut rig,
+        "turn-1",
+        "hi",
+        &tagged_plan(json!({"output_refs":true})),
+    )
+    .await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let raw = call(&mut rig, 7, "session.read", json!({})).await;
+    let raw = result(&raw);
+    let lineage = raw["lineage_id"].as_str().unwrap();
+    let keys = [
+        raw["messages"][1]["tool_calls"][0]["call_key"].clone(),
+        raw["messages"][3]["tool_calls"][0]["call_key"].clone(),
+    ];
+    assert!(keys.iter().all(Value::is_string));
+    assert_ne!(keys[0], keys[1]);
+    let refs = call(
+        &mut rig,
+        7,
+        "session.output_refs",
+        json!({"set_id":format!("{lineage}/m5")}),
+    )
+    .await;
+    let refs = result(&refs);
+    for (index, key) in keys.iter().enumerate() {
+        assert_eq!(refs["records"][index]["call_key"], *key);
+        assert_eq!(refs["records"][index]["provider"], WORK_MODULE);
+    }
+    let display = call(&mut rig, 7, "session.history", json!({"form":"display"})).await;
+    let display = result(&display);
+    assert_eq!(
+        display["messages"][1]["row"]["parts"][0]["output_refs"]["call_key"],
+        keys[0]
+    );
+    assert_eq!(
+        display["messages"][3]["row"]["parts"][0]["output_refs"]["call_key"],
+        keys[1]
+    );
+    rig.finish().await;
+}
+
 /// `method` with `params` on `channel`.
 async fn call(rig: &mut Rig, channel: u16, method: &str, params: Value) -> subc_protocol::Frame {
     rig.request(channel, json!({"method": method, "params": params}))
@@ -460,6 +839,7 @@ async fn ids_are_session_bound_and_access_follows_session_read() {
     assert_eq!(read_refusal["code"], "sender_not_owner");
     let wal = rig.wal_bytes();
     for (method, params) in [
+        ("session.history", json!({"form":"display"})),
         ("session.output_refs", json!({"set_id": set})),
         (
             "session.output_ref_read",
@@ -665,6 +1045,25 @@ async fn an_opted_in_call_scans_only_its_declared_slots() {
     let (id, call_set) = &sets.calls[0];
     assert_eq!(id, "call-2");
     assert_eq!(call_set.descriptor.set_id, set);
+    let display = call(
+        &mut rig,
+        7,
+        "session.history",
+        json!({"form": "display", "limit": 1000}),
+    )
+    .await;
+    let display = result(&display);
+    let row = &display["messages"][3]["row"];
+    assert_eq!(
+        row["output_refs"],
+        serde_json::to_value(&sets.reply.descriptor).unwrap()
+    );
+    assert_eq!(
+        row["parts"][1]["output_refs"],
+        serde_json::to_value(&call_set.descriptor).unwrap()
+    );
+    assert_eq!(row["parts"][1]["tool_call_id"], "call-2");
+    assert_eq!(row["parts"][1]["part"], "m3#1");
     let dispatched = call(&mut rig, 7, "session.read", json!({"from_ordinal": 3})).await;
     assert_eq!(
         call_set.descriptor.call_key.as_deref(),

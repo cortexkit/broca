@@ -1745,8 +1745,8 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// Every durable record of the session's current lineage, oldest first, read under the
-    /// expiry check of run `run_id`. `None` from a handler that keeps no log reader. Only output
-    /// references on a compaction session read it, to find the view a past request rendered.
+    /// expiry check of run `run_id`. `None` from a handler that keeps no log reader. On-demand
+    /// history uses it for send metadata; output references use it to find a past compaction view.
     async fn session_log(
         &self,
         _session: &LineageKey,

@@ -463,6 +463,271 @@ async fn a_folded_part_was_not_in_the_writing_request() {
     }
 }
 
+struct CountedReads<'a> {
+    registry: &'a LineageRegistry,
+    reads: AtomicUsize,
+    tags: AtomicUsize,
+    manifests: AtomicUsize,
+}
+
+#[async_trait]
+impl ServeHandler for CountedReads<'_> {
+    async fn read(
+        &self,
+        request: broca_module::serve::SessionReadRequest,
+    ) -> Result<broca_wire::SessionReadResponse, broca_module::ServeError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.registry.read(request).await
+    }
+    async fn tag_location(
+        &self,
+        session: &BindIdentity,
+        number: u64,
+    ) -> Result<Option<broca_core::TagLocation>, broca_module::ServeError> {
+        self.tags.fetch_add(1, Ordering::Relaxed);
+        self.registry.tag_location(session, number).await
+    }
+    async fn frozen_manifest(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<Arc<broca_wal::PlanManifest>>, broca_module::ServeError> {
+        self.manifests.fetch_add(1, Ordering::Relaxed);
+        self.registry.frozen_manifest(session).await
+    }
+    async fn send(
+        &self,
+        _: broca_module::serve::SendRequest,
+    ) -> Result<broca_module::serve::SendResponse, broca_module::ServeError> {
+        unreachable!()
+    }
+    async fn retract(
+        &self,
+        _: &BindIdentity,
+        _: broca_protocol::SubmissionId,
+    ) -> Result<broca_module::serve::RetractResponse, broca_module::ServeError> {
+        unreachable!()
+    }
+    async fn cancel(
+        &self,
+        _: &BindIdentity,
+        _: RunId,
+    ) -> Result<broca_module::serve::CancelResponse, broca_module::ServeError> {
+        unreachable!()
+    }
+    async fn status(
+        &self,
+        _: &BindIdentity,
+    ) -> Result<broca_module::serve::StatusResponse, broca_module::ServeError> {
+        unreachable!()
+    }
+    async fn run_status(
+        &self,
+        _: &BindIdentity,
+        _: RunId,
+    ) -> Result<broca_wire::RunStatusResponse, broca_module::ServeError> {
+        unreachable!()
+    }
+    async fn subscribe(
+        &self,
+        _: &BindIdentity,
+        _: broca_module::serve::SubscribeFrom,
+        _: mpsc::Sender<broca_module::Delivery>,
+    ) -> Result<(), broca_module::ServeError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn a_display_page_reads_each_shared_target_and_manifest_once() {
+    let rig = Rig::new("page-batch");
+    seed(&rig, 3, false);
+    let page = rig
+        .registry
+        .read(broca_module::serve::SessionReadRequest::new(
+            rig.key(),
+            Some(0),
+            Some(12),
+        ))
+        .await
+        .unwrap();
+    let entries: Vec<_> = page
+        .messages
+        .into_iter()
+        .filter(|entry| entry.ordinal % 4 == 3)
+        .collect();
+    let counted = CountedReads {
+        registry: &rig.registry,
+        reads: AtomicUsize::new(0),
+        tags: AtomicUsize::new(0),
+        manifests: AtomicUsize::new(0),
+    };
+    let sets = broca_module::output_refs::page_output_refs(
+        &counted,
+        &rig.key(),
+        page.lineage_id.as_deref().unwrap(),
+        &entries,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sets.len(), 3);
+    assert!(sets.values().all(|refs| refs.reply.count == 2));
+    assert_eq!(
+        counted.reads.load(Ordering::Relaxed),
+        6,
+        "three distinct outputs and their containing calls, not per-row rereads"
+    );
+    assert_eq!(
+        counted.tags.load(Ordering::Relaxed),
+        3,
+        "one lookup per distinct number"
+    );
+    assert_eq!(counted.manifests.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn history_never_invents_creation_times_for_legacy_records() {
+    let rig = Rig::new("history-untimed");
+    seed(&rig, 1, false);
+    let reply = broca_module::history::read(
+        &rig.registry,
+        &rig.key(),
+        &cortexkit_role_llm_runner::history::HistoryRequest::newest(),
+    )
+    .await;
+    assert!(
+        matches!(
+            reply,
+            Err(broca_module::history::HistoryError::Unrepresentable {
+                ordinal: 0,
+                field: "written_at"
+            })
+        ),
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn pre_message_times_history_uses_legacy_clocks_and_reports_remaining_gaps() {
+    let rig = Rig::new("history-before-message-times");
+    let mut start: WalRecord = serde_json::from_str(
+        include_str!("../../broca-wal/tests/fixtures/before_message_times.jsonl")
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    if let WalRecord::RunStarted { session, ts_ms, .. } = &mut start {
+        *session = rig.key();
+        *ts_ms = Some(10);
+    }
+    // These pre-message-times records retain the clocks older writers actually recorded.
+    // The last assistant has no completed-attempt clock; no other event can supply its time.
+    let values = [
+        json!({"type":"step_started","step_id":1}),
+        json!({"type":"model_attempt_finished","step_id":1,"attempt":0,"outcome":"complete","ts_ms":12,
+            "request_body_len":0,"request_body_sha256":"a","response_body_len":0,"response_body_sha256":"b"}),
+        json!({"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"call","content":[
+            {"type":"tool_call","tool_call_id":"call","tool_name":"work","input":{}}
+        ]},"usage":{},"retries_used":0}),
+        json!({"type":"tool_batch_started","batch_id":"b","step_id":1,"planned_calls":["call"]}),
+        json!({"type":"steered","ts_ms":13,"input":[{"role":"user","content":[{"type":"text","text":"steer"}]}]}),
+        json!({"type":"tool_result","finished_at_ms":14,"batch_id":"b","result":{
+            "tool_call_id":"call","output":{"kind":"text","text":"done"},"is_error":false},"outcome":"completed"}),
+        json!({"type":"tool_batch_finished","batch_id":"b"}),
+        json!({"type":"turn_finished","step_id":1}),
+        json!({"type":"step_started","step_id":2}),
+        json!({"type":"model_attempt_finished","step_id":2,"attempt":0,"outcome":"complete","ts_ms":15,
+            "request_body_len":0,"request_body_sha256":"c","response_body_len":0,"response_body_sha256":"d"}),
+        json!({"type":"model_step_finished","step_id":2,"assistant_message":{"message_id":"answer","content":[{"type":"text","text":"answer"}]},"usage":{},"retries_used":0}),
+        json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0}),
+    ];
+    let mut records = vec![start.clone()];
+    records.extend(
+        values
+            .into_iter()
+            .map(|value| serde_json::from_value::<WalRecord>(value).unwrap()),
+    );
+    if let WalRecord::RunStarted { run_id, ts_ms, .. } = &mut start {
+        *run_id = RunId("legacy-later".into());
+        *ts_ms = Some(20);
+    }
+    records.push(start);
+    for value in [
+        json!({"type":"step_started","step_id":3}),
+        json!({"type":"model_step_finished","step_id":3,"assistant_message":{"message_id":"untimed","content":[{"type":"text","text":"untimed answer"}]},"usage":{},"retries_used":0}),
+        json!({"type":"run_finished","reason":"completed","usage":{},"retries_used":0}),
+    ] {
+        records.push(serde_json::from_value(value).unwrap());
+    }
+    assert!(records
+        .iter()
+        .all(|record| !record.required_features().contains(&"message-times/v1")));
+    let key = rig.key();
+    let mut wal = rig.wal_store.open(&key).unwrap();
+    for record in &records {
+        wal.append(1, record, false).unwrap();
+    }
+    wal.sync().unwrap();
+    drop(wal);
+    let range = rig
+        .wal_store
+        .read_records_range(&key, 0, None, None)
+        .unwrap();
+    rig.store.project_range(&key, &range).unwrap();
+    let raw = rig
+        .registry
+        .read(broca_module::serve::SessionReadRequest::new(
+            key.clone(),
+            Some(0),
+            Some(100),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        raw.messages
+            .iter()
+            .map(|entry| entry.written_at)
+            .collect::<Vec<_>>(),
+        [
+            Some(10),
+            Some(12),
+            Some(14),
+            Some(13),
+            Some(15),
+            Some(20),
+            None
+        ]
+    );
+    let missing_models = raw
+        .messages
+        .iter()
+        .filter(|entry| entry.message.role == Role::Assistant && entry.message.origin.is_none())
+        .count();
+    assert_eq!(missing_models, 0);
+    println!("HISTORY_REPRESENTABILITY pre_0_3_255: rows=7 missing_written_at=1 missing_model=0 display_refusals=1");
+    let request = cortexkit_role_llm_runner::history::HistoryRequest::newest()
+        .with_form(cortexkit_role_llm_runner::history::HistoryForm::Display);
+    let reply = broca_module::history::read(&rig.registry, &key, &request).await;
+    assert!(
+        matches!(
+            reply,
+            Err(broca_module::history::HistoryError::Unrepresentable {
+                ordinal: 6,
+                field: "written_at"
+            })
+        ),
+        "{reply:?}"
+    );
+    let representable = cortexkit_role_llm_runner::history::HistoryRequest::from_ordinal(0)
+        .with_limit(6)
+        .with_form(cortexkit_role_llm_runner::history::HistoryForm::Display);
+    let page = broca_module::history::read(&rig.registry, &key, &representable)
+        .await
+        .unwrap();
+    assert_eq!(page["messages"].as_array().unwrap().len(), 6);
+}
+
 /// The cost of both operations on a session of `OUTPUT_REFS_COST_MESSAGES` messages (20,000
 /// by default), with and without a compaction view.
 #[tokio::test]

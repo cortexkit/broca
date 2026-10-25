@@ -2011,7 +2011,9 @@ async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
     let mut rig = Rig::start_with_scopes("unsupported-output-refs").await;
     let describe = call(&mut rig, ops::ROLE_DESCRIBE, serde_json::json!({})).await;
     let describe: RoleDescribe = serde_json::from_value(result(&describe)).unwrap();
-    assert!(!describe.declares(groups::OUTPUT_REFS));
+    assert!(describe.declares(groups::OUTPUT_REFS));
+    // This rig installs no plan admitter. Even though production discovery advertises the
+    // reader, a handler without an output-reference admitter must refuse before overrides.
     for flag in [true, false] {
         let before = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
         let wal = rig.wal_bytes();

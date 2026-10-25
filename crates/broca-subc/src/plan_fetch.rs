@@ -210,6 +210,10 @@ impl SubcPlanAdmitter {
 
 #[async_trait]
 impl broca_fetch_plan::PlanAdmitter for SubcPlanAdmitter {
+    fn admits_output_refs(&self) -> bool {
+        true
+    }
+
     async fn admit(
         &self,
         plan: &broca_fetch_plan::Plan,
@@ -256,6 +260,13 @@ impl Fetcher for SubcPlanFetcher {
 #[cfg(test)]
 mod preset_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn production_admitter_enables_output_reference_plans() {
+        use broca_fetch_plan::PlanAdmitter;
+        let (connection, _, _) = SubcConnection::in_process_for_test(1, 1);
+        assert!(SubcPlanAdmitter::new(Arc::new(connection)).admits_output_refs());
+    }
 
     #[tokio::test]
     async fn fetch_and_consent_without_scopes_fail_closed_on_the_same_cached_capabilities() {
