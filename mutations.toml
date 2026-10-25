@@ -30489,3 +30489,87 @@ old = '''                    held_calls.retain(|(batch, call, _)| {
                     });'''
 new = '''                    let _ = batch_id;
                     held_calls.retain(|_| true); // NON-VACUITY BREAK: retain a terminal held call.'''
+
+
+[[control]]
+id = "fold-keeps-terminal-held-range-during-intake-rebuild"
+guards = "An incomplete intake store is not evidence that a terminal held range has no registration"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_fold.rs"
+expect_red = ["wal_fold::provider_held_store_tests::incomplete_intake_keeps_a_terminal_held_range_live"]
+file = "crates/broca-core/src/wal_fold.rs"
+old = '''    if matches!(
+        held_ranges,
+        HeldRanges::Store(StoreHeld { complete: false })
+    ) && held.needs_intake()
+    {'''
+new = '''    if false && matches!(
+        held_ranges,
+        HeldRanges::Store(StoreHeld { complete: false })
+    ) && held.needs_intake()
+    { // NON-VACUITY BREAK: trust an incomplete intake.'''
+
+[[control]]
+id = "retention-keeps-shared-late-result-feed"
+guards = "Deleting one lineage preserves its module feed cursor and ack debt for other sessions"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::retention_cleanup_keeps_shared_feed_and_other_lineages"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = '''        transaction
+            .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])'''
+new = '''        transaction.execute("DELETE FROM feeds", []).unwrap(); // NON-VACUITY BREAK: erase a shared feed during lineage cleanup.
+        transaction
+            .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])'''
+
+[[control]]
+id = "retention-unreadable-intake-refuses-deletion"
+guards = "An unreadable intake store cannot silently authorize retention deletion of an uncertain lineage"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention.rs"
+expect_red = ["retention::provider_held_tests::unreadable_intake_refuses_retention_and_counts_health"]
+file = "crates/broca-module/src/retention.rs"
+old = '''            Err(_) => {
+                self.mark_unreadable(key);
+                tracing::warn!(target: "retention", session = %broca_core::session_addr(key), reason = "provider_held_intake_unknown",
+                    "retention deletion skipped: intake store cannot be read");
+                return Ok(None);
+            }'''
+new = '''            Err(_) => {} // NON-VACUITY BREAK: delete despite unreadable intake ownership.'''
+
+[[control]]
+id = "retention-missing-intake-keeps-held-history"
+guards = "Losing the intake projection does not erase durable registration history or the provider-held feature floor"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention.rs"
+expect_red = ["retention::provider_held_tests::absent_intake_with_held_history_refuses_retention"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = '''        return Ok((prior_registration || floor.contains("provider-held/v1"))
+            .then_some("provider_held_intake_unknown"));'''
+new = '''        return Ok((false && (prior_registration || floor.contains("provider-held/v1")))
+            .then_some("provider_held_intake_unknown")); // NON-VACUITY BREAK: forget intake history after projection loss.'''
+
+[[control]]
+id = "retention-tombstones-prune-intake-before-actor-open"
+guards = "A retention tombstone removes intake ownership at boot without needing the deleted WAL or a session actor"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::boot_prunes_tombstoned_registrations_without_a_wal_or_actor"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = "            self.remove_lineage(&row.call.lineage)?;"
+new = "            let _ = &row.call.lineage; // NON-VACUITY BREAK: retain tombstoned intake ownership."

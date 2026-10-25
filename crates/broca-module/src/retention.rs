@@ -985,7 +985,7 @@ impl RetentionService {
     }
 }
 
-fn sync_dir(path: &Path) -> Result<(), String> {
+pub(crate) fn sync_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         File::open(path)
@@ -1294,6 +1294,38 @@ impl RetentionService {
                 (row.lineage_id, deadline)
             }
         };
+        let state_root = self
+            .wal
+            .root()
+            .parent()
+            .ok_or("WAL tree has no state root")?;
+        let held_record = read.as_ref().is_ok_and(|read| {
+            frames(read)
+                .iter()
+                .any(|frame| matches!(frame.record, WalRecord::ToolCallProviderHeld { .. }))
+        });
+        let intake = if held_record {
+            Ok(Some("provider_held_record"))
+        } else {
+            crate::late_results_store::retention_block_reason(state_root, &id)
+        };
+        match intake {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                if reason == "provider_held_intake_unknown" {
+                    self.mark_unreadable(key);
+                }
+                tracing::warn!(target: "retention", session = %broca_core::session_addr(key), reason,
+                    "retention deletion skipped: held-call ownership is not settled");
+                return Ok(None);
+            }
+            Err(_) => {
+                self.mark_unreadable(key);
+                tracing::warn!(target: "retention", session = %broca_core::session_addr(key), reason = "provider_held_intake_unknown",
+                    "retention deletion skipped: intake store cannot be read");
+                return Ok(None);
+            }
+        }
         self.unreadable
             .lock()
             .unwrap()
@@ -1500,6 +1532,12 @@ impl RetentionService {
                 .map_err(|error| error.to_string())?;
             }
         }
+        let state_root = self
+            .wal
+            .root()
+            .parent()
+            .ok_or("WAL tree has no state root")?;
+        crate::late_results_store::remove_retained_lineage(state_root, &stone.lineage_id)?;
         // Completion is durable only after identity sidecars are removed and the directory is synced.
         // A crash or removal failure before this point leaves an incomplete tombstone to retry.
         stone.completed_at_ms = Some(now_ms);
@@ -1666,5 +1704,209 @@ fn durable_prefix_bytes_from(mut file: File, head: u64) -> Result<u64, String> {
         Ok(offset)
     } else {
         Err("retention durable head is absent".into())
+    }
+}
+
+#[cfg(test)]
+mod provider_held_tests {
+    use super::*;
+    use crate::late_results_store::{LateResultsStore, REGISTRATION_MARKER};
+
+    fn expired_session(name: &str) -> (RetentionService, BindIdentity, PathBuf, String) {
+        let root = broca_test_support::scratch_root().join(name);
+        fs::create_dir_all(&root).unwrap();
+        let key = BindIdentity::new("/project", "broca", name);
+        let wal = Arc::new(FileWalStore::new(root.join("wal")));
+        let store = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
+        let service = RetentionService::new(
+            wal.clone(),
+            store.clone(),
+            Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
+            store,
+            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+        )
+        .unwrap();
+        let mut writer = wal.open_with_retention(&key, Some(1)).unwrap();
+        let mut started = crate::move_install::tests::started(&key, "run");
+        if let WalRecord::RunStarted {
+            retention, ts_ms, ..
+        } = &mut started
+        {
+            *retention = Some(1);
+            *ts_ms = Some(100);
+        }
+        writer.append(1, &started, false).unwrap();
+        writer
+            .append(
+                1,
+                &WalRecord::RunFinished {
+                    interrupt_reason: None,
+                    ts_ms: Some(200),
+                    reason: broca_protocol::RunFinishReason::Completed,
+                    usage: Default::default(),
+                    error: None,
+                    retries_used: 0,
+                },
+                true,
+            )
+            .unwrap();
+        let id = writer.lineage_id().unwrap().to_string();
+        drop(writer);
+        service.rederive(&key).unwrap();
+        (service, key, root, id)
+    }
+
+    fn corrupt(service: &RetentionService, key: &BindIdentity) -> Vec<u8> {
+        let path = service.wal.ephemeral_wal_path(key);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[broca_wal::framing::LINEAGE_FRAME_LEN + 10] ^= 1;
+        fs::write(path, &bytes).unwrap();
+        assert!(service
+            .read_path(&service.wal.ephemeral_wal_path(key))
+            .is_err());
+        bytes
+    }
+
+    #[test]
+    fn absent_intake_without_held_history_keeps_ordinary_corrupt_wal_expiry() {
+        let (service, key, _, id) = expired_session("retention-no-intake");
+        corrupt(&service, &key);
+        let _lease = service.lease(&key).unwrap();
+        assert_eq!(service.delete_expired(&key, 1200).unwrap(), Some(id));
+        assert!(!service.wal.ephemeral_wal_path(&key).exists());
+    }
+
+    #[test]
+    fn absent_intake_with_held_history_refuses_retention() {
+        for evidence in [
+            REGISTRATION_MARKER,
+            "late-results.db.rebuild",
+            broca_wal::FEATURE_FLOOR_FILENAME,
+        ] {
+            let (service, key, root, _) = expired_session(&format!("retention-history-{evidence}"));
+            let bytes = corrupt(&service, &key);
+            fs::write(root.join(evidence), "provider-held/v1\n").unwrap();
+            let _lease = service.lease(&key).unwrap();
+            assert_eq!(service.delete_expired(&key, 1200).unwrap(), None);
+            assert_eq!(
+                fs::read(service.wal.ephemeral_wal_path(&key)).unwrap(),
+                bytes
+            );
+            assert_eq!(service.unreadable_sessions(), 1);
+            let _recreated = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+            assert_eq!(service.delete_expired(&key, 1200).unwrap(), None);
+            assert_eq!(
+                fs::read(service.wal.ephemeral_wal_path(&key)).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_intake_refuses_retention_and_counts_health() {
+        let (service, key, root, _) = expired_session("retention-unreadable-intake");
+        let bytes = corrupt(&service, &key);
+        fs::write(root.join("late-results.db"), b"not sqlite").unwrap();
+        let logs = broca_test_support::LogCapture::new();
+        let _lease = service.lease(&key).unwrap();
+        assert_eq!(
+            logs.in_scope(|| service.delete_expired(&key, 1200))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            fs::read(service.wal.ephemeral_wal_path(&key)).unwrap(),
+            bytes
+        );
+        assert_eq!(service.unreadable_sessions(), 1);
+        assert!(format!("{:?}", logs.events()).contains("provider_held_intake_unknown"));
+    }
+
+    #[test]
+    fn readable_intake_only_blocks_registered_lineages() {
+        for registered in [false, true] {
+            let (service, key, root, id) =
+                expired_session(&format!("retention-readable-{registered}"));
+            let bytes = corrupt(&service, &key);
+            let intake = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+            if registered {
+                intake
+                    .register_calls(&[broca_core::tool_plane::LateResultRegistration {
+                        lineage: id.clone(),
+                        call_key: format!("{id}:1"),
+                        module: "provider".into(),
+                        bind: key.clone(),
+                        scope: None,
+                    }])
+                    .unwrap();
+            }
+            let _lease = service.lease(&key).unwrap();
+            let deleted = service.delete_expired(&key, 1200).unwrap();
+            if registered {
+                assert_eq!(deleted, None);
+                assert_eq!(
+                    fs::read(service.wal.ephemeral_wal_path(&key)).unwrap(),
+                    bytes
+                );
+            } else {
+                assert_eq!(deleted, Some(id));
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_held_record_keeps_a_finished_session_live() {
+        let (service, key, _, id) = expired_session("retention-held-record");
+        let mut writer = service.wal.open_with_retention(&key, Some(1)).unwrap();
+        writer
+            .append(
+                1,
+                &WalRecord::ToolCallProviderHeld {
+                    batch_id: broca_protocol::BatchId("batch".into()),
+                    tool_call_id: broca_protocol::ToolCallId("call".into()),
+                    call_key: format!("{id}:1"),
+                    module: "provider".into(),
+                    reason: "running".into(),
+                    detail_digest: None,
+                    held_at_ms: 100,
+                    sequential: false,
+                },
+                true,
+            )
+            .unwrap();
+        drop(writer);
+        let path = service.wal.ephemeral_wal_path(&key);
+        let bytes = fs::read(&path).unwrap();
+        let _lease = service.lease(&key).unwrap();
+        assert_eq!(service.delete_expired(&key, 1200).unwrap(), None);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn retention_completion_removes_receipts_but_keeps_feed() {
+        use crate::late_results_store::{Disposition, FeedPosition};
+        let (service, key, root, id) = expired_session("retention-intake-cleanup");
+        let intake = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let entry = cortexkit_role_tool_provider::late_results::IntakeKey {
+            provider: "provider".into(),
+            custodian: "broca".into(),
+            call_key: format!("{id}:1"),
+            event_id: "event".into(),
+        };
+        let position = FeedPosition {
+            provider_incarnation: "inc".into(),
+            seq: 1,
+        };
+        intake.record_ack("provider", &position).unwrap();
+        intake.set_ack_owed("provider", true).unwrap();
+        intake
+            .record_receipt(&entry, "result", Disposition::NoOp)
+            .unwrap();
+        let _lease = service.lease(&key).unwrap();
+        assert_eq!(service.delete_expired(&key, 1200).unwrap(), Some(id));
+        assert_eq!(intake.receipt(&entry).unwrap(), None);
+        let feed = intake.feed("provider").unwrap().unwrap();
+        assert_eq!(feed.position, Some(position));
+        assert!(feed.ack_owed);
     }
 }
