@@ -101,6 +101,8 @@ impl std::error::Error for ReplayError {}
 /// The result of replaying a session's WAL — a LINEAGE of one or more episodes.
 #[derive(Debug, Clone)]
 pub struct ReplayState {
+    /// Next absolute transcript ordinal, including messages not held in the prompt.
+    pub extent: u64,
     /// The last episode renders tags under the computed rules on a compaction-managed session,
     /// is still running, and no Setup answer is recorded yet: the answer may carry a tag
     /// checkpoint that renumbers the run's parts from its cut (llm-runner §9.6), so no read
@@ -1387,7 +1389,7 @@ impl Episode {
 /// the last episode is a resume/continue target. Fails with [`ReplayError`] on a
 /// corrupt lineage (a new episode opened over an unfinished prior one).
 pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
-    let mut state = replay_seeded(
+    replay_seeded(
         records,
         None,
         None,
@@ -1396,14 +1398,7 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
         0,
         false,
         crate::tags::TagSeed::default(),
-    )?;
-    // Stamp the fully-assembled prompt with each message's durable lineage position. Done at
-    // this top-level finalization point (not inside `replay_seeded`, which produces sub-lists
-    // like a store-merge tail) so the position is over the WHOLE prompt. The store-merge fast
-    // path stamps the same way in `effective_context`/`resume_state_from_store`, so live and
-    // resume assign identical ordinals — asserted by `merge_equals_full_replay`.
-    broca_protocol::content::stamp_ordinals(&mut state.prompt);
-    Ok(state)
+    )
 }
 
 /// Persisted state needed to project a WAL suffix without replaying the materialized prefix.
@@ -1411,6 +1406,14 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
 pub struct ProjectionSeed {
     /// First model-produced message of the episode open at the watermark, if it has one.
     pub open_episode_span: Option<u64>,
+    /// The episode open at the watermark, as the projection holds it, and every earlier
+    /// episode's render inputs. A seed without them cannot continue an open episode's metadata,
+    /// so the successor projection would drop it (see `projected_open_episode`).
+    pub open_episode: Option<crate::context::EpisodeRenderProjection>,
+    pub earlier_episodes: Vec<crate::context::EpisodeRenderProjection>,
+    /// Every episode the projection holds, when it computed them and its reader may reuse any.
+    /// `None` while they are absent or superseded, which is when a projection refills them.
+    pub projection_episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
     pub watermark_seq: u64,
     pub anchor: Option<WalByteAnchor>,
     pub prefix_len: u64,
@@ -1432,6 +1435,9 @@ impl ProjectionSeed {
     pub fn empty() -> Self {
         Self {
             open_episode_span: None,
+            open_episode: None,
+            earlier_episodes: Vec::new(),
+            projection_episodes: None,
             watermark_seq: 0,
             anchor: None,
             prefix_len: 0,
@@ -1454,6 +1460,7 @@ impl ProjectionSeed {
 pub struct ProjectionDelta {
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
+    pub open_episode: Option<crate::context::EpisodeRenderProjection>,
     pub messages: Vec<Message>,
     pub message_runs: Vec<Option<RunAttribution>>,
     pub run_finals: BTreeMap<u64, RunAttribution>,
@@ -1568,7 +1575,10 @@ pub fn replay_projection_tail(
             seed.open_episode_span
         },
     );
-    let last_run_id = tail_state.run_id.or_else(|| seed.last_run_id.clone());
+    let last_run_id = tail_state
+        .run_id
+        .clone()
+        .or_else(|| seed.last_run_id.clone());
     debug_assert_eq!(
         last_run_id.as_ref(),
         admission_checkpoint
@@ -1576,9 +1586,17 @@ pub fn replay_projection_tail(
             .as_ref()
             .map(|episode| &episode.run_id)
     );
+    // A truncation restarts the transcript from ordinal zero, so no earlier episode survives
+    // it and the tail's own ordinals are already the projection's.
+    let open_episode = if truncate_prefix_to.is_some() {
+        projected_episode_metadata(&tail_state).pop()
+    } else {
+        projected_open_episode(&tail_state, seed.prefix_len, seed.open_episode.clone())
+    };
     Ok(ProjectionDelta {
         episode_spans,
         open_episode_span,
+        open_episode,
         messages: tail_state.prompt,
         message_runs: tail_state.message_runs,
         run_finals: tail_state.run_finals,
@@ -1599,6 +1617,41 @@ pub fn replay_projection_tail(
     })
 }
 
+/// Every replayed episode's render inputs as durable ordinals, for the store's episode
+/// projection. A resumed run under an applied view reads the projection instead of replaying the
+/// whole WAL, and this is the WAL-derived truth it must match.
+///
+/// Each episode's coordinates come from the same replay facts the run loop renders from: its
+/// `RunStarted` position, its admitted first user, its `frozen_render_config`, and the start of
+/// its first model-step span (`episode_step_spans`, which runs from the first model-produced
+/// message to the end of the episode). A value for an episode present in the replay is always
+/// known here: a known absence is `Some(None)`.
+pub fn projected_episode_metadata(
+    state: &ReplayState,
+) -> Vec<crate::context::EpisodeRenderProjection> {
+    let episodes = state.render_episodes.as_deref().unwrap_or_default();
+    let step_starts: Vec<usize> = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|span| span.start)
+        .collect();
+    episodes
+        .iter()
+        .enumerate()
+        .map(|(index, episode)| crate::context::EpisodeRenderProjection {
+            start: Some(episode.prompt_start as u64),
+            first_user: Some(episode.first_user.map(|first| first as u64)),
+            // Episode spans list only the episodes that committed a model step, in episode
+            // order, so once an episode has no span every later one shifts: an episode at or
+            // past that point records an unknown first step rather than another episode's.
+            first_step: Some(step_starts.get(index).map(|start| *start as u64)),
+            render_config: Some(episode.frozen_config.clone()),
+        })
+        .collect()
+}
+
 /// Continue the materialized episode across a replay seam, closing it before the next
 /// episode's input. Tail replay alone only knows the first model message after the seam.
 pub(crate) fn projected_episode_spans(
@@ -1609,7 +1662,7 @@ pub(crate) fn projected_episode_spans(
     let episodes = state.render_episodes.as_deref().unwrap_or_default();
     let first_boundary = episodes
         .first()
-        .map_or(state.prompt.len(), |e| e.prompt_start);
+        .map_or(state.prompt.len(), |e| e.prompt_start - base as usize);
     let mut spans = Vec::new();
     if let Some(start) = previous_open {
         spans.push(start..base + first_boundary as u64);
@@ -1626,11 +1679,62 @@ pub(crate) fn projected_episode_spans(
         Some(episode) => spans
             .iter()
             .rev()
-            .find(|span| span.start >= base + episode.prompt_start as u64)
+            .find(|span| span.start >= episode.prompt_start as u64)
             .map(|span| span.start),
         None => previous_open.or_else(|| spans.last().map(|span| span.start)),
     };
     (spans, open)
+}
+
+/// The episode that is open after a replay tail, in the coordinates of the projection this seed
+/// produces. Seeding hands the tail's own episode boundaries forward only for replay; this is the
+/// metadata the store keeps, and it must describe the same episode so a later read continues its
+/// first model step instead of losing it.
+pub(crate) fn projected_open_episode(
+    state: &ReplayState,
+    base: u64,
+    previous: Option<crate::context::EpisodeRenderProjection>,
+) -> Option<crate::context::EpisodeRenderProjection> {
+    let episodes = state.render_episodes.as_deref().unwrap_or_default();
+    let first_boundary = episodes.first().map_or(state.prompt.len(), |episode| {
+        episode.prompt_start - base as usize
+    });
+    // Episodes that committed a model step, in episode order.
+    let spanned = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .len();
+    let first_step = state
+        .episode_step_spans
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|span| base + span.start as u64)
+        .find(|start| episodes.is_empty() || *start >= base + first_boundary as u64);
+    let previous = previous.filter(|previous| previous.start.is_some());
+    match episodes.last() {
+        // A tail whose first record opens an episode shows nothing of the projection's open
+        // episode, so the projection's open episode keeps its own facts and takes the tail
+        // episode's first step only if it had none. Otherwise the tail's last episode is open,
+        // and it is the episode every one of its records belongs to.
+        Some(_) if first_boundary == 0 && episodes.len() > 1 => {
+            let metadata = projected_episode_metadata(state);
+            let mut last = metadata.last().cloned()?;
+            last.first_step = Some(first_step);
+            Some(last)
+        }
+        _ => {
+            let previous = previous?;
+            let tail_first_step = (spanned == 0).then_some(first_step).flatten();
+            Some(crate::context::EpisodeRenderProjection {
+                start: previous.start,
+                first_user: previous.first_user,
+                first_step: previous.first_step.or(Some(tail_first_step)),
+                render_config: previous.render_config,
+            })
+        }
+    }
 }
 
 /// Validate a budgeted projection/admission seed before it can affect replay.
@@ -1833,7 +1937,8 @@ fn replay_seeded_with_compaction<'a>(
                 .map_err(ReplayError::TagNumbering)?;
             numbering.start_run(config);
         }
-        compaction.fold_at(rec, ordinal_base.saturating_add(prompt.len() as u64));
+        let extent_before = placement.next_ordinal();
+        compaction.fold_at(rec, extent_before);
         if compaction_session || compaction.state().is_some() {
             compaction_history.fold(rec);
             if let crate::compaction::CompactionCheckpoint::State(state) = &mut compaction {
@@ -1925,11 +2030,11 @@ fn replay_seeded_with_compaction<'a>(
                 seeded_budget = None;
                 saw_run_started = true;
                 render_episodes.push(broca_protocol::request::EpisodeRenderInput {
-                    prompt_start: prompt.len(),
+                    prompt_start: extent_before as usize,
                     first_user: input
                         .iter()
                         .position(|m| m.role == Role::User)
-                        .map(|i| prompt.len() + i),
+                        .map(|i| extent_before as usize + i),
                     frozen_config: config.frozen_render_config.clone(),
                 });
                 let input_tags = rec.runner_tags();
@@ -2554,6 +2659,27 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::StructuredOutputResult { .. }
             | WalRecord::QuestionWithdrawalAcknowledged { .. } => {}
         }
+        // Placement is the authority for transcript positions, including a seeded prefix and
+        // steers held until a boundary. Assign its ordinals as each record places its messages.
+        let placed = actions
+            .iter()
+            .map(|action| match action {
+                PlacementAction::Append { count, .. }
+                | PlacementAction::PlaceHeld { count, .. } => *count as usize,
+                _ => 0,
+            })
+            .sum::<usize>();
+        let placed_start = prompt.len() - placed;
+        let mut newly_placed = prompt[placed_start..].iter_mut();
+        for action in &actions {
+            if let PlacementAction::Append { first, count, .. }
+            | PlacementAction::PlaceHeld { first, count } = *action
+            {
+                for ordinal in first..first + count {
+                    newly_placed.next().expect("placement message").ordinal = Some(ordinal);
+                }
+            }
+        }
         message_runs.truncate(prompt.len());
         for message in &prompt[message_runs.len()..] {
             let mut attribution = run_id
@@ -2572,11 +2698,7 @@ fn replay_seeded_with_compaction<'a>(
                     .last()
                     .and_then(|run| run.as_ref())
                     .filter(|run| Some(&run.run_id) == run_id.as_ref().map(|id| &id.0))
-                    .and_then(|_| {
-                        ordinal_base
-                            .checked_add(prompt.len() as u64)?
-                            .checked_sub(1)
-                    })
+                    .and_then(|_| placement.next_ordinal().checked_sub(1))
                     .or_else(|| {
                         prompt
                             .is_empty()
@@ -2685,21 +2807,27 @@ fn replay_seeded_with_compaction<'a>(
             .as_ref()
             .zip(ep.open_step_record)
             .map(|(assistant, step_record)| {
-                (
-                    tagged(
-                        Message {
-                            cache_prefix_blocks: None,
-                            role: Role::Assistant,
-                            content: assistant.content.clone(),
-                            origin: ep.origin.clone(),
-                            ordinal: None,
-                            tags: Default::default(),
-                        },
-                        ep.open_assistant_tags.as_ref(),
-                    ),
-                    step_record,
-                )
+                let mut message = tagged(
+                    Message {
+                        cache_prefix_blocks: None,
+                        role: Role::Assistant,
+                        content: assistant.content.clone(),
+                        origin: ep.origin.clone(),
+                        ordinal: None,
+                        tags: Default::default(),
+                    },
+                    ep.open_assistant_tags.as_ref(),
+                );
+                // Reads expose this turn before its batch commits. Commit appends it right
+                // after the numbered prompt, so number it now exactly as commit will: an
+                // exposed part that later gained a number would be a renumbering within the
+                // lineage.
+                numbering
+                    .number_pending(&mut message)
+                    .map_err(ReplayError::TagNumbering)?;
+                Ok::<_, ReplayError>((message, step_record))
             })
+            .transpose()?
     } else {
         None
     };
@@ -2751,6 +2879,7 @@ fn replay_seeded_with_compaction<'a>(
             .as_ref()
             .is_some_and(|config| config.render_tags && config.computed_tags.is_some());
     Ok(ReplayState {
+        extent: placement.next_ordinal(),
         tags_await_setup,
         input_budget,
         cancel_at,
@@ -2891,33 +3020,27 @@ impl RunUsageProjection {
             }
             WalRecord::ModelStepFinished { usage, .. } if self.active => {
                 if let Some((model, variant)) = &self.model {
-                    let mut step_usage = cortexkit_role_llm_runner::usage::StepUsage::unreported();
-                    if let Some(tokens) = usage.input_tokens {
-                        step_usage = step_usage.with_input_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.cached_input_tokens {
-                        step_usage = step_usage.with_cached_input_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.cache_write_tokens {
-                        step_usage = step_usage.with_cache_write_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.output_tokens {
-                        step_usage = step_usage.with_output_tokens(tokens);
-                    }
-                    if let Some(tokens) = usage.reasoning_tokens {
-                        step_usage = step_usage.with_reasoning_tokens(tokens);
-                    }
                     self.usage.record_step(
                         &model.provider_module_id,
                         &model.model_id,
                         variant.as_deref().filter(|value| !value.is_empty()),
-                        step_usage,
+                        reported_step_usage(usage),
                     );
                 }
             }
             _ => {}
         }
     }
+}
+
+pub(crate) fn reported_step_usage(usage: &Usage) -> cortexkit_role_llm_runner::usage::StepUsage {
+    let mut step = cortexkit_role_llm_runner::usage::StepUsage::unreported();
+    step.input_tokens = usage.input_tokens;
+    step.cached_input_tokens = usage.cached_input_tokens;
+    step.cache_write_tokens = usage.cache_write_tokens;
+    step.output_tokens = usage.output_tokens;
+    step.reasoning_tokens = usage.reasoning_tokens;
+    step
 }
 
 /// A run state reconciled from the WAL, including terminal metadata absent from the index.
@@ -3547,6 +3670,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(step_id),
@@ -3604,6 +3728,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -3671,7 +3796,10 @@ pub(crate) mod projection_boundary_tests {
             unreachable!("fixture starts a run")
         };
         ProjectionSeed {
+            projection_episodes: None,
             open_episode_span: Some(1),
+            open_episode: None,
+            earlier_episodes: Vec::new(),
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,
@@ -3692,6 +3820,7 @@ pub(crate) mod projection_boundary_tests {
             trailing_origin: Some(ModelHandle::new("stub", "old-model")),
             last_run_id: Some(RunId("r1".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                head: None,
                 has_deferred_calls: None,
                 tags: None,
                 pending_order: None,
@@ -4163,6 +4292,7 @@ pub(crate) mod deferred_tests {
         vec![
             super::projection_boundary_tests::run_started(1, "r").record,
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),

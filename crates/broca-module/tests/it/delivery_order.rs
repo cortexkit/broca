@@ -277,15 +277,37 @@ async fn dedupe_never_replaces_a_delivered_send() {
 
 /// A send whose expiry passes before any boundary could deliver it is dropped with a durable
 /// `SendEnded {expired}` and never delivered; a retry reports it expired.
+#[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn an_expired_send_is_dropped_durably_and_never_delivered() {
+    use std::sync::Arc;
+
+    use broca_core::{FileLeaseStore, FileWalStore};
+    use broca_module::retention::RetentionService;
+
     let (exec, gate) = FakeExecutor::gated_with_step_boundary();
     let rig = Rig::new("ordered-expiry", exec, LONG_TTL);
     let key = rig.key("s");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+    let now = 1_000_000;
+    std::fs::write(
+        rig.dir.join("test-clock"),
+        serde_json::json!({"now_ms": now}).to_string(),
+    )
+    .unwrap();
+    // Ordered-send expiry uses the retention clock; freeze it before opening the actor so
+    // admission cannot overtake the deadline while the machine is busy.
+    let retention = Arc::new(
+        RetentionService::new(
+            Arc::new(FileWalStore::new(rig.dir.join("wal"))),
+            rig.run_index.clone(),
+            Arc::new(FileLeaseStore::new(rig.dir.join("leases"))),
+            rig.run_index.clone(),
+            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
+        )
+        .unwrap(),
+    );
+    rig.registry.set_retention_service(retention.clone());
+    assert_eq!(retention.clock.now_ms(), now);
     let expiring = || {
         Some(DeliveryOrder {
             expires_at_ms: Some(now + 300),
@@ -299,7 +321,13 @@ async fn an_expired_send_is_dropped_durably_and_never_delivered() {
             .unwrap(),
         SendResponse::Pending { .. }
     ));
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    std::fs::write(
+        rig.dir.join("test-clock"),
+        serde_json::json!({"now_ms": now + 400}).to_string(),
+    )
+    .unwrap();
+    retention.clock.refresh().unwrap();
+    assert_eq!(retention.clock.now_ms(), now + 400);
     assert!(matches!(
         rig.registry.send(send(&key, "run", None)).await.unwrap(),
         SendResponse::Active { .. }

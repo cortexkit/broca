@@ -882,6 +882,8 @@ const DISPATCH_CACHE_SESSIONS: usize = 4096;
 
 /// One `session.read` snapshot: the page, plus what the same snapshot says beyond it.
 pub struct RouteReadPage {
+    pub head_facts: broca_core::head::HeadProjection,
+    pub head_facts_complete: bool,
     pub page: broca_core::SessionReadPage,
     /// Projection commits only complete tool turns. Any open batch therefore remains in the
     /// WAL records after the snapshot's watermark, which supply this batch's call states.
@@ -955,6 +957,9 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    pub(crate) fn upload_store(&self) -> Option<broca_core::media_uploads::Uploads> {
+        self.inner.reader.as_ref()?.wal_store.uploads()
+    }
     pub fn active_event_sessions(&self) -> Vec<LineageKey> {
         self.inner
             .slots
@@ -1349,6 +1354,18 @@ impl LineageRegistry {
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
         self.check_authorization_expired(key).await?;
         self.durable_session_ownership(key, false)
+            .await
+            .map_err(OwnershipReadError::into_open)
+    }
+
+    /// Upload standing includes plan-named senders, unlike cancel/retract. Read
+    /// the frozen first manifest without retaining its contents in owner caches.
+    pub(crate) async fn upload_ownership(
+        &self,
+        key: &LineageKey,
+    ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+        self.check_authorization_expired(key).await?;
+        self.durable_session_ownership(key, true)
             .await
             .map_err(OwnershipReadError::into_open)
     }
@@ -3330,6 +3347,74 @@ impl LineageRegistry {
         }
         .map(str::to_owned)
         .or_else(|| snapshot.last_title.clone());
+        let mut head_facts = snapshot.head.clone().unwrap_or_default();
+        let head_facts_complete = (snapshot.watermark_seq == 0 || snapshot.head.is_some())
+            && matches!(
+                tail.records(),
+                broca_wal::WalRangeRecords::Complete(_) | broca_wal::WalRangeRecords::Absent
+            );
+        let mut head_after = (snapshot.watermark_seq > 0).then_some(snapshot.watermark_seq);
+        let retained_identity = retention_activity_ms
+            .and(lineage_id)
+            .map(|id| id.to_string());
+        if let (Some(lineage), Some(store), broca_wal::WalRangeRecords::Complete(records)) = (
+            retained_identity.as_ref(),
+            reader.store.as_ref(),
+            tail.records(),
+        ) {
+            let store = store.clone();
+            let session = key.clone();
+            let lineage = lineage.clone();
+            let checkpoint = spawn_blocking(JobKind::StoreRead, move || {
+                store.read_retained_head(&session, &lineage)
+            })
+            .await;
+            if let Ok(Ok(Some(checkpoint))) = checkpoint {
+                if checkpoint.lineage_id == retained_identity.as_deref().unwrap()
+                    && records
+                        .last()
+                        .is_some_and(|last| checkpoint.at_seq <= last.seq)
+                    && records
+                        .first()
+                        .is_some_and(|first| first.seq <= checkpoint.at_seq.saturating_add(1))
+                {
+                    head_facts = checkpoint.facts;
+                    head_after = Some(checkpoint.at_seq);
+                }
+            }
+        }
+        match tail.records() {
+            broca_wal::WalRangeRecords::Complete(records)
+            | broca_wal::WalRangeRecords::Partial(records)
+            | broca_wal::WalRangeRecords::Unknown(records) => {
+                for frame in records {
+                    if head_after.is_none_or(|after| frame.seq > after) {
+                        head_facts.observe(&frame.record);
+                    }
+                }
+            }
+            broca_wal::WalRangeRecords::Absent => {}
+        }
+        if head_facts_complete {
+            if let (Some(lineage_id), Some(store), broca_wal::WalRangeRecords::Complete(records)) =
+                (retained_identity, reader.store.as_ref(), tail.records())
+            {
+                if let Some(last) = records.last() {
+                    let checkpoint = broca_core::head::RetainedHeadCheckpoint {
+                        lineage_id,
+                        at_seq: last.seq,
+                        facts: head_facts.clone(),
+                    };
+                    let store = store.clone();
+                    let session = key.clone();
+                    // The store's expiry transaction deletes this content-free row and prevents late resurrection.
+                    let _ = spawn_blocking(JobKind::Projection, move || {
+                        store.checkpoint_retained_head(&session, &checkpoint)
+                    })
+                    .await;
+                }
+            }
+        }
         let (mut page, dispatches) = broca_core::read_session_page_owned_with_dispatches(
             snapshot,
             match tail.records() {
@@ -3392,6 +3477,8 @@ impl LineageRegistry {
             repair_materialized_lineage(store, session, stale_lineage_id, tail).await;
         }
         Ok(RoutedPage::Raw(Box::new(RouteReadPage {
+            head_facts,
+            head_facts_complete,
             page,
             open_batch,
             tools,
@@ -5251,6 +5338,7 @@ mod tests {
 
     pub(super) fn started_record(session: &LineageKey) -> WalRecord {
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -5306,6 +5394,7 @@ mod tests {
 
     pub(super) fn assistant_record() -> WalRecord {
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(1),

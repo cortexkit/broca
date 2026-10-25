@@ -187,6 +187,34 @@ def tail_state(path: pathlib.Path) -> str:
         raise WalUnreadable(path, error) from error
 
 
+# How many times a scan starts over after a listed log vanished under it before refusing.
+SCAN_ATTEMPTS = 4
+
+
+def scan_population(
+    wal_dir: pathlib.Path,
+) -> tuple[int, list[tuple[str, float]], list[tuple[str, float]]]:
+    """Read every live log's tail once: (logs scanned, open logs, newer-writer logs).
+
+    Raises ArchiveRefusal or WalUnreadable; either one caused by FileNotFoundError means a log
+    vanished between listing and reading.
+    """
+    unsealed: list[tuple[str, float]] = []
+    newer_writer: list[tuple[str, float]] = []
+    files = logical_wals(wal_dir, include_archives=False)
+    for wal in files:
+        state = tail_state(wal)
+        if state in (OPEN, NEWER_WRITER):
+            try:
+                mtime = wal.stat().st_mtime
+            except OSError as error:
+                raise WalUnreadable(wal, error) from error
+            # A newer-writer log is not corruption and not a reason to stop: listed by name,
+            # decided by the caller.
+            (unsealed if state == OPEN else newer_writer).append((wal.name, mtime))
+    return len(files), unsealed, newer_writer
+
+
 # KNOWN LIMIT, measured rather than assumed: a frame torn mid-write can hide a run that is
 # starting. Matching the tailmost COMPLETE token means a trailing `{"type":"run_st` is invisible,
 # so a file whose previous state was sealed reads as sealed. Reproduced deliberately -- sealed
@@ -412,28 +440,21 @@ def main() -> int:
         )
         return 2
 
-    scanned = 0
-    unsealed: list[tuple[str, float]] = []
-    newer_writer: list[tuple[str, float]] = []
-    try:
-        files = logical_wals(wal_dir, include_archives=False)
-    except ArchiveRefusal as error:
-        print(f"cannot compare: {error}", file=sys.stderr)
-        return 2
-    for wal in files:
-        scanned += 1
+    # Retention can delete a retained session's log between listing it and reading its tail.
+    # A log that is gone held no live run (retention never deletes a running session), so the
+    # scan starts again on the population as it now stands. Any other unreadable log refuses.
+    for attempt in range(SCAN_ATTEMPTS):
         try:
-            state = tail_state(wal)
-        except WalUnreadable as unreadable:
+            scanned, unsealed, newer_writer = scan_population(wal_dir)
+            break
+        except (ArchiveRefusal, WalUnreadable) as error:
+            vanished = isinstance(error.__cause__, FileNotFoundError)
+            if vanished and attempt + 1 < SCAN_ATTEMPTS:
+                continue
             # Refuse rather than guess: this is the one answer a restart gate must never
             # invent, and "cannot compare" is the exit code that already means it.
-            print(f"cannot compare: {unreadable}", file=sys.stderr)
+            print(f"cannot compare: {error}", file=sys.stderr)
             return 2
-        if state == OPEN:
-            unsealed.append((wal.name, wal.stat().st_mtime))
-        elif state == NEWER_WRITER:
-            # Not corruption and not a reason to stop: listed by name, decided below.
-            newer_writer.append((wal.name, wal.stat().st_mtime))
 
     # A scan that examined nothing would report a clean idle box. Refuse instead.
     if scanned == 0:

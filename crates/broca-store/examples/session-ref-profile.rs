@@ -20,6 +20,7 @@ fn session(i: usize) -> BindIdentity {
 }
 fn record(session: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,

@@ -90,6 +90,15 @@ pub fn transcript_message(message: &Message) -> Option<TranscriptMessage> {
     ))
 }
 
+/// The transcript message at `ordinal` in `prompt`: the lookup [`decide_stored_at`] passes to
+/// `dispose_fetched`, for tests that compare what that lookup returns over two prompts.
+#[cfg(test)]
+pub(crate) fn transcript_at(prompt: &[Message], ordinal: u64) -> Option<TranscriptMessage> {
+    transcript(ordinal_range(prompt, ordinal, ordinal.saturating_add(1)))
+        .next()
+        .and_then(transcript_message)
+}
+
 /// The transcript messages of `prompt`: every message with an ordinal, in order, except
 /// system messages, which the runner places ahead of the history itself (as it does under
 /// Setup's initial message).
@@ -228,6 +237,21 @@ fn assemble_judged(
     Ok(out)
 }
 
+/// Whether a replacement message could be an unchanged copy of content only the model may
+/// author, so that it is judged against the stored messages its range stands for: it carries a
+/// model origin or signed reasoning, or the transcript has a model-origin message of its role
+/// (it could be such a message with its origin removed). The same test `assemble_judged` makes
+/// before it reads those stored messages; the two must agree, or a decision reads a stored
+/// message the run never read back.
+pub(super) fn carries_model_authorship(
+    candidate: &Message,
+    stored: super::StoredTranscript<'_>,
+) -> bool {
+    candidate.origin.is_some()
+        || candidate.content.iter().any(super::is_signed)
+        || stored.has_model_origin(candidate.role)
+}
+
 /// A replacement message broca refuses: bytes that are not a message in broca's schema are
 /// rejected; a message in the schema that claims model authorship is a provider constraint.
 fn replacement_problem(value: &Value) -> AssemblyProblem {
@@ -339,6 +363,13 @@ pub fn rendered_history(state: &CompactionState, prompt: &[Message]) -> Vec<Mess
 /// one is broca's own, because the role names none for a runner that does not serve cut
 /// lineages.
 pub const CUT_UNSUPPORTED: &str = "cut_unsupported";
+
+/// The reason broca gives in `view_refused:<version>:<reason>` for a view that keeps, edits or
+/// copies a message the run released from memory and that neither the materialized store nor
+/// the WAL can supply. Rendering the view without that message would send a shorter history
+/// than the view asks for, so the view is refused instead. Broca's own reason, like
+/// [`CUT_UNSUPPORTED`].
+pub const HISTORY_UNAVAILABLE: &str = "history_unavailable";
 
 /// What the runner does with a fetched view at a step boundary.
 #[derive(Debug, Clone, PartialEq)]
@@ -564,10 +595,7 @@ pub(crate) fn decide_stored_at(
     if invalidated.is_empty() && !invalidated_copies {
         return Decision::Apply(CompactionViewChoice::Applied);
     }
-    let to_ordinal = transcript(prompt)
-        .filter_map(|message| message.ordinal)
-        .max()
-        .map_or(0, |last| last + 1);
+    let to_ordinal = stored.extent();
     // With only copies invalidated the recorded range is empty; the companion choice itself
     // strips the copies' reasoning when the view renders.
     let from_ordinal = invalidated.iter().min().copied().unwrap_or(to_ordinal);
@@ -702,8 +730,31 @@ pub(crate) fn notice_through(
     through: &Message,
     facts: NoticeFacts<'_>,
 ) -> Option<AdvanceNotice> {
+    notice_at(state, &notice_anchor(through)?, facts)
+}
+
+pub(crate) struct NoticeAnchor {
+    pub(crate) ordinal: u64,
+    digest: String,
+}
+
+/// Only the ordinal and digest are needed after a view releases the newest raw message.
+pub(crate) fn notice_anchor(through: &Message) -> Option<NoticeAnchor> {
     let through_ordinal = through.ordinal?;
     let through_digest = content_digest(&serde_json::to_value(through).expect("native JSON"));
+    Some(NoticeAnchor {
+        ordinal: through_ordinal,
+        digest: through_digest,
+    })
+}
+
+pub(crate) fn notice_at(
+    state: &CompactionState,
+    through: &NoticeAnchor,
+    facts: NoticeFacts<'_>,
+) -> Option<AdvanceNotice> {
+    let through_ordinal = through.ordinal;
+    let through_digest = through.digest.clone();
     let applied = state.applied_view_version(facts.lineage_id);
     let mut events: Vec<Event> = state
         .unannounced

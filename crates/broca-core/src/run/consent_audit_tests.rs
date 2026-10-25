@@ -678,6 +678,7 @@ async fn stopped_expired_sibling(cancel: bool) -> Rig {
         None,
         Some(rig.wal_store()),
         None,
+        None,
     ));
     let interrupt = async {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(2));

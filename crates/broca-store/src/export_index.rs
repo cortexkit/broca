@@ -772,6 +772,7 @@ mod tests {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -815,6 +816,7 @@ mod tests {
                 seq: records.len() as u64 + 1,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(ordinal as u64),

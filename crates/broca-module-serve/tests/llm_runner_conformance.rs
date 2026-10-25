@@ -37,7 +37,7 @@ use cortexkit_role_harness::{
 use cortexkit_role_llm_runner::points;
 use cortexkit_role_llm_runner_conformance::{
     run_suite, Capability, CaseOutcome, LlmRunnerSubject, Reply, RouteFailure, RunnerRoute, Script,
-    ScriptedPart, SubscribeOutcome, SCRIPTED_TOOL,
+    ScriptedPart, ScriptedUsage, SubscribeOutcome, SCRIPTED_TOOL,
 };
 use serde_json::{json, Map, Value};
 use subc_control::ConsumerIdentity;
@@ -51,6 +51,7 @@ const TOOL_MODULE: &str = "conformance-tools";
 /// The stand-in module whose launch nonce gives the suite a second caller identity.
 const OWNER_MODULE: &str = "conformance-owner";
 const SENDER_MODULE: &str = "conformance-sender";
+const HEAD_SENDER_MODULE: &str = "conformance-head-sender";
 const PLAN_MODEL_PREFIX: &str = "conformance-plan-";
 /// The system-prompt marker naming the session a model request belongs to.
 const SESSION_MARKER: &str = "conformance-session:";
@@ -695,15 +696,7 @@ async fn serve_model_request(
         Some(if calls > 0 { "tool_calls" } else { "stop" }),
     ));
     if let Some(usage) = &turn.usage {
-        let prompt = usage
-            .input_tokens
-            .saturating_add(usage.cache_read_tokens)
-            .saturating_add(usage.cache_write_tokens);
-        let output = usage.output_tokens.min(output_cap);
-        events.push(json!({"id": id, "object": "chat.completion.chunk", "choices": [],
-            "usage": {"prompt_tokens": prompt, "completion_tokens": output,
-                "total_tokens": prompt.saturating_add(output),
-                "prompt_tokens_details": {"cached_tokens": usage.cache_read_tokens, "cache_write_tokens": usage.cache_write_tokens}}}));
+        events.push(scripted_usage_chunk(&id, usage, output_cap));
     }
     let mut body = String::new();
     let mut prefix_bytes = 0;
@@ -1095,6 +1088,16 @@ impl BrocaSubject {
                     "enabled": true,
                     "reserved": true,
                 },
+                HEAD_SENDER_MODULE: {
+                    "program": sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN"),
+                    "args": [],
+                    "env": {
+                        "FAKE_AFT_MODULE_ID": HEAD_SENDER_MODULE,
+                        "FAKE_AFT_LAUNCH_NONCE_PATH": root.join("head-sender.nonce"),
+                    },
+                    "enabled": true,
+                    "reserved": true,
+                },
             }
         });
         let mut config = config;
@@ -1234,6 +1237,7 @@ impl BrocaSubject {
             let nonce_path = match module {
                 OWNER_MODULE => live.owner_nonce.clone(),
                 SENDER_MODULE => live.owner_nonce.with_file_name("sender.nonce"),
+                HEAD_SENDER_MODULE => live.owner_nonce.with_file_name("head-sender.nonce"),
                 "magic-context" => live.owner_nonce.with_file_name("reader.nonce"),
                 _ => return Err(HarnessError::new("unknown conformance module principal")),
             };
@@ -1642,10 +1646,64 @@ struct BrocaRoute {
     logs_dir: PathBuf,
 }
 
-fn error_body(bytes: &[u8]) -> subc_protocol::ErrorBody {
+fn scripted_usage_chunk(id: &str, usage: &ScriptedUsage, output_cap: u64) -> Value {
+    let prompt = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_tokens)
+        .saturating_add(usage.cache_write_tokens);
+    let output = usage.output_tokens.min(output_cap);
+    let mut event = json!({"id":id,"object":"chat.completion.chunk","choices":[],"usage":{
+        "prompt_tokens":prompt,"completion_tokens":output,"total_tokens":prompt.saturating_add(output),
+        "prompt_tokens_details":{"cached_tokens":usage.cache_read_tokens,"cache_write_tokens":usage.cache_write_tokens}
+    }});
+    if let Some(reasoning) = usage.reasoning_tokens {
+        event["usage"]["completion_tokens_details"] =
+            json!({"reasoning_tokens":reasoning.min(output)});
+    }
+    event
+}
+
+#[test]
+fn scripted_usage_chunk_preserves_reasoning_as_an_output_breakdown() {
+    let usage = ScriptedUsage::new(7, 2, 1, 10).with_reasoning_tokens(3);
+    let event = scripted_usage_chunk("id", &usage, u64::MAX);
+    assert_eq!(event["usage"]["completion_tokens"], 10);
+    assert_eq!(
+        event["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        3
+    );
+    let capped = scripted_usage_chunk("id", &usage, 2);
+    assert_eq!(capped["usage"]["completion_tokens"], 2);
+    assert_eq!(
+        capped["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        2
+    );
+    let event = scripted_usage_chunk("id", &ScriptedUsage::new(7, 2, 1, 10), u64::MAX);
+    assert!(event["usage"].get("completion_tokens_details").is_none());
+}
+
+// Decode the kit's error type from wire bytes, independently of the connection's protocol version.
+fn error_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
     serde_json::from_slice(bytes).unwrap_or_else(|_| {
-        subc_protocol::ErrorBody::new("undecodable_error", String::from_utf8_lossy(bytes))
+        serde_json::from_value(
+            json!({"code":"undecodable_error", "message":String::from_utf8_lossy(bytes)}),
+        )
+        .expect("the fallback refusal has a valid protocol error shape")
     })
+}
+
+#[test]
+fn role_kit_error_body_keeps_served_refusal_fields() {
+    let wire = json!({"code":"invalid_params","message":"bad selector","detail":{"field":"preset","class":"permanent"}});
+    let Reply::Error(body) = Reply::Error(error_body(&serde_json::to_vec(&wire).unwrap())) else {
+        unreachable!()
+    };
+    assert_eq!(serde_json::to_value(body).unwrap(), wire);
+    let Reply::Error(body) = Reply::Error(error_body(b"not-json")) else {
+        unreachable!()
+    };
+    assert_eq!(body.code, "undecodable_error");
+    assert_eq!(body.message, "not-json");
 }
 
 impl BrocaRoute {
@@ -1793,7 +1851,11 @@ impl RunnerRoute for BrocaRoute {
                     let (code, message) = rejection
                         .split_once(" — ")
                         .unwrap_or((rejection.as_ref(), ""));
-                    break SubscribeOutcome::Refused(subc_protocol::ErrorBody::new(code, message));
+                    break SubscribeOutcome::Refused(
+                        serde_json::from_value(json!({"code":code,"message":message})).map_err(
+                            |error| RouteFailure::new(format!("an undecodable refusal: {error}")),
+                        )?,
+                    );
                 }
                 Ok(Err(error)) => return Err(RouteFailure::new(error.to_string())),
             }
@@ -1966,6 +2028,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::NoTools,
             Capability::RunStatus,
             Capability::RunUsage,
+            Capability::SessionUsage,
             Capability::RunCancel,
             Capability::Retract,
             Capability::DispatchAttribution,
@@ -1994,6 +2057,25 @@ impl LlmRunnerSubject for BrocaSubject {
             capabilities.extend([Capability::Retention, Capability::RetentionClock]);
         }
         capabilities
+    }
+
+    fn session_usage_fixtures(&self) -> bool {
+        true
+    }
+
+    fn head_sender_identities(
+        &self,
+    ) -> Option<[cortexkit_role_llm_runner_conformance::PlanSenderIdentity; 2]> {
+        let identity = |module: &str| {
+            cortexkit_role_llm_runner_conformance::PlanSenderIdentity::new(
+                RouteStamp {
+                    principal: format!("reserved:{module}"),
+                    scope: None,
+                },
+                module,
+            )
+        };
+        Some([identity(SENDER_MODULE), identity(HEAD_SENDER_MODULE)])
     }
 
     fn owner_stamp(&self) -> RouteStamp {

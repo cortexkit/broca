@@ -83,6 +83,22 @@ pub struct MoveObservation {
 /// because they have no local bytes that the incoming cut could overwrite.
 #[async_trait::async_trait]
 pub trait MoveDriver: Send + Sync {
+    /// Media needs a transport carrying objects as well as WAL bytes. Until the
+    /// bridge supplies that transport, refuse before any cut intent or freeze.
+    fn prepare_media(
+        &self,
+        session: &BindIdentity,
+        digests: &BTreeSet<String>,
+    ) -> Result<(), ErrorBody> {
+        if digests.is_empty() {
+            return Ok(());
+        }
+        Err(refusal(
+            "incompatible_version",
+            "session media cannot move through the WAL-only transport",
+            serde_json::json!({"session": session.session, "required": ["media-content/v1"]}),
+        ))
+    }
     async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody>;
     async fn cover(&self, reference: &str) -> Result<u64, ErrorBody>;
     async fn export(&self, reference: &str, frozen: &[u8]) -> Result<(), ErrorBody>;
@@ -673,6 +689,10 @@ impl CutArtifacts for FileCutArtifacts {
                 }
             }
             if op == Op::Prepare {
+                let digests =
+                    broca_core::media_store::session_media_digests(&self.state_root, &plan.session)
+                        .map_err(unavailable)?;
+                self.driver.prepare_media(&plan.session, &digests)?;
                 if !live.try_exists().map_err(unavailable)? && plan.local_archive.is_none() {
                     return Err(refusal(
                         "unknown_ref",

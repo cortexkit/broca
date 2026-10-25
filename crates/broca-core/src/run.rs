@@ -46,9 +46,14 @@ use crate::{
     provider::Provider,
     replay::{replay, PendingTurn, ReplayResolution, ReplayState},
     tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError},
-    tool_repetition::{result_bytes, RepetitionObserver},
+    tool_repetition::{result_bytes, RepetitionFold, RepetitionObserver},
     wal_writer::{session_addr, WalHandle, WalStore, WalWriteError},
 };
+
+pub(crate) mod held_prompt;
+pub(crate) mod released_history;
+pub mod repetition_guidance;
+use held_prompt::PromptPosition;
 
 /// Default safety cap when the caller supplies no `stop_when`.
 ///
@@ -93,6 +98,7 @@ pub enum OutputEvent {
 /// The caller's request to start a run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRequest {
+    pub input_written_at_ms: Option<u64>,
     pub directives: Option<Vec<cortexkit_role_llm_runner::directives::DirectiveName>>,
     pub session_class: Option<String>,
     /// Retention accepted for this send, recorded in a new episode's `RunStarted` but never
@@ -236,6 +242,7 @@ impl RunRequest {
         submission_id: broca_protocol::SubmissionId,
     ) -> Self {
         RunRequest {
+            input_written_at_ms: None,
             directives: req.directives,
             session_class: None,
             retention: None,
@@ -364,6 +371,7 @@ where
                 if checkpoint.at_seq == snapshot.watermark_seq
                     && snapshot.watermark_seq <= safe_head
                     && checkpoint.ownership_complete()
+                    && checkpoint.head.is_some()
                     && checkpoint.compaction_complete()
                     && checkpoint.input_budget.is_some()
                 {
@@ -516,6 +524,12 @@ pub(crate) struct ApprovalWaitProbe {
 /// emission defaults to "on" so existing callers retain the complete output stream.
 #[derive(Clone)]
 pub struct RunControl {
+    #[cfg(test)]
+    pub(crate) held_prompt_probe: Option<Arc<held_prompt::Probe>>,
+    #[cfg(test)]
+    pub(crate) view_release_probe: Option<Arc<held_prompt::ReleaseProbe>>,
+    #[cfg(test)]
+    pub(crate) retain_full_prompt: bool,
     /// Installed by the late-result runtime to rejoin durable waiting slots without re-dispatch.
     /// Absent by default: a reader or a caller retry cannot drive a provider-held run.
     pub provider_held_lifecycle: Option<Arc<dyn crate::tool_plane::ProviderHeldLifecycle>>,
@@ -678,6 +692,12 @@ impl RunControl {
 impl Default for RunControl {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
+            held_prompt_probe: None,
+            #[cfg(test)]
+            view_release_probe: None,
+            #[cfg(test)]
+            retain_full_prompt: false,
             provider_held_lifecycle: None,
             step_progress: None,
             #[cfg(all(test, feature = "test-clock"))]
@@ -1466,6 +1486,21 @@ where
             return Err(e);
         }
     };
+    // An applied view can leave the resumed prompt without the episode coordinates of earlier
+    // episodes, which ChatGPT effort updates and per-episode repetition guidance render from.
+    // The store projects them, so take them from there instead of replaying the whole WAL.
+    if is_resume && !append_episode && prior.render_episodes.is_none() {
+        if let Some(store) = store.as_ref() {
+            match store_episode_render_history(Arc::clone(store), req.session.clone()).await {
+                Ok(Some(episodes)) => prior.render_episodes = Some(episodes),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    target: "store",
+                    "episode projection read failed; the admission replay decides: {error}"
+                ),
+            }
+        }
+    }
     // Compaction notices are numbered per session, not per lineage: the provider and the bus
     // both key them on the session. A compaction session's lineage that has recorded no notice
     // yet numbers its first one past every notice of this session's earlier lineages that
@@ -1669,10 +1704,27 @@ where
                         budget_state,
                     ) {
                         Ok(mut prior) => {
-                            snapshot
-                                .checkpoint_at_head
-                                .restore_unchanged_effort(&mut prior);
-                            if store_prior_needs_episode_spans(&prior) {
+                            // restore_unchanged_effort creates a placeholder with first_user=None
+                            // and no active-episode boundary. A sparse view needs the original
+                            // episode coordinates after its messages are released, so replay them.
+                            // A tail-only view can leave Some(empty) render inputs; absent prefix
+                            // spans still mean the lineage's original episode history is unknown.
+                            let missing_compaction_episodes = (prior.render_episodes.is_none()
+                                || prior.episode_step_spans.is_none())
+                                && snapshot
+                                    .checkpoint_at_head
+                                    .compaction
+                                    .as_ref()
+                                    .and_then(|checkpoint| checkpoint.state())
+                                    .is_some();
+                            if !missing_compaction_episodes {
+                                snapshot
+                                    .checkpoint_at_head
+                                    .restore_unchanged_effort(&mut prior);
+                            }
+                            if missing_compaction_episodes
+                                || store_prior_needs_episode_spans(&prior)
+                            {
                                 // Effort updates and tool-loop repetition warnings must stay in
                                 // the episodes that first showed them. Recover those boundaries
                                 // from the WAL when the checkpoint cannot replace them.
@@ -1800,6 +1852,78 @@ fn replay_complete_snapshot_or_wal<W: WalStore>(
             .collect()
     };
     replay(&records).map_err(|error| RunError::Wal(error.to_string()))
+}
+
+/// The resumed run's per-episode render inputs, from the store's episode projection.
+///
+/// A resumed prompt rebuilt from a materialized store prefix carries no episode boundaries, and
+/// an applied view can hide most of the messages that would show them. The projection holds each
+/// episode's start ordinal, its original admitted first user, its first model-step ordinal and its
+/// frozen render config: the same coordinates a full WAL replay derives, which is what the test
+/// beside this reads them against.
+///
+/// `Ok(None)` means the store cannot supply them, and the caller's WAL replay decides instead:
+/// the session has no projection (a store written before the column existed), its projection is
+/// older than the store's watermark (a write that advanced the transcript without recomputing
+/// it), or a value in it was never computed. The stored render config is the episode's whole
+/// frozen run config, from which replay renders the config blob it puts on the episode.
+async fn store_episode_render_history(
+    store: Arc<dyn SessionStore>,
+    session: BindIdentity,
+) -> Result<Option<Vec<broca_protocol::request::EpisodeRenderInput>>, String> {
+    let stored = store
+        .read_episode_projection_async(&session)
+        .await
+        .map_err(|error| format!("store episode projection read failed: {error}"))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    episode_render_inputs(&stored)
+}
+
+/// The render inputs of an episode projection read from the store, or `Ok(None)` when one of
+/// its values was never computed or the episodes are out of order, so the caller replays the
+/// WAL instead.
+fn episode_render_inputs(
+    stored: &[crate::context::EpisodeRenderProjection],
+) -> Result<Option<Vec<broca_protocol::request::EpisodeRenderInput>>, String> {
+    if stored.is_empty()
+        || !stored
+            .iter()
+            .all(crate::context::EpisodeRenderProjection::is_complete)
+        || stored
+            .iter()
+            .skip(1)
+            .any(|episode| episode.start() == Some(0))
+        || stored
+            .windows(2)
+            .any(|pair| pair[0].start() >= pair[1].start())
+    {
+        return Ok(None);
+    }
+    let mut episodes = Vec::with_capacity(stored.len());
+    for episode in stored {
+        if episode.first_step().is_none() {
+            return Ok(None);
+        }
+        let (Some(start), Some(first_user)) = (episode.start(), episode.first_user()) else {
+            return Ok(None);
+        };
+        let usize_of = |ordinal: u64| usize::try_from(ordinal).map_err(|e| e.to_string());
+        episodes.push(broca_protocol::request::EpisodeRenderInput {
+            prompt_start: usize_of(start)?,
+            first_user: first_user.map(usize_of).transpose()?,
+            frozen_config: episode
+                .render_config()
+                .and_then(|config| {
+                    serde_json::from_value::<crate::RunConfig>(config.clone())
+                        .ok()
+                        .map(|config| config.frozen_render_config)
+                })
+                .unwrap_or_else(|| episode.render_config().cloned().unwrap_or_default()),
+        });
+    }
+    Ok(Some(episodes))
 }
 
 async fn read_store_prefix_blocking(
@@ -2025,12 +2149,13 @@ fn record_budget_firings(writer: &WalHandle, run_id: &RunId, firings: &[BudgetFi
 async fn append_budget_firings(
     writer: &WalHandle,
     prompt: &mut Vec<Message>,
+    position: &PromptPosition,
     run_id: &RunId,
     firings: &[BudgetFiring],
     out: &mpsc::Sender<OutputEvent>,
 ) {
     for firing in firings {
-        debug_assert_eq!(prompt.len() as u64, firing.ordinal);
+        debug_assert_eq!(position.extent(prompt), firing.ordinal);
         let mut message = Message::new(
             Role::User,
             vec![ContentBlock::Text {
@@ -2459,7 +2584,8 @@ where
             out,
             on_admitted,
             Some(wal_store),
-            approval_frames.clone(),
+            approval_frames,
+            None,
         )
         .await;
         return seal_size_refusal(
@@ -2479,6 +2605,7 @@ where
     // performs the ordered drain below.
     let (projector, pending) = projection_channel();
     let projection_session = req.session.clone();
+    let history_store = Arc::clone(&store);
     let projection = projector_task(wal_store, store, &projection_session, pending);
     tokio::pin!(projection);
 
@@ -2501,6 +2628,7 @@ where
             on_admitted,
             Some(wal_store),
             approval_frames,
+            Some(history_store),
         );
         tokio::pin!(body);
         tokio::select! {
@@ -2653,7 +2781,7 @@ fn render_new_tags(
     if *rendered_len >= prompt.len() {
         return;
     }
-    for (index, message) in prompt.iter_mut().enumerate().skip(*rendered_len) {
+    for message in prompt.iter_mut().skip(*rendered_len) {
         let original = originals
             .as_ref()
             .filter(|_| message.part_tags().is_some())
@@ -2667,22 +2795,32 @@ fn render_new_tags(
             broca_protocol::tags::clean_computed_into(std::slice::from_mut(message));
         }
         if let (Some(originals), Some(original)) = (originals.as_deref_mut(), original) {
-            originals.retain_change(index, original, message);
+            originals.retain_change(
+                message.ordinal.expect("stamped tag message") as usize,
+                original,
+                message,
+            );
         }
     }
     *rendered_len = prompt.len();
 }
 
-fn stamp_raw_suffix(raw: &mut [Message], stamped_len: &mut usize) -> usize {
-    let stamped = broca_protocol::content::stamp_ordinals_from(raw, *stamped_len);
-    *stamped_len = raw.len();
-    stamped
+fn stamp_raw_suffix(raw: &mut [Message], position: &mut PromptPosition) -> usize {
+    if position.stamped_len == position.held_stamped as u64 {
+        // A dense prompt can use the protocol's append-only fast path unchanged.
+        let stamped_len = &mut position.held_stamped;
+        let stamped = broca_protocol::content::stamp_ordinals_from(raw, *stamped_len);
+        *stamped_len = raw.len();
+        position.stamped_len += stamped as u64;
+        return stamped;
+    }
+    position.stamp(raw)
 }
 
 #[test]
 fn raw_stamping_visits_only_new_messages() {
     let mut raw = vec![Message::new(Role::User, vec![]); 1000];
-    let mut stamped_len = 0;
+    let mut stamped_len = PromptPosition::default();
     assert_eq!(stamp_raw_suffix(&mut raw, &mut stamped_len), 1000);
     raw.extend([
         Message::new(Role::Assistant, vec![]),
@@ -2730,6 +2868,7 @@ async fn run_body<P: Provider, T: ToolPlane, A: ApprovalPolicy>(
         on_admitted,
         None,
         None,
+        None,
     ))
     .await
 }
@@ -2753,12 +2892,14 @@ async fn run_body_with_approval_history<P, T, A>(
     on_admitted: Option<tokio::sync::oneshot::Sender<Result<RunId, RunError>>>,
     approval_store: Option<&dyn WalStore>,
     approval_frames: Option<Arc<Vec<broca_wal::FramedRecord>>>,
+    history_store: Option<Arc<dyn SessionStore>>,
 ) -> Result<RunSummary, RunError>
 where
     P: Provider,
     T: ToolPlane,
     A: ApprovalPolicy,
 {
+    held_prompt::release_read_metadata(&mut prior);
     if !is_resume && req.retention.is_some() && writer.is_retention_lineage() == Some(false) {
         return Err(RunError::Config(
             "retention disagrees with the lineage's frozen policy".into(),
@@ -3193,8 +3334,8 @@ where
 
     // Where each replayed episode's model steps sit in the prompt; read before the start-mode
     // arms below move the reconstructed prompt out of `prior`.
-    let episode_step_spans = prior.episode_step_spans.clone();
-    let mut render_episodes = prior.render_episodes.clone().unwrap_or_default();
+    let episode_step_spans = prior.episode_step_spans.take();
+    let mut render_episodes = prior.render_episodes.take().unwrap_or_default();
     let tools = Arc::clone(&cfg.tools);
     let mut manifest = ToolManifest::from_shared_tools(Arc::clone(&tools));
     let frozen_plan = if is_resume {
@@ -3226,7 +3367,7 @@ where
     // Number of leading messages whose append-only positions are already stamped. Replay and
     // store reconstruction stamp their complete result; fresh/appended input begins after this
     // boundary and is stamped once before its first provider call.
-    let mut stamped_len: usize;
+    let mut stamped_len: PromptPosition;
     let mut total_usage: Usage;
     let mut total_retries_used: u32;
     let mut last_step_finish_reason: Option<FinishReason>;
@@ -3272,7 +3413,7 @@ where
     } else {
         &[]
     };
-    let lineage_prefix_stamped_len = lineage_prefix.len();
+    let lineage_prefix_stamped_len = if append_episode { prior.extent } else { 0 } as usize;
     // The request is private to this run from here onward, so transfer its input buffer instead
     // of retaining a second deep copy for the provider turn. Resume identity checks below read
     // this moved vector before any append-only system-message normalization can apply.
@@ -3758,7 +3899,7 @@ where
                 writer.sync().await?;
                 prompt = prior.prompt;
                 own_messages_start = prompt.len();
-                stamped_len = prompt.len();
+                stamped_len = PromptPosition::restored(prior.extent, prompt.len());
                 total_usage = prior.usage;
                 total_retries_used = prior.retries_used;
                 last_step_finish_reason = prior_last_step_finish_reason;
@@ -3904,7 +4045,7 @@ where
                 }
                 prompt = prior.prompt;
                 own_messages_start = prompt.len();
-                stamped_len = prompt.len();
+                stamped_len = PromptPosition::restored(prior.extent, prompt.len());
                 total_usage = prior.usage;
                 total_retries_used = prior.retries_used;
                 last_step_finish_reason = prior_last_step_finish_reason;
@@ -4017,7 +4158,7 @@ where
                 // record — it's already durable and authoritative.
                 prompt = prior.prompt;
                 own_messages_start = prompt.len();
-                stamped_len = prompt.len();
+                stamped_len = PromptPosition::restored(prior.extent, prompt.len());
                 total_usage = prior.usage;
                 total_retries_used = prior.retries_used;
                 last_step_finish_reason = prior_last_step_finish_reason;
@@ -4045,6 +4186,15 @@ where
         // prompt takes its own copy only after the record is durable.
         let episode_input = Arc::new(episode_input);
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
+            written_at_ms: req
+                .input_written_at_ms
+                .or_else(|| {
+                    req.submission_id
+                        .is_none()
+                        .then(|| control.now_ms())
+                        .flatten()
+                })
+                .filter(|at| *at != 0),
             tags: None,
             session_class: req.session_class.clone(),
             retention: req.retention,
@@ -4173,7 +4323,7 @@ where
         {
             crate::tags::attach(message, Some(tags));
         }
-        stamped_len = lineage_prefix_stamped_len;
+        stamped_len = PromptPosition::restored(lineage_prefix_stamped_len as u64, input_start);
         total_usage = Usage::default();
         total_retries_used = 0;
         last_step_finish_reason = None;
@@ -4238,6 +4388,7 @@ where
     // A resumed prompt comes from raw WAL results, while an uninterrupted run retained the
     // model-only repetition guidance in memory. Rebuild the observer from only this episode's
     // completed steps, then reproduce that guidance before either path renders another request.
+    drop(last_input);
     let committed_episode_steps = completed_steps.saturating_sub(u64::from(pending_turn.is_some()));
     let episode_history_start = episode_history_start(&prompt, committed_episode_steps);
     let mut originals = compaction_runtime
@@ -4245,6 +4396,7 @@ where
         .map(|_| crate::compaction::OriginalMessages::default());
     let mut closing_tail = Vec::new();
     let mut raw_len = prompt.len();
+    let mut raw_extent = stamped_len.extent(&prompt);
     // The prompt can contain system messages anywhere, not just at its beginning.
     // Index their positions once as the append-only prompt grows instead of rescanning history.
     let mut system_positions = Vec::new();
@@ -4259,8 +4411,7 @@ where
         episode_history_start,
         originals.as_mut(),
     );
-    let mut repetition_observer = RepetitionObserver::from_prompt(&prompt[episode_history_start..]);
-    restore_guidance_with_originals(
+    let mut repetition_observer = restore_guidance_with_originals(
         &mut prompt[episode_history_start..],
         episode_history_start,
         originals.as_mut(),
@@ -4280,8 +4431,11 @@ where
     // re-dispatch only the never-left calls, reuse the durable terminals, append
     // the now-complete tool turn to the prompt.
     if let Some(pending) = pending_turn.take() {
-        let budget_firings =
-            due_budget_firings(cfg.budget.as_ref(), &budget_state, prompt.len() as u64 + 2);
+        let budget_firings = due_budget_firings(
+            cfg.budget.as_ref(),
+            &budget_state,
+            stamped_len.extent(&prompt) + 2,
+        );
         let interrupt = Box::pin(complete_pending_turn(
             req,
             &resolved_run_id,
@@ -4292,6 +4446,7 @@ where
             approval,
             writer,
             &mut prompt,
+            &stamped_len,
             originals.as_mut(),
             // The resumed turn belongs to this (last) episode → stamp its model, matching
             // what replay stamps for the same turn (C7 byte-identity).
@@ -4317,6 +4472,7 @@ where
         ))
         .await?;
         raw_len = prompt.len();
+        raw_extent = stamped_len.extent(&prompt);
         if !interrupt.1.is_empty() || interrupt.2 {
             return pause_approval(
                 writer,
@@ -4342,7 +4498,15 @@ where
             &resolved_run_id,
             &budget_firings,
         );
-        append_budget_firings(writer, &mut prompt, &resolved_run_id, &budget_firings, out).await;
+        append_budget_firings(
+            writer,
+            &mut prompt,
+            &stamped_len,
+            &resolved_run_id,
+            &budget_firings,
+            out,
+        )
+        .await;
         if let Some(reason) = interrupt.0 {
             // The completed turn was itself ambiguous → interrupt.
             control.close_steers();
@@ -4366,6 +4530,11 @@ where
         }
     }
 
+    // History keeps full frames for historical ToolCallDeferred records (outside an args-cut
+    // recovery, or with an installed adapter), a frozen hook plan that approves calls, or a
+    // resumed batch containing a deferred/approved call.
+    // Only runs without that independent History owner release all admission frames here.
+    drop(approval_frames);
     // The typed terminal error, set only when the loop breaks with `Error`. Persisted on
     // the durable RunFinished so the control-stream projection can surface the cause.
     let mut terminal_error: Option<ProviderError> = None;
@@ -4382,6 +4551,15 @@ where
         crate::tags::rules_for(computed_tags, render_tags, &provider.render_config_blob()),
         computed_tags,
     );
+    let mut guidance_episodes = held_prompt::GuidanceEpisodes::new(
+        &render_episodes,
+        episode_step_spans.as_deref(),
+        stamped_len.extent(&prompt),
+    );
+    if completed_steps > 0 {
+        guidance_episodes.active_step(episode_history_start as u64);
+    }
+    drop(episode_step_spans);
     let mut opts = Arc::new(CallOptions {
         ephemeral_session: retention_lineage()?,
         render_episodes: Arc::new(render_episodes.into()),
@@ -4409,6 +4587,84 @@ where
         .is_some_and(|frozen| frozen.mode == broca_protocol::structured_output::Mode::FinalText);
     let mut natural_final_text: Option<String> = None;
     let mut interrupt_reason = None;
+    let mut raw_notice_anchor: Option<crate::compaction::view::NoticeAnchor> = None;
+    // Reads back messages released from the prompt when a newer view keeps or copies them.
+    let released_history = compaction_runtime
+        .as_ref()
+        .map(|_| released_history::RunHistory {
+            wal: approval_store,
+            store: history_store,
+            writer,
+            session: req.session.clone(),
+            form: released_history::PromptForm {
+                render_tags,
+                render_config: provider.render_config_blob(),
+            },
+        });
+    let released_history = released_history
+        .as_ref()
+        .map(|history| history as &dyn crate::compaction::ReleasedHistory);
+    macro_rules! release_held {
+        ($state:expr) => {{
+            let releasing_state: Option<&crate::compaction::CompactionState> = $state;
+            let release_history = {
+                #[cfg(test)]
+                {
+                    !control.retain_full_prompt
+                }
+                #[cfg(not(test))]
+                {
+                    true
+                }
+            };
+            // Released messages the newly applied view keeps were read back to decide it; they
+            // join the prompt before it is trimmed to that view.
+            let reheld = boundary_views.take_reheld();
+            let reheld = release_history
+                && reheld.is_some_and(|reheld| {
+                    held_prompt::rehold(
+                        &mut mutable_call_options(&mut opts).prompt,
+                        originals.as_mut(),
+                        &mut stamped_len,
+                        &mut guidance_episodes,
+                        reheld,
+                    )
+                });
+            if release_history
+                && held_prompt::release(
+                    &mut mutable_call_options(&mut opts).prompt,
+                    releasing_state,
+                    originals.as_mut(),
+                    &mut stamped_len,
+                )
+                || reheld
+            {
+                tag_numbering.released(opts.prompt.len());
+                tags_rendered_len = opts.prompt.len();
+                system_positions = opts
+                    .prompt
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, message)| (message.role == Role::System).then_some(index))
+                    .collect();
+                system_indexed_len = opts.prompt.len();
+                raw_len = opts.prompt.len();
+            }
+            if releasing_state.is_some_and(|state| state.view.is_some()) {
+                let history =
+                    guidance_episodes.retain(&opts.prompt, stamped_len.extent(&opts.prompt));
+                mutable_call_options(&mut opts).render_episodes = Arc::new(history);
+                #[cfg(test)]
+                if let Some(probe) = &control.view_release_probe {
+                    probe(
+                        &opts.prompt,
+                        stamped_len.extent(&opts.prompt),
+                        releasing_state.unwrap(),
+                    );
+                }
+            }
+        }};
+    }
     let reason = loop {
         input_budget.limit = writer.input_token_limit().or(input_budget.limit);
         // A session budget is independent of episode counters and reminder inheritance.
@@ -4423,8 +4679,11 @@ where
         // A crash-cut can retain the completed tool turn while losing one or more coalesced
         // BudgetFired records from the same barrier. Re-derive any missing firing from the
         // durable call count before rendering the next request.
-        let recovered_firings =
-            due_budget_firings(cfg.budget.as_ref(), &budget_state, opts.prompt.len() as u64);
+        let recovered_firings = due_budget_firings(
+            cfg.budget.as_ref(),
+            &budget_state,
+            stamped_len.extent(&opts.prompt),
+        );
         if !recovered_firings.is_empty() {
             record_budget_firings(writer, &resolved_run_id, &recovered_firings);
             let safe_h = writer.sync().await?;
@@ -4440,6 +4699,7 @@ where
             append_budget_firings(
                 writer,
                 &mut mutable_call_options(&mut opts).prompt,
+                &stamped_len,
                 &resolved_run_id,
                 &recovered_firings,
                 out,
@@ -4551,6 +4811,7 @@ where
         tag_numbering
             .number_new(&mut mutable_call_options(&mut opts).prompt)
             .map_err(RunError::TagNumbering)?;
+        raw_extent = stamped_len.extent(&opts.prompt);
         // A run frozen with `render_tags` shows each tagged user and tool-result text part
         // with its `§N§ ` prefix, and on Anthropic Messages each assistant text part's tag too.
         // Each message is rendered once, the first time a request includes it, and depends only
@@ -4671,7 +4932,19 @@ where
             if let Some(originals) = originals.as_mut() {
                 originals.index_origins(&opts.prompt);
             }
-            let raw = crate::compaction::StoredTranscript::new(&opts.prompt, originals.as_ref());
+            let raw = crate::compaction::StoredTranscript::new(&opts.prompt, originals.as_ref())
+                .with_extent(stamped_len.extent(&opts.prompt));
+            if let Some(anchor) = raw
+                .newest()
+                .and_then(crate::compaction::view::notice_anchor)
+            {
+                if raw_notice_anchor
+                    .as_ref()
+                    .is_none_or(|prior| prior.ordinal <= anchor.ordinal)
+                {
+                    raw_notice_anchor = Some(anchor);
+                }
+            }
             let state = compaction_state.as_mut().expect("Setup is durable");
             let session_ref = crate::wal_writer::agent_session_ref(&req.session);
             // Ride when the prefix is being rewritten anyway, then fetch the newest announced
@@ -4712,9 +4985,11 @@ where
                         step: step_id.0,
                         superseded: &[],
                     },
+                    released_history,
                 ))
                 .await?
             };
+            release_held!(Some(&*state));
             let mut request = crate::compaction::BoundaryRequest::default();
             request
                 .refresh(&opts, state, &system_positions, |view| {
@@ -4727,8 +5002,8 @@ where
             // Tell the provider what the session wrote since its last notice. The notice is
             // durable in the WAL before the model call, and the bus publisher projects it from
             // there, so it is never published before it is durable.
-            if let Some(notice) = raw.newest().and_then(|through| {
-                crate::compaction::view::notice_through(
+            if let Some(notice) = raw_notice_anchor.as_ref().and_then(|through| {
+                crate::compaction::view::notice_at(
                     state,
                     through,
                     crate::compaction::view::NoticeFacts {
@@ -4746,22 +5021,36 @@ where
                 runtime.record_notice(state, notice).await?;
             }
             state.history = compaction_history.clone();
-            let ceiling_detail = Box::pin(runtime.ceiling_before_request(
-                &mut boundary_views,
-                state,
-                &session_ref,
-                &lineage_id,
-                step_id,
-                &resolved_run_id,
-                out,
-                &opts,
-                &system_positions,
-                &mut request,
-                raw,
-                provider,
-                context_limit,
-            ))
-            .await?;
+            let ceiling_detail = loop {
+                let raw =
+                    crate::compaction::StoredTranscript::new(&opts.prompt, originals.as_ref())
+                        .with_extent(stamped_len.extent(&opts.prompt));
+                let progress = Box::pin(runtime.ceiling_progress(
+                    crate::compaction::runtime::CeilingAt {
+                        views: &mut boundary_views,
+                        state,
+                        session_ref: &session_ref,
+                        lineage_id: &lineage_id,
+                        step_id,
+                        run_id: &resolved_run_id,
+                        out,
+                        opts: &opts,
+                        systems: &system_positions,
+                        request: &mut request,
+                        stored: raw,
+                        released: released_history,
+                        provider,
+                        window: context_limit,
+                    },
+                ))
+                .await?;
+                match progress {
+                    crate::compaction::runtime::CeilingProgress::Finished(detail) => break detail,
+                    crate::compaction::runtime::CeilingProgress::ViewApplied => {
+                        release_held!(Some(&*state));
+                    }
+                }
+            };
             // A ceiling ride or a view-ready notification may have changed the durable view.
             request
                 .refresh(&opts, state, &system_positions, |view| {
@@ -4769,8 +5058,8 @@ where
                 })
                 .map_err(|error| RunError::Wal(error.to_string()))?;
             notice_request_bytes = request.bytes;
-            if let Some(notice) = raw.newest().and_then(|through| {
-                crate::compaction::view::notice_through(
+            if let Some(notice) = raw_notice_anchor.as_ref().and_then(|through| {
+                crate::compaction::view::notice_at(
                     state,
                     through,
                     crate::compaction::view::NoticeFacts {
@@ -4818,6 +5107,19 @@ where
                 .await?;
             }
         }
+        release_held!(compaction_state.as_ref());
+        #[cfg(test)]
+        if let Some(probe) = &control.held_prompt_probe {
+            probe(
+                &opts.prompt,
+                stamped_len.extent(&opts.prompt),
+                originals.as_ref().map_or(0, |o| o.len()),
+                guidance_episodes.episodes(),
+                approval_history
+                    .as_ref()
+                    .map_or(0, |history| history.retained_base_len()),
+            );
+        }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
             break RunFinishReason::Cancelled;
@@ -4836,7 +5138,15 @@ where
         // Complete attempts still share the step's existing barrier.
         let session = &req.session;
         let attempt_run_id = &resolved_run_id;
+        let completed_attempt_time = std::sync::Mutex::new(None);
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
+            if matches!(
+                attempt.outcome,
+                broca_protocol::AttemptOutcome::Complete
+                    | broca_protocol::AttemptOutcome::ToolArgsTrailingGarbage
+            ) {
+                *completed_attempt_time.lock().unwrap() = Some(attempt.ts_ms);
+            }
             Box::pin(async move {
                 if let Some(warm) = &control.keep_warm {
                     warm.note_attempt(&attempt);
@@ -4914,6 +5224,11 @@ where
             Ok(step) => step,
             Err(reason) => break reason,
         };
+        let step_written_at_ms = completed_attempt_time
+            .lock()
+            .unwrap()
+            .or_else(|| control.now_ms())
+            .filter(|at| *at != 0);
 
         // Set below when this step's final answer is extended by a steered message.
         let extend_for_steer: bool;
@@ -5016,6 +5331,7 @@ where
                                     false,
                                 );
                                 let mut records = vec![WalRecord::ModelStepFinished {
+                                    written_at_ms: step_written_at_ms,
                                     tags: None,
                                     hooks: metadata,
                                     step_id,
@@ -5121,6 +5437,7 @@ where
                         hooks.is_some(),
                         writer,
                         WalRecord::ModelStepFinished {
+                            written_at_ms: step_written_at_ms,
                             tags: None,
                             hooks: message_hooks,
                             step_id,
@@ -5154,6 +5471,7 @@ where
                 // extraction. The prompt reclaims ownership only after the turn is durable.
                 let message = Arc::new(message);
                 let model_record = WalRecord::ModelStepFinished {
+                    written_at_ms: step_written_at_ms,
                     tags: None,
                     hooks: message_hooks,
                     step_id,
@@ -5303,8 +5621,10 @@ where
                         crate::compaction::StoredTranscript::new(
                             &opts.prompt[..raw_len],
                             originals.as_ref(),
-                        ),
+                        )
+                        .with_extent(raw_extent),
                         &closing_tail,
+                        raw_notice_anchor.as_ref(),
                         writer,
                         &req.session,
                         &cfg.model,
@@ -5358,8 +5678,10 @@ where
                     crate::compaction::StoredTranscript::new(
                         &opts.prompt[..raw_len],
                         originals.as_ref(),
-                    ),
+                    )
+                    .with_extent(raw_extent),
                     &closing_tail,
+                    raw_notice_anchor.as_ref(),
                     writer,
                     &req.session,
                     &cfg.model,
@@ -5399,8 +5721,10 @@ where
                         crate::compaction::StoredTranscript::new(
                             &opts.prompt[..raw_len],
                             originals.as_ref(),
-                        ),
+                        )
+                        .with_extent(raw_extent),
                         &closing_tail,
+                        raw_notice_anchor.as_ref(),
                         writer,
                         &req.session,
                         &cfg.model,
@@ -5425,7 +5749,7 @@ where
         let budget_firings = due_budget_firings(
             cfg.budget.as_ref(),
             &step_budget_state,
-            opts.prompt.len() as u64 + 2,
+            stamped_len.extent(&opts.prompt) + 2,
         );
 
         // Evaluate stop_when AFTER the step, BEFORE tool dispatch.
@@ -5495,8 +5819,10 @@ where
                         crate::compaction::StoredTranscript::new(
                             &opts.prompt[..raw_len],
                             originals.as_ref(),
-                        ),
+                        )
+                        .with_extent(raw_extent),
                         &closing_tail,
+                        raw_notice_anchor.as_ref(),
                         writer,
                         &req.session,
                         &cfg.model,
@@ -5531,6 +5857,7 @@ where
                     tags: Default::default(),
                 };
                 crate::tags::attach(&mut answer, writer.take_step_tags(step_id).as_ref());
+                guidance_episodes.active_step(stamped_len.extent(&opts.prompt));
                 mutable_call_options(&mut opts).prompt.push(answer);
                 continue;
             }
@@ -5643,6 +5970,7 @@ where
             tags: Default::default(),
         };
         crate::tags::attach(&mut answer, writer.take_step_tags(step_id).as_ref());
+        guidance_episodes.active_step(stamped_len.extent(&opts.prompt));
         mutable_call_options(&mut opts).prompt.push(answer);
         // Computed-tag runs number this appended message at the next step boundary. Only a
         // legacy stored-ledger run needs the result tags assigned by the WAL writer here.
@@ -5667,13 +5995,19 @@ where
             crate::tags::attach_parts(&mut results, Some(tags));
         }
         if let (Some(originals), Some(original)) = (originals.as_mut(), original_results) {
-            originals.retain_change(opts.prompt.len(), original, &results);
+            originals.retain_change(
+                stamped_len.extent(&opts.prompt) as usize,
+                original,
+                &results,
+            );
         }
         mutable_call_options(&mut opts).prompt.push(results);
         raw_len = opts.prompt.len();
+        raw_extent = stamped_len.extent(&opts.prompt);
         append_budget_firings(
             writer,
             &mut mutable_call_options(&mut opts).prompt,
+            &stamped_len,
             &resolved_run_id,
             &budget_firings,
             out,
@@ -5705,9 +6039,9 @@ where
         }
     };
 
-    broca_protocol::content::stamp_ordinals_from(
+    stamp_raw_suffix(
         &mut mutable_call_options(&mut opts).prompt,
-        stamped_len,
+        &mut stamped_len,
     );
     // Announce what the run wrote after its last step boundary (its final answer) now, not at
     // the next send's first boundary: the contract owes a notice after each durable write. The
@@ -5717,8 +6051,10 @@ where
         &compaction_runtime,
         ClosingNotice::new(
             compaction_state.as_mut(),
-            crate::compaction::StoredTranscript::new(&opts.prompt[..raw_len], originals.as_ref()),
+            crate::compaction::StoredTranscript::new(&opts.prompt[..raw_len], originals.as_ref())
+                .with_extent(raw_extent),
             &closing_tail,
+            raw_notice_anchor.as_ref(),
             writer,
             &req.session,
             &cfg.model,
@@ -5898,21 +6234,27 @@ pub(crate) async fn project_committed<W: WalStore>(
             lineage.as_deref(),
             None,
         );
-        let result = match metadata {
-            Ok(Some(metadata)) => {
+        let result = match (metadata, lineage) {
+            (Ok(metadata), Some(lineage)) => {
                 let session = session.clone();
-                spawn_blocking(JobKind::Projection, move || {
-                    store.project_retention_metadata(&session, &metadata)
+                spawn_blocking(JobKind::Projection, move || -> Result<(), String> {
+                    if let broca_wal::WalRangeRecords::Complete(records) = range.records() {
+                        store.project_retained_head(&session, &lineage, records)?;
+                    }
+                    if let Some(metadata) = metadata {
+                        store.project_retention_metadata(&session, &metadata)?;
+                    }
+                    Ok(())
                 })
                 .await
                 .map_err(|_| ())
                 .and_then(|result| result.map_err(|_| ()))
             }
-            Ok(None) => Ok(()),
-            Err(_) => Err(()),
+            (Ok(_), None) => Ok(()),
+            (Err(_), _) => Err(()),
         };
         if result.is_err() {
-            tracing::warn!(target: "store", "retention withdrawal metadata projection failed; the WAL remains authoritative");
+            tracing::warn!(target: "store", "retention head or withdrawal metadata projection failed; the WAL remains authoritative");
             PROJECTION_WARNING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             crate::projection_health::record_failure(session);
         } else {
@@ -6359,37 +6701,12 @@ fn store_prior_needs_episode_spans(prior: &ReplayState) -> bool {
 
 /// Whether folding `prompt` with a single observer produces guidance for any tool result.
 fn repetition_guidance_fires(prompt: &[Message]) -> bool {
-    let mut observer = RepetitionObserver::new();
-    let mut index = 0;
-    while index + 1 < prompt.len() {
-        if prompt[index].role != Role::Assistant || prompt[index + 1].role != Role::Tool {
-            index += 1;
-            continue;
-        }
-        let mut calls = prompt[index]
-            .content
+    let mut fold = RepetitionFold::default();
+    prompt.iter().any(|message| {
+        fold.push(message)
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall(call) => Some(call),
-                _ => None,
-            });
-        for block in &prompt[index + 1].content {
-            if let ContentBlock::ToolResult(result) = block {
-                if let Some(call) = calls.next() {
-                    let bytes = result_bytes(&result.output);
-                    if observer
-                        .observe(call, bytes.as_ref(), result.is_error)
-                        .guidance()
-                        .is_some()
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        index += 2;
-    }
-    false
+            .any(|(_, verdict)| verdict.guidance().is_some())
+    })
 }
 
 fn append_repetition_guidance(result: &mut ToolResult, guidance: &str) {
@@ -6451,37 +6768,26 @@ fn restore_guidance_with_originals(
     prompt: &mut [Message],
     base: usize,
     mut originals: Option<&mut crate::compaction::OriginalMessages>,
-) {
-    let mut observer = RepetitionObserver::new();
-    let mut index = 0;
-    while index + 1 < prompt.len() {
-        if prompt[index].role != Role::Assistant || prompt[index + 1].role != Role::Tool {
-            index += 1;
-            continue;
-        }
-
-        let calls: Vec<ToolCall> = prompt[index]
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall(call) => Some(call.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut calls = calls.iter();
-        let original = originals.as_ref().map(|_| prompt[index + 1].clone());
-        for block in &mut prompt[index + 1].content {
-            if let ContentBlock::ToolResult(result) = block {
-                if let Some(call) = calls.next() {
-                    attach_repetition_guidance_to_result(&mut observer, call, result);
+) -> RepetitionObserver {
+    let mut fold = RepetitionFold::default();
+    for (index, message) in prompt.iter_mut().enumerate() {
+        let verdicts = fold.push(message);
+        let original = originals
+            .as_ref()
+            .filter(|_| !verdicts.is_empty())
+            .map(|_| message.clone());
+        for (block_index, verdict) in verdicts {
+            if let Some(guidance) = verdict.guidance() {
+                if let ContentBlock::ToolResult(result) = &mut message.content[block_index] {
+                    append_repetition_guidance(result, &guidance);
                 }
             }
         }
         if let (Some(originals), Some(original)) = (originals.as_deref_mut(), original) {
-            originals.retain_change(base + index + 1, original, &prompt[index + 1]);
+            originals.retain_change(base + index, original, message);
         }
-        index += 2;
     }
+    fold.into_observer()
 }
 
 /// On resume, complete an incomplete trailing tool turn WITHOUT re-running the
@@ -6500,6 +6806,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
     approval: &A,
     writer: &WalHandle,
     prompt: &mut Vec<Message>,
+    position: &PromptPosition,
     originals: Option<&mut crate::compaction::OriginalMessages>,
     origin: ModelHandle,
     stored_tag_rules: bool,
@@ -6672,7 +6979,7 @@ async fn complete_pending_turn<T: ToolPlane, A: ApprovalPolicy>(
         crate::tags::attach_parts(&mut results, Some(tags));
     }
     if let (Some(originals), Some(original)) = (originals, original_results) {
-        originals.retain_change(prompt.len(), original, &results);
+        originals.retain_change(position.extent(prompt) as usize, original, &results);
     }
     prompt.push(results);
 
@@ -8567,6 +8874,7 @@ struct ClosingNotice<'a> {
     state: &'a mut crate::compaction::CompactionState,
     raw: crate::compaction::StoredTranscript<'a>,
     extra: &'a [Message],
+    anchor: Option<&'a crate::compaction::view::NoticeAnchor>,
     lineage_id: String,
     session: &'a broca_protocol::BindIdentity,
     model: &'a broca_protocol::ModelHandle,
@@ -8582,6 +8890,7 @@ impl<'a> ClosingNotice<'a> {
         state: Option<&'a mut crate::compaction::CompactionState>,
         raw: crate::compaction::StoredTranscript<'a>,
         extra: &'a [Message],
+        anchor: Option<&'a crate::compaction::view::NoticeAnchor>,
         writer: &WalHandle,
         session: &'a broca_protocol::BindIdentity,
         model: &'a broca_protocol::ModelHandle,
@@ -8594,6 +8903,7 @@ impl<'a> ClosingNotice<'a> {
             state: state?,
             raw,
             extra,
+            anchor,
             lineage_id: writer.lineage_id()?.to_string(),
             session,
             model,
@@ -8633,7 +8943,7 @@ impl<'a> ClosingNotice<'a> {
             ));
         }
         for (index, message) in extra.iter_mut().enumerate() {
-            message.ordinal = Some((self.raw.len() + index) as u64);
+            message.ordinal = Some(self.raw.extent() + index as u64);
         }
         let announced = self
             .state
@@ -8651,8 +8961,20 @@ impl<'a> ClosingNotice<'a> {
             self.request_bytes.saturating_add(appended),
             self.history,
         );
-        let through = extra.last().or_else(|| self.raw.newest())?;
-        let notice = crate::compaction::view::notice_through(
+        let raw_anchor = self
+            .raw
+            .newest()
+            .and_then(crate::compaction::view::notice_anchor);
+        let extra_anchor = extra
+            .last()
+            .and_then(crate::compaction::view::notice_anchor);
+        let through = self
+            .anchor
+            .into_iter()
+            .chain(raw_anchor.as_ref())
+            .chain(extra_anchor.as_ref())
+            .max_by_key(|anchor| anchor.ordinal)?;
+        let notice = crate::compaction::view::notice_at(
             self.state,
             through,
             crate::compaction::view::NoticeFacts {
@@ -9117,6 +9439,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         println!(
             "run_body_with_approval_history={} bytes",
@@ -9438,6 +9761,7 @@ mod tests {
             reply: None,
         };
         let mut req = RunRequest {
+            input_written_at_ms: None,
             directives: None,
             session_class: None,
             retention: None,
@@ -11122,6 +11446,9 @@ mod tests {
         };
         let seed = crate::ProjectionSeed {
             open_episode_span: Some(1),
+            open_episode: None,
+            earlier_episodes: Vec::new(),
+            projection_episodes: None,
             deferred_calls: None,
             watermark_seq: 8,
             anchor: None,
@@ -11134,6 +11461,7 @@ mod tests {
             trailing_origin: None,
             last_run_id: Some(RunId("budget".into())),
             admission_checkpoint: crate::AdmissionCheckpointV1 {
+                head: None,
                 has_deferred_calls: None,
                 tags: Some(crate::tags::LineageTags::Off),
                 pending_order: None,
@@ -11849,6 +12177,11 @@ mod approval_gate {
         live_scan: Arc<std::sync::Mutex<FeedProgress>>,
     }
     impl History {
+        #[cfg(test)]
+        pub(super) fn retained_base_len(&self) -> usize {
+            self.frames.base.len()
+        }
+
         pub fn new(
             writer: &WalHandle,
             frames: impl Into<Arc<Vec<broca_wal::FramedRecord>>>,

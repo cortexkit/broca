@@ -11,6 +11,11 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod lifecycle;
+pub use lifecycle::{
+    preview_sweep, session_media_digests, spawn_startup_sweep, sweep, SweepReport,
+};
+
 /// Stores deduplicate only within a WAL durability class, never across classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaStoreClass {
@@ -43,6 +48,13 @@ pub fn create_media_directories(state_root: &Path) -> io::Result<()> {
             })?;
         }
     }
+    let lock = broca_owner_only::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(state_root.join("media-uploads/uploads.lock"))?;
+    lock.sync_all()?;
+    broca_wal::migration::sync_dir(&state_root.join("media-uploads"))?;
     Ok(())
 }
 
@@ -65,6 +77,13 @@ impl MediaStore {
     /// The session actor must retain its lease for this handle's lifetime. A
     /// maintenance sweep uses the exclusive store lock and skips leased sessions.
     pub fn session(&self, identity: &BindIdentity) -> io::Result<MediaManifest> {
+        let registration_lock = self.lock()?;
+        registration_lock.lock_shared()?;
+        // The WAL may not exist yet. Persist the identity so maintenance can
+        // still check its writer lease before reclaiming an uncommitted capture.
+        let address = crate::wal_writer::session_addr(identity);
+        let identity_path = self.root.join("identities").join(address);
+        broca_wal::migration::atomic_json(self.root.parent().unwrap(), &identity_path, identity)?;
         let path = self
             .root
             .join("refs")
@@ -73,9 +92,10 @@ impl MediaStore {
             .read(true)
             .append(true)
             .create(true)
-            .open(path)?;
+            .open(&path)?;
         Ok(MediaManifest {
             store: self.clone(),
+            path,
             file,
             refs_synced: false,
         })
@@ -164,6 +184,7 @@ impl MediaStore {
 /// One append-only digest manifest, addressed by the full bind triple.
 pub struct MediaManifest {
     store: MediaStore,
+    path: PathBuf,
     file: File,
     refs_synced: bool,
 }
@@ -197,7 +218,7 @@ impl MediaManifest {
         let lock = self.store.lock()?;
         lock.lock_shared()?;
         self.store.publish(reference, bytes, steps)?;
-        recover_torn_tail(&mut self.file)?;
+        recover_torn_tail(&mut self.file, &self.path)?;
         self.file
             .write_all(format!("{}\n", reference.sha256).as_bytes())?;
         steps.file_sync(&self.file, Step::ManifestSynced)?;
@@ -281,7 +302,7 @@ fn matches_bytes(reference: &MediaRef, bytes: &[u8]) -> bool {
 // A failed write can leave part of a digest at EOF. Never join a retry to that
 // prefix: only complete newline-terminated entries are append-only records.
 // The next manifest fsync makes both this tail repair and the new entry durable.
-fn recover_torn_tail(file: &mut File) -> io::Result<()> {
+fn recover_torn_tail(file: &mut File, path: &Path) -> io::Result<()> {
     let length = file.metadata()?.len();
     let start = length.saturating_sub(65);
     file.seek(SeekFrom::Start(start))?;
@@ -292,7 +313,14 @@ fn recover_torn_tail(file: &mut File) -> io::Result<()> {
             .iter()
             .rposition(|byte| *byte == b'\n')
             .map_or(start, |at| start + at as u64 + 1);
-        file.set_len(complete)?;
+        // Windows append handles lack FILE_WRITE_DATA, which set_len requires.
+        // Reopen only for repair under the session lease and shared store lock;
+        // keep normal writes on the append handle so they land at the new EOF.
+        let repair = broca_owner_only::OpenOptions::new()
+            .write(true)
+            .open(path)?;
+        repair.set_len(complete)?;
+        repair.sync_all()?;
     }
     Ok(())
 }
@@ -304,6 +332,7 @@ enum Step {
     ManifestSynced,
     RefsSynced,
     WalAppended,
+    WalDirectorySynced,
 }
 
 trait StorageSteps {

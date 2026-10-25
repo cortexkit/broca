@@ -34,6 +34,8 @@ mod billing_floor;
 mod compaction;
 #[cfg(test)]
 mod model_history;
+#[cfg(test)]
+mod streamed_guidance;
 pub use attribution::{
     imported_and_pre_run_id_messages_omit_run, interrupted_tool_result_is_final,
     rollback_rows_require_attribution_backfill, run_attribution_follows_each_episode,
@@ -755,6 +757,7 @@ where
         framed(
             seq,
             WalRecord::Steered {
+                written_at_ms: None,
                 tags: None,
                 retention: None,
                 ts_ms: None,
@@ -2226,6 +2229,7 @@ pub(crate) fn text_step(seq: u64, step: u64, text: &str) -> FramedRecord {
     framed(
         seq,
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(step),
@@ -2266,6 +2270,7 @@ fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
         framed(
             seq_base,
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(step),
@@ -2370,6 +2375,7 @@ pub(crate) fn run_started(
     framed(
         seq,
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,

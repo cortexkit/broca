@@ -143,6 +143,7 @@ fn queued_record(
     ts_ms: Option<u64>,
 ) -> WalRecord {
     WalRecord::Queued {
+        written_at_ms: None,
         retention,
         ts_ms,
         hooks: None,
@@ -279,6 +280,7 @@ impl Fixture {
             wal.append(
                 1,
                 &WalRecord::RunStarted {
+                    written_at_ms: None,
                     tags: None,
                     session_class: None,
                     retention: retained.then_some(3600),
@@ -543,6 +545,7 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
     retract.actor.ensure_wal_scan_loaded().await.unwrap();
     let steer = broca_core::SteerInbox::new();
     steer.seed_ordered(vec![broca_core::delivery_order::OrderedSend {
+        admitted_at_ms: None,
         submission_id: id.clone(),
         principal: None,
         input: retract.request.input.clone(),

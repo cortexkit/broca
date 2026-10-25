@@ -222,6 +222,61 @@ pub(crate) struct BoundaryViews {
     /// view, or one that is not (yet) a prefix of the transcript, is offered again at a later
     /// boundary from here, without fetching it again.
     held: Option<(ViewReady, CompactionView)>,
+    /// Messages the run released and read back to decide a view that then applied and keeps
+    /// them. The owner of the prompt merges them in before anything renders under that view.
+    reheld: Option<super::ReleasedMessages>,
+    ceiling_events: Vec<Event>,
+    ceiling_pause_until: Option<u64>,
+    ceiling_release_pending: bool,
+    #[cfg(feature = "test-clock")]
+    ceiling_reentry: bool,
+}
+
+pub(crate) enum CeilingProgress {
+    Finished(Option<broca_protocol::ContextCeilingDetail>),
+    /// Release the owning prompt before continuing the ceiling wait.
+    ViewApplied,
+}
+
+impl BoundaryViews {
+    /// The released messages the newest applied view keeps, for the prompt's owner to hold
+    /// again before it renders under that view.
+    pub(crate) fn take_reheld(&mut self) -> Option<super::ReleasedMessages> {
+        self.reheld.take()
+    }
+
+    fn yield_applied(
+        &mut self,
+        events: Vec<Event>,
+        pause_until: Option<u64>,
+    ) -> Option<broca_protocol::ContextCeilingDetail> {
+        self.ceiling_events = events;
+        self.ceiling_pause_until = pause_until;
+        self.ceiling_release_pending = true;
+        #[cfg(feature = "test-clock")]
+        {
+            self.ceiling_reentry = true;
+        }
+        None
+    }
+}
+
+pub(crate) struct CeilingAt<'a> {
+    pub views: &'a mut BoundaryViews,
+    pub state: &'a mut CompactionState,
+    pub session_ref: &'a str,
+    pub lineage_id: &'a str,
+    pub step_id: broca_protocol::StepId,
+    pub run_id: &'a broca_protocol::RunId,
+    pub out: &'a tokio::sync::mpsc::Sender<crate::OutputEvent>,
+    pub opts: &'a broca_protocol::CallOptions,
+    pub systems: &'a [usize],
+    pub request: &'a mut super::BoundaryRequest,
+    pub stored: super::StoredTranscript<'a>,
+    /// Reads back messages the run released, for a view that keeps or copies them.
+    pub released: Option<&'a dyn super::ReleasedHistory>,
+    pub provider: &'a dyn crate::Provider,
+    pub window: Option<u64>,
 }
 
 /// The run and step at whose boundary a view is offered, named in the line that logs the
@@ -392,6 +447,28 @@ pub async fn apply_idle_view(
     }
     Ok(applied)
 }
+/// Whether deciding `view` can depend on transcript messages at all. A view that is not the one
+/// announced, is malformed, is not newer than the view applied now, belongs to another lineage or
+/// covers a message the session has not written yet is rejected, ignored or discarded by
+/// `dispose_fetched` before it looks a message up, whatever the transcript holds; nothing the run
+/// released is read back for it.
+fn reads_released(
+    view: &CompactionView,
+    ready: &ViewReady,
+    state: &CompactionState,
+    lineage_id: &str,
+    stored: super::StoredTranscript<'_>,
+) -> bool {
+    let current = state.view.as_ref().map(|applied| applied.view.view_version);
+    view.session_ref == ready.session_ref
+        && view.view_version == ready.view_version
+        && view.check().is_ok()
+        && view.digest == ready.digest
+        && current.is_none_or(|current| view.view_version > current)
+        && view.lineage_id == lineage_id
+        && view.covers_through.ordinal < stored.extent()
+}
+
 /// How a run ends when a recorded compaction wait seals it.
 pub(crate) struct Terminal(pub RunFinishReason, pub Option<Box<ProviderError>>);
 
@@ -492,11 +569,41 @@ impl Runtime<'_> {
         Ok(())
     }
 
+    /// Yield to the owner after each applied view, before borrowing its prompt for more wait I/O.
+    pub(crate) async fn ceiling_progress(
+        &self,
+        at: CeilingAt<'_>,
+    ) -> Result<CeilingProgress, crate::RunError> {
+        let detail = self
+            .ceiling_before_request(
+                at.views,
+                at.state,
+                at.session_ref,
+                at.lineage_id,
+                at.step_id,
+                at.run_id,
+                at.out,
+                at.opts,
+                at.systems,
+                at.request,
+                at.stored,
+                at.released,
+                at.provider,
+                at.window,
+            )
+            .await?;
+        Ok(if std::mem::take(&mut at.views.ceiling_release_pending) {
+            CeilingProgress::ViewApplied
+        } else {
+            CeilingProgress::Finished(detail)
+        })
+    }
+
     /// Decide before model I/O and retain both the absolute wait bound and its decision for
     /// recovery. The published compaction-provider 0.3.1 CONTRACT.md §8, lines 629–641,
     /// refuses a request still at the ceiling after the bound even if it fits the window.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn ceiling_before_request(
+    async fn ceiling_before_request(
         &self,
         views: &mut BoundaryViews,
         state: &mut CompactionState,
@@ -509,11 +616,19 @@ impl Runtime<'_> {
         systems: &[usize],
         request: &mut super::BoundaryRequest,
         stored: super::StoredTranscript<'_>,
+        released: Option<&dyn super::ReleasedHistory>,
         provider: &dyn crate::Provider,
         window: Option<u64>,
     ) -> Result<Option<broca_protocol::ContextCeilingDetail>, crate::RunError> {
         use crate::compaction_provider::ceiling::WaitEnd;
-        let mut events = Vec::new();
+        let mut events = std::mem::take(&mut views.ceiling_events);
+        // Continue at the original absolute poll deadline after the owner releases history.
+        if let Some(until) = views.ceiling_pause_until.take() {
+            tokio::select! {
+                _ = clock_deadline(self.control.clock.as_ref(), until) => {},
+                _ = cancelled(self.control) => return Ok(None),
+            }
+        }
         let mut estimate = |state: &CompactionState| -> Result<u64, crate::RunError> {
             request
                 .refresh(opts, state, systems, |model| provider.render_request(model))
@@ -575,12 +690,14 @@ impl Runtime<'_> {
                     }
                 };
                 #[cfg(feature = "test-clock")]
-                crate::compaction::test_control::barrier(
-                    self.control.clock.as_ref(),
-                    &self.bind.session,
-                    "CeilingWaitRecorded",
-                )
-                .await?;
+                if !std::mem::take(&mut views.ceiling_reentry) {
+                    crate::compaction::test_control::barrier(
+                        self.control.clock.as_ref(),
+                        &self.bind.session,
+                        "CeilingWaitRecorded",
+                    )
+                    .await?;
+                }
                 if unavailable.is_none() && self.now() < deadline_ms {
                     let remaining = deadline_ms.saturating_sub(self.now());
                     let request = view::ceiling_ride(session_ref, remaining, None);
@@ -598,6 +715,7 @@ impl Runtime<'_> {
                     // still wins even when select polls the response first.
                     let answer = answer.filter(|_| self.now() < deadline_ms);
                     unavailable = Some(answer.is_none());
+                    let before = state.applied_view_version(lineage_id);
                     if let Some(RideAnswer::View { view, .. }) = answer {
                         let ready = ViewReady::for_view(&view);
                         self.offer(
@@ -608,6 +726,7 @@ impl Runtime<'_> {
                             lineage_id,
                             &opts.prompt,
                             stored,
+                            released,
                             provider.reasoning_is_prefix_bound(),
                             // The boundary's own offer (views_at_boundary) already ended any
                             // deferral at a run's first step; a ceiling ride only adds views.
@@ -630,6 +749,9 @@ impl Runtime<'_> {
                         },
                     )
                     .await?;
+                    if state.applied_view_version(lineage_id) != before {
+                        return Ok(views.yield_applied(events, None));
+                    }
                 }
                 loop {
                     let size = estimate(state)?;
@@ -685,6 +807,7 @@ impl Runtime<'_> {
                         }
                         match fetched {
                             Fetch::View(view) => {
+                                let before = state.applied_view_version(lineage_id);
                                 self.offer(
                                     views,
                                     state,
@@ -693,6 +816,7 @@ impl Runtime<'_> {
                                     lineage_id,
                                     &opts.prompt,
                                     stored,
+                                    released,
                                     provider.reasoning_is_prefix_bound(),
                                     false,
                                     StepAt {
@@ -703,6 +827,10 @@ impl Runtime<'_> {
                                     &mut events,
                                 )
                                 .await?;
+                                if state.applied_view_version(lineage_id) != before {
+                                    let until = self.now().saturating_add(50).min(deadline_ms);
+                                    return Ok(views.yield_applied(events, Some(until)));
+                                }
                             }
                             Fetch::Refused(_) => views.declined = Some(ready.view_version),
                             Fetch::Unavailable => {}
@@ -945,6 +1073,7 @@ impl Runtime<'_> {
         prefix_bound: bool,
         run_start: bool,
         at: StepAt<'_>,
+        released: Option<&dyn super::ReleasedHistory>,
     ) -> Result<Vec<Event>, crate::RunError> {
         let mut events = Vec::new();
         // Versions passed over at this boundary because a newer one was known by the time
@@ -962,6 +1091,7 @@ impl Runtime<'_> {
                     lineage_id,
                     prompt,
                     stored,
+                    released,
                     prefix_bound,
                     run_start,
                     at,
@@ -1020,6 +1150,7 @@ impl Runtime<'_> {
                 lineage_id,
                 prompt,
                 stored,
+                released,
                 prefix_bound,
                 run_start,
                 StepAt {
@@ -1048,12 +1179,14 @@ impl Runtime<'_> {
         lineage_id: &str,
         prompt: &[Message],
         stored: super::StoredTranscript<'_>,
+        released: Option<&dyn super::ReleasedHistory>,
         prefix_bound: bool,
         run_start: bool,
         at: StepAt<'_>,
         events: &mut Vec<Event>,
     ) -> Result<Offered, crate::RunError> {
         let version = fetched.view_version;
+        let mut reheld = None;
         let (decision, event) = Box::pin(self.offer_stored_view(
             state,
             fetched,
@@ -1061,10 +1194,16 @@ impl Runtime<'_> {
             lineage_id,
             prompt,
             stored,
+            released.map(|history| (history, &mut reheld)),
             prefix_bound,
             run_start,
         ))
         .await?;
+        if matches!(decision, view::Decision::Apply(_)) {
+            // Replaced, not merged: this view's read-back was taken against the prompt as it is
+            // now, so it already holds everything the view keeps that the prompt lacks.
+            views.reheld = reheld;
+        }
         // One line for each applied or refused view, and for the first boundary that defers
         // a version; a held view is offered again at every later boundary, and repeating the
         // line there would bury the others.
@@ -1078,11 +1217,11 @@ impl Runtime<'_> {
             if !matches!(decision, view::Decision::Defer(_)) || first_report {
                 if at.superseded.is_empty() {
                     tracing::info!(target: "compaction", run_id = at.run_id, step = at.step,
-                        view_version = version, choice, reason,
+                        session_ref = %ready.session_ref, view_version = version, choice, reason,
                         "compaction view decided at a step boundary");
                 } else {
                     tracing::info!(target: "compaction", run_id = at.run_id, step = at.step,
-                        view_version = version, choice, reason,
+                        session_ref = %ready.session_ref, view_version = version, choice, reason,
                         superseded = %version_list(at.superseded),
                         "compaction view decided at a step boundary");
                 }
@@ -1152,6 +1291,7 @@ impl Runtime<'_> {
             lineage_id,
             prompt,
             super::StoredTranscript::plain(stored),
+            None,
             prefix_bound,
             run_start,
         )
@@ -1167,6 +1307,10 @@ impl Runtime<'_> {
         lineage_id: &str,
         prompt: &[Message],
         stored: super::StoredTranscript<'_>,
+        released: Option<(
+            &dyn super::ReleasedHistory,
+            &mut Option<super::ReleasedMessages>,
+        )>,
         prefix_bound: bool,
         run_start: bool,
     ) -> Result<(view::Decision, Option<Event>), crate::RunError> {
@@ -1185,16 +1329,61 @@ impl Runtime<'_> {
         let decision = if newer_announced || fetched.view_version > ready.view_version {
             view::Decision::Superseded
         } else {
-            view::decide_stored_at(
-                fetched,
-                ready,
-                state,
-                lineage_id,
-                prompt,
-                stored,
-                prefix_bound,
-                run_start,
-            )
+            match released.filter(|_| reads_released(fetched, ready, state, lineage_id, stored)) {
+                None => view::decide_stored_at(
+                    fetched,
+                    ready,
+                    state,
+                    lineage_id,
+                    prompt,
+                    stored,
+                    prefix_bound,
+                    run_start,
+                ),
+                Some((history, reheld)) => {
+                    let needs =
+                        super::released::released_needs(fetched, prompt, stored, stored.extent());
+                    if needs.is_empty() {
+                        view::decide_stored_at(
+                            fetched,
+                            ready,
+                            state,
+                            lineage_id,
+                            prompt,
+                            stored,
+                            prefix_bound,
+                            run_start,
+                        )
+                    } else {
+                        match history.load(&needs).await {
+                            Ok(loaded) => {
+                                let judging =
+                                    super::released::Judging::new(prompt, stored, &loaded);
+                                let decision = view::decide_stored_at(
+                                    fetched,
+                                    ready,
+                                    state,
+                                    lineage_id,
+                                    &judging.prompt,
+                                    judging.stored(),
+                                    prefix_bound,
+                                    run_start,
+                                );
+                                if matches!(decision, view::Decision::Apply(_)) {
+                                    *reheld = Some(loaded.held_by(fetched));
+                                }
+                                decision
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "compaction",
+                                    view_version = fetched.view_version, %error,
+                                    "released history needed to decide a compaction view is unavailable; refusing it");
+                                view::Decision::Refuse(view::HISTORY_UNAVAILABLE)
+                            }
+                        }
+                    }
+                }
+            }
         };
         if let view::Decision::Apply(choice) = &decision {
             self.apply_view(state, fetched, choice.clone()).await?;

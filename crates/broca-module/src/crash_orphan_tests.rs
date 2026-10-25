@@ -124,6 +124,7 @@ impl RunExecutor for Recording {
     ) -> Result<RunSummary, broca_core::RunError> {
         self.executed.lock().unwrap().push(job.req.run_id.0.clone());
         job.writer.record(WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -406,6 +407,7 @@ impl Drop for Fixture {
 
 fn run_started(key: &BindIdentity) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,
@@ -434,6 +436,7 @@ fn run_started(key: &BindIdentity) -> WalRecord {
 /// has not ended. Replay resumes such a run by dispatching the call.
 fn model_step_with_tool_call() -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: broca_protocol::StepId(1),

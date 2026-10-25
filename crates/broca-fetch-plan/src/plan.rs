@@ -28,11 +28,11 @@ pub const PERSONA_PRESET: &str = "persona";
 /// `session.send` members a send carrying a plan must not carry: the plan replaces them.
 pub const MEMBERS_REPLACED_BY_PLAN: &[&str] = &["tools", "system", "context_management"];
 
-/// One plan item: a provider, the preset it defines, and params passed to it verbatim.
+/// One plan item: a provider, an optional named preset, and verbatim provider params.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
     pub provider: String,
-    pub preset: String,
+    pub preset: Option<String>,
     pub params: Map<String, Value>,
     /// Tool and non-persona system-text items may be optional.
     pub optional: bool,
@@ -182,13 +182,17 @@ fn string_member(object: &Map<String, Value>, key: &str, at: &str) -> Result<Str
 fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal> {
     let object = value.as_object().ok_or_else(|| Refusal::invalid(at))?;
     let provider = string_member(object, "provider", at)?;
-    let preset = string_member(object, "preset", at)?;
-    if preset.is_empty()
-        || preset.len() > 64
-        || !preset.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
-        })
-    {
+    let preset = object
+        .get("preset")
+        .map(|_| string_member(object, "preset", at))
+        .transpose()?;
+    if preset.as_ref().is_some_and(|preset| {
+        preset.is_empty()
+            || preset.len() > 64
+            || !preset.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+            })
+    }) {
         return Err(Refusal::invalid(format!("{at}.preset")));
     }
     let params = object
@@ -325,6 +329,16 @@ pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, R
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
     let system_text_items = items(object, "system_text_items", true)?;
+    // tool-provider 0.10.4 has no default system-text selector: its nested item requires
+    // `preset`. Refuse the missing name rather than sending an unrepresentable request.
+    if let Some(index) = system_text_items
+        .iter()
+        .position(|item| item.preset.is_none())
+    {
+        return Err(Refusal::invalid(format!(
+            "plan.system_text_items[{index}].preset"
+        )));
+    }
     if let Some((index, _)) = system_text_items
         .iter()
         .enumerate()

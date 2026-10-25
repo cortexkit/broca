@@ -151,7 +151,7 @@ across sessions is not built (see SECURITY.md).
 ```
 session.read { from_ordinal?, limit?, include_tools?, after_mid?, lineage_id?, max_bytes?,
                  include_originals? }
-    → { messages: [{ ordinal, mid, message,
+    → { messages: [{ ordinal, mid, message, written_at?,
                      tool_calls?: [{ tool_call_id, call_key?, dispatched_to?, indeterminate }] }],
         next_from_ordinal?, head?, lineage_id?, lineage_state,
         tools?: [{ name, description, input_schema, module? }], tools_run_id? }
@@ -159,7 +159,8 @@ session.read { from_ordinal?, limit?, include_tools?, after_mid?, lineage_id?, m
 
 session.head {} → { lineage_id?, last_ordinal?, head?, last_run_state?, updated_at?,
                        cache?: { last_sent_at_ms, ttl_ms?, expires_at_ms?, expiry_basis },
-                       title? }
+                       title?, model?: { provider, model, variant? }, usage?,
+                       sender?: { modes, interrupt, owner?: true }, incarnation? }
 session.warm { lineage_id? }
     → { request_body_sha256, warm_body_sha256, cache_read_tokens?, cache_write_tokens?,
         input_tokens?, ttl_ms, expires_at_ms, expiry_basis: "estimated" } (§4a)
@@ -186,6 +187,50 @@ run.status { run_id | session }
 send.status { send_id }
     → { state, run_id?, step?, last_error?, head: cursor, title?, usage } (state enum §14)
 ```
+
+Read-entry `written_at` is an optional Unix-millisecond time in the **entry envelope**, never
+inside the opaque `message`. It is part of default reads, with no request opt-in. New input
+and steers record admission time; a completed assistant records the end of its successful model
+attempt, before post-assistant hooks. The `message-times/v1` WAL feature preserves those times
+across rollback. Existing records are not rewritten: reads expose only recorded admission or
+successful-attempt times, and tool results' recorded `tool-times/v1` finish times. Unknown times
+stay absent, never zero. The same placement rules attach these facts before and after projection.
+
+`session.head.model` is the latest recorded next-send selection, not a model guessed from plan
+JSON. `usage`, behind the `session_usage` group, is incremental durable session spend with
+`since` naming the first counted run. Its selection keys, first-use ordering and lower-bound
+totals are exactly run usage's: a field no counted step reported is absent; unreported steps
+are counted, not silently treated as measured zeros. Projection commits totals with its WAL
+watermark. `reasoning_tokens` is already included in `output_tokens`, not an additional charge;
+the session and run totals preserve that breakdown without adding it again. Head folds only
+the unprojected suffix. Retained sessions use a separate,
+lineage-bound checkpoint of content-free spend and grant facts; its watermark never advances
+the transcript projection. Expiry deletes that checkpoint in the retained-metadata transaction,
+and late writes cannot recreate it. A missing or unreadable checkpoint is reconstructed from
+the WAL, never served as a partial total. The retained head operation still uses its existing
+full-WAL latest-message read for older metadata and titles: spend is incremental, but the whole
+retained `session.head` operation is not yet constant-time.
+
+`sender`, behind `head_sender`, reports
+the attested caller's own effective grant, using send admission's owner and plan checks. Owners
+receive all supported modes and interruption; named senders receive `idle_start` and interruption
+only when their entries grant them. An absent sender means no grant. `incarnation` is the UUID v4
+already stored in the WAL header, preserved by restart, archive and move; it is omitted for an
+unverifiable or missing header and is never minted by a read.
+
+Sessions recorded before attested owners were stamped, and direct or unverified sessions, retain
+their pre-existing unrestricted admission: any attested caller is admitted as owner. Head therefore
+reports the full owner grant to those callers too; reporting absence would incorrectly deny the
+permission the next send actually has. This does not tighten or otherwise change legacy admission.
+
+Tool, step-transform and compaction plan items may omit `preset`. Broca preserves the omission
+on catalog, declaration and compaction calls; it never substitutes an empty string. An explicit
+`"worker"` tool preset still requires scope. **System-text items still require a preset**:
+tool-provider 0.10.4 defines `system_text: {preset, params}` and has no default selector. A
+preset-less system-text item is refused before fetching or writing as `invalid_params`, naming
+`plan.system_text_items[index].preset`, rather than sending a shape the provider contract cannot
+express. A preset-less step declaration refused by its provider keeps the provider's code,
+message and field; it does not invent a `preset_missing` difference for a nonexistent name.
 
 ### Health counters and per-request diagnostics
 

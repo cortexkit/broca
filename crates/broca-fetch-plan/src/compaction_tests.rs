@@ -43,7 +43,7 @@ fn compaction_support_is_explicit_and_unsupported_keeps_the_refusal() {
     let supported = parse_plan(&raw, CompactionSupport::Supported).unwrap();
     let item = supported.compaction_item.as_ref().unwrap();
     assert_eq!(item.provider, "magic-context");
-    assert_eq!(item.preset, "head");
+    assert_eq!(item.preset.as_deref(), Some("head"));
     assert_eq!(
         serde_json::to_value(&item.params).unwrap(),
         raw["compaction_item"]["params"]
@@ -54,6 +54,24 @@ fn compaction_support_is_explicit_and_unsupported_keeps_the_refusal() {
             .detail(),
         json!({"field": "plan.compaction_item"})
     );
+}
+
+#[test]
+fn compaction_and_step_items_preserve_an_absent_preset() {
+    let mut raw = raw_plan("magic-context", Some("magic-context"), "replace");
+    raw["compaction_item"]
+        .as_object_mut()
+        .unwrap()
+        .remove("preset");
+    raw["step_transform_items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("preset");
+    raw["composition"]["step_transform_items"] = raw["step_transform_items"].clone();
+    raw["composition_digest"] = json!(composition_digest(&raw["composition"]).unwrap());
+    let parsed = parse_plan(&raw, CompactionSupport::Supported).unwrap();
+    assert!(parsed.compaction_item.unwrap().preset.is_none());
+    assert!(parsed.step_items[0].item.preset.is_none());
 }
 
 #[test]

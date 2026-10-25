@@ -501,6 +501,48 @@ fn admitted_sends(path: &Path) -> (usize, usize) {
     )
 }
 
+/// The `requires` list of every frame in a WAL's bytes that carries a `run_started` record,
+/// in file order: `Some(names)` for a gated frame, `None` for an ordinary one that any reader
+/// would accept. Walks the frame headers (`[len u32 LE][ver u8][seq][fence][digest]`) so a
+/// payload is read whole, not matched by a byte prefix that depends on every other feature.
+fn run_started_frame_requires(wal: &[u8]) -> Vec<Option<Vec<String>>> {
+    use broca_wal::framing::{FRAMING_VERSION as ORDINARY, GATED_FRAMING_VERSION as GATED};
+    let header = broca_wal::framing::HEADER_LEN;
+    let mut found = Vec::new();
+    let mut rest = wal;
+    while rest.len() >= header {
+        let len = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as usize;
+        let ver = rest[4];
+        let Some(payload) = rest.get(header..header + len) else {
+            break; // a torn tail: the record was never durable
+        };
+        let parsed = || serde_json::from_slice::<serde_json::Value>(payload).ok();
+        match ver {
+            ORDINARY => {
+                if parsed().is_some_and(|record| record["type"] == "run_started") {
+                    found.push(None);
+                }
+            }
+            GATED => {
+                if let Some(envelope) =
+                    parsed().filter(|envelope| envelope["record"]["type"] == "run_started")
+                {
+                    let requires = envelope["requires"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|name| name.as_str().map(str::to_owned))
+                        .collect();
+                    found.push(Some(requires));
+                }
+            }
+            _ => {}
+        }
+        rest = &rest[header + len..];
+    }
+    found
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity() {
     let Some(rig) = Rig::start().await else {
@@ -556,21 +598,27 @@ async fn the_real_daemons_stamp_freezes_the_scope_and_refuses_another_identity()
         )],
         "broca froze exactly the (owner, ref, scope_epoch) the daemon stamped"
     );
-    // The session is tagged too, so its RunStarted also requires runner tags.
-    let gated = br#"{"requires":["runner-tags/v2","scope/v1"],"record":{"type":"run_started""#;
+    // The scoped RunStarted must sit in a gated frame whose `requires` names scope/v1, so a
+    // reader that predates scopes refuses the WAL instead of reading the episode as unscoped.
+    // The frame also names whatever other features the record uses (runner tags, message
+    // times, ...); those may grow with later records and are not what this test guards.
+    let run_started = run_started_frame_requires(&wal);
     assert_eq!(
-        wal.windows(gated.len())
-            .filter(|window| *window == gated)
-            .count(),
+        run_started.len(),
         1,
-        "the scoped RunStarted is a gated frame requiring scope/v1"
+        "exactly one RunStarted frame: {run_started:?}"
     );
-    assert_eq!(
-        std::fs::read_to_string(rig.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-            .ok()
-            .as_deref(),
-        Some("runner-tags/v2\nscope/v1\n"),
-        "the feature floor lists scope/v1"
+    assert!(
+        run_started[0]
+            .as_ref()
+            .is_some_and(|requires| requires.iter().any(|name| name == "scope/v1")),
+        "the scoped RunStarted is a gated frame requiring scope/v1: {run_started:?}"
+    );
+    let floor = std::fs::read_to_string(rig.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+        .unwrap_or_default();
+    assert!(
+        floor.lines().any(|name| name == "scope/v1"),
+        "the feature floor lists scope/v1: {floor:?}"
     );
 
     // A second identity, admitted by the daemon as a listed carrier of the same scope, is not

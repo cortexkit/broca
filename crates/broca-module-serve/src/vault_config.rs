@@ -40,9 +40,6 @@ use serde::{Deserialize, Deserializer};
 
 use crate::auth_routing::CredentialId;
 
-/// The env var that overrides the default handle-map path.
-pub const HANDLES_PATH_ENV: &str = "BROCA_VAULT_HANDLES_PATH";
-
 // This deserialized shape contains bearer secrets. Do not derive `Debug`, which could expose
 // every handle if the parsing path is logged during future maintenance.
 #[derive(Deserialize)]
@@ -92,28 +89,16 @@ where
 
 #[derive(Debug)]
 pub enum VaultHandlesError {
-    Unresolvable,
-    ExplicitMissing {
-        path: PathBuf,
-        source: std::io::Error,
-    },
     Inspect {
         path: PathBuf,
         source: std::io::Error,
     },
     #[cfg(unix)]
-    Symlink {
-        path: PathBuf,
-    },
+    Symlink { path: PathBuf },
     #[cfg(unix)]
-    NotRegularFile {
-        path: PathBuf,
-    },
+    NotRegularFile { path: PathBuf },
     #[cfg(unix)]
-    InsecurePermissions {
-        path: PathBuf,
-        mode: u32,
-    },
+    InsecurePermissions { path: PathBuf, mode: u32 },
     Read {
         path: PathBuf,
         source: std::io::Error,
@@ -128,14 +113,6 @@ pub enum VaultHandlesError {
 impl std::fmt::Display for VaultHandlesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VaultHandlesError::Unresolvable => {
-                write!(f, "no config home to locate the developer handle map")
-            }
-            VaultHandlesError::ExplicitMissing { path, source } => write!(
-                f,
-                "{HANDLES_PATH_ENV} selects missing vault handles file {}: {source}",
-                path.display()
-            ),
             VaultHandlesError::Inspect { path, source } => {
                 write!(f, "inspect vault handles file {}: {source}", path.display())
             }
@@ -172,14 +149,14 @@ impl std::fmt::Display for VaultHandlesError {
 impl std::error::Error for VaultHandlesError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            VaultHandlesError::Inspect { source, .. }
-            | VaultHandlesError::Read { source, .. }
-            | VaultHandlesError::ExplicitMissing { source, .. } => Some(source),
+            VaultHandlesError::Inspect { source, .. } | VaultHandlesError::Read { source, .. } => {
+                Some(source)
+            }
             #[cfg(unix)]
             VaultHandlesError::Symlink { .. }
             | VaultHandlesError::NotRegularFile { .. }
             | VaultHandlesError::InsecurePermissions { .. } => None,
-            VaultHandlesError::Parse { .. } | VaultHandlesError::Unresolvable => None,
+            VaultHandlesError::Parse { .. } => None,
         }
     }
 }
@@ -251,36 +228,6 @@ pub struct VaultHandles {
 }
 
 impl VaultHandles {
-    /// The resolved handle-file path: `$BROCA_VAULT_HANDLES_PATH` if set, else
-    /// `vault-handles.json` under the shared config home (`crate::config_home`).
-    ///
-    /// This file sits BESIDE `broca.jsonc` and `auth-methods.json`, which is why the three used
-    /// to be the fleet's most likely instance of QTA's two-resolvers-one-directory defect: one
-    /// ladder gaining a rung the others did not would orphan the handle map from the config an
-    /// operator had just edited. A missing handle file is fatal when vault auth is enabled.
-    pub fn default_path() -> crate::config_home::ConfigHome {
-        crate::config_home::config_file(HANDLES_PATH_ENV, "vault-handles.json")
-    }
-
-    /// Preserve strict missing-file handling while identifying an operator's broken override.
-    /// Wrap only missing-file IO errors; parse diagnostics must never expose secret contents.
-    pub fn load_resolved(
-        resolved: crate::config_home::ConfigHome,
-    ) -> Result<Self, VaultHandlesError> {
-        let crate::config_home::ConfigHome::Resolved { path, explicit } = resolved else {
-            return Err(VaultHandlesError::Unresolvable);
-        };
-        Self::load(&path).map_err(|error| match error {
-            VaultHandlesError::Inspect { path, source }
-            | VaultHandlesError::Read { path, source }
-                if explicit && source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                VaultHandlesError::ExplicitMissing { path, source }
-            }
-            other => other,
-        })
-    }
-
     /// Load and parse the handle file at `path`. Errors never include the file contents, so a
     /// malformed secrets file cannot echo a handle. Unix files must be regular, non-symlink
     /// files with no group or world access.
@@ -302,29 +249,6 @@ impl VaultHandles {
         Ok(Self {
             handles: parsed.handles,
         })
-    }
-
-    /// As [`Self::load_resolved`], except that a MISSING file at the default location is an
-    /// empty map: a deployment whose credentials are all read by grant needs no handle file.
-    /// A missing file that `BROCA_VAULT_HANDLES_PATH` names explicitly is still fatal, since
-    /// naming a file that does not exist is a typo, not a choice. A file that exists but is
-    /// malformed, insecure, or unreadable is fatal either way.
-    pub fn load_resolved_optional(
-        resolved: crate::config_home::ConfigHome,
-    ) -> Result<Self, VaultHandlesError> {
-        match Self::load_resolved(resolved) {
-            Err(
-                VaultHandlesError::Inspect { source, .. } | VaultHandlesError::Read { source, .. },
-            ) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty()),
-            other => other,
-        }
-    }
-
-    /// A map with no handles: every credential is read by grant.
-    pub fn empty() -> Self {
-        Self {
-            handles: HashMap::new(),
-        }
     }
 
     /// The vault handle for a credential id, if the map carries one. Looked up by the
@@ -721,40 +645,6 @@ mod tests {
         }
     }
 
-    /// The handle file is optional at its default location, still fatal when an explicit
-    /// override names a missing file, and still fatal when present but malformed.
-    #[test]
-    fn a_missing_default_handle_file_is_an_empty_map() {
-        let missing = broca_test_support::scratch_root().join(format!(
-            "broca-vault-handles-{}-absent.json",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&missing);
-        let loaded =
-            VaultHandles::load_resolved_optional(crate::config_home::ConfigHome::Resolved {
-                path: missing.clone(),
-                explicit: false,
-            })
-            .expect("a missing default handle file is no handles");
-        assert!(loaded.credential_ids().is_empty());
-        assert!(matches!(
-            VaultHandles::load_resolved_optional(crate::config_home::ConfigHome::Resolved {
-                path: missing,
-                explicit: true,
-            }),
-            Err(VaultHandlesError::ExplicitMissing { .. })
-        ));
-        let malformed = write_temp("optional-malformed", r#"{ "handles": 7 }"#);
-        assert!(matches!(
-            VaultHandles::load_resolved_optional(crate::config_home::ConfigHome::Resolved {
-                path: malformed.clone(),
-                explicit: false,
-            }),
-            Err(VaultHandlesError::Parse { .. })
-        ));
-        let _ = std::fs::remove_file(&malformed);
-    }
-
     #[test]
     fn scoped_not_found_names_both_causes_the_principal_and_the_id() {
         let message = scoped_not_found_message(
@@ -889,47 +779,6 @@ mod tests {
         assert!(message.contains(&link.display().to_string()));
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_file(&target);
-    }
-
-    /// INJECTS the environment rather than mutating the process's own.
-    ///
-    /// This used to `set_var` then `remove_var`, which is a data race under a parallel test
-    /// runner: the environment is PROCESS-GLOBAL, so between those two calls every other test
-    /// thread in this binary sees the override. Any of them reading a config path would resolve
-    /// against `/tmp/custom-handles.json` and fail for a reason with no visible cause -- and it
-    /// would fail INTERMITTENTLY, on scheduling, which is the expensive kind. The restore also
-    /// clears the variable unconditionally rather than restoring a prior value, so a developer
-    /// with a real override exported would have it silently deleted for the rest of the run.
-    ///
-    /// `config_file_with` takes the lookup as a parameter for exactly this reason, so the two
-    /// rungs are testable without touching the process at all. Rust 2024 marks `set_var` unsafe
-    /// on the same grounds.
-    ///
-    /// THE REST OF THE WORKSPACE'S ENV MUTATION IS SOUND, and the reason is not the one I first
-    /// wrote. I claimed the other sites set env for CHILD processes before spawn; they do not.
-    /// Four test files call `remove_var` on the PARENT's own environment to scrub
-    /// `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` so a spawned daemon is not rejected. That is
-    /// process-global mutation. It is safe for a different reason: a UNIDIRECTIONAL SCRUB toward
-    /// the state every reader in the binary wants cannot race a concurrent reader into a wrong
-    /// answer, and there is no restore to clobber anyone.
-    ///
-    /// The two save/restore sites hold a lock. `conformance.rs::with_perturbed_env` runs under
-    /// the harness's process-global lock; `transport.rs::StreamFloorEnvGuard::apply` returns the
-    /// `MutexGuard` ALONGSIDE the restore guard, so the lock cannot be dropped before the
-    /// environment is put back. That pairing is the shape to copy -- the tempting version drops
-    /// the lock at the end of `apply()` and leaves the restore unprotected.
-    #[test]
-    fn env_override_takes_precedence_for_path() {
-        let env = |key: &str| {
-            (key == HANDLES_PATH_ENV).then(|| std::ffi::OsString::from("/tmp/custom-handles.json"))
-        };
-        assert_eq!(
-            crate::config_home::config_file_with(env, HANDLES_PATH_ENV, "vault-handles.json"),
-            crate::config_home::ConfigHome::Resolved {
-                path: PathBuf::from("/tmp/custom-handles.json"),
-                explicit: true,
-            }
-        );
     }
 }
 

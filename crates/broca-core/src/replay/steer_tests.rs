@@ -19,6 +19,7 @@ fn user(text: &str) -> Message {
 
 fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,
@@ -68,6 +69,7 @@ fn run_started(stop_when: Vec<StopCondition>) -> WalRecord {
 
 fn steered(text: &str) -> WalRecord {
     WalRecord::Steered {
+        written_at_ms: None,
         tags: None,
         retention: None,
         ts_ms: None,
@@ -86,8 +88,46 @@ fn step_started(step: u64) -> WalRecord {
     }
 }
 
+#[test]
+fn seeded_episode_coordinates_are_absolute_and_a_steer_is_not_the_first_user() {
+    for admitted_user in [false, true] {
+        let mut start = run_started(vec![]);
+        if let WalRecord::RunStarted { input, .. } = &mut start {
+            *input = Arc::new(vec![Message::new(Role::Assistant, vec![])]);
+            if admitted_user {
+                Arc::make_mut(input).push(user("admitted"));
+            }
+        }
+        let records = vec![start, steered("later user"), step_started(1)];
+        let state = super::replay_seeded(
+            &records,
+            None,
+            None,
+            None,
+            None,
+            100,
+            false,
+            crate::tags::TagSeed::default(),
+        )
+        .unwrap();
+        assert_eq!(state.extent, if admitted_user { 103 } else { 102 });
+        assert_eq!(
+            state.prompt.iter().map(|m| m.ordinal).collect::<Vec<_>>(),
+            if admitted_user {
+                vec![Some(100), Some(101), Some(102)]
+            } else {
+                vec![Some(100), Some(101)]
+            }
+        );
+        let episode = &state.render_episodes.unwrap()[0];
+        assert_eq!(episode.prompt_start, 100);
+        assert_eq!(episode.first_user, admitted_user.then_some(101));
+    }
+}
+
 fn text_step(step: u64, text: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(step),
@@ -105,6 +145,7 @@ fn text_step(step: u64, text: &str) -> WalRecord {
 
 fn call_step(step: u64, call: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(step),

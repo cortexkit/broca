@@ -439,9 +439,9 @@ fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct BindObservation {
     agent_data: bool,
-    /// The route was opened declaring the `classifier/v1` role: it serves only that role's
-    /// ops (System One), holds no session, and reads no session history.
-    classifier: bool,
+    /// Only llm-runner routes address a session. Other roles serve their own operations
+    /// without opening a session or reading its history.
+    role: RouteRole,
     /// The producer's registered project id, as the client supplied it (unattested).
     project_id: Option<String>,
     /// The daemon-stamped principal, converted without change. `None` when the bind carried
@@ -1334,7 +1334,7 @@ where
                 }));
                 return Ok(true);
             }
-            if bind.classifier {
+            if bind.role == RouteRole::Classifier {
                 spawn_classifier_request(
                     frame.body,
                     bind.clone(),
@@ -1343,6 +1343,19 @@ where
                     request_tasks,
                     (ver, channel, epoch, corr),
                 );
+                return Ok(true);
+            }
+            if matches!(bind.role, RouteRole::ToolProvider | RouteRole::Permissions) {
+                send_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "unknown_method",
+                    "this role's operations are not implemented in this build",
+                )
+                .await?;
                 return Ok(true);
             }
             let req: RouteRequest = match serde_json::from_slice(&frame.body) {
@@ -1490,8 +1503,8 @@ async fn handle_control_request(
             ..
         } => {
             stall::method_context(1);
-            let classifier = match bind_role(role_versions.as_ref(), routes.system_one.is_some()) {
-                Ok(classifier) => classifier,
+            let role = match bind_role(role_versions.as_ref(), routes.system_one.is_some()) {
+                Ok(role) => role,
                 Err(message) => {
                     return send_error(
                         writer,
@@ -1512,8 +1525,11 @@ async fn handle_control_request(
             let bind = BindObservation {
                 agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
                     if service_id == broca_wire::agent_data::SERVICE_ID),
-                classifier: classifier
-                    && matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }),
+                role: if matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }) {
+                    role
+                } else {
+                    RouteRole::LlmRunner
+                },
                 project_id: identity.project_id.clone(),
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
@@ -1533,8 +1549,8 @@ async fn handle_control_request(
                 .await;
             }
             let identity = to_broca_identity(&identity);
-            // A classifier route names no session, so its identity keys nothing.
-            if let Err(error) = if bind.agent_data || bind.classifier {
+            // Sessionless roles use the stamped caller and scope, not a session identity.
+            if let Err(error) = if bind.agent_data || bind.role.is_sessionless() {
                 Ok(())
             } else {
                 identity.validate_keyable()
@@ -1569,7 +1585,7 @@ async fn handle_control_request(
             // Keep the bind unacknowledged until its history authorizes the stamp. The read
             // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
             if !completed.bind.agent_data
-                && !completed.bind.classifier
+                && !completed.bind.role.is_sessionless()
                 && matches!(&completed.bind.scope, broca_protocol::SendScope::Stamped(_))
             {
                 let registry = health_registry.clone();
@@ -2217,7 +2233,8 @@ where
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
         let write = matches!(method, OP_SEND | OP_WARM | OP_IMPORT | OP_CANCEL | OP_RETRACT);
-        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE);
+        let write = write || matches!(method, "session.upload_begin" | "session.upload_append" | "session.upload_commit");
+        let session_read = matches!(method, OP_READ | OP_RESOLVE | OP_HEAD | OP_RUN_RESULT | OP_RUN_TOOL_CALLS | OP_RUN_EVENT_GET | OP_STATUS | OP_SUBSCRIBE | OP_BASELINE | "session.upload_status");
         if write || session_read {
             if let Err(error) = handler.check_migration(&session, write).await {
                 return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
@@ -2345,6 +2362,24 @@ where
         }
     }
     match req.method.as_str() {
+        "session.upload_begin"
+        | "session.upload_append"
+        | "session.upload_commit"
+        | "session.upload_status" => {
+            match handler
+                .upload(
+                    &session,
+                    bind.principal.as_ref(),
+                    &bind.scope,
+                    &req.method,
+                    req.params,
+                )
+                .await
+            {
+                Ok(reply) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Err(error) => send_serve_error(writer, ver, channel, epoch, corr, &error).await,
+            }
+        }
         OP_SEND_STATUS => {
             let params: broca_wire::SendStatusRequest =
                 match serde_json::from_value(req.params.clone()) {
@@ -2388,6 +2423,18 @@ where
                     corr,
                     "unsupported_seed_from",
                     "seed_from is reserved for lineage forks and is not supported in v1",
+                )
+                .await;
+            }
+            if let Err(message) = broca_wire::check_upload_references(&req.params) {
+                return send_invalid_params(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    Some("content".into()),
+                    &message,
                 )
                 .await;
             }
@@ -3165,7 +3212,10 @@ where
                 return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
                     .await;
             }
-            match handler.head(&session).await {
+            match handler
+                .head_for(&session, bind.principal.as_ref(), &bind.scope)
+                .await
+            {
                 Ok(head) => send_json_response(writer, ver, channel, epoch, corr, &head).await,
                 Err(e) => send_serve_error(writer, ver, channel, epoch, corr, &e).await,
             }
@@ -3696,6 +3746,7 @@ async fn send_json_response<T: serde::Serialize>(
 
 fn refused_send_code(error: &ServeError) -> String {
     match error {
+        ServeError::Upload(error) => error.code.into(),
         ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND.into(),
         ServeError::SessionMoving { .. } => "session_moving".into(),
@@ -3812,6 +3863,23 @@ async fn send_serve_error(
         return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
     }
     let code = match err {
+        ServeError::Upload(error) => {
+            let mut detail = serde_json::json!({});
+            if let Some(field) = error.field {
+                detail["field"] = field.into();
+            }
+            if let Some(received) = error.received {
+                detail["received"] = received.into();
+            }
+            if matches!(
+                error.code,
+                "upload_staging_full" | "upload_session_full" | "upload_store_failed"
+            ) {
+                detail["class"] = "transient".into();
+            }
+            let body = ErrorBody::new(error.code, error.to_string()).with_detail(detail);
+            return send_error_body(writer, ver, channel, epoch, corr, body).await;
+        }
         ServeError::ReplyTooLarge(_) => unreachable!("reply_too_large returned above"),
         ServeError::SessionMoving { cut_id } => {
             let body = ErrorBody::new("session_moving", err.to_string())
@@ -4059,7 +4127,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         && parsed
             .tool_items
             .iter()
-            .any(|item| item.preset == broca_fetch_plan::CONFINED_TOOL_PRESET)
+            .any(|item| item.preset.as_deref() == Some(broca_fetch_plan::CONFINED_TOOL_PRESET))
     {
         return Err(SendPlanRefusal::WorkerPresetRequiresScope);
     }
@@ -4137,35 +4205,79 @@ fn send_field_of(differing: &str) -> Option<&'static str> {
     })
 }
 
-/// The bind refusal for a route whose declared roles this build cannot answer as one role: a
-/// `classifier` version it does not serve, or `classifier` beside `llm-runner` (a route has
-/// one `role.describe`, so it cannot be both).
+/// The bind refusal for an unsupported role version or multiple supported roles on one route.
+/// Each route has only one operation namespace, including one `role.describe`.
 pub const ROLE_VERSIONS_UNSUPPORTED: &str = "role_versions_unsupported";
 
-/// Which role a bind's `role_versions` asks this route to serve: `Ok(true)` for
-/// `classifier/v1`, `Ok(false)` for llm-runner (no classifier declared), or the refusal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RouteRole {
+    #[default]
+    LlmRunner,
+    Classifier,
+    ToolProvider,
+    Permissions,
+}
+
+impl RouteRole {
+    fn is_sessionless(self) -> bool {
+        self != Self::LlmRunner
+    }
+}
+
+/// Select a supported role, retaining llm-runner for legacy or unrelated declarations.
 fn bind_role(
     role_versions: Option<&std::collections::BTreeMap<String, String>>,
     serves_classifier: bool,
-) -> Result<bool, String> {
-    let (role, version) = broca_subc::CLASSIFIER_ROLE_VERSIONS;
-    let Some(declared) = role_versions.and_then(|roles| roles.get(role)) else {
-        return Ok(false);
+) -> Result<RouteRole, String> {
+    let Some(roles) = role_versions else {
+        return Ok(RouteRole::LlmRunner);
     };
+    let supported = [
+        ("classifier", "v1", RouteRole::Classifier),
+        ("llm-runner", "v1", RouteRole::LlmRunner),
+        ("tool-provider", "v1", RouteRole::ToolProvider),
+        ("permissions", "v1", RouteRole::Permissions),
+    ];
+    let mut declared_roles = supported
+        .into_iter()
+        .filter(|(role, _, _)| roles.contains_key(*role));
+    let Some((role, version, selected)) = declared_roles.next() else {
+        return Ok(RouteRole::LlmRunner);
+    };
+    let declared = &roles[role];
     if declared != version {
         return Err(format!(
             "this build serves {role} {version} only; the route declares {role} {declared}"
         ));
     }
-    if role_versions.is_some_and(|roles| roles.contains_key("llm-runner")) {
+    if let Some((other, _, _)) = declared_roles.next() {
         return Err(format!(
-            "a route serves one role; this one declares both {role} and llm-runner"
+            "a route serves one role; this one declares both {role} and {other}"
         ));
     }
-    if !serves_classifier {
+    if selected == RouteRole::Classifier && !serves_classifier {
         return Err(format!("this build does not serve {role} {version}"));
     }
-    Ok(true)
+    Ok(selected)
+}
+
+#[cfg(test)]
+mod role_selection_tests {
+    use super::{bind_role, RouteRole};
+
+    #[test]
+    fn each_supported_role_selects_its_own_dispatch() {
+        assert_eq!(bind_role(None, true), Ok(RouteRole::LlmRunner));
+        for (name, expected) in [
+            ("llm-runner", RouteRole::LlmRunner),
+            ("classifier", RouteRole::Classifier),
+            ("tool-provider", RouteRole::ToolProvider),
+            ("permissions", RouteRole::Permissions),
+        ] {
+            let roles = [(name.into(), "v1".into())].into_iter().collect();
+            assert_eq!(bind_role(Some(&roles), true), Ok(expected), "{name}");
+        }
+    }
 }
 
 /// Answer one request on a classifier route, on tasks of its own: never the frame loop, and
@@ -5039,6 +5151,7 @@ mod tests {
             lineage_id: None,
             messages: vec![
                 SessionReadMessage {
+                    written_at: None,
                     delivered_as: None,
                     run: None,
                     ordinal: 0,
@@ -5056,6 +5169,7 @@ mod tests {
                     part_digests: None,
                 },
                 SessionReadMessage {
+                    written_at: None,
                     delivered_as: None,
                     run: None,
                     ordinal: 1,
@@ -5706,6 +5820,7 @@ mod tests {
             let end = (from + 2).min(self.messages.len());
             let messages = (from..end)
                 .map(|ordinal| broca_wire::SessionReadMessage {
+                    written_at: None,
                     delivered_as: None,
                     ordinal: ordinal as u64,
                     mid: format!("m{ordinal}"),
@@ -6521,6 +6636,7 @@ mod tests {
     async fn refused_replacement_goodbye_preserves_published_route_and_stream() {
         let session = BrocaBindIdentity::new("/tmp/project-a", "runner", "published");
         let record = broca_wal::WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -6952,7 +7068,7 @@ mod tests {
                 identity: BrocaBindIdentity::new("/tmp/project-a", "runner", "late-bind"),
                 bind: BindObservation {
                     agent_data: false,
-                    classifier: false,
+                    role: RouteRole::LlmRunner,
                     project_id: None,
                     principal: None,
                     scope: broca_protocol::SendScope::Unstamped,

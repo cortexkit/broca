@@ -95,10 +95,72 @@ impl StorePrefix {
 /// One materialized message row, preserving its lineage ordinal.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePageRow {
+    pub written_at: Option<u64>,
     pub ordinal: u64,
     pub message: Message,
     pub run: Option<crate::RunAttribution>,
 }
+
+/// One episode's durable render inputs, with the state of every value separated from the value
+/// itself.
+///
+/// A resumed run under an applied compaction view reads these from the store projection instead
+/// of replaying the whole WAL (see `ModelHistory::episodes`). Each coordinate is an absolute
+/// transcript ordinal and states which of three things it is: a known value (a `Some(Some(_))`
+/// for the optional coordinates), a known absence (`Some(None)`), or a value nobody has computed
+/// yet (`None`), which sends the reader back to the WAL for that episode instead of guessing.
+/// Read through the accessors, which never let a stored zero stand in for an unknown ordinal.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EpisodeRenderProjection {
+    /// The episode's first message, the ordinal its `RunStarted` input starts at.
+    pub start: Option<u64>,
+    /// The episode's original admitted first user message, `Some(None)` when its admitted input
+    /// carried none (a later steer is never this).
+    pub first_user: Option<Option<u64>>,
+    /// The episode's first model-produced message: its first model step's start. `Some(None)`
+    /// while the episode has committed no model step.
+    pub first_step: Option<Option<u64>>,
+    /// The episode's frozen render config, the bytes its `RunStarted` recorded.
+    #[serde(default)]
+    pub render_config: Option<serde_json::Value>,
+}
+
+impl EpisodeRenderProjection {
+    pub fn start(&self) -> Option<u64> {
+        self.start
+    }
+
+    pub fn first_user(&self) -> Option<Option<u64>> {
+        self.first_user
+    }
+
+    pub fn first_step(&self) -> Option<Option<u64>> {
+        self.first_step
+    }
+
+    pub fn render_config(&self) -> Option<&serde_json::Value> {
+        self.render_config.as_ref()
+    }
+
+    /// Whether every value a reader needs was computed for this episode. `false` means the
+    /// reader must take this episode's metadata from the WAL.
+    pub fn is_complete(&self) -> bool {
+        self.start.is_some()
+            && self.first_user.is_some()
+            && self.first_step.is_some()
+            && self.render_config.is_some()
+    }
+}
+
+/// A boxed future of an episode projection read, shared by the store seams that serve a
+/// running loop without blocking its runtime thread.
+pub type EpisodeProjectionRead<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Option<Vec<EpisodeRenderProjection>>, String>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Rebuildable model-guidance coordinates captured with a page's rows and watermark.
 /// Missing metadata means replay, not an episode without repeated calls.
@@ -106,13 +168,20 @@ pub struct StorePageRow {
 pub struct ModelHistory {
     pub spans: Vec<std::ops::Range<u64>>,
     pub open_span: Option<u64>,
+    /// Every episode's render inputs, in lineage order, for a session with an applied view.
+    /// `None` when the store holds no complete episode metadata; readers then replay the WAL.
+    pub episodes: Option<Vec<EpisodeRenderProjection>>,
     /// The exact ordinal ranges the store read, including episode history and lookahead.
     pub row_ranges: Vec<std::ops::Range<u64>>,
+    /// How many transcript messages the materialized prefix holds: the session's extent below
+    /// the WAL tail, and the end of the episode that is open at the watermark.
+    pub prefix_len: u64,
 }
 
 /// The metadata and requested rows captured by one store transaction for `session.read`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorePageSnapshot {
+    pub head: Option<crate::head::HeadProjection>,
     pub model_history: Option<ModelHistory>,
     pub watermark_seq: u64,
     /// WAL identity represented by the materialized rows. Without a known matching
@@ -150,6 +219,7 @@ pub struct StorePageSnapshot {
 impl StorePageSnapshot {
     pub fn empty() -> Self {
         Self {
+            head: Some(crate::head::HeadProjection::default()),
             model_history: None,
             last_title: None,
             deferred_calls: None,
@@ -229,6 +299,20 @@ pub struct TagLocation {
 
 /// The materialized store read seam. The loop depends only on this trait.
 pub trait MaterializedStore: Send + Sync {
+    fn read_retained_head(
+        &self,
+        _session: &BindIdentity,
+        _lineage_id: &str,
+    ) -> Result<Option<crate::head::RetainedHeadCheckpoint>, String> {
+        Ok(None)
+    }
+    fn checkpoint_retained_head(
+        &self,
+        _session: &BindIdentity,
+        _checkpoint: &crate::head::RetainedHeadCheckpoint,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Look a runner tag up in the store's tag index, without reading any message. `None`
     /// when this store keeps no tag index; the caller then has to read the whole transcript.
     fn tag_location(
@@ -264,7 +348,33 @@ pub trait MaterializedStore: Send + Sync {
     /// consistent transaction (never two racing reads). Any decode or component-read
     /// failure must surface as an error so the caller can fall back to a full WAL replay
     /// instead of merging a partial snapshot.
+    /// Messages carry their absolute store-row ordinals; merging never renumbers loaded rows.
     fn read_prefix_with_watermark(&self, session: &BindIdentity) -> Result<StorePrefix, String>;
+
+    /// Read the session's projected episode render inputs (start, original first user, first
+    /// model step and frozen render config per episode) without reading a transcript message.
+    ///
+    /// The default implementation keeps no such projection. A store that does returns
+    /// `Ok(Some(episodes))` only when every episode's values were computed at the projection's
+    /// materialization watermark. `Ok(None)` means they were not: a store written before the
+    /// column existed, or one whose projection advanced without recomputing them. A caller that
+    /// needs episode coordinates then replays the WAL rather than render from an absence, and
+    /// the projection fills the values on its next write. `Err` is a read failure, answered the
+    /// same way.
+    fn read_episode_projection(
+        &self,
+        _session: &BindIdentity,
+    ) -> Result<Option<Vec<EpisodeRenderProjection>>, String> {
+        Ok(None)
+    }
+
+    /// The same projection read for a running session's own loop, which must not wait on a
+    /// store lock. `Ok(None)` means the store cannot supply the values: it keeps no projection,
+    /// the projection is stale or absent, or it belongs to another lineage. The caller then uses
+    /// its WAL replay, and the projection fills the values on its next write.
+    fn read_episode_projection_async(&self, _session: &BindIdentity) -> EpisodeProjectionRead<'_> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Read the watermark, matching byte anchor, and admission checkpoint in one transaction.
     /// `None` means there is no metadata row; callers use the complete WAL.
@@ -308,6 +418,15 @@ pub trait MaterializedStore: Send + Sync {
 /// The WAL→store projection seam. Defined in the loop crate (so `run_loop` can
 /// drive it without depending on the SQLite impl); `SqliteStore` implements it.
 pub trait Persister: Send + Sync {
+    /// Retained transcripts stay WAL-only; only content-free head facts may be checkpointed.
+    fn project_retained_head(
+        &self,
+        _session: &BindIdentity,
+        _lineage_id: &str,
+        _records: &[FramedRecord],
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Read the complete seed for a suffix-only projection. `None` asks the caller to provide
     /// the full WAL because metadata from an older schema cannot safely seed incremental replay.
     /// The default preserves compatibility for persisters that only support full-prefix replay.
@@ -691,6 +810,7 @@ pub fn emit_lineage_usage_exports(
 /// prompt ordinal, which is kept out of [`Message`]'s serde shape for render byte stability.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionReadMessage {
+    pub written_at: Option<u64>,
     pub ordinal: u64,
     pub message: Message,
     pub run: Option<crate::RunAttribution>,
@@ -817,6 +937,7 @@ pub fn read_session_page(
                 })
                 .cloned()
                 .map(|row| SessionReadMessage {
+                    written_at: row.written_at,
                     ordinal: row.ordinal,
                     message: row.message,
                     run: row.run,
@@ -866,6 +987,7 @@ pub fn read_session_page_owned_with_dispatches(
                     !discard_materialized_seed && row.ordinal >= start && row.ordinal < end
                 })
                 .map(|row| SessionReadMessage {
+                    written_at: row.written_at,
                     ordinal: row.ordinal,
                     message: row.message,
                     run: row.run,
@@ -891,6 +1013,22 @@ fn read_session_page_from_rows(
     let capped_limit = limit
         .unwrap_or(SESSION_READ_DEFAULT_LIMIT)
         .clamp(1, SESSION_READ_MAX_LIMIT);
+    let times = crate::message_times::written_times_with_queued(
+        framed_tail.iter().map(|frame| &frame.record),
+        crate::placement::Placement::new(snapshot.prefix_len),
+        snapshot
+            .head
+            .as_ref()
+            .map(|head| head.queued_times().clone())
+            .unwrap_or_default(),
+    )
+    .map_err(|reason| crate::ReplayError::CorruptLineage {
+        episode_run_id: snapshot
+            .last_run_id
+            .clone()
+            .unwrap_or_else(|| RunId(String::new())),
+        reason,
+    })?;
     let discard_materialized_seed = snapshot.completed_steps == 0
         && crate::replay::first_session_record_is_interrupted(
             framed_tail.iter().map(|framed| &framed.record),
@@ -946,6 +1084,7 @@ fn read_session_page_from_rows(
                 let ordinal = prefix_len + tail_start + index as u64;
                 message.ordinal = Some(ordinal);
                 SessionReadMessage {
+                    written_at: times.get(&ordinal).copied(),
                     ordinal,
                     message,
                     run: tail_state.message_runs[(tail_start + index as u64) as usize].clone(),
@@ -1209,6 +1348,7 @@ fn read_session_page_full(
         .cloned()
         .enumerate()
         .map(|(index, message)| SessionReadMessage {
+            written_at: None,
             run: runs[(start + index as u64) as usize].clone(),
             ordinal: message.ordinal.unwrap_or(start + index as u64),
             message,
@@ -1252,7 +1392,8 @@ pub fn effective_context(
     tail: &[WalRecord],
 ) -> Result<Vec<Message>, crate::ReplayError> {
     let mut prompt = prefix.prefix.clone();
-    if materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail) {
+    let abandoned = materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail);
+    if abandoned {
         prompt.clear();
     }
     // The tail may begin mid-episode (its `RunStarted` already materialized into the
@@ -1266,17 +1407,16 @@ pub fn effective_context(
             None,
             None,
             None,
-            prefix.prefix.len() as u64,
+            if abandoned {
+                0
+            } else {
+                prefix.prefix.len() as u64
+            },
             false,
             crate::tags::TagSeed::from_prefix(&prefix.prefix),
         )?
         .prompt,
     );
-    // Stamp the merged prompt's durable lineage positions over the WHOLE prompt (prefix
-    // messages come back from the store with no ordinal — the field is not serialized). This
-    // matches `replay`'s stamping so the fast path and a full replay assign identical
-    // ordinals (the `merge_equals_full_replay` gate proves it).
-    broca_protocol::content::stamp_ordinals(&mut prompt);
     Ok(prompt)
 }
 
@@ -1316,6 +1456,7 @@ pub fn resume_state_from_store(
     run_id: Option<crate::RunId>,
     budget_state: Option<crate::BudgetReplayStateV1>,
 ) -> Result<crate::ReplayState, crate::ReplayError> {
+    let abandoned = materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail);
     // Seed the mid-episode tail's origin from the prefix's trailing assistant turn (see
     // `effective_context`) so a resumed turn stamps the same model a full replay would.
     let tail_state = crate::replay::replay_seeded(
@@ -1324,15 +1465,49 @@ pub fn resume_state_from_store(
         run_id.clone(),
         run_config.as_ref().and_then(|config| config.budget.clone()),
         budget_state,
-        prefix.prefix.len() as u64,
+        if abandoned {
+            0
+        } else {
+            prefix.prefix.len() as u64
+        },
         !prefix.prefix.is_empty(),
         crate::tags::TagSeed::from_prefix(&prefix.prefix),
     )?;
+    // A view the prefix's leading records applied or replaced: a replacement at the transcript's
+    // start, so the prompt no longer leads with the lineage's first message and the tail's
+    // episode coordinates are not the lineage's either.
+    let leading_view = tail
+        .iter()
+        .fold(
+            crate::compaction::CompactionCheckpoint::None,
+            |mut checkpoint, record| {
+                checkpoint.fold(record);
+                checkpoint
+            },
+        )
+        .state()
+        .is_some_and(|state| {
+            state
+                .applied
+                .as_ref()
+                .is_some_and(|applied| applied.range.from == 0)
+                || state.view.as_ref().is_some_and(|applied| {
+                    applied.view.ranges.iter().any(|range| match range {
+                        crate::compaction_provider::view::ViewRange::Keep { from, .. }
+                        | crate::compaction_provider::view::ViewRange::Replace { from, .. } => {
+                            *from == 0
+                        }
+                        // A range mark this build does not know cannot be shown to start the
+                        // transcript, so the tail's episode coordinates are not trusted either.
+                        _ => true,
+                    })
+                })
+        });
     // Leave room for the resumed run's next turns. Cloning the exact-capacity prefix would
     // otherwise copy the entire transcript again when the first new message is appended.
     let mut prompt = Vec::with_capacity(prefix.prefix.len() + tail_state.prompt.len() + 256);
     prompt.extend_from_slice(&prefix.prefix);
-    if materialized_zero_step_seed_was_interrupted(prefix.completed_steps, tail) {
+    if abandoned {
         prompt.clear();
     }
     // Episode boundaries are only known for what the tail replay itself walked. With an empty
@@ -1344,9 +1519,6 @@ pub fn resume_state_from_store(
         None
     };
     prompt.extend(tail_state.prompt);
-    // Stamp durable lineage positions over the whole merged prompt (as `replay` does), so a
-    // resumed run's messages carry the same ordinals a full replay would assign.
-    broca_protocol::content::stamp_ordinals(&mut prompt);
     let starts_new_episode = tail
         .iter()
         .any(|record| matches!(record, WalRecord::RunStarted { .. }));
@@ -1400,6 +1572,7 @@ pub fn resume_state_from_store(
         )
     };
     Ok(crate::ReplayState {
+        extent: tail_state.extent,
         tags_await_setup: tail_state.tags_await_setup,
         input_budget: tail_state.input_budget,
         cancel_at: tail_state.cancel_at,
@@ -1436,7 +1609,7 @@ pub fn resume_state_from_store(
         provider_call_started,
         run_finished_durable: tail_state.run_finished_durable,
         episode_step_spans,
-        render_episodes: if prefix.prefix.is_empty() {
+        render_episodes: if prefix.prefix.is_empty() || leading_view {
             tail_state.render_episodes
         } else {
             None
@@ -1949,6 +2122,7 @@ mod tests {
     fn sample_wal() -> Vec<WalRecord> {
         vec![
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -2003,6 +2177,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),
@@ -2062,6 +2237,7 @@ mod tests {
             },
             WalRecord::TurnFinished { step_id: StepId(1) },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(2),
@@ -2313,6 +2489,7 @@ mod tests {
         };
         records.extend([
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -2342,6 +2519,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(3),
@@ -2391,6 +2569,7 @@ mod tests {
             // This naturally terminal no-tool step is durable but has no RunFinished, so the
             // corpus ends with a non-empty, not-yet-materialized tail.
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(4),
@@ -2415,10 +2594,7 @@ mod tests {
             .map(|record| record.record.clone())
             .collect();
         let committed_state = replay(&committed).expect("committed corpus replays");
-        let mut prefix = committed_state.prompt;
-        for message in &mut prefix {
-            message.ordinal = None;
-        }
+        let prefix = committed_state.prompt;
         (
             framed,
             StorePrefix {
@@ -2467,6 +2643,7 @@ mod tests {
                 let ordinal = index as u64;
                 message.ordinal = Some(ordinal);
                 StorePageRow {
+                    written_at: None,
                     ordinal,
                     message,
                     run: runs[index].clone(),
@@ -2474,6 +2651,7 @@ mod tests {
             })
             .collect();
         StorePageSnapshot {
+            head: None,
             model_history: None,
             last_title: None,
             deferred_calls: None,
@@ -2644,6 +2822,7 @@ mod tests {
                 );
                 message.ordinal = Some(ordinal);
                 StorePageRow {
+                    written_at: None,
                     ordinal,
                     message,
                     run: None,
@@ -2704,7 +2883,7 @@ mod tests {
         let framed = framed(&wal);
         let watermark = framed.len() as u64 - 1;
         let committed = replay(&wal[..watermark as usize]).expect("committed prefix replays");
-        let mut prefix = StorePrefix {
+        let prefix = StorePrefix {
             lineage_id: None,
             prefix: committed.prompt,
             completed_steps: committed.completed_steps,
@@ -2715,9 +2894,6 @@ mod tests {
             watermark_seq: watermark,
             context_epoch: 0,
         };
-        for message in &mut prefix.prefix {
-            message.ordinal = None;
-        }
         let snapshot = snapshot_for_request(&prefix, &framed, None, Some(10));
         let tail = &framed[watermark as usize..];
         let actual = read_session_page(&snapshot, tail, None, Some(10)).expect("paged read");
@@ -3023,6 +3199,7 @@ mod episode_merge_regression {
 
     fn start(run: &str, model: &str, text: &str) -> WalRecord {
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3069,6 +3246,7 @@ mod episode_merge_regression {
         let wal = vec![
             start("a", "a-model", "episode a"),
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(1),
@@ -3097,10 +3275,7 @@ mod episode_merge_regression {
             WalRecord::StepStarted { step_id: StepId(1) },
         ];
         let projected = crate::replay(&wal[..2]).expect("episode A prefix replays");
-        let mut stored_messages = projected.prompt;
-        for message in &mut stored_messages {
-            message.ordinal = None;
-        }
+        let stored_messages = projected.prompt;
         let prefix = StorePrefix {
             lineage_id: None,
             prefix: stored_messages,

@@ -11,6 +11,9 @@ use std::sync::{
     Mutex,
 };
 
+#[path = "held_history_tests.rs"]
+mod held_history;
+
 pub(super) fn text(role: Role, text: &str) -> Message {
     Message::new(role, vec![ContentBlock::Text { text: text.into() }])
 }
@@ -723,7 +726,9 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
         model_history: Some(crate::context::ModelHistory {
             spans: vec![],
             open_span: None,
+            episodes: None,
             row_ranges: std::iter::once(0..raw.len() as u64).collect(),
+            prefix_len: raw.len() as u64,
         }),
         prefix_len: raw.len() as u64,
         rows: raw
@@ -731,6 +736,7 @@ fn model_page_folds_snapshot_and_mid_turn_tail_and_refuses_after_mid() {
             .cloned()
             .enumerate()
             .map(|(i, message)| crate::StorePageRow {
+                written_at: None,
                 run: None,
                 ordinal: i as u64,
                 message,
@@ -1154,6 +1160,59 @@ fn history_request() -> (crate::RunRequest, crate::RunControl, Arc<OneView>) {
     (request, control, views)
 }
 
+#[tokio::test]
+async fn presetless_compaction_setup_omits_the_member_on_the_real_call() {
+    struct DefaultSetup(AtomicUsize);
+    #[async_trait::async_trait]
+    impl CompactionPlane for DefaultSetup {
+        async fn setup(
+            &self,
+            _: &str,
+            _: &BindIdentity,
+            request: SetupRequest,
+        ) -> Result<SetupAnswer, CompactionUnavailable> {
+            assert!(serde_json::to_value(&request)
+                .unwrap()
+                .get("preset")
+                .is_none());
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut answer = ready();
+            answer["request_id"] = json!(request.request_id);
+            Ok(serde_json::from_value(answer).unwrap())
+        }
+    }
+    let shared = Shared::default();
+    let writer = shared.writer();
+    let (request, mut control, _) = history_request();
+    let mut manifest = control.manifest.take().unwrap().as_ref().clone();
+    manifest.plan = OpaqueJson::from_json_text(
+        json!({"compaction_item":{"provider":"provider","params":{}},"composition":{}}).to_string(),
+    )
+    .unwrap();
+    let plane = Arc::new(DefaultSetup(AtomicUsize::new(0)));
+    control.manifest = Some(Arc::new(manifest));
+    control.compaction_plane = Some(plane.clone());
+    control.compaction_views = None;
+    let model = PrefixBound(crate::StubProvider::new(vec![model_events()]));
+    let (out, _events) = tokio::sync::mpsc::channel(256);
+    crate::run_loop_on_writer(
+        request,
+        &writer,
+        crate::StartMode::FreshOrResume,
+        &model,
+        &crate::StubToolPlane::new(),
+        &crate::AllowAll,
+        &shared,
+        None,
+        control,
+        &out,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plane.0.load(Ordering::SeqCst), 1);
+    writer.shutdown().await.unwrap();
+}
+
 async fn run_history(shared: &Shared) -> (PrefixBound, Arc<OneView>) {
     run_history_with(shared, OneView::default()).await
 }
@@ -1432,12 +1491,32 @@ fn views_applied(records: &[WalRecord]) -> Vec<u64> {
 #[tokio::test]
 async fn an_announced_view_is_fetched_at_the_step_boundary_and_applied() {
     let shared = Shared::default();
-    let (model, views) = run_history(&shared).await;
+    let ((model, views), logs) = broca_test_support::capture_logs(run_history(&shared)).await;
     assert_eq!(*views.fetches.lock().unwrap(), vec![(2, true)]);
     assert_eq!(views_applied(&shared.records()), vec![2]);
     let sent =
         String::from_utf8_lossy(&crate::canonical_request_bytes(&model.0.calls()[0])).into_owned();
     assert!(sent.contains("summary"), "{sent}");
+    assert_step_decisions(&logs, &[(2, "applied", "")]);
+}
+
+fn assert_step_decisions(logs: &[broca_test_support::LogEvent], expected: &[(u64, &str, &str)]) {
+    let session_ref = crate::agent_session_ref(&bind());
+    let decisions: Vec<_> = logs
+        .iter()
+        .filter(|event| event.message() == "compaction view decided at a step boundary")
+        .map(|event| {
+            assert_eq!(event.target, "compaction");
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_eq!(event.fields.get("session_ref"), Some(&session_ref));
+            (
+                event.fields["view_version"].parse::<u64>().unwrap(),
+                event.fields["choice"].as_str(),
+                event.fields.get("superseded").map_or("", String::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(decisions, expected, "one correlated INFO decision per view");
 }
 
 /// A fetched view whose bytes are not the ones its `view_ready` announced (its digest differs
@@ -1741,6 +1820,86 @@ async fn idle_boundary_applies_only_the_newest_view_announced_during_its_fetch()
         "exactly one applied view, the newest"
     );
     assert_eq!(*racing.fetches.lock().unwrap(), vec![1, 2]);
+    let _ = writer.shutdown().await;
+}
+
+#[tokio::test]
+async fn step_boundary_logs_applied_and_superseded_views_with_session_ref() {
+    use crate::compaction_provider::notice::ViewReady;
+    let mut raw = vec![
+        text(Role::User, &"large history ".repeat(2000)),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "next"),
+    ];
+    broca_protocol::content::stamp_ordinals(&mut raw);
+    let shared = Shared::with_records(vec![setup_record(Some("{}"))]);
+    let writer = shared.writer();
+    let session = bind();
+    let session_ref = crate::agent_session_ref(&session);
+    let inbox = Arc::new(crate::ViewReadyInbox::default());
+    inbox.announce(ViewReady::for_view(&RacingViews::view(&session_ref, 1)));
+    let racing = Arc::new(RacingViews {
+        fetching_first: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        fetches: Mutex::new(Vec::new()),
+    });
+    let plane: Arc<dyn CompactionPlane> = racing.clone();
+    let control = crate::RunControl {
+        compaction_views: Some(inbox.clone()),
+        ..Default::default()
+    };
+    let runtime = runtime::Runtime {
+        provider: "provider",
+        bind: &session,
+        plane: Some(&plane),
+        writer: &writer,
+        control: &control,
+    };
+    let mut state = CompactionState::default();
+    for record in shared.records() {
+        state.fold(&record);
+    }
+    let mut boundary = runtime::BoundaryViews::default();
+    let lineage = fixture_lineage_id().to_string();
+    let ((), logs) = broca_test_support::capture_logs(async {
+        broca_test_support::wait_for(
+            "step boundary deciding the newest view",
+            async {
+                let (result, ()) = tokio::join!(
+                    runtime.views_at_boundary(
+                        &mut boundary,
+                        &mut state,
+                        Some(inbox.as_ref()),
+                        &session_ref,
+                        &lineage,
+                        "model",
+                        &raw,
+                        super::StoredTranscript::plain(&raw),
+                        false,
+                        true,
+                        runtime::StepAt {
+                            run_id: "run",
+                            step: 1,
+                            superseded: &[]
+                        },
+                        None,
+                    ),
+                    async {
+                        racing.fetching_first.notified().await;
+                        inbox.announce(ViewReady::for_view(&RacingViews::view(&session_ref, 2)));
+                        racing.release.notify_one();
+                    }
+                );
+                result.unwrap();
+            },
+            || format!("fetches={:?}", racing.fetches.lock().unwrap()),
+        )
+        .await;
+    })
+    .await;
+    assert_eq!(views_applied(&shared.records()), vec![2]);
+    assert_eq!(*racing.fetches.lock().unwrap(), vec![1, 2]);
+    assert_step_decisions(&logs, &[(1, "superseded", ""), (2, "applied", "1")]);
     let _ = writer.shutdown().await;
 }
 

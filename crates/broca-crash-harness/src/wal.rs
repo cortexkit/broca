@@ -184,6 +184,10 @@ impl ObservedWalStore {
 // test in tests/it/observed_wal_fidelity.rs compares these impls with FileWalStore's and
 // FileWal's, so a new production override cannot be missed here silently.
 impl WalStore for ObservedWalStore {
+    fn uploads(&self) -> Option<broca_core::media_uploads::Uploads> {
+        WalStore::uploads(&self.inner)
+    }
+
     fn read_records_tail_bounded(
         &self,
         session: &BindIdentity,

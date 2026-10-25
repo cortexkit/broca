@@ -387,6 +387,12 @@ impl SqliteStore {
                 "retention lineage changed session or was already expired",
             ));
         }
+        if lineage.expired_at_ms.is_some() {
+            tx.execute(
+                "DELETE FROM retained_head WHERE lineage_id=?1 AND session=?2",
+                params![lineage.lineage_id, Self::key(&lineage.session)],
+            )?;
+        }
         for (row, usage_json, finish_reason_json, state_changed_ms) in prepared {
             let changed = tx.execute(
                 "INSERT INTO run_index

@@ -282,10 +282,20 @@ fn every_model_production_uses_still_resolves() {
 
 /// Ids production sent that broca stopped serving ON PURPOSE, not because a catalog lost them.
 ///
-/// `gpt-5.6-luna-pro` and `gpt-5.6-terra-pro` were never catalog models: broca mapped the
-/// `-pro` suffix to the base model with reasoning effort `max` on the ChatGPT path. That effort
-/// is now requested as `model.variant`, and an id resolves only if the catalog lists it, so
-/// these are refused as unknown. They stay in the manifest because the manifest is the record
+/// `gpt-5.6-luna-pro`, `gpt-5.6-terra-pro`, `gpt-6-luna-pro` and `gpt-6-luna-fast` were never
+/// catalog models: broca mapped the `-pro` suffix to the base model with reasoning effort `max`,
+/// and `-fast` to priority processing, on the ChatGPT path. Effort is now requested as
+/// `model.variant` and priority as `service_tier`, and an id resolves only if the catalog lists
+/// it, so these are refused as unknown. They stay in the manifest because the manifest is the record
 /// of what was sent; this list is the record of the decision to stop serving them, and the test
 /// checks that they really do refuse.
-const RETIRED_BY_DECISION: &[&str] = &["openai/gpt-5.6-luna-pro", "openai/gpt-5.6-terra-pro"];
+///
+/// `antigravity-gemini-3.7-flash` was withdrawn upstream with `antigravity-gemini-3.8-flash` as
+/// its named successor; broca follows Fusiform's retirement facts and refuses it by name.
+const RETIRED_BY_DECISION: &[&str] = &[
+    "openai/gpt-5.6-luna-pro",
+    "openai/gpt-5.6-terra-pro",
+    "openai/gpt-6-luna-pro",
+    "openai/gpt-6-luna-fast",
+    "google/antigravity-gemini-3.7-flash",
+];

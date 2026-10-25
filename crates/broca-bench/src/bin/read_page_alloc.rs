@@ -168,6 +168,7 @@ fn snapshot(shape: Shape) -> StorePageSnapshot {
             );
             message.ordinal = Some(ordinal);
             StorePageRow {
+                written_at: None,
                 ordinal,
                 message,
                 run: None,

@@ -51,6 +51,7 @@ async fn a_build_without_steer_queue_refuses_a_steered_session_as_newer_writer()
     wal.append(
         1,
         &WalRecord::Steered {
+            written_at_ms: None,
             tags: None,
             retention: None,
             ts_ms: None,

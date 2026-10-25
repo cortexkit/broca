@@ -142,8 +142,13 @@ impl ProjectionPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedProjection {
+    pub head_json: String,
+    pub message_times: Vec<Option<u64>>,
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
+    /// Every episode's render inputs, in lineage order. Read by a resumed run under an applied
+    /// view, which cannot take them from the discarded transcript.
+    pub episodes: Vec<crate::context::EpisodeRenderProjection>,
     pub expected_watermark: u64,
     pub expected_lineage_id: Option<String>,
     pub reset: bool,
@@ -342,6 +347,34 @@ pub fn plan_projection(
                 _ => None,
             })
             == Some(true);
+    let incremental_seed = seed.clone().filter(|seed| {
+        seed.admission_checkpoint.ownership_complete()
+            && seed.admission_checkpoint.head.is_some()
+            && (!budgeted || crate::budget_replay_seed_is_valid(seed))
+    });
+    let time_placement = incremental_seed
+        .as_ref()
+        .and_then(crate::projection::ControlProjectionState::from_projection_seed)
+        .map(|state| state.placement().clone())
+        .unwrap_or_default();
+    let times = crate::message_times::written_times_with_queued(
+        records
+            .iter()
+            .filter(|frame| {
+                frame.seq <= new_watermark
+                    && incremental_seed
+                        .as_ref()
+                        .is_none_or(|seed| seed.prefix_len == 0 || frame.seq > seed.watermark_seq)
+            })
+            .map(|frame| &frame.record),
+        time_placement,
+        incremental_seed
+            .as_ref()
+            .and_then(|seed| seed.admission_checkpoint.head.as_ref())
+            .map(|head| head.queued_times().clone())
+            .unwrap_or_default(),
+    )
+    .map_err(|_| ProjectionPlanError::InconsistentSnapshot("message time placement failed"))?;
     let (
         truncate_prefix_to,
         new_messages,
@@ -355,13 +388,11 @@ pub fn plan_projection(
         admission_checkpoint,
         episode_spans,
         open_episode_span,
-    ) = if let Some(seed) = seed.filter(|seed| {
+        episode_metadata,
+    ) = if let Some(seed) = incremental_seed {
         // A seed stored before the ownership summary existed (or before it recorded the frozen
         // plan manifest) cannot carry it forward: the summary covers every episode, and the
         // seed's earlier ones are not in this tail.
-        seed.admission_checkpoint.ownership_complete()
-            && (!budgeted || crate::budget_replay_seed_is_valid(seed))
-    }) {
         let tail: Vec<FramedRecord> = records
             .iter()
             .filter(|framed| {
@@ -383,6 +414,11 @@ pub fn plan_projection(
             delta.admission_checkpoint,
             delta.episode_spans,
             delta.open_episode_span,
+            {
+                let mut episodes = seed.earlier_episodes.clone();
+                episodes.extend(delta.open_episode);
+                episodes
+            },
         )
     } else {
         // Legacy or malformed checkpoint metadata asks the caller for a complete WAL read;
@@ -399,6 +435,20 @@ pub fn plan_projection(
         let prefix_state = replay(&up_to)?;
         let (episode_spans, open_episode_span) =
             crate::replay::projected_episode_spans(&prefix_state, 0, None);
+        // The stored span list may start mid-episode, so the opened episode's start is the
+        // episode projection's, not the first span's. A store that never recorded one takes its
+        // coordinates from the seed's own open episode, whose start and frozen config are
+        // durable facts of the run that wrote this prefix.
+        let mut episode_metadata = crate::replay::projected_episode_metadata(&prefix_state);
+        if let (Some(seed), Some(open)) = (seed.as_ref(), episode_metadata.last_mut()) {
+            if seed.projection_episodes.is_none() {
+                if let Some(previous) = seed.open_episode.as_ref() {
+                    open.start = previous.start;
+                    open.first_user = previous.first_user;
+                    open.render_config = previous.render_config.clone();
+                }
+            }
+        }
         let admission_checkpoint = AdmissionCheckpointV1::from_frames(&up_to_frames)?;
         let last_run_id = admission_checkpoint
             .last_episode
@@ -417,6 +467,7 @@ pub fn plan_projection(
             admission_checkpoint,
             episode_spans,
             open_episode_span,
+            episode_metadata,
         )
     };
 
@@ -449,6 +500,9 @@ pub fn plan_projection(
         .iter()
         .map(serde_json::to_string)
         .collect::<Result<Vec<_>, _>>()?;
+    let message_times = (0..new_messages.len())
+        .map(|index| times.get(&(next_ord as u64 + index as u64)).copied())
+        .collect();
     let message_run_json = message_runs
         .iter()
         .map(serde_json::to_string)
@@ -527,8 +581,11 @@ pub fn plan_projection(
     let lineage_id = incoming_lineage_id.or_else(|| expected_lineage_id.clone());
 
     Ok(ProjectionPlan::Write(Box::new(PreparedProjection {
+        message_times,
+        head_json: serde_json::to_string(&admission_checkpoint.head)?,
         episode_spans,
         open_episode_span,
+        episodes: episode_metadata,
         expected_watermark,
         expected_lineage_id,
         reset,

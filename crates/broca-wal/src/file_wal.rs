@@ -2303,6 +2303,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(2),
@@ -2428,6 +2429,7 @@ mod tests {
 
     fn run_started(n: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(n),
@@ -2734,6 +2736,7 @@ mod tests {
     #[cfg(unix)]
     fn large_step(n: u64, text_bytes: usize) -> WalRecord {
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(n),
@@ -3349,6 +3352,7 @@ mod tests {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: StepId(i),

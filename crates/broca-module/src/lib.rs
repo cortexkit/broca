@@ -23,6 +23,7 @@ pub mod retention_withdrawals;
 mod send_fate;
 pub mod serve;
 pub mod session_class;
+mod uploads;
 
 pub use cache::{CacheDeclaration, CacheDeclarer};
 pub use executor::{RunExecutor, RunJob, RunKind, SealedRun, WarmBase, WarmError, WarmJob};

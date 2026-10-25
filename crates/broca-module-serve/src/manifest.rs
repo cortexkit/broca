@@ -133,6 +133,26 @@ pub fn manifest_with_archive(
 pub(crate) fn management_operations() -> Vec<ManagementOperation> {
     vec![
         ManagementOperation {
+            name: "session.upload_begin".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Reserve session-owned attachment staging.".into()),
+        },
+        ManagementOperation {
+            name: "session.upload_append".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Append a bounded chunk to session-owned staging.".into()),
+        },
+        ManagementOperation {
+            name: "session.upload_commit".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Verify and commit a staged upload without admitting a send.".into()),
+        },
+        ManagementOperation {
+            name: "session.upload_status".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Read the state and received count of a staged upload.".into()),
+        },
+        ManagementOperation {
             name: OP_SEND_STATUS.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some("Read the durable fate of a send_id without admitting or delivering work.".into()),

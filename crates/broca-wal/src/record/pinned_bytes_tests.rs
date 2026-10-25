@@ -12,6 +12,32 @@
 
 use super::*;
 
+/// Messages written before durable envelope times retain their original payload and framing.
+#[test]
+fn pre_message_times_records_keep_exact_bytes() {
+    use crate::framing::{
+        encode, FRAMING_VERSION, GATED_FRAMING_VERSION, HEADER_LEN, STEER_QUEUE_FEATURE,
+    };
+    for pinned in include_str!("../../tests/fixtures/before_message_times.jsonl").lines() {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert_ne!(record, WalRecord::Unknown);
+        assert_eq!(serde_json::to_string(&record).unwrap(), pinned);
+        let frame = encode(7, 3, &record).unwrap();
+        if matches!(record, WalRecord::Steered { .. }) {
+            assert_eq!(record.required_features(), &[STEER_QUEUE_FEATURE]);
+            assert_eq!(frame[4], GATED_FRAMING_VERSION);
+            assert_eq!(
+                &frame[HEADER_LEN..],
+                format!(r#"{{"requires":["steer-queue/v1"],"record":{pinned}}}"#).as_bytes()
+            );
+        } else {
+            assert!(record.required_features().is_empty());
+            assert_eq!(frame[4], FRAMING_VERSION);
+            assert_eq!(&frame[HEADER_LEN..], pinned.as_bytes());
+        }
+    }
+}
+
 /// Pre-interrupt `run_finished` records keep their exact bytes and require no reader feature.
 #[test]
 fn pre_interrupt_reason_terminal_bytes_and_features_are_pinned() {

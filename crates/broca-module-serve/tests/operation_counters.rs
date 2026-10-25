@@ -38,6 +38,11 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "session.subscribe",
     // Served only on routes opened for the classifier role, and counted like the others.
     "classify.run",
+    // Staged media uploads, served before any send references them.
+    "session.upload_begin",
+    "session.upload_append",
+    "session.upload_commit",
+    "session.upload_status",
 ];
 
 #[derive(Clone, Debug)]

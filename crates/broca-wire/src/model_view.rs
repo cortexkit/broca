@@ -41,8 +41,8 @@ impl<'de> Deserialize<'de> for WriterReadParams {
 pub struct ModelEntry {
     pub source: EntrySource,
     pub message: broca_protocol::Message,
-    /// The runner tags of a transcript message's parts, as on a transcript page. Absent on a
-    /// replacement entry and on a message of a session admitted before tags existed.
+    /// One row per exposed transcript part, as on a transcript page, with a number only when
+    /// the part has been counted by a tag-rendering session. Absent on a replacement entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<crate::SessionReadTag>,
 }

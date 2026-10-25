@@ -29,6 +29,7 @@ impl RunExecutor for ClosedInboxExecutor {
     ) -> Result<RunSummary, RunError> {
         let run = self.runs.fetch_add(1, Ordering::SeqCst);
         job.writer.record(WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,

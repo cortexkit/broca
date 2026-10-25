@@ -618,6 +618,7 @@ async fn paused_restart_steer_is_transformed_and_retry_is_hookless() {
     wal.append(
         1,
         &WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,

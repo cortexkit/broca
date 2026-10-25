@@ -2370,6 +2370,7 @@ async fn paused_run(provider: &impl Provider, label: &str) -> Vec<broca_wal::Fra
     let dir = broca_test_support::scratch_root().join(label);
     let bind = BindIdentity::new(dir.join("project"), "websocket-auth", label);
     let request = RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -2862,7 +2863,7 @@ async fn websocket_over_age_socket_is_retired_before_the_next_send() {
 }
 
 fn tool_run_request(bind: &BindIdentity) -> RunRequest {
-    RunRequest { directives: None, session_class: None, retention: None,
+    RunRequest { input_written_at_ms: None, directives: None, session_class: None, retention: None,
     on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, title: None,
     project_id: None, principal: None, scope: None, run_id: RunId("ws-run".into()), session: bind.clone(),
     model: ModelHandle::new("openai", "m"),

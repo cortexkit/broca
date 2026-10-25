@@ -8,6 +8,7 @@ repository.workspace = true
 description = "broca as a subc module: the session-lineage coordinator (one actor per session over the durable WAL/lease/store), fan-out + per-subscriber backpressure, and the session.*/run.* serve surface. The coordinator + serve types live here; subc owns the wire mechanics."
 
 [dependencies]
+base64 = "0.22"
 broca-diagnostics = { path = "../broca-diagnostics" }
 broca-memory-relief = { path = "../broca-memory-relief" }
 broca-protocol = { path = "../broca-protocol" }

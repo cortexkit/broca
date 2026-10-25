@@ -328,6 +328,7 @@ data: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"a
 
     fn request(dir: &Path, tools: Vec<Tool>) -> RunRequest {
         RunRequest {
+            input_written_at_ms: None,
             directives: None,
             session_class: None,
             retention: None,

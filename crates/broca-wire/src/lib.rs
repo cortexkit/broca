@@ -291,6 +291,66 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Staging alone is not attachment admission. Refuse upload-bearing sends rather
+/// than silently dropping content: staged bytes are not connected to the send's
+/// model checks or to publication into its session's media store.
+pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String> {
+    if let Some(content) = params.get("content").filter(|value| !value.is_null()) {
+        // A content part is an upload reference and nothing else. A `media` block, or a tool
+        // result with a media part, is refused by the closed decode below anyway; naming the
+        // rule here tells the caller how to send media instead of only that the variant is
+        // unknown.
+        if let Some(index) = content
+            .as_array()
+            .and_then(|parts| parts.iter().position(names_media_inline))
+        {
+            return Err(format!(
+                "content[{index}] names media inline; a message names media only through \
+                 upload references"
+            ));
+        }
+        let parts: Vec<cortexkit_role_llm_runner::attachments::ContentPart> =
+            serde_json::from_value(content.clone())
+                .map_err(|error| format!("invalid content: {error}"))?;
+        if let Some(part) = parts.first() {
+            return Err(format!(
+                "upload {} cannot be sent: attachment admission is unavailable",
+                part.upload_id()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A raw content entry shaped like a stored `media` block, or a stored tool result whose
+/// `parts` output holds a media part.
+fn names_media_inline(part: &serde_json::Value) -> bool {
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some("media") => true,
+        Some("tool_result") => part
+            .pointer("/output/parts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|entry| {
+                    entry.get("kind").and_then(serde_json::Value::as_str) == Some("media")
+                })
+            }),
+        _ => false,
+    }
+}
+
+/// Refuse a caller-supplied transcript (a `session.import`'s `messages`) that names media
+/// directly, as a `media` block or a `Parts` media part. A `MediaRef` enters a WAL record only
+/// from broca's own capture path (an upload commit or a tool capture), which publishes bytes broca
+/// holds; an inline reference holds no bytes and could name an object the session never
+/// captured. The error is `(field, message)`, naming the offending member's path.
+pub fn check_supplied_media(messages: &[broca_protocol::Message]) -> Result<(), (String, String)> {
+    match broca_core::media_provenance::find_supplied_media(messages) {
+        Some(found) => Err((found.path(), found.to_string())),
+        None => Ok(()),
+    }
+}
+
 /// Check every `tools[i].reply` of a `session.send` before anything else reads the send, so a
 /// malformed deadline is refused `invalid_params` naming its exact member
 /// (`tools[0].reply.max_ms`, `tools[1].reply.timeout`, ...) rather than the whole `tools` field,
@@ -1060,6 +1120,8 @@ impl serde::Serialize for CallerBlockRef<'_> {
 /// One message in a `session.read` page.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionReadMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_at: Option<u64>,
     pub ordinal: u64,
     /// Message-coordinate spelling used by consumers for stable message badges.
     pub mid: String,
@@ -1080,8 +1142,8 @@ pub struct SessionReadMessage {
     /// each call's dispatch. Absent on a message with no tool call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<SessionReadToolCall>,
-    /// The message's runner tags: one row per tagged part, in block order. Absent on a message
-    /// of a session admitted before tags existed.
+    /// One row per exposed part, in block order. A row has a number only when that part has
+    /// been counted by a tag-rendering session; legacy and not-yet-counted parts still have keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<SessionReadTag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1117,6 +1179,8 @@ impl Serialize for SessionReadMessage {
         // inline read keeps its exact bytes.
         #[derive(Serialize)]
         struct Wire<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            written_at: Option<u64>,
             ordinal: u64,
             mid: &'a str,
             message: Body<'a>,
@@ -1137,6 +1201,7 @@ impl Serialize for SessionReadMessage {
             part_digests: &'a Option<Vec<cortexkit_role_llm_runner::read::descriptors::PartDigest>>,
         }
         Wire {
+            written_at: self.written_at,
             ordinal: self.ordinal,
             mid: &self.mid,
             message: Body(&self.message, self.described.as_ref()),
@@ -1291,6 +1356,7 @@ pub fn describe_resolved_part(
         message.content.get(index).cloned().into_iter().collect(),
     );
     let mut entry = SessionReadMessage {
+        written_at: None,
         ordinal,
         mid: format!("m{ordinal}"),
         message: single,
@@ -1331,26 +1397,26 @@ fn serialize_run_attribution<S: serde::Serializer>(
 
 pub use cortexkit_role_llm_runner::tags::PartTag as SessionReadTag;
 
-/// The tag rows of `message`, the transcript message at `ordinal`; empty when it has no tags.
+/// One row per exposed part, in content order. A message can be read before its parts are
+/// counted, so missing ledger entries omit only the number, never the stable part key.
 pub fn tag_rows(ordinal: u64, message: &broca_protocol::Message) -> Vec<SessionReadTag> {
     message
-        .part_tags()
-        .map(|tags| {
-            tags.parts
-                .iter()
-                .enumerate()
-                .map(|(index, tag)| {
-                    let part = broca_protocol::tags::part_key(ordinal, index);
-                    match tag {
-                        Some(tag) => {
-                            SessionReadTag::tagged(part, broca_protocol::tags::tag_mark(*tag))
-                        }
-                        None => SessionReadTag::untagged(part),
-                    }
-                })
-                .collect()
+        .content
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let part = broca_protocol::tags::part_key(ordinal, index);
+            match message
+                .part_tags()
+                .and_then(|tags| tags.parts.get(index))
+                .copied()
+                .flatten()
+            {
+                Some(tag) => SessionReadTag::tagged(part, broca_protocol::tags::tag_mark(tag)),
+                None => SessionReadTag::untagged(part),
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The lineage state returned beside a `session.read` page.
@@ -1498,6 +1564,10 @@ pub struct PendingApproval {
 #[cfg(test)]
 #[path = "../tests/support/run_usage.rs"]
 mod usage_compat;
+
+#[cfg(test)]
+#[path = "supplied_media_tests.rs"]
+mod supplied_media_tests;
 
 #[cfg(test)]
 mod approval_wire_tests {
@@ -5504,6 +5574,7 @@ mod caller_message_tests {
 
     fn read_message(content: Vec<ContentBlock>) -> SessionReadMessage {
         SessionReadMessage {
+            written_at: None,
             delivered_as: None,
             tags: Vec::new(),
             ordinal: 3,
@@ -5712,9 +5783,8 @@ mod caller_message_tests {
         assert_eq!(serde_json::to_value(&again).unwrap(), inline);
     }
 
-    /// A read entry carries one tag row per tagged part, after `tool_calls`; the message
-    /// itself keeps the exact bytes it had before tags existed, and an untagged entry has no
-    /// `tags` member at all.
+    /// Part rows sit beside the unchanged message. A complete ledger keeps its byte spelling;
+    /// a missing ledger still exposes the same keys without inventing numbers.
     #[test]
     fn tagged_entries_carry_part_tag_rows_beside_an_unchanged_message() {
         let content = vec![
@@ -5725,17 +5795,20 @@ mod caller_message_tests {
                 text: "second".into(),
             },
         ];
-        let plain = read_message(content.clone());
+        let mut plain = read_message(content.clone());
+        plain.tags = tag_rows(plain.ordinal, &plain.message);
         let mut tagged = read_message(content);
         tagged.message.set_tags(Some(std::sync::Arc::new(
             broca_protocol::tags::PartTags::all([7, 8]),
         )));
         tagged.tags = tag_rows(tagged.ordinal, &tagged.message);
-        assert!(tag_rows(plain.ordinal, &plain.message).is_empty());
 
         let plain_json = serde_json::to_value(&plain).unwrap();
         let tagged_json = serde_json::to_value(&tagged).unwrap();
-        assert!(plain_json.get("tags").is_none());
+        assert_eq!(
+            plain_json["tags"],
+            json!([{"part": "m3#0"}, {"part": "m3#1"}])
+        );
         assert_eq!(tagged_json["message"], plain_json["message"]);
         assert_eq!(
             serde_json::to_string(&tagged).unwrap(),
@@ -5743,6 +5816,36 @@ mod caller_message_tests {
         );
         let decoded: SessionReadMessage = serde_json::from_value(tagged_json).unwrap();
         assert_eq!(decoded.tags, tagged.tags);
+    }
+
+    #[test]
+    fn part_rows_cover_short_ledgers_without_using_surplus_numbers() {
+        let mut entry = read_message(vec![
+            ContentBlock::Text {
+                text: "first".into(),
+            },
+            ContentBlock::Text {
+                text: "second".into(),
+            },
+        ]);
+        for (parts, expected) in [
+            (
+                vec![Some(7)],
+                json!([{"part": "m3#0", "tag": "§7§"}, {"part": "m3#1"}]),
+            ),
+            (
+                vec![Some(7), None, Some(9)],
+                json!([{"part": "m3#0", "tag": "§7§"}, {"part": "m3#1"}]),
+            ),
+        ] {
+            entry.message.set_tags(Some(std::sync::Arc::new(
+                broca_protocol::tags::PartTags::new(parts),
+            )));
+            assert_eq!(
+                serde_json::to_value(tag_rows(entry.ordinal, &entry.message)).unwrap(),
+                expected
+            );
+        }
     }
 
     /// A caller reads the transcript's text, never the provider bytes kept to send back. A
@@ -5788,6 +5891,7 @@ mod caller_message_tests {
         );
         message.cache_prefix_blocks = Some(1);
         let response = SessionReadMessage {
+            written_at: None,
             delivered_as: None,
             tags: Vec::new(),
             ordinal: 0,
@@ -5929,5 +6033,18 @@ mod live_subscribe_tests {
         expected.pop();
         expected.extend_from_slice(br#","seq":13}"#);
         assert_eq!(live, expected);
+    }
+}
+
+#[cfg(test)]
+mod envelope_time_tests {
+    use super::SessionReadMessage;
+
+    #[test]
+    fn untimed_entries_keep_their_pre_addition_bytes() {
+        let pinned = r#"{"ordinal":0,"mid":"m0","message":{"role":"user","content":[{"type":"text","text":"legacy"}]}}"#;
+        let entry: SessionReadMessage = serde_json::from_str(pinned).unwrap();
+        assert_eq!(entry.written_at, None);
+        assert_eq!(serde_json::to_string(&entry).unwrap(), pinned);
     }
 }

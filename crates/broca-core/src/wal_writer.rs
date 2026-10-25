@@ -48,6 +48,11 @@ pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
 /// Opens the per-session WAL (mirrors `LeaseStore`, so the file impl swaps for a
 /// future store without touching the loop).
 pub trait WalStore: Send + Sync {
+    /// File-backed sessions stage uploads beside their WAL trees, never in a
+    /// second host media store. In-memory stores do not offer upload staging.
+    fn uploads(&self) -> Option<crate::media_uploads::Uploads> {
+        None
+    }
     fn backup_classes(&self) -> Vec<String> {
         vec!["head".into()]
     }
@@ -472,6 +477,32 @@ impl FileWalStore {
             broca_wal::WalRangeRecords::Absent => Ok(Vec::new()),
             _ => unreachable!("unanchored read always reports complete records or absence"),
         }
+    }
+
+    pub(crate) fn media_store_class(
+        &self,
+        address: &str,
+    ) -> Result<Option<crate::media_store::MediaStoreClass>, WalError> {
+        use crate::media_store::MediaStoreClass;
+        if let Some(path) = self.resolve_live_address(address)? {
+            return Ok(Some(
+                if path.parent() == Some(self.durable_root().as_path()) {
+                    MediaStoreClass::Durable
+                } else if path.parent() == Some(self.ephemeral_root().as_path()) {
+                    MediaStoreClass::Ephemeral
+                } else {
+                    MediaStoreClass::NonDurable
+                },
+            ));
+        }
+        let archived = self.archived_member_at_address(address)?;
+        Ok(archived.member.map(|_| {
+            if archived.durable {
+                MediaStoreClass::Durable
+            } else {
+                MediaStoreClass::NonDurable
+            }
+        }))
     }
 
     pub fn addresses(&self) -> Result<std::collections::BTreeSet<String>, WalError> {
@@ -1376,6 +1407,9 @@ pub fn session_addr(session: &BindIdentity) -> String {
 }
 
 impl WalStore for FileWalStore {
+    fn uploads(&self) -> Option<crate::media_uploads::Uploads> {
+        self.root.parent().map(crate::media_uploads::Uploads::at)
+    }
     fn open_writer(
         &self,
         session: &BindIdentity,

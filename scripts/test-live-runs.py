@@ -26,7 +26,7 @@ live_runs = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = live_runs
 SPEC.loader.exec_module(live_runs)
 
-EXPECTED_SUITE_ANCHORS = 19
+EXPECTED_SUITE_ANCHORS = 22
 
 # Session logs written by the real runner for a resume close-out: two dispatched calls with no
 # result, the resume's `resume_started` record, an `outcome_unknown` result for each, and the
@@ -176,6 +176,58 @@ class LiveRunsGateTests(unittest.TestCase):
             code, out, err = self.run_main(root, int(time.time()) - 60)
             self.assertEqual(code, 0, err)
             self.assertIn("newer-writer       1  (a newer broca wrote these; 0 since", out)
+
+    def test_a_log_deleted_mid_scan_rescans_instead_of_refusing(self) -> None:
+        # Retention deletes an expired retained log between the listing and the tail read.
+        # That log held no live run, so the gate rescans and decides on what remains.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            wal_dir = root / "wal"
+            wal_dir.mkdir()
+            (wal_dir / "gone.wal").write_bytes(frame(1, STARTED) + frame(2, FINISHED))
+            (wal_dir / "sealed.wal").write_bytes(frame(1, STARTED) + frame(2, FINISHED))
+            real = live_runs.tail_state
+
+            def delete_then_read(path: pathlib.Path) -> str:
+                if path.name == "gone.wal" and path.exists():
+                    path.unlink()
+                return real(path)
+
+            with unittest.mock.patch.object(live_runs, "tail_state", delete_then_read):
+                code, out, err = self.run_main(root, int(time.time()) - 60)
+            self.assertEqual(code, 0, err)
+            self.assertIn("wal files scanned  1", out)
+            self.assertNotIn("cannot compare", err)
+
+    def test_a_log_that_keeps_vanishing_still_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "wal").mkdir()
+            (root / "wal" / "flaky.wal").write_bytes(frame(1, STARTED) + frame(2, FINISHED))
+
+            def always_gone(path: pathlib.Path) -> str:
+                raise live_runs.WalUnreadable(path, FileNotFoundError(2, "gone")) from FileNotFoundError(2, "gone")
+
+            with unittest.mock.patch.object(live_runs, "tail_state", always_gone):
+                code, _out, err = self.run_main(root, int(time.time()) - 60)
+            self.assertEqual(code, 2, err)
+            self.assertIn("cannot compare: cannot read flaky.wal", err)
+
+    def test_an_unreadable_log_that_still_exists_refuses_without_rescanning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "wal").mkdir()
+            (root / "wal" / "locked.wal").write_bytes(frame(1, STARTED))
+            calls = []
+
+            def denied(path: pathlib.Path) -> str:
+                calls.append(path.name)
+                raise live_runs.WalUnreadable(path, PermissionError(13, "denied")) from PermissionError(13, "denied")
+
+            with unittest.mock.patch.object(live_runs, "tail_state", denied):
+                code, _out, err = self.run_main(root, int(time.time()) - 60)
+            self.assertEqual(code, 2, err)
+            self.assertEqual(calls, ["locked.wal"])
 
     def run_main_against_processes(self, pids: list[str]) -> tuple[int, str, str]:
         """Run the gate with no --boot-epoch, so it must find the daemon itself. One WAL

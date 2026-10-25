@@ -8,6 +8,7 @@ const MARKER: &str = "RETENTION-MODULE-CONTENT-SENTINEL-59137";
 #[cfg(any(target_os = "linux", feature = "test-clock"))]
 fn large_expiry_step() -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: broca_protocol::StepId(1),
@@ -220,6 +221,45 @@ struct Rig {
     service: Arc<RetentionService>,
     store: Arc<SqliteStore>,
     leases: Arc<broca_core::FileLeaseStore>,
+}
+
+#[test]
+fn retention_deletion_drops_media_manifest_after_wal_unlink_and_leaves_collection_to_sweep() {
+    let rig = Rig::new();
+    rig.seed(1, 1000, Some(1000));
+    let bytes = b"%PDF-1.7\nretention fixture\n%%EOF";
+    let reference = broca_core::media_validation::validate_media(bytes, "application/pdf").unwrap();
+    let media = broca_core::media_store::MediaStore::open(
+        &rig.root,
+        broca_core::media_store::MediaStoreClass::Ephemeral,
+    )
+    .unwrap();
+    media
+        .session(&rig.key)
+        .unwrap()
+        .register_and_append(&reference, bytes, || Ok(()))
+        .unwrap();
+    let manifest = rig
+        .root
+        .join("media-ephemeral/refs")
+        .join(broca_core::session_addr(&rig.key));
+    assert!(manifest.exists());
+    let _lease = rig.service.lease(&rig.key).unwrap();
+    assert!(rig
+        .service
+        .delete_expired(&rig.key, 2001)
+        .unwrap()
+        .is_some());
+    assert!(!rig.service.wal.ephemeral_wal_path(&rig.key).exists());
+    assert!(!manifest.exists());
+    assert_eq!(media.read_verified(&reference).unwrap(), bytes);
+    drop(_lease);
+    assert_eq!(
+        broca_core::media_store::sweep(&rig.root)
+            .unwrap()
+            .objects_removed,
+        1
+    );
 }
 impl Rig {
     fn new() -> Self {
@@ -1250,6 +1290,7 @@ async fn status_of_expired_large_session_refuses_in_the_status_opener() {
             wal.append(
                 1,
                 &WalRecord::ModelStepFinished {
+                    written_at_ms: None,
                     tags: None,
                     hooks: None,
                     step_id: broca_protocol::StepId(step),
@@ -2426,6 +2467,7 @@ fn seed_owed_question_with_scope_at(
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: broca_protocol::StepId(1),
@@ -3589,6 +3631,7 @@ async fn assert_tight_crash_recovery(open_batch: bool) {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: broca_protocol::StepId(1),
@@ -4192,6 +4235,7 @@ async fn missing_materialized_history_is_not_known_empty_ownership() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: broca_protocol::StepId(1),
@@ -4254,6 +4298,7 @@ async fn zero_record_wal_does_not_hide_materialized_ownership_history() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: broca_protocol::StepId(1),
@@ -4323,6 +4368,7 @@ async fn append_repairs_inferred_prior_terminal_before_refusing_new_admission_at
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: broca_protocol::StepId(1),
@@ -4468,6 +4514,7 @@ async fn cold_forever_status_uses_bounded_wal_without_opening_actor() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: broca_protocol::StepId(1),

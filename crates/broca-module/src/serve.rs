@@ -408,6 +408,7 @@ fn session_read_response(
             .messages
             .into_iter()
             .map(|message| SessionReadMessage {
+                written_at: message.written_at,
                 delivered_as: message
                     .run
                     .as_ref()
@@ -1377,6 +1378,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
 pub enum ServeError {
+    Upload(broca_core::media_uploads::UploadError),
     ContextCeiling(broca_protocol::ContextCeilingDetail),
     UnknownSend,
     SessionMoving {
@@ -1525,6 +1527,7 @@ impl From<OpenError> for ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Upload(error) => error.fmt(f),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
             ServeError::SessionMoving { cut_id } => write!(f, "session is moving under cut {cut_id}"),
             ServeError::SessionMoved { holder } => write!(f, "session moved to {holder}"),
@@ -1607,6 +1610,19 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
+    async fn upload(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        Err(ServeError::InvalidParams {
+            field: "upload_id".into(),
+            message: "uploads unavailable".into(),
+        })
+    }
     fn backup_classes(&self) -> Vec<String> {
         vec!["head".into()]
     }
@@ -1862,6 +1878,15 @@ pub trait ServeHandler: Send + Sync {
             "session.head is unsupported".into(),
             Some(broca_protocol::ErrorClass::Permanent),
         ))
+    }
+
+    async fn head_for(
+        &self,
+        session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+        _scope: &broca_protocol::SendScope,
+    ) -> Result<broca_wire::HeadResponse, ServeError> {
+        self.head(session).await
     }
 
     /// `session.warm` — re-send the session's most recent model request shaped to generate
@@ -2181,6 +2206,17 @@ impl ServeHandler for crate::LineageRegistry {
         let ownership = self.owner_ownership(session).await?;
         broca_core::scope_admission::decide_owner_access(&ownership, principal, scope)
             .map_err(ServeError::ScopeRefused)
+    }
+
+    async fn upload(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ServeError> {
+        crate::uploads::upload(self, session, principal, scope, method, params).await
     }
 
     async fn send(&self, req: SendRequest) -> Result<SendResponse, ServeError> {
@@ -2579,6 +2615,11 @@ impl ServeHandler for crate::LineageRegistry {
 
     async fn import(&self, req: SessionImportRequest) -> Result<SessionImportResponse, ServeError> {
         use crate::actor::ImportOutcome;
+        // Refused before the session is routed or opened, so a transcript naming media inline
+        // writes nothing: a person names media only through upload references.
+        if let Err((field, message)) = broca_wire::check_supplied_media(&req.messages) {
+            return Err(ServeError::InvalidParams { field, message });
+        }
         let request = broca_core::ImportRequest {
             project_id: req.project_id,
             principal: req.principal,
@@ -2603,6 +2644,12 @@ impl ServeHandler for crate::LineageRegistry {
             ImportOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
             ImportOutcome::Error(broca_core::ImportError::ImportIdReuse) => {
                 Err(ServeError::ImportIdReuse)
+            }
+            ImportOutcome::Error(broca_core::ImportError::SuppliedMedia(found)) => {
+                Err(ServeError::InvalidParams {
+                    field: found.path(),
+                    message: found.to_string(),
+                })
             }
             ImportOutcome::Error(error) => Err(ServeError::Import(error.to_string())),
         }
@@ -2798,10 +2845,22 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn head(&self, session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
+        self.head_for(session, None, &broca_protocol::SendScope::default())
+            .await
+    }
+
+    async fn head_for(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+        scope: &broca_protocol::SendScope,
+    ) -> Result<broca_wire::HeadResponse, ServeError> {
         // The newest page of one message: the store's last row and the WAL past its watermark,
         // so the cost follows what is not yet materialized, never the session's length.
         let crate::registry::RouteReadPage {
             page,
+            head_facts,
+            head_facts_complete,
             newest_record_ms,
             retention_activity_ms,
             last_title,
@@ -2814,6 +2873,12 @@ impl ServeHandler for crate::LineageRegistry {
         let Some(lineage_id) = page.lineage_id else {
             return Ok(broca_wire::HeadResponse::default());
         };
+        if !head_facts_complete {
+            return Err(crate::registry::OpenError::Open(
+                "session.head cannot attest metadata from an incomplete WAL suffix".into(),
+            )
+            .into());
+        }
         // Retained sessions report expiry activity; maintenance must not move that clock.
         // Otherwise use the live WAL file's own write time, a stat; else
         // (its WAL was folded into an archive) the newest timestamped record of the read's
@@ -2841,7 +2906,12 @@ impl ServeHandler for crate::LineageRegistry {
         } else {
             None
         };
+        let sender = head_facts.sender(principal, scope, broca_wire::DELIVERY_MODES);
         Ok(broca_wire::HeadResponse {
+            model: head_facts.model,
+            usage: head_facts.usage.filter(|usage| usage.consistent()),
+            sender,
+            incarnation: lineage_id.incarnation(),
             lineage_id: Some(lineage_id.to_string()),
             last_ordinal: page.prompt_len.checked_sub(1),
             first_ordinal: Some(0),

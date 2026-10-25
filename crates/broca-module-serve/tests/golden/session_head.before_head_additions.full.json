@@ -1,0 +1,1 @@
+{"result":{"lineage_id":"@LOG_ID@","last_ordinal":1,"first_ordinal":0,"history_version":0,"head":{"wal_seq":3,"sub_index":0},"last_run_state":{"run_id":"@RUN_ID@","state":"completed","reason":"completed"},"updated_at":"@UPDATED_AT@","input":{"attachments":"no"}}}

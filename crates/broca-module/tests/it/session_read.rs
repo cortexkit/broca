@@ -30,6 +30,8 @@ use tokio::sync::{mpsc, Mutex};
 mod attribution;
 #[path = "session_read/run_usage.rs"]
 mod run_usage;
+#[path = "session_read/tags.rs"]
+mod tags;
 #[path = "session_read/wal_cost.rs"]
 mod wal_cost;
 
@@ -561,6 +563,7 @@ fn req(key: &BindIdentity, run: &str, text: &str) -> RunRequest {
     let tools = vec![tool("lookup")];
     let policy_allowed: HashSet<String> = tools.iter().map(|t| t.name.clone()).collect();
     RunRequest {
+        input_written_at_ms: None,
         directives: None,
         session_class: None,
         retention: None,
@@ -1685,6 +1688,7 @@ fn min_config() -> RunConfig {
 
 fn started(key: &BindIdentity, run: &str, text: &str) -> WalRecord {
     WalRecord::RunStarted {
+        written_at_ms: None,
         tags: None,
         session_class: None,
         retention: None,
@@ -1719,6 +1723,7 @@ fn assistant_text(step: u64, text: &str) -> WalRecord {
 
 fn assistant_text_with_usage(step: u64, text: &str, step_usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        written_at_ms: None,
         tags: None,
         hooks: None,
         step_id: StepId(step),
@@ -2787,6 +2792,7 @@ fn dispatch_module_episode(key: &BindIdentity, run: &str, call: &str) -> Vec<Wal
     vec![
         started(key, run, &format!("{run} question")),
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(0),
@@ -2924,6 +2930,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
     let batch_id = BatchId("batch-1".into());
     let records = vec![
         WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -2953,6 +2960,7 @@ async fn read_falls_back_when_budget_config_is_only_in_materialized_prefix() {
             submission_id: None,
         },
         WalRecord::ModelStepFinished {
+            written_at_ms: None,
             tags: None,
             hooks: None,
             step_id: StepId(0),
@@ -3262,6 +3270,7 @@ async fn read_lineage_state_paused_and_active_with_open_dispatch() {
         &[
             started(&active, "run-active", "open"),
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(0),
@@ -3363,6 +3372,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
         &key,
         &[
             WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -3392,6 +3402,7 @@ async fn read_falls_back_for_a_budget_firing_in_a_later_unprojected_episode() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                written_at_ms: None,
                 tags: None,
                 hooks: None,
                 step_id: StepId(0),
@@ -3498,6 +3509,7 @@ async fn torn_import_is_publicly_interrupted_for_read_and_run_status() {
         &rig.wal_store,
         &key,
         &[WalRecord::RunStarted {
+            written_at_ms: None,
             tags: None,
             session_class: None,
             retention: None,
@@ -3952,6 +3964,36 @@ async fn two_episode_read_response_bytes_are_pinned() {
     assert_eq!(bytes, two_episode_pinned_bytes());
 }
 
+/// Pin both no-media read modes to fixed bytes so a runner contract update cannot change
+/// caller-visible messages, content identities or the surrounding page unnoticed.
+#[tokio::test]
+async fn no_media_inline_and_descriptors_response_bytes_are_pinned() {
+    let rig = Rig::new("no-media-read-pin", Arc::new(NoopExec));
+    let key = rig.key("pinned");
+    write_legacy_seed(&rig.wal_store, &key, &two_episode_tool_seed(&key));
+
+    for (media, fixture) in [
+        (
+            cortexkit_role_llm_runner::read::MediaMode::Inline,
+            two_episode_golden_path(),
+        ),
+        (
+            cortexkit_role_llm_runner::read::MediaMode::Descriptors,
+            two_episode_golden_path().with_file_name("session_read.two_episode.descriptors.json"),
+        ),
+    ] {
+        let mut request = read_request(&key, Some(0), Some(10));
+        request.media = media;
+        let page = rig.registry.read(request).await.expect("session.read");
+        let bytes = serde_json::to_string(&page).expect("serialize session.read response");
+        if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+            std::fs::write(&fixture, format!("{bytes}\n")).unwrap();
+        }
+        let pinned = std::fs::read_to_string(&fixture).unwrap();
+        assert_eq!(bytes, pinned.trim_end_matches('\n'), "{media:?}");
+    }
+}
+
 /// The pinned response with the latest episode's tools appended: the opt-in adds exactly the
 /// two tool fields and changes nothing else about the page.
 fn pinned_bytes_with_latest_tools() -> String {
@@ -4104,6 +4146,7 @@ async fn session_read_renders_a_steered_message_at_its_wal_position() {
     let rig = Rig::new("steered-read", Arc::new(NoopExec));
     let key = rig.key("steered");
     let steered = WalRecord::Steered {
+        written_at_ms: None,
         tags: None,
         retention: None,
         ts_ms: None,

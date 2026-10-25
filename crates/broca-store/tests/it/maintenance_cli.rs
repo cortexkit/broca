@@ -34,6 +34,7 @@ fn import_records(session: &BindIdentity) -> Vec<FramedRecord> {
             seq: 1,
             fence: 1,
             record: WalRecord::RunStarted {
+                written_at_ms: None,
                 tags: None,
                 session_class: None,
                 retention: None,
@@ -1028,4 +1029,51 @@ fn wal_manifest_mapping_bytes_ignore_project_observations() {
     assert_eq!(observed.contents.as_bytes(), absent.contents.as_bytes());
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn media_sweep_reclaims_uploads_only_in_write_mode_and_fails_closed() {
+    let root = state_root("upload-sweep");
+    broca_core::media_store::create_media_directories(&root).unwrap();
+    let uploads = broca_core::media_uploads::Uploads::at(&root);
+    let owner = session(&root, "uploads");
+    let request = serde_json::from_value(serde_json::json!({"mime":"application/pdf","bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"})).unwrap();
+    let abandoned = uploads.begin(&owner, &request, 0).unwrap().upload_id;
+    let expired = uploads.begin(&owner, &request, 0).unwrap().upload_id;
+    uploads.commit(&owner, &expired, 0).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let fresh = uploads.begin(&owner, &request, now).unwrap().upload_id;
+    uploads.commit(&owner, &fresh, now).unwrap();
+    let invoke = |write: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_store-maintenance"));
+        command.arg("media-sweep").arg(&root);
+        if write {
+            command.arg("--write");
+        }
+        command.output().unwrap()
+    };
+    let preview = invoke(false);
+    assert!(preview.status.success(), "{:?}", preview);
+    assert!(stdout(&preview).contains("uploads_removed 2"));
+    for id in [&abandoned, &expired, &fresh] {
+        assert!(root.join("media-uploads/objects").join(id).exists());
+    }
+    let applied = invoke(true);
+    assert!(applied.status.success(), "{:?}", applied);
+    assert!(stdout(&applied).contains("uploads_removed 2"));
+    for id in [&abandoned, &expired] {
+        assert!(!root.join("media-uploads/objects").join(id).exists());
+    }
+    assert!(root.join("media-uploads/objects").join(&fresh).exists());
+    let retained = uploads.begin(&owner, &request, 0).unwrap().upload_id;
+    std::fs::write(root.join("media-uploads/refs/broken"), b"bad metadata").unwrap();
+    let refused = invoke(true);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("upload sweep failed"));
+    for id in [&retained, &fresh] {
+        assert!(root.join("media-uploads/objects").join(id).exists());
+    }
 }

@@ -426,6 +426,12 @@ def _members(path: pathlib.Path) -> list[ArchivedWal]:
         raise ArchiveRefusal(f"{path}: {error}") from error
 
 
+# A retained session's log can be deleted by retention between the directory listing and the
+# read that verifies it. Rescanning sees the population as it now stands; a log that is gone
+# held no live run, because retention never deletes a session that is running.
+RESCANS_ON_VANISHED_WAL = 3
+
+
 @overload
 def logical_wals(wal_dir: pathlib.Path, *, include_archives: Literal[False]) -> list[pathlib.Path]: ...
 
@@ -439,6 +445,18 @@ def logical_wals(wal_dir: pathlib.Path, *, include_archives: bool) -> list[pathl
 
 
 def logical_wals(wal_dir: pathlib.Path, *, include_archives: bool = True):
+    """Resolve all live trees, then select the newest archived snapshot. A log that vanishes
+    mid-scan triggers a full rescan, up to RESCANS_ON_VANISHED_WAL times, before refusing."""
+    for attempt in range(RESCANS_ON_VANISHED_WAL + 1):
+        try:
+            return _logical_wals_once(wal_dir, include_archives=include_archives)
+        except ArchiveRefusal as refusal:
+            vanished = isinstance(refusal.__cause__, FileNotFoundError)
+            if not vanished or attempt == RESCANS_ON_VANISHED_WAL:
+                raise
+
+
+def _logical_wals_once(wal_dir: pathlib.Path, *, include_archives: bool):
     """Resolve all live trees, then select the newest archived snapshot.
 
     Only .wal inputs are considered, never .expired/ children or .deleting files.

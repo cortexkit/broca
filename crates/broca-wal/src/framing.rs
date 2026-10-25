@@ -52,6 +52,10 @@ pub struct FramedRecord {
 pub struct WalLineageId([u8; 16]);
 
 impl WalLineageId {
+    /// Only a UUID v4 header supplies the non-repeating identity exposed as `session.head.incarnation`.
+    pub fn incarnation(self) -> Option<String> {
+        (self.0[6] >> 4 == 4 && self.0[8] >> 6 == 2).then(|| self.to_string())
+    }
     pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
@@ -218,6 +222,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
     TOOL_REPLY_FEATURE,
     TOOL_TIMES_FEATURE,
+    MESSAGE_TIMES_FEATURE,
 ];
 
 /// Google RPC quota details on a stored provider error must not be silently discarded on read.
@@ -339,6 +344,9 @@ pub const TOOL_REPLY_FEATURE: &str = "tool-reply/v1";
 /// Preserve the tool timestamps subscriptions replay after a restart; older readers refuse
 /// these frames rather than silently discarding the observations.
 pub const TOOL_TIMES_FEATURE: &str = "tool-times/v1";
+
+/// Preserve read-entry times across rollback; dropping them would change an already served entry.
+pub const MESSAGE_TIMES_FEATURE: &str = "message-times/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -802,6 +810,68 @@ mod provider_held_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn message_times_require_an_understanding_reader() {
+        use super::*;
+        let old = include_str!("../tests/fixtures/before_message_times.jsonl");
+        let known: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|feature| *feature != MESSAGE_TIMES_FEATURE)
+            .collect();
+        for line in old.lines().take(3) {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            value["written_at_ms"] = serde_json::json!(42);
+            let record: WalRecord = serde_json::from_value(value).unwrap();
+            assert!(record.required_features().contains(&MESSAGE_TIMES_FEATURE));
+            let bytes = encode(1, 1, &record).unwrap();
+            assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
+            match decode_next_with(&bytes, &known) {
+                DecodeStep::NewerWriter { missing, .. } => {
+                    assert_eq!(missing, vec![MESSAGE_TIMES_FEATURE])
+                }
+                _ => panic!("a reader without message times must refuse the complete frame"),
+            }
+        }
+    }
+
+    #[test]
+    fn message_times_compose_with_existing_admission_features() {
+        use super::*;
+        let mut value: serde_json::Value = serde_json::from_str(
+            include_str!("../tests/fixtures/before_message_times.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        value["written_at_ms"] = serde_json::json!(42);
+        value["session_class"] = serde_json::json!("head");
+        value["config"]["budget"] = serde_json::json!({"max_input_tokens":5});
+        let record: WalRecord = serde_json::from_value(value).unwrap();
+        for feature in [
+            MESSAGE_TIMES_FEATURE,
+            SESSION_CLASS_FEATURE,
+            INPUT_TOKEN_CAP_FEATURE,
+        ] {
+            assert!(record.required_features().contains(&feature));
+        }
+        assert!(matches!(
+            decode_next(&encode(1, 1, &record).unwrap()),
+            DecodeStep::Record { .. }
+        ));
+    }
+
+    #[test]
+    fn incarnation_requires_a_uuid_v4_header() {
+        use super::*;
+        assert!(WalLineageId::from_bytes([0; 16]).incarnation().is_none());
+        let mut bytes = [1; 16];
+        bytes[6] = 0x41;
+        bytes[8] = 0x81;
+        let id = WalLineageId::from_bytes(bytes);
+        assert_eq!(id.incarnation(), Some(id.to_string()));
+    }
     use super::*;
     use broca_protocol::StepId;
 
@@ -1019,9 +1089,11 @@ mod tests {
                 STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
                 TOOL_REPLY_FEATURE,
                 TOOL_TIMES_FEATURE,
+                MESSAGE_TIMES_FEATURE,
             ]
         );
         assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
+        assert_eq!(MESSAGE_TIMES_FEATURE, "message-times/v1");
         assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");
         assert_eq!(RUNNER_TAGS_V2_FEATURE, "runner-tags/v2");
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
