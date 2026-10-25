@@ -717,6 +717,126 @@ async fn retention_sync_before_the_first_run_is_a_quiet_no_op_on_a_fresh_state_r
     fixture.close().await;
 }
 
+/// The actor-start sync no longer writes a session sidecar before the first RunStarted, so a
+/// retained session's sidecar and index row are first written by the sync that follows
+/// admission. A crash between the retained RunStarted append and that sync leaves a retained
+/// WAL with neither, and the writer's in-memory change hints die with the process. Boot
+/// recovery must still find the WAL by walking the ephemeral root, rediscover its session from
+/// the WAL itself, and give it its deadline once its interrupted run is sealed.
+#[tokio::test]
+async fn retained_first_send_cut_before_its_index_sync_is_recovered_at_boot() {
+    let mut fixture = Fixture::with_placement(false, true, false).await;
+    let service = fixture.actor.registry.retention_service().unwrap();
+    let key = fixture.actor.key.clone();
+    let sidecar = service
+        .wal
+        .ephemeral_wal_path(&key)
+        .with_extension("session");
+    // Production state roots already hold retained logs, so the ephemeral root exists and the
+    // removed actor-start sidecar write would have succeeded there.
+    std::fs::create_dir_all(service.wal.ephemeral_root()).unwrap();
+    fixture.actor.sync_retention_index().await.unwrap();
+    assert!(!sidecar.exists(), "actor start writes no sidecar");
+
+    // Admission's durable step: the retained first RunStarted, which moves the WAL under
+    // the ephemeral root. The process then dies before the post-admission index sync.
+    let request = fixture.request.clone();
+    let writer = fixture.actor.writer.as_ref().unwrap().clone();
+    let digest = send_identity_digest(&request, broca_protocol::Delivery::Queue, None);
+    writer
+        .record(WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: Some(3600),
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: Some("first".into()),
+            request_identity_digest: Some(digest),
+            project_id: None,
+            principal: None,
+            ts_ms: Some(1000),
+            run_id: RunId("first".into()),
+            session: key.clone(),
+            config: Box::new(min_config()),
+            input: request.input.clone().into(),
+            origin: broca_wal::RunOrigin::Fresh,
+            submission_id: None,
+        })
+        .into_result()
+        .unwrap();
+    writer.sync().await.unwrap();
+    drop(writer);
+    fixture.actor.shutdown_writer().await;
+    drop(fixture.actor.lease.take());
+    assert!(
+        service.wal.ephemeral_wal_path(&key).exists(),
+        "the WAL is retained"
+    );
+    assert!(!sidecar.exists(), "the cut leaves no sidecar");
+    assert!(
+        service.index.live(&key).unwrap().is_none(),
+        "the cut leaves no index row"
+    );
+
+    // A restarted process: same durable state, but a new WAL store, so no writer hints.
+    let restart = || {
+        crate::retention::RetentionService::new(
+            Arc::new(FileWalStore::new(fixture.root.join("wal"))),
+            service.index.clone(),
+            Arc::new(FileLeaseStore::new(fixture.root.join("leases"))),
+            Arc::new(broca_store::SqliteStore::open_in_memory().unwrap()),
+            Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 1)),
+        )
+        .unwrap()
+    };
+    let booted = restart();
+    assert_eq!(booted.wal.take_retention_changes(), (vec![], false));
+    assert_eq!(booted.recover_enrollment().unwrap(), 1);
+    let row = service
+        .index
+        .live(&key)
+        .unwrap()
+        .expect("boot recovery finds the WAL");
+    assert_eq!(row.retention_s, 3600);
+    assert_eq!(
+        row.expires_at_ms, None,
+        "an unfinished run has no deadline yet"
+    );
+    assert!(sidecar.exists(), "recovery rewrites the sidecar");
+
+    // Boot's crash-orphan seal finishes the interrupted run. It is appended through yet
+    // another store so it nominates nothing to the next boot's service either.
+    let mut sealed = FileWalStore::new(fixture.root.join("wal"))
+        .open(&key)
+        .unwrap();
+    sealed
+        .append(
+            1,
+            &WalRecord::RunFinished {
+                interrupt_reason: None,
+                reason: broca_protocol::RunFinishReason::Interrupted,
+                ts_ms: Some(2000),
+                usage: Default::default(),
+                error: None,
+                retries_used: 0,
+            },
+            true,
+        )
+        .unwrap();
+    drop(sealed);
+    let rebooted = restart();
+    assert_eq!(rebooted.recover_enrollment().unwrap(), 1);
+    let row = service.index.live(&key).unwrap().unwrap();
+    assert_eq!(row.expires_at_ms, Some(2000 + 3600 * 1000));
+    fixture.close().await;
+}
+
 #[test]
 fn retention_warning_errors_keep_their_reason_and_drop_paths() {
     assert_eq!(
