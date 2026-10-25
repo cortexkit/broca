@@ -198,6 +198,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     MEDIA_CONTENT_FEATURE,
     OPENROUTER_REASONING_FEATURE,
     PLAN_MANIFEST_FEATURE,
+    PLAN_REFERENCE_SLOTS_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
@@ -215,6 +216,12 @@ pub const KNOWN_FEATURES: &[&str] = &[
     TOOL_TIMES_FEATURE,
     MESSAGE_TIMES_FEATURE,
 ];
+
+/// A plan manifest that froze a provider's catalog reference slots (`FetchOutcome::Answered`'s
+/// `reference_slots`): the arguments output references are read from (llm-runner §9.13). A
+/// reader without it would decode the manifest without the slots and write later episodes'
+/// `RunStarted` records without them, so it must refuse the WAL instead.
+pub const PLAN_REFERENCE_SLOTS_FEATURE: &str = "plan-reference-slots/v1";
 
 /// Google RPC quota details on a stored provider error must not be silently discarded on read.
 pub const GOOGLE_RPC_ERROR_DETAILS_FEATURE: &str = "google-rpc-error-details/v1";
@@ -1063,6 +1070,7 @@ mod tests {
                 MEDIA_CONTENT_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
                 PLAN_MANIFEST_FEATURE,
+                PLAN_REFERENCE_SLOTS_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
@@ -1091,6 +1099,7 @@ mod tests {
         assert_eq!(DEFERRED_CALL_FEATURE, "deferred-call/v1");
         assert_eq!(DISPATCH_MODULE_FEATURE, "dispatch-module/v1");
         assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
+        assert_eq!(PLAN_REFERENCE_SLOTS_FEATURE, "plan-reference-slots/v1");
         assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
         assert_eq!(CHATGPT_CODEX_WIRE_FEATURE, "chatgpt-codex-wire/v1");
         assert_eq!(OPENROUTER_REASONING_FEATURE, "openrouter-reasoning/v1");

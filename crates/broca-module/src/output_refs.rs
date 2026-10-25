@@ -777,14 +777,67 @@ pub async fn read<H: ServeHandler + ?Sized>(
     Ok(Ok(reply))
 }
 
-/// The tool calls of `entry` whose arguments are scanned for references. None yet: scanning a
-/// call needs its provider's catalog reference slots frozen at admission, which no manifest
-/// holds yet, so every message has its reply set only.
+/// The tool calls of `entry` whose arguments are scanned for references: each call of a tool
+/// whose provider's plan item opted into output references and whose catalog declared reference
+/// slots, as the session's manifest froze them at admission (admission freezes slots only for
+/// an opted-in provider). A tool declared on a send has no plan item or catalog, so it is never
+/// scanned.
 fn call_scans(
-    _entry: &SessionReadMessage,
-    _manifest: Option<&broca_wal::PlanManifest>,
+    entry: &SessionReadMessage,
+    manifest: Option<&broca_wal::PlanManifest>,
 ) -> Vec<CallScan> {
-    Vec::new()
+    let Some(manifest) = manifest else {
+        return Vec::new();
+    };
+    let slots_of = |tool: &str| -> Option<Vec<ReferenceSlot>> {
+        let provider = manifest
+            .tools
+            .iter()
+            .find(|frozen| frozen.name == tool)?
+            .module
+            .as_deref()?;
+        let fetch = manifest
+            .fetches
+            .iter()
+            .find(|fetch| fetch.provider == provider)?;
+        let broca_wal::FetchOutcome::Answered {
+            reference_slots: Some(slots),
+            ..
+        } = &fetch.outcome
+        else {
+            return None;
+        };
+        let slots: Vec<_> = slots
+            .get(tool)?
+            .iter()
+            .map(|slot| ReferenceSlot::new(&slot.name, &slot.kind))
+            .collect();
+        (!slots.is_empty()).then_some(slots)
+    };
+    entry
+        .message
+        .content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            let ContentBlock::ToolCall(call) = block else {
+                return None;
+            };
+            let slots = slots_of(&call.tool_name)?;
+            let id = call.tool_call_id.0.clone();
+            Some(CallScan {
+                index,
+                call_key: entry
+                    .tool_calls
+                    .iter()
+                    .find(|dispatch| dispatch.tool_call_id == id)
+                    .and_then(|dispatch| dispatch.call_key.clone()),
+                tool_call_id: id,
+                arguments: call.input.clone(),
+                slots,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

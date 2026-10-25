@@ -133,6 +133,7 @@ pub(super) fn frozen(
                 tools: vec![tool()].into(),
                 text: None,
                 reply: None,
+                reference_slots: None,
                 result_ops: permissions.map(|ops| {
                     [("edit".into(), ops.into_iter().map(str::to_owned).collect())]
                         .into_iter()

@@ -61,6 +61,14 @@ impl OpaqueJson {
     }
 }
 
+/// One reference slot a catalog tool declared, as frozen: the argument's top-level name and its
+/// kind (`token`, or `source:<dialect>`). Kinds stay open strings, as the catalog sends them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenReferenceSlot {
+    pub name: String,
+    pub kind: String,
+}
+
 /// What one provider's fetch at admission came back with.
 ///
 /// An answered fetch with no `text` (no system-text item was asked of the provider), one whose
@@ -86,6 +94,13 @@ pub enum FetchOutcome {
         /// Reply deadlines by tool name, frozen only when the provider declares them.
         /// Absent keeps manifests from providers without deadlines byte-compatible.
         reply: Option<BTreeMap<String, FrozenReply>>,
+        /// The catalog's reference slots by tool name: the top-level string arguments in which
+        /// output references are read (llm-runner §9.13). Frozen only when the provider's plan
+        /// item opts into output references and one of its tools declares slots; absent
+        /// otherwise, which keeps every other manifest's bytes. Must-understand (feature
+        /// `plan-reference-slots/v1`): a reader that dropped it would re-freeze later episodes
+        /// without the slots.
+        reference_slots: Option<BTreeMap<String, Vec<FrozenReferenceSlot>>>,
     },
     /// An optional tool or system-text provider that gave no usable answer, so the session was
     /// admitted without it. Written as `"absent": "<reason>"`. The reason is an open string
@@ -128,6 +143,8 @@ struct ProviderFetchOut<'a> {
     result_ops: Option<&'a BTreeMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply: Option<&'a BTreeMap<String, FrozenReply>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_slots: Option<&'a BTreeMap<String, Vec<FrozenReferenceSlot>>>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +162,8 @@ struct ProviderFetchIn {
     result_ops: Option<BTreeMap<String, Vec<String>>>,
     #[serde(default)]
     reply: Option<BTreeMap<String, FrozenReply>>,
+    #[serde(default)]
+    reference_slots: Option<BTreeMap<String, Vec<FrozenReferenceSlot>>>,
 }
 
 impl Serialize for ProviderFetch {
@@ -157,6 +176,7 @@ impl Serialize for ProviderFetch {
             absent: None,
             result_ops: None,
             reply: None,
+            reference_slots: None,
         };
         match &self.outcome {
             FetchOutcome::Answered {
@@ -165,12 +185,14 @@ impl Serialize for ProviderFetch {
                 text,
                 result_ops,
                 reply,
+                reference_slots,
             } => {
                 out.catalog_digest = Some(catalog_digest);
                 out.tools = Some(tools.as_slice());
                 out.text = text.as_deref();
                 out.result_ops = result_ops.as_ref();
                 out.reply = reply.as_ref();
+                out.reference_slots = reference_slots.as_ref();
             }
             FetchOutcome::Absent { reason } => out.absent = Some(reason),
             FetchOutcome::Unknown => {
@@ -195,6 +217,7 @@ impl<'de> Deserialize<'de> for ProviderFetch {
                 text: fetch.text,
                 result_ops: fetch.result_ops,
                 reply: fetch.reply,
+                reference_slots: fetch.reference_slots,
             },
             (None, Some(reason)) => {
                 if fetch.tools.is_some() || fetch.text.is_some() {
@@ -278,6 +301,48 @@ mod tests {
         assert_eq!(serde_json::to_string(&record).unwrap(), bytes);
     }
 
+    /// Frozen reference slots round-trip through a whole `RunStarted`, written after `reply`,
+    /// and make the record require `plan-reference-slots/v1`; the fixture without them requires
+    /// no such feature.
+    #[test]
+    fn frozen_reference_slots_round_trip_and_are_must_understand() {
+        let mut record: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
+        assert!(!record
+            .required_features()
+            .contains(&crate::framing::PLAN_REFERENCE_SLOTS_FEATURE));
+        let WalRecord::RunStarted {
+            manifest: Some(manifest),
+            ..
+        } = &mut record
+        else {
+            panic!("fixture must carry a manifest")
+        };
+        let FetchOutcome::Answered {
+            reference_slots, ..
+        } = &mut manifest.fetches[0].outcome
+        else {
+            panic!("fixture must carry an answered fetch")
+        };
+        *reference_slots = Some(
+            [(
+                "read".into(),
+                vec![FrozenReferenceSlot {
+                    name: "data".into(),
+                    kind: "token".into(),
+                }],
+            )]
+            .into(),
+        );
+        let bytes = serde_json::to_string(&record).unwrap();
+        assert!(bytes.contains(r#""reference_slots":{"read":[{"name":"data","kind":"token"}]}"#));
+        let decoded: WalRecord = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), bytes);
+        assert!(record
+            .required_features()
+            .contains(&crate::framing::PLAN_REFERENCE_SLOTS_FEATURE));
+    }
+
     #[test]
     fn frozen_reply_round_trips_through_wal_record() {
         let mut record: WalRecord = serde_json::from_str(FIXTURE.trim_end()).unwrap();
@@ -359,6 +424,7 @@ mod tests {
             text: text.map(str::to_owned),
             result_ops: None,
             reply: None,
+            reference_slots: None,
         }
     }
 
@@ -370,6 +436,7 @@ mod tests {
                 text,
                 result_ops,
                 reply,
+                reference_slots,
                 ..
             } => FetchOutcome::Answered {
                 catalog_digest: String::new(),
@@ -377,6 +444,7 @@ mod tests {
                 text: text.clone(),
                 result_ops: result_ops.clone(),
                 reply: reply.clone(),
+                reference_slots: reference_slots.clone(),
             },
             other => other.clone(),
         }

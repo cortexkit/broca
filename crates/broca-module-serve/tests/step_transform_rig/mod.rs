@@ -345,6 +345,7 @@ pub fn frozen(state: &State) -> Arc<broca_wal::PlanManifest> {
             provider: MODULE.into(),
             outcome: broca_wal::FetchOutcome::Answered {
                 reply: None,
+                reference_slots: None,
                 catalog_digest: "catalog".into(),
                 tools: vec![tool].into(),
                 text: None,

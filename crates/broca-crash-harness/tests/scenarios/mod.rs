@@ -418,6 +418,7 @@ pub fn planned_manifest() -> broca_wal::PlanManifest {
                 text: Some(PLANNED_TEXT.into()),
                 result_ops: None,
                 reply: None,
+                reference_slots: None,
             },
         }],
         tools,

@@ -539,3 +539,190 @@ async fn the_view_in_effect_is_the_last_one_applied_before_the_writing_step() {
     );
     rig.finish().await;
 }
+
+/// A plan whose `work` provider opts into output references freezes its catalog's reference
+/// slots (feature `plan-reference-slots/v1`), and a call of that tool gets its own set: only
+/// declared string slots are scanned, a `token` slot must be exactly one reference, a
+/// `source:` slot is scanned as a program (a reference inside a string literal is none), and
+/// other arguments are never read. The set's descriptor names the containing call's key.
+#[tokio::test]
+async fn an_opted_in_call_scans_only_its_declared_slots() {
+    let (mut rig, admitter) = plan_rig("refs-call-slots").await;
+    admitter.admit_output_refs();
+    admitter.answer_reference_slots(json!([
+        {"name": "data", "kind": "token"},
+        {"name": "program", "kind": "source:rich-ui/1"},
+    ]));
+    rig.script.push(&[
+        Step::Call("call-1"),
+        Step::Usage {
+            content: vec![
+                broca_protocol::content::ContentBlock::Text {
+                    text: "see $$tc(2)".into(),
+                },
+                broca_protocol::content::ContentBlock::ToolCall(broca_protocol::ToolCall {
+                    tool_call_id: broca_protocol::ToolCallId("call-2".into()),
+                    tool_name: "work".into(),
+                    input: json!({
+                        "data": "extra $$tc(2)",
+                        "program": "export const x = $$tc(2)\nexport const y = \"$$tc(2)\"",
+                        "other": "$$tc(2)",
+                    }),
+                    thought_signature: None,
+                }),
+            ],
+            usage: Default::default(),
+        },
+        Step::Text("done"),
+    ]);
+    let run_id = send_plan(
+        &mut rig,
+        "turn-1",
+        "hi",
+        &tagged_plan(json!({"output_refs": true})),
+    )
+    .await;
+    let records = rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let started = records
+        .iter()
+        .find(|record| matches!(record, WalRecord::RunStarted { .. }))
+        .unwrap();
+    assert!(
+        started
+            .required_features()
+            .contains(&broca_wal::PLAN_REFERENCE_SLOTS_FEATURE),
+        "frozen slots are must-understand"
+    );
+    let WalRecord::RunStarted {
+        manifest: Some(manifest),
+        ..
+    } = started
+    else {
+        panic!("the plan froze a manifest")
+    };
+    let broca_wal::FetchOutcome::Answered {
+        reference_slots: Some(slots),
+        ..
+    } = &manifest.fetches[0].outcome
+    else {
+        panic!("the opted-in provider's slots are frozen")
+    };
+    assert_eq!(
+        serde_json::to_value(slots).unwrap(),
+        json!({"work": [{"name": "data", "kind": "token"},
+                        {"name": "program", "kind": "source:rich-ui/1"}]})
+    );
+
+    let head = rig
+        .request(7, json!({"method": "session.head", "params": {}}))
+        .await;
+    let lineage = result(&head)["lineage_id"].as_str().unwrap().to_owned();
+    let reply = call(
+        &mut rig,
+        7,
+        "session.output_refs",
+        json!({"set_id": format!("{lineage}/m3")}),
+    )
+    .await;
+    let reply = result(&reply)["records"].clone();
+    assert_eq!(reply.as_array().unwrap().len(), 1, "{reply}");
+    assert_eq!(reply[0]["state"], "resolved");
+
+    let set = format!("{lineage}/m3/c1");
+    let page = call(&mut rig, 7, "session.output_refs", json!({"set_id": set})).await;
+    let records = result(&page)["records"].clone();
+    assert_eq!(records.as_array().unwrap().len(), 2, "{records}");
+    assert_eq!(records[0]["reason"], "not_a_reference");
+    assert_eq!(records[0]["tag"], Value::Null);
+    assert_eq!(records[1]["state"], "resolved");
+    assert_eq!(records[1]["tag"], "2");
+    assert_eq!(records[1]["part"], "m2#0");
+    check_golden(
+        &normalized(&page.body, &run_id, &lineage),
+        "output_refs.call_set.page.json",
+    );
+    let read = call(
+        &mut rig,
+        7,
+        "session.output_ref_read",
+        json!({"ref_id": format!("{set}/r1"), "offset": 0, "length": 6}),
+    )
+    .await;
+    assert_eq!(result(&read)["data"], "d29ya2Vk");
+
+    let sets = broca_module::output_refs::message_output_refs(
+        rig.registry().as_ref(),
+        &rig.session,
+        3,
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the message has sets")
+    .1;
+    assert_eq!(sets.calls.len(), 1);
+    let (id, call_set) = &sets.calls[0];
+    assert_eq!(id, "call-2");
+    assert_eq!(call_set.descriptor.set_id, set);
+    let dispatched = call(&mut rig, 7, "session.read", json!({"from_ordinal": 3})).await;
+    assert_eq!(
+        call_set.descriptor.call_key.as_deref(),
+        result(&dispatched)["messages"][0]["tool_calls"][0]["call_key"].as_str(),
+        "the descriptor names the containing call"
+    );
+    rig.finish().await;
+}
+
+/// A plan item that does not opt in leaves its provider's calls unscanned: no call set exists.
+#[tokio::test]
+async fn a_call_without_opt_in_has_no_set() {
+    let (mut rig, admitter) = plan_rig("refs-call-no-opt-in").await;
+    admitter.admit_output_refs();
+    admitter.answer_reference_slots(json!([{"name": "data", "kind": "token"}]));
+    rig.script.push(&[
+        Step::Call("call-1"),
+        Step::Usage {
+            content: vec![broca_protocol::content::ContentBlock::ToolCall(
+                broca_protocol::ToolCall {
+                    tool_call_id: broca_protocol::ToolCallId("call-2".into()),
+                    tool_name: "work".into(),
+                    input: json!({"data": "$$tc(2)"}),
+                    thought_signature: None,
+                },
+            )],
+            usage: Default::default(),
+        },
+        Step::Text("done"),
+    ]);
+    send_plan(
+        &mut rig,
+        "turn-1",
+        "hi",
+        &tagged_plan(json!({"output_refs": false})),
+    )
+    .await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let head = rig
+        .request(7, json!({"method": "session.head", "params": {}}))
+        .await;
+    let lineage = result(&head)["lineage_id"].as_str().unwrap().to_owned();
+    let frame = call(
+        &mut rig,
+        7,
+        "session.output_refs",
+        json!({"set_id": format!("{lineage}/m3/c0")}),
+    )
+    .await;
+    assert_eq!(refusal(&frame)["code"], "unknown_ref");
+    let reply = call(
+        &mut rig,
+        7,
+        "session.output_refs",
+        json!({"set_id": format!("{lineage}/m3")}),
+    )
+    .await;
+    assert_eq!(result(&reply), json!({"records": []}));
+    rig.finish().await;
+}

@@ -36,6 +36,10 @@ pub struct Item {
     pub params: Map<String, Value>,
     /// Tool and non-persona system-text items may be optional.
     pub optional: bool,
+    /// The item opts into output references (llm-runner §9.13): its provider's tools have
+    /// their declared reference slots scanned. Only a runner serving the group accepts the
+    /// member at all ([`OutputRefsSupport`]); absent means false.
+    pub output_refs: bool,
 }
 
 /// A step-transform item: an [`Item`] and the hook subscriptions frozen into the plan.
@@ -256,6 +260,7 @@ fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal>
         preset,
         params,
         optional,
+        output_refs: object.get("output_refs") == Some(&Value::Bool(true)),
     })
 }
 

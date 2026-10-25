@@ -158,6 +158,8 @@ pub(super) struct CountingAdmitter {
     reply_schema: Mutex<Option<Value>>,
     /// A catalog `reference_slots` member every answered tool carries, when set.
     reference_slots: Mutex<Option<Value>>,
+    /// Whether the admitter accepts plan items opting into output references.
+    output_refs: Mutex<bool>,
 }
 
 impl CountingAdmitter {
@@ -168,6 +170,11 @@ impl CountingAdmitter {
     /// Make every answered catalog tool declare `slots` as its `reference_slots`.
     pub(super) fn answer_reference_slots(&self, slots: Value) {
         *self.reference_slots.lock().unwrap() = Some(slots);
+    }
+
+    /// Accept plan items that opt into output references, as a runner serving the group does.
+    pub(super) fn admit_output_refs(&self) {
+        *self.output_refs.lock().unwrap() = true;
     }
 }
 
@@ -297,6 +304,10 @@ impl PlanAdmitter for CountingAdmitter {
             broca_fetch_plan::ADMISSION_DEADLINE,
         )
         .await
+    }
+
+    fn admits_output_refs(&self) -> bool {
+        *self.output_refs.lock().unwrap()
     }
 }
 

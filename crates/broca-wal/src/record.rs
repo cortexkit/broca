@@ -23,8 +23,8 @@ use serde_json::Value;
 
 mod plan_manifest;
 pub use plan_manifest::{
-    FetchOutcome, FrozenDeclaration, FrozenHoldArgument, FrozenReply, OpaqueJson, PlanManifest,
-    ProviderFetch,
+    FetchOutcome, FrozenDeclaration, FrozenHoldArgument, FrozenReferenceSlot, FrozenReply,
+    OpaqueJson, PlanManifest, ProviderFetch,
 };
 mod compaction;
 pub use compaction::{
@@ -1493,6 +1493,11 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_reference_slots() {
+            with_feature(base, crate::framing::PLAN_REFERENCE_SLOTS_FEATURE)
+        } else {
+            base
+        };
         let base = if self.carries_google_rpc_error_details() {
             with_feature(base, crate::framing::GOOGLE_RPC_ERROR_DETAILS_FEATURE)
         } else {
@@ -1546,6 +1551,15 @@ impl WalRecord {
         } else {
             base
         }
+    }
+
+    /// A `RunStarted` whose plan manifest froze a provider's catalog reference slots.
+    fn carries_reference_slots(&self) -> bool {
+        matches!(self, WalRecord::RunStarted { manifest: Some(manifest), .. }
+        if manifest.fetches.iter().any(|fetch| matches!(
+            fetch.outcome,
+            FetchOutcome::Answered { reference_slots: Some(_), .. }
+        )))
     }
 
     /// Whether a tool this record freezes or queues declares its own reply deadline, which an

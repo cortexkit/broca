@@ -28834,3 +28834,16 @@ expect_red = ["a_folded_part_was_not_in_the_writing_request"]
 file = "crates/broca-module/src/output_refs.rs"
 old = "    if ordinal > view.covers_through.ordinal {"
 new = "    if ordinal > view.covers_through.ordinal || ordinal < u64::MAX { // NON-VACUITY BREAK: treat every part as shown in the request."
+
+[[control]]
+id = "output-refs-slots-frozen-only-on-opt-in"
+guards = "A provider's catalog reference slots are frozen, and its calls scanned, only when its plan item opts into output references"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/output_refs.rs"
+expect_red = ["output_refs::a_call_without_opt_in_has_no_set", "output_refs::declared_slots_without_opt_in_keep_the_manifest_bytes"]
+file = "crates/broca-fetch-plan/src/admit.rs"
+old = "        .filter(|item| item.output_refs)?;"
+new = "        .filter(|item| item.output_refs || !item.output_refs)?; // NON-VACUITY BREAK: freeze every provider's slots."
