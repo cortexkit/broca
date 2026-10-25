@@ -24,6 +24,8 @@ impl RetentionWithdrawalAdapter for ScopedRetentionWithdrawalAdapter {
             };
         };
         let ctx = BatchCtx {
+            // Retention withdrawals do not capture tool media.
+            media_capture: None,
             batch_id: BatchId(format!("retention:{}", question.call_key)),
             bind: question.session.clone(),
             run_id: RunId(format!("retention:{}", question.lineage_id)),

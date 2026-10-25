@@ -2592,3 +2592,99 @@ async fn post_hook_restream_counts_delta_less_stored_blocks() {
         .collect();
     assert_eq!(parts, vec![1, 2]);
 }
+
+#[tokio::test]
+async fn tool_reference_provenance_is_enforced_before_hook_payloads_are_stored() {
+    use broca_protocol::{MediaMarkerReason, ToolOutputPart};
+    let bind = BindIdentity::new("/project", "caller", "media-hooks");
+    let root = scratch("tool-reference-provenance");
+    let wal = crate::FileWalStore::new(root.join("wal"));
+    drop(wal.open(&bind).unwrap());
+    let (mut writer, records) = writer();
+    writer.bind_media_capture(&wal, &bind);
+    let capture = writer.media_capture().unwrap();
+    let own = capture
+        .capture(
+            &BatchId("r-b1".into()),
+            &ToolCallId("c".into()),
+            b"%PDF-1.7\nown\n%%EOF".to_vec(),
+            "application/pdf".into(),
+        )
+        .await
+        .unwrap();
+    let foreign = capture
+        .capture(
+            &BatchId("r-b1".into()),
+            &ToolCallId("other".into()),
+            b"%PDF-1.7\nforeign\n%%EOF".to_vec(),
+            "application/pdf".into(),
+        )
+        .await
+        .unwrap();
+    let mut altered = own.clone();
+    altered.mime = "image/png".into();
+    let supplied = [own.clone(), foreign.clone(), altered.clone()];
+    let plane = crate::StubToolPlane::new().with_tool("edit", move |_| {
+        crate::StubReply::Output(ToolOutput::Parts {
+            parts: supplied
+                .iter()
+                .cloned()
+                .map(|media| ToolOutputPart::Media { media })
+                .collect(),
+        })
+    });
+    let manifest = frozen(vec![vec![sub("post_tool", None, "refuse")]], None, false);
+    let plan = HookPlan::from_manifest(&manifest).unwrap();
+    let (hooks, seen) = scripted(|_, request| {
+        let text = &request.subject.blocks().unwrap()[0];
+        assert!(text.contains("reason=carrier]"));
+        assert_eq!(text.matches("reason=provenance]").count(), 2);
+        Reply::Answer(append("!"))
+    });
+    let runtime = runtime(&plan, &hooks, &bind, &writer);
+    batch(
+        vec![call("c")],
+        &plane,
+        &crate::AllowAll,
+        &writer,
+        &runtime,
+        None,
+    )
+    .await;
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let original = {
+        let records = records.lock().unwrap();
+        records
+            .iter()
+            .find_map(|record| match record {
+                WalRecord::ToolResult {
+                    hooks: Some(hooks), ..
+                } => hooks.original.as_ref(),
+                _ => None,
+            })
+            .unwrap()
+            .clone()
+    };
+    let result: ToolResult = serde_json::from_value(original).unwrap();
+    assert_eq!(
+        result.output,
+        ToolOutput::Parts {
+            parts: vec![
+                ToolOutputPart::Media { media: own },
+                ToolOutputPart::Text {
+                    text: broca_protocol::content::media_not_shown_marker(
+                        &foreign,
+                        MediaMarkerReason::Provenance
+                    )
+                },
+                ToolOutputPart::Text {
+                    text: broca_protocol::content::media_not_shown_marker(
+                        &altered,
+                        MediaMarkerReason::Provenance
+                    )
+                },
+            ]
+        }
+    );
+    writer.shutdown().await.unwrap();
+}

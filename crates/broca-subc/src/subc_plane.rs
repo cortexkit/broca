@@ -1515,25 +1515,31 @@ impl SubcToolPlane {
                         }
                     }
                 }
-                let result = if has_held {
+                let (result, captures) = if has_held {
                     // Never quote the body: even a malformed held reply contains interim text,
                     // which must not be mistaken for a final answer in a later prompt.
-                    route_failure_result(
-                        call,
-                        "malformed provider-held reply: prerequisites not met".into(),
+                    (
+                        route_failure_result(
+                            call,
+                            "malformed provider-held reply: prerequisites not met".into(),
+                        ),
+                        Vec::new(),
                     )
                 } else if sent_on.reads_held_reply && content_v1 {
-                    decoded
+                    let mut result = decoded
                         .as_ref()
                         .and_then(|reply| {
                             crate::content_v1::map_content_v1_result(&call.tool_call_id, reply).ok()
                         })
                         .unwrap_or_else(|| {
                             route_failure_result(call, "malformed content/v1 tool reply".into())
-                        })
+                        });
+                    let captures = tool_capture::content_v1_captures(&mut result, &raw);
+                    (result, captures)
                 } else {
                     map_call_tool_result(&call.tool_call_id, &raw)
                 };
+                let result = tool_capture::capture(ctx, result, captures).await;
                 // Build the fence copy before taking the process-wide guard. Tool payloads can be
                 // large, while the critical section only needs to update the bounded maps.
                 let fenced_result = result.clone();
@@ -3014,13 +3020,18 @@ fn warm_bind_backoff(attempt: u32) -> Duration {
     Duration::from_millis((BASE_MS << exp).min(CAP_MS))
 }
 
-/// Map an MCP `CallToolResult` to the canonical `ToolResult` without placing raw media in
-/// the model prompt. Text blocks retain their byte-exact concatenation; non-text blocks become
-/// compact source-order placeholders. A result with no content can use `structuredContent` as
-/// JSON, while execution errors remain textual errors. A reply carrying none of `content`,
-/// `structuredContent` or `isError` is not CallToolResult-shaped and maps to an error quoting
-/// the (bounded) raw reply.
-fn map_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
+mod tool_capture;
+
+/// Classify without storage I/O; dispatch captures the returned blobs before fencing.
+fn map_call_tool_result(
+    id: &ToolCallId,
+    raw: &serde_json::Value,
+) -> (ToolResult, Vec<tool_capture::PendingCapture>) {
+    tool_capture::classify(id, raw)
+}
+
+// Keep the no-capture mapping unchanged, including structuredContent and malformed replies.
+fn map_legacy_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
     let is_error = raw
         .get("isError")
         .and_then(serde_json::Value::as_bool)
@@ -3119,6 +3130,12 @@ fn malformed_tool_reply_message(raw: &serde_json::Value) -> String {
 }
 
 fn non_text_tool_content_placeholder(block: &serde_json::Value) -> String {
+    if let Some(media) = tool_capture::supplied_reference(block) {
+        return broca_protocol::content::media_not_shown_marker(
+            &media,
+            broca_protocol::MediaMarkerReason::Provenance,
+        );
+    }
     broca_protocol::content::non_text_tool_content_placeholder(
         block
             .get("type")
@@ -3145,6 +3162,8 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    mod tool_capture_tests;
 
     #[derive(Clone)]
     struct RouteOpenGate {
@@ -3705,6 +3724,7 @@ mod tests {
 
     fn batch_ctx_for(batch_id: &str, project_root: &str, session: &str) -> BatchCtx {
         BatchCtx {
+            media_capture: None,
             batch_id: BatchId(batch_id.into()),
             bind: BindIdentity::new(project_root, "test", session),
             run_id: broca_protocol::RunId("r1".into()),
@@ -4340,18 +4360,6 @@ mod tests {
                 include_str!("../tests/fixtures/content_v1/legacy_text.json"),
             ),
             (
-                serde_json::json!({
-                    "content": [
-                        {"type": "text", "text": "before"},
-                        {"type": "image", "mimeType": "image/png", "data": "aGVsbG8=", "width": 1, "height": 1},
-                        {"type": "text", "text": "after"}
-                    ],
-                    "isError": true,
-                    "errorCode": "provider_error"
-                }),
-                include_str!("../tests/fixtures/content_v1/legacy_image_error.json"),
-            ),
-            (
                 serde_json::json!({"structuredContent": {"program_facing": "still visible on legacy path"}}),
                 include_str!("../tests/fixtures/content_v1/legacy_structured.json"),
             ),
@@ -4378,6 +4386,10 @@ mod tests {
             assert_eq!(String::from_utf8(rendered).unwrap(), golden.trim_end());
             assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
         }
+    }
+
+    fn classified_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
+        map_call_tool_result(id, raw).0
     }
 
     fn legacy_map_call_tool_result(id: &ToolCallId, raw: &serde_json::Value) -> ToolResult {
@@ -4409,7 +4421,7 @@ mod tests {
     }
 
     #[test]
-    fn image_only_tool_result_maps_to_a_compact_placeholder() {
+    fn image_only_tool_result_classifies_as_parts_awaiting_capture() {
         let id = ToolCallId("t1".into());
         let raw = serde_json::json!({
             "content": [{
@@ -4424,15 +4436,10 @@ mod tests {
             legacy_map_call_tool_result(&id, &raw).output,
             ToolOutput::Text { text } if text.is_empty()
         ));
-        let result = map_call_tool_result(&id, &raw);
+        let result = classified_result(&id, &raw);
         assert!(!result.is_error);
-        assert_eq!(
-            result.output,
-            ToolOutput::Text {
-                text: "[non-text tool content omitted: type=image mimeType=image/png data≈8 bytes]"
-                    .into()
-            }
-        );
+        assert!(matches!(result.output, ToolOutput::Parts { parts } if parts.len() == 1));
+        assert_eq!(map_call_tool_result(&id, &raw).1.len(), 1);
     }
 
     #[test]
@@ -4446,12 +4453,21 @@ mod tests {
             "isError": false
         });
 
-        let result = map_call_tool_result(&ToolCallId("t1".into()), &raw);
+        let result = classified_result(&ToolCallId("t1".into()), &raw);
+        let ToolOutput::Parts { parts } = result.output else {
+            panic!("capture needs Parts")
+        };
+        assert_eq!(parts.len(), 3);
         assert_eq!(
-            result.output,
-            ToolOutput::Text {
-                text: "before[non-text tool content omitted: type=image mimeType=image/jpeg data≈4 bytes]after"
-                    .into()
+            parts[0],
+            broca_protocol::ToolOutputPart::Text {
+                text: "before".into()
+            }
+        );
+        assert_eq!(
+            parts[2],
+            broca_protocol::ToolOutputPart::Text {
+                text: "after".into()
             }
         );
     }
@@ -4464,7 +4480,7 @@ mod tests {
             "isError": false
         });
 
-        let result = map_call_tool_result(&ToolCallId("t1".into()), &raw);
+        let result = classified_result(&ToolCallId("t1".into()), &raw);
         assert!(!result.is_error);
         assert_eq!(result.output, ToolOutput::Json { value: structured });
     }
@@ -4482,26 +4498,21 @@ mod tests {
         });
 
         let legacy = serde_json::to_vec(&legacy_map_call_tool_result(&id, &raw)).unwrap();
-        let mapped = serde_json::to_vec(&map_call_tool_result(&id, &raw)).unwrap();
+        let mapped = serde_json::to_vec(&classified_result(&id, &raw)).unwrap();
         assert_eq!(mapped, legacy);
     }
 
     #[test]
-    fn error_with_non_text_content_keeps_error_and_placeholder() {
+    fn error_with_invalid_media_keeps_error_and_marker_parts() {
         let raw = serde_json::json!({
             "content": [{ "type": "audio", "mimeType": "audio/wav", "data": "123456" }],
             "isError": true
         });
 
-        let result = map_call_tool_result(&ToolCallId("t1".into()), &raw);
+        let result = classified_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
-        assert_eq!(
-            result.output,
-            ToolOutput::Error {
-                message:
-                    "[non-text tool content omitted: type=audio mimeType=audio/wav data≈6 bytes]"
-                        .into()
-            }
+        assert!(
+            matches!(result.output, ToolOutput::Parts { parts } if matches!(&parts[0], broca_protocol::ToolOutputPart::Text { text } if text.ends_with("reason=undecodable]")))
         );
     }
 
@@ -4511,7 +4522,7 @@ mod tests {
             "result": { "hits": ["a", "b"] }
         });
 
-        let result = map_call_tool_result(&ToolCallId("t1".into()), &raw);
+        let result = classified_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
         let ToolOutput::Error { message } = result.output else {
             panic!("expected an error output, got {:?}", result.output);
@@ -4530,7 +4541,7 @@ mod tests {
     fn empty_content_array_stays_an_empty_success() {
         let raw = serde_json::json!({ "content": [] });
 
-        let result = map_call_tool_result(&ToolCallId("t1".into()), &raw);
+        let result = classified_result(&ToolCallId("t1".into()), &raw);
         assert!(!result.is_error);
         assert_eq!(
             result.output,
@@ -4545,7 +4556,7 @@ mod tests {
         let structured = serde_json::json!({"answer": 42});
         let raw = serde_json::json!({ "structuredContent": structured.clone() });
 
-        let result = map_call_tool_result(&ToolCallId("t1".into()), &raw);
+        let result = classified_result(&ToolCallId("t1".into()), &raw);
         assert!(!result.is_error);
         assert_eq!(result.output, ToolOutput::Json { value: structured });
     }
@@ -4558,7 +4569,7 @@ mod tests {
             serde_json::json!({ "result": "é".repeat(10 * MALFORMED_TOOL_REPLY_QUOTE_MAX_BYTES) });
         let full_len = serde_json::to_string(&raw).unwrap().len();
 
-        let result = map_call_tool_result(&ToolCallId("t1".into()), &raw);
+        let result = classified_result(&ToolCallId("t1".into()), &raw);
         assert!(result.is_error);
         let ToolOutput::Error { message } = result.output else {
             panic!("expected an error output");
@@ -4580,7 +4591,7 @@ mod tests {
             "content": [{ "type": "text", "text": "boom" }],
             "isError": true
         });
-        let r = map_call_tool_result(&ToolCallId("t1".into()), &raw);
+        let r = classified_result(&ToolCallId("t1".into()), &raw);
         assert!(r.is_error);
         assert!(matches!(r.output, ToolOutput::Error { message } if message == "boom"));
     }
@@ -6157,6 +6168,7 @@ mod tests {
 
         fn ctx(batch: &str, session: &str, run: &str, scope: Option<SessionScope>) -> BatchCtx {
             BatchCtx {
+                media_capture: None,
                 batch_id: BatchId(batch.into()),
                 bind: BindIdentity::new("/tmp/scope-carrier", "test", session),
                 run_id: RunId(run.into()),
@@ -6925,6 +6937,7 @@ mod approved_queue_contract_tests {
             }
             let plane = SubcToolPlane::new(conn, "aft");
             let ctx = BatchCtx {
+                media_capture: None,
                 batch_id: BatchId("ordinary".into()),
                 bind: BindIdentity::new("/project", "test", "ordinary"),
                 run_id: broca_protocol::RunId("run".into()),
@@ -7021,6 +7034,7 @@ mod approved_queue_contract_tests {
         let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
         let plane = SubcToolPlane::new(conn, "aft");
         let ctx = BatchCtx {
+            media_capture: None,
             batch_id: broca_protocol::BatchId("after-push".into()),
             bind: BindIdentity::new("/project", "test", "after-push"),
             run_id: broca_protocol::RunId("run".into()),
@@ -7061,6 +7075,7 @@ mod approved_queue_contract_tests {
         module.close_writer_for_test();
         let plane = SubcToolPlane::new(conn, "aft");
         let ctx = BatchCtx {
+            media_capture: None,
             batch_id: broca_protocol::BatchId("closed-queue".into()),
             bind: BindIdentity::new("/project", "test", "closed-queue"),
             run_id: broca_protocol::RunId("run".into()),
@@ -7097,6 +7112,7 @@ mod approved_queue_contract_tests {
             let (conn, route, mut module) = SubcConnection::in_process_full_writer_for_test(5, 3);
             let plane = SubcToolPlane::new(conn, "aft");
             let ctx = BatchCtx {
+                media_capture: None,
                 batch_id: broca_protocol::BatchId("queue".into()),
                 bind: BindIdentity::new("/project", "test", "queue"),
                 run_id: broca_protocol::RunId("run".into()),

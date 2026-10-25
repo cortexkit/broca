@@ -2048,6 +2048,7 @@ pub struct WalHandle {
     /// Zero means unlimited; finite limits only decrease over the writer's lifetime.
     input_token_limit: AtomicU64,
     move_check: Option<Arc<dyn Fn() -> Result<(), WalError> + Send + Sync>>,
+    media_capture: Option<crate::tool_media::ToolMediaCapture>,
     fence: u64,
     append_budget: Option<Mutex<AppendBudget>>,
     tx: std_mpsc::Sender<WalCommand>,
@@ -2093,6 +2094,16 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    pub fn media_capture(&self) -> Option<crate::tool_media::ToolMediaCapture> {
+        self.media_capture.clone()
+    }
+
+    pub(crate) fn bind_media_capture(&mut self, store: &impl WalStore, session: &BindIdentity) {
+        self.media_capture = store
+            .uploads()
+            .map(|uploads| crate::tool_media::ToolMediaCapture::new(uploads, session.clone()));
+    }
+
     pub fn check_move(&self) -> Result<(), WalError> {
         match &self.move_check {
             Some(check) => check(),
@@ -2196,6 +2207,7 @@ impl WalHandle {
         let (wal, last_seq, fence, lease) = opened;
         let mut handle = Self::spawn_proven_observed(wal, last_seq, fence, observer, None)
             .map_err(WalOpenError::Failed)?;
+        handle.bind_media_capture(check_store.as_ref(), &check_session);
         handle.move_check = Some(Arc::new(move || {
             check_store.check_move(&check_session, true)
         }));
@@ -2269,6 +2281,7 @@ impl WalHandle {
             display_placement: Mutex::new((last_seq == 0).then(Default::default)),
             input_token_limit: AtomicU64::new(0),
             move_check: None,
+            media_capture: None,
             fence,
             append_budget,
             tx,

@@ -489,7 +489,7 @@ impl ToolPlane for Tools {
     async fn batch_finished(&self, _: &BatchCtx) -> Result<(), ToolPlaneError> {
         Ok(())
     }
-    async fn dispatch(&self, _: &BatchCtx, call: &ToolCall) -> DispatchResult {
+    async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         self.provider_requests.fetch_add(1, Ordering::SeqCst);
         self.started.store(true, Ordering::SeqCst);
         let hold = self.hold.lock().unwrap().clone();
@@ -497,6 +497,27 @@ impl ToolPlane for Tools {
             hold.notified().await;
         }
         self.completed.store(true, Ordering::SeqCst);
+        if *self.outcome.lock().unwrap() == "media" {
+            let media = ctx
+                .media_capture
+                .as_ref()
+                .expect("dispatch must carry the session capture handle")
+                .capture(
+                    &ctx.batch_id,
+                    &call.tool_call_id,
+                    b"%PDF-1.7\nlate capture\n%%EOF".to_vec(),
+                    "application/pdf".into(),
+                )
+                .await
+                .unwrap();
+            return DispatchResult::Completed(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Parts {
+                    parts: vec![broca_protocol::ToolOutputPart::Media { media }],
+                },
+                is_error: false,
+            });
+        }
         DispatchResult::Completed(ToolResult {
             tool_call_id: call.tool_call_id.clone(),
             output: ToolOutput::Text {
@@ -2859,5 +2880,65 @@ async fn boundary_cancel_preserves_active_approval_wait_until_immediate_escalati
         .unwrap();
     assert_eq!(result.interruption, Some(BatchInterruption::CallerCancel));
     drop(batch);
+    rig.finish().await;
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn late_admission_carries_capture_and_records_registered_media() {
+    let mut rig = expired_run("pass").await;
+    let state = rig.root.join("capture-state");
+    let wal = crate::FileWalStore::new(state.join("wal"));
+    drop(wal.open(&rig.bind).unwrap());
+    rig.writer.bind_media_capture(&wal, &rig.bind);
+    *rig.tools.outcome.lock().unwrap() = "media";
+    *rig.questions.answer.lock().unwrap() = "approve";
+    let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
+    approval_gate::admission(
+        &mut history,
+        &rig.writer,
+        &rig.bind,
+        &rig.control,
+        &rig.tools,
+    )
+    .await
+    .unwrap();
+    let frames = rig.frames();
+    let result = frames
+        .iter()
+        .find_map(|frame| match &frame.record {
+            WalRecord::LateResult { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("late result must be durable");
+    assert!(!result.is_error);
+    let ToolOutput::Parts { parts } = &result.output else {
+        panic!("late result lost captured parts")
+    };
+    let broca_protocol::ToolOutputPart::Media { media } = &parts[0] else {
+        panic!("late result lost captured reference")
+    };
+    assert_eq!(media.kind, broca_protocol::MediaKind::Document);
+    assert_eq!(rig.tools.sent.lock().unwrap().len(), 1);
+    assert!(rig.tools.sent.lock().unwrap()[0].2 .0.starts_with("late:"));
+    let store = crate::media_store::MediaStore::open(
+        &state,
+        crate::media_store::MediaStoreClass::NonDurable,
+    )
+    .unwrap();
+    assert_eq!(
+        store.read_verified(media).unwrap(),
+        b"%PDF-1.7\nlate capture\n%%EOF"
+    );
+    let manifest = state
+        .join("media/refs")
+        .join(crate::wal_writer::session_addr(&rig.bind));
+    assert_eq!(
+        std::fs::read_to_string(manifest).unwrap(),
+        format!("{}\n", media.sha256)
+    );
+    let round_trip: ToolResult =
+        serde_json::from_value(serde_json::to_value(result).unwrap()).unwrap();
+    assert_eq!(&round_trip, result.as_ref());
     rig.finish().await;
 }

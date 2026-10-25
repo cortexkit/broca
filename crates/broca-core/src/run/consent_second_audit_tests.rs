@@ -418,6 +418,7 @@ async fn live_feed_traversal_has_total_budget_and_keeps_progress() {
     let rig = Rig::new("pass", "none", false, false);
     let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("scan".into()),
         bind: rig.bind.clone(),
         run_id: RunId("r".into()),
@@ -444,6 +445,7 @@ async fn healthy_live_feed_continues_after_budget_without_restarting() {
     let rig = Rig::new("pass", "none", false, false);
     let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("scan".into()),
         bind: rig.bind.clone(),
         run_id: RunId("r".into()),
@@ -481,6 +483,7 @@ async fn live_feed_slow_pages_share_one_total_time_budget() {
     let rig = Rig::new("pass", "none", false, false);
     let mut history = approval_gate::History::new(&rig.writer, rig.frames()).unwrap();
     let ctx = BatchCtx {
+        media_capture: None,
         batch_id: BatchId("slow-scan".into()),
         bind: rig.bind.clone(),
         run_id: RunId("r".into()),

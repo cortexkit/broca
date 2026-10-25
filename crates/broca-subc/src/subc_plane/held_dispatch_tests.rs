@@ -195,6 +195,7 @@ impl ProviderHeldLifecycle for Rig {
 
 fn ctx() -> BatchCtx {
     BatchCtx {
+        media_capture: None,
         batch_id: BatchId("batch".into()),
         bind: BindIdentity {
             project_root: "/project".into(),
@@ -611,4 +612,66 @@ async fn approved_provider_held_reply_keeps_its_deferred_anchor() {
         &[(Some("lineage:1".into()), Some(bytes.into()))]
     );
     assert_eq!(rig.waits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn negotiated_media_dispatch_captures_with_nullable_error_code() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use broca_core::{
+        media_store::{MediaStore, MediaStoreClass},
+        tool_media::ToolMediaCapture,
+        wal_writer::WalStore,
+    };
+    use broca_protocol::ToolOutputPart;
+    let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let rig = Rig::new(true, true, true, true);
+    *rig.reply.lock().unwrap() = json!({"content":[
+        {"type":"text","text":"before"},
+        {"type":"image","mimeType":"image/png","data":data,"width":1,"height":1},
+        {"type":"text","text":"after"}
+    ],"errorCode":null});
+    let plane = rig.plane(true);
+    let mut ctx = ctx();
+    let root =
+        broca_test_support::scratch_root().join(format!("negotiated-media-{}", std::process::id()));
+    let wal = broca_core::FileWalStore::new(root.join("wal"));
+    drop(wal.open(&ctx.bind).unwrap());
+    ctx.media_capture = Some(ToolMediaCapture::new(
+        wal.uploads().unwrap(),
+        ctx.bind.clone(),
+    ));
+    let call = call("captured");
+    plane
+        .batch_started(&ctx, std::slice::from_ref(&call), &manifest())
+        .await
+        .unwrap();
+    let result = completed(plane.dispatch(&ctx, &call).await);
+    assert_eq!(result.tool_call_id, call.tool_call_id);
+    assert!(!result.is_error);
+    let ToolOutput::Parts { parts } = &result.output else {
+        panic!("negotiated image lost its parts")
+    };
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        parts[0],
+        ToolOutputPart::Text {
+            text: "before".into()
+        }
+    );
+    assert_eq!(
+        parts[2],
+        ToolOutputPart::Text {
+            text: "after".into()
+        }
+    );
+    let ToolOutputPart::Media { media } = &parts[1] else {
+        panic!("negotiated image was not captured")
+    };
+    let store = MediaStore::open(&root, MediaStoreClass::NonDurable).unwrap();
+    assert_eq!(
+        store.read_verified(media).unwrap(),
+        STANDARD.decode(data).unwrap()
+    );
+    assert_eq!(completed(plane.dispatch(&ctx, &call).await), result);
+    assert_eq!(rig.sent.lock().unwrap().len(), 1);
 }
