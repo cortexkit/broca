@@ -371,7 +371,8 @@ async fn an_installed_runtime_without_the_route_declaration_leaves_every_call_un
             map_call_tool_result(
                 &call.tool_call_id,
                 &json!({"content":[{"type":"text","text":"terminal"}]})
-            ),
+            )
+            .0,
             "installed={installed}: the reply is read as the legacy body"
         );
     }
