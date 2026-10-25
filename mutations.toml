@@ -29224,6 +29224,22 @@ old = "role == RouteRole::ToolProvider && tools,"
 new = "role == RouteRole::ToolProvider || tools, // NON-VACUITY BREAK: accept unrelated roles on a tool target."
 
 [[control]]
+id = "llm-tool-target-selects-role-without-declaration"
+guards = "A run-scoped BASAL tool-provider target serves the model-tool catalog without role_versions"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_route"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
+expect_red = ["basal_tool_provider_target_without_role_versions_serves_catalog_on_real_daemon"]
+expect_message = "broca does not serve this route target"
+file = "crates/broca-module-serve/src/serve.rs"
+old = """    bind_role(role_versions, serves_classifier)?;
+    Ok(RouteRole::ToolProvider)"""
+new = """    // NON-VACUITY BREAK: restore declaration-only role selection on tool-provider targets.
+    bind_role(role_versions, serves_classifier)"""
+
+[[control]]
 id = "llm-tool-tags-are-opt-in"
 guards = "Production catalogs omit llm tags unless the operator explicitly enables them"
 runner = "cargo"
