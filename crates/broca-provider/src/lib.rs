@@ -23,6 +23,7 @@ pub mod hash;
 pub mod media_profile;
 pub mod normalize;
 mod opencode_go;
+pub mod person_media;
 pub mod policy;
 pub mod reasoning;
 pub mod registry;

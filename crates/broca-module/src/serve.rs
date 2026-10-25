@@ -2219,8 +2219,29 @@ impl ServeHandler for crate::LineageRegistry {
         crate::uploads::upload(self, session, principal, scope, method, params).await
     }
 
-    async fn send(&self, req: SendRequest) -> Result<SendResponse, ServeError> {
+    async fn send(&self, mut req: SendRequest) -> Result<SendResponse, ServeError> {
         use crate::actor::SendOutcome;
+        if !req.request.content.is_empty() && !self.session_written(&req.session)? {
+            let mut request = (*req.request).clone();
+            crate::person_media::stage(self.upload_store().as_ref(), &req.session, &mut request)
+                .map_err(media_preflight_error)?;
+            let profile = self
+                .media_profile(&request)
+                .await
+                .map_err(media_preflight_error)?;
+            let model = format!(
+                "{}/{}",
+                request.model.provider_module_id, request.model.model_id
+            );
+            crate::person_media::check(profile.as_deref(), &model, &request.input)
+                .map_err(media_preflight_error)?;
+            if let Some(held) = &mut request.staged_uploads {
+                std::sync::Arc::make_mut(held).profile = profile
+                    .as_ref()
+                    .map(|profile| serde_json::to_value(profile).expect("media profile JSON"));
+            }
+            req.request.staged_uploads = request.staged_uploads;
+        }
         // Opening an actor creates the lineage header. A fresh run scope has no frozen
         // history to consult, so reject a wrong carrier or tools before creating any WAL.
         // Existing sessions still use the actor's authoritative frozen-ownership check.
@@ -3639,5 +3660,19 @@ mod context_ceiling_tests {
         let status: cortexkit_role_llm_runner::run::RunStatus =
             serde_json::from_value(wire).unwrap();
         assert_eq!(status.runner_wait_until(), Some(234_567));
+    }
+}
+
+fn media_preflight_error(error: broca_core::RunError) -> ServeError {
+    match error {
+        broca_core::RunError::MediaUnsupported(message) => ServeError::DeliveryRefused {
+            code: "media_unsupported",
+            message,
+        },
+        broca_core::RunError::Transient(message) => ServeError::Transient(message),
+        error => ServeError::InvalidParams {
+            field: "content".into(),
+            message: error.to_string(),
+        },
     }
 }

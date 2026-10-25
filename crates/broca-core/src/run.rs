@@ -196,6 +196,8 @@ impl RunRequest {
     /// [`from_submission`]: RunRequest::from_submission
     pub fn to_submission(&self) -> SubmissionRequest {
         SubmissionRequest {
+            staged_uploads: None,
+            content: Vec::new(),
             directives: self.directives.clone(),
             on_restart: self.on_restart,
             keep_warm: self.keep_warm,
@@ -781,6 +783,8 @@ pub enum RunError {
     /// error and writes NOTHING durable (no ghost run). Distinct from a mid-run failure
     /// (which is a normal short terminal run).
     Config(String),
+    /// Person media failed admission before a record could name it.
+    MediaUnsupported(String),
     /// Unsupported reasoning variant, refused before durable admission.
     VariantUnsupported(VariantRefusal),
     /// Admission failed because a required dependency is temporarily unavailable. Nothing
@@ -840,6 +844,7 @@ impl RunError {
     pub fn admission_error_class(&self) -> ErrorClass {
         match self {
             Self::Config(_)
+            | Self::MediaUnsupported(_)
             | Self::VariantUnsupported(_)
             | Self::SendIdReuse { .. }
             | Self::SystemPromptChanged
@@ -878,6 +883,7 @@ impl std::fmt::Display for RunError {
             RunError::TagNumbering(overflow) => write!(f, "{overflow}"),
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),
             RunError::Config(s) => write!(f, "run resolution failed: {s}"),
+            RunError::MediaUnsupported(s) => write!(f, "{s}"),
             RunError::Transient(s) => write!(f, "run admission temporarily unavailable: {s}"),
             RunError::SendIdReuse { differing } => write!(
                 f,
@@ -4710,9 +4716,10 @@ where
         // first possible mode is `steer` joins this step after the steered messages, and one that
         // expired ends. Their records precede `StepStarted`, exactly where replay places them.
         let mut steered = match &control.steer {
-            Some(inbox) => match inbox.try_take_at_step_ordered(
+            Some(inbox) => match inbox.try_take_at_step_ordered_for(
                 &resolved_run_id,
                 control.now_ms().unwrap_or(0),
+                step_id,
                 |records| {
                     let assigned = records
                         .into_iter()

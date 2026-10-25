@@ -28596,3 +28596,187 @@ expect_red = ["supplied_media_tests::a_send_naming_media_inline_is_refused_with_
 file = "crates/broca-wire/src/lib.rs"
 old = '            .and_then(|parts| parts.iter().position(names_media_inline))'
 new = '            .and_then(|_| None::<usize>) // NON-VACUITY BREAK: fall through to the generic decode error.'
+
+[[control]]
+id = "person-send-catalog-modality"
+guards = "Person PDF refusal names its catalog modality, model and modality reason"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::pdf_without_catalog_modality_names_pdf_model_and_reason"]
+file = "crates/broca-provider/src/person_media.rs"
+old = "profile.filter(|profile| profile.accepts_modality(media.kind))"
+new = "profile.filter(|_| true) /* NON-VACUITY BREAK: ignore the catalog modality */"
+
+[[control]]
+id = "person-send-chatgpt-audio-carrier"
+guards = "ChatGPT audio without a live-gated carrier is refused with the carrier reason"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::chatgpt_audio_without_live_flag_is_carrier_refusal"]
+file = "crates/broca-provider/src/person_media.rs"
+old = "if kind.user_message == MediaCarrier::Marker {"
+new = "if false { // NON-VACUITY BREAK: accept a missing user carrier"
+
+[[control]]
+id = "person-send-protected-payload-boundary"
+guards = "The temporary encoded-payload bound admits equality without an envelope reserve"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::protected_encoded_payload_bound_omits_text_and_envelope_bytes"]
+file = "crates/broca-provider/src/person_media.rs"
+old = "if encoded > profile.request_cap_bytes"
+new = "if encoded >= profile.request_cap_bytes // NON-VACUITY BREAK: falsely refuse the fitting payload"
+
+[[control]]
+id = "person-send-protected-count"
+guards = "Every occurrence of a protected media reference consumes the per-request count"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::request_cap_counts_every_protected_input_and_duplicate_reference"]
+file = "crates/broca-provider/src/person_media.rs"
+old = ".is_some_and(|max| counts[index] > max)"
+new = ".is_some_and(|_| false) /* NON-VACUITY BREAK: omit protected media counts */"
+
+[[control]]
+id = "person-send-steer-per-item-before-publish"
+guards = "A text-only run refuses an image steer before publication as well as before Steered sync"
+runner = "cargo"
+package = "broca-module"
+features = ["test-attachments"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/pre_user_tests.rs"
+expect_red = ["actor::pre_user_tests::person_send_gate::text_only_steer_refuses_image_before_publication_or_steered_sync"]
+file = "crates/broca-module/src/actor.rs"
+old = "crate::person_media::check(media_profile.as_deref(), &media_model, &request.input)"
+new = "Ok::<(), RunError>(()) /* NON-VACUITY BREAK: publish a steer before its per-item gate */"
+
+[[control]]
+id = "person-send-inbox-atomic-protected-budget"
+guards = "Two steers share one protected-input budget under their Steered append lock"
+runner = "cargo"
+package = "broca-module"
+features = ["test-attachments"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/pre_user_tests.rs"
+expect_red = ["actor::pre_user_tests::person_send_gate::later_steer_cap_refusal_leaves_only_lease_protected_manifest_entries"]
+file = "crates/broca-core/src/steer.rs"
+old = """        check(&protected)?;
+        if let Some(tags) = record() {"""
+new = """        let _ = (&check, &protected); // NON-VACUITY BREAK: append without the atomic budget check
+        if let Some(tags) = record() {"""
+
+[[control]]
+id = "person-send-queued-admission-recheck"
+guards = "A queued media input is rechecked against admission's frozen provider and ends with the same refusal"
+runner = "cargo"
+package = "broca-module"
+features = ["test-attachments"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/pre_user_tests.rs"
+expect_red = ["actor::pre_user_tests::person_send_gate::queued_media_is_checked_again_at_admission_and_keeps_the_same_refusal"]
+file = "crates/broca-module/src/executor.rs"
+old = """        crate::person_media::check(
+            frozen.as_ref().and_then(|frozen| frozen.media.as_ref()),
+            &model,
+            &protected,
+        )?;"""
+new = """        let _ = (frozen, model); // NON-VACUITY BREAK: trust the enqueue profile at admission"""
+
+[[control]]
+id = "person-send-fresh-refusal-before-wal-open"
+guards = "A PDF refusal happens on held staged bytes before a fresh actor can create its WAL"
+runner = "cargo"
+package = "broca-module-serve"
+features = ["test-attachments"]
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/it/llm_runner_role.rs"
+expect_red = ["llm_runner_role::debug_pdf_send_is_refused_before_any_session_write"]
+file = "crates/broca-module/src/serve.rs"
+old = "if !req.request.content.is_empty() && !self.session_written(&req.session)? {"
+new = "if false && !req.request.content.is_empty() && !self.session_written(&req.session)? { // NON-VACUITY BREAK: open the actor before media preflight"
+
+[[control]]
+id = "person-send-default-read-media-marker"
+guards = "Default transcript reads keep media grammar away from strict text-only readers"
+runner = "cargo"
+package = "broca-wire"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wire/src/lib.rs"
+expect_red = ["caller_message_tests::default_media_read_uses_text_markers_without_changing_the_stored_message"]
+file = "crates/broca-wire/src/lib.rs"
+old = "if exposed.content.iter().any(|block| {"
+new = "if false && exposed.content.iter().any(|block| { // NON-VACUITY BREAK: expose stored media on default reads"
+
+[[control]]
+id = "person-send-frozen-profile-feature"
+guards = "A RunStarted that freezes a media profile requires media-content/v1 even without a media block"
+runner = "cargo"
+package = "broca-provider"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-provider/tests/it/media_profile_frozen.rs"
+expect_red = ["media_profile_frozen::a_frozen_media_profile_requires_the_media_content_feature"]
+file = "crates/broca-wal/src/record.rs"
+old = """                config
+                    .frozen_render_config
+                    .get("media")"""
+new = """                config
+                    .frozen_render_config
+                    .get("unrecognized_media") /* NON-VACUITY BREAK: omit the frozen profile's feature */"""
+
+[[control]]
+id = "person-send-nonshipping-marker-staging"
+platforms = ["linux", "macos"]
+guards = "Release staging rejects a binary carrying debug-only attachment admission"
+runner = "command"
+command = ["python3", "-B", "scripts/tests/test_release_fences.py", "{test}"]
+test_count_pattern = "Ran {count} test"
+test_file = "scripts/tests/test_release_fences.py"
+expect_red = ["RetryMarkerStaging.test_test_attachments_marker_refuses_artifact"]
+file = "scripts/nonshipping-markers.sh"
+old = "test-attachments broca-nonshipping-attachments-v1"
+new = "# NON-VACUITY BREAK: forget the attachment ingress marker"
+
+[[control]]
+id = "person-send-prequeued-steer-initial-budget"
+guards = "A new episode checks its initial media with prequeued ordered steers before publishing its own bytes"
+runner = "cargo"
+package = "broca-module"
+features = ["test-attachments"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/pre_user_tests.rs"
+expect_red = ["actor::pre_user_tests::person_send_gate::fresh_input_is_checked_with_prequeued_ordered_steers_before_publication"]
+file = "crates/broca-module/src/executor.rs"
+old = "|inbox| inbox.protected_inputs()"
+new = "|_| self.req.input.clone() /* NON-VACUITY BREAK: omit prequeued steers from initial admission */"
+
+[[control]]
+id = "person-send-family-mime"
+guards = "Per-family MIME checks use detected M4A and WMV spellings without admitting undocumented containers"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/person_media/tests.rs"
+expect_red = ["person_media::tests::per_family_mime_gate_uses_detected_container_spellings"]
+file = "crates/broca-provider/src/person_media.rs"
+old = "if !accepts_mime(profile, media) {"
+new = "if false { // NON-VACUITY BREAK: bypass family MIME support"

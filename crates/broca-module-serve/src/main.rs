@@ -3253,6 +3253,62 @@ mod executor {
 
     #[async_trait]
     impl RunExecutor for LiveLoopExecutor {
+        async fn media_profile(
+            &self,
+            request: &broca_protocol::request::SubmissionRequest,
+        ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, RunError> {
+            let catalog =
+                broca_catalog::catalog().map_err(|error| RunError::Transient(error.to_string()))?;
+            let Some((provider, model)) = catalog
+                .model_for_serving(&request.model.provider_module_id, &request.model.model_id)
+            else {
+                return Ok(None);
+            };
+            let (pin, account) =
+                caller_auth_for_episode(request.auth.as_ref(), EpisodeAuthContext::FreshSession)?;
+            let method = if self.provider_base_url.is_some() {
+                None
+            } else {
+                self.vault
+                    .as_ref()
+                    .map(|vault| {
+                        broca_module_serve::auth_routing::resolve_credential_id(
+                            &request.model.provider_module_id,
+                            pin,
+                            account,
+                            &vault.methods,
+                            FALLBACK_METHOD,
+                        )
+                        .method
+                    })
+                    .or(pin)
+            };
+            let catalog_family = if catalog
+                .routing_facts(&request.model.provider_module_id, &request.model.model_id)
+                .is_some()
+            {
+                catalog
+                    .resolve_route(&request.model.provider_module_id, &request.model.model_id)
+                    .map_err(|error| RunError::Config(error.to_string()))?
+                    .0
+            } else {
+                provider.wire_family
+            };
+            let family = method.and_then(family_for_method).unwrap_or(catalog_family);
+            Ok(Some(Box::new(
+                broca_provider::media_profile::select_media_profile(
+                    family,
+                    provider.quirks.media.or_else(|| {
+                        broca_provider::media_profile::media_quirk_for_catalog_provider(
+                            &provider.id,
+                        )
+                    }),
+                    &model.id,
+                    model.input_modalities,
+                    model.limits.context,
+                ),
+            )))
+        }
         fn elicitation_plane(&self) -> Option<Arc<dyn broca_core::tool_plane::ElicitationPlane>> {
             self.elicitation_plane
                 .as_ref()
@@ -3671,6 +3727,8 @@ mod executor {
                 None
             };
             let resolve_options = broca_catalog::live::ResolveOptions {
+                media: fresh_episode && job.has_media_input(),
+                media_profile: job.media_profile.as_deref().filter(|_| fresh_episode),
                 claude_code_persona: fresh_persona.as_ref(),
                 auth_method: resolution.method,
                 family_override,
@@ -3819,6 +3877,19 @@ mod executor {
                         }
                         return Err(RunError::Config(msg));
                     }
+                }
+            }
+
+            if job.has_media_input() {
+                let checked = job.admit_media(
+                    resolved.provider.as_ref(),
+                    self.wal_store.uploads().as_ref(),
+                );
+                if let Err(error) = checked {
+                    if let Some(ack) = job.on_admitted {
+                        let _ = ack.send(Err(error.clone()));
+                    }
+                    return Err(error);
                 }
             }
 
@@ -4512,6 +4583,8 @@ mod executor {
                         .into(),
                 ),
                 &broca_catalog::live::ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: method,
                     family_override,
@@ -4538,6 +4611,8 @@ mod executor {
         fn chatgpt_pause_only_construction_is_gated_and_repaired_resume_is_strict() {
             install_test_catalog();
             let options = broca_catalog::live::ResolveOptions {
+                media: false,
+                media_profile: None,
                 claude_code_persona: None,
                 auth_method: Some(AuthMethod::Chatgpt),
                 family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),

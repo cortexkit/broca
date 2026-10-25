@@ -88,7 +88,7 @@ async fn execute_recorded_fixture(
     let writer = Arc::new(broca_core::WalHandle::spawn(store.open(&req.session).unwrap(), 1).unwrap());
     let prior_snapshot = broca_core::load_prior_wal_snapshot(store.as_ref(), &req.session, writer.durable_head().load(Ordering::Acquire), None::<&broca_store::SqliteStore>).unwrap();
     let session = req.session.clone();
-    let job = RunJob { req, auth: None, conversation_key: None, writer: Arc::clone(&writer), kind: RunKind::FreshOrResume,
+    let job = RunJob { media: Vec::new(), media_profile: None, req, auth: None, conversation_key: None, writer: Arc::clone(&writer), kind: RunKind::FreshOrResume,
         skip_materialization: true, control: Default::default(), prior_snapshot, on_admitted: None };
     let (out, mut events) = mpsc::channel(128);
     let outcome = tokio::time::timeout(Duration::from_secs(15), executor.execute(job, out)).await;

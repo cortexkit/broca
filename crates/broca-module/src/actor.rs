@@ -1157,6 +1157,8 @@ fn submission_from_config(
 ) -> SubmissionRequest {
     let policy_allowed = config.tools.iter().map(|tool| tool.name.clone()).collect();
     SubmissionRequest {
+        staged_uploads: None,
+        content: Vec::new(),
         directives: config.turn_directives_v1,
         on_restart: None,
         keep_warm: None,
@@ -1947,22 +1949,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 // Keep the reply available to input hooks so a dropped RPC cannot write its
                 // unacknowledged transform. Ordinary run admission keeps its existing barrier.
                 let prior_reply = self.send_reply.replace(reply);
-                let outcome = self
-                    .on_send(
-                        run_id,
-                        *request,
-                        kind,
-                        key,
-                        skip_materialization,
-                        delivery,
-                        plan.map(|plan| *plan),
-                        conversation_key,
-                        title,
-                        retention,
-                        session_class,
-                        stop_sequences_named,
-                    )
-                    .await;
+                // Input preparation carries admission and staging state; heap-own its
+                // future so ordinary command polling does not copy that state on the stack.
+                let outcome = Box::pin(self.on_send(
+                    run_id,
+                    *request,
+                    kind,
+                    key,
+                    skip_materialization,
+                    delivery,
+                    plan.map(|plan| *plan),
+                    conversation_key,
+                    title,
+                    retention,
+                    session_class,
+                    stop_sequences_named,
+                ))
+                .await;
                 let _ = self.sync_retention_index().await;
                 self.admitting_retention = None;
                 self.admitting_order = None;
@@ -3500,6 +3503,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 },
                 Err(StartRunFailure::Expired) => SendOutcome::Reopen,
                 Err(StartRunFailure::ContextCeiling(detail)) => SendOutcome::ContextCeiling(detail),
+                Err(StartRunFailure::Admission(RunError::MediaUnsupported(message))) => {
+                    crate::person_media::outcome(RunError::MediaUnsupported(message))
+                }
                 Err(StartRunFailure::Admission(RunError::Transient(message))) => {
                     SendOutcome::Transient(message)
                 }
@@ -3636,7 +3642,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     async fn steer_submission(
         &mut self,
         run_id: RunId,
-        request: SubmissionRequest,
+        mut request: SubmissionRequest,
         kind: RunKind,
         identity: SendIdentity,
         skip_materialization: bool,
@@ -3650,6 +3656,60 @@ impl<W: WalStore + 'static> LineageActor<W> {
         else {
             match self.paused_run().await {
                 Ok(Some((paused, broca_protocol::PauseReason::Restart))) => {
+                    let checkpoint = match self.load_checkpoint_at_head().await {
+                        Ok(checkpoint) => checkpoint,
+                        Err(error) => return SendOutcome::Transient(error),
+                    };
+                    let profile = checkpoint
+                        .last_episode
+                        .as_ref()
+                        .and_then(|episode| crate::person_media::frozen(&episode.config));
+                    let model = checkpoint
+                        .last_episode
+                        .as_ref()
+                        .map(|episode| {
+                            format!(
+                                "{}/{}",
+                                episode.config.model.provider_module_id,
+                                episode.config.model.model_id
+                            )
+                        })
+                        .unwrap_or_default();
+                    let staged = match crate::person_media::stage(
+                        self.wal_store.uploads().as_ref(),
+                        &self.key,
+                        &mut request,
+                    ) {
+                        Ok(staged) => staged,
+                        Err(error) => return crate::person_media::outcome(error),
+                    };
+                    if let Err(error) =
+                        crate::person_media::check(profile.as_deref(), &model, &request.input)
+                    {
+                        return crate::person_media::outcome(error);
+                    }
+                    let records = match self.read_wal_records().await {
+                        Ok(records) => records,
+                        Err(error) => return SendOutcome::Transient(error),
+                    };
+                    let mut protected = crate::person_media::protected_input(&records);
+                    protected.extend(request.input.iter().cloned());
+                    if let Err(refusal) = broca_provider::person_media::check_protected_payload(
+                        profile.as_deref(),
+                        &model,
+                        protected.iter(),
+                    ) {
+                        return crate::person_media::outcome(RunError::MediaUnsupported(
+                            refusal.to_string(),
+                        ));
+                    }
+                    if let Err(error) = crate::person_media::publish(
+                        self.wal_store.uploads().as_ref(),
+                        &self.key,
+                        &staged,
+                    ) {
+                        return crate::person_media::outcome(error);
+                    }
                     let input = request
                         .input
                         .iter()
@@ -3724,6 +3784,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
         };
         let active = active.clone();
         let inbox = Arc::clone(steer);
+        if inbox.is_closed() && !request.content.is_empty() {
+            return self
+                .queue_submission(
+                    run_id,
+                    request,
+                    identity,
+                    skip_materialization,
+                    broca_protocol::Delivery::Steer,
+                )
+                .await;
+        }
+        let mut media_profile = None;
+        let mut media_model = format!(
+            "{}/{}",
+            request.model.provider_module_id, request.model.model_id
+        );
         if !inbox.is_closed() {
             // Read the admitted episode, not the snapshot from before it started: a resumed
             // run may also have ignored the settings carried by its resuming send.
@@ -3745,6 +3821,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     "the active run has no frozen episode config".into(),
                 );
             };
+            media_profile = crate::person_media::frozen(&episode.config);
+            media_model = format!(
+                "{}/{}",
+                episode.config.model.provider_module_id, episode.config.model.model_id
+            );
             if let Some(field) =
                 steer_settings_conflict(&request, &episode.config, stop_sequences_named)
             {
@@ -3754,6 +3835,19 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     return SendOutcome::SteerSettingsConflict { field };
                 }
             }
+        }
+        let staged = match crate::person_media::stage(
+            self.wal_store.uploads().as_ref(),
+            &self.key,
+            &mut request,
+        ) {
+            Ok(staged) => staged,
+            Err(error) => return crate::person_media::outcome(error),
+        };
+        if let Err(error) =
+            crate::person_media::check(media_profile.as_deref(), &media_model, &request.input)
+        {
+            return crate::person_media::outcome(error);
         }
         // The running turn already has its system prompt; a steer adds conversation only.
         let input: Vec<broca_protocol::Message> = request
@@ -3778,6 +3872,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 provider: provider.clone(),
             };
         }
+        if let Err(error) =
+            crate::person_media::publish(self.wal_store.uploads().as_ref(), &self.key, &staged)
+        {
+            return crate::person_media::outcome(error);
+        }
         let input = prepared.input.clone();
         let writer = Arc::clone(self.writer.as_ref().expect("writer live while open"));
         let record = WalRecord::Steered {
@@ -3792,16 +3891,51 @@ impl<W: WalStore + 'static> LineageActor<W> {
             input: Arc::new(input.clone()),
             hooks: prepared.hooks.clone(),
         };
-        if !inbox.deliver(input, || {
-            if let Some(limit) = request
-                .budget
-                .as_ref()
-                .and_then(|budget| budget.max_input_tokens)
-            {
-                writer.record(WalRecord::InputTokenCapFrozen { limit });
+        let delivered = if media_profile.is_none() {
+            // Admissions without a media profile cannot accept person media, so
+            // the text-only handoff needs no media-budget callback.
+            let mut delivered = true;
+            if !inbox.deliver(input, || {
+                if let Some(limit) = request
+                    .budget
+                    .as_ref()
+                    .and_then(|budget| budget.max_input_tokens)
+                {
+                    writer.record(WalRecord::InputTokenCapFrozen { limit });
+                }
+                writer.record_tagged(record).1
+            }) {
+                delivered = false;
             }
-            writer.record_tagged(record).1
-        }) {
+            Ok(delivered)
+        } else {
+            inbox.deliver_checked(
+                input,
+                |protected| {
+                    broca_provider::person_media::check_protected_payload(
+                        media_profile.as_deref(),
+                        &media_model,
+                        protected.iter(),
+                    )
+                    .map_err(|refusal| RunError::MediaUnsupported(refusal.to_string()))
+                },
+                || {
+                    if let Some(limit) = request
+                        .budget
+                        .as_ref()
+                        .and_then(|budget| budget.max_input_tokens)
+                    {
+                        writer.record(WalRecord::InputTokenCapFrozen { limit });
+                    }
+                    writer.record_tagged(record).1
+                },
+            )
+        };
+        let delivered = match delivered {
+            Ok(delivered) => delivered,
+            Err(error) => return crate::person_media::outcome(error),
+        };
+        if !delivered {
             // The run has decided it renders no further step and is writing its terminal: there
             // is no running turn left to join, so the message waits for the next turn instead.
             return self
@@ -4201,6 +4335,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
             .flatten()
             .map(|tool| tool.name.clone())
             .collect();
+        let media = crate::person_media::stage(
+            self.wal_store.uploads().as_ref(),
+            &self.key,
+            &mut resolved_request,
+        )
+        .map_err(StartRunFailure::Admission)?;
+        let media_profile = resolved_request
+            .staged_uploads
+            .as_ref()
+            .and_then(|held| held.profile.clone())
+            .and_then(|profile| serde_json::from_value(profile).ok());
         // A consumed queue entry is already transformed, even if every provider passed or
         // the entry predates hooks. Never ask pre_user again when draining it.
         let mut input_hooks = None;
@@ -4331,6 +4476,25 @@ impl<W: WalStore + 'static> LineageActor<W> {
             recorded: std::sync::Mutex::new(recorded),
         });
         let steer = broca_core::SteerInbox::new();
+        let resuming_media = !matches!(kind, RunKind::AppendEpisode)
+            && prior_snapshot
+                .checkpoint_at_head
+                .last_episode
+                .as_ref()
+                .is_some_and(|episode| {
+                    episode.disposition != EpisodeDisposition::Finished
+                        && crate::person_media::frozen(&episode.config).is_some()
+                });
+        if resuming_media {
+            let records = self
+                .read_wal_records()
+                .await
+                .map_err(StartRunFailure::Infrastructure)?;
+            let (current, pending, step) = crate::person_media::protection_state(&records);
+            steer.seed_replayed_protection(current, pending, step);
+        } else {
+            steer.seed_protected(req.input.clone());
+        }
         // The run may deliver every ordered send still queued, except the one this run consumes.
         steer.seed_ordered(
             self.pending_fifo
@@ -4374,6 +4538,8 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     && episode.pause_reason == Some(broca_protocol::PauseReason::Restart)
             });
         let job = RunJob {
+            media,
+            media_profile,
             conversation_key,
             req,
             auth,
@@ -4742,6 +4908,33 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 Some(differing) => SendOutcome::SendIdReuse { differing },
             };
         }
+        let staged = match crate::person_media::stage(
+            self.wal_store.uploads().as_ref(),
+            &self.key,
+            &mut request,
+        ) {
+            Ok(staged) => staged,
+            Err(error) => return crate::person_media::outcome(error),
+        };
+        let quoted = if broca_provider::person_media::references(&request.input)
+            .next()
+            .is_some()
+        {
+            self.executor.media_profile(&request).await
+        } else {
+            Ok(None)
+        };
+        let profile = match quoted {
+            Ok(profile) => profile,
+            Err(error) => return crate::person_media::outcome(error),
+        };
+        let model = format!(
+            "{}/{}",
+            request.model.provider_module_id, request.model.model_id
+        );
+        if let Err(error) = crate::person_media::check(profile.as_deref(), &model, &request.input) {
+            return crate::person_media::outcome(error);
+        }
         let prepared = match prepared {
             Some(prepared) => prepared,
             None => {
@@ -4763,7 +4956,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 provider: provider.clone(),
             };
         }
+        if let Err(error) =
+            crate::person_media::publish(self.wal_store.uploads().as_ref(), &self.key, &staged)
+        {
+            return crate::person_media::outcome(error);
+        }
         let hooks = prepared.queued_hooks();
+        request.staged_uploads = None;
         let principal = request.principal.clone();
         let pending = PendingSubmission {
             admitted_at_ms: self.message_timestamp(),
@@ -5120,6 +5319,73 @@ impl<W: WalStore + 'static> LineageActor<W> {
         if let Err(error) = self.record_frozen_model(&mut request).await {
             return SendOutcome::Error(error);
         }
+        let staged = match crate::person_media::stage(
+            self.wal_store.uploads().as_ref(),
+            &self.key,
+            &mut request,
+        ) {
+            Ok(staged) => staged,
+            Err(error) => return crate::person_media::outcome(error),
+        };
+        let has_media = broca_provider::person_media::references(&request.input)
+            .next()
+            .is_some();
+        let mut media_model = format!(
+            "{}/{}",
+            request.model.provider_module_id, request.model.model_id
+        );
+        let mut profile = if has_media {
+            match self.executor.media_profile(&request).await {
+                Ok(profile) => profile,
+                Err(error) => return crate::person_media::outcome(error),
+            }
+        } else {
+            None
+        };
+        if order.modes.contains(&broca_protocol::DeliveryMode::Steer)
+            && matches!(self.state, RunState::Active { .. })
+        {
+            let checkpoint = match self.load_checkpoint_at_head().await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return SendOutcome::Transient(error),
+            };
+            profile = checkpoint
+                .last_episode
+                .as_ref()
+                .and_then(|episode| crate::person_media::frozen(&episode.config));
+            if let Some(episode) = &checkpoint.last_episode {
+                media_model = format!(
+                    "{}/{}",
+                    episode.config.model.provider_module_id, episode.config.model.model_id
+                );
+            }
+        }
+        if let Err(error) =
+            crate::person_media::check(profile.as_deref(), &media_model, &request.input)
+        {
+            return crate::person_media::outcome(error);
+        }
+        if has_media
+            && !order.modes.iter().any(|mode| {
+                matches!(
+                    mode,
+                    broca_protocol::DeliveryMode::Steer | broca_protocol::DeliveryMode::IdleStart
+                )
+            })
+        {
+            let kind = broca_provider::person_media::references(&request.input)
+                .next()
+                .unwrap()
+                .kind;
+            return crate::person_media::outcome(RunError::MediaUnsupported(
+                broca_provider::person_media::refusal(
+                    &media_model,
+                    kind,
+                    broca_protocol::MediaMarkerReason::Carrier,
+                )
+                .to_string(),
+            ));
+        }
         let manifest = match self.frozen_input_manifest().await {
             Ok(manifest) => manifest,
             Err(outcome) => return outcome,
@@ -5140,6 +5406,12 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 provider: provider.clone(),
             };
         }
+        if let Err(error) =
+            crate::person_media::publish(self.wal_store.uploads().as_ref(), &self.key, &staged)
+        {
+            return crate::person_media::outcome(error);
+        }
+        request.staged_uploads = None;
         let SendIdentity {
             conversation_key,
             title,
@@ -5218,7 +5490,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 write(old);
             }
         };
-        let superseded = match open_inbox.map(|inbox| inbox.accept_ordered(send, &mut write_once)) {
+        let accepted = open_inbox
+            .map(|inbox| {
+                inbox.accept_ordered_checked(
+                    send,
+                    |protected| {
+                        broca_provider::person_media::check_protected_payload(
+                            profile.as_deref(),
+                            &media_model,
+                            protected.iter(),
+                        )
+                        .map_err(|refusal| RunError::MediaUnsupported(refusal.to_string()))
+                    },
+                    &mut write_once,
+                )
+            })
+            .transpose();
+        let accepted = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => return crate::person_media::outcome(error),
+        };
+        let superseded = match accepted {
             Some(broca_core::OrderedAcceptance::Queued { superseded }) => superseded,
             Some(broca_core::OrderedAcceptance::Closed) | None => {
                 // No turn can deliver anything now, so the actor's own queue decides what this
@@ -6336,7 +6628,11 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         submission_id,
                         run_id,
                         error.to_string(),
-                        "queued_admission_failed",
+                        if matches!(error, RunError::MediaUnsupported(_)) {
+                            "media_unsupported"
+                        } else {
+                            "queued_admission_failed"
+                        },
                     )
                     .await?;
                 }
@@ -8691,6 +8987,8 @@ mod tests {
             out: mpsc::Sender<OutputEvent>,
         ) -> Result<RunSummary, RunError> {
             let RunJob {
+                media: _,
+                media_profile: _,
                 conversation_key: _,
                 req,
                 auth: _,

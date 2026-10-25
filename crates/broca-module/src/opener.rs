@@ -88,6 +88,13 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
     fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
         self.run_index.clone()
     }
+    async fn media_profile(
+        &self,
+        request: &broca_protocol::request::SubmissionRequest,
+    ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, broca_core::RunError>
+    {
+        self.executor.media_profile(request).await
+    }
     fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
         self.wal_store
             .check_move(key, write)

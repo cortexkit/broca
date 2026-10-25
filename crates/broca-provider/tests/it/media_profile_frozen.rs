@@ -1,5 +1,5 @@
 //! The media profile is an optional frozen render field: absent configs keep their exact
-//! serialized shape and request bytes, a recorded profile adds no must-understand WAL feature,
+//! serialized shape and request bytes, a recorded profile requires the media-content/v1 WAL feature,
 //! and the profile a run froze is the one it keeps while the catalog moves underneath it.
 
 use broca_protocol::{
@@ -93,7 +93,7 @@ fn a_config_without_media_omits_the_field_and_reads_back_as_absent() {
 }
 
 #[test]
-fn a_frozen_media_profile_adds_no_must_understand_feature() {
+fn a_frozen_media_profile_requires_the_media_content_feature() {
     let frozen = with_media(WireFamilyId::AnthropicMessages);
     assert!(frozen.media.is_some());
     let started: WalRecord = serde_json::from_value(json!({
@@ -116,8 +116,8 @@ fn a_frozen_media_profile_adds_no_must_understand_feature() {
     .unwrap();
     for record in [started, refrozen] {
         assert!(
-            record.required_features().is_empty(),
-            "a media profile is an optional frozen field, not must-understand: {:?}",
+            record.required_features().contains(&"media-content/v1"),
+            "a media profile must be understood before resuming the run: {:?}",
             record.required_features()
         );
     }

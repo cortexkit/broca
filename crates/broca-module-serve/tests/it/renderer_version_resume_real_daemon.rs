@@ -146,6 +146,7 @@ impl Rig {
                 format!("{PROVIDER}/{MODEL}"): {
                     "existence": "present",
                     "capability.attachment": false,
+                    "capability.input_modalities": ["text", "image"],
                     "capability.reasoning": false,
                     "capability.tool_call": true,
                     "limit.context": 1000000,
@@ -468,4 +469,85 @@ async fn a_run_admitted_at_a_reproducible_renderer_version_resumes_and_an_undecl
     assert!(!refused
         .iter()
         .any(|record| matches!(record, WalRecord::StepStarted { .. })));
+}
+
+#[cfg(feature = "test-attachments")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn person_pdf_reaches_debug_gate_and_is_refused_without_any_session_write() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let url = serve_model(bodies.clone()).await;
+    let Some(rig) = Rig::start(&url).await else {
+        return;
+    };
+    let state = rig.wal_dir().parent().unwrap().to_owned();
+    let key = rig.key("pdf-gate");
+    let uploads = broca_core::media_uploads::Uploads::at(&state);
+    let bytes = b"%PDF-1.7\n%%EOF\n";
+    let now = broca_module::person_media::now_seconds();
+    let id = uploads
+        .begin(
+            &key,
+            &cortexkit_role_llm_runner::attachments::UploadBeginRequest::new(
+                "application/pdf",
+                bytes.len() as u64,
+                format!("{:x}", Sha256::digest(bytes)),
+            ),
+            now,
+        )
+        .unwrap()
+        .upload_id;
+    uploads.append(&key, &id, 0, bytes, now).unwrap();
+    uploads.commit(&key, &id, now).unwrap();
+    let conn = broca_subc::SubcConnection::connect(&rig.connection_file)
+        .await
+        .unwrap();
+    let route = conn.route_open_management("broca", &key).await.unwrap();
+    let describe = conn
+        .route_request(
+            &route,
+            serde_json::to_vec(&serde_json::json!({"method":"role.describe","params":{}})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !describe.to_string().contains("\"attachments\""),
+        "the debug ingress does not promise media.read: {describe}"
+    );
+    let reply = conn.route_request(&route, serde_json::to_vec(&serde_json::json!({
+        "method":"session.send", "params": {"prompt":"inspect", "send_id":"pdf-gate", "model":{"provider":PROVIDER,"model":MODEL}, "content":[{"type":"upload","upload_id":id}]}
+    })).unwrap()).await.expect_err("the person PDF must be refused before admission");
+    let text = reply.to_string();
+    assert!(
+        text.contains("media_unsupported")
+            && text.contains("pdf")
+            && text.contains("modality")
+            && text.contains(MODEL),
+        "{reply}"
+    );
+    let wal = broca_core::FileWalStore::new(rig.wal_dir());
+    assert!(
+        !wal.wal_path(&key).exists(),
+        "a refused fresh send must not even open its WAL"
+    );
+    for class in ["media", "media-durable", "media-ephemeral"] {
+        for dir in ["objects", "refs"] {
+            assert_eq!(
+                std::fs::read_dir(state.join(class).join(dir))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+    assert!(
+        bodies.lock().unwrap().is_empty(),
+        "no provider request on refusal"
+    );
+    let (mime, held) = uploads.read_committed(&key, &id, now).unwrap();
+    assert_eq!(mime, "application/pdf");
+    assert_eq!(held, bytes);
+    // Keep the upload's bytes out of the route request: only the contract reference is sent.
+    assert!(!text.contains(&base64::engine::general_purpose::STANDARD.encode(bytes)));
 }
