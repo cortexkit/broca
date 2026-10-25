@@ -25974,7 +25974,7 @@ runner = "cargo"
 package = "broca-provider"
 target = "--test it"
 test_file = "crates/broca-provider/tests/live_common/vault.rs"
-expect_red = ["live_common::vault::live_credentials_require_explicit_consent_before_reading"]
+expect_red = ["it::live_common::vault::live_credentials_require_explicit_consent_before_reading"]
 expect_message = "credential read without consent"
 file = "crates/broca-provider/tests/live_common/vault.rs"
 old = "    if consent != Some(\"1\") {"

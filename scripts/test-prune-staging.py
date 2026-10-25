@@ -33,6 +33,8 @@ class PruneStagingTests(unittest.TestCase):
             name = f"ck-broca.rollback-{20260101 + i}T010203Z"
             (self.seam / name).write_bytes(f"rollback{i}".encode())
             (self.seam / (name + ".sha256")).write_text("checksum\n")
+            # Retention ranks mtimes, not names; fast writes can share a filesystem tick.
+            os.utime(self.seam / name, ns=(i * 1_000_000_000, i * 1_000_000_000))
         current = self.names[2]
         data = (self.seam / current).read_bytes()
         (self.seam / "ck-broca.current").write_text(

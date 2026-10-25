@@ -418,12 +418,15 @@ fn fill_copy(source: &mut Source, temporary: &TemporaryCopy, destination: &Path)
     let _ = destination;
     #[cfg(unix)]
     {
-        // Copying opens the executable for writing only in cp, which exits before the final rename.
+        // Only the copy child opens the executable for writing, and exits before the final rename.
         // A child forked by another test thread therefore cannot inherit a writer that
-        // would block exec. Read the already-hashed inode even if Cargo replaces its path.
-        let output = Command::new("/bin/cp")
-            .args(["-p", "/dev/fd/0"])
-            .arg(&temporary.path)
+        // would block exec. Read the already-hashed inode even if Cargo replaces its path;
+        // dd reads that input directly instead of reopening stdin through /dev/fd/0.
+        let mut output_path = OsString::from("of=");
+        output_path.push(&temporary.path);
+        let output = Command::new("/bin/dd")
+            .arg("bs=65536")
+            .arg(output_path)
             .stdin(std::process::Stdio::from(source.file.try_clone()?))
             .output()?;
         if !output.status.success() {
@@ -437,8 +440,8 @@ fn fill_copy(source: &mut Source, temporary: &TemporaryCopy, destination: &Path)
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        // macOS reports read-only permissions for /dev/fd/0, not the source's real mode.
-        // Keep owner write access so fixtures can set timestamps or simulate truncation.
+        // Restore the source mode and keep owner write access so fixtures can set timestamps
+        // or simulate truncation; dd copies bytes without preserving permissions.
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = source.file.metadata()?.permissions();
         permissions.set_mode((permissions.mode() & 0o777) | 0o711);
@@ -1231,6 +1234,49 @@ mod tests {
         // Launch the published executable without retry_executable_file_busy, just as an
         // external daemon does: retrying would hide a writer accidentally left open.
         assert!(Command::new(&published).status().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_succeeds_with_closed_stdin() {
+        const CHILD: &str = "BROCA_CKDEV_CLOSED_STDIN_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let scratch = fixture("closed-stdin");
+            let built = source(&scratch, "ck-probe", b"closed stdin build");
+            // Rust can reopen standard descriptors at startup; close stdin at publication.
+            // This child has no other tests whose process-global descriptors could be affected.
+            nix::unistd::close(0).expect("close stdin in isolated publication child");
+            let published = ckdev_binary(&built, &scratch);
+            assert_eq!(fs::read(published).unwrap(), b"closed stdin build");
+            return;
+        }
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ckdev::tests::publication_succeeds_with_closed_stdin",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap(),
+        );
+        let status = crate::wait_until_sync("publication with closed stdin", || {
+            child
+                .0
+                .try_wait()
+                .unwrap()
+                .ok_or_else(|| "publication child is still running".to_string())
+        });
+        assert!(status.success(), "publication child failed: {status}");
     }
 
     #[cfg(unix)]

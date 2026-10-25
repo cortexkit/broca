@@ -256,10 +256,29 @@ impl Rig {
             let identity = identity.clone();
             let scope = scope.clone();
             async move {
-                connection
+                match connection
                     .route_open_tool_provider_v1(target, &identity, scope)
                     .await
-                    .map_err(|e| e.to_string())
+                {
+                    Ok(route) => Ok(route),
+                    // Peers register asynchronously, so unknown_module is also a startup state.
+                    // Capability refusals cannot become ready and must fail without retrying.
+                    Err(error)
+                        if matches!(
+                            error.code(),
+                            Some(
+                                "target_unavailable"
+                                    | "unknown_module"
+                                    | "module_warming"
+                                    | "module_reloading"
+                                    | "module_timeout"
+                            )
+                        ) =>
+                    {
+                        Err(error.to_string())
+                    }
+                    Err(error) => panic!("tool-provider route to {target} refused: {error}"),
+                }
             }
         })
         .await;
