@@ -1285,7 +1285,9 @@ start. A registration is pruned once its call's terminal and batch commit are du
 At boot every session with a registration is opened so its open-time recovery runs, then each
 module that still needs its feed gets its puller. A missing or unreadable `late-results.db` is
 rebuilt off the startup path by scanning the live WALs, decoding only those holding a
-provider-held frame; until that scan completes no entry is delivered or acked.
+provider-held frame; until that scan completes no entry is delivered or acked. A state root
+whose WAL feature floor never named `provider-held/v1` holds no such frame, so its rebuild reads
+no WAL at all.
 
 Ack guarantee, narrowed: broca puts no bound of its own on a hold. A provider keeps at most
 1,000 unacked results per session and drops the oldest first; a held call whose entry was

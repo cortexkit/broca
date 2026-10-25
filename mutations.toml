@@ -27535,3 +27535,16 @@ expect_red = ["actor::tests::a_late_result_resumes_a_held_run_that_opening_alone
 file = "crates/broca-module/src/actor.rs"
 old = "                && !self.resuming_for_late_result"
 new = "                // NON-VACUITY BREAK: keep a held run parked even when its late result arrived."
+
+[[control]]
+id = "intake-rebuild-skips-only-without-held-frames"
+guards = "A rebuild skips the WAL scan only when the state root's feature floor proves no provider-held frame was ever written"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::a_rebuilt_store_registers_held_calls_and_owes_their_feeds_an_ack"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "        .is_ok_and(|floor| !floor.contains(broca_wal::PROVIDER_HELD_FEATURE))"
+new = "        .is_ok_and(|_| true) // NON-VACUITY BREAK: skip the scan whatever the floor says."

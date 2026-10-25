@@ -978,6 +978,9 @@ pub struct RebuildReport {
     pub registered: usize,
     /// Marked WALs that could not be decoded; the rebuild is incomplete while any remain.
     pub unreadable: Vec<std::path::PathBuf>,
+    /// The state root's WAL feature floor shows no provider-held frame was ever written here,
+    /// so no WAL was looked at.
+    pub skipped_by_floor: bool,
 }
 
 /// Whether `path` holds `marker` anywhere, read in bounded chunks so a large WAL never sits in
@@ -1022,6 +1025,17 @@ pub fn rebuild_store_from_wals(
     state_root: &Path,
 ) -> Result<RebuildReport, String> {
     let mut report = RebuildReport::default();
+    // A provider-held frame is gated, and the writer raises the state root's feature floor
+    // before the first gated frame reaches any file. A floor that is readable and lacks the
+    // feature therefore proves no WAL here holds a held call: there is nothing to scan. An
+    // unreadable floor proves nothing, so the scan runs.
+    let floor = state_root.join(broca_wal::FEATURE_FLOOR_FILENAME);
+    if broca_wal::read_floor(&floor)
+        .is_ok_and(|floor| !floor.contains(broca_wal::PROVIDER_HELD_FEATURE))
+    {
+        report.skipped_by_floor = true;
+        return Ok(report);
+    }
     for tree in ["wal", "wal-ephemeral", "wal-durable"] {
         let directory = state_root.join(tree);
         let entries = match std::fs::read_dir(&directory) {
@@ -1898,8 +1912,15 @@ mod tests {
             &delivered_records("lineage:7", "core", &closed),
         );
         quiet_bind("never-held", &wal_root.join("wal"));
+        // A real writer raised the floor before the held frames reached the files.
+        broca_wal::raise_floor(
+            &wal_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
+            &[broca_wal::PROVIDER_HELD_FEATURE],
+        )
+        .unwrap();
         let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
         let report = rebuild_store_from_wals(&store, &wal_root).unwrap();
+        assert!(!report.skipped_by_floor);
         assert_eq!(report.files, 3);
         assert_eq!(
             report.decoded, 2,
@@ -1916,6 +1937,21 @@ mod tests {
         assert_eq!(keys, ["lineage:4", "lineage:7"]);
         assert!(store.feed("tools").unwrap().unwrap().ack_owed);
         assert!(store.feed("core").unwrap().unwrap().ack_owed);
+    }
+
+    /// A state root whose feature floor never named `provider-held/v1` holds no held frame, so a
+    /// rebuild there reads no WAL at all: a deployment that never held a call pays nothing.
+    #[test]
+    fn a_rebuild_reads_no_wal_when_the_floor_never_named_a_held_frame() {
+        let root = rig_root("rebuild-floor");
+        let _ = std::fs::remove_dir_all(&root);
+        let wal_root = root.join("wal-root");
+        quiet_bind("never-held", &wal_root.join("wal"));
+        let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
+        let report = rebuild_store_from_wals(&store, &wal_root).unwrap();
+        assert!(report.skipped_by_floor);
+        assert_eq!(report.files, 0);
+        assert!(store.registrations().unwrap().is_empty());
     }
 
     /// Write one session's records as a real writer frames them, gated frames included, so a
@@ -2156,6 +2192,11 @@ mod tests {
             }
             std::fs::write(tree.join(format!("{index:08}.wal")), encoded).unwrap();
         }
+        broca_wal::raise_floor(
+            &wal_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
+            &[broca_wal::PROVIDER_HELD_FEATURE],
+        )
+        .unwrap();
         let generated_ms = started.elapsed().as_millis();
         let store = LateResultsStore::open(&root.join("late-results.db")).unwrap();
         let rss_before = peak_rss_kb();

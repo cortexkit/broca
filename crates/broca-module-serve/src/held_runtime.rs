@@ -231,6 +231,7 @@ impl HeldRuntime {
                             files = report.files,
                             decoded = report.decoded,
                             registered = report.registered,
+                            skipped_by_floor = report.skipped_by_floor,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "late-results store rebuilt from the live WALs"
                         );
