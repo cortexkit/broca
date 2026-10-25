@@ -2053,8 +2053,9 @@ pub struct WalHandle {
     tx: std_mpsc::Sender<WalCommand>,
     /// Reservation order must equal channel-send order because the writer cross-checks
     /// handle-assigned and WAL-assigned seqs and poisons the handle if they drift.
-    /// Poisoning this mutex is deliberately fail-stop: a panic while it is held leaves
-    /// the reserved-versus-enqueued state unknown, so callers must not recover the guard.
+    /// A panic while it is held leaves the reserved-versus-enqueued state unknown, so
+    /// `lock_enqueue` fails the writer closed (a sticky writer poison) before recovering the
+    /// guard: no later append can reach the WAL, and later calls get errors, not panics.
     enqueue_lock: Mutex<()>,
     /// The next seq this handle will assign. HOISTED from the WAL (writer-task-owned)
     /// to the handle (caller-side) so `record` can assign + RETURN a record's final
@@ -2575,11 +2576,26 @@ impl WalHandle {
                 if budget.refused && !reserved_terminal {
                     return RecordOutcome::Refused(budget.refusal());
                 }
-                let frame = match broca_wal::framing::encode(seq, self.fence, &record) {
-                    Ok(frame) => frame,
-                    Err(error) => {
+                // Framing runs broca-wal's per-record feature logic while this holds both the
+                // enqueue lock and the budget lock. A panic there must not unwind through
+                // them: it would poison both, and every later call on this handle would panic
+                // on the poisoned locks. It fails this append like an encode error instead.
+                let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    broca_wal::framing::encode(seq, self.fence, &record)
+                }));
+                let frame = match encoded {
+                    Ok(Ok(frame)) => frame,
+                    Ok(Err(error)) => {
                         set_poison(&self.poisoned, error.to_string());
                         return RecordOutcome::Refused(WalWriteError::Failed(error.to_string()));
+                    }
+                    Err(panic) => {
+                        let error = format!(
+                            "framing WAL record {seq} panicked: {}",
+                            panic_text(panic.as_ref())
+                        );
+                        set_poison(&self.poisoned, error.clone());
+                        return RecordOutcome::Refused(WalWriteError::Failed(error));
                     }
                 };
                 let end = budget
@@ -2821,13 +2837,31 @@ impl WalHandle {
     /// Serializes sequence reservation with the enqueue that follows it, so two appenders
     /// cannot interleave and hand the writer records out of sequence order.
     ///
-    /// The lock carries no data: it orders two statements rather than protecting state, so a
-    /// panic between reserve and send aborts that append without leaving anything half-written
-    /// for the next holder to observe. That is why unwrapping here is safe, and why the guarded
-    /// region must stay confined to the reserve-and-send pair.
+    /// A panic while the lock is held poisons it, and leaves unknown whether the panicking
+    /// append reserved a seq it never sent. Unwrapping the poison would make every later call
+    /// on this handle panic too, including the ones that tear the session down. Instead the
+    /// handle fails closed the way any other append failure does: it records a sticky writer
+    /// poison before handing the guard back. From then on the writer task drops every append
+    /// and every barrier reports the error, so nothing reserved in the unknown state can be
+    /// written or claimed durable.
     #[cfg(not(test))]
     fn lock_enqueue(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.enqueue_lock.lock().unwrap()
+        self.enqueue_lock
+            .lock()
+            .unwrap_or_else(|poisoned| self.recover_enqueue_lock(poisoned))
+    }
+
+    /// Fail the writer closed after a panic poisoned the enqueue lock, then keep using the
+    /// lock: it guards no data, only the order of reservation and send.
+    fn recover_enqueue_lock<'a>(
+        &self,
+        poisoned: std::sync::PoisonError<std::sync::MutexGuard<'a, ()>>,
+    ) -> std::sync::MutexGuard<'a, ()> {
+        set_poison(
+            &self.poisoned,
+            "an earlier WAL append panicked while holding the enqueue lock".into(),
+        );
+        poisoned.into_inner()
     }
 
     #[cfg(test)]
@@ -2839,9 +2873,11 @@ impl WalHandle {
                 if let Some(probe) = probe {
                     probe();
                 }
-                self.enqueue_lock.lock().unwrap()
+                self.enqueue_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| self.recover_enqueue_lock(poisoned))
             }
-            Err(std::sync::TryLockError::Poisoned(_)) => self.enqueue_lock.lock().unwrap(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => self.recover_enqueue_lock(poisoned),
         }
     }
 
@@ -3018,6 +3054,15 @@ fn writer_loop(
             }
         }
     }
+}
+
+/// The message a panic carried, for the writer error that replaces it.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a non-string panic payload")
 }
 
 /// Records the first fatal writer error, which every later append and barrier then reports.
@@ -3293,6 +3338,46 @@ mod tests {
         fn last_seq(&self) -> u64 {
             self.last_seq
         }
+    }
+
+    /// A panic while an append holds the enqueue lock (here, after it reserved its seq and
+    /// before it sent the record) fails the writer closed. Later calls on the handle get the
+    /// writer error instead of panicking on the poisoned lock, so one bad record cannot turn
+    /// every later append, barrier and teardown on the session into another panic.
+    #[tokio::test]
+    async fn a_panic_inside_an_append_fails_the_writer_closed_without_later_panics() {
+        let dir = tmp("enqueue-panic");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = FileWalStore::new(&dir);
+        let session = BindIdentity::new("/tmp/p", "h", "s");
+        let handle = WalHandle::spawn(store.open(&session).unwrap(), 1).expect("spawn writer");
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        handle.set_after_reserve_probe_for_test(Arc::new(move |seq| {
+            if first.swap(false, Ordering::SeqCst) {
+                panic!("append {seq} panicked after reserving its seq");
+            }
+        }));
+        let record = |step| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.record(WalRecord::StepStarted {
+                    step_id: StepId(step),
+                })
+            }))
+        };
+        assert!(record(1).is_err(), "the probe panics the first append");
+        assert!(
+            record(2).is_ok(),
+            "a later append panicked on the poisoned enqueue lock"
+        );
+        let error = handle.sync().await.expect_err("the writer failed closed");
+        assert!(
+            matches!(&error, WalWriteError::Failed(message)
+                if message.contains("panicked while holding the enqueue lock")),
+            "{error:?}"
+        );
+        assert!(handle.is_poisoned());
+        assert!(handle.shutdown().await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn park_first_reservation(
