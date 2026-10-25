@@ -374,8 +374,8 @@ async fn a_resend_after_an_interrupted_call_asks_only_unanswered_items() {
     );
 }
 
-/// The process-kill form of the same: a process died holding the batch (its row is still
-/// `running`). Startup releases it, and the re-send asks only the unanswered item.
+/// A partial batch stays running while its owner's lifetime lock is held. Once the owner
+/// disappears, startup releases it and a re-send asks only the unanswered item.
 #[tokio::test]
 async fn a_batch_a_dead_process_held_is_released_at_startup_and_resumed() {
     let path = broca_test_support::scratch_root()
@@ -385,24 +385,46 @@ async fn a_batch_a_dead_process_held_is_released_at_startup_and_resumed() {
         Arc::new(SystemOneStore::open(&path).unwrap()),
         Config::default(),
     );
-    first
-        .stand_in
-        .script("a", vec![Script::Answer(noul("0.5", None))]);
-    let gate = Arc::new(Semaphore::new(0));
-    first
-        .stand_in
-        .script("b", vec![Script::Held(gate, noul("0.6", None))]);
-    let service = Arc::clone(&first.service);
     let body = params("dead", JEV, &["a", "b"], None);
-    let call = {
-        let body = body.clone();
-        tokio::spawn(async move { classify::run(&service, &body, &test_scope(), None).await })
-    };
-    while first.stand_in.held.load(Ordering::SeqCst) == 0 {
-        first.stand_in.entered.notified().await;
-    }
-    // A killed process runs no drop: forget the call's future so its hold is never released.
-    std::mem::forget(call);
+    use broca_store::system_one::{BatchClaim, Outcome, StoredOutcome};
+    use sha2::{Digest, Sha256};
+    let request = cortexkit_role_classifier::request::parse_request(&body).unwrap();
+    let identity = serde_json::to_string(
+        &cortexkit_role_classifier::identity::BatchIdentity::of(&request).unwrap(),
+    )
+    .unwrap();
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    first
+        .store
+        .claim(&BatchClaim {
+            role: STORE_ROLE,
+            batch_id: "dead",
+            model: JEV,
+            identity: &identity,
+            body_digest: &digest,
+            frozen_row: r#"{"input_rate_nanos":42000000,"output_rate_nanos":0}"#,
+            scope: &test_scope(),
+            ceiling_nanos: None,
+            owner: &first.service.owner,
+            now_ms: 1,
+        })
+        .unwrap();
+    first
+        .store
+        .record(
+            STORE_ROLE,
+            "dead",
+            &first.service.owner,
+            &StoredOutcome {
+                index: 0,
+                outcome: Outcome::Answered(r#"{"q":{"type":"noul","noul":0.5}}"#.into()),
+                input_tokens: None,
+                output_tokens: None,
+            },
+            0,
+            2,
+        )
+        .unwrap();
 
     let second = rig_owned(
         Arc::new(SystemOneStore::open(&path).unwrap()),
@@ -414,6 +436,12 @@ async fn a_batch_a_dead_process_held_is_released_at_startup_and_resumed() {
         .script("b", vec![Script::Answer(noul("0.6", None))]);
     let blocked = refused(&second, body.clone()).await;
     assert_eq!(blocked["code"], "batch_in_progress");
+    assert_eq!(
+        second.service.release_abandoned().unwrap(),
+        0,
+        "a live owner must keep its claim"
+    );
+    drop(first);
     assert_eq!(second.service.release_abandoned().unwrap(), 1);
     let reply = admitted(&second, body).await;
     assert_eq!(
@@ -854,8 +882,8 @@ async fn retention_deletes_a_batch_seven_days_after_its_first_admission() {
     );
 }
 
-/// The batch store is its own file: serving batches writes nothing beside it in broca's state
-/// root, and leaves the run index and the session WAL tree byte for byte as they were.
+/// Serving batches writes only its database and owner-lifetime lock, leaving the run index
+/// and the session WAL tree byte for byte as they were.
 #[tokio::test]
 async fn the_store_never_touches_the_run_index_or_any_wal() {
     let root = broca_test_support::scratch_root()
@@ -896,13 +924,19 @@ async fn the_store_never_touches_the_run_index_or_any_wal() {
     admitted(&rig, params("files", JEV, &["a", "b"], None)).await;
     admitted(&rig, params("files", JEV, &["a", "b"], None)).await;
     rig.service.sweep().await.unwrap();
+    use sha2::{Digest, Sha256};
+    let owner_file = root.join(format!(
+        "system-one.db.owner-{:x}.lock",
+        Sha256::digest(b"this-process")
+    ));
+    assert!(std::fs::read(&owner_file).unwrap().is_empty());
     let after: Vec<_> = snapshot(&root)
         .into_iter()
-        .filter(|(path, _, _)| path != &root.join("system-one.db"))
+        .filter(|(path, _, _)| path != &root.join("system-one.db") && path != &owner_file)
         .collect();
     assert_eq!(
         after, before,
-        "only system-one.db is new; nothing else changed"
+        "only system-one.db and its exact owner-lifetime lock are new; nothing else changed"
     );
 }
 

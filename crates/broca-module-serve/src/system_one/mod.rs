@@ -265,6 +265,13 @@ pub struct SystemOne {
     fallback_release_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
+/// Pricing accepted before private-content admission. Keeping this snapshot with a delayed
+/// call prevents a catalog refresh from changing what was already admitted.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ToolAdmission {
+    frozen_row: String,
+}
+
 /// Process-lifetime observations only. No batch ids, questions, states or answers enter health.
 #[derive(Default, serde::Serialize)]
 struct Metrics {
@@ -369,6 +376,69 @@ impl SystemOne {
         &self.role
     }
 
+    /// Share durable storage and provider clients, but not claims or concurrency permits.
+    /// Startup releases abandoned claims once, before either instance starts serving.
+    pub fn fork_for_tools(&self) -> Self {
+        let mut service = Self::new(
+            self.store.clone(),
+            self.owner.clone(),
+            self.catalog.clone(),
+            self.pins.clone(),
+            self.config.clone(),
+            self.in_flight.clone(),
+        )
+        .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+        .with_clock(self.clock.clone());
+        service.export = self.export.clone();
+        service.charge_basis = self.charge_basis.clone();
+        service
+    }
+
+    pub(crate) fn tool_now(&self) -> i64 {
+        (self.clock)()
+    }
+
+    pub(crate) fn admit_tool(
+        &self,
+        params: &str,
+        stored: Option<&broca_store::system_one::StoredBatch>,
+    ) -> Result<ToolAdmission, Refusal> {
+        classify::admit_tool(self, params, stored)
+    }
+
+    pub(crate) fn replay_tool(
+        &self,
+        params: &str,
+        stored: &broca_store::system_one::StoredBatch,
+    ) -> Result<Box<RawValue>, Refusal> {
+        classify::replay_tool(params, stored)
+    }
+
+    pub(crate) async fn execute_tool(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+        args_digest: String,
+        admission: ToolAdmission,
+        admitted_at_ms: Option<i64>,
+    ) -> Result<Box<RawValue>, Refusal> {
+        self.sweep()
+            .await
+            .map_err(|_| internal_refusal("batch retention is unavailable"))?;
+        let gauge = self.in_flight.clone();
+        gauge.fetch_add(1, Ordering::Relaxed);
+        let _lowered = GaugeGuard(gauge);
+        let _slot = self.call_slots.clone().acquire_owned().await;
+        classify::run_inner(
+            &self,
+            &params,
+            &scope,
+            admitted_at_ms,
+            Some((&args_digest, &admission)),
+        )
+        .await
+    }
+
     /// The batch recorded under this service's role for `batch_id`, with its outcomes; `None`
     /// when there is none. Reads only: nothing is claimed or written.
     pub async fn stored_batch(
@@ -389,7 +459,7 @@ impl SystemOne {
         self
     }
 
-    /// Release every batch a previous process left running. Call once, before serving.
+    /// Release provably abandoned batches without disturbing a live owner. Call before serving.
     pub fn release_abandoned(&self) -> Result<usize, String> {
         self.flush_facts()?;
         self.store.release_abandoned().map_err(|e| e.to_string())
@@ -664,3 +734,92 @@ mod tests;
 #[cfg(test)]
 #[path = "workers_ai_tests.rs"]
 mod workers_ai_tests;
+
+#[cfg(test)]
+mod tool_admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicI64};
+
+    struct Catalog {
+        present: AtomicBool,
+        reads: AtomicUsize,
+    }
+    impl BatchCatalog for Catalog {
+        fn row(&self, _: &str) -> Option<ModelBatchRow> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.present.load(Ordering::SeqCst).then(|| ModelBatchRow {
+                kind: Some("decision".into()),
+                context_tokens: None,
+                attachment: false,
+                input_rate_nanos: Some(42_000_000),
+                output_rate_nanos: Some(0),
+            })
+        }
+    }
+    struct Answer;
+    #[async_trait::async_trait]
+    impl ClassifierProvider for Answer {
+        fn egress_host(&self) -> String {
+            "localhost".into()
+        }
+        fn credential_id(&self) -> Option<String> {
+            None
+        }
+        async fn call(&self, _: String) -> ProviderReply {
+            ProviderReply::Answered(br#"{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":0.5}},"usage":{"input_tokens":100}}"#.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_admission_and_original_time_survive_delayed_execution() {
+        let catalog = Arc::new(Catalog {
+            present: AtomicBool::new(true),
+            reads: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(AtomicI64::new(1000 + 24 * 60 * 60 * 1000));
+        let read_clock = clock.clone();
+        let service = Arc::new(
+            SystemOne::new(
+                Arc::new(SystemOneStore::open_in_memory().unwrap()),
+                "delayed-owner",
+                catalog.clone(),
+                vec![ModelPin::jev(Arc::new(Answer))],
+                Config::default(),
+                Arc::default(),
+            )
+            .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+            .with_clock(Arc::new(move || read_clock.load(Ordering::SeqCst))),
+        );
+        let params = serde_json::json!({"batch_id":"held","model":JEV_1_13_0,"questions":{"q":{"type":"noul","instructions":"Flag?"}},"items":[{"state":"invented"}],"max_cost_usd":0.01}).to_string();
+        let admission = service.admit_tool(&params, None).unwrap();
+        catalog.present.store(false, Ordering::SeqCst);
+        let scope = broca_store::system_one::BatchScope::Run {
+            agent_id: "agent".into(),
+            run_id: "run".into(),
+        };
+        service
+            .clone()
+            .execute_tool(params, scope, "digest".into(), admission, Some(1000))
+            .await
+            .unwrap();
+        let stored = service.stored_batch("held").await.unwrap().unwrap();
+        assert_eq!(
+            stored.admitted_at_ms, 1000,
+            "execution must not reset the admission anchor"
+        );
+        assert_eq!(stored.args_digest, "digest");
+        assert_eq!(stored.outcomes.len(), 1);
+        assert_eq!(
+            catalog.reads.load(Ordering::SeqCst),
+            1,
+            "execution must not reread the admitted catalog row"
+        );
+        clock.store(
+            1000 + broca_store::system_one::RETENTION_MS - 1,
+            Ordering::SeqCst,
+        );
+        assert_eq!(service.sweep().await.unwrap(), 0);
+        clock.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(service.sweep().await.unwrap(), 1);
+    }
+}

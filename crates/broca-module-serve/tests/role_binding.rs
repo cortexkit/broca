@@ -485,7 +485,7 @@ fn manifest_does_not_advertise_unimplemented_roles_or_operations() {
     use subc_protocol::manifest::ProviderRole;
     let manifest = broca_module_serve::manifest::manifest("broca");
     let capabilities = manifest.capabilities.as_ref().unwrap();
-    for capability in ["llm-runner/v1", "classifier/v1"] {
+    for capability in ["llm-runner/v1", "classifier/v1", "tool-provider/v1"] {
         assert!(
             capabilities
                 .provides
@@ -494,15 +494,13 @@ fn manifest_does_not_advertise_unimplemented_roles_or_operations() {
             "missing {capability}"
         );
     }
-    for capability in ["tool-provider/v1", "permissions/v1"] {
-        assert!(
-            !capabilities
-                .provides
-                .iter()
-                .any(|provided| provided == capability),
-            "unimplemented role advertised: {capability}"
-        );
-    }
+    assert!(
+        !capabilities
+            .provides
+            .iter()
+            .any(|provided| provided == "permissions/v1"),
+        "unimplemented role advertised: permissions/v1"
+    );
     let operations = manifest
         .provides
         .iter()
@@ -511,14 +509,13 @@ fn manifest_does_not_advertise_unimplemented_roles_or_operations() {
             _ => None,
         })
         .unwrap();
-    for name in [
-        "tool.catalog",
-        "tool.call",
-        "late_results",
-        "late_results.ack",
-        "permissions.list",
-        "permissions.revoke",
-    ] {
+    for name in ["tool.catalog", "late_results", "late_results.ack"] {
+        assert!(
+            operations.iter().any(|operation| operation.name == name),
+            "missing implemented operation: {name}"
+        );
+    }
+    for name in ["tool.call", "permissions.list", "permissions.revoke"] {
         assert!(
             !operations.iter().any(|operation| operation.name == name),
             "unimplemented operation advertised: {name}"

@@ -521,6 +521,7 @@ struct Routes {
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     /// System One, when this build serves it; a classifier bind is refused without it.
     system_one: Option<Arc<crate::system_one::SystemOne>>,
+    llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
     // The bind observations (project id, principal) stay beside the session key rather than
     // inside it: BindIdentity also keys the actor registry, so folding them in would give one
     // session WAL a separate actor per distinct observation, all writing the same file.
@@ -542,6 +543,7 @@ impl Routes {
         Self {
             agent_data: None,
             system_one: None,
+            llm_tools: None,
             by_channel: std::collections::HashMap::new(),
             pending_binds: std::collections::HashMap::new(),
             bind_tasks: JoinSet::new(),
@@ -904,6 +906,49 @@ where
 /// `classifier/v1` role, reached by routes that declare it.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_connection_with_services<R, W, H>(
+    read_half: R,
+    write_half: W,
+    module_id: &str,
+    handler: Arc<H>,
+    health_registry: Arc<LineageRegistry>,
+    vault_gauge: Arc<VaultGauge>,
+    catalog_cache: Option<Arc<broca_catalog::CatalogCache>>,
+    archive: crate::wal_archive::WalArchiveConfig,
+    consumer_routes: crate::consumer_routes::ConsumerRoutes,
+    vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
+    daemon_capabilities: Option<Vec<String>>,
+    scope_describer: Option<Arc<broca_subc::ModuleScopeDescriber>>,
+    agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
+    system_one: Option<Arc<crate::system_one::SystemOne>>,
+) -> Result<ServeEnd, ServeIoError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+    H: ServeHandler + 'static,
+{
+    serve_connection_with_llm_tools(
+        read_half,
+        write_half,
+        module_id,
+        handler,
+        health_registry,
+        vault_gauge,
+        catalog_cache,
+        archive,
+        consumer_routes,
+        vault_auditor,
+        daemon_capabilities,
+        scope_describer,
+        agent_data,
+        system_one,
+        None,
+    )
+    .await
+}
+
+/// Add the sessionless model-tool service without changing existing classifier callers.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_connection_with_llm_tools<R, W, H>(
     mut read_half: R,
     write_half: W,
     module_id: &str,
@@ -918,6 +963,7 @@ pub async fn serve_connection_with_services<R, W, H>(
     scope_describer: Option<Arc<broca_subc::ModuleScopeDescriber>>,
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     system_one: Option<Arc<crate::system_one::SystemOne>>,
+    llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
@@ -953,6 +999,7 @@ where
             scope_describer.as_deref(),
             agent_data,
             system_one,
+            llm_tools,
         ),
     );
     let mut writer_finished = false;
@@ -1008,6 +1055,7 @@ async fn run_frame_loop<R, H>(
     scope_describer: Option<&broca_subc::ModuleScopeDescriber>,
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     system_one: Option<Arc<crate::system_one::SystemOne>>,
+    llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
 ) -> Result<ServeEnd, ServeIoError>
 where
     R: AsyncRead + Unpin,
@@ -1031,6 +1079,7 @@ where
     let mut routes = Routes::new(daemon_scopes);
     routes.agent_data = agent_data;
     routes.system_one = system_one;
+    routes.llm_tools = llm_tools;
     let request_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_ROUTE_REQUESTS));
     let mut request_tasks = JoinSet::new();
 
@@ -1346,6 +1395,53 @@ where
                 return Ok(true);
             }
             if matches!(bind.role, RouteRole::ToolProvider | RouteRole::Permissions) {
+                if bind.role == RouteRole::ToolProvider {
+                    let service = routes.llm_tools.clone();
+                    let writer = writer.clone();
+                    request_tasks.spawn(reply_on_panic(
+                        writer.clone(),
+                        (ver, channel, epoch, corr),
+                        async move {
+                            let answer = match service {
+                                Some(service) => tokio::spawn(async move {
+                                    service
+                                        .answer(&frame.body, bind.principal.as_ref(), &bind.scope)
+                                        .await
+                                })
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(crate::system_one::refusal_body(
+                                        &crate::system_one::internal_refusal(
+                                            "model tool request failed",
+                                        ),
+                                    ))
+                                }),
+                                None => Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                                    "unknown_method",
+                                    "model tools are not configured",
+                                ))
+                                .expect("error encodes")),
+                            };
+                            match answer {
+                                Ok(body) => {
+                                    send_response_bytes(
+                                        &writer,
+                                        ver,
+                                        channel,
+                                        epoch,
+                                        corr,
+                                        body.get().as_bytes().to_vec(),
+                                    )
+                                    .await
+                                }
+                                Err(body) => {
+                                    send_error_bytes(&writer, ver, channel, epoch, corr, body).await
+                                }
+                            }
+                        },
+                    ));
+                    return Ok(true);
+                }
                 send_error(
                     writer,
                     ver,
@@ -1525,7 +1621,10 @@ async fn handle_control_request(
             let bind = BindObservation {
                 agent_data: matches!(&target, subc_protocol::RouteTarget::InternalService { service_id, .. }
                     if service_id == broca_wire::agent_data::SERVICE_ID),
-                role: if matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. }) {
+                role: if matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. })
+                    || (matches!(target, subc_protocol::RouteTarget::ToolProvider { .. })
+                        && role == RouteRole::ToolProvider)
+                {
                     role
                 } else {
                     RouteRole::LlmRunner
@@ -1534,9 +1633,7 @@ async fn handle_control_request(
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
             };
-            if !bind.agent_data
-                && !matches!(target, subc_protocol::RouteTarget::ManagementSurface { .. })
-            {
+            if !serves_bind_target(&target, bind.role, routes.llm_tools.is_some()) {
                 return send_error(
                     writer,
                     frame.header.ver,
@@ -3744,6 +3841,42 @@ async fn send_json_response<T: serde::Serialize>(
     send(writer, frame).await
 }
 
+async fn send_response_bytes(
+    writer: &EgressSender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    body: Vec<u8>,
+) -> Result<(), ServeIoError> {
+    let frame_bytes = body.len().saturating_add(subc_protocol::HEADER_LEN);
+    if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {
+        // No bytes from this reply have reached the wire, so a small correlated Error
+        // can fail this call without invalidating any sibling request on the connection.
+        return send_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "response_too_large",
+            "response exceeds the transport frame limit",
+        )
+        .await;
+    }
+    let frame = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|e| ServeIoError(e.to_string()))?;
+    send(writer, frame).await
+}
+
 fn refused_send_code(error: &ServeError) -> String {
     match error {
         ServeError::Upload(error) => error.code.into(),
@@ -4216,6 +4349,18 @@ enum RouteRole {
     Classifier,
     ToolProvider,
     Permissions,
+}
+
+/// Adding model tools admits only the matching tool-provider role, not arbitrary new route
+/// targets. Internal agent-data and management routes retain their existing target rules.
+fn serves_bind_target(target: &subc_protocol::RouteTarget, role: RouteRole, tools: bool) -> bool {
+    match target {
+        subc_protocol::RouteTarget::ManagementSurface { .. } => true,
+        subc_protocol::RouteTarget::InternalService { service_id, .. } => {
+            service_id == broca_wire::agent_data::SERVICE_ID
+        }
+        subc_protocol::RouteTarget::ToolProvider { .. } => role == RouteRole::ToolProvider && tools,
+    }
 }
 
 impl RouteRole {
@@ -4782,6 +4927,42 @@ impl std::error::Error for ServeIoError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_bind_target_does_not_widen_management_or_internal_service_admission() {
+        use subc_protocol::RouteTarget;
+        let module_id = "broca".to_owned();
+        let management = RouteTarget::ManagementSurface {
+            module_id: module_id.clone(),
+        };
+        let tools = RouteTarget::ToolProvider {
+            module_id: module_id.clone(),
+        };
+        let agent_data = RouteTarget::InternalService {
+            module_id: module_id.clone(),
+            service_id: broca_wire::agent_data::SERVICE_ID.into(),
+        };
+        let unrelated = RouteTarget::InternalService {
+            module_id,
+            service_id: "unrelated-service".into(),
+        };
+        for role in [
+            RouteRole::LlmRunner,
+            RouteRole::Classifier,
+            RouteRole::ToolProvider,
+            RouteRole::Permissions,
+        ] {
+            for enabled in [false, true] {
+                assert!(serves_bind_target(&management, role, enabled));
+                assert!(serves_bind_target(&agent_data, role, enabled));
+                assert!(!serves_bind_target(&unrelated, role, enabled));
+                assert_eq!(
+                    serves_bind_target(&tools, role, enabled),
+                    role == RouteRole::ToolProvider && enabled
+                );
+            }
+        }
+    }
     use broca_module::serve::{
         CancelResponse, RetractResponse, RunStatusResponse, SendRequest, SendResponse,
         SessionReadResponse, StatusResponse,
@@ -7198,6 +7379,44 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn oversized_tool_response_is_call_local() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (writer, mut written) =
+                broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
+            let large = serde_json::to_vec(&serde_json::json!({
+                "answers":{"q":{"type":"noul","noul":0.5,"provider_extra":{"text":"x".repeat(broca_wire::SUBC_MAX_FRAME_BYTES as usize)}}},
+                "usage":{"input_tokens":0},"cost_usd":0,
+            })).unwrap();
+            let result: cortexkit_llm_tools::classify::Result = serde_json::from_slice(&large).unwrap();
+            cortexkit_llm_tools::classify::validate_result(&result).unwrap();
+            send_response_bytes(
+                &writer,
+                PROTOCOL_VERSION,
+                1,
+                1,
+                1,
+                large,
+            )
+            .await
+            .unwrap();
+            send_response_bytes(&writer, PROTOCOL_VERSION, 1, 1, 2, b"{}".to_vec())
+                .await
+                .unwrap();
+            let refused = next_written(&mut written).await;
+            assert_eq!(refused.header.ty, FrameType::Error);
+            assert_eq!(refused.header.corr, 1);
+            let error: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+            assert_eq!(error["code"], "response_too_large");
+            let sibling = next_written(&mut written).await;
+            assert_eq!(sibling.header.ty, FrameType::Response);
+            assert_eq!(sibling.header.corr, 2);
+            assert_eq!(sibling.body, b"{}");
+        })
+        .await
+        .expect("the tool reply writer did not finish within its bound");
+    }
+
     #[test]
     fn reply_frame_size_uses_the_real_header_length_and_result_envelope() {
         let result = serde_json::json!({"answer":"ok"});
@@ -7329,6 +7548,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &crate::consumer_routes::ConsumerRoutes::default(),
+                None,
                 None,
                 None,
                 None,
@@ -7524,6 +7744,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -7696,6 +7917,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -7851,6 +8073,7 @@ mod tests {
                 Some(loop_describer.as_ref()),
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -7953,6 +8176,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
@@ -8102,6 +8326,7 @@ mod tests {
                 CancellationToken::new(),
                 crate::wal_archive::WalArchiveConfig::default(),
                 &consumer_routes,
+                None,
                 None,
                 None,
                 None,
