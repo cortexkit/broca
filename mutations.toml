@@ -29282,8 +29282,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
 expect_red = ["memory_private_unknown_provider_is_not_dispatched"]
 file = "crates/broca-module-serve/src/llm_tools/route.rs"
-old = "        if stored.is_none() {\n            match self.private_content.admit(scope, &admission.provider).await {"
-new = "        if stored.is_none() {\n            match Ok::<Verdict, Vec<u8>>(Verdict::Admitted) { // NON-VACUITY BREAK: execute an unlisted provider."
+old = "        if stored.is_none() {\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
+new = "        if stored.is_none() && admission.provider == \"never-a-provider\" { // NON-VACUITY BREAK: skip the policy for a fresh call.\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
 
 [[control]]
 id = "llm-tool-single-flight-joins-waiters"
@@ -29568,8 +29568,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
 expect_red = ["llm_tools::private_content::tests::a_marked_run_needs_approval_for_an_unlisted_provider_and_files_nothing"]
 file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
-old = "        if !marked.marked {\n            return Ok(Verdict::Admitted);\n        }\n        // A live grant admits without a card; grants are the next slice's admission path."
-new = "        if true { // NON-VACUITY BREAK: call a marked scope's provider without asking anyone.\n            return Ok(Verdict::Admitted);\n        }\n        // A live grant admits without a card; grants are the next slice's admission path."
+old = "        if !marked.marked {\n            return Ok(());\n        }\n        // A live grant would also admit here; this code does not consult grants yet."
+new = "        if true { // NON-VACUITY BREAK: call a marked scope provider without asking anyone.\n            return Ok(());\n        }\n        // A live grant would also admit here; this code does not consult grants yet."
 
 [[control]]
 id = "llm-tool-private-content-unrecognized-source-files-no-card"
@@ -29594,8 +29594,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
 expect_red = ["llm_tools::private_content::tests::a_marked_flow_calls_the_base_set_and_basals_list"]
 file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
-old = "        if !marked.marked {\n            return Ok(Verdict::Admitted);\n        }\n        Err(encoded_refusal(\n            \"provider_not_allowed\","
-new = "        if true { // NON-VACUITY BREAK: let a marked flow call a provider its version never allowed.\n            return Ok(Verdict::Admitted);\n        }\n        Err(encoded_refusal(\n            \"provider_not_allowed\","
+old = "        if !marked.marked {\n            return Ok(());\n        }\n        Err(encoded_refusal(\n            \"provider_not_allowed\","
+new = "        if true { // NON-VACUITY BREAK: let a marked flow call a provider its version never allowed.\n            return Ok(());\n        }\n        Err(encoded_refusal(\n            \"provider_not_allowed\","
 
 [[control]]
 id = "llm-tool-flow-refusal-is-passed-through"
