@@ -29581,8 +29581,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
 expect_red = ["llm_tools::private_content::tests::a_marked_answer_with_only_unknown_kinds_has_no_source_to_name"]
 file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
-old = "        if marked.sources.is_empty() {\n            return Err(consent_refusal(provider, PRIVATE_CONTENT_UNKNOWN));\n        }"
-new = "        if false { // NON-VACUITY BREAK: draw a card for a scope whose source cannot be named.\n            return Err(consent_refusal(provider, PRIVATE_CONTENT_UNKNOWN));\n        }"
+old = "            let consent = if answered {\n                PRIVATE_CONTENT_UNKNOWN"
+new = "            let consent = if answered\n                && false { // NON-VACUITY BREAK: never take the answered branch, so an unknown source reads as unreachable.\n                PRIVATE_CONTENT_UNKNOWN"
 
 [[control]]
 id = "llm-tool-flow-providers-narrow-a-marked-flow"
