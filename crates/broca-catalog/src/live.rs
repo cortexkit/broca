@@ -93,6 +93,9 @@ impl CodeAssistRoute<'_> {
 /// policies within the same `AnthropicMessages` family.
 #[derive(Debug, Clone, Default)]
 pub struct ResolveOptions<'a> {
+    /// Freeze media only for an input that needs it; ordinary admissions keep their bytes.
+    pub media: bool,
+    pub media_profile: Option<&'a broca_provider::media_profile::MediaProfile>,
     /// The selected credential method. Most providers use it only for credential lookup;
     /// Anthropic also uses it to freeze the API-key or OAuth request policies.
     pub auth_method: Option<AuthMethod>,
@@ -1088,6 +1091,15 @@ fn resolve_provider_inner(
                     spec.capabilities.structured_output
                 }),
         )?;
+        if opts.media {
+            if let Some(profile) = opts.media_profile {
+                frozen.media = Some(profile.clone());
+            } else if let Some((provider, model)) =
+                catalog.model_for_serving(provider_id, catalog_model_id)
+            {
+                broca_provider::media_profile::freeze_media_profile(&mut frozen, &provider, &model);
+            }
+        }
         let frozen = episode_render.apply(frozen);
         let resolved_base_url = frozen
             .base_url
@@ -1248,6 +1260,17 @@ fn resolve_provider_inner(
             && model_id == "kimi-k2.6"
         {
             frozen.opencode_go_long_cache_retention_unsupported = true;
+        }
+    }
+    if opts.media {
+        if let Some(profile) = opts.media_profile {
+            frozen.media = Some(profile.clone());
+        } else {
+            broca_provider::media_profile::freeze_media_profile(
+                &mut frozen,
+                &provider_spec,
+                &model_spec,
+            );
         }
     }
     let frozen = episode_render.apply(frozen);

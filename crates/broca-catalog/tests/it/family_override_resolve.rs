@@ -78,6 +78,47 @@ mod gated {
     }
 
     #[test]
+    fn media_freezes_only_when_needed_and_uses_the_final_override_family() {
+        common::install_snapshot();
+        for family_override in [None, Some(WireFamilyId::OpenAiResponsesChatgpt)] {
+            for media in [false, true] {
+                let resolved = ok(
+                    resolve_provider(
+                        "openai/gpt-5.3-codex",
+                        None,
+                        2048,
+                        &AuthMode::Bearer(CHATGPT_JWT.into()),
+                        &ResolveOptions {
+                            media,
+                            family_override,
+                            ..Default::default()
+                        },
+                    ),
+                    "media profile resolution",
+                );
+                let frozen: broca_provider::wire::FrozenRenderConfig =
+                    serde_json::from_value(resolved.provider.render_config_blob()).unwrap();
+                assert_eq!(frozen.media.is_some(), media);
+                if let Some(profile) = frozen.media {
+                    let expected = match frozen.family_id {
+                        WireFamilyId::OpenAiResponsesChatgpt => {
+                            broca_provider::media_profile::MediaProfileId::OpenaiResponsesChatgpt
+                        }
+                        WireFamilyId::OpenAiResponses => {
+                            broca_provider::media_profile::MediaProfileId::OpenaiResponses
+                        }
+                        WireFamilyId::OpenAiChat => {
+                            broca_provider::media_profile::MediaProfileId::OpenaiChat
+                        }
+                        family => panic!("unexpected family {family:?}"),
+                    };
+                    assert_eq!(profile.profile, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn catalog_resolution_surfaces_the_model_context_limit() {
         common::install_snapshot();
         // A catalog-resolved model carries its context-window limit (the pressure ground truth
@@ -113,6 +154,8 @@ mod gated {
         // account claim, which no dummy credential can satisfy; the limit is read from the catalog
         // before any of that, so this reaches the code under test without a live credential.
         let opts = ResolveOptions {
+            media: false,
+            media_profile: None,
             family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
             auth_method: Some(AuthMethod::Chatgpt),
             ..Default::default()
@@ -171,6 +214,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
@@ -213,6 +258,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
@@ -249,6 +296,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
@@ -278,6 +327,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -309,6 +360,8 @@ mod gated {
                 None,
                 &AuthMode::Bearer("dummy-token".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::GoogleCodeAssist),
@@ -341,6 +394,8 @@ mod gated {
     fn chatgpt_ids_resolve_verbatim_with_no_tier_suffixes() {
         common::install_snapshot();
         let options = ResolveOptions {
+            media: false,
+            media_profile: None,
             claude_code_persona: None,
             auth_method: None,
             family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -420,6 +475,8 @@ mod gated {
                     2048,
                     &AuthMode::Bearer(CHATGPT_JWT.into()),
                     &ResolveOptions {
+                        media: false,
+                        media_profile: None,
                         claude_code_persona: None,
                         auth_method: None,
                         family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -471,6 +528,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -504,6 +563,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer(CHATGPT_JWT.into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     claude_code_persona: None,
                     auth_method: None,
                     family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -539,6 +600,8 @@ mod gated {
     fn chatgpt_pause_only_construction_skips_auth_but_ordinary_none_stays_strict() {
         common::install_snapshot();
         let options = ResolveOptions {
+            media: false,
+            media_profile: None,
             claude_code_persona: None,
             auth_method: None,
             family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -594,6 +657,8 @@ mod gated {
             2048,
             &AuthMode::Bearer("not-a-codex-token".into()),
             &ResolveOptions {
+                media: false,
+                media_profile: None,
                 claude_code_persona: None,
                 auth_method: None,
                 family_override: Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -647,6 +712,8 @@ mod gated {
                 2048,
                 &AuthMode::Bearer("dummy".into()),
                 &ResolveOptions {
+                    media: false,
+                    media_profile: None,
                     cache_policy: Some(CachePolicy {
                         version: 1,
                         class: CacheClass::Markers {

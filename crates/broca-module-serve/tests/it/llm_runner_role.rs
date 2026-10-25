@@ -2538,6 +2538,7 @@ fn upload_staging_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, V
     entries
 }
 
+#[cfg(not(feature = "test-attachments"))]
 #[tokio::test]
 async fn upload_roundtrip_is_staged_but_not_advertised_or_admitted() {
     let mut rig = Rig::start("upload-roundtrip").await;
@@ -2747,5 +2748,62 @@ async fn upload_plan_named_sender_has_standing_on_the_frozen_session() {
         .await;
     assert_eq!(result(&committed)["state"], "committed");
     assert_eq!(rig.wal_bytes(), before);
+    rig.finish().await;
+}
+
+#[cfg(feature = "test-attachments")]
+#[tokio::test]
+async fn debug_pdf_send_is_refused_before_any_session_write() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::start("debug-pdf-send-gate").await;
+    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    let uploads = broca_core::media_uploads::Uploads::at(&rig.dir);
+    let bytes = b"%PDF-1.7\n%%EOF\n";
+    let now = broca_module::person_media::now_seconds();
+    let id = uploads
+        .begin(
+            &rig.session,
+            &cortexkit_role_llm_runner::attachments::UploadBeginRequest::new(
+                "application/pdf",
+                bytes.len() as u64,
+                format!("{:x}", Sha256::digest(bytes)),
+            ),
+            now,
+        )
+        .unwrap()
+        .upload_id;
+    uploads.append(&rig.session, &id, 0, bytes, now).unwrap();
+    uploads.commit(&rig.session, &id, now).unwrap();
+    let before = upload_staging_snapshot(&rig.dir);
+    assert!(!rig.wal_path.exists());
+    let refused = rig
+        .send_with(
+            "pdf",
+            "inspect",
+            None,
+            serde_json::json!({"content":[{"type":"upload","upload_id":id}]}),
+        )
+        .await;
+    assert_eq!(refusal(&refused)["code"], "media_unsupported");
+    let message = refusal(&refused)["message"].as_str().unwrap().to_owned();
+    assert!(
+        message.contains("pdf") && message.contains("modality") && message.contains("model"),
+        "{message}"
+    );
+    assert!(!rig.wal_path.exists(), "a refused send must not open a WAL");
+    assert_eq!(upload_staging_snapshot(&rig.dir), before);
+    for class in ["media", "media-durable", "media-ephemeral"] {
+        for dir in ["objects", "refs"] {
+            assert_eq!(
+                std::fs::read_dir(rig.dir.join(class).join(dir))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+    let describe = call(&mut rig, "role.describe", serde_json::json!({})).await;
+    let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
+    assert!(!checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));
     rig.finish().await;
 }

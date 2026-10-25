@@ -1585,9 +1585,25 @@ impl WalRecord {
         };
         match self {
             Self::RunStarted {
-                input, hooks: h, ..
+                config,
+                input,
+                hooks: h,
+                ..
+            } => {
+                config
+                    .frozen_render_config
+                    .get("media")
+                    .is_some_and(|media| !media.is_null())
+                    || messages(input)
+                    || hooks(h, MediaHookSubject::Messages)
             }
-            | Self::Steered {
+            Self::RunConfigRefrozen {
+                frozen_render_config,
+                ..
+            } => frozen_render_config
+                .get("media")
+                .is_some_and(|media| !media.is_null()),
+            Self::Steered {
                 input, hooks: h, ..
             } => messages(input) || hooks(h, MediaHookSubject::Messages),
             Self::Queued {
@@ -1645,7 +1661,6 @@ impl WalRecord {
             | Self::RunFinished { .. }
             | Self::RunCancelRequested { .. }
             | Self::RunPaused { .. }
-            | Self::RunConfigRefrozen { .. }
             | Self::RunAuthRefrozen { .. }
             | Self::Retracted { .. }
             | Self::ApprovalRequested { .. }
@@ -4097,6 +4112,8 @@ mod schema_tests {
                 delivery: None,
                 submission_id: SubmissionId("sub2".into()),
                 request: Box::new(SubmissionRequest {
+                    staged_uploads: None,
+                    content: Vec::new(),
                     directives: None,
                     on_restart: None,
                     keep_warm: None,

@@ -64,6 +64,8 @@ fn deserialize_session_class<'de, D: serde::Deserializer<'de>>(
 /// `session.send` params. The session comes from the bound route identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendParams {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<cortexkit_role_llm_runner::attachments::ContentPart>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -291,9 +293,9 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Staging alone is not attachment admission. Refuse upload-bearing sends rather
-/// than silently dropping content: staged bytes are not connected to the send's
-/// model checks or to publication into its session's media store.
+/// Shipping builds refuse uploads by name before decoding a send. Debug builds
+/// must explicitly opt into the attachment admission path; neither path permits
+/// a client to supply stored media references inline.
 pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String> {
     if let Some(content) = params.get("content").filter(|value| !value.is_null()) {
         // A content part is an upload reference and nothing else. A `media` block, or a tool
@@ -312,6 +314,9 @@ pub fn check_upload_references(params: &serde_json::Value) -> Result<(), String>
         let parts: Vec<cortexkit_role_llm_runner::attachments::ContentPart> =
             serde_json::from_value(content.clone())
                 .map_err(|error| format!("invalid content: {error}"))?;
+        if broca_protocol::attachments_enabled() {
+            return Ok(());
+        }
         if let Some(part) = parts.first() {
             return Err(format!(
                 "upload {} cannot be sent: attachment admission is unavailable",
@@ -1033,7 +1038,8 @@ pub enum SendResult {
 
 /// Serialize `message` as callers read it: every `text_with_state` block becomes a plain `text`
 /// block with the same text, the model's text is cleaned where its writing run cleans it, and
-/// every other block is written unchanged.
+/// stored media is exposed as not-requested text markers for readers that do not
+/// understand the media grammar.
 fn serialize_caller_message<S: serde::Serializer>(
     message: &broca_protocol::Message,
     serializer: S,
@@ -1042,6 +1048,42 @@ fn serialize_caller_message<S: serde::Serializer>(
     // The model's text as every exposure shows it: cleaned of tag notation where the run that
     // wrote it cleans (llm-runner §9.6). The stored message keeps the raw text.
     let exposed = broca_protocol::tags::exposed_message(message);
+    let mut exposed = exposed;
+    if exposed.content.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::Media(_)
+                | ContentBlock::ToolResult(broca_protocol::ToolResult {
+                    output: broca_protocol::ToolOutput::Parts { .. },
+                    ..
+                })
+        )
+    }) {
+        use broca_protocol::{MediaMarkerReason, ToolOutput};
+        for block in &mut exposed.to_mut().content {
+            match block {
+                ContentBlock::Media(media) => {
+                    *block = ContentBlock::Text {
+                        text: broca_protocol::content::media_not_shown_marker(
+                            media,
+                            MediaMarkerReason::NotRequested,
+                        ),
+                    }
+                }
+                ContentBlock::ToolResult(result) => {
+                    if let ToolOutput::Parts { parts } = &result.output {
+                        result.output = ToolOutput::Text {
+                            text: broca_protocol::content::media_parts_text(
+                                parts,
+                                MediaMarkerReason::NotRequested,
+                            ),
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     let message: &broca_protocol::Message = &exposed;
     if !message
         .content
@@ -3907,6 +3949,7 @@ mod tests {
         assert_eq!(
             send_params_keys(),
             &[
+                "content",
                 "directives",
                 "session_class",
                 "on_restart",
@@ -5586,6 +5629,55 @@ mod caller_message_tests {
             digest: None,
             part_digests: None,
         }
+    }
+
+    #[test]
+    fn default_media_read_uses_text_markers_without_changing_the_stored_message() {
+        use broca_protocol::{
+            MediaKind, MediaRef, ToolCallId, ToolOutput, ToolOutputPart, ToolResult,
+        };
+        let media = MediaRef {
+            kind: MediaKind::Image,
+            mime: "image/png".into(),
+            byte_size: 69,
+            sha256: "b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640".into(),
+            width: Some(1),
+            height: Some(1),
+        };
+        let marker = "[media not shown: kind=image mime=image/png bytes=69 sha256=b1ff9c8ea3a7 reason=not_requested]";
+        let row = read_message(vec![
+            ContentBlock::Text {
+                text: "before".into(),
+            },
+            ContentBlock::Media(media.clone()),
+            ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId("call".into()),
+                is_error: true,
+                output: ToolOutput::Parts {
+                    parts: vec![
+                        ToolOutputPart::Text {
+                            text: "left".into(),
+                        },
+                        ToolOutputPart::Media { media },
+                        ToolOutputPart::Text {
+                            text: "right".into(),
+                        },
+                    ],
+                },
+            }),
+        ]);
+        let stored = row.message.clone();
+        let value = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            value["message"]["content"][1],
+            json!({"type":"text","text":marker})
+        );
+        assert_eq!(
+            value["message"]["content"][2]["output"],
+            json!({"kind":"text","text":format!("left\n{marker}\nright")})
+        );
+        assert_eq!(value["message"]["content"][2]["is_error"], true);
+        assert_eq!(row.message, stored);
     }
 
     /// The member names of a JSON object, sorted.

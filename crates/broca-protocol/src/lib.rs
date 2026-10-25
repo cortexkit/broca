@@ -89,3 +89,19 @@ pub use request::{
 pub use session::{BindIdentity, BindPrincipal, BindScope, SendScope, SessionScope};
 pub use usage::Usage;
 pub mod run_events;
+
+#[cfg(all(feature = "test-attachments", not(debug_assertions)))]
+compile_error!("test-attachments is a non-shipping feature");
+
+/// Attachment admission is available only in explicitly opted-in debug test builds.
+pub fn attachments_enabled() -> bool {
+    #[cfg(all(feature = "test-attachments", debug_assertions))]
+    {
+        std::hint::black_box("broca-nonshipping-attachments-v1");
+        true
+    }
+    #[cfg(not(all(feature = "test-attachments", debug_assertions)))]
+    {
+        false
+    }
+}

@@ -40,6 +40,8 @@ fn queued(id: &str) -> WalRecord {
         delivery: None,
         submission_id: SubmissionId(id.into()),
         request: Box::new(SubmissionRequest {
+            staged_uploads: None,
+            content: Vec::new(),
             directives: None,
             on_restart: None,
             keep_warm: None,
