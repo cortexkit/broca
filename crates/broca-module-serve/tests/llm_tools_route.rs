@@ -267,6 +267,8 @@ impl Rig {
         *self.provider.calls.lock().unwrap()
     }
 
+    // Only the Unix cross-process claim test starts a second daemon.
+    #[cfg(unix)]
     fn spawn_peer(&self, id: &str) -> broca_test_support::RigChild {
         let config = self.root.join("config/cortexkit/broca.jsonc");
         let settings: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
