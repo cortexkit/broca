@@ -180,6 +180,8 @@ enum Cmd {
     /// The combined single-turn flow: subscribe, send a prompt, drain the control stream to
     /// the run's terminal. This is the single-client/single-turn proof.
     Run {
+        #[command(flatten)]
+        admission: AdmissionArgs,
         #[arg(long)]
         prompt: String,
         /// `<provider>/<model>` (the run's model handle; the module resolves the provider).
@@ -188,6 +190,9 @@ enum Cmd {
         /// Tool schemas (JSON array) the turn may call. Omit to inherit; pass `[]` for none.
         #[arg(long)]
         tools: Option<String>,
+        /// Maximum output tokens for the turn. Must be greater than zero.
+        #[arg(long = "max-output-tokens")]
+        max_output_tokens: Option<u64>,
         /// Per-send tool-call budget JSON.
         #[arg(long = "budget-json")]
         budget_json: Option<String>,
@@ -228,6 +233,8 @@ enum Cmd {
     /// This command only sends; it does not wait for the runs to finish (a separate observer
     /// drains them).
     Send {
+        #[command(flatten)]
+        admission: AdmissionArgs,
         #[arg(long = "prompt")]
         prompts: Vec<String>,
         #[arg(long)]
@@ -369,6 +376,34 @@ enum Cmd {
     },
 }
 
+#[derive(clap::Args, Debug)]
+struct AdmissionArgs {
+    /// Session class to freeze on the first send (for example, "acceptance").
+    #[arg(long)]
+    session_class: Option<String>,
+    /// Read the fetch plan JSON from a file; the daemon checks and freezes provider answers.
+    #[arg(long, conflicts_with = "tools")]
+    plan: Option<PathBuf>,
+}
+
+fn load_plan(path: &Option<PathBuf>) -> Result<Option<serde_json::Value>, String> {
+    path.as_ref()
+        .map(|path| {
+            let bytes = std::fs::read(path)
+                .map_err(|error| format!("read --plan {}: {error}", path.display()))?;
+            let plan: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("parse --plan {}: {error}", path.display()))?;
+            if !plan.is_object() {
+                return Err(format!(
+                    "parse --plan {}: expected a JSON object",
+                    path.display()
+                ));
+            }
+            Ok(plan)
+        })
+        .transpose()
+}
+
 fn split_model(model: &str) -> Result<(String, String), String> {
     model
         .split_once('/')
@@ -441,6 +476,9 @@ fn auth_params(method: Option<String>, account: Option<String>) -> Option<AuthPa
 /// A caller passing them positionally has adjacent `None`s and no way to see a transposition.
 #[derive(Default)]
 struct SendKnobs {
+    session_class: Option<String>,
+    plan: Option<serde_json::Value>,
+    max_output_tokens: Option<u64>,
     budget: Option<broca_protocol::BudgetConfig>,
     cache: Option<CacheParams>,
     auth: Option<AuthParams>,
@@ -528,6 +566,9 @@ fn validate_max_output_tokens(cmd: &Cmd) -> Result<(), String> {
         Cmd::Send {
             max_output_tokens: Some(0),
             ..
+        } | Cmd::Run {
+            max_output_tokens: Some(0),
+            ..
         }
     ) {
         return Err("--max-output-tokens must be greater than 0".into());
@@ -537,6 +578,10 @@ fn validate_max_output_tokens(cmd: &Cmd) -> Result<(), String> {
 
 async fn run(args: Args) -> Result<i32, String> {
     validate_max_output_tokens(&args.cmd)?;
+    let plan = match &args.cmd {
+        Cmd::Run { admission, .. } | Cmd::Send { admission, .. } => load_plan(&admission.plan)?,
+        _ => None,
+    };
     let json = args.json_events;
     // The audit is dispatched before the broca management-surface bind, and it returns its own
     // exit code rather than an error: every way it can fail to run is exit 2, and an `Err` out
@@ -630,9 +675,11 @@ async fn run(args: Args) -> Result<i32, String> {
     match args.cmd {
         Cmd::CacheDump(_) => Err("cache-dump must be invoked without daemon arguments".into()),
         Cmd::Run {
+            admission,
             prompt,
             model,
             tools,
+            max_output_tokens,
             budget_json,
             cache_role,
             cache_ttl,
@@ -650,6 +697,9 @@ async fn run(args: Args) -> Result<i32, String> {
                 &model,
                 &tools,
                 SendKnobs {
+                    session_class: admission.session_class,
+                    plan,
+                    max_output_tokens,
                     budget: parse_budget(&budget_json)?,
                     cache: cache_params(cache_role, cache_ttl, None, no_cache),
                     auth: auth_params(auth_method, auth_account),
@@ -661,6 +711,7 @@ async fn run(args: Args) -> Result<i32, String> {
             .await
         }
         Cmd::Send {
+            admission,
             prompts,
             model,
             tools,
@@ -713,6 +764,8 @@ async fn run(args: Args) -> Result<i32, String> {
                         auth: None,
                         one_shot: None,
                         context_management: None,
+                        session_class: admission.session_class.as_deref(),
+                        plan: plan.clone(),
                     })
                     .await
                     .map_err(|e| format!("send: {e}"))?;
@@ -1403,6 +1456,9 @@ async fn run_turn(
     knobs: SendKnobs,
 ) -> Result<i32, String> {
     let SendKnobs {
+        session_class,
+        plan,
+        max_output_tokens,
         budget,
         cache,
         auth,
@@ -1431,12 +1487,14 @@ async fn run_turn(
             service_tier,
             tools,
             send_id: None,
-            max_output_tokens: None,
+            max_output_tokens,
             cache,
             budget,
             auth,
             one_shot: None,
             context_management,
+            session_class: session_class.as_deref(),
+            plan,
         })
         .await
         .map_err(|e| format!("send: {e}"))?;
@@ -1997,7 +2055,7 @@ fn emit_to(
 mod tests {
     use std::sync::Arc;
 
-    use super::{cache_params, read_page_event, run, Args, Cmd};
+    use super::{cache_params, load_plan, read_page_event, run, Args, Cmd, PathBuf};
 
     #[test]
     fn cache_dump_reads_all_compaction_records_live_and_archived() {
@@ -2443,6 +2501,116 @@ mod tests {
         );
 
         assert_eq!(content_import_id(&messages).unwrap(), legacy);
+    }
+
+    #[test]
+    fn run_and_send_accept_class_and_plan_flags() {
+        for command in ["run", "send"] {
+            let args = Args::try_parse_from([
+                "broca-session",
+                "--subc",
+                "unused",
+                "--project-root",
+                ".",
+                "--session",
+                "s",
+                command,
+                "--prompt",
+                "hello",
+                "--model",
+                "provider/model",
+                "--session-class",
+                "acceptance",
+                "--plan",
+                "plan.json",
+                "--max-output-tokens",
+                "32",
+            ])
+            .unwrap();
+            let (admission, max_output_tokens) = match args.cmd {
+                Cmd::Run {
+                    admission,
+                    max_output_tokens,
+                    ..
+                }
+                | Cmd::Send {
+                    admission,
+                    max_output_tokens,
+                    ..
+                } => (admission, max_output_tokens),
+                _ => panic!("expected run or send"),
+            };
+            assert_eq!(admission.session_class.as_deref(), Some("acceptance"));
+            assert_eq!(admission.plan, Some(PathBuf::from("plan.json")));
+            assert_eq!(max_output_tokens, Some(32));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_plan_is_refused_before_connecting() {
+        let dir = broca_test_support::scratch_root().join("session-cli-plan");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plan.json");
+        for contents in ["{", "[]"] {
+            std::fs::write(&path, contents).unwrap();
+            let args = Args::try_parse_from([
+                "broca-session",
+                "--subc",
+                "absent-connection",
+                "--project-root",
+                ".",
+                "--session",
+                "s",
+                "run",
+                "--prompt",
+                "hello",
+                "--model",
+                "provider/model",
+                "--plan",
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+            assert!(run(args).await.unwrap_err().starts_with("parse --plan"));
+        }
+        std::fs::write(
+            &path,
+            r#"{"tool_items":[{"provider":"aft","preset":"reader"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_plan(&Some(path.clone())).unwrap().unwrap()["tool_items"][0]["provider"],
+            "aft"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_plan(&Some(path))
+            .unwrap_err()
+            .starts_with("read --plan"));
+        assert_eq!(load_plan(&None).unwrap(), None);
+    }
+
+    #[test]
+    fn plan_and_inline_tools_conflict() {
+        for command in ["run", "send"] {
+            assert!(Args::try_parse_from([
+                "broca-session",
+                "--subc",
+                "unused",
+                "--project-root",
+                ".",
+                "--session",
+                "s",
+                command,
+                "--prompt",
+                "hello",
+                "--model",
+                "provider/model",
+                "--plan",
+                "plan.json",
+                "--tools",
+                "[]",
+            ])
+            .is_err());
+        }
     }
 
     #[test]

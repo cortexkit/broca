@@ -20,6 +20,8 @@ class TurnHarnesses(unittest.TestCase):
         scripts.mkdir()
         for name in ("acceptance-turn.sh", "mint-lineage-specimen.sh"):
             shutil.copy2(ROOT / "scripts" / name, scripts)
+        (scripts / "lib").mkdir()
+        shutil.copy2(ROOT / "scripts/lib/acceptance-models.txt", scripts / "lib")
         self.bins = self.root / "bin"
         self.bins.mkdir()
         self.home = self.root / "home"
@@ -102,6 +104,12 @@ shutil.copyfile(source, dest)
         result = self.run_script("acceptance-turn.sh")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS -- tool dispatched", result.stdout)
+
+    def test_acceptance_reads_shared_candidate_file(self):
+        (self.root / "scripts/lib/acceptance-models.txt").write_text("shared/model\n")
+        result = self.run_script("acceptance-turn.sh", ACCEPTANCE_MODELS="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("served by shared/model", result.stdout)
 
 
 if __name__ == "__main__":
