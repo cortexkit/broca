@@ -2379,6 +2379,13 @@ impl LlmRunnerSubject for BrocaSubject {
     ) -> Option<Value> {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use cortexkit_role_llm_runner::tags::ToolResultBlock;
+        if !broca_protocol::attachments_enabled()
+            && blocks
+                .iter()
+                .any(|block| matches!(block, ToolResultBlock::Image | ToolResultBlock::Media))
+        {
+            return None;
+        }
         if blocks.is_empty() {
             return Some(json!({OWN_STRUCTURED: {"marker": marker}}));
         }
@@ -2407,14 +2414,39 @@ impl LlmRunnerSubject for BrocaSubject {
         Some(json!({OWN_CONTENT: content}))
     }
 
-    /// When attachments are enabled, capture a real image. Otherwise the legacy placeholder's
-    /// MIME type carries `marker` so the case can find the entry.
+    /// Resolve identity only from the listed call and the actual read entry. Its tag row
+    /// supplies the part key; fixture markers and the adapter's remembered messages do not.
+    fn tool_result_part(
+        &self,
+        call: &cortexkit_role_llm_runner::tool_calls::RunToolCall,
+        result: &cortexkit_role_llm_runner::read::ReadMessage,
+    ) -> Option<String> {
+        if call.result_ordinal != Some(result.ordinal) {
+            return None;
+        }
+        let mut matching = result
+            .message
+            .get("content")?
+            .as_array()?
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                block["type"] == "tool_result"
+                    && block["tool_call_id"].as_str() == Some(call.tool_call_id.as_str())
+            });
+        let (index, _) = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        result.tags.get(index).map(|row| row.part.clone())
+    }
+
+    /// The older image fixture requires marker text in the stored payload. Captured references
+    /// cannot carry arbitrary text; the marker-free numbering fixture checks those images.
+    /// Without capture, the legacy placeholder's MIME type can carry the marker.
     fn image_tool_result(&self, marker: &str) -> Option<Value> {
         if broca_protocol::attachments_enabled() {
-            return self.numbering_tool_result(
-                marker,
-                &[cortexkit_role_llm_runner::tags::ToolResultBlock::Image],
-            );
+            return None;
         }
         Some(json!({ OWN_CONTENT: [{
             "type": "image",
@@ -2874,6 +2906,9 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     // a case that drifts to skipped or inapplicable would otherwise pass this test without
     // checking anything.
     for name in [
+        #[cfg(feature = "test-attachments")]
+        "tags_tool_result_blocks_share_one_number",
+        #[cfg(not(feature = "test-attachments"))]
         "tags_count_only_parts_rendered_with_a_number",
         "compaction_setup_durable_once",
         "model_view_half_open_ranges_and_travel",
