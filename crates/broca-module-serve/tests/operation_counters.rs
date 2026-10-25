@@ -38,6 +38,10 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "session.subscribe",
     // Served only on routes opened for the classifier role, and counted like the others.
     "classify.run",
+    // Served only on tool-provider routes for the sessionless model tools.
+    "tool.catalog",
+    "late_results",
+    "late_results.ack",
     // Staged media uploads, served before any send references them.
     "session.upload_begin",
     "session.upload_append",
