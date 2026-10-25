@@ -168,11 +168,12 @@ impl Rig {
             std::fs::write(
                 &handoff,
                 format!(
-                    "#!/bin/sh\n# The daemon names our connection file on the command line.\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --subc) SUBC_CONNECTION=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nexport SUBC_CONNECTION\nexec {surface} --module-id {module_id} --SURFACE_FIXTURES={fixtures} --SURFACE_REQUESTS={requests} 2>> {stderr}\n",
+                    "#!/bin/sh\n# The daemon names our connection file on the command line.\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --subc) SUBC_CONNECTION=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nexport SUBC_CONNECTION\n# A daemon spawns a module before it is ready to acknowledge the module's HELLO, so a\n# registration that ends early is not a failure: register again until one is answered.\nattempt=0\nwhile [ \"$attempt\" -lt 20 ]; do\n  attempt=$((attempt + 1))\n  SURFACE_MODULE_ID={module_id} {surface} --module-id {module_id} --SURFACE_FIXTURES={fixtures} --SURFACE_REQUESTS={requests} >> {ready} 2>> {stderr}\n  status=$?\n  [ $status -eq 0 ] && exit 0\n  sleep 0.1\ndone\necho \"the stand-in for {module_id} never registered\" >> {stderr}\nexit 1\n",
                     surface = fake_surface_bin().display(),
                     module_id = module_id,
                     fixtures = hex(&fixture),
                     requests = hex(&root.join(format!("{module_id}.requests"))),
+                    ready = root.join(format!("{module_id}.stand-in.out")).display(),
                     stderr = root
                         .join(format!("{module_id}.stand-in.stderr.log"))
                         .display(),
@@ -377,19 +378,40 @@ async fn served_route(
     identity: &broca_protocol::BindIdentity,
     scope: Option<subc_protocol::scope::ScopeSelector>,
 ) -> Route {
-    let route = broca_test_support::wait_until("tool-provider route", || {
-        let connection = connection.clone();
-        let identity = identity.clone();
-        let scope = scope.clone();
-        let target = target.to_owned();
-        async move {
-            connection
-                .route_open_tool_provider_v1(&target, &identity, scope)
-                .await
-                .map_err(|e| e.to_string())
+    // A daemon admits a route to a module whose registration it has not finished handling,
+    // and once that route exists it does not open a second one. A module that blinks during
+    // its first registration would therefore lose its only route for the rest of the rig, so
+    // keep asking until the daemon agrees to open one.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let route = loop {
+        let opened: Result<RouteHandle, String> =
+            broca_test_support::wait_until("a tool-provider route", || {
+                let connection = connection.clone();
+                let identity = identity.clone();
+                let scope = scope.clone();
+                let target = target.to_owned();
+                async move {
+                    Ok(
+                        match connection
+                            .route_open_tool_provider_v1(&target, &identity, scope)
+                            .await
+                        {
+                            Ok(route) => Ok(route),
+                            Err(error) => Err(error.to_string()),
+                        },
+                    )
+                }
+            })
+            .await;
+        match opened {
+            Ok(route) => break route,
+            Err(error) if std::time::Instant::now() < deadline => {
+                eprintln!("tool-provider route to {target} not ready yet: {error}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => panic!("tool-provider route to {target} never opened: {error}"),
         }
-    })
-    .await;
+    };
     let body = serde_json::to_vec(&json!({"name":"tool.catalog","arguments":{}})).unwrap();
     broca_test_support::wait_until("a served tool catalog", || {
         let connection = connection.clone();
@@ -820,7 +842,7 @@ async fn a_marked_run_with_an_unknown_source_files_no_card() {
     };
     let route = rig.open("run", false).await;
     // Cerebellum answered, and named no source kind broca knows: a card could name none.
-    let error = refused_without_writes(&rig, &route, "unknown-source").await;
+    let error = refused_once_the_route_is_served(&rig, &route, "unknown-source").await;
     assert_eq!(error["detail"]["consent"], "private_content_unknown");
     assert_eq!(rig.calls(), 0);
 }
