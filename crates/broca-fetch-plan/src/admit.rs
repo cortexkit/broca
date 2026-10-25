@@ -443,6 +443,14 @@ pub trait PlanAdmitter: Send + Sync {
         session: &broca_protocol::BindIdentity,
         scope: Option<&broca_protocol::SessionScope>,
     ) -> Result<Admitted, Refusal>;
+
+    /// Whether sessions this admitter freezes may carry plan items opting into output
+    /// references (llm-runner §9.13), so a send's `output_refs` member is accepted rather than
+    /// refused. It must hold exactly when `role.describe` declares the `output_refs` group;
+    /// broca does not declare it yet, so every production admitter answers false.
+    fn admits_output_refs(&self) -> bool {
+        false
+    }
 }
 
 /// An admitted plan: the manifest to freeze.

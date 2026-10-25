@@ -14,6 +14,7 @@ mod compaction_watch;
 pub mod executor;
 pub mod fanout;
 pub mod opener;
+pub mod output_refs;
 pub mod registry;
 pub mod retention;
 pub mod retention_withdrawals;

@@ -56,6 +56,11 @@ fn every_open_failed_site_chooses_a_class() {
             "session_written: classifier unsupported",
             "Some(broca_protocol::ErrorClass::Transient)",
         ),
+        // The session log read for output references ended short; a later read may complete.
+        (
+            "session_log: incomplete WAL range",
+            "Some(broca_protocol::ErrorClass::Transient)",
+        ),
         (
             "model_read: invalid source",
             "Some(broca_protocol::ErrorClass::Permanent)",

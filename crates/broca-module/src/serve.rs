@@ -1727,6 +1727,55 @@ pub trait ServeHandler: Send + Sync {
     /// acquiring the session lease.
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError>;
 
+    /// The plan manifest the session froze at admission. `None` for a session admitted without a
+    /// plan, and from a handler that cannot read the session's history.
+    async fn frozen_manifest(
+        &self,
+        _session: &LineageKey,
+    ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, ServeError> {
+        Ok(None)
+    }
+
+    /// Every durable record of the session's current lineage, oldest first, read under the
+    /// expiry check of run `run_id`. `None` from a handler that keeps no log reader. Only output
+    /// references on a compaction session read it, to find the view a past request rendered.
+    async fn session_log(
+        &self,
+        _session: &LineageKey,
+        _run_id: &str,
+    ) -> Result<Option<Vec<broca_wal::WalRecord>>, ServeError> {
+        Ok(None)
+    }
+
+    /// `session.output_refs` (llm-runner §9.13): one page of an output-reference set, derived
+    /// from the session log on every read (see [`crate::output_refs`]).
+    async fn output_refs(
+        &self,
+        session: &LineageKey,
+        request: &cortexkit_role_llm_runner::output_refs::ListRequest,
+    ) -> Result<
+        Result<cortexkit_role_llm_runner::output_refs::Page, crate::output_refs::OutputRefRefusal>,
+        ServeError,
+    > {
+        crate::output_refs::list(self, session, request).await
+    }
+
+    /// `session.output_ref_read` (llm-runner §9.13): a byte range of one output reference's
+    /// content, derived from the session log on every read (see [`crate::output_refs`]).
+    async fn output_ref_read(
+        &self,
+        session: &LineageKey,
+        request: &cortexkit_role_llm_runner::output_refs::ReadRequest,
+    ) -> Result<
+        Result<
+            cortexkit_role_llm_runner::output_refs::ReadReply,
+            crate::output_refs::OutputRefRefusal,
+        >,
+        ServeError,
+    > {
+        crate::output_refs::read(self, session, request).await
+    }
+
     /// Where the session's materialized transcript holds the part tagged `tag`, from the
     /// store's tag index (see [`broca_core::TagLocation`]). `None` when this handler keeps no
     /// tag index, which leaves [`ServeHandler::resolve`] to read the transcript from its start.
@@ -2134,6 +2183,39 @@ impl ServeHandler for crate::LineageRegistry {
         self.route_tag_location(session, tag)
             .await
             .map_err(ServeError::from)
+    }
+
+    async fn frozen_manifest(
+        &self,
+        session: &LineageKey,
+    ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, ServeError> {
+        Ok(self
+            .session_ownership_for_bind(session)
+            .await
+            .and_then(|ownership| ownership.first_episode)
+            .and_then(|first| first.manifest))
+    }
+
+    async fn session_log(
+        &self,
+        session: &LineageKey,
+        run_id: &str,
+    ) -> Result<Option<Vec<broca_wal::WalRecord>>, ServeError> {
+        let range = self
+            .read_run_tool_calls_range(session, run_id, 0, None, None)
+            .await?;
+        match range.records() {
+            broca_wal::WalRangeRecords::Complete(records) => Ok(Some(
+                records.iter().map(|framed| framed.record.clone()).collect(),
+            )),
+            broca_wal::WalRangeRecords::Absent => Ok(Some(Vec::new())),
+            broca_wal::WalRangeRecords::Partial(_) | broca_wal::WalRangeRecords::Unknown(_) => {
+                Err(ServeError::Open(
+                    "the session log could not be read completely".into(),
+                    Some(broca_protocol::ErrorClass::Transient),
+                ))
+            }
+        }
     }
 
     async fn read_model(
