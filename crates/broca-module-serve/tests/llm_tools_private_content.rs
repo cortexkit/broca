@@ -178,8 +178,9 @@ impl Rig {
             std::fs::write(
                 &handoff,
                 format!(
-                    "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --subc) SUBC_CONNECTION=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nexport SUBC_CONNECTION\nexport PRIVATE_CONTENT_ROOT='{root}'\nexport SURFACE_MODULE_ID={module_id}\nexport PRIVATE_CONTENT_SURFACE='{surface}'\nexport PRIVATE_CONTENT_FIXTURES={fixtures}\nexport PRIVATE_CONTENT_REQUESTS={requests}\nexec '{helper}' --exact private_content_handoff --nocapture >> '{ready}' 2>> '{stderr}'\n",
+                    "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --subc) SUBC_CONNECTION=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nexport SUBC_CONNECTION\nexport PRIVATE_CONTENT_ROOT='{root}'\nexport PRIVATE_CONTENT_HOLD_HANDOFF={hold}\nexport SURFACE_MODULE_ID={module_id}\nexport PRIVATE_CONTENT_SURFACE='{surface}'\nexport PRIVATE_CONTENT_FIXTURES={fixtures}\nexport PRIVATE_CONTENT_REQUESTS={requests}\nexec '{helper}' --exact private_content_handoff --nocapture >> '{ready}' 2>> '{stderr}'\n",
                     root = root.display(),
+                    hold = u8::from(hold),
                     helper = broca_test_support::ckdev_binary(std::env::current_exe().unwrap(), broca_test_support::scratch_root()).display(),
                     surface = fake_surface_bin().display(),
                     module_id = module_id,
@@ -223,7 +224,6 @@ impl Rig {
             .env_remove("BROCA_STATE_ROOT")
             .env("HOME", root.join("home"))
             .env("SUBC_PORT", "0")
-            .env("PRIVATE_CONTENT_HOLD_HANDOFF", if hold { "1" } else { "0" })
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("SUBC_LAUNCH_NONCE_FD")
             .env_remove("SUBC_MODULE_ID")
@@ -1004,12 +1004,13 @@ async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
     let other_root = root.with_extension("lookalike");
     std::fs::create_dir_all(&other_root).unwrap();
     let script = other_root.join("cerebellum.handoff.sh");
-    std::fs::write(&script, "#!/bin/sh\nexec sleep 300\n").unwrap();
+    std::fs::write(&script, "#!/bin/sh\nread ignored\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut probe = CleanupProbe {
         root: root.clone(),
         lookalike: std::process::Command::new("/bin/sh")
             .arg(&script)
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap(),
     };
