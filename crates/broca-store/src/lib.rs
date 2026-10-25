@@ -470,6 +470,25 @@ fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Create the SQLite database file at `path` owner-only before SQLite first opens it, for a
+/// store outside this crate that keeps its own schema. SQLite creates files through the
+/// process umask and gives no mode hook; a journal or WAL sidecar it creates later takes the
+/// database file's own mode on Unix, and on Windows the state tree's protected, inheritable
+/// DACL (checked here) gives every sidecar owner-only access. An existing file is opened as it
+/// is; on Windows one with broader access is refused.
+pub fn create_private_sqlite(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        prepare_private_sqlite(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut options = broca_owner_only::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        options.open(path).map(|_| ())
+    }
+}
+
 #[cfg(test)]
 type SchemaUpgradeHook = fn() -> Result<(), StoreError>;
 

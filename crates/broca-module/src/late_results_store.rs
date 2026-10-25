@@ -121,6 +121,11 @@ impl LateResultsStore {
                 }
             }
         }
+        // The store names sessions and late results, so like every other file under the state
+        // root it is owner-only: created that way here, before SQLite opens it through the
+        // process umask.
+        broca_store::create_private_sqlite(&path)
+            .map_err(|error| format!("create {} owner-only: {error}", path.display()))?;
         let connection = Connection::open(&path).map_err(|error| error.to_string())?;
         connection
             .execute_batch(
@@ -532,6 +537,40 @@ mod tests {
         }
         let reopened = LateResultsStore::open(&path).unwrap();
         assert_eq!(reopened.registrations().unwrap(), expected);
+    }
+
+    /// The store is created owner-only, and a write leaves no file in its directory that group or
+    /// world can read: the database, and any journal SQLite made for the write, carry the
+    /// database's own mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_store_and_its_journal_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("late-results-mode");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Under a umask that already strips group and world bits, every file lands owner-only
+        // whatever this code does, so the check could not fail: refuse instead of passing.
+        let ambient = dir.join("ambient-control");
+        std::fs::File::create(&ambient).unwrap();
+        let ambient_mode = std::fs::metadata(&ambient).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_file(&ambient).unwrap();
+        assert_ne!(
+            ambient_mode & 0o077,
+            0,
+            "the ambient umask already yields {ambient_mode:o}, so this test cannot tell an \
+             explicit mode from the default"
+        );
+        let path = dir.join("late-results.db");
+        let store = LateResultsStore::open(&path).unwrap();
+        store.register_group(&[call("lineage:1")]).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "late-results.db is {mode:o}");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "{} is {mode:o}", entry.path().display());
+        }
     }
 
     #[tokio::test]

@@ -29232,3 +29232,18 @@ expect_red = ["late_results_puller::tests::an_empty_page_sends_no_ack_and_settle
 file = "crates/broca-module/src/late_results_puller.rs"
 old = "            if ackable && reply.entries.is_empty() {"
 new = "            if false && ackable && reply.entries.is_empty() { // NON-VACUITY BREAK: ack every idle poll."
+
+[[control]]
+id = "late-results-store-is-owner-only"
+platforms = ["linux", "macos"]
+guards = "late-results.db is created owner-only before SQLite opens it, so the state root holds no group- or world-readable file"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::the_store_and_its_journal_are_owner_only"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = '''        broca_store::create_private_sqlite(&path)
+            .map_err(|error| format!("create {} owner-only: {error}", path.display()))?;'''
+new = "        // NON-VACUITY BREAK: let SQLite create the store through the umask."
