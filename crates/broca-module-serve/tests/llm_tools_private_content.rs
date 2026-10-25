@@ -277,7 +277,7 @@ impl Rig {
             scope_ref,
             Some(1),
         );
-        served_route(&connection, &target, &identity, Some(scope)).await
+        served_route(&connection, target, &identity, Some(scope)).await
     }
 
     fn calls(&self) -> usize {
@@ -655,28 +655,57 @@ fn artifacts(rig: &Rig) -> Value {
     value
 }
 
-/// A call the policy admits, retried while the request's own reply deadline outlasts the
-/// policy's questions: a route binds and asks before the answer is due, so a short client
-/// deadline can expire on a call that is in fact proceeding.
+/// A call the policy admits, retried until it is.
+///
+/// The first call on a fresh route can meet a daemon that admitted the route before the module
+/// served its providers; that call fails closed by design, and a retry reaches a served route.
+/// Each attempt uses the caller's key, so a retry is the same work and joins whatever the
+/// first attempt left running rather than starting a second provider call.
 async fn admitted_with_retry(rig: &Rig, route: &Route, key: &str) -> Value {
-    let mut last = None;
-    for attempt in 0..4 {
-        match route.call(args(), Some(&format!("{key}-{attempt}"))).await {
-            Ok(bytes) => {
-                return serde_json::from_slice(&bytes).unwrap();
-            }
-            Err(error) => {
-                // A call that outlived its client deadline may still be running, and a second
-                // call under the same key would join it; a fresh key per attempt is new work.
-                last = Some(error);
-                std::thread::sleep(Duration::from_secs(1));
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = observed.clone();
+    let admitted = broca_test_support::wait_until("an admitted model-tool call", || {
+        let seen = seen.clone();
+        async move {
+            match route.call(args(), Some(key)).await {
+                Ok(bytes) => Ok(Some(serde_json::from_slice::<Value>(&bytes).ok())),
+                // Nothing reached a provider, so the call was refused before dispatch; the
+                // route may simply not have been served yet.
+                Err(error) if rig.calls() == 0 => {
+                    *seen.lock().unwrap() = Some(error);
+                    Err("the route has not been admitted yet".to_string())
+                }
+                // A provider call was made and its answer was an error: that is the outcome.
+                Err(_) => Ok(None),
             }
         }
+    })
+    .await;
+    match admitted.flatten() {
+        Some(result) => result,
+        None => {
+            let last = observed.lock().unwrap().clone();
+            panic!("the call was never admitted: {last:?}")
+        }
     }
-    panic!(
-        "the call was never admitted: {last:?} ({} provider calls)",
-        rig.calls()
-    );
+}
+
+/// A call that the policy refuses, waited for until the route can actually reach it.
+///
+/// A daemon admits a route to a module that has not yet served its providers, and a call in
+/// that window is refused before the policy runs. That is the intended production behaviour,
+/// and it reports the scope as unreachable. This helper is for tests about the policy itself,
+/// so it keeps asking until the policy answers, and checks every artifact stayed untouched on
+/// every attempt.
+async fn refused_once_the_route_is_served(rig: &Rig, route: &Route, key: &str) -> Value {
+    broca_test_support::wait_until("a policy refusal", || async {
+        let error = refused_without_writes(rig, route, key).await;
+        if error["detail"]["consent"] == "private_content_unreachable" {
+            return Err(format!("the route is not served yet: {error}"));
+        }
+        Ok(error)
+    })
+    .await
 }
 
 /// One call that is refused, leaving every artifact exactly as it was.
@@ -768,7 +797,7 @@ async fn a_marked_run_ends_not_started_consent_required_and_files_nothing() {
     };
     let route = rig.open("run", false).await;
     for key in ["marked", "marked-again"] {
-        let error = refused_without_writes(&rig, &route, key).await;
+        let error = refused_once_the_route_is_served(&rig, &route, key).await;
         assert_eq!(error["code"], "not_started");
         assert_eq!(error["detail"]["consent"], "consent_required");
     }
