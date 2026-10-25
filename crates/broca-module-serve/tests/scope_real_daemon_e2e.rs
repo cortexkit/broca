@@ -38,6 +38,109 @@ const SCOPE_EPOCH: u64 = 7;
 /// out with corr `SCOPE_SYNC_CORR_BASE + n`, and its reply is recorded under that corr.
 const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 
+struct AcceptanceCatalog;
+
+#[async_trait::async_trait]
+impl subc_client_rs::ModuleHandler for AcceptanceCatalog {
+    async fn handle(
+        &self,
+        _ctx: subc_client_rs::RequestCtx,
+        body: Vec<u8>,
+    ) -> subc_client_rs::HandlerOutcome {
+        use sha2::{Digest, Sha256};
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["name"], "tool.catalog");
+        assert_eq!(request["arguments"]["preset"], "reader");
+        let composition = &request["arguments"]["composition"];
+        let schema = serde_json::json!({"type": "object"});
+        let answer = serde_json::json!({
+            "generation": "1",
+            "catalog_digest": format!("{:x}", Sha256::digest(b"acceptance-catalog")),
+            "composition_digest": cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap(),
+            "capabilities": {"late_results": true},
+            "tools": [{
+                "name": "read", "description": "Read a file",
+                "input_schema": schema,
+                "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).unwrap(),
+                "semantics": 1, "capabilities": ["code.read/v1"],
+                "result_format": "content/v1"
+            }]
+        });
+        subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_admission_acceptance_reads_real_run_started_gates() {
+    use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, ProviderRole, Tool};
+    let model = ScopeModel::start().await;
+    let Some(rig) = Rig::start_configured(None, None, Some(&model.url)).await else {
+        return;
+    };
+    let manifest =
+        subc_protocol::manifest::ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
+            .provides(vec![ProviderRole::ToolProvider {
+                tools: vec![Tool {
+                    name: "read".into(),
+                    description: Some("Read a file".into()),
+                    execution_mode: ExecutionMode::Pure,
+                    schema: serde_json::json!({"type": "object"}),
+                }],
+                identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: false,
+                sub_supervises: false,
+            }])
+            .build();
+    let (_, serve) =
+        subc_client_rs::serve_with_handle(&rig.connection_file, manifest, AcceptanceCatalog)
+            .await
+            .expect("register declaring AFT catalog on private daemon");
+    let serving = tokio::spawn(serve);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let output = Command::new("python3")
+        .arg(root.join("scripts/acceptance-worker-turn.py"))
+        .arg("--session-bin")
+        .arg(env!("CARGO_BIN_EXE_broca-session"))
+        .arg("--subc")
+        .arg(&rig.connection_file)
+        .arg("--state-root")
+        .arg(&rig.state_root)
+        .arg("--project-root")
+        .arg(&rig.dir)
+        .args(["--model", "mock/mock-model", "--timeout", "30"])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .await
+        .unwrap();
+    serving.abort();
+    println!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        for path in walk(&rig.dir) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                for line in text
+                    .lines()
+                    .filter(|line| line.contains("panicked") || line.contains("precomputed"))
+                    .take(4)
+                {
+                    println!("{}: {line}", path.display());
+                }
+            }
+        }
+    }
+    assert!(
+        output.status.success(),
+        "worker admission acceptance failed"
+    );
+}
+
 fn sibling_bin(name: &str, env_key: &str) -> PathBuf {
     broca_test_support::subc_bin(name, env_key)
 }

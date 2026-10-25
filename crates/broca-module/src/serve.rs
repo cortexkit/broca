@@ -1239,8 +1239,8 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             .to_string()
     });
     match state.state {
-        // A runner-owned wait (llm-runner 0.5.2 §6) is whatever carries a deadline: the context
-        // ceiling's wait for a view, else a rewrite ride's reported wait. `reason` only names it.
+        // Deadline waits and provider-held calls are independent runner-owned waits.
+        // Consumers recognize them from their fields, never from the informational reason.
         State::Active => RunStatusResponse::Active {
             auth_selection,
             reason: match (state.ceiling_deadline_ms, state.ride_wait_deadline_ms) {
@@ -1255,12 +1255,19 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
             step: state.live_step,
             title,
             awaiting_approval: None,
+            held_calls: state.held_calls,
         },
         State::Paused => RunStatusResponse::Paused {
             auth_selection,
             pause_reason: state
                 .pause_reason
-                .filter(|reason| *reason == broca_protocol::PauseReason::Restart)
+                .filter(|reason| {
+                    matches!(
+                        reason,
+                        broca_protocol::PauseReason::Restart
+                            | broca_protocol::PauseReason::ToolHeld
+                    )
+                })
                 .map(Into::into),
             usage,
             retries_used,
@@ -1287,6 +1294,7 @@ fn run_status_response(state: Option<broca_core::ReconciledRunState>) -> RunStat
                         }),
                 }),
             title,
+            held_calls: state.held_calls,
         },
         State::Interrupted => RunStatusResponse::Interrupted {
             auth_selection,
@@ -3581,6 +3589,94 @@ impl ServeHandler for crate::LineageRegistry {
 }
 
 #[cfg(test)]
+mod held_status_tests {
+    use super::*;
+
+    fn state(index: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
+        broca_core::ReconciledRunState {
+            state: index,
+            held_calls: Vec::new(),
+            budget_detail: None,
+            context_ceiling: None,
+            ceiling_deadline_ms: None,
+            ride_wait_deadline_ms: None,
+            structured_output: None,
+            live_step: None,
+            undelivered_steers: None,
+            final_step_finish_reason: None,
+            indeterminate_tool_calls: None,
+            usage: None,
+            run_usage: Default::default(),
+            retries_used: 0,
+            error: None,
+            pause_reason: None,
+            auth_selection: None,
+            title: None,
+        }
+    }
+
+    #[test]
+    fn active_and_paused_status_omit_empty_held_calls() {
+        for index in [
+            broca_core::RunIndexState::Active,
+            broca_core::RunIndexState::Paused,
+        ] {
+            let wire = serde_json::to_value(run_status_response(Some(state(index)))).unwrap();
+            assert!(
+                wire.get("held_calls").is_none(),
+                "empty held_calls must be omitted, not null or []: {wire}"
+            );
+            let decoded: cortexkit_role_llm_runner::run::RunStatus =
+                serde_json::from_value(wire).unwrap();
+            assert!(!decoded.is_held_wait());
+            assert!(decoded.held_calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn active_and_paused_status_map_open_provider_held_calls() {
+        let expected = serde_json::json!([{
+            "call_key": "lineage:4", "tool": "ask", "provider": "tools",
+            "reason": "running", "held_at_ms": 42
+        }]);
+        for index in [
+            broca_core::RunIndexState::Active,
+            broca_core::RunIndexState::Paused,
+        ] {
+            let mut reconciled = state(index.clone());
+            reconciled.pause_reason = (index == broca_core::RunIndexState::Paused)
+                .then_some(broca_protocol::PauseReason::ToolHeld);
+            reconciled
+                .held_calls
+                .push(cortexkit_role_llm_runner::run::HeldCall::new(
+                    "lineage:4",
+                    "ask",
+                    "tools",
+                    "running",
+                    42,
+                ));
+            let wire = serde_json::to_value(run_status_response(Some(reconciled))).unwrap();
+            assert_eq!(
+                wire["held_calls"], expected,
+                "open held calls must be reported on live and paused runs"
+            );
+            assert!(wire.get("deadline_ms").is_none());
+            if index == broca_core::RunIndexState::Paused {
+                assert_eq!(wire["pause_reason"], "tool_held");
+                assert_eq!(wire["reason"], "tool_held");
+            }
+            let decoded: cortexkit_role_llm_runner::run::RunStatus =
+                serde_json::from_value(wire).unwrap();
+            assert!(decoded.is_held_wait());
+            assert_eq!(decoded.held_calls()[0].tool(), "ask");
+            assert!(!cortexkit_role_tool_provider::result::is_person_wait(
+                decoded.held_calls()[0].reason()
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
 mod paused_auth_tests {
     use super::run_status_response;
 
@@ -3603,6 +3699,7 @@ mod paused_auth_tests {
                 broca_protocol::PauseReason::AuthRequired,
             ] {
                 let state = broca_core::ReconciledRunState {
+                    held_calls: Vec::new(),
                     run_usage: Default::default(),
                     budget_detail: None,
                     context_ceiling: None,
@@ -3679,6 +3776,7 @@ mod context_ceiling_tests {
     use super::*;
     fn reconciled(state: broca_core::RunIndexState) -> broca_core::ReconciledRunState {
         broca_core::ReconciledRunState {
+            held_calls: Vec::new(),
             state,
             context_ceiling: None,
             ceiling_deadline_ms: None,

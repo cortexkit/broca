@@ -90,6 +90,9 @@ if name == "accept" and os.environ.get("WARMING_ACCEPTS"):
         sys.exit(1)
 sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
 ''')
+        (self.scripts / "acceptance-worker-turn.py").write_text(
+            'import runpy, sys\nsys.argv[1:] = ["worker-accept"]\n'
+            'runpy.run_path(__file__.replace("acceptance-worker-turn.py", "stub.py"), run_name="__main__")\n')
         for file, step in (("stage-release.sh", "stage"), ("place-release.sh", "place"),
                            ("verify-deploy.sh", "verify"), ("acceptance-turn.sh", "accept"),
                            ("tag-when-green.sh", "publish")):
@@ -161,7 +164,7 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
     def test_acceptance_waits_out_a_module_still_starting(self):
         result = self.deploy(WARMING_ACCEPTS="2", BROCA_DEPLOY_WARMING_RETRY_SECS="0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept", "accept", "accept", "publish"])
+        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept", "accept", "accept", "worker-accept", "publish"])
         self.assertIn("still starting (module_warming)", result.stdout)
 
     def test_acceptance_failure_other_than_warming_is_not_retried(self):
@@ -178,17 +181,25 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertIn("already names", result.stderr)
         self.assertEqual(self.steps(), [])
 
+    def test_failed_worker_admission_never_publishes(self):
+        result = self.deploy(FAIL_STEP="worker-accept")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept", "worker-accept"])
+        self.assertIn("WORKER ADMISSION ACCEPTANCE FAILED", result.stderr)
+        self.assertIn("Rollback:", result.stderr)
+
     def test_success_passes_probes_and_approval_reports_pid_and_only_then_publishes(self):
         result = self.deploy("--live-approved")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         records = self.records()
-        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept", "publish"])
+        self.assertEqual(self.steps(), ["stage", "place", "verify", "accept", "worker-accept", "publish"])
         self.assertEqual(records[0][1], ["--marker", "new marker", "--control", "known control"])
         self.assertIn("--restart", records[1][1])
         self.assertIn("--live-approved", records[1][1])
         self.assertIn(hashlib.sha256(b"signed release").hexdigest(), records[2][1])
         self.assertEqual(records[3][1], ["0.0.2"])
-        self.assertEqual(records[4][1], [self.sha, "0.0.2"])
+        self.assertEqual(records[4][1], [])
+        self.assertEqual(records[5][1], [self.sha, "0.0.2"])
         self.assertIn("pid        4321", result.stdout)
         self.assertIn("sessions sealed at restart (WAL readback): session.wal", result.stdout)
         self.assertIn("acceptance PASS", result.stdout)

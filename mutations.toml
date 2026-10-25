@@ -7031,8 +7031,8 @@ test_count_pattern = "Ran {count} test"
 test_file = "scripts/test-archive-read.py"
 expect_red = ["ArchiveReadTests.test_compaction_records_decode_and_scan_live_and_archived"]
 file = "scripts/lib/archive_read.py"
-old = "frames.append(WalFrame(seq, fence, record, payload))"
-new = "if record['type'] != 'compaction_wait':  # NON-VACUITY BREAK\n            frames.append(WalFrame(seq, fence, record, payload))"
+old = "frames.append(WalFrame(seq, fence, record, payload, requires))"
+new = "if record['type'] != 'compaction_wait':  # NON-VACUITY BREAK\n            frames.append(WalFrame(seq, fence, record, payload, requires))"
 
 [[control]]
 id = "wal-tools-newer-writer-refusal"
@@ -30659,3 +30659,137 @@ expect_red = ["output_refs::tests::a_repeated_result_id_keeps_its_own_tool_name"
 file = "crates/broca-module/src/output_refs.rs"
 old = ".nth(occurrence)"
 new = ".nth(occurrence.min(0)) /* NON-VACUITY BREAK: borrow the preceding same-id call's tool name */"
+
+[[control]]
+id = "held-status-omits-empty-list"
+platforms = ["linux", "macos"]
+guards = "An ordinary active status omits held_calls instead of emitting an empty wait list"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::held_status_tests::active_and_paused_status_omit_empty_held_calls"]
+expect_message = "empty held_calls must be omitted"
+file = "crates/broca-wire/src/lib.rs"
+old = '''        /// Open provider-held calls are a runner-owned wait, independent of `reason`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]'''
+new = '''        /// Open provider-held calls are a runner-owned wait, independent of `reason`.
+        #[serde(default)] // NON-VACUITY BREAK: emit an empty held list on ordinary runs.'''
+
+[[control]]
+id = "held-status-live-list-present"
+platforms = ["linux", "macos"]
+guards = "A live run reports its open provider-held calls as well as a paused run"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::held_status_tests::active_and_paused_status_map_open_provider_held_calls"]
+expect_message = "open held calls must be reported on live and paused runs"
+file = "crates/broca-module/src/serve.rs"
+old = '''            awaiting_approval: None,
+            held_calls: state.held_calls,'''
+new = '''            awaiting_approval: None,
+            held_calls: Vec::new(), // NON-VACUITY BREAK: hide the live held wait.'''
+
+[[control]]
+id = "held-status-terminal-removes-call"
+platforms = ["linux", "macos"]
+guards = "WAL reconciliation removes each provider-held call at its terminal before the batch barrier"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::held_calls_status_rebuilds_live_and_paused_calls_and_drops_each_terminal"]
+file = "crates/broca-core/src/replay.rs"
+old = '''                    held_calls.retain(|(batch, call, _)| {
+                        batch != batch_id || call != &result.tool_call_id
+                    });'''
+new = '''                    let _ = batch_id;
+                    held_calls.retain(|_| true); // NON-VACUITY BREAK: retain a terminal held call.'''
+
+[[control]]
+id = "fold-keeps-terminal-held-range-during-intake-rebuild"
+guards = "An incomplete intake store is not evidence that a terminal held range has no registration"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_fold.rs"
+expect_red = ["wal_fold::provider_held_store_tests::incomplete_intake_keeps_a_terminal_held_range_live"]
+file = "crates/broca-core/src/wal_fold.rs"
+old = '''    if matches!(
+        held_ranges,
+        HeldRanges::Store(StoreHeld { complete: false })
+    ) && held.needs_intake()
+    {'''
+new = '''    if false && matches!(
+        held_ranges,
+        HeldRanges::Store(StoreHeld { complete: false })
+    ) && held.needs_intake()
+    { // NON-VACUITY BREAK: trust an incomplete intake.'''
+
+[[control]]
+id = "retention-keeps-shared-late-result-feed"
+guards = "Deleting one lineage preserves its module feed cursor and ack debt for other sessions"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::retention_cleanup_keeps_shared_feed_and_other_lineages"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = '''        transaction
+            .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])'''
+new = '''        transaction.execute("DELETE FROM feeds", []).unwrap(); // NON-VACUITY BREAK: erase a shared feed during lineage cleanup.
+        transaction
+            .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])'''
+
+[[control]]
+id = "retention-unreadable-intake-refuses-deletion"
+guards = "An unreadable intake store cannot silently authorize retention deletion of an uncertain lineage"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention.rs"
+expect_red = ["retention::provider_held_tests::unreadable_intake_refuses_retention_and_counts_health"]
+file = "crates/broca-module/src/retention.rs"
+old = '''            Err(_) => {
+                self.mark_unreadable(key);
+                tracing::warn!(target: "retention", session = %broca_core::session_addr(key), reason = "provider_held_intake_unknown",
+                    "retention deletion skipped: intake store cannot be read");
+                return Ok(None);
+            }'''
+new = '''            Err(_) => {} // NON-VACUITY BREAK: delete despite unreadable intake ownership.'''
+
+[[control]]
+id = "retention-missing-intake-keeps-held-history"
+guards = "Losing the intake projection does not erase durable registration history or the provider-held feature floor"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/retention.rs"
+expect_red = ["retention::provider_held_tests::absent_intake_with_held_history_refuses_retention"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = '''        return Ok((prior_registration || floor.contains("provider-held/v1"))
+            .then_some("provider_held_intake_unknown"));'''
+new = '''        return Ok((false && (prior_registration || floor.contains("provider-held/v1")))
+            .then_some("provider_held_intake_unknown")); // NON-VACUITY BREAK: forget intake history after projection loss.'''
+
+[[control]]
+id = "retention-tombstones-prune-intake-before-actor-open"
+guards = "A retention tombstone removes intake ownership at boot without needing the deleted WAL or a session actor"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::boot_prunes_tombstoned_registrations_without_a_wal_or_actor"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = "            self.remove_lineage(&row.call.lineage)?;"
+new = "            let _ = &row.call.lineage; // NON-VACUITY BREAK: retain tombstoned intake ownership."

@@ -1089,3 +1089,48 @@ impl CutArtifacts for FileCutArtifacts {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod provider_held_tests {
+    use super::*;
+    use broca_core::WalStore;
+    use broca_protocol::{PauseReason, RunId};
+    use broca_wal::WalRecord;
+
+    #[test]
+    fn tool_held_session_is_run_active_for_move() {
+        let root = broca_test_support::scratch_root().join("move-tool-held");
+        let store = FileWalStore::new(root.join("wal"));
+        let session = BindIdentity::new("/project", "broca", "held");
+        let mut writer = store.open(&session).unwrap();
+        writer
+            .append(
+                1,
+                &crate::move_install::tests::started(&session, "run"),
+                true,
+            )
+            .unwrap();
+        writer
+            .append(
+                1,
+                &WalRecord::RunPaused {
+                    run_id: RunId("run".into()),
+                    reason: PauseReason::ToolHeld,
+                    error: None,
+                    ts_ms: Some(1),
+                },
+                true,
+            )
+            .unwrap();
+        drop(writer);
+        let range = broca_wal::read_records_range(
+            store.wal_path(&session),
+            broca_wal::DEFAULT_MAX_READ_BYTES,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(source_busy_reason(&range).unwrap(), Some("run_active"));
+    }
+}

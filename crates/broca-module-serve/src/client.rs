@@ -70,6 +70,10 @@ pub struct SendSpec<'a> {
     /// `None` omits the wire field: inherit the session's value, or take the process default
     /// on its first episode.
     pub context_management: Option<broca_protocol::request::ContextManagement>,
+    /// Class to freeze on the first send; `None` omits the field and preserves an existing class.
+    pub session_class: Option<&'a str>,
+    /// Fetch plan admitted by the daemon before it decodes the ordinary send fields.
+    pub plan: Option<serde_json::Value>,
 }
 
 /// What a `send` produced: an active run, an already-finished run, or a durably-queued submission.
@@ -434,49 +438,60 @@ fn request_body<P: serde::Serialize>(method: &str, params: &P) -> Result<Vec<u8>
         .map_err(|error| ConnError::Transport(format!("encode {method} params: {error}")))
 }
 
-fn send_params(spec: SendSpec<'_>) -> SendParams {
-    SendParams {
-        content: Vec::new(),
-        directives: None,
-        session_class: None,
-        title: None,
-        client_message_id: None,
-        on_restart: None,
-        keep_warm: None,
-        retention: None,
-        conversation_key: None,
-        service_tier: spec.service_tier,
-        prompt: spec.prompt.to_string(),
-        prompt_blocks: None,
-        system: spec.system.map(str::to_owned),
-        send_id: spec.send_id.map(str::to_owned),
-        model: Some(ModelParams {
-            provider: spec.provider.to_string(),
-            model: spec.model.to_string(),
-            variant: spec.variant.map(str::to_owned),
-        }),
-        tools: spec.tools,
-        tool_choice: Default::default(),
-        generation: broca_protocol::request::GenerationConfig {
-            max_output_tokens: spec.max_output_tokens,
-            ..Default::default()
+#[derive(serde::Serialize)]
+struct SendRequest {
+    #[serde(flatten)]
+    params: SendParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<serde_json::Value>,
+}
+
+fn send_params(spec: SendSpec<'_>) -> SendRequest {
+    SendRequest {
+        plan: spec.plan,
+        params: SendParams {
+            content: Vec::new(),
+            directives: None,
+            session_class: spec.session_class.map(str::to_owned),
+            title: None,
+            client_message_id: None,
+            on_restart: None,
+            keep_warm: None,
+            retention: None,
+            conversation_key: None,
+            service_tier: spec.service_tier,
+            prompt: spec.prompt.to_string(),
+            prompt_blocks: None,
+            system: spec.system.map(str::to_owned),
+            send_id: spec.send_id.map(str::to_owned),
+            model: Some(ModelParams {
+                provider: spec.provider.to_string(),
+                model: spec.model.to_string(),
+                variant: spec.variant.map(str::to_owned),
+            }),
+            tools: spec.tools,
+            tool_choice: Default::default(),
+            generation: broca_protocol::request::GenerationConfig {
+                max_output_tokens: spec.max_output_tokens,
+                ..Default::default()
+            },
+            stop_when: Vec::new(),
+            cache: spec.cache,
+            budget: spec.budget,
+            structured_output: None,
+            auth: spec.auth,
+            context_limit: None,
+            work_class: None,
+            one_shot: spec.one_shot,
+            delivery: None,
+            dedupe_key: None,
+            expires_at_ms: None,
+            template: None,
+            // Inert (back-compat wire field); the coordinator decides append-vs-no-op from
+            // run_id identity. A fresh send over an idle lineage auto-appends a new episode.
+            append_episode: false,
+            context_management: spec.context_management,
         },
-        stop_when: Vec::new(),
-        cache: spec.cache,
-        budget: spec.budget,
-        structured_output: None,
-        auth: spec.auth,
-        context_limit: None,
-        work_class: None,
-        one_shot: spec.one_shot,
-        delivery: None,
-        dedupe_key: None,
-        expires_at_ms: None,
-        template: None,
-        // Inert (back-compat wire field); the coordinator decides append-vs-no-op from
-        // run_id identity. A fresh send over an idle lineage auto-appends a new episode.
-        append_episode: false,
-        context_management: spec.context_management,
     }
 }
 
@@ -719,6 +734,34 @@ mod tests {
     }
 
     #[test]
+    fn session_send_body_keeps_class_and_fetch_plan() {
+        let plan = serde_json::json!({"tool_items": [{"provider": "aft", "preset": "reader"}]});
+        let params = send_params(SendSpec {
+            prompt: "hello",
+            system: None,
+            provider: "provider",
+            model: "model",
+            variant: None,
+            service_tier: None,
+            tools: None,
+            send_id: None,
+            max_output_tokens: Some(32),
+            cache: None,
+            budget: None,
+            auth: None,
+            one_shot: None,
+            context_management: None,
+            session_class: Some("acceptance"),
+            plan: Some(plan.clone()),
+        });
+        let body = request_body("session.send", &params).unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["params"]["session_class"], "acceptance");
+        assert_eq!(request["params"]["plan"], plan);
+        assert!(request["params"].get("tools").is_none());
+    }
+
+    #[test]
     fn session_send_body_keeps_output_cap_and_cache_key_verbatim() {
         let cache_key = "shared:prompt/東京:\"quoted\"\\path";
         let params = send_params(SendSpec {
@@ -742,6 +785,8 @@ mod tests {
             auth: None,
             one_shot: None,
             context_management: None,
+            session_class: None,
+            plan: None,
         });
         let body = request_body("session.send", &params).unwrap();
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -749,6 +794,8 @@ mod tests {
         assert_eq!(request["method"], "session.send");
         assert_eq!(request["params"]["generation"]["max_output_tokens"], 137);
         assert_eq!(request["params"]["cache"]["key"], cache_key);
+        assert!(request["params"].get("plan").is_none());
+        assert!(request["params"].get("session_class").is_none());
         assert!(body
             .windows(b"\"max_output_tokens\":137".len())
             .any(|window| window == b"\"max_output_tokens\":137"));

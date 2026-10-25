@@ -1,0 +1,3 @@
+anthropic/claude-opus-5
+google/antigravity-gemini-3.8-flash
+deepseek/deepseek-v4-flash

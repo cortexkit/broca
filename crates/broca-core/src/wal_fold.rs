@@ -380,6 +380,13 @@ fn eligible_with(
     if matches!(held_ranges, HeldRanges::UnknownStore) && held.needs_intake() {
         return Err("provider_held_registered");
     }
+    if matches!(
+        held_ranges,
+        HeldRanges::Store(StoreHeld { complete: false })
+    ) && held.needs_intake()
+    {
+        return Err("provider_held_registered");
+    }
     let mut identity = None;
     let mut last_ts = None;
     for framed in records {
@@ -1301,5 +1308,58 @@ mod windows_acl_tests {
         }
         assert_private(&path);
         assert_private(&fixture.path.join("wal-archive"));
+    }
+}
+
+#[cfg(test)]
+mod provider_held_store_tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_intake_keeps_a_terminal_held_range_live() {
+        let records = [
+            WalRecord::ToolCallProviderHeld {
+                batch_id: broca_protocol::BatchId("batch".into()),
+                tool_call_id: ToolCallId("call".into()),
+                call_key: "lineage:1".into(),
+                module: "provider".into(),
+                reason: "running".into(),
+                detail_digest: None,
+                held_at_ms: 1,
+                sequential: false,
+            },
+            WalRecord::ToolResult {
+                finished_at_ms: None,
+                batch_id: broca_protocol::BatchId("batch".into()),
+                result: crate::replay::deferred_tests::result("call", "late"),
+                outcome: broca_wal::DispatchOutcome::Completed,
+                reason: None,
+                tags: None,
+                hooks: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            },
+        ];
+        let bytes = records
+            .iter()
+            .enumerate()
+            .flat_map(|(index, record)| {
+                broca_wal::framing::encode_payload(
+                    index as u64 + 1,
+                    1,
+                    &serde_json::to_vec(record).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for knowledge in [
+            HeldRanges::UnknownStore,
+            HeldRanges::Store(StoreHeld { complete: false }),
+        ] {
+            assert_eq!(
+                eligible_with(&bytes, COLD_MS * 3, COLD_MS, knowledge),
+                Err("provider_held_registered")
+            );
+        }
     }
 }

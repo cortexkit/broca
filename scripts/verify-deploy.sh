@@ -300,7 +300,8 @@ echo "  layers 1-2 checked the artifact. Nothing above proves the daemon SERVES 
 echo "  acceptance turn, and use a tool-bearing one so route open, dispatch, result and"
 echo "  completion are all exercised rather than just generation:"
 echo
-echo "    ./scripts/acceptance-turn.sh            # add --model <provider/model> to pick one"
+echo "    bash scripts/acceptance-turn.sh"
+echo "    python3 scripts/acceptance-worker-turn.py"
 echo
 # POINTS AT THE SCRIPT RATHER THAN INLINING THE RECIPE. The inlined form drifted from the
 # script that owns it, and a reader following the printed prompt would see the version in the
@@ -309,6 +310,8 @@ echo
 # version is established above, by --version on the destination binary and the marker
 # differential. See the comment in scripts/acceptance-turn.sh for the live proof.
 echo "  expect: TOOL_CALL read -> TOOL_RESULT is_error=false -> RUN_FINISHED Completed"
+echo "  then: classed fetch-plan turn completed; RunStarted WAL requires session-class/v1"
+echo "        and provider-declarations/v1 (not inferred from the session reply)"
 
 # --- a standing question, not a check -------------------------------------------------------
 #

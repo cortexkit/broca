@@ -117,6 +117,13 @@ if [ ! -x ./target/release/broca-session ] || ! acceptance; then
   rollback_command >&2
   exit 1
 fi
+if ! python3 scripts/acceptance-worker-turn.py >"$logdir/acceptance-worker.log" 2>&1; then
+  cat "$logdir/acceptance-worker.log" >&2
+  echo "deploy: WORKER ADMISSION ACCEPTANCE FAILED; not publishing." >&2
+  rollback_command >&2
+  exit 1
+fi
+cat "$logdir/acceptance-worker.log"
 ci_log="$logdir/ci.log"
 if ! TAG_WHEN_GREEN_LOG="$ci_log" bash scripts/tag-when-green.sh "$sha" "$version"; then
   echo "deploy: live acceptance passed, but could not start background publication. Retry scripts/tag-when-green.sh $sha $version" >&2
@@ -140,6 +147,6 @@ if report["seal_error"]:
 if report.get("sessions_cancelled"):
     sys.exit(1)
 PY
-echo "   acceptance PASS (live tool dispatch, result, completed turn)"
+echo "   acceptance PASS (live tool dispatch; classed fetch-plan turn and WAL feature gates)"
 rollback_command
 echo "   CI log     $ci_log (detached; CI does not gate deployment)"

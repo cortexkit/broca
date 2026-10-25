@@ -15,6 +15,75 @@ use cortexkit_role_tool_provider::late_results::{Cursor, IntakeKey};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
+pub(crate) const REGISTRATION_MARKER: &str = "late-results-registered";
+const REBUILD_REQUIRED_MARKER: &str = "late-results-rebuild-required";
+
+fn sync_marker(root: &Path, name: &str) -> Result<(), String> {
+    let marker = root.join(name);
+    broca_store::create_private_sqlite(&marker).map_err(|error| error.to_string())?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(marker)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    crate::retention::sync_dir(root)
+}
+
+/// Missing projections are harmless only on roots with no evidence of prior held intake.
+/// An existing but unreadable projection cannot prove that a lineage is unregistered.
+pub(crate) fn retention_block_reason(
+    root: &Path,
+    lineage: &str,
+) -> Result<Option<&'static str>, String> {
+    if root
+        .join(REBUILD_REQUIRED_MARKER)
+        .try_exists()
+        .map_err(|e| e.to_string())?
+        || root
+            .join("late-results.db.rebuild")
+            .try_exists()
+            .map_err(|e| e.to_string())?
+    {
+        return Ok(Some("provider_held_intake_unknown"));
+    }
+    let path = root.join("late-results.db");
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        let prior_registration = root
+            .join(REGISTRATION_MARKER)
+            .try_exists()
+            .map_err(|e| e.to_string())?;
+        let floor = broca_wal::read_floor(&root.join(broca_wal::FEATURE_FLOOR_FILENAME))
+            .map_err(|e| e.to_string())?;
+        return Ok((prior_registration || floor.contains("provider-held/v1"))
+            .then_some("provider_held_intake_unknown"));
+    }
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    let registered: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM registrations WHERE lineage = ?1)",
+            [lineage],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(registered.then_some("provider_held_registered"))
+}
+
+pub(crate) fn remove_retained_lineage(root: &Path, lineage: &str) -> Result<(), String> {
+    let path = root.join("late-results.db");
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(());
+    }
+    let connection =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|error| error.to_string())?;
+    LateResultsStore {
+        connection: Mutex::new(connection),
+        path,
+    }
+    .remove_lineage(lineage)
+}
+
 /// The feed cursor as this store keeps it: the provider's incarnation plus the sequence the
 /// provider said that incarnation's entries had reached.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +180,14 @@ impl LateResultsStore {
     /// over the replaced file would resurrect content the rebuild exists to regenerate.
     pub fn open_with_wal_recovery(path: &Path, replay_journal: bool) -> Result<Self, String> {
         let path = path.to_path_buf();
+        if !path.try_exists().map_err(|error| error.to_string())? {
+            let root = path.parent().ok_or("intake store has no state root")?;
+            if retention_block_reason(root, "")?.is_some() {
+                // A newly created database is not a completed rebuild. Keep retention fenced
+                // across its creation; only a verified full scan can discharge this marker.
+                sync_marker(root, REBUILD_REQUIRED_MARKER)?;
+            }
+        }
         if !replay_journal {
             for suffix in ["-wal", "-shm"] {
                 let mut side = path.clone().into_os_string();
@@ -156,10 +233,12 @@ impl LateResultsStore {
              );",
             )
             .map_err(|error| error.to_string())?;
-        Ok(Self {
+        let store = Self {
             connection: Mutex::new(connection),
             path,
-        })
+        };
+        store.prune_tombstoned()?;
+        Ok(store)
     }
 
     pub fn path(&self) -> &Path {
@@ -181,6 +260,11 @@ impl LateResultsStore {
 
     /// Every registration with its state.
     pub fn registration_rows(&self) -> Result<Vec<RegistrationRow>, String> {
+        self.prune_tombstoned()?;
+        self.unpruned_registration_rows()
+    }
+
+    fn unpruned_registration_rows(&self) -> Result<Vec<RegistrationRow>, String> {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
@@ -208,6 +292,7 @@ impl LateResultsStore {
         module: &str,
         call_key: &str,
     ) -> Result<Option<RegistrationRow>, String> {
+        self.prune_tombstoned()?;
         let connection = self.lock()?;
         connection
             .query_row(
@@ -430,6 +515,10 @@ impl LateResultsStore {
         if calls.is_empty() {
             return Ok(());
         }
+        // The projection may later be deleted for rebuild. Keep durable evidence that absence
+        // no longer proves this state root has never registered a provider-held-capable call.
+        let root = self.path.parent().ok_or("intake store has no state root")?;
+        sync_marker(root, REGISTRATION_MARKER)?;
         let mut connection = self.lock()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -478,6 +567,47 @@ impl LateResultsStore {
                 .map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// Retention retires a whole lineage, including receipts whose registrations were already
+    /// pruned. Feed positions and ack debt belong to the module, not to the deleted session.
+    pub fn remove_lineage(&self, lineage: &str) -> Result<(), String> {
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM receipts WHERE substr(call_key, 1, length(?1) + 1) = ?1 || ':'",
+                [lineage],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// A tombstone is durable before WAL removal. It is enough to retire intake ownership even
+    /// if deletion crashed before cleaning this projection; no session actor needs to open.
+    fn prune_tombstoned(&self) -> Result<(), String> {
+        let root = self.path.parent().ok_or("intake store has no state root")?;
+        let wal = broca_core::FileWalStore::new(root.join("wal"));
+        for row in self.unpruned_registration_rows()? {
+            let path = wal.tombstone_path(&row.call.bind, &row.call.lineage);
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            let stone: crate::retention::Tombstone =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if stone.lineage_id != row.call.lineage {
+                return Err("intake retention tombstone identity mismatch".into());
+            }
+            self.remove_lineage(&row.call.lineage)?;
+        }
+        Ok(())
     }
 }
 
@@ -673,5 +803,93 @@ mod tests {
         let row = store.feed("provider").unwrap().unwrap();
         assert_eq!(row.position, None);
         assert!(row.ack_owed, "an owed ack survives an incarnation change");
+    }
+
+    #[test]
+    fn retention_cleanup_keeps_shared_feed_and_other_lineages() {
+        let path = scratch("late-results-retention/late-results.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = LateResultsStore::open(&path).unwrap();
+        let deleted = call("lineage:1");
+        let mut other = call("lineage-other:1");
+        other.lineage = "lineage-other".into();
+        other.bind.session = "other-session".into();
+        store.register_calls(&[deleted, other.clone()]).unwrap();
+        let position = FeedPosition {
+            provider_incarnation: "inc-1".into(),
+            seq: 42,
+        };
+        store.record_ack("provider", &position).unwrap();
+        store.set_ack_owed("provider", true).unwrap();
+        let deleted_receipt = intake_key("deleted");
+        let mut unregistered_receipt = intake_key("pruned");
+        unregistered_receipt.call_key = "lineage:2".into();
+        let mut other_receipt = intake_key("other");
+        other_receipt.call_key = other.call_key.clone();
+        for key in [&deleted_receipt, &unregistered_receipt, &other_receipt] {
+            store
+                .record_receipt(key, "result", Disposition::NoOp)
+                .unwrap();
+        }
+        store.remove_lineage("lineage").unwrap();
+        drop(store);
+        let store = LateResultsStore::open(&path).unwrap();
+        assert_eq!(store.registrations().unwrap(), vec![other]);
+        assert_eq!(store.receipt(&deleted_receipt).unwrap(), None);
+        assert_eq!(store.receipt(&unregistered_receipt).unwrap(), None);
+        assert_eq!(
+            store.receipt(&other_receipt).unwrap(),
+            Some(Disposition::NoOp)
+        );
+        assert_eq!(
+            store.feed("provider").unwrap(),
+            Some(FeedRow {
+                module: "provider".into(),
+                position: Some(position),
+                ack_owed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn boot_prunes_tombstoned_registrations_without_a_wal_or_actor() {
+        let path = scratch("late-results-tombstone/late-results.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = LateResultsStore::open(&path).unwrap();
+        let deleted = call("lineage:1");
+        store
+            .register_calls(std::slice::from_ref(&deleted))
+            .unwrap();
+        store.ensure_feed("provider", true).unwrap();
+        let key = intake_key("ev-1");
+        store
+            .record_receipt(&key, "result", Disposition::NoOp)
+            .unwrap();
+        drop(store);
+        let wal = broca_core::FileWalStore::new(path.parent().unwrap().join("wal"));
+        let tombstone = wal.tombstone_path(&deleted.bind, &deleted.lineage);
+        std::fs::create_dir_all(tombstone.parent().unwrap()).unwrap();
+        std::fs::write(
+            tombstone,
+            serde_json::to_vec(&crate::retention::Tombstone {
+                lineage_id: deleted.lineage,
+                expired_at_ms: 1,
+                seq: 1,
+                completed_at_ms: None,
+                next_tag: None,
+                next_notice_seq: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let reopened = LateResultsStore::open(&path).unwrap();
+        assert!(reopened.unpruned_registration_rows().unwrap().is_empty());
+        assert!(reopened.registrations().unwrap().is_empty());
+        assert_eq!(
+            reopened.registration("provider", "lineage:1").unwrap(),
+            None
+        );
+        assert_eq!(reopened.receipt(&key).unwrap(), None);
+        assert!(reopened.feed("provider").unwrap().unwrap().ack_owed);
     }
 }

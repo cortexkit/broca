@@ -1349,7 +1349,8 @@ whose held record is not yet durable pins the ack. Entries are deduplicated on
 `(provider, custodian, call_key, event_id)`, and `cursor_incarnation_changed` re-reads from the
 start. A registration is pruned once its call's terminal and batch commit are durable.
 
-At boot every session with a registration is opened so its open-time recovery runs, then each
+At boot tombstoned lineages are pruned from the intake without opening an actor. Every remaining
+session with a registration is opened so its open-time recovery runs, then each
 module that still needs its feed gets its puller. A missing or unreadable `late-results.db` is
 rebuilt off the startup path by scanning the live WALs, decoding only those holding a
 provider-held frame; until that scan completes no entry is delivered or acked. A state root
@@ -1362,6 +1363,23 @@ dropped that way never receives one and its run stays paused until it is cancell
 which arrives with cancel and stop support for held calls. A finished session that retention
 deletes while its ack is still owed keeps its feed row, and entries for its lineage are then
 no-ops.
+
+For a retention session, held calls last only as long as the session. Deletion removes the
+lineage's registrations and receipts, and late entries for that lineage are acked as no-ops.
+The shared module feed row, cursor and owed ack survive so other sessions can still receive
+their results. Deletion sends no `tool.withdraw`.
+
+Until archive folding can verify intake ownership per session, its production default keeps
+every held-record range live. Retention separately blocks deletion while a decoded held record
+or an intake registration remains. A missing intake
+store also prevents deletion after any registration history, held feature floor or rebuild
+marker; an unreadable store prevents deletion and counts in retention's unreadable-session
+health total. Before the first registration, `late-results-registered` is synced at the state
+root so losing the rebuildable database cannot erase that history. None of these guards changes
+ordinary expiry on roots that have never enabled held intake.
+Recreating a missing projection with held history leaves `late-results-rebuild-required` set;
+the current runtime cannot durably verify full-scan completion and does not clear this marker.
+Retention remains fenced pending that capability.
 
 ## 20. Persistence + storage
 

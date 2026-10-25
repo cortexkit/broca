@@ -3082,6 +3082,8 @@ pub struct ReconciledRunState {
     pub structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
     /// Only the live actor fills this; WAL reconciliation never guesses an in-flight step.
     pub live_step: Option<broca_protocol::provider::InFlightStep>,
+    /// Provider-held calls without a durable terminal, in held-record order.
+    pub held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
     pub state: crate::RunIndexState,
     /// Durable steer send ids with no later StepStarted to give their input to the model,
     /// in WAL order. Reported only after the run ends: adding the input to the transcript
@@ -3128,6 +3130,12 @@ pub fn reconcile_run_state<'a>(
     let mut title: Option<String> = None;
     let mut budget_detail = None;
     let mut context_ceiling = None;
+    let mut tool_names = HashMap::new();
+    let mut held_calls: Vec<(
+        BatchId,
+        ToolCallId,
+        cortexkit_role_llm_runner::run::HeldCall,
+    )> = Vec::new();
     // The structured-output settings the target run froze, and the result it recorded.
     let mut frozen_structured_output = None;
     let mut structured_output_result = None;
@@ -3145,6 +3153,7 @@ pub fn reconcile_run_state<'a>(
                 ..
             } => {
                 if rid.0 == run_id {
+                    held_calls.clear();
                     auth_selection = config.auth_selection.clone();
                     title = started_title.clone();
                     frozen_structured_output =
@@ -3153,6 +3162,7 @@ pub fn reconcile_run_state<'a>(
                         );
                 }
                 active_run = Some(rid.0.clone());
+                tool_names.clear();
                 budget_detail = None;
                 context_ceiling = None;
                 pending_steer_ids.clear();
@@ -3170,6 +3180,7 @@ pub fn reconcile_run_state<'a>(
                         ceiling_deadline_ms: None,
                         structured_output: None,
                         live_step: None,
+                        held_calls: Vec::new(),
                         title: None,
                         state: RunIndexState::Active,
                         undelivered_steers: None,
@@ -3224,11 +3235,15 @@ pub fn reconcile_run_state<'a>(
                 result,
             } if rid.0 == run_id => structured_output_result = Some(result.clone()),
             WalRecord::ModelStepFinished {
+                assistant_message,
                 usage,
                 finish_reason,
                 retries_used,
                 ..
             } => {
+                for call in assistant_message.tool_calls() {
+                    tool_names.insert(call.tool_call_id.clone(), call.tool_name.clone());
+                }
                 active_zero_step_seed = false;
                 has_completed_step = true;
                 total_usage.accumulate(usage);
@@ -3242,15 +3257,60 @@ pub fn reconcile_run_state<'a>(
                 }
             }
             WalRecord::ToolBatchStarted { .. } => indeterminate_tool_calls.reset_batch(),
-            WalRecord::ToolDispatchIntent { tool_call_id, .. } => {
+            WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                tool_name,
+                ..
+            } => {
+                if let Some(tool) = tool_name {
+                    tool_names
+                        .entry(tool_call_id.clone())
+                        .or_insert_with(|| tool.clone());
+                }
                 indeterminate_tool_calls.record_dispatch_intent(tool_call_id);
             }
-            WalRecord::ToolNoDispatch { tool_call_id, .. } => {
+            WalRecord::ToolCallProviderHeld {
+                batch_id,
+                tool_call_id,
+                call_key,
+                module,
+                reason,
+                held_at_ms,
+                ..
+            } if active_run.as_deref() == Some(run_id) => {
+                held_calls.push((
+                    batch_id.clone(),
+                    tool_call_id.clone(),
+                    cortexkit_role_llm_runner::run::HeldCall::new(
+                        call_key.clone(),
+                        tool_names.get(tool_call_id).cloned().unwrap_or_default(),
+                        module.clone(),
+                        reason.clone(),
+                        *held_at_ms,
+                    ),
+                ));
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } => {
+                if active_run.as_deref() == Some(run_id) {
+                    held_calls.retain(|(batch, call, _)| batch != batch_id || call != tool_call_id);
+                }
                 indeterminate_tool_calls.record_dispatch_terminal(tool_call_id, false);
             }
             WalRecord::ToolResult {
-                result, outcome, ..
+                batch_id,
+                result,
+                outcome,
+                ..
             } => {
+                if active_run.as_deref() == Some(run_id) {
+                    held_calls.retain(|(batch, call, _)| {
+                        batch != batch_id || call != &result.tool_call_id
+                    });
+                }
                 indeterminate_tool_calls
                     .record_dispatch_terminal(&result.tool_call_id, outcome.is_indeterminate());
             }
@@ -3305,6 +3365,7 @@ pub fn reconcile_run_state<'a>(
                         ceiling_deadline_ms: None,
                         structured_output,
                         live_step: None,
+                        held_calls: Vec::new(),
                         title: None,
                         state,
                         undelivered_steers: Some(pending_steer_ids.clone()),
@@ -3333,6 +3394,7 @@ pub fn reconcile_run_state<'a>(
                     ceiling_deadline_ms: None,
                     structured_output: None,
                     live_step: None,
+                    held_calls: Vec::new(),
                     title: None,
                     state: RunIndexState::Paused,
                     undelivered_steers: None,
@@ -3364,6 +3426,7 @@ pub fn reconcile_run_state<'a>(
                     ceiling_deadline_ms: None,
                     structured_output: None,
                     live_step: None,
+                    held_calls: Vec::new(),
                     title: None,
                     state: RunIndexState::Error,
                     undelivered_steers: Some(Vec::new()),
@@ -3388,6 +3451,7 @@ pub fn reconcile_run_state<'a>(
             ceiling_deadline_ms: None,
             structured_output: None,
             live_step: None,
+            held_calls: Vec::new(),
             state: RunIndexState::Interrupted,
             undelivered_steers: Some(pending_steer_ids.clone()),
             final_step_finish_reason: None,
@@ -3403,6 +3467,11 @@ pub fn reconcile_run_state<'a>(
         });
     }
     found.map(|state| ReconciledRunState {
+        held_calls: if matches!(state.state, RunIndexState::Active | RunIndexState::Paused) {
+            held_calls.into_iter().map(|(_, _, held)| held).collect()
+        } else {
+            Vec::new()
+        },
         auth_selection,
         title,
         run_usage: run_usage.usage,
@@ -4643,6 +4712,83 @@ pub(crate) mod provider_held_tests {
         let mut records = deferred_tests::batch(&["a", "b"]);
         records.extend([intent("a"), intent("b"), held(sequential)]);
         records
+    }
+
+    #[test]
+    fn held_calls_status_rebuilds_live_and_paused_calls_and_drops_each_terminal() {
+        let mut records = prefix(false);
+        let held_a = serde_json::json!({
+            "call_key": "lineage:4", "tool": "edit", "provider": "tools",
+            "reason": "running", "held_at_ms": 42
+        });
+        let status = |records: &[WalRecord]| reconcile_run_state(records, "r").unwrap();
+        let live = status(&records);
+        assert_eq!(live.state, crate::RunIndexState::Active);
+        assert_eq!(
+            serde_json::to_value(&live.held_calls).unwrap(),
+            serde_json::json!([held_a])
+        );
+
+        // The assistant's tool name remains authoritative when the optional intent name is absent.
+        let WalRecord::ToolDispatchIntent { tool_name, .. } = &mut records[3] else {
+            panic!("expected first dispatch intent")
+        };
+        *tool_name = None;
+        assert_eq!(status(&records).held_calls, live.held_calls);
+        let mut second = held(false);
+        if let WalRecord::ToolCallProviderHeld {
+            tool_call_id,
+            call_key,
+            reason,
+            ..
+        } = &mut second
+        {
+            *tool_call_id = ToolCallId("b".into());
+            *call_key = "lineage:5".into();
+            *reason = "future_reason".into();
+        }
+        records.push(second);
+        records.push(WalRecord::RunPaused {
+            run_id: RunId("r".into()),
+            reason: PauseReason::ToolHeld,
+            error: None,
+            ts_ms: Some(43),
+        });
+        let paused = status(&records);
+        assert_eq!(paused.state, crate::RunIndexState::Paused);
+        assert_eq!(paused.held_calls.len(), 2);
+        assert_eq!(paused.held_calls[1].reason(), "future_reason");
+        let restored: Vec<WalRecord> =
+            serde_json::from_slice(&serde_json::to_vec(&records).unwrap()).unwrap();
+        assert_eq!(status(&restored).held_calls, paused.held_calls);
+
+        for outcome in [
+            DispatchOutcome::Completed,
+            DispatchOutcome::Interrupted,
+            DispatchOutcome::MaxSteps,
+            DispatchOutcome::Unknown,
+        ] {
+            let mut closed = records.clone();
+            closed.push(terminal("a", outcome));
+            assert_eq!(status(&closed).held_calls, paused.held_calls[1..]);
+            closed.push(terminal("b", outcome));
+            assert!(
+                status(&closed).held_calls.is_empty(),
+                "held calls must disappear at their terminals, before the batch barrier"
+            );
+        }
+        records.push(WalRecord::ToolNoDispatch {
+            dispatched_at_ms: None,
+            hooks: None,
+            tags: None,
+            batch_id: BatchId("b".into()),
+            tool_call_id: ToolCallId("a".into()),
+            reason: NoDispatchReason::Unavailable {
+                detail: "unavailable".into(),
+            },
+        });
+        assert_eq!(status(&records).held_calls, paused.held_calls[1..]);
+        assert!(status(&deferred_tests::batch(&["a"])).held_calls.is_empty());
     }
 
     #[test]

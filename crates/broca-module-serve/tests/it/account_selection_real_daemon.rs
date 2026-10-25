@@ -1453,6 +1453,8 @@ fn spec<'a>(send_id: &'a str, auth: Option<broca_wire::AuthParams>) -> SendSpec<
         auth,
         one_shot: None,
         context_management: None,
+        session_class: None,
+        plan: None,
     }
 }
 
