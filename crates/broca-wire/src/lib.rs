@@ -973,9 +973,9 @@ pub struct ReadParams {
     /// so no message carries any.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_originals: bool,
-    /// `inline` (the default) or `descriptors`, which serves large payloads as refs in place
-    /// and every entry's content identities (llm-runner §4.1). Any other value is refused
-    /// naming `media`; a model-view read refuses `descriptors`.
+    /// `inline` (the default), `blocks` (stored media references), or `descriptors`, which
+    /// serves large payloads as refs in place and every entry's content identities. Any other
+    /// value is refused naming `media`; a model-view read refuses `descriptors`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<cortexkit_role_llm_runner::read::MediaMode>,
 }
@@ -1044,20 +1044,29 @@ fn serialize_caller_message<S: serde::Serializer>(
     message: &broca_protocol::Message,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
+    serialize_read_message(message, false, serializer)
+}
+
+fn serialize_read_message<S: serde::Serializer>(
+    message: &broca_protocol::Message,
+    media_blocks: bool,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     use broca_protocol::ContentBlock;
     // The model's text as every exposure shows it: cleaned of tag notation where the run that
     // wrote it cleans (llm-runner §9.6). The stored message keeps the raw text.
     let exposed = broca_protocol::tags::exposed_message(message);
     let mut exposed = exposed;
     if exposed.content.iter().any(|block| {
-        matches!(
-            block,
-            ContentBlock::Media(_)
-                | ContentBlock::ToolResult(broca_protocol::ToolResult {
-                    output: broca_protocol::ToolOutput::Parts { .. },
-                    ..
-                })
-        )
+        !media_blocks
+            && matches!(
+                block,
+                ContentBlock::Media(_)
+                    | ContentBlock::ToolResult(broca_protocol::ToolResult {
+                        output: broca_protocol::ToolOutput::Parts { .. },
+                        ..
+                    })
+            )
     }) {
         use broca_protocol::{MediaMarkerReason, ToolOutput};
         for block in &mut exposed.to_mut().content {
@@ -1190,7 +1199,7 @@ pub struct SessionReadMessage {
     pub tags: Vec<SessionReadTag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_as: Option<cortexkit_role_llm_runner::delivery_order::EntryDelivery>,
-    /// The content identity of the whole message exactly as an inline read serves it
+    /// The content identity of the whole stored message, before read-time media markers
     /// (`content_digest`, JCS SHA-256). Served on every entry of a descriptors read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
@@ -1198,7 +1207,7 @@ pub struct SessionReadMessage {
     /// key them. Served beside `digest`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part_digests: Option<Vec<cortexkit_role_llm_runner::read::descriptors::PartDigest>>,
-    /// The message as a descriptors read serves it, large payloads replaced by refs in place.
+    /// The message for an opt-in read: stored media blocks, or descriptors with payload refs.
     /// When present it is what `message` serializes as; never decoded.
     #[serde(skip)]
     pub described: Option<serde_json::Value>,
@@ -1259,8 +1268,27 @@ impl Serialize for SessionReadMessage {
 }
 
 impl SessionReadMessage {
+    fn has_media_grammar(&self) -> bool {
+        self.message.content.iter().any(|block| {
+            matches!(block, broca_protocol::ContentBlock::Media(_))
+                || matches!(block, broca_protocol::ContentBlock::ToolResult(result)
+                    if matches!(result.output, broca_protocol::ToolOutput::Parts { .. }))
+        })
+    }
+
+    /// Expose stored media references only for a reader opting in to `media: "blocks"`.
+    /// Leave entries using only the legacy grammar on their byte-identical serializer.
+    pub fn show_media_blocks(&mut self) {
+        if self.has_media_grammar() {
+            self.described = Some(
+                serde_json::to_value(CallerMessage(&self.message, true))
+                    .expect("a stored message serializes"),
+            );
+        }
+    }
+
     /// Serve this entry as a descriptors read does (llm-runner §4.2): its content identities
-    /// over the full inline message, and large payloads replaced by refs in place, largest first
+    /// before media markers or refs, and large payloads replaced by refs in place, largest first
     /// past the fixed per-message budget. Selection depends only on this message, so every
     /// read of it on one lineage gives the same bytes. `Err` when the message's structure alone
     /// exceeds the budget, which a descriptors read refuses `reply_too_large`.
@@ -1269,7 +1297,7 @@ impl SessionReadMessage {
             describe, PartDigest, Payload, Reference, DESCRIPTOR_MESSAGE_MAX,
         };
         self.described = None;
-        let inline = serde_json::to_value(CallerMessage(&self.message))
+        let inline = serde_json::to_value(CallerMessage(&self.message, true))
             .expect("a stored message serializes");
         self.digest = Some(cortexkit_role_llm_runner::content_digest::content_digest(
             &inline,
@@ -1293,6 +1321,13 @@ impl SessionReadMessage {
             let at = |field: &str| format!("/content/{index}/{field}");
             let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
             match part.get("type").and_then(serde_json::Value::as_str) {
+                Some("media") => payloads.push((
+                    format!("/content/{index}"),
+                    media_reference(
+                        part,
+                        Some(broca_protocol::tags::part_key(self.ordinal, index)),
+                    ),
+                )),
                 Some("text") => {
                     if let Some(text) = text(&part["text"]) {
                         payloads.push((at("text"), Reference::text(None, &text)));
@@ -1327,6 +1362,22 @@ impl SessionReadMessage {
                         let encoded = serde_json::to_string(value).expect("JSON");
                         payloads.push((at("output/value"), Reference::text(None, &encoded)));
                     }
+                    if let Some(parts) = output.get("parts").and_then(serde_json::Value::as_array) {
+                        for (j, part) in parts.iter().enumerate() {
+                            if let Some(text) = text(&part["text"]) {
+                                payloads.push((
+                                    at(&format!("output/parts/{j}/text")),
+                                    Reference::text(None, &text),
+                                ));
+                            }
+                            if let Some(media) = part.get("media") {
+                                payloads.push((
+                                    at(&format!("output/parts/{j}/media")),
+                                    media_reference(media, None),
+                                ));
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1335,18 +1386,18 @@ impl SessionReadMessage {
             .into_iter()
             .map(|(pointer, reference)| Payload {
                 pointer,
+                required: matches!(reference, Reference::MediaRef { .. }),
                 reference,
-                required: false,
             })
             .collect();
         // The budget is the fixed per-message bound less this entry's envelope, measured with
         // the message itself left out.
         let envelope = serialized_json_len(&*self)
-            .saturating_sub(serde_json::to_vec(&inline).expect("JSON").len());
+            .saturating_sub(serialized_json_len(&CallerMessage(&self.message, false)));
         let budget = DESCRIPTOR_MESSAGE_MAX.saturating_sub(envelope);
         match describe(&inline, &payloads, budget) {
             Ok(described) => {
-                if described != inline {
+                if described != inline || self.has_media_grammar() {
                     self.described = Some(described);
                 }
                 Ok(())
@@ -1357,11 +1408,30 @@ impl SessionReadMessage {
 }
 
 /// A message as callers read it, for serializing outside a read entry.
-struct CallerMessage<'a>(&'a broca_protocol::Message);
+struct CallerMessage<'a>(&'a broca_protocol::Message, bool);
 
 impl Serialize for CallerMessage<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serialize_caller_message(self.0, serializer)
+        serialize_read_message(self.0, self.1, serializer)
+    }
+}
+
+fn media_reference(
+    value: &serde_json::Value,
+    part: Option<String>,
+) -> cortexkit_role_llm_runner::read::descriptors::Reference {
+    let mut value = value.clone();
+    value.as_object_mut().expect("media object").remove("type");
+    let media: broca_protocol::MediaRef =
+        serde_json::from_value(value).expect("stored media has validated reference metadata");
+    cortexkit_role_llm_runner::read::descriptors::Reference::MediaRef {
+        part,
+        kind: media.kind.as_str().into(),
+        mime: media.mime,
+        byte_size: media.byte_size,
+        sha256: media.sha256,
+        width: media.width.map(u64::from),
+        height: media.height.map(u64::from),
     }
 }
 
@@ -1411,13 +1481,19 @@ pub fn describe_resolved_part(
         described: None,
     };
     let _ = entry.describe();
-    let body = entry
-        .described
-        .unwrap_or_else(|| serde_json::to_value(CallerMessage(&entry.message)).expect("JSON"));
-    body.get("content")
+    let body = entry.described.unwrap_or_else(|| {
+        serde_json::to_value(CallerMessage(&entry.message, true)).expect("JSON")
+    });
+    let mut content = body
+        .get("content")
         .and_then(|content| content.get(0))
         .cloned()
-        .unwrap_or(serde_json::Value::Null)
+        .unwrap_or(serde_json::Value::Null);
+    if content.get("type").and_then(serde_json::Value::as_str) == Some("media_ref") {
+        // The temporary single-part message used index zero; resolution keeps the original key.
+        content["part"] = serde_json::Value::String(part);
+    }
+    content
 }
 
 fn serialized_json_len(value: &impl Serialize) -> usize {

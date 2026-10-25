@@ -394,20 +394,28 @@ pub fn part_kind(role: Role, block: &ContentBlock, clean: bool) -> Option<PartKi
                 text_kind(message, PartKind::ToolResultText)
             }
             ToolOutput::Json { .. } => return None,
-            ToolOutput::Parts { parts } => {
-                if !parts.is_empty()
-                    && parts.iter().all(|part| {
-                        matches!(part,
-                    crate::ToolOutputPart::Media { media } if media.kind == crate::MediaKind::Image)
-                    })
-                {
-                    PartKind::ToolResultImageOnly
-                } else {
-                    PartKind::ToolResultText
-                }
-            }
+            ToolOutput::Parts { parts } => parts_numbering(parts).0,
         },
     })
+}
+
+// Map storage once for the shared contract's classification and placement rules. Numbering
+// and rendering must see the same blocks, including empty text and every media reference.
+fn parts_numbering(parts: &[crate::ToolOutputPart]) -> (PartKind, Option<usize>) {
+    use cortexkit_role_llm_runner::tags::{
+        numbered_block_index, tool_result_kind, ToolResultBlock,
+    };
+    let blocks: Vec<_> = parts
+        .iter()
+        .map(|part| match part {
+            crate::ToolOutputPart::Text { text } => ToolResultBlock::Text(text),
+            crate::ToolOutputPart::Media { media } => match media.kind {
+                crate::MediaKind::Image => ToolResultBlock::Image,
+                _ => ToolResultBlock::Media,
+            },
+        })
+        .collect();
+    (tool_result_kind(&blocks), numbered_block_index(&blocks))
 }
 
 /// The model's text as every exposure shows it: cleaned of tag notation when `clean`, else as
@@ -547,30 +555,26 @@ fn render_computed(message: &mut Message, tags: &PartTags, computed: ComputedTag
                     }
                     ToolOutput::Json { .. } => {}
                     ToolOutput::Parts { parts } => {
-                        let image_only = !parts.is_empty() && parts.iter().all(|part| matches!(part,
-                            crate::ToolOutputPart::Media { media } if media.kind == crate::MediaKind::Image));
-                        if image_only {
-                            parts.insert(
-                                0,
-                                crate::ToolOutputPart::Text {
-                                    text: cortexkit_role_llm_runner::tags::image_label(number),
-                                },
-                            );
-                        } else if let Some(crate::ToolOutputPart::Text { text }) = parts
-                            .iter_mut()
-                            .find(|part| matches!(part, crate::ToolOutputPart::Text { .. }))
-                        {
-                            *text =
-                                cortexkit_role_llm_runner::tags::render_counted_text(number, text);
+                        let (kind, index) = parts_numbering(parts);
+                        if let Some(index) = index {
+                            if let crate::ToolOutputPart::Text { text } = &mut parts[index] {
+                                *text = cortexkit_role_llm_runner::tags::render_counted_text(
+                                    number, text,
+                                );
+                            }
                         } else {
-                            parts.insert(
-                                0,
-                                crate::ToolOutputPart::Text {
-                                    text: cortexkit_role_llm_runner::tags::render_counted_text(
-                                        number, "",
-                                    ),
-                                },
-                            );
+                            let label = match kind {
+                                PartKind::ToolResultImageOnly => {
+                                    Some(cortexkit_role_llm_runner::tags::image_label(number))
+                                }
+                                PartKind::ToolResultMediaOnly => {
+                                    Some(cortexkit_role_llm_runner::tags::media_label(number))
+                                }
+                                _ => None,
+                            };
+                            if let Some(text) = label {
+                                parts.insert(0, crate::ToolOutputPart::Text { text });
+                            }
                         }
                     }
                 }

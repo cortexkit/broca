@@ -78,6 +78,7 @@ const HARNESS: &str = "conformance";
 /// The member of a scripted tool result that holds the content blocks the scripted tool
 /// provider answers with as they are, instead of the result's JSON as one text block.
 const OWN_CONTENT: &str = "$broca_content";
+const OWN_STRUCTURED: &str = "$broca_structured";
 #[cfg(feature = "test-clock")]
 #[path = "llm_runner_conformance/bus.rs"]
 mod bus;
@@ -856,6 +857,14 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
         if let Some(content) = result.as_ref().and_then(|result| result.get(OWN_CONTENT)) {
             return subc_client_rs::HandlerOutcome::Response(
                 serde_json::to_vec(&json!({ "content": content })).unwrap(),
+            );
+        }
+        if let Some(value) = result
+            .as_ref()
+            .and_then(|result| result.get(OWN_STRUCTURED))
+        {
+            return subc_client_rs::HandlerOutcome::Response(
+                serde_json::to_vec(&json!({ "structuredContent": value })).unwrap(),
             );
         }
         let text = result.map_or_else(
@@ -2458,9 +2467,84 @@ impl LlmRunnerSubject for BrocaSubject {
             .collect()
     }
 
-    /// An image-only tool result. Broca keeps no image bytes: its tool plane maps the image to
-    /// a placeholder naming its MIME type, which carries `marker` so the case finds the entry.
+    /// Preserve the supplied blocks exactly. Media-only and empty results have nowhere to
+    /// store arbitrary locator text, so the kit must locate them through `run.tool_calls`.
+    fn numbering_tool_result(
+        &self,
+        marker: &str,
+        blocks: &[cortexkit_role_llm_runner::tags::ToolResultBlock<'_>],
+    ) -> Option<Value> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use cortexkit_role_llm_runner::tags::ToolResultBlock;
+        if !broca_protocol::attachments_enabled()
+            && blocks
+                .iter()
+                .any(|block| matches!(block, ToolResultBlock::Image | ToolResultBlock::Media))
+        {
+            return None;
+        }
+        if blocks.is_empty() {
+            return Some(json!({OWN_STRUCTURED: {"marker": marker}}));
+        }
+        let png_hex = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
+        let png: Vec<_> = png_hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let content: Vec<_> = blocks
+            .iter()
+            .map(|block| match block {
+                ToolResultBlock::Text(text) => json!({"type":"text", "text":text}),
+                ToolResultBlock::Image => {
+                    json!({"type":"image", "mimeType":"image/png", "data":STANDARD.encode(&png)})
+                }
+                ToolResultBlock::Media => json!({"type":"resource", "resource":{
+                    "uri":"fixture:///invented.pdf", "mimeType":"application/pdf",
+                    "blob":STANDARD.encode(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n"),
+                }}),
+                _ => panic!("unmapped numbering fixture block"),
+            })
+            .collect();
+        Some(json!({OWN_CONTENT: content}))
+    }
+
+    /// Resolve identity only from the listed call and the actual read entry. Its tag row
+    /// supplies the part key; fixture markers and the adapter's remembered messages do not.
+    fn tool_result_part(
+        &self,
+        call: &cortexkit_role_llm_runner::tool_calls::RunToolCall,
+        result: &cortexkit_role_llm_runner::read::ReadMessage,
+    ) -> Option<String> {
+        if call.result_ordinal != Some(result.ordinal) {
+            return None;
+        }
+        let mut matching = result
+            .message
+            .get("content")?
+            .as_array()?
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                block["type"] == "tool_result"
+                    && block["tool_call_id"].as_str() == Some(call.tool_call_id.as_str())
+            });
+        let (index, _) = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        result.tags.get(index).map(|row| row.part.clone())
+    }
+
+    /// The older image fixture requires marker text in the stored payload. Captured references
+    /// cannot carry arbitrary text; the marker-free numbering fixture checks those images.
+    /// Without capture, the legacy placeholder's MIME type can carry the marker.
     fn image_tool_result(&self, marker: &str) -> Option<Value> {
+        if broca_protocol::attachments_enabled() {
+            return None;
+        }
         Some(json!({ OWN_CONTENT: [{
             "type": "image",
             "mimeType": format!("image/png; name={marker}"),
@@ -2938,6 +3022,10 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "output_refs_reference_limit",
         "output_refs_read_limits",
         "output_refs_snapshot_budget",
+        #[cfg(feature = "test-attachments")]
+        "tags_tool_result_blocks_share_one_number",
+        #[cfg(not(feature = "test-attachments"))]
+        "tags_count_only_parts_rendered_with_a_number",
         "compaction_setup_durable_once",
         "model_view_half_open_ranges_and_travel",
         "compaction_unavailable_distinct_from_refuse",

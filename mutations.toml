@@ -30853,3 +30853,109 @@ expect_red = ["held_call_tests::only_registered_history_and_display_fixture_name
 file = "crates/broca-module-serve/tests/llm_runner_conformance.rs"
 old = "if history_display_kit_session(session) {"
 new = "if history_display_kit_session(session) && false { // NON-VACUITY BREAK: add the legacy system entry to dedicated kit histories."
+
+[[control]]
+id = "session-read-media-default-legacy-markers"
+guards = "Default inline media reads retain legacy block/output kinds and newline-joined not_requested markers"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/media.rs"
+expect_red = ["session_read::media::served_media_read_modes_have_pinned_bytes_and_stored_identities"]
+file = "crates/broca-wire/src/lib.rs"
+old = "    serialize_read_message(message, false, serializer)"
+new = "    serialize_read_message(message, true, serializer) // NON-VACUITY BREAK: expose media grammar to legacy readers."
+
+[[control]]
+id = "session-read-media-blocks-opt-in"
+guards = "The blocks read opt-in exposes stored references and Parts without changing default reads"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/media.rs"
+expect_red = ["session_read::media::served_media_read_modes_have_pinned_bytes_and_stored_identities"]
+file = "crates/broca-module/src/serve.rs"
+old = "        if req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks {"
+new = "        if false && req.media == cortexkit_role_llm_runner::read::MediaMode::Blocks { // NON-VACUITY BREAK: ignore the stored-media opt-in."
+
+[[control]]
+id = "session-read-media-stored-descriptor-identities"
+guards = "Descriptors preserve stored media identities instead of digesting the default marker rendering"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/media.rs"
+expect_red = ["session_read::media::served_media_read_modes_have_pinned_bytes_and_stored_identities"]
+file = "crates/broca-wire/src/lib.rs"
+old = "        let inline = serde_json::to_value(CallerMessage(&self.message, true))"
+new = "        let inline = serde_json::to_value(CallerMessage(&self.message, false)) // NON-VACUITY BREAK: identify the lossy marker rendering."
+
+[[control]]
+id = "session-read-media-nested-text-descriptors"
+guards = "Large text/media/text results fit the descriptor budget by describing nested text payloads in place"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/media.rs"
+expect_red = ["session_read::media::descriptors_bound_large_text_media_text_without_flattening_parts"]
+file = "crates/broca-wire/src/lib.rs"
+old = """                        for (j, part) in parts.iter().enumerate() {
+                            if let Some(text) = text(&part["text"]) {"""
+new = """                        for (j, part) in parts.iter().enumerate() {
+                            if let Some(text) = text(&part["missing"]) { // NON-VACUITY BREAK: omit nested text payloads."""
+
+[[control]]
+id = "tags-multipart-result-counts-once"
+guards = "A mixed Parts tool result carries one top-level number and keeps all media when its first visible text is tagged"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/media.rs"
+expect_red = ["session_read::media::stored_parts_count_once_and_render_without_losing_media"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "            ToolOutput::Parts { parts } => parts_numbering(parts).0,"
+new = "            ToolOutput::Parts { .. } => return None, // NON-VACUITY BREAK: mixed results consume no number."
+
+[[control]]
+id = "tags-multipart-empty-text-is-absent"
+guards = "Empty Parts text neither consumes a number nor hides the image/media label or first visible text number"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/media.rs"
+expect_red = ["session_read::media::stored_empty_text_parts_do_not_consume_or_hide_a_number"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "            crate::ToolOutputPart::Text { text } => ToolResultBlock::Text(text),"
+new = "            crate::ToolOutputPart::Text { text } => ToolResultBlock::Text(if text.is_empty() { \"empty\" } else { text }), // NON-VACUITY BREAK: empty text counts as visible."
+
+[[control]]
+id = "session-read-media-marker-only-descriptors"
+guards = "Descriptors keep marker-only and empty Parts outputs in their stored grammar even when no payload needs a ref"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/media.rs"
+expect_red = ["session_read::media::descriptors_keep_marker_only_and_empty_parts_as_stored"]
+file = "crates/broca-wire/src/lib.rs"
+old = "                if described != inline || self.has_media_grammar() {"
+new = "                if described != inline { // NON-VACUITY BREAK: flatten small Parts through the legacy fallback."
+
+[[control]]
+id = "tags-multipart-vector-first-visible-text"
+guards = "The real read and render paths match every pinned tool-result vector, including placement on the first nonempty text block"
+runner = "cargo"
+package = "broca-module"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-module/tests/it/session_read/media.rs"
+expect_red = ["session_read::media::served_tool_result_numbering_matches_runner_vectors"]
+file = "crates/broca-protocol/src/tags.rs"
+old = "    (tool_result_kind(&blocks), numbered_block_index(&blocks))"
+new = "    (tool_result_kind(&blocks), blocks.iter().rposition(|block| matches!(block, ToolResultBlock::Text(text) if !text.is_empty()))) // NON-VACUITY BREAK: number the last text block."

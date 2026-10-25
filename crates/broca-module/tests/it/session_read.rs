@@ -28,6 +28,8 @@ use broca_wal::{DispatchOutcome, FileWal, RunConfig, Wal, WalRecord};
 use tokio::sync::{mpsc, Mutex};
 #[path = "session_read/attribution.rs"]
 mod attribution;
+#[path = "session_read/media.rs"]
+mod media;
 #[path = "session_read/run_usage.rs"]
 mod run_usage;
 #[path = "session_read/tags.rs"]
@@ -3975,6 +3977,10 @@ async fn no_media_inline_and_descriptors_response_bytes_are_pinned() {
     for (media, fixture) in [
         (
             cortexkit_role_llm_runner::read::MediaMode::Inline,
+            two_episode_golden_path(),
+        ),
+        (
+            cortexkit_role_llm_runner::read::MediaMode::Blocks,
             two_episode_golden_path(),
         ),
         (
