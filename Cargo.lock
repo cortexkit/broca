@@ -248,6 +248,7 @@ dependencies = [
  "broca-replay",
  "broca-store",
  "broca-wal",
+ "rusqlite",
  "serde",
  "serde_json",
  "subc-protocol 0.32.4",

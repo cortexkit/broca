@@ -29113,3 +29113,42 @@ expect_red = ["materialized_resume::an_absent_episode_projection_is_filled_by_th
 file = "crates/broca-store/src/lib.rs"
 old = "    if projection_episodes.is_none() && prefix_len > 0 {"
 new = "    if projection_episodes.is_none() && prefix_len > 0 && false { // NON-VACUITY BREAK: continue an absent projection"
+
+[[control]]
+id = "session-length-threshold-bound"
+guards = "The session-length benchmark's flatness bound allows exactly its ratio of the smallest size's value plus its slack"
+runner = "cargo"
+package = "broca-bench"
+target = "--test session_length_cost"
+select = "expected"
+test_file = "crates/broca-bench/examples/session_length_cost.rs"
+expect_red = ["session_length_cost::tests::a_threshold_allows_its_ratio_and_slack_and_nothing_more"]
+file = "crates/broca-bench/examples/session_length_cost.rs"
+old = "        self.ratio * base.max(0.0) + self.slack"
+new = "        self.ratio * base.max(0.0) + self.slack * 2.0 // NON-VACUITY BREAK: loosen the bound"
+
+[[control]]
+id = "session-length-resume-is-held-only"
+guards = "The session-length benchmark counts a resume as going through the store only with a held read and no whole-WAL or complete-prefix read"
+runner = "cargo"
+package = "broca-bench"
+target = "--test session_length_cost"
+select = "expected"
+test_file = "crates/broca-bench/examples/session_length_cost.rs"
+expect_red = ["session_length_cost::tests::a_resume_is_held_only_without_a_whole_wal_or_prefix_read"]
+file = "crates/broca-bench/examples/session_length_cost.rs"
+old = "        self.held >= 1 && self.whole_wal == 0 && self.prefix == 0"
+new = "        self.held >= 1 && self.prefix == 0 // NON-VACUITY BREAK: accept a whole-WAL fallback"
+
+[[control]]
+id = "session-length-cut-inside-the-long-episode"
+guards = "The session-length benchmark's cut falls inside the 50-message episode and leaves a 200-message suffix at every size"
+runner = "cargo"
+package = "broca-bench"
+target = "--test session_length_cost"
+select = "expected"
+test_file = "crates/broca-bench/examples/session_length_cost.rs"
+expect_red = ["session_length_cost::tests::only_the_discarded_episodes_change_with_session_length"]
+file = "crates/broca-bench/examples/session_length_cost.rs"
+old = "        cut: long_start + LONG_BEFORE_CUT,"
+new = "        cut: long_start, // NON-VACUITY BREAK: cut where the long episode starts"
