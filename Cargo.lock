@@ -622,6 +622,7 @@ name = "broca-test-support"
 version = "0.3.260"
 dependencies = [
  "broca-owner-only",
+ "nix",
  "sha2",
  "tokio",
  "tracing",
