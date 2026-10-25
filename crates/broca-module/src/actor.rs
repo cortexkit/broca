@@ -573,6 +573,7 @@ pub(crate) fn indexed_run_state(
             .as_ref()
             .and_then(|state| state.structured_output.clone()),
         live_step: None,
+        held_calls: Vec::new(),
         state: row.state,
         undelivered_steers: reconciled
             .as_ref()
@@ -6081,7 +6082,10 @@ impl<W: WalStore + 'static> LineageActor<W> {
 
     /// Active runs publish held transitions through their shared batch state. Paused runs
     /// use the admission checkpoint rebuilt during open-time recovery, before commands run.
-    /// Missing, contended or poisoned state is uncertainty, never evidence of absence.
+    /// Missing or poisoned state is uncertainty, never evidence of absence. The lock is taken,
+    /// not tried: every holder keeps it for a few statements and never across an await, and
+    /// run status treats uncertainty as a full log read, so a contended try would turn an
+    /// ordinary status poll into one.
     fn provider_held_episode(&self, run_id: &RunId) -> ProviderHeldPresence {
         match &self.state {
             RunState::Active {
@@ -6095,7 +6099,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 }
                 match provider_held.as_ref().and_then(|provider_held| {
                     provider_held
-                        .try_lock()
+                        .lock()
                         .ok()
                         .and_then(|held| held.held_presence())
                 }) {
@@ -6444,8 +6448,20 @@ impl<W: WalStore + 'static> LineageActor<W> {
                         .map(|state| state.run_usage)
                         .unwrap_or_default(),
                 };
+                // The shared batch flag avoids a WAL scan for ordinary runs. A held or
+                // uncertain batch must read durable records so terminals remove calls at once.
+                let held_calls =
+                    if self.provider_held_episode(run_id) == ProviderHeldPresence::NotHeld {
+                        Vec::new()
+                    } else {
+                        self.reconcile_from_wal(run_id)
+                            .await?
+                            .map(|state| state.held_calls)
+                            .unwrap_or_default()
+                    };
                 return Ok(Some(ReconciledRunState {
                     run_usage,
+                    held_calls,
                     budget_detail: None,
                     context_ceiling: None,
                     ceiling_deadline_ms,
@@ -8635,7 +8651,10 @@ mod tests {
             })
             .collect();
         std::fs::write(path, bytes).unwrap();
-        let executor = Arc::new(RecoveryGate::new());
+        let executor = Arc::new(RecoveryGate {
+            preserve_held_prefix: true,
+            ..RecoveryGate::new()
+        });
         let registry = LineageRegistry::new(Arc::new(SeamOpener {
             lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))),
             wal_store: wal_store.clone(),
@@ -8650,11 +8669,34 @@ mod tests {
             executor.started().is_empty(),
             "opening a held session leaves its run parked"
         );
+        let restored = registry
+            .route_run_state(&key, RunId("held".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.state, RunIndexState::Paused);
+        assert_eq!(
+            serde_json::to_value(&restored.held_calls).unwrap(),
+            serde_json::json!([{
+                "call_key": "lineage:4", "tool": "ask", "provider": "tools",
+                "reason": "running", "held_at_ms": 42
+            }])
+        );
         registry.resume_held_run(&key).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), executor.wait_for_start())
             .await
             .expect("a deposited late result resumes the held run");
         assert_eq!(executor.started(), ["held"]);
+        let live = registry
+            .route_run_state(&key, RunId("held".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.state, RunIndexState::Active);
+        assert_eq!(
+            live.held_calls, restored.held_calls,
+            "live held-call status must not lose the WAL projection"
+        );
         executor.release_first.notify_one();
         executor.wait_for_finish().await;
         assert!(registry.stop_and_seal().await);
@@ -10104,6 +10146,7 @@ mod tests {
     }
 
     struct RecoveryGate {
+        preserve_held_prefix: bool,
         started: Mutex<Vec<String>>,
         start_signal: Semaphore,
         finish_signal: Semaphore,
@@ -10113,6 +10156,7 @@ mod tests {
     impl RecoveryGate {
         fn new() -> Self {
             Self {
+                preserve_held_prefix: false,
                 started: Mutex::new(Vec::new()),
                 start_signal: Semaphore::new(0),
                 finish_signal: Semaphore::new(0),
@@ -10153,30 +10197,34 @@ mod tests {
                 started.push(job.req.run_id.0.clone());
                 started.len() == 1
             };
-            job.writer.record(WalRecord::RunStarted {
-                written_at_ms: None,
-                tags: None,
-                session_class: None,
-                retention: None,
-                hooks: None,
-                title: None,
-                on_restart: None,
-                keep_warm: None,
-                marker_order_version: None,
-                manifest: None,
-                scope: None,
-                send_id: None,
-                request_identity_digest: None,
-                project_id: None,
-                principal: None,
-                ts_ms: Some(100),
-                run_id: job.req.run_id.clone(),
-                session: job.req.session.clone(),
-                config: Box::new(min_config()),
-                input: job.req.input.clone().into(),
-                origin: broca_wal::RunOrigin::Fresh,
-                submission_id: job.req.submission_id.clone(),
-            });
+            // A resumed held batch continues its existing episode. A synthetic fresh start
+            // would discard its held-call metadata before status can observe the live wait.
+            if !self.preserve_held_prefix {
+                job.writer.record(WalRecord::RunStarted {
+                    written_at_ms: None,
+                    tags: None,
+                    session_class: None,
+                    retention: None,
+                    hooks: None,
+                    title: None,
+                    on_restart: None,
+                    keep_warm: None,
+                    marker_order_version: None,
+                    manifest: None,
+                    scope: None,
+                    send_id: None,
+                    request_identity_digest: None,
+                    project_id: None,
+                    principal: None,
+                    ts_ms: Some(100),
+                    run_id: job.req.run_id.clone(),
+                    session: job.req.session.clone(),
+                    config: Box::new(min_config()),
+                    input: job.req.input.clone().into(),
+                    origin: broca_wal::RunOrigin::Fresh,
+                    submission_id: job.req.submission_id.clone(),
+                });
+            }
             job.writer.sync().await?;
             if let Some(ack) = job.on_admitted.take() {
                 let _ = ack.send(Ok(job.req.run_id.clone()));

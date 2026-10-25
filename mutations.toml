@@ -30438,3 +30438,54 @@ expect_red = ["subc_plane::tests::release_tool_capture_tests::capture_off_image_
 file = "crates/broca-core/src/wal_writer.rs"
 old = "self.media_capture = if broca_protocol::attachments_enabled() {"
 new = "self.media_capture = if true { // NON-VACUITY BREAK: bind tool capture in shipping builds."
+
+[[control]]
+id = "held-status-omits-empty-list"
+platforms = ["linux", "macos"]
+guards = "An ordinary active status omits held_calls instead of emitting an empty wait list"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::held_status_tests::active_and_paused_status_omit_empty_held_calls"]
+expect_message = "empty held_calls must be omitted"
+file = "crates/broca-wire/src/lib.rs"
+old = '''        /// Open provider-held calls are a runner-owned wait, independent of `reason`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]'''
+new = '''        /// Open provider-held calls are a runner-owned wait, independent of `reason`.
+        #[serde(default)] // NON-VACUITY BREAK: emit an empty held list on ordinary runs.'''
+
+[[control]]
+id = "held-status-live-list-present"
+platforms = ["linux", "macos"]
+guards = "A live run reports its open provider-held calls as well as a paused run"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::held_status_tests::active_and_paused_status_map_open_provider_held_calls"]
+expect_message = "open held calls must be reported on live and paused runs"
+file = "crates/broca-module/src/serve.rs"
+old = '''            awaiting_approval: None,
+            held_calls: state.held_calls,'''
+new = '''            awaiting_approval: None,
+            held_calls: Vec::new(), // NON-VACUITY BREAK: hide the live held wait.'''
+
+[[control]]
+id = "held-status-terminal-removes-call"
+platforms = ["linux", "macos"]
+guards = "WAL reconciliation removes each provider-held call at its terminal before the batch barrier"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::held_calls_status_rebuilds_live_and_paused_calls_and_drops_each_terminal"]
+file = "crates/broca-core/src/replay.rs"
+old = '''                    held_calls.retain(|(batch, call, _)| {
+                        batch != batch_id || call != &result.tool_call_id
+                    });'''
+new = '''                    let _ = batch_id;
+                    held_calls.retain(|_| true); // NON-VACUITY BREAK: retain a terminal held call.'''
