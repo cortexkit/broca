@@ -575,6 +575,8 @@ async fn refused_queue_and_retract_leave_memory_unchanged() {
         step_progress: Default::default(),
         handle: tokio::spawn(async {}),
         durable_finish: Arc::default(),
+        // This fixture deliberately takes the durable cancellation path when held state is unknown.
+        provider_held: None,
     });
     retract.refuse_next_append(1).await;
     // The run appends after the actor captures its read head, leaving work for the
