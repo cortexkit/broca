@@ -39,10 +39,45 @@ pub(super) struct FeedState {
     acked: u64,
     /// Every ack's position, in order.
     acks: Vec<u64>,
+    /// Every ack that landed, with when it landed, for a failure's account.
+    ack_log: Vec<(u64, std::time::Instant)>,
+    /// When the provider published its first entry.
+    published_at: Option<std::time::Instant>,
     /// How many acks arrived, including those held unanswered.
     ack_attempts: usize,
     /// Leave acks unanswered (and unrecorded), so the rig can kill broca while one is in flight.
     hold_acks: bool,
+}
+
+impl FeedState {
+    fn publish(&mut self, entry: LateEntry) {
+        self.published_at
+            .get_or_insert_with(std::time::Instant::now);
+        self.entries.push(entry);
+    }
+
+    /// Each ack that landed: its position, and how long before (negative) or after the first
+    /// publication it landed.
+    fn ack_account(&self) -> Vec<String> {
+        self.ack_log
+            .iter()
+            .map(|(seq, at)| match self.published_at {
+                Some(published) if *at >= published => {
+                    format!(
+                        "seq {seq} {} ms after publication",
+                        (*at - published).as_millis()
+                    )
+                }
+                Some(published) => {
+                    format!(
+                        "seq {seq} {} ms before publication",
+                        (published - *at).as_millis()
+                    )
+                }
+                None => format!("seq {seq} with nothing published"),
+            })
+            .collect()
+    }
 }
 
 /// Add the provider-held declarations to a catalog answer while the feed is enabled: the
@@ -157,6 +192,7 @@ pub(super) async fn serve_feed(
             let mut feed = shared.held_feed.lock().unwrap();
             feed.acked = feed.acked.max(seq);
             feed.acks.push(seq);
+            feed.ack_log.push((seq, std::time::Instant::now()));
             Some(subc_client_rs::HandlerOutcome::Response(b"{}".to_vec()))
         }
         _ => None,
@@ -340,13 +376,7 @@ impl HeldCase {
             1_761_220_000_000,
         )
         .with_result(json!({"content": [{"type": "text", "text": self.late_text()}]}));
-        self.subject
-            .shared
-            .held_feed
-            .lock()
-            .unwrap()
-            .entries
-            .push(entry);
+        self.subject.shared.held_feed.lock().unwrap().publish(entry);
     }
 
     fn late_text(&self) -> String {
@@ -373,6 +403,12 @@ impl HeldCase {
         loop {
             let acks = self.subject.shared.held_feed.lock().unwrap().acks.clone();
             if acks.contains(&1) {
+                // The feed's whole ack history, for the run's log.
+                eprintln!(
+                    "{} acks: {:?}",
+                    self.session,
+                    self.subject.shared.held_feed.lock().unwrap().ack_account()
+                );
                 break;
             }
             assert!(
@@ -539,7 +575,11 @@ async fn a_kill_after_the_result_is_written_and_before_its_ack_never_writes_it_t
     drop(live);
     {
         let mut feed = case.subject.shared.held_feed.lock().unwrap();
-        assert!(feed.acks.is_empty(), "the ack was held, so none landed");
+        assert!(
+            feed.acks.is_empty(),
+            "the ack was held, so none landed: {:?}",
+            feed.ack_account()
+        );
         feed.hold_acks = false;
     }
 

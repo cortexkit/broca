@@ -492,7 +492,14 @@ impl LateResultsIntake {
                 puller.set_pinned(still);
             }
             let ackable = puller.pinned().is_empty();
-            if ackable {
+            if ackable && reply.entries.is_empty() {
+                // Nothing after the acked position: an ack would cover no entry, and sending one
+                // on every idle poll only adds a round trip to the provider. Nothing unacked
+                // remains before the feed's head, so an owed ack is settled without one.
+                self.store
+                    .set_ack_owed(module, false)
+                    .map_err(FeedError::Retryable)?;
+            } else if ackable {
                 self.ack(module, &reply.cursor, &reply.entries).await?;
             } else if settled > 0 {
                 // The settled entries of this page form one run at its head, so a limit re-pull
@@ -2214,5 +2221,27 @@ mod tests {
         assert_eq!(report.decoded, files.div_ceil(HELD_EVERY));
         assert!(report.unreadable.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An idle poll (a page with no entry after the acked position) sends no ack: it would
+    /// cover nothing. An ack the store still owed, as after a rebuild, is settled by reaching
+    /// the feed's head without one.
+    #[tokio::test]
+    async fn an_empty_page_sends_no_ack_and_settles_an_owed_one() {
+        let call_key = "lineage:4";
+        let bind = session("held");
+        let rig = Rig::new(
+            "empty-page",
+            Some((call_key, "tools", bind.clone())),
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        rig.store.set_ack_owed("tools", true).unwrap();
+        let _puller = rig.puller("tools");
+        rig.feed.replies(vec![reply(Vec::new(), 0, false)]);
+        rig.intake.tick("tools").await.unwrap();
+        assert_eq!(rig.feed.pulls().len(), 1);
+        assert!(rig.feed.acks().is_empty(), "{:?}", rig.feed.acks());
+        assert!(!rig.store.feed("tools").unwrap().unwrap().ack_owed);
     }
 }

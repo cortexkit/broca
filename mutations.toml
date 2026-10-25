@@ -29219,3 +29219,16 @@ expect_red = ["late_results_puller::tests::a_rebuilt_store_registers_held_calls_
 file = "crates/broca-module/src/late_results_puller.rs"
 old = "        .is_ok_and(|floor| !floor.contains(broca_wal::PROVIDER_HELD_FEATURE))"
 new = "        .is_ok_and(|_| true) // NON-VACUITY BREAK: skip the scan whatever the floor says."
+
+[[control]]
+id = "intake-empty-page-sends-no-ack"
+guards = "An idle poll whose page holds no entry sends no ack, so a held call's puller does not ack the provider every few seconds"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_empty_page_sends_no_ack_and_settles_an_owed_one"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "            if ackable && reply.entries.is_empty() {"
+new = "            if false && ackable && reply.entries.is_empty() { // NON-VACUITY BREAK: ack every idle poll."
