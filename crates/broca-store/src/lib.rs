@@ -1154,6 +1154,17 @@ impl SqliteStore {
         // The one-time index build scans existing messages during upgrade. Thereafter
         // completeness probes visit only this session's unattributed rows, not its bodies.
         conn.execute("CREATE INDEX IF NOT EXISTS message_unattributed_session_idx ON message(session) WHERE run_json IS NULL", [])?;
+        // System messages render at the head of every request wherever they sit in the
+        // transcript, so a resume under an applied compaction view holds every one of them. This
+        // partial index finds them without reading the other rows. A stored message is its serde
+        // JSON, whose first member is always `role`; `substr` (unlike a JSON function) cannot fail
+        // on a malformed row. The one-time build scans existing rows during upgrade.
+        conn.execute(
+            &format!(
+                "CREATE INDEX IF NOT EXISTS message_system_idx ON message(session, ord) WHERE {SYSTEM_ROW_SQL}"
+            ),
+            [],
+        )?;
         // The runner-tag index: which materialized message and block hold each tag, written
         // with the message rows, so `session.resolve` finds a part without reading the
         // transcript. Rows follow their message: a truncated or reset projection drops them.
@@ -1972,6 +1983,16 @@ impl MaterializedStore for SqliteStore {
             }
         };
         Ok(snapshot)
+    }
+
+    fn read_held_prefix(
+        &self,
+        session: &BindIdentity,
+        held: &broca_core::HeldRowsRequest,
+    ) -> Result<Option<broca_core::HeldPrefix>, String> {
+        read_held_prefix(&self.conn, &Self::key(session), held)
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 
     fn read_admission_snapshot(
@@ -2965,6 +2986,12 @@ fn projection_seed_from_complete_tx(
     // The episodes the stored projection holds, split into the one open at this watermark and
     // the earlier ones: a later write continues the open episode and keeps the rest.
     let projection_episodes = episode_projection_from_tx(tx, key)?;
+    if projection_episodes.is_none() && prefix_len > 0 {
+        // A store that never computed its episodes (written before they existed, or by a build
+        // that advanced the transcript without them) cannot continue them from a suffix. The
+        // next projection replays the complete WAL once and stores them.
+        return Ok(None);
+    }
     let (open_episode, earlier_episodes) = projection_episodes
         .clone()
         .map(|mut episodes| {
@@ -3050,6 +3077,195 @@ fn trailing_origin_from_tx(
 }
 
 type EncodedMessage = (u64, String, Option<String>);
+
+/// The `message` rows `message_system_idx` covers: system messages (see the index).
+const SYSTEM_ROW_SQL: &str = "substr(json, 1, 16) = '{\"role\":\"system\"'";
+
+/// The rows a resume under an applied compaction view holds, with the prefix's metadata and
+/// seeds, in one transaction (see `MaterializedStore::read_held_prefix`). Rows are copied
+/// inside the transaction and decoded after the shared connection is released.
+fn read_held_prefix(
+    conn: &Mutex<Connection>,
+    key: &str,
+    held: &broca_core::HeldRowsRequest,
+) -> Result<broca_core::HeldPrefix, StoreError> {
+    let conn = conn.lock().unwrap();
+    let tx = conn.unchecked_transaction()?;
+    let (watermark_seq, prefix_len) = current_projection_position(&tx, key)?;
+    let prefix_len = u64::try_from(prefix_len).map_err(StoreError::Int)?;
+    let meta = tx
+        .query_row(
+            "SELECT context_epoch, completed_steps, usage_json, retries_used, \
+             last_step_usage_json, last_step_finish_reason_json, lineage_id \
+             FROM meta WHERE session=?1",
+            [key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        context_epoch,
+        completed_steps,
+        usage_json,
+        retries_used,
+        last_step_usage_json,
+        last_step_finish_reason_json,
+        lineage_id,
+    )) = meta
+    else {
+        return Err(StoreError::InconsistentSnapshot(
+            "no materialized prefix to hold rows from",
+        ));
+    };
+    // The prefix's rows must be exactly ordinals `0..prefix_len`: its last row is the seed row.
+    let last_ord: Option<i64> = tx.query_row(
+        "SELECT MAX(ord) FROM message WHERE session=?1",
+        [key],
+        |row| row.get(0),
+    )?;
+    if last_ord.map_or(0, |ord| ord as u64 + 1) != prefix_len {
+        return Err(StoreError::InconsistentSnapshot(
+            "materialized prefix length does not match its last row",
+        ));
+    }
+    // Every held range below the prefix, the prefix's last row, then every system message.
+    let mut ranges: Vec<std::ops::Range<u64>> = held
+        .keep
+        .iter()
+        .map(|range| range.start..range.end.min(prefix_len))
+        .chain(std::iter::once(
+            held.suffix_from.min(prefix_len)..prefix_len,
+        ))
+        .chain(std::iter::once(prefix_len.saturating_sub(1)..prefix_len))
+        .filter(|range| range.start < range.end)
+        .collect();
+    ranges.sort_by_key(|range| range.start);
+    let mut encoded: std::collections::BTreeMap<u64, (String, Option<String>)> =
+        std::collections::BTreeMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT ord, json, tags_json FROM message WHERE session=?1 AND ord>=?2 AND ord<?3 \
+             ORDER BY ord ASC",
+        )?;
+        for range in &ranges {
+            let rows = stmt.query_map(
+                rusqlite::params![key, range.start as i64, range.end as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?;
+            let mut next = range.start;
+            for row in rows {
+                let (ord, json, tags_json) = row?;
+                let ord = u64::try_from(ord).map_err(StoreError::Int)?;
+                if ord != next {
+                    return Err(StoreError::InconsistentSnapshot(
+                        "materialized transcript has an ordinal gap in a held range",
+                    ));
+                }
+                next += 1;
+                encoded.entry(ord).or_insert((json, tags_json));
+            }
+            if next != range.end {
+                return Err(StoreError::InconsistentSnapshot(
+                    "materialized transcript is missing a held row",
+                ));
+            }
+        }
+        let mut systems = tx.prepare(&format!(
+            "SELECT ord, json, tags_json FROM message INDEXED BY message_system_idx \
+             WHERE session=?1 AND ord<?2 AND {SYSTEM_ROW_SQL} ORDER BY ord ASC"
+        ))?;
+        let rows = systems.query_map(rusqlite::params![key, prefix_len as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (ord, json, tags_json) = row?;
+            encoded
+                .entry(u64::try_from(ord).map_err(StoreError::Int)?)
+                .or_insert((json, tags_json));
+        }
+    }
+    let trailing_origin = if prefix_len == 0 {
+        None
+    } else {
+        match trailing_origin_from_tx(&tx, key)? {
+            Some(origin) => Some(origin),
+            // The projectable boundary normally ends within two rows of its assistant turn. When
+            // it does not, keep reading back to the newest origin, which is what a merge of the
+            // complete prefix seeds the tail with.
+            None => newest_origin_from_tx(&tx, key)?,
+        }
+    };
+    let tag_seed = tag_seed_from_tx(&tx, key)?;
+    let episodes_json = episode_projection_json(&tx, key)?;
+    tx.commit()?;
+    drop(conn);
+
+    let mut rows = Vec::with_capacity(encoded.len());
+    for (ordinal, (json, tags_json)) in encoded {
+        let mut message = decode_message(json, tags_json)?;
+        message.ordinal = Some(ordinal);
+        rows.push(message);
+    }
+    let episodes = episodes_json.and_then(|json| {
+        broca_core::select_held_episodes(&json, rows.iter().filter_map(|message| message.ordinal))
+    });
+    Ok(broca_core::HeldPrefix {
+        lineage_id,
+        watermark_seq,
+        prefix_len,
+        context_epoch: u64::try_from(context_epoch).map_err(StoreError::Int)?,
+        completed_steps: u64::try_from(completed_steps).map_err(StoreError::Int)?,
+        usage: serde_json::from_str(&usage_json)?,
+        retries_used: u32::try_from(retries_used.unwrap_or(0)).map_err(StoreError::Int)?,
+        last_step_usage: last_step_usage_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+        last_step_finish_reason: last_step_finish_reason_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+        rows,
+        trailing_origin,
+        tag_seed,
+        episodes,
+    })
+}
+
+/// The origin of the newest materialized message that has one, read back row by row.
+fn newest_origin_from_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+) -> Result<Option<broca_protocol::request::ModelHandle>, StoreError> {
+    let mut stmt = tx.prepare("SELECT json FROM message WHERE session=?1 ORDER BY ord DESC")?;
+    let mut rows = stmt.query([key])?;
+    while let Some(row) = rows.next()? {
+        let message: Message = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        if message.origin.is_some() {
+            return Ok(message.origin);
+        }
+    }
+    Ok(None)
+}
 
 fn read_message_json(
     tx: &rusqlite::Transaction,

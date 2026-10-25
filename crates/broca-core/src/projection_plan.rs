@@ -147,8 +147,10 @@ pub struct PreparedProjection {
     pub episode_spans: Vec<std::ops::Range<u64>>,
     pub open_episode_span: Option<u64>,
     /// Every episode's render inputs, in lineage order. Read by a resumed run under an applied
-    /// view, which cannot take them from the discarded transcript.
-    pub episodes: Vec<crate::context::EpisodeRenderProjection>,
+    /// view, which cannot take them from the discarded transcript. `None` when an incremental
+    /// projection continued a store that never computed them: they stay absent (read as "replay
+    /// the WAL") until a complete projection fills them.
+    pub episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
     pub expected_watermark: u64,
     pub expected_lineage_id: Option<String>,
     pub reset: bool,
@@ -414,11 +416,7 @@ pub fn plan_projection(
             delta.admission_checkpoint,
             delta.episode_spans,
             delta.open_episode_span,
-            {
-                let mut episodes = seed.earlier_episodes.clone();
-                episodes.extend(delta.open_episode);
-                episodes
-            },
+            delta.episodes,
         )
     } else {
         // Legacy or malformed checkpoint metadata asks the caller for a complete WAL read;
@@ -467,7 +465,7 @@ pub fn plan_projection(
             admission_checkpoint,
             episode_spans,
             open_episode_span,
-            episode_metadata,
+            Some(episode_metadata),
         )
     };
 

@@ -28768,3 +28768,120 @@ expect_red = ["compaction::tests::held_history::a_later_view_whose_released_mess
 file = "crates/broca-core/src/compaction/runtime.rs"
 old = "                                view::Decision::Refuse(view::HISTORY_UNAVAILABLE)"
 new = "                                view::decide_stored_at(fetched, ready, state, lineage_id, prompt, stored, prefix_bound, run_start) // NON-VACUITY BREAK: decide over the released prompt"
+
+[[control]]
+id = "held-resume-folds-guidance-episodes"
+guards = "A resume holding only an applied view's held set still folds every guidance episode's repetition guidance into the held messages"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_is_byte_identical_at_every_crash_cut"]
+file = "crates/broca-core/src/run/held_resume.rs"
+old = "            source.restore_episode(Some(episode.first_step), episode.end, &mut state.prompt)?;"
+new = "            RepetitionObserver::new(); // NON-VACUITY BREAK: skip the guidance fold"
+
+[[control]]
+id = "held-resume-uses-the-held-prior"
+guards = "A resume under an applied view builds its state from the held rows and the WAL tail, never a whole-WAL replay"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_reads_only_the_held_set_and_the_wal_tail"]
+file = "crates/broca-core/src/run.rs"
+old = "                Ok(held_resume::HeldLoad::Prior(prior)) => held_prior = Some(*prior),"
+new = "                Ok(held_resume::HeldLoad::Prior(_)) => held_needs_replay = true, // NON-VACUITY BREAK: replay the whole WAL"
+
+[[control]]
+id = "held-resume-reports-the-whole-replayed-transcript"
+guards = "A held resume's ResumeStarted record reports the whole reconstructed transcript, as a full replay's does"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_reads_only_the_held_set_and_the_wal_tail"]
+file = "crates/broca-core/src/resume.rs"
+old = "                .map_or(prior.prompt.len() as u64, |held| held.replayed_messages),"
+new = "                .map_or(prior.prompt.len() as u64, |_| prior.prompt.len() as u64), // NON-VACUITY BREAK: report the held count"
+
+[[control]]
+id = "held-store-reads-every-system-message"
+guards = "The store's held read returns every system message below its prefix, including ones in a replaced range"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_is_byte_identical_at_every_crash_cut"]
+file = "crates/broca-store/src/lib.rs"
+old = "             WHERE session=?1 AND ord<?2 AND {SYSTEM_ROW_SQL} ORDER BY ord ASC\""
+new = "             WHERE session=?1 AND ord<?2 AND ord<0 AND {SYSTEM_ROW_SQL} ORDER BY ord ASC\" // NON-VACUITY BREAK: no system rows"
+
+[[control]]
+id = "projection-continues-every-tail-episode"
+guards = "An incremental projection records every episode its WAL tail starts, not only the one open at the watermark"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::held_view_resume_is_byte_identical_at_every_crash_cut"]
+file = "crates/broca-core/src/replay.rs"
+old = "    episodes.extend(episodes_with_first_steps(tail, &step_starts));"
+new = "    let _ = (tail, &step_starts); // NON-VACUITY BREAK: forget the tail's episodes"
+
+[[control]]
+id = "projected-first-step-stays-in-its-episode"
+guards = "A projected episode's first model step lies inside that episode, so an episode without one never takes the next one's"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::projected_episode_tests::an_episode_without_a_model_step_takes_no_other_episodes_step"]
+file = "crates/broca-core/src/replay.rs"
+old = "                        .find(|first| start <= *first && *first < end),"
+new = "                        .find(|first| start <= *first && end > 0), // NON-VACUITY BREAK: take a later episode's step"
+
+[[control]]
+id = "held-episodes-refuse-a-misaligned-step-list"
+guards = "A stored episode projection whose first model step lies past its episode is distrusted, sending the resume to the WAL"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/context.rs"
+expect_red = ["context::held_resume_tests::a_first_step_outside_its_episode_distrusts_the_whole_projection"]
+file = "crates/broca-core/src/context.rs"
+old = "            if first_step < starts[index] || first_step >= end {"
+new = "            if first_step < starts[index] && first_step >= end { // NON-VACUITY BREAK: trust a shifted step"
+
+[[control]]
+id = "episode-projection-stores-a-known-absence"
+guards = "A known absent first user or first model step survives the stored JSON instead of reading back as uncomputed"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/context.rs"
+expect_red = ["context::held_resume_tests::a_known_absence_survives_the_stored_json_and_an_old_null_reads_as_uncomputed"]
+file = "crates/broca-core/src/context.rs"
+old = "            Some(None) => serializer.serialize_str(KNOWN_NONE),"
+new = "            Some(None) => serializer.serialize_none(), // NON-VACUITY BREAK: write a known absence as null"
+
+[[control]]
+id = "absent-episode-projection-is-refilled"
+guards = "A store whose episode projection was never computed is refilled by one complete projection, not continued from a suffix"
+runner = "cargo"
+package = "broca-store"
+target = "--test it"
+select = "expected"
+test_file = "crates/broca-store/tests/it/materialized_resume.rs"
+expect_red = ["materialized_resume::an_absent_episode_projection_is_filled_by_the_next_projection"]
+file = "crates/broca-store/src/lib.rs"
+old = "    if projection_episodes.is_none() && prefix_len > 0 {"
+new = "    if projection_episodes.is_none() && prefix_len > 0 && false { // NON-VACUITY BREAK: continue an absent projection"

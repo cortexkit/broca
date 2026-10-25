@@ -18,11 +18,34 @@ pub(crate) struct GuidanceEpisode {
     pub end: u64,
 }
 
+/// What a resume that loaded only the held set of an applied compaction view hands the run
+/// loop, in place of what the loop would derive from a whole transcript.
+#[derive(Clone, Debug)]
+pub(crate) struct HeldResume {
+    /// The guidance episodes: the newest one (the episode being resumed) and every one that
+    /// holds a message of the prompt, in lineage order, with their first model steps and ends.
+    pub episodes: Vec<GuidanceEpisode>,
+    /// The newest episode's repetition observer, folded over its model steps.
+    pub observer: crate::tool_repetition::RepetitionObserver,
+    /// The undecorated copy of every held message the repetition-guidance fold changed.
+    pub originals: Vec<Message>,
+    /// The highest runner tag the whole transcript shows: where numbering continues.
+    pub tag_high: u64,
+    /// How many messages a merge of the complete prefix with the WAL tail would hold; the
+    /// resume record reports it as the replayed transcript.
+    pub replayed_messages: u64,
+}
+
 pub(super) struct GuidanceEpisodes {
     episodes: Vec<GuidanceEpisode>,
 }
 
 impl GuidanceEpisodes {
+    /// Episodes a held resume already knows, in lineage order (see [`HeldResume::episodes`]).
+    pub(super) fn known(episodes: Vec<GuidanceEpisode>) -> Self {
+        Self { episodes }
+    }
+
     pub(super) fn new(
         render: &[broca_protocol::request::EpisodeRenderInput],
         spans: Option<&[std::ops::Range<usize>]>,

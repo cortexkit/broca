@@ -107,7 +107,12 @@ pub fn resume_started_record(
             .unwrap_or_else(|| broca_protocol::RunId(String::new())),
         resumed_from_seq,
         replayed: ResumeReplayed {
-            messages: prior.prompt.len() as u64,
+            // A held resume loads only part of the transcript; the record still reports what
+            // the resume reconstructed, the whole transcript at the store prefix and WAL tail.
+            messages: prior
+                .held
+                .as_ref()
+                .map_or(prior.prompt.len() as u64, |held| held.replayed_messages),
             model_steps: prior.completed_steps,
             tool_results,
         },
