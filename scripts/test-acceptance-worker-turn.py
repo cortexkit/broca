@@ -154,7 +154,7 @@ class WorkerAcceptance(unittest.TestCase):
         self.assertEqual(self.sent_plans, [self.composed])
         compose = invoke.call_args_list[1].args[0]
         self.assertEqual(compose[-3:], ["compose-plan", "--items", str(acceptance.PLAN)])
-        self.assertEqual(command[command.index("--max-output-tokens") + 1], "32")
+        self.assertEqual(command[command.index("--max-output-tokens") + 1], "2048")
         self.assertEqual(check.call_args.args[1], "new-run")
         self.assertIn("PASS -- admitted, completed", output)
 

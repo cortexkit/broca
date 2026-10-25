@@ -212,6 +212,10 @@ def run_models(base, args, state_root, project_root, plan_path):
     models = candidates(args.model)
     # The reader fetch-plan preset is legal unscoped; worker requires a daemon-attested session scope.
     # No tool call is needed: declarations freeze during admission, before the model turn.
+    # The output cap must exceed the largest thinking budget an auth method can switch on
+    # (Anthropic OAuth enables 1024 tokens), or admission refuses the send before any model
+    # call. The reply itself is a few tokens; the cap is only a ceiling.
+    max_output_tokens = "2048"
     for index, model in enumerate(models, 1):
         session = "acceptance-plan-" + uuid.uuid4().hex
         path = state_root / "wal" / wal_name(project_root, "broca", session)
@@ -219,7 +223,7 @@ def run_models(base, args, state_root, project_root, plan_path):
         try:
             output = composed_turn(base + ["--session", session],
                                    base + ["--session", session, "run", "--model", model,
-                                           "--session-class", CLASS, "--max-output-tokens", "32",
+                                           "--session-class", CLASS, "--max-output-tokens", max_output_tokens,
                                            "--prompt", "Reply only OK. Do not call tools."],
                                    args.timeout, plan_path)
         except ClientFailure as error:
