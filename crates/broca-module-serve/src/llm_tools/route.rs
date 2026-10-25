@@ -10,6 +10,37 @@ use subc_protocol::tool_call::ToolCallRequest;
 use tokio::sync::watch;
 
 use super::admission::{admit, hash, refusal, Admission};
+use super::private_content::{PrivateContent, Verdict};
+
+/// The private-content answer for a route with no cerebellum or Basal behind it, which is what
+/// a test that drives this route directly gets: the scope counts as marked and its sources are
+/// unknown, so only local models and providers the operator listed may be called.
+pub struct NoPrivateContent;
+
+#[async_trait::async_trait]
+impl super::Asks for NoPrivateContent {
+    async fn marked(
+        &self,
+        _owner: subc_protocol::Principal,
+        _scope_ref: &str,
+    ) -> Option<broca_subc::PrivateContent> {
+        None
+    }
+
+    async fn flow_providers(
+        &self,
+        _owner: subc_protocol::Principal,
+        _flow_id: &str,
+    ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
+        Err(broca_subc::FlowProvidersError::Unanswered(
+            "no Basal behind this route".into(),
+        ))
+    }
+
+    async fn run_live(&self, _owner: subc_protocol::Principal, _scope_ref: &str) -> Option<bool> {
+        None
+    }
+}
 
 type Answer = Result<Box<RawValue>, Vec<u8>>;
 
@@ -28,6 +59,7 @@ struct Flight {
 pub struct LlmTools {
     system: Arc<crate::system_one::SystemOne>,
     config: crate::config::LlmToolsConfig,
+    private_content: PrivateContent,
     flights: Mutex<HashMap<String, Flight>>,
 }
 
@@ -35,14 +67,17 @@ impl LlmTools {
     pub fn new(
         system: Arc<crate::system_one::SystemOne>,
         config: crate::config::LlmToolsConfig,
+        asks: Arc<dyn super::Asks>,
     ) -> Self {
         assert_eq!(
             system.store_role(),
             crate::system_one::LLM_CLASSIFY_STORE_ROLE
         );
+        let private_content = PrivateContent::new(config.clone(), asks);
         Self {
             system,
             config,
+            private_content,
             flights: Mutex::new(HashMap::new()),
         }
     }
@@ -112,7 +147,7 @@ impl LlmTools {
                         return Err(serde_json::to_vec(&json!({"code":"tool_semantics_changed", "message":"the pinned tool semantics are no longer served", "detail":{"tool":call.name, "expected":pin.semantics, "current":1}})).expect("refusal encodes"));
                     }
                 }
-                self.call(admission, call.call_key.is_some()).await
+                self.call(admission, call.call_key.is_some(), scope).await
             }
             _ => Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
                 "unknown_method",
@@ -170,7 +205,12 @@ impl LlmTools {
         raw(answer)
     }
 
-    async fn call(self: &Arc<Self>, admission: Admission, keyed: bool) -> Answer {
+    async fn call(
+        self: &Arc<Self>,
+        admission: Admission,
+        keyed: bool,
+        scope: &SendScope,
+    ) -> Answer {
         // Read replay before catalog, pricing or private-content policy. A changed catalog or
         // policy must never turn an already-paid answer into a new provider attempt.
         let stored = if keyed {
@@ -224,22 +264,15 @@ impl LlmTools {
             .system
             .admit_tool(&admission.params, stored.as_ref())
             .map_err(error)?;
-        // Until this route can determine whether a call contains private content, require
-        // every provider to be operator-listed. This fallback creates no consent request,
-        // approval card, or persisted held-call record.
-        if stored.is_none()
-            && !self
-                .config
-                .private_content_providers
-                .contains(&admission.provider)
-        {
-            let mut body = serde_json::to_value(refusal(
-                "not_started",
-                "private-content status is unknown for this provider",
-            ))
-            .expect("refusal encodes");
-            body["detail"]["consent"] = json!("private_content_unknown");
-            return Err(serde_json::to_vec(&body).expect("refusal encodes"));
+        // Private-content admission runs on every call that is not replaying a stored answer:
+        // a repeat must return the bytes it already paid for even after the operator's list
+        // changed or cerebellum started marking the scope.
+        if stored.is_none() {
+            match self.private_content.admit(scope, &admission.provider).await {
+                Ok(Verdict::Admitted) => {}
+                Ok(Verdict::Refused(body)) => return Err(body),
+                Err(body) => return Err(body),
+            }
         }
         let receiver = {
             let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
