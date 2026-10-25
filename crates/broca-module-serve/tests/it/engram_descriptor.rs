@@ -75,6 +75,7 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
         // System One's batch store keeps caller text for seven days by ruling; a backup
         // generation would keep it longer.
         ("broca/system-one", "excluded", "whole-db"),
+        ("broca/grants", "excluded", "whole-db"),
     ]
     .iter()
     .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))

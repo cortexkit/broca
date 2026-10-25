@@ -732,11 +732,28 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             llm_tools_identity,
         )),
     ));
-    let llm_tools = Arc::new(broca_module_serve::llm_tools::LlmTools::new(
-        Arc::new(system_one.fork_for_tools()),
-        broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?,
-        llm_tools_asks,
+    let held_calls = Arc::new(broca_module_serve::llm_tools::held::HeldCalls::new(
+        Arc::new(
+            broca_store::grants::GrantsStore::open(state_root.join("grants.db"))
+                .map_err(|error| ServeIoError(format!("open grants store: {error}")))?,
+        ),
+        broca_module_serve::serve::process_launch_id().into(),
     ));
+    held_calls
+        .expire_due(broca_module_serve::llm_tools::held::epoch_ms())
+        .map_err(|error| ServeIoError(format!("recover held deadlines: {error}")))?;
+    let _held_timers = held_calls.spawn_timers(registry.stopping_signal());
+    let llm_tools = Arc::new(
+        broca_module_serve::llm_tools::LlmTools::new(
+            Arc::new(system_one.fork_for_tools()),
+            broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?,
+            llm_tools_asks,
+        )
+        .with_held(held_calls),
+    );
+    llm_tools
+        .recover_authorized()
+        .map_err(|error| ServeIoError(format!("recover authorized held calls: {error}")))?;
     let agent_data = Arc::new(broca_module_serve::agent_data::AgentDataService::new(
         state_root.clone(),
         registry.as_ref().clone(),

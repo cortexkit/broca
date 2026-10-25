@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use broca_protocol::{BindPrincipal, SendScope};
+use broca_store::grants::{GrantsStore, HeldCall, HeldState};
 use broca_store::system_one::{BatchScope, Outcome, StoredBatch};
 use cortexkit_llm_tools::classify;
 use cortexkit_role_classifier::errors::Refusal;
@@ -61,6 +62,7 @@ pub struct LlmTools {
     config: crate::config::LlmToolsConfig,
     private_content: PrivateContent,
     flights: Mutex<HashMap<String, Flight>>,
+    held: Arc<super::held::HeldCalls>,
 }
 
 impl LlmTools {
@@ -79,7 +81,43 @@ impl LlmTools {
             config,
             private_content,
             flights: Mutex::new(HashMap::new()),
+            held: Arc::new(super::held::HeldCalls::new(
+                Arc::new(GrantsStore::open_in_memory().expect("in-memory grants store opens")),
+                crate::serve::process_launch_id().into(),
+            )),
         }
+    }
+
+    pub fn with_held(mut self, held: Arc<super::held::HeldCalls>) -> Self {
+        self.held = held;
+        self
+    }
+
+    /// Only previously authorized rows dispatch on startup. Filing and held rows remain in
+    /// consent recovery, and their timers use the persisted deadlines rather than a new wait.
+    pub fn recover_authorized(self: &Arc<Self>) -> Result<(), broca_store::grants::GrantsError> {
+        for row in self.held.store.recovering(self.system.tool_now())? {
+            if row.state != HeldState::Authorized {
+                continue;
+            }
+            let service = self.clone();
+            tokio::spawn(async move {
+                let admission = Admission {
+                    scope: row.batch_scope.clone(),
+                    batch_id: row.batch_id.clone(),
+                    args_digest: row.args_digest.clone(),
+                    provider: row.provider.clone(),
+                    params: row
+                        .request
+                        .clone()
+                        .expect("authorized calls retain their request"),
+                };
+                let _ = service
+                    .call(admission, true, &SendScope::Internal, Some(row))
+                    .await;
+            });
+        }
+        Ok(())
     }
 
     pub async fn answer(
@@ -96,33 +134,10 @@ impl LlmTools {
                 "implementation_version": env!("CARGO_PKG_VERSION"),
             })),
             "tool.catalog" => self.catalog(&call.arguments),
-            "late_results" => {
-                let since = &call.arguments["since"];
-                if !since.is_null()
-                    && (since["provider_incarnation"] != crate::serve::process_launch_id()
-                        || since["seq"] != 0)
-                {
-                    return Err(error(refusal(
-                        "cursor_incarnation_changed",
-                        "late-results cursor is not from this provider incarnation",
-                    )));
-                }
-                raw(
-                    json!({"entries":[], "cursor":{"provider_incarnation":crate::serve::process_launch_id(),"seq":0}, "more":false}),
-                )
-            }
-            "late_results.ack" => {
-                let through = &call.arguments["through"];
-                if through["provider_incarnation"] != crate::serve::process_launch_id()
-                    || through["seq"] != 0
-                {
-                    return Err(error(refusal(
-                        "cursor_incarnation_changed",
-                        "late-results acknowledgement is not from this provider incarnation",
-                    )));
-                }
-                raw(json!({}))
-            }
+            "late_results" => self
+                .held
+                .read(&call.arguments, principal, self.system.tool_now()),
+            "late_results.ack" => self.held.acknowledge(&call.arguments, principal),
             CLASSIFY_TOOL_NAME => {
                 let envelope: RawEnvelope<'_> = serde_json::from_slice(body)
                     .map_err(|e| error(Refusal::invalid_params("arguments", e.to_string())))?;
@@ -147,7 +162,19 @@ impl LlmTools {
                         return Err(serde_json::to_vec(&json!({"code":"tool_semantics_changed", "message":"the pinned tool semantics are no longer served", "detail":{"tool":call.name, "expected":pin.semantics, "current":1}})).expect("refusal encodes"));
                     }
                 }
-                self.call(admission, call.call_key.is_some(), scope).await
+                let held = if let Some(call_key) = &call.call_key {
+                    self.held.replay(
+                        &admission,
+                        principal,
+                        scope,
+                        call_key,
+                        self.system.tool_now(),
+                    )?
+                } else {
+                    None
+                };
+                self.call(admission, call.call_key.is_some(), scope, held)
+                    .await
             }
             _ => Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
                 "unknown_method",
@@ -207,10 +234,27 @@ impl LlmTools {
 
     async fn call(
         self: &Arc<Self>,
-        admission: Admission,
+        mut admission: Admission,
         keyed: bool,
         scope: &SendScope,
+        held: Option<HeldCall>,
     ) -> Answer {
+        if let Some(row) = &held {
+            match row.state {
+                HeldState::Final => return super::held::HeldCalls::final_reply(row),
+                HeldState::Filing | HeldState::Held => {
+                    return super::held::HeldCalls::held_reply(row)
+                }
+                HeldState::Authorized => {
+                    let Some(params) = &row.request else {
+                        return Err(error(crate::system_one::internal_refusal(
+                            "authorized held call has no validated request",
+                        )));
+                    };
+                    admission.params.clone_from(params);
+                }
+            }
+        }
         // Read replay before catalog, pricing or private-content policy. A changed catalog or
         // policy must never turn an already-paid answer into a new provider attempt.
         let stored = if keyed {
@@ -232,12 +276,16 @@ impl LlmTools {
         if let Some(stored) = &stored {
             check_replay(stored, &admission).map_err(error)?;
             if has_final_outcome(stored) {
-                return convert(
+                let answer = convert(
                     &self
                         .system
                         .replay_tool(&admission.params, stored)
                         .map_err(error)?,
                 );
+                if held.is_some() {
+                    self.persist_held_answer(&admission.batch_id, &answer)?;
+                }
+                return answer;
             }
         }
         let running = {
@@ -260,14 +308,21 @@ impl LlmTools {
         if let Some(receiver) = running {
             return await_flight(receiver).await;
         }
-        let pricing = self
-            .system
-            .admit_tool(&admission.params, stored.as_ref())
-            .map_err(error)?;
+        let pricing = if let Some(row) = &held {
+            serde_json::from_value(json!({"frozen_row":row.frozen_row})).map_err(|_| {
+                error(crate::system_one::internal_refusal(
+                    "held pricing snapshot is unreadable",
+                ))
+            })?
+        } else {
+            self.system
+                .admit_tool(&admission.params, stored.as_ref())
+                .map_err(error)?
+        };
         // Private-content admission runs on every call that is not replaying a stored answer:
         // a repeat must return the bytes it already paid for even after the operator's list
         // changed or cerebellum started marking the scope.
-        if stored.is_none() {
+        if stored.is_none() && held.is_none() {
             self.private_content
                 .admit(scope, &admission.provider)
                 .await?;
@@ -299,6 +354,7 @@ impl LlmTools {
                 tokio::spawn(async move {
                     let batch_id = admission.batch_id.clone();
                     let system = service.system.clone();
+                    let admitted_at = held.as_ref().map(|row| row.admitted_at_ms);
                     let execution = tokio::spawn(async move {
                         system
                             .execute_tool(
@@ -306,7 +362,7 @@ impl LlmTools {
                                 admission.scope,
                                 admission.args_digest,
                                 pricing,
-                                None,
+                                admitted_at,
                             )
                             .await
                     })
@@ -317,6 +373,11 @@ impl LlmTools {
                         Err(_) => Err(error(crate::system_one::internal_refusal(
                             "model tool execution failed; retry the call",
                         ))),
+                    };
+                    let answer = if held.is_some() {
+                        service.persist_held_answer(&batch_id, &answer).and(answer)
+                    } else {
+                        answer
                     };
                     sender.send_replace(Some(answer));
                     service
@@ -329,6 +390,46 @@ impl LlmTools {
             }
         };
         await_flight(receiver).await
+    }
+
+    fn persist_held_answer(&self, batch_id: &str, answer: &Answer) -> Result<(), Vec<u8>> {
+        // Transient execution refusals stay authorized so recovery can retry them. They must
+        // not be converted into a not-started consent outcome after dispatch.
+        if let Ok(body) = answer {
+            self.held
+                .store
+                .complete_authorized(batch_id, body.get(), self.system.tool_now())
+                .map_err(|_| {
+                    error(crate::system_one::internal_refusal(
+                        "held outcome persistence is unavailable",
+                    ))
+                })?;
+        } else if let Err(body) = answer {
+            let value: Value = serde_json::from_slice(body).map_err(|_| {
+                error(crate::system_one::internal_refusal(
+                    "held execution error is unreadable",
+                ))
+            })?;
+            if value["detail"]["class"] == "permanent" {
+                self.held
+                    .store
+                    .complete_authorized_error(
+                        batch_id,
+                        std::str::from_utf8(body).map_err(|_| {
+                            error(crate::system_one::internal_refusal(
+                                "held execution error is not UTF-8",
+                            ))
+                        })?,
+                        self.system.tool_now(),
+                    )
+                    .map_err(|_| {
+                        error(crate::system_one::internal_refusal(
+                            "held error persistence is unavailable",
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
     }
 }
 

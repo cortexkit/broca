@@ -40,6 +40,7 @@ pub mod compaction_facts;
 pub mod compaction_receipts;
 pub mod export_index;
 mod fold_identities;
+pub mod grants;
 pub mod late_results_store;
 mod retained_head;
 pub mod retention;

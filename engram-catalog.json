@@ -82,6 +82,13 @@
       "reason": "System One batch answers hold caller text and are kept seven days after first admission; an immutable backup snapshot would outlive that promise, and a lost batch is re-sent and answered again"
     },
     {
+      "entry_id": "broca/grants",
+      "class": "excluded",
+      "mechanism": "whole-db",
+      "path": "grants.db",
+      "reason": "grants are consent decisions and losing one only means the person is asked again; held calls carry request content and are kept seven days after first admission, so an immutable backup would outlive that promise"
+    },
+    {
       "entry_id": "broca/leases",
       "class": "device-local",
       "mechanism": "filetree",
