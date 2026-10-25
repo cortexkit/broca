@@ -1318,6 +1318,60 @@ impl WalRecord {
     /// would read without checking.
     pub fn required_features(&self) -> &'static [&'static str] {
         let base = self.base_required_features();
+        // The agent-run, session-class and input-cap unions below are precomputed tables that
+        // cover only what `base_required_features` returns, plus the names the earlier tables
+        // add. Every other feature is added after them, by `with_feature`, so a new feature
+        // added here never reaches a table it was not listed in. A name a table does not list
+        // still gets a correct answer, through `FeatureUnionTable::lookup`'s fallback.
+        let scope = match self {
+            WalRecord::RunStarted { scope, .. } => scope.as_ref(),
+            WalRecord::ToolCallDeferred { scope, .. } => Some(scope),
+            _ => None,
+        };
+        let base = if scope.is_some_and(|scope| scope.run_id.is_some() || scope.agent_id.is_some())
+        {
+            agent_run_features(base)
+        } else {
+            base
+        };
+        let base = if matches!(
+            self,
+            WalRecord::RunStarted {
+                session_class: Some(_),
+                ..
+            }
+        ) {
+            session_class_features(base)
+        } else {
+            base
+        };
+        let capped = match self {
+            WalRecord::RunStarted { config, .. } => config
+                .budget
+                .as_ref()
+                .is_some_and(|budget| budget.max_input_tokens.is_some()),
+            WalRecord::Queued { request, .. } => request
+                .budget
+                .as_ref()
+                .is_some_and(|budget| budget.max_input_tokens.is_some()),
+            WalRecord::InputTokenCapFrozen { .. } | WalRecord::InputTokenBudgetExhausted { .. } => {
+                true
+            }
+            WalRecord::RunFinished {
+                reason: RunFinishReason::BudgetExhausted,
+                ..
+            } => true,
+            WalRecord::ToolResult {
+                reason: Some(reason),
+                ..
+            } if reason == "budget_exhausted" => true,
+            _ => false,
+        };
+        let base = if capped {
+            input_cap_features(base)
+        } else {
+            base
+        };
         let base = if self.carries_media_content() {
             with_feature(base, crate::framing::MEDIA_CONTENT_FEATURE)
         } else {
@@ -1386,55 +1440,6 @@ impl WalRecord {
         };
         let base = if identity_digest.is_some_and(digest_carries_client_message_id) {
             with_feature(base, crate::framing::CLIENT_MESSAGE_ID_FEATURE)
-        } else {
-            base
-        };
-        let scope = match self {
-            WalRecord::RunStarted { scope, .. } => scope.as_ref(),
-            WalRecord::ToolCallDeferred { scope, .. } => Some(scope),
-            _ => None,
-        };
-        let base = if scope.is_some_and(|scope| scope.run_id.is_some() || scope.agent_id.is_some())
-        {
-            agent_run_features(base)
-        } else {
-            base
-        };
-        let base = if matches!(
-            self,
-            WalRecord::RunStarted {
-                session_class: Some(_),
-                ..
-            }
-        ) {
-            session_class_features(base)
-        } else {
-            base
-        };
-        let capped = match self {
-            WalRecord::RunStarted { config, .. } => config
-                .budget
-                .as_ref()
-                .is_some_and(|budget| budget.max_input_tokens.is_some()),
-            WalRecord::Queued { request, .. } => request
-                .budget
-                .as_ref()
-                .is_some_and(|budget| budget.max_input_tokens.is_some()),
-            WalRecord::InputTokenCapFrozen { .. } | WalRecord::InputTokenBudgetExhausted { .. } => {
-                true
-            }
-            WalRecord::RunFinished {
-                reason: RunFinishReason::BudgetExhausted,
-                ..
-            } => true,
-            WalRecord::ToolResult {
-                reason: Some(reason),
-                ..
-            } if reason == "budget_exhausted" => true,
-            _ => false,
-        };
-        let base = if capped {
-            input_cap_features(base)
         } else {
             base
         };
@@ -1519,8 +1524,8 @@ impl WalRecord {
         } else {
             base
         };
-        // Scope, session-class and input-cap helpers accept only their fixed older feature sets.
-        // Add message times afterward, so a timed record cannot reach those tables with a new name.
+        // Like every feature added after the precomputed unions above, message times never reach
+        // their tables.
         let base = if matches!(
             self,
             Self::RunStarted {
@@ -2250,11 +2255,19 @@ impl SendEndReason {
     }
 }
 
-// `WalRecord::required_features` returns sorted static slices without allocation. Records
-// without agent-run identifiers keep their existing requirements; records carrying those
-// identifiers add the agent-run requirement to every combination of other frozen fields,
-// including malformed combinations a reader may encounter.
-const AGENT_RUN_BASE_FEATURES: [&str; 6] = [
+// `WalRecord::required_features` adds the agent-run, session-class and input-cap features
+// through precomputed tables, so the common records find their sorted feature list without
+// taking a lock or allocating. All three tables are generated from one list, and a name a
+// table does not list falls back to the cached sorted union `with_feature` computes, so a
+// feature added later can make a lookup slower but can never make it panic or answer wrongly.
+
+/// Every feature name `base_required_features` returns for a record that reaches one of the
+/// tables below, sorted: `RunStarted` (all three tables), `ToolCallDeferred` (agent-run) and
+/// `Queued`, `ToolResult`, `RunFinished`, `InputTokenCapFrozen` and
+/// `InputTokenBudgetExhausted` (input cap). Each later table also lists the features the
+/// earlier tables add. `required_features` adds every other feature after the tables, so none
+/// of them needs listing here.
+const UNION_TABLE_BASE_FEATURES: [&str; 6] = [
     crate::framing::DEFERRED_CALL_FEATURE,
     crate::framing::FLOW_SCOPE_FEATURE,
     crate::framing::PLAN_MANIFEST_FEATURE,
@@ -2262,155 +2275,175 @@ const AGENT_RUN_BASE_FEATURES: [&str; 6] = [
     crate::framing::SCOPE_FEATURE,
     crate::framing::STEP_TRANSFORMS_FEATURE,
 ];
-
-struct AgentRunFeatures {
-    names: [&'static str; 7],
-    len: usize,
-}
-
-const AGENT_RUN_FEATURE_SETS: [AgentRunFeatures; 64] = {
-    let mut sets = [const {
-        AgentRunFeatures {
-            names: [""; 7],
-            len: 0,
-        }
-    }; 64];
-    let mut mask = 0;
-    while mask < sets.len() {
-        sets[mask].names[0] = crate::framing::AGENT_RUN_SCOPE_FEATURE;
-        sets[mask].len = 1;
-        let mut bit = 0;
-        while bit < AGENT_RUN_BASE_FEATURES.len() {
-            if mask & (1 << bit) != 0 {
-                let at = sets[mask].len;
-                sets[mask].names[at] = AGENT_RUN_BASE_FEATURES[bit];
-                sets[mask].len += 1;
-            }
-            bit += 1;
-        }
-        mask += 1;
-    }
-    sets
-};
-
-fn agent_run_features(base: &[&str]) -> &'static [&'static str] {
-    let mask = base.iter().fold(0, |mask, name| {
-        let bit = AGENT_RUN_BASE_FEATURES
-            .iter()
-            .position(|known| known == name)
-            .expect("agent-run scope's existing features must be listed");
-        mask | (1 << bit)
-    });
-    let set = &AGENT_RUN_FEATURE_SETS[mask];
-    &set.names[..set.len]
-}
-
-// Precompute the possible feature-name combinations so append discovers them without allocating.
-const CLASS_BASE_FEATURES: [&str; 7] = [
+/// What a classed `RunStarted` can carry when it reaches the session-class table: the shared
+/// list plus the agent-run feature that table runs after.
+const CLASS_BASE_FEATURES: [&str; 7] = insert_sorted(
+    UNION_TABLE_BASE_FEATURES,
     crate::framing::AGENT_RUN_SCOPE_FEATURE,
-    crate::framing::DEFERRED_CALL_FEATURE,
-    crate::framing::FLOW_SCOPE_FEATURE,
-    crate::framing::PLAN_MANIFEST_FEATURE,
-    crate::framing::RETENTION_FEATURE,
-    crate::framing::SCOPE_FEATURE,
-    crate::framing::STEP_TRANSFORMS_FEATURE,
-];
-struct ClassFeatures {
-    names: [&'static str; 8],
-    len: usize,
-}
-static CLASS_FEATURE_SETS: [ClassFeatures; 128] = {
-    let mut sets = [const {
-        ClassFeatures {
-            names: [""; 8],
-            len: 0,
-        }
-    }; 128];
-    let mut mask = 0;
-    while mask < sets.len() {
-        let mut bit = 0;
-        while bit < CLASS_BASE_FEATURES.len() {
-            if bit == 6 {
-                sets[mask].names[sets[mask].len] = crate::framing::SESSION_CLASS_FEATURE;
-                sets[mask].len += 1;
-            }
-            if mask & (1 << bit) != 0 {
-                sets[mask].names[sets[mask].len] = CLASS_BASE_FEATURES[bit];
-                sets[mask].len += 1;
-            }
-            bit += 1;
-        }
-        mask += 1;
-    }
-    sets
-};
-fn session_class_features(base: &[&str]) -> &'static [&'static str] {
-    let mask = base.iter().fold(0, |mask, name| {
-        let bit = CLASS_BASE_FEATURES
-            .iter()
-            .position(|known| known == name)
-            .expect("classed RunStarted features must be listed");
-        mask | (1 << bit)
-    });
-    let set = &CLASS_FEATURE_SETS[mask];
-    &set.names[..set.len]
-}
+);
+/// What a capped record can carry when it reaches the input-cap table: the session-class
+/// table's list plus the session-class feature.
+const INPUT_CAP_BASE_FEATURES: [&str; 8] =
+    insert_sorted(CLASS_BASE_FEATURES, crate::framing::SESSION_CLASS_FEATURE);
 
-// Precompute sorted feature unions: capped records can also carry scope, hooks or retention.
-const INPUT_CAP_BASE_FEATURES: [&str; 8] = [
+static AGENT_RUN_FEATURE_SETS: FeatureUnionTable<6, 7, 64> = FeatureUnionTable::new(
+    UNION_TABLE_BASE_FEATURES,
     crate::framing::AGENT_RUN_SCOPE_FEATURE,
-    crate::framing::DEFERRED_CALL_FEATURE,
-    crate::framing::FLOW_SCOPE_FEATURE,
-    crate::framing::PLAN_MANIFEST_FEATURE,
-    crate::framing::RETENTION_FEATURE,
-    crate::framing::SCOPE_FEATURE,
-    crate::framing::SESSION_CLASS_FEATURE,
-    crate::framing::STEP_TRANSFORMS_FEATURE,
-];
-struct InputCapFeatures {
-    names: [&'static str; 9],
-    len: usize,
-}
-static INPUT_CAP_FEATURE_SETS: [InputCapFeatures; 256] = {
-    let mut sets = [const {
-        InputCapFeatures {
-            names: [""; 9],
-            len: 0,
-        }
-    }; 256];
-    let mut mask = 0;
-    while mask < sets.len() {
-        let mut bit = 0;
-        while bit < INPUT_CAP_BASE_FEATURES.len() {
-            if bit == 3 {
-                sets[mask].names[sets[mask].len] = crate::framing::INPUT_TOKEN_CAP_FEATURE;
-                sets[mask].len += 1;
-            }
-            if mask & (1 << bit) != 0 {
-                sets[mask].names[sets[mask].len] = INPUT_CAP_BASE_FEATURES[bit];
-                sets[mask].len += 1;
-            }
-            bit += 1;
-        }
-        mask += 1;
-    }
-    sets
-};
-fn input_cap_features(base: &[&str]) -> &'static [&'static str] {
-    let mask = base.iter().fold(0, |mask, name| {
-        let bit = INPUT_CAP_BASE_FEATURES
-            .iter()
-            .position(|known| known == name)
-            .expect("input cap's existing features must be listed");
-        mask | (1 << bit)
-    });
-    let set = &INPUT_CAP_FEATURE_SETS[mask];
-    &set.names[..set.len]
+);
+static CLASS_FEATURE_SETS: FeatureUnionTable<7, 8, 128> =
+    FeatureUnionTable::new(CLASS_BASE_FEATURES, crate::framing::SESSION_CLASS_FEATURE);
+static INPUT_CAP_FEATURE_SETS: FeatureUnionTable<8, 9, 256> = FeatureUnionTable::new(
+    INPUT_CAP_BASE_FEATURES,
+    crate::framing::INPUT_TOKEN_CAP_FEATURE,
+);
+
+fn agent_run_features(base: &'static [&'static str]) -> &'static [&'static str] {
+    AGENT_RUN_FEATURE_SETS.lookup(base)
 }
 
-/// `base` with `feature` added in sorted position. The feature sets a record can require are a
-/// small fixed family, so each distinct union is built once and kept for the process lifetime;
-/// the cache is keyed by the address of `base`, which is always a static slice.
+fn session_class_features(base: &'static [&'static str]) -> &'static [&'static str] {
+    CLASS_FEATURE_SETS.lookup(base)
+}
+
+fn input_cap_features(base: &'static [&'static str]) -> &'static [&'static str] {
+    INPUT_CAP_FEATURE_SETS.lookup(base)
+}
+
+/// One sorted feature list of a [`FeatureUnionTable`]; only the first `len` names are used.
+#[derive(Clone, Copy)]
+struct FeatureUnion<const W: usize> {
+    names: [&'static str; W],
+    len: usize,
+}
+
+/// `added` united with every subset of the `N` sorted names in `listed`, indexed by the subset's
+/// bitmask (bit `i` set means `listed[i]` is present). `W` is `N + 1` and `S` is `2^N`; stable
+/// Rust cannot compute either from `N`, so [`FeatureUnionTable::new`] checks them at compile
+/// time.
+struct FeatureUnionTable<const N: usize, const W: usize, const S: usize> {
+    listed: [&'static str; N],
+    added: &'static str,
+    sets: [FeatureUnion<W>; S],
+}
+
+impl<const N: usize, const W: usize, const S: usize> FeatureUnionTable<N, W, S> {
+    const fn new(listed: [&'static str; N], added: &'static str) -> Self {
+        assert!(
+            W == N + 1 && S == 1 << N,
+            "a table needs N + 1 names and 2^N sets"
+        );
+        let mut i = 1;
+        while i < N {
+            assert!(
+                str_lt(listed[i - 1], listed[i]),
+                "listed names must be sorted"
+            );
+            i += 1;
+        }
+        let mut i = 0;
+        while i < N {
+            assert!(
+                str_lt(listed[i], added) || str_lt(added, listed[i]),
+                "the added name cannot also be listed"
+            );
+            i += 1;
+        }
+        let mut sets = [FeatureUnion {
+            names: [""; W],
+            len: 0,
+        }; S];
+        let mut mask = 0;
+        while mask < S {
+            let mut len = 0;
+            let mut placed = false;
+            let mut bit = 0;
+            while bit < N {
+                // `added` goes before the first listed name that sorts after it, so every set
+                // comes out sorted whichever listed names it holds.
+                if !placed && str_lt(added, listed[bit]) {
+                    sets[mask].names[len] = added;
+                    len += 1;
+                    placed = true;
+                }
+                if mask & (1 << bit) != 0 {
+                    sets[mask].names[len] = listed[bit];
+                    len += 1;
+                }
+                bit += 1;
+            }
+            if !placed {
+                sets[mask].names[len] = added;
+                len += 1;
+            }
+            sets[mask].len = len;
+            mask += 1;
+        }
+        Self {
+            listed,
+            added,
+            sets,
+        }
+    }
+
+    /// The sorted union of `base` (itself sorted and duplicate-free, as every list
+    /// `required_features` builds is) and this table's added name.
+    ///
+    /// A name this table does not list is answered by `with_feature`, which builds that union
+    /// once and caches it, instead of panicking: a must-understand feature added after this
+    /// table was written must still let the record be framed. The coverage test in
+    /// `feature_union_tests` fails when one of its records brings an unlisted name here, so
+    /// the slower path is reported rather than left in place silently.
+    fn lookup(&'static self, base: &'static [&'static str]) -> &'static [&'static str] {
+        #[cfg(test)]
+        feature_union_tests::note_lookup(self.added, base);
+        let mut mask = 0;
+        for name in base {
+            let Some(bit) = self.listed.iter().position(|known| known == name) else {
+                return with_feature(base, self.added);
+            };
+            mask |= 1 << bit;
+        }
+        let set = &self.sets[mask];
+        &set.names[..set.len]
+    }
+}
+
+/// `a < b` in the byte order `str`'s `Ord` uses, for sorting in a `const` context.
+const fn str_lt(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut i = 0;
+    while i < a.len() && i < b.len() {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+        i += 1;
+    }
+    a.len() < b.len()
+}
+
+/// `list` with `name` inserted in sorted position; `M` must be `N + 1`.
+const fn insert_sorted<const N: usize, const M: usize>(
+    list: [&'static str; N],
+    name: &'static str,
+) -> [&'static str; M] {
+    assert!(M == N + 1, "inserting one name needs one more slot");
+    let mut out = [""; M];
+    let mut from = 0;
+    let mut to = 0;
+    let mut placed = false;
+    while to < M {
+        if !placed && (from == N || str_lt(name, list[from])) {
+            out[to] = name;
+            placed = true;
+        } else {
+            out[to] = list[from];
+            from += 1;
+        }
+        to += 1;
+    }
+    out
+}
+
 /// Whether a stored request identity digest (a JSON object of per-field digests written by
 /// broca-core) carries the send's `client_message_id`. A digest that does not parse carries
 /// none: it is compared as an opaque string, and this build never writes such a digest with
@@ -2424,6 +2457,9 @@ fn digest_carries_client_message_id(digest: &str) -> bool {
     serde_json::from_str::<Probe>(digest).is_ok_and(|probe| probe.client_message_id.is_some())
 }
 
+/// `base` with `feature` added in sorted position. The feature sets a record can require are a
+/// small fixed family, so each distinct union is built once and kept for the process lifetime;
+/// the cache is keyed by the address of `base`, which is always a static slice.
 fn with_feature(base: &'static [&'static str], feature: &'static str) -> &'static [&'static str] {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -5374,6 +5410,9 @@ mod schema_tests {
 
 #[cfg(test)]
 mod pinned_bytes_tests;
+
+#[cfg(test)]
+mod feature_union_tests;
 
 #[cfg(test)]
 mod step_transform_bytes_tests;

@@ -27434,8 +27434,10 @@ guards = "new message-time requirements are added after fixed scope/class/input-
 runner = "cargo"
 package = "broca-wal"
 target = "--lib"
-test_file = "crates/broca-wal/src/framing.rs"
-expect_red = ["framing::tests::message_times_compose_with_existing_admission_features"]
+# A message-time feature that reaches the input-cap union falls back to the cached sorted
+# union rather than panicking; the coverage test names the unlisted feature.
+test_file = "crates/broca-wal/src/record/feature_union_tests.rs"
+expect_red = ["record::feature_union_tests::every_feature_a_record_brings_to_a_union_table_is_listed_in_it"]
 file = "crates/broca-wal/src/record.rs"
 old = "input_cap_features(base)"
 new = "input_cap_features(with_feature(base, crate::framing::MESSAGE_TIMES_FEATURE)) /* NON-VACUITY BREAK */"
@@ -30073,3 +30075,56 @@ expect_red = ["session_length_cost::tests::only_the_discarded_episodes_change_wi
 file = "crates/broca-bench/examples/session_length_cost.rs"
 old = "        cut: long_start + LONG_BEFORE_CUT,"
 new = "        cut: long_start, // NON-VACUITY BREAK: cut where the long episode starts"
+
+[[control]]
+id = "wal-feature-unions-see-only-base-features"
+select = "expected"
+guards = "only base_required_features and the earlier unions feed the agent-run, session-class and input-cap unions; a feature added before them, like the provider declarations that panicked every classed RunStarted, is reported by name"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/record/feature_union_tests.rs"
+expect_red = ["record::feature_union_tests::every_feature_a_record_brings_to_a_union_table_is_listed_in_it"]
+file = "crates/broca-wal/src/record.rs"
+old = "let base = self.base_required_features();"
+new = "let base = self.base_required_features(); let base = if matches!(self, WalRecord::RunStarted { manifest: Some(manifest), .. } if manifest.fetches.iter().any(|fetch| matches!(&fetch.outcome, FetchOutcome::Answered { declarations_frozen: Some(declarations), .. } if !declarations.is_empty()))) { with_feature(base, crate::framing::PROVIDER_DECLARATIONS_FEATURE) } else { base }; // NON-VACUITY BREAK: add provider declarations before the unions, as the release that panicked did."
+
+[[control]]
+id = "wal-feature-union-unlisted-name-never-panics"
+select = "expected"
+guards = "a feature union asked about a name it does not list answers with the sorted union instead of panicking the WAL writer"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+test_file = "crates/broca-wal/src/record/feature_union_tests.rs"
+expect_red = ["record::feature_union_tests::every_table_answers_any_sorted_list_with_the_sorted_union"]
+file = "crates/broca-wal/src/record.rs"
+old = "return with_feature(base, self.added);"
+new = "panic!(\"{} union features must be listed\", self.added); // NON-VACUITY BREAK: restore the panicking lookup."
+
+[[control]]
+id = "classed-declaring-run-started-frames-both-features"
+# Only the real-path admission test runs; other `it` tests are skipped.
+select = "expected"
+guards = "a classed session admitted with a plan whose providers declare result formats and late results frames its RunStarted requiring session-class and provider-declarations, also with an agent-run scope or an input cap"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test it"
+test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
+expect_red = ["plan_admission::a_classed_session_with_declaring_providers_frames_its_run_started"]
+file = "crates/broca-wal/src/record.rs"
+old = "session_class_features(base)"
+new = "base /* NON-VACUITY BREAK: frame a classed RunStarted without the session-class union. */"
+
+[[control]]
+id = "wal-enqueue-lock-poison-fails-closed"
+select = "expected"
+guards = "a panic inside a WAL append fails the writer closed; later calls on the handle get the writer error instead of panicking on the poisoned enqueue lock"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+test_file = "crates/broca-core/src/wal_writer.rs"
+expect_red = ["wal_writer::tests::a_panic_inside_an_append_fails_the_writer_closed_without_later_panics"]
+file = "crates/broca-core/src/wal_writer.rs"
+old = "Err(std::sync::TryLockError::Poisoned(poisoned)) => self.recover_enqueue_lock(poisoned),"
+new = "Err(std::sync::TryLockError::Poisoned(poisoned)) => { drop(poisoned); self.enqueue_lock.lock().unwrap() } // NON-VACUITY BREAK: panic on the poisoned lock, as the production path did."

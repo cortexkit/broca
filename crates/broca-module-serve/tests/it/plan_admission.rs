@@ -156,6 +156,9 @@ pub(super) struct CountingAdmitter {
     stale_digest: Mutex<Option<String>>,
     reply: Mutex<Option<Value>>,
     reply_schema: Mutex<Option<Value>>,
+    /// Every provider's catalog answer declares late results and a `content/v1` result format
+    /// for each of its tools, as AFT's and Core's do in production.
+    declare: Mutex<bool>,
 }
 
 impl CountingAdmitter {
@@ -194,8 +197,12 @@ impl Fetcher for Answering<'_> {
             .unwrap()
             .clone()
             .unwrap_or_else(|| self.plan.composition_digest.clone());
-        let tools: Vec<Value> = self.plan.composed[provider]
-            .iter()
+        let tools: Vec<Value> = self
+            .plan
+            .composed
+            .get(provider)
+            .into_iter()
+            .flatten()
             .map(|tool| {
                 let schema = self.admitter.reply_schema.lock().unwrap().clone()
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
@@ -210,6 +217,9 @@ impl Fetcher for Answering<'_> {
                 if let Some(reply) = self.admitter.reply.lock().unwrap().clone() {
                     answer["reply"] = reply;
                 }
+                if *self.admitter.declare.lock().unwrap() {
+                    answer["result_format"] = json!("content/v1");
+                }
                 answer
             })
             .collect();
@@ -219,6 +229,9 @@ impl Fetcher for Answering<'_> {
             "composition_digest": digest,
             "tools": tools,
         });
+        if *self.admitter.declare.lock().unwrap() {
+            answer["capabilities"] = json!({"late_results": true});
+        }
         if request.system_text.is_some() {
             let text = text_of(provider);
             answer["system_text"] = json!({
@@ -2661,4 +2674,122 @@ async fn a_model_less_steer_checks_its_plan_against_the_inherited_model() {
     );
     assert_eq!(rig.wal_bytes(), before, "refusal must preserve WAL bytes");
     rig.finish().await;
+}
+
+/// The `requires` list of every gated `RunStarted` frame in `wal`, read from the raw frames
+/// (a decoded record does not keep its frame's `requires`).
+fn run_started_requires(wal: &[u8]) -> Vec<Vec<String>> {
+    use broca_wal::{GATED_FRAMING_VERSION, HEADER_LEN};
+    let mut lists = Vec::new();
+    let mut at = 0;
+    while at + HEADER_LEN <= wal.len() {
+        let len = u32::from_le_bytes(wal[at..at + 4].try_into().unwrap()) as usize;
+        let payload = &wal[at + HEADER_LEN..at + HEADER_LEN + len];
+        if wal[at + 4] == GATED_FRAMING_VERSION {
+            let gated: Value = serde_json::from_slice(payload).unwrap();
+            if gated["record"]["type"] == "run_started" {
+                lists.push(serde_json::from_value(gated["requires"].clone()).unwrap());
+            }
+        }
+        at += HEADER_LEN + len;
+    }
+    lists
+}
+
+fn agent_run_stamp() -> subc_protocol::scope::ScopeStamp {
+    use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
+    ScopeStamp::new(scope_owner(), "head-1", 1, ScopeKind::Head)
+        .with_attributes(
+            ScopeAttributes::new()
+                .with_agent_id(Some("agent-1".into()))
+                .with_run_id(Some("agent-run-1".into())),
+        )
+        .with_owner_authorized(true)
+}
+
+/// A session with a session class, admitted with a plan whose providers declare result formats
+/// and late results (every worker Core launches), writes its first `RunStarted` in a frame
+/// that requires both the session-class and the provider-declarations features. The same
+/// holds with an agent-run scope and with an input cap, the other two features added through
+/// a precomputed union. The provider-declarations feature once reached the session-class
+/// union, which did not list it, and the WAL writer panicked on every such send.
+#[tokio::test]
+async fn a_classed_session_with_declaring_providers_frames_its_run_started() {
+    use broca_wal::framing::{
+        AGENT_RUN_SCOPE_FEATURE, INPUT_TOKEN_CAP_FEATURE, PLAN_MANIFEST_FEATURE,
+        PROVIDER_DECLARATIONS_FEATURE, SESSION_CLASS_FEATURE,
+    };
+    for case in ["classed", "agent-run", "input-cap"] {
+        let tag = format!("declaring-{case}");
+        let mut plan = vector("plans/broca-head-no-compaction.json");
+        let (mut rig, admitter, channel) = if case == "agent-run" {
+            // An agent-run scope admits model-only plans, so its providers answer for system
+            // text alone and declare late results without any tool's result format.
+            plan["tool_items"] = json!([]);
+            // An agent-run scope accepts sends only from its basal carrier, never its owner.
+            let carrier = subc_protocol::Principal::Reserved {
+                module_id: "basal".into(),
+            };
+            let mut rig = Rig::start_with_scopes(&tag).await;
+            rig.bind_with_scope(8, Some(carrier), Some(agent_run_stamp()))
+                .await;
+            let admitter = Arc::new(CountingAdmitter::default());
+            rig.registry().set_plan_admitter(admitter.clone());
+            (rig, admitter, 8)
+        } else {
+            let (rig, admitter) = plan_rig(&tag).await;
+            (rig, admitter, 7)
+        };
+        *admitter.declare.lock().unwrap() = true;
+        rig.script.push(&[Step::Text("done")]);
+        let mut extra = json!({"session_class": "mason"});
+        let mut expected = vec![
+            PLAN_MANIFEST_FEATURE,
+            PROVIDER_DECLARATIONS_FEATURE,
+            SESSION_CLASS_FEATURE,
+        ];
+        match case {
+            "agent-run" => expected.push(AGENT_RUN_SCOPE_FEATURE),
+            "input-cap" => {
+                extra["budget"] = json!({"max_input_tokens": 1_000_000});
+                expected.push(INPUT_TOKEN_CAP_FEATURE);
+            }
+            _ => {}
+        }
+        let reply = send_plan(&mut rig, channel, "turn-1", "hi", Some(&plan), extra).await;
+        result(&reply);
+        let records = rig.wait_for_finished(1).await;
+
+        // The catalog answers' declarations were frozen into the manifest.
+        let manifest = serde_json::to_value(manifest_of(run_started(&records)[0])).unwrap();
+        let fetches = manifest["fetches"].as_array().unwrap();
+        assert!(!fetches.is_empty(), "{case}: {manifest}");
+        for fetch in fetches {
+            assert_eq!(
+                fetch["declarations_frozen"]["late_results"], true,
+                "{case}: {fetch}"
+            );
+        }
+        if case != "agent-run" {
+            assert!(
+                fetches
+                    .iter()
+                    .any(|fetch| fetch["declarations_frozen"]["result_formats"]
+                        .as_object()
+                        .is_some_and(|formats| !formats.is_empty())),
+                "{case}: {manifest}"
+            );
+        }
+
+        let requires = run_started_requires(&rig.wal_bytes());
+        assert_eq!(requires.len(), 1, "{case}: {requires:?}");
+        for feature in expected {
+            assert!(
+                requires[0].iter().any(|name| name == feature),
+                "{case}: the RunStarted frame requires {:?}, without {feature}",
+                requires[0]
+            );
+        }
+        rig.finish().await;
+    }
 }
