@@ -36,6 +36,10 @@ pub struct Item {
     pub params: Map<String, Value>,
     /// Tool and non-persona system-text items may be optional.
     pub optional: bool,
+    /// The item opts into output references (llm-runner §9.13): its provider's tools have
+    /// their declared reference slots scanned. Only a runner serving the group accepts the
+    /// member at all ([`OutputRefsSupport`]); absent means false.
+    pub output_refs: bool,
 }
 
 /// A step-transform item: an [`Item`] and the hook subscriptions frozen into the plan.
@@ -130,9 +134,19 @@ pub fn check_later_plan(frozen: Option<&str>, sent: &str) -> Result<(), Refusal>
 }
 
 /// Refuse a send that carries a plan beside a member the plan replaces, naming the member.
+/// A plan item's `output_refs` member is refused as on a runner without the `output_refs` group.
 pub fn check_send_members(params: &Map<String, Value>) -> Result<(), Refusal> {
+    check_send_members_with(params, OutputRefsSupport::Unsupported)
+}
+
+/// [`check_send_members`] on a runner whose `output_refs` support is `output_refs`: with
+/// [`OutputRefsSupport::Supported`] a plan item may carry a boolean `output_refs` member.
+pub fn check_send_members_with(
+    params: &Map<String, Value>,
+    output_refs: OutputRefsSupport,
+) -> Result<(), Refusal> {
     if let Some(plan) = params.get("plan") {
-        check_unsupported_output_refs(plan)?;
+        check_output_refs(plan, output_refs)?;
     }
     match MEMBERS_REPLACED_BY_PLAN
         .iter()
@@ -141,6 +155,42 @@ pub fn check_send_members(params: &Map<String, Value>) -> Result<(), Refusal> {
         Some(member) => Err(Refusal::invalid(*member)),
         None => Ok(()),
     }
+}
+
+/// Whether the runner serves llm-runner's `output_refs` group (§9.13), which decides what a plan
+/// item's `output_refs` member means. It must be `Supported` exactly when `role.describe`
+/// declares the group: a runner without the group refuses the member, even `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputRefsSupport {
+    Unsupported,
+    Supported,
+}
+
+/// Check every plan item's `output_refs` member before anything else in the plan. Without the
+/// group any member is refused, even `false`; with it, a present member must be a boolean (absent
+/// means false). Either refusal names `plan.items[].output_refs`.
+fn check_output_refs(plan: &Value, support: OutputRefsSupport) -> Result<(), Refusal> {
+    if support == OutputRefsSupport::Unsupported {
+        return check_unsupported_output_refs(plan);
+    }
+    let lists = [
+        "items",
+        "tool_items",
+        "system_text_items",
+        "step_transform_items",
+    ]
+    .into_iter()
+    .filter_map(|name| plan.get(name).and_then(Value::as_array))
+    .flatten();
+    let compaction = plan.get("compaction_item").into_iter();
+    let malformed = lists.chain(compaction).any(|item| {
+        item.get("output_refs")
+            .is_some_and(|member| !member.is_boolean())
+    });
+    if malformed {
+        return Err(Refusal::invalid("plan.items[].output_refs"));
+    }
+    Ok(())
 }
 
 fn check_unsupported_output_refs(plan: &Value) -> Result<(), Refusal> {
@@ -210,6 +260,7 @@ fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal>
         preset,
         params,
         optional,
+        output_refs: object.get("output_refs") == Some(&Value::Bool(true)),
     })
 }
 
@@ -325,7 +376,18 @@ pub enum CompactionSupport {
 /// order, does not list exactly the plan's providers, or does not repeat the plan's
 /// step-transform items and compaction provider.
 pub fn parse_plan(plan: &Value, compaction: CompactionSupport) -> Result<Plan, Refusal> {
-    check_unsupported_output_refs(plan)?;
+    parse_plan_with(plan, compaction, OutputRefsSupport::Unsupported)
+}
+
+/// [`parse_plan`] on a runner whose `output_refs` support is `output_refs`: with
+/// [`OutputRefsSupport::Supported`], a
+/// plan item may carry a boolean `output_refs` member.
+pub fn parse_plan_with(
+    plan: &Value,
+    compaction: CompactionSupport,
+    output_refs: OutputRefsSupport,
+) -> Result<Plan, Refusal> {
+    check_output_refs(plan, output_refs)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
     let system_text_items = items(object, "system_text_items", true)?;
@@ -628,5 +690,75 @@ mod unsupported_output_refs_tests {
                 .detail()["field"],
             "tools"
         );
+    }
+
+    /// A plan with one tool item for `p`, whose item carries `output_refs` when given.
+    fn tool_plan(output_refs: Option<Value>) -> Value {
+        let composition = serde_json::json!({"providers": [{"provider": "p", "tools": []}], "step_transform_items": []});
+        let mut item = serde_json::json!({"provider": "p", "params": {}});
+        if let Some(flag) = output_refs {
+            item["output_refs"] = flag;
+        }
+        serde_json::json!({
+            "tool_items": [item], "system_text_items": [], "step_transform_items": [],
+            "composition_digest":
+                cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),
+            "composition": composition,
+        })
+    }
+
+    #[test]
+    fn a_runner_with_the_group_accepts_boolean_members_and_refuses_any_other_value() {
+        let supported = OutputRefsSupport::Supported;
+        for flag in [None, Some(Value::Bool(true)), Some(Value::Bool(false))] {
+            let plan = tool_plan(flag);
+            parse_plan_with(&plan, CompactionSupport::Supported, supported)
+                .unwrap_or_else(|refusal| panic!("{plan} refused: {refusal:?}"));
+            check_send_members_with(
+                serde_json::json!({"plan": plan}).as_object().unwrap(),
+                supported,
+            )
+            .unwrap();
+        }
+        for flag in [Value::Null, serde_json::json!("true"), serde_json::json!(1)] {
+            let plan = tool_plan(Some(flag));
+            let refusal =
+                parse_plan_with(&plan, CompactionSupport::Supported, supported).unwrap_err();
+            assert_eq!(
+                refusal.detail()["field"],
+                "plan.items[].output_refs",
+                "{plan}"
+            );
+            let refusal = check_send_members_with(
+                serde_json::json!({"plan": plan}).as_object().unwrap(),
+                supported,
+            )
+            .unwrap_err();
+            assert_eq!(refusal.detail()["field"], "plan.items[].output_refs");
+        }
+    }
+
+    #[test]
+    fn the_plain_entry_points_refuse_as_a_runner_without_the_group() {
+        for flag in [true, false] {
+            let plan = tool_plan(Some(Value::Bool(flag)));
+            assert_eq!(
+                parse_plan(&plan, CompactionSupport::Supported)
+                    .unwrap_err()
+                    .detail()["field"],
+                "plan.items[].output_refs"
+            );
+            assert_eq!(
+                parse_plan_with(
+                    &plan,
+                    CompactionSupport::Supported,
+                    OutputRefsSupport::Unsupported
+                )
+                .unwrap_err()
+                .detail()["field"],
+                "plan.items[].output_refs"
+            );
+        }
+        parse_plan(&tool_plan(None), CompactionSupport::Supported).unwrap();
     }
 }

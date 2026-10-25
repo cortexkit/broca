@@ -231,6 +231,7 @@ fn manifest_declaring(opt_in: bool, late_results: bool) -> ToolManifest {
                 result_ops: None,
                 reply: None,
                 declarations_frozen: Some(declarations),
+                reference_slots: None,
             },
         }],
         tools: Vec::new().into(),

@@ -17,6 +17,7 @@ pub mod held_slots;
 pub mod late_results_puller;
 pub mod late_results_store;
 pub mod opener;
+pub mod output_refs;
 pub mod person_media;
 pub mod registry;
 pub mod retention;
