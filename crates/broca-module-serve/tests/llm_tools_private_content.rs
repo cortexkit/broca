@@ -277,20 +277,7 @@ impl Rig {
             scope_ref,
             Some(1),
         );
-        let route = broca_test_support::wait_until("tool-provider route", || {
-            let connection = connection.clone();
-            let identity = identity.clone();
-            let scope = scope.clone();
-            let target = target.to_owned();
-            async move {
-                connection
-                    .route_open_tool_provider_v1(&target, &identity, Some(scope))
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        })
-        .await;
-        Route { connection, route }
+        served_route(&connection, &target, &identity, Some(scope)).await
     }
 
     fn calls(&self) -> usize {
@@ -348,8 +335,7 @@ impl Rig {
             &self.root,
             "restarted",
         ));
-        // A freshly started broca registers with the daemon a moment after spawn. Wait until it
-        // answers the provider catalog, so the first tool call reaches a served route.
+        // A freshly started broca registers with the daemon a moment after spawn.
         let connection = Arc::new(
             SubcConnection::connect_with_consumer_identity(
                 &self.root.join("runtime/subc-connection.json"),
@@ -369,33 +355,59 @@ impl Rig {
             "test",
             "restart-probe",
         );
-        broca_test_support::wait_until("the restarted broca", || {
-            let connection = connection.clone();
-            let identity = identity.clone();
-            async move {
-                let route = connection
-                    .route_open_tool_provider_v1("broca-restarted", &identity, None)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let body = serde_json::to_vec(&json!({"name":"tool.catalog","arguments":{}}))
-                    .map_err(|error| error.to_string())?;
-                let answer = connection
-                    .route_request_terminal_with_deadline(&route, body, Duration::from_secs(10))
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let _ = connection.route_close(&route).await;
-                answer
-                    .map(|_| ())
-                    .map_err(|body| String::from_utf8_lossy(&body).into_owned())
-            }
-        })
-        .await;
+        served_route(&connection, "broca-restarted", &identity, None).await;
         self.open_to("broca-restarted", "run", false).await
     }
 
     /// How many `private_content.query` requests reached cerebellum.
     fn cerebellum_queries(&self) -> usize {
         requests(self, "cerebellum", "private_content.query")
+    }
+}
+
+/// Open a tool-provider route to `target` and wait until that process answers a catalog.
+///
+/// A daemon admits a route to a module while the module is still starting, and that module may
+/// then see the route bind before it has registered its own providers. The first call on such
+/// a route is answered by whatever guards it has, which for this route means it fails closed.
+/// Waiting for the catalog keeps the first tool call on a served route. Returns the route.
+async fn served_route(
+    connection: &Arc<SubcConnection>,
+    target: &str,
+    identity: &broca_protocol::BindIdentity,
+    scope: Option<subc_protocol::scope::ScopeSelector>,
+) -> Route {
+    let route = broca_test_support::wait_until("tool-provider route", || {
+        let connection = connection.clone();
+        let identity = identity.clone();
+        let scope = scope.clone();
+        let target = target.to_owned();
+        async move {
+            connection
+                .route_open_tool_provider_v1(&target, &identity, scope)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await;
+    let body = serde_json::to_vec(&json!({"name":"tool.catalog","arguments":{}})).unwrap();
+    broca_test_support::wait_until("a served tool catalog", || {
+        let connection = connection.clone();
+        let route = &route;
+        let body = body.clone();
+        async move {
+            connection
+                .route_request_terminal_with_deadline(route, body, Duration::from_secs(10))
+                .await
+                .map_err(|error| error.to_string())?
+                .map(|_| ())
+                .map_err(|body| String::from_utf8_lossy(&body).into_owned())
+        }
+    })
+    .await;
+    Route {
+        connection: connection.clone(),
+        route,
     }
 }
 
@@ -564,10 +576,13 @@ impl Route {
             body["call_key"] = json!(key);
         }
         self.connection
+            // The route's own dispatch budget: a call may open routes and ask cerebellum and
+            // Basal before it answers, and a client deadline is a liveness probe, not a work
+            // budget.
             .route_request_terminal_with_deadline(
                 &self.route,
                 serde_json::to_vec(&body).unwrap(),
-                Duration::from_secs(30),
+                Duration::from_secs(120),
             )
             .await
             .unwrap()
@@ -650,7 +665,12 @@ async fn admitted_with_retry(rig: &Rig, route: &Route, key: &str) -> Value {
             Ok(bytes) => {
                 return serde_json::from_slice(&bytes).unwrap();
             }
-            Err(error) => last = Some(error),
+            Err(error) => {
+                // A call that outlived its client deadline may still be running, and a second
+                // call under the same key would join it; a fresh key per attempt is new work.
+                last = Some(error);
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
     }
     panic!(
@@ -694,9 +714,9 @@ async fn unreachable_cerebellum_counts_as_marked_and_asks_again_on_every_call() 
     let route = rig.open("run", false).await;
     let error = refused_without_writes(&rig, &route, "unlisted").await;
     assert_eq!(error["code"], "not_started");
-    assert_eq!(error["detail"]["consent"], "private_content_unknown");
+    assert_eq!(error["detail"]["consent"], "private_content_unreachable");
     let error = refused_without_writes(&rig, &route, "unlisted-again").await;
-    assert_eq!(error["detail"]["consent"], "private_content_unknown");
+    assert_eq!(error["detail"]["consent"], "private_content_unreachable");
     assert_eq!(
         rig.cerebellum_queries(),
         2,
@@ -770,6 +790,7 @@ async fn a_marked_run_with_an_unknown_source_files_no_card() {
         return;
     };
     let route = rig.open("run", false).await;
+    // Cerebellum answered, and named no source kind broca knows: a card could name none.
     let error = refused_without_writes(&rig, &route, "unknown-source").await;
     assert_eq!(error["detail"]["consent"], "private_content_unknown");
     assert_eq!(rig.calls(), 0);

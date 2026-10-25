@@ -38,6 +38,11 @@ pub const CONSENT_REQUIRED: &str = "consent_required";
 /// `detail.consent` for a scope broca counts as marked but cannot name a source for.
 pub const PRIVATE_CONTENT_UNKNOWN: &str = "private_content_unknown";
 
+/// `detail.consent` for a scope broca could not ask about at all. The two codes differ so a
+/// caller, and an operator reading a log, can tell "the person would have to approve this"
+/// from "nothing could tell refusals from unknown scopes": a rig with no cerebellum at all.
+pub const PRIVATE_CONTENT_UNREACHABLE: &str = "private_content_unreachable";
+
 /// The scope identity an answer belongs to. Owner, reference and epoch together: an answer for
 /// one epoch says nothing about the next run under the same reference.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -220,8 +225,8 @@ impl PrivateContent {
     async fn admit_run(&self, identity: &ScopeIdentity, provider: &str) -> Result<(), Vec<u8>> {
         // A cached "marked" still counts as marked until cerebellum answers again; a cached
         // "unmarked" is never trusted, because a mark written between two calls must be seen.
-        let marked = match self.cached(identity) {
-            Some(marked) => marked,
+        let (marked, answered) = match self.cached(identity) {
+            Some(marked) => (marked, true),
             None => self.ask(identity).await,
         };
         if !marked.marked {
@@ -229,7 +234,12 @@ impl PrivateContent {
         }
         // A live grant would also admit here; this code does not consult grants yet.
         if marked.sources.is_empty() {
-            return Err(consent_refusal(provider, PRIVATE_CONTENT_UNKNOWN));
+            let consent = if answered {
+                PRIVATE_CONTENT_UNKNOWN
+            } else {
+                PRIVATE_CONTENT_UNREACHABLE
+            };
+            return Err(consent_refusal(provider, consent));
         }
         Err(consent_refusal(provider, CONSENT_REQUIRED))
     }
@@ -278,7 +288,7 @@ impl PrivateContent {
         // any provider; Basal's list adds providers to the base set for a marked one.
         let marked = match self.cached(identity) {
             Some(marked) => marked,
-            None => self.ask(identity).await,
+            None => self.ask(identity).await.0,
         };
         if !marked.marked {
             return Ok(());
@@ -291,24 +301,27 @@ impl PrivateContent {
     }
 
     /// Ask cerebellum and cache a marked answer. An unmarked answer, an error and a timeout all
-    /// leave the cache alone, so a failed question is asked again on the next call.
-    async fn ask(&self, identity: &ScopeIdentity) -> MarkedScope {
+    /// leave the cache alone, so a failed question is asked again on the next call. The flag
+    /// says whether anything answered: no answer is marked, with no source to name.
+    async fn ask(&self, identity: &ScopeIdentity) -> (MarkedScope, bool) {
         let Some(answer) = self
             .asks
             .marked(identity.owner_principal(), &identity.scope_ref)
             .await
         else {
-            // No answer counts as marked, and nothing is cached, so no source can be named.
-            return MarkedScope {
-                marked: true,
-                sources: Vec::new(),
-            };
+            return (
+                MarkedScope {
+                    marked: true,
+                    sources: Vec::new(),
+                },
+                false,
+            );
         };
         let fresh = recognized(answer);
         if fresh.marked {
             self.remember(identity.clone(), fresh.clone());
         }
-        fresh
+        (fresh, true)
     }
 
     /// Record a marked answer under the full scope identity. An unmarked answer never replaces
@@ -577,7 +590,7 @@ mod tests {
         let policy = policy(LlmToolsConfig::default(), stub.clone());
         for _ in 0..2 {
             let error = refused(policy.admit(&run(1), "typesafe").await);
-            assert_eq!(error["detail"]["consent"], PRIVATE_CONTENT_UNKNOWN);
+            assert_eq!(error["detail"]["consent"], PRIVATE_CONTENT_UNREACHABLE);
         }
         assert_eq!(stub.marked_asks.load(Ordering::SeqCst), 2);
     }

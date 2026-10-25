@@ -902,7 +902,8 @@ async fn memory_private_unknown_provider_is_not_dispatched() {
     )
     .unwrap();
     assert_eq!(error["code"], "not_started");
-    assert_eq!(error["detail"]["consent"], "private_content_unknown");
+    // No cerebellum answers this direct route, and no grant admits the provider.
+    assert_eq!(error["detail"]["consent"], "private_content_unreachable");
     assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
@@ -1594,11 +1595,13 @@ async fn unknown_private_content_never_executes_an_unlisted_provider() {
         return;
     };
     let route = rig.open(true, false).await;
+    // The daemon has no cerebellum to ask, and this machine has no grant, so nothing can tell
+    // this scope apart from a marked one.
     let error = refused_without_writes(&rig, &route, args(), "private", "not_started").await;
-    assert_eq!(error["detail"]["consent"], "private_content_unknown");
+    assert_eq!(error["detail"]["consent"], "private_content_unreachable");
     assert_eq!(
         route.call(args(), None).await.unwrap_err()["detail"]["consent"],
-        "private_content_unknown"
+        "private_content_unreachable"
     );
 }
 
