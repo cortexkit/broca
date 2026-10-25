@@ -23,8 +23,8 @@ pub(crate) struct ReleasedNeeds {
     /// and every message after its coverage.
     pub prompt: Vec<Range<u64>>,
     /// Read only as stored (what `session.read` returns): the replace ranges whose
-    /// replacement could be a copy of a message only the model may author, which is judged
-    /// against the stored messages it stands for.
+    /// replacement carries media or could be a copy of model-authored content, judged against
+    /// the stored messages it stands for.
     pub stored: Vec<Range<u64>>,
 }
 
@@ -111,7 +111,7 @@ pub(crate) fn released_needs(
 }
 
 /// Whether `assemble_judged` reads the stored messages a replace range stands for: only when
-/// one of its replacement messages could be an unchanged copy of model-authored content.
+/// one of its replacement messages carries media or could copy model-authored content.
 /// Bytes that do not decode are rejected before anything is read.
 fn replacement_judged_against_stored(bytes: &str, stored: StoredTranscript<'_>) -> bool {
     let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(bytes) else {
@@ -120,7 +120,7 @@ fn replacement_judged_against_stored(bytes: &str, stored: StoredTranscript<'_>) 
     values
         .iter()
         .filter_map(native_schema_message)
-        .any(|candidate| super::view::carries_model_authorship(&candidate, stored))
+        .any(|candidate| super::view::carries_stored_content(&candidate, stored))
 }
 
 /// Append to `out` the ordinals of `[from, to)` that `prompt` does not hold.

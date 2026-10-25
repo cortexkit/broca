@@ -133,11 +133,23 @@ pub enum AssemblyProblem {
 /// replace range's messages, then every transcript message after the coverage. Transcript
 /// messages keep their ordinals; the provider's messages have none. `CompactionView::assemble`
 /// is the role's reference for the same rule over JSON.
+/// Without a session's capture index, media fail closed to provenance markers. The session
+/// render paths supply their WAL-folded index instead.
 pub fn assemble(
     view: &CompactionView,
     prompt: &[Message],
 ) -> Result<Vec<Message>, AssemblyProblem> {
-    assemble_judged(view, prompt, None)
+    assemble_captured(view, prompt, &super::CapturedMedia::default())
+}
+
+fn assemble_captured(
+    view: &CompactionView,
+    prompt: &[Message],
+    captured: &super::CapturedMedia,
+) -> Result<Vec<Message>, AssemblyProblem> {
+    let mut history = assemble_judged(view, prompt, None)?;
+    captured.enforce(&mut history);
+    Ok(history)
 }
 
 /// [`assemble`], also judging who wrote the view's bytes when `stored` is given: the transcript
@@ -195,20 +207,25 @@ fn assemble_judged(
                         candidate.origin.is_some()
                             || candidate.content.iter().any(super::is_signed)
                             || stored.has_model_origin(candidate.role)
+                            || super::media_refs(&candidate.content).next().is_some()
                     }) {
                         return Vec::new();
                     }
                     stored
                         .range(*from, *to)
-                        // A different role or content cannot be an unchanged signed copy, nor
-                        // an otherwise unchanged message with its model origin removed.
+                        // Keep possible signed copies and media sources without cloning unrelated
+                        // transcript text. Media can be reused without copying the whole message.
                         .filter(|original| {
                             candidates.iter().any(|candidate| {
-                                candidate.role == original.role
+                                (candidate.role == original.role
                                     && candidate.content == original.content
                                     && (original.origin.is_some()
                                         || candidate.origin.is_some()
-                                        || candidate.content.iter().any(super::is_signed))
+                                        || candidate.content.iter().any(super::is_signed)))
+                                    || super::media_refs(&candidate.content).any(|reference| {
+                                        super::media_refs(&original.content)
+                                            .any(|original| original == reference)
+                                    })
                             })
                         })
                         .cloned()
@@ -237,26 +254,30 @@ fn assemble_judged(
     Ok(out)
 }
 
-/// Whether a replacement message could be an unchanged copy of content only the model may
-/// author, so that it is judged against the stored messages its range stands for: it carries a
-/// model origin or signed reasoning, or the transcript has a model-origin message of its role
-/// (it could be such a message with its origin removed). The same test `assemble_judged` makes
+/// Whether a replacement needs its stored range to judge media provenance or model authorship.
+/// A model origin removed from an otherwise unchanged copy still needs authorship checking.
+/// The same test `assemble_judged` makes
 /// before it reads those stored messages; the two must agree, or a decision reads a stored
 /// message the run never read back.
-pub(super) fn carries_model_authorship(
+pub(super) fn carries_stored_content(
     candidate: &Message,
     stored: super::StoredTranscript<'_>,
 ) -> bool {
-    candidate.origin.is_some()
+    super::media_refs(&candidate.content).next().is_some()
+        || candidate.origin.is_some()
         || candidate.content.iter().any(super::is_signed)
         || stored.has_model_origin(candidate.role)
 }
 
 /// A replacement message broca refuses: bytes that are not a message in broca's schema are
-/// rejected; a message in the schema that claims model authorship is a provider constraint.
+/// rejected; a message in the schema that violates provenance or authorship is a provider constraint.
 fn replacement_problem(value: &Value) -> AssemblyProblem {
-    match serde_json::from_value::<Message>(value.clone()) {
-        Ok(message) if message.origin.is_some() || message.content.iter().any(is_signed) => {
+    match native_schema_message(value) {
+        Some(message)
+            if message.origin.is_some()
+                || message.content.iter().any(is_signed)
+                || super::media_refs(&message.content).next().is_some() =>
+        {
             AssemblyProblem::ProviderConstraint
         }
         _ => AssemblyProblem::Rejected(ViewProblem::ReplacementNotArray),
@@ -266,6 +287,8 @@ fn replacement_problem(value: &Value) -> AssemblyProblem {
 /// One edited part: `bytes` decoded as a content block of broca's schema. A block that only
 /// the model may author (signed or encrypted reasoning, provider-signed text) is accepted only
 /// as a byte-identical copy of the part it replaces.
+/// Text may be edited freely or replace media; each reference that remains must match a
+/// reference in the original stored part, never merely another capture in the session.
 /// `original` is the stored part the edit replaces, when the caller judges authorship
 /// (`Some(None)` when there is no such stored part); `None` to skip that judgement.
 fn edited_part(
@@ -283,6 +306,13 @@ fn edited_part(
     };
     if let Some(original) = original {
         if is_signed(&block) && original != Some(&block) {
+            return Err(AssemblyProblem::ProviderConstraint);
+        }
+        if !super::media_refs(std::slice::from_ref(&block)).all(|reference| {
+            original.is_some_and(|original| {
+                super::media_refs(std::slice::from_ref(original)).any(|stored| stored == reference)
+            })
+        }) {
             return Err(AssemblyProblem::ProviderConstraint);
         }
     }
@@ -334,12 +364,12 @@ pub fn is_prefix_bound(block: &ContentBlock) -> bool {
 /// place of its range, or else the transcript as written.
 pub fn rendered_history(state: &CompactionState, prompt: &[Message]) -> Vec<Message> {
     if let Some(applied) = &state.view {
-        if let Ok(mut history) = assemble(&applied.view, prompt) {
+        if let Ok(mut history) = assemble_captured(&applied.view, prompt, &state.captured) {
             apply_strips(&mut history, &state.strips, strips_copies(state));
             return history;
         }
     }
-    match &state.applied {
+    let mut history: Vec<Message> = match &state.applied {
         Some(applied) => applied
             .replacement
             .iter()
@@ -355,7 +385,9 @@ pub fn rendered_history(state: &CompactionState, prompt: &[Message]) -> Vec<Mess
             )
             .collect(),
         None => transcript(prompt).cloned().collect(),
-    }
+    };
+    state.captured.enforce(&mut history);
+    history
 }
 
 /// The reason broca gives in `view_refused:<version>:<reason>` for a view that carries a `cut`.
@@ -661,7 +693,7 @@ pub(crate) fn render(
     systems: &[usize],
 ) -> Option<Result<broca_protocol::CallOptions, ViewNotRenderable>> {
     let applied = state.view.as_ref()?;
-    let mut history = match assemble(&applied.view, &opts.prompt) {
+    let mut history = match assemble_captured(&applied.view, &opts.prompt, &state.captured) {
         Ok(history) => history,
         Err(problem) => {
             return Some(Err(ViewNotRenderable {

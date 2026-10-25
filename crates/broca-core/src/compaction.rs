@@ -30,7 +30,9 @@ use std::{
 };
 
 pub use broca_wal::MAX_REPLACEMENT_BYTES;
+mod media;
 mod released;
+pub use media::CapturedMedia;
 mod stored;
 pub(crate) use released::{ReleasedHistory, ReleasedMessages, ReleasedNeeds};
 pub use runtime::{
@@ -48,12 +50,13 @@ pub const COMPACTION_CALL_BUDGET_MS: u64 = 2_000;
 /// Two bytes per token deliberately overcounts typical text/JSON's unmeasured input.
 pub const ESTIMATE_BYTES_PER_TOKEN: u64 = 2;
 
-/// Absent checkpoint field means not captured; `None` means captured before Setup; `State`
+/// Absent checkpoint field means not captured; `None` and `Captures` precede Setup; `State`
 /// carries everything needed to continue without consulting the provider or the old WAL.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub enum CompactionCheckpoint {
     None,
+    Captures(CapturedMedia),
     State(Box<CompactionState>),
 }
 impl CompactionCheckpoint {
@@ -68,7 +71,7 @@ impl CompactionCheckpoint {
 
     pub fn state(&self) -> Option<&CompactionState> {
         match self {
-            Self::None => None,
+            Self::None | Self::Captures(_) => None,
             Self::State(state) => Some(state),
         }
     }
@@ -80,10 +83,30 @@ impl CompactionCheckpoint {
                 ..
             }
         ) {
-            *self = Self::State(Box::default());
+            let captured = self.captured().cloned().unwrap_or_default();
+            *self = Self::State(Box::new(CompactionState {
+                captured,
+                ..Default::default()
+            }));
         }
-        if let Self::State(state) = self {
-            state.fold(record);
+        match self {
+            Self::State(state) => state.fold(record),
+            Self::Captures(captured) => captured.fold(record),
+            Self::None => {
+                let mut captured = CapturedMedia::default();
+                captured.fold(record);
+                if !captured.is_empty() {
+                    *self = Self::Captures(captured);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn captured(&self) -> Option<&CapturedMedia> {
+        match self {
+            Self::None => None,
+            Self::Captures(captured) => Some(captured),
+            Self::State(state) => Some(&state.captured),
         }
     }
 }
@@ -130,6 +153,9 @@ pub struct OpenCompactionWait {
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompactionState {
+    /// Captures survive view replacement and sparse resume; provider content never adds entries.
+    /// Required on decode so older materialized states replay instead of silently losing captures.
+    pub captured: CapturedMedia,
     /// The current step's wait or completed decision. Folded before any request can be sent.
     #[serde(default)]
     pub ceiling_check: Option<CeilingCheck>,
@@ -242,6 +268,7 @@ impl CompactionState {
     }
 
     pub fn fold(&mut self, record: &WalRecord) {
+        self.captured.fold(record);
         self.history.fold(record);
         match record {
             WalRecord::RunStarted { .. } => {
@@ -507,6 +534,18 @@ pub(crate) fn native_fields(value: &Value) -> bool {
             blocks
                 .iter()
                 .all(|block| match block.get("type").and_then(Value::as_str) {
+                    Some("media") => keys(
+                        block,
+                        &[
+                            "type",
+                            "kind",
+                            "mime",
+                            "byte_size",
+                            "sha256",
+                            "width",
+                            "height",
+                        ],
+                    ),
                     Some("text") => keys(block, &["type", "text"]),
                     Some("text_with_state") => {
                         keys(block, &["type", "text", "provider_state"])
@@ -534,6 +573,7 @@ pub(crate) fn native_fields(value: &Value) -> bool {
                                     Some("json") => keys(output, &["kind", "value"]),
                                     Some("denied") => keys(output, &["kind", "reason"]),
                                     Some("error") => keys(output, &["kind", "message"]),
+                                    Some("parts") => keys(output, &["kind", "parts"]),
                                     _ => false,
                                 }
                             })
@@ -599,8 +639,18 @@ impl<'a> CarriedMessages<'a> {
 /// copy of one in `carried` (the transcript messages it stands in for) is authored by the
 /// provider, and may then carry no model origin, signed or encrypted reasoning, or
 /// provider-signed text: those would claim the model wrote what the provider wrote.
+/// Every media reference must equal a reference in the carried range, including its metadata.
 pub(crate) fn native_message(value: &Value, carried: &CarriedMessages<'_>) -> Option<Message> {
     let message = native_schema_message(value)?;
+    if !media_refs(&message.content).all(|reference| {
+        carried
+            .messages
+            .iter()
+            .flat_map(|message| media_refs(&message.content))
+            .any(|stored| stored == reference)
+    }) {
+        return None;
+    }
     let candidate = encoded(&message);
     let unchanged = carried.encoded.contains(&candidate);
     if !unchanged {
@@ -617,6 +667,33 @@ pub(crate) fn native_message(value: &Value, carried: &CarriedMessages<'_>) -> Op
         }
     }
     Some(message)
+}
+
+/// References are compared as complete metadata, not just digests: a provider cannot change
+/// the kind, size or dimensions of an object the session captured.
+pub(crate) fn media_refs(
+    blocks: &[ContentBlock],
+) -> impl Iterator<Item = &broca_protocol::MediaRef> {
+    use broca_protocol::{ToolOutput, ToolOutputPart};
+    blocks.iter().flat_map(|block| {
+        let direct = match block {
+            ContentBlock::Media(media) => Some(media),
+            _ => None,
+        };
+        let parts = match block {
+            ContentBlock::ToolResult(broca_protocol::ToolResult {
+                output: ToolOutput::Parts { parts },
+                ..
+            }) => parts.as_slice(),
+            _ => &[],
+        };
+        direct
+            .into_iter()
+            .chain(parts.iter().filter_map(|part| match part {
+                ToolOutputPart::Media { media } => Some(media),
+                ToolOutputPart::Text { .. } => None,
+            }))
+    })
 }
 
 /// One provider-written message in broca's schema, without judging who wrote its content: no
@@ -796,6 +873,7 @@ pub(crate) fn model_options_indexed(
             .filter(|m| m.role != Role::System)
             .cloned(),
     );
+    state.captured.enforce(&mut prompt);
     let mut view = opts.with_prompt(prompt);
     view.declared_markers = state
         .stability

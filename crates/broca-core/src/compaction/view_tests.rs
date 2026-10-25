@@ -20,6 +20,9 @@ use serde_json::json;
 const LINEAGE: &str = "lineage-1";
 const SESSION_REF: &str = "0123456789abcdef0123456789abcdef";
 
+#[path = "media_view_tests.rs"]
+mod media;
+
 fn stamped(mut prompt: Vec<Message>) -> Vec<Message> {
     broca_protocol::content::stamp_ordinals(&mut prompt);
     prompt

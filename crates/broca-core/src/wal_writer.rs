@@ -2049,6 +2049,7 @@ pub struct WalHandle {
     input_token_limit: AtomicU64,
     move_check: Option<Arc<dyn Fn() -> Result<(), WalError> + Send + Sync>>,
     media_capture: Option<crate::tool_media::ToolMediaCapture>,
+    pending_media: Mutex<std::collections::VecDeque<(u64, crate::compaction::CapturedMedia)>>,
     fence: u64,
     append_budget: Option<Mutex<AppendBudget>>,
     tx: std_mpsc::Sender<WalCommand>,
@@ -2095,6 +2096,18 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    /// Transfer only captures covered by a successful WAL barrier. Appends racing after that
+    /// barrier wait for the next one, so an uncommitted steer cannot authorize rendered media.
+    pub(crate) fn take_media_captures(&self) -> crate::compaction::CapturedMedia {
+        let head = self.durable_head.load(Ordering::SeqCst);
+        let mut pending = self.pending_media.lock().unwrap();
+        let mut captured = crate::compaction::CapturedMedia::default();
+        while pending.front().is_some_and(|(seq, _)| *seq <= head) {
+            captured.extend(pending.pop_front().expect("front checked").1);
+        }
+        captured
+    }
+
     pub fn media_capture(&self) -> Option<crate::tool_media::ToolMediaCapture> {
         self.media_capture.clone()
     }
@@ -2288,6 +2301,7 @@ impl WalHandle {
             input_token_limit: AtomicU64::new(0),
             move_check: None,
             media_capture: None,
+            pending_media: Mutex::default(),
             fence,
             append_budget,
             tx,
@@ -2670,6 +2684,14 @@ impl WalHandle {
                     .and_then(|budget| budget.max_input_tokens),
             ),
             _ => {}
+        }
+        let mut captures = crate::compaction::CapturedMedia::default();
+        captures.fold(&record);
+        if !captures.is_empty() {
+            self.pending_media
+                .lock()
+                .unwrap()
+                .push_back((seq, captures));
         }
         if self
             .tx
