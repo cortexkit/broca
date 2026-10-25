@@ -30,7 +30,7 @@ use broca_protocol::{
     content::{AssistantMessage, ContentBlock, Message, Role, ToolOutput, ToolResult},
     error::ProviderError,
     request::BudgetConfig,
-    BatchId, FinishReason, RunId, StepId, ToolCallId, Usage,
+    BatchId, BindIdentity, FinishReason, RunId, StepId, ToolCallId, Usage,
 };
 use broca_wal::{
     DeferredDecision, DispatchOutcome, FramedRecord, LateDecision, LateExecution, NoDispatchReason,
@@ -367,6 +367,312 @@ impl DeferredCallObligations {
             && self.expired_without_late_record.is_empty()
             && self.pending_late_execution.is_empty()
     }
+}
+
+/// What one WAL says about provider-held calls: what the intake needs to class a late entry.
+///
+/// A registration (and its WAL) outlives the batches it names, so this covers the WHOLE file,
+/// not just the trailing episode: a call can be held by one batch and closed out by a later one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeldCallFacts {
+    /// Every `ToolCallProviderHeld` in the WAL, open or closed.
+    pub held: Vec<ProviderHeldCall>,
+    /// The latest durable terminal of each held call.
+    pub terminals: Vec<(ToolCallId, DispatchOutcome)>,
+    /// Calls of a sequential batch that keep a dispatch intent with no terminal behind a held
+    /// call, so they were never sent.
+    pub held_successors: Vec<ToolCallId>,
+    /// A batch whose calls all have terminals but whose commit was never recorded.
+    pub barrier_owed: bool,
+    /// The session identity a `RunStarted` recorded, when the WAL has one.
+    pub session: Option<BindIdentity>,
+    /// The WAL could not be read or decoded completely, so these facts are incomplete.
+    pub unreadable: bool,
+}
+
+impl HeldCallFacts {
+    /// The terminal of a held call, if the WAL has one.
+    pub fn terminal(&self, id: &ToolCallId) -> Option<DispatchOutcome> {
+        self.terminals
+            .iter()
+            .find(|(call, _)| call == id)
+            .map(|(_, outcome)| *outcome)
+    }
+
+    /// The held call this key names, when the WAL records one.
+    pub fn held_call(&self, call_key: &str) -> Option<&ProviderHeldCall> {
+        self.held.iter().find(|held| held.call_key == call_key)
+    }
+
+    /// Whether the WAL shows anything a late-results puller must watch: an open held call or a
+    /// batch that still owes its commit barrier.
+    pub fn needs_intake(&self) -> bool {
+        !self.unreadable
+            && (self.barrier_owed
+                || self
+                    .held
+                    .iter()
+                    .any(|held| self.terminal(&held.tool_call_id).is_none()))
+    }
+}
+
+/// Read provider-held facts out of one session WAL.
+///
+/// `call_key` names a single call the caller already knows about, which is how a registration
+/// asks about its own entry. It still counts a held call whose close-out terminal is durable
+/// (the entry is then classed rather than delivered), and only that read also lists the
+/// sequential held successors, which no delivery needs.
+pub fn held_call_facts(records: &[FramedRecord], call_key: Option<&str>) -> HeldCallFacts {
+    let mut facts = HeldCallFacts::default();
+    for frame in records {
+        match &frame.record {
+            WalRecord::RunStarted { session, .. } => facts.session = Some(session.clone()),
+            WalRecord::ToolCallProviderHeld {
+                tool_call_id,
+                call_key,
+                module,
+                reason,
+                detail_digest,
+                held_at_ms,
+                sequential,
+                ..
+            } => {
+                if facts
+                    .held
+                    .iter()
+                    .any(|held| &held.tool_call_id == tool_call_id)
+                {
+                    continue;
+                }
+                facts.held.push(ProviderHeldCall {
+                    tool_call_id: tool_call_id.clone(),
+                    call_key: call_key.clone(),
+                    module: module.clone(),
+                    reason: reason.clone(),
+                    detail_digest: detail_digest.clone(),
+                    held_at_ms: *held_at_ms,
+                    sequential: *sequential,
+                });
+            }
+            WalRecord::ToolResult {
+                result, outcome, ..
+            } => {
+                if facts
+                    .held
+                    .iter()
+                    .any(|held| held.tool_call_id == result.tool_call_id)
+                {
+                    facts
+                        .terminals
+                        .retain(|(call, _)| call != &result.tool_call_id);
+                    facts
+                        .terminals
+                        .push((result.tool_call_id.clone(), *outcome));
+                }
+            }
+            WalRecord::ToolNoDispatch { tool_call_id, .. }
+                if facts
+                    .held
+                    .iter()
+                    .any(|held| &held.tool_call_id == tool_call_id) =>
+            {
+                facts.terminals.retain(|(call, _)| call != tool_call_id);
+                facts
+                    .terminals
+                    .push((tool_call_id.clone(), DispatchOutcome::Interrupted));
+            }
+            _ => {}
+        }
+    }
+    // Each registered call is asked about its own key. Successors are read only then, so the
+    // per-registration scan stays linear.
+    let registered = call_key.is_some();
+    if let Some(key) = call_key {
+        if !facts.held.iter().any(|held| held.call_key == key) {
+            // An approved call's key is its deferred anchor, so the intent carries it.
+            let anchor = records.iter().find_map(|frame| match &frame.record {
+                WalRecord::ToolDispatchIntent {
+                    tool_call_id,
+                    call_key: Some(intent_key),
+                    ..
+                } if intent_key == key => Some(tool_call_id.clone()),
+                _ => None,
+            });
+            if let Some(tool_call_id) = anchor {
+                facts.held.push(ProviderHeldCall {
+                    tool_call_id,
+                    call_key: key.to_owned(),
+                    module: String::new(),
+                    reason: String::new(),
+                    detail_digest: None,
+                    held_at_ms: 0,
+                    sequential: false,
+                });
+            }
+        }
+    }
+    facts.held_successors = if registered {
+        held_successor_calls(records)
+    } else {
+        Vec::new()
+    };
+    facts.barrier_owed = barrier_owed(records);
+    facts
+}
+
+/// Calls that keep a dispatch intent with no terminal behind a held call of the same sequential
+/// batch. Barrier 1 writes every intent before the first send, and a sequential batch sends a
+/// call only after its predecessor resolves, so such a call was never sent.
+fn held_successor_calls(records: &[FramedRecord]) -> Vec<ToolCallId> {
+    struct Batch {
+        planned: Vec<ToolCallId>,
+        intents: Vec<ToolCallId>,
+        terminals: Vec<ToolCallId>,
+        held: Vec<ToolCallId>,
+        sequential_held: bool,
+    }
+    let mut batches: Vec<(BatchId, Batch)> = Vec::new();
+    let batch = |id: &BatchId, batches: &mut Vec<(BatchId, Batch)>| {
+        if let Some(index) = batches.iter().position(|(existing, _)| existing == id) {
+            return index;
+        }
+        batches.push((
+            id.clone(),
+            Batch {
+                planned: Vec::new(),
+                intents: Vec::new(),
+                terminals: Vec::new(),
+                held: Vec::new(),
+                sequential_held: false,
+            },
+        ));
+        batches.len() - 1
+    };
+    for frame in records {
+        match &frame.record {
+            WalRecord::ToolBatchStarted {
+                batch_id,
+                planned_calls,
+                ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.planned = planned_calls.clone();
+            }
+            WalRecord::ToolDispatchIntent {
+                batch_id,
+                tool_call_id,
+                ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.intents.push(tool_call_id.clone());
+            }
+            WalRecord::ToolResult {
+                batch_id, result, ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.terminals.push(result.tool_call_id.clone());
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.terminals.push(tool_call_id.clone());
+            }
+            WalRecord::ToolCallProviderHeld {
+                batch_id,
+                tool_call_id,
+                sequential,
+                ..
+            } => {
+                let index = batch(batch_id, &mut batches);
+                batches[index].1.held.push(tool_call_id.clone());
+                batches[index].1.sequential_held |= *sequential;
+            }
+            _ => {}
+        }
+    }
+    let mut successors = Vec::new();
+    for (_, batch) in batches {
+        if !batch.sequential_held || batch.held.is_empty() {
+            continue;
+        }
+        let calls = batch.planned.clone();
+        let first_held = calls
+            .iter()
+            .position(|call| batch.held.contains(call))
+            .unwrap_or(calls.len());
+        for call in calls.iter().skip(first_held + 1) {
+            if batch.intents.contains(call) && !batch.terminals.contains(call) {
+                successors.push(call.clone());
+            }
+        }
+    }
+    successors
+}
+
+/// One batch as the scan has read it so far.
+struct ScannedBatch {
+    planned: Option<Vec<ToolCallId>>,
+    terminals: Vec<ToolCallId>,
+}
+
+/// A batch that reached a terminal for every planned call while its commit record never came.
+fn barrier_owed(records: &[FramedRecord]) -> bool {
+    let mut open: Vec<(BatchId, ScannedBatch)> = Vec::new();
+    let slot = |id: &BatchId, open: &mut Vec<(BatchId, ScannedBatch)>| {
+        if let Some(index) = open.iter().position(|(existing, _)| existing == id) {
+            return index;
+        }
+        open.push((
+            id.clone(),
+            ScannedBatch {
+                planned: None,
+                terminals: Vec::new(),
+            },
+        ));
+        open.len() - 1
+    };
+    for frame in records {
+        match &frame.record {
+            WalRecord::ToolBatchStarted {
+                batch_id,
+                planned_calls,
+                ..
+            } => {
+                let index = slot(batch_id, &mut open);
+                open[index].1.planned = Some(planned_calls.clone());
+            }
+            WalRecord::ToolResult {
+                batch_id, result, ..
+            } => {
+                let index = slot(batch_id, &mut open);
+                open[index].1.terminals.push(result.tool_call_id.clone());
+            }
+            WalRecord::ToolNoDispatch {
+                batch_id,
+                tool_call_id,
+                ..
+            } => {
+                let index = slot(batch_id, &mut open);
+                open[index].1.terminals.push(tool_call_id.clone());
+            }
+            WalRecord::ToolBatchFinished { batch_id } => {
+                open.retain(|(existing, _)| existing != batch_id);
+            }
+            // A finished run owes no barrier: a run sealed (interrupted, cancelled, stopped)
+            // with a batch whose calls all have terminals never commits that batch.
+            WalRecord::RunFinished { .. } => open.clear(),
+            _ => {}
+        }
+    }
+    open.iter().any(|(_, batch)| {
+        batch
+            .planned
+            .as_ref()
+            .is_some_and(|planned| planned.iter().all(|call| batch.terminals.contains(call)))
+    })
 }
 
 /// Derive approval debt from a complete WAL, never from a projection tail or a pending marker.
@@ -2341,8 +2647,8 @@ fn replay_seeded_with_compaction<'a>(
             WalRecord::LateApprovalRecorded { .. }
             | WalRecord::LateDispatchIntent { .. }
             | WalRecord::LateResult { .. } => {}
-            // The framed reader still refuses provider-held/v1 until runtime intake is installed.
-            // Replay also serves the supplied in-memory lifecycle and must preserve its obligations.
+            // A held call stays open until its late result is written as its terminal; replay
+            // keeps it out of the indeterminate set so recovery never seals or re-sends it.
             WalRecord::ToolCallProviderHeld {
                 tool_call_id,
                 call_key,
@@ -4541,6 +4847,42 @@ pub(crate) mod provider_held_tests {
         assert!(
             matches!(&*pending.approved[0].prepared, WalRecord::ToolCallDeferred { args_jcs, .. } if args_jcs == "{\"n\":1}")
         );
+    }
+    /// One held call's records as `FramedRecord`s, the shape a registration's WAL read returns.
+    fn framed(records: Vec<WalRecord>) -> Vec<FramedRecord> {
+        records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| FramedRecord {
+                seq: index as u64 + 2,
+                fence: 1,
+                record,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_registered_call_needs_its_feed_only_while_it_is_held() {
+        // The registered read of a held call: it names the call, reports its held record and its
+        // sequential successor, and keeps the feed alive.
+        let held_read = held_call_facts(&framed(prefix(true)), Some("lineage:4"));
+        assert!(held_read.needs_intake());
+        assert_eq!(held_read.held.len(), 1);
+        assert_eq!(held_read.held_successors, vec![ToolCallId("b".into())]);
+        // Once the held call has its terminal the same read needs nothing, though it still
+        // reports the call so its entry can be classed.
+        let mut settled = prefix(true);
+        // The entries of a closed-out or delivered call are still reported by a read that names
+        // it, so its late entry can be classed.
+        settled.push(terminal("a", DispatchOutcome::Completed));
+        let settled_read = held_call_facts(&framed(settled.clone()), Some("lineage:4"));
+        assert!(!settled_read.needs_intake());
+        assert_eq!(settled_read.held.len(), 1);
+        // A read that names no call reports the WAL's held records but no successors, which no
+        // delivery needs.
+        let unnamed = held_call_facts(&framed(settled), None);
+        assert_eq!(unnamed.held.len(), 1);
+        assert!(unnamed.held_successors.is_empty());
     }
 }
 

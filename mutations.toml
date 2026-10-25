@@ -29555,3 +29555,482 @@ expect_red = ["system_one::tool_admission_tests::frozen_admission_and_original_t
 file = "crates/broca-module-serve/src/system_one/mod.rs"
 old = "            admitted_at_ms,\n            Some((&args_digest, &admission)),"
 new = "            None, // NON-VACUITY BREAK: date retention from delayed execution.\n            Some((&args_digest, &admission)),"
+
+[[control]]
+id = "intake-unheld-registration-never-starts-a-puller"
+guards = "A registration for a call that is not held keeps no puller running, so an ordinary call to a late-results provider opens no feed"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_unheld_registration_alone_never_starts_a_puller"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = '''                    if facts.needs_intake() {
+                        holds = true;'''
+new = '''                    if true { // NON-VACUITY BREAK: keep a puller for any registration.
+                        holds = true;'''
+
+[[control]]
+id = "intake-one-puller-per-module"
+guards = "A module's feed has one puller, claimed under the lock that inserts it, however many sessions and scopes register on it"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::a_module_holds_one_puller_however_many_scopes_register"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = '''            if pullers.contains_key(module) {
+                return Ok(StartOutcome::Held);
+            }'''
+new = "            // NON-VACUITY BREAK: start a second puller for a module that has one."
+
+[[control]]
+id = "intake-nothing-acked-before-its-delivery"
+guards = "An entry is acked only after its delivery is durable: a delivery that could not be written pins the ack instead of passing it"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::nothing_is_acked_before_its_delivery_is_durable"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = '''                if let Err(_reason) = self
+                    .deliver_settled(module, std::slice::from_ref(entry), &rows)
+                    .await
+                {
+                    pinned.push(key);
+                    continue;
+                }'''
+new = "                let _delivery = self.deliver_settled(module, std::slice::from_ref(entry), &rows).await; // NON-VACUITY BREAK: settle an entry even when its delivery could not be written."
+
+[[control]]
+id = "intake-no-ack-past-a-pending-entry"
+guards = "A pinned entry stops the ack, and a later page is still delivered past it"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::a_pinned_entry_pins_the_ack_but_a_later_page_is_still_delivered"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "            let ackable = puller.pinned().is_empty();"
+new = "            let ackable = true; // NON-VACUITY BREAK: ack a page past a pinned entry."
+
+[[control]]
+id = "intake-limited-repull-must-return-the-prefix"
+guards = "A limit re-pull whose entries are not exactly the settled prefix acks nothing"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::a_mismatched_limit_repull_acks_nothing"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "        if keys != expected {"
+new = "        if false { // NON-VACUITY BREAK: ack a re-pull that answered other entries."
+
+[[control]]
+id = "intake-incarnation-change-keeps-its-debt"
+guards = "A refused cursor is forgotten while an owed ack stays owed, so a provider restart never settles an undelivered entry"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_incarnation_change_forgets_the_cursor_and_keeps_the_owed_ack"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = '''                "UPDATE feeds SET provider_incarnation = NULL, seq = NULL WHERE module = ?1",'''
+new = '''                "UPDATE feeds SET provider_incarnation = NULL, seq = NULL, ack_owed = 0 WHERE module = ?1", // NON-VACUITY BREAK: clear the owed ack on an incarnation change.'''
+
+[[control]]
+id = "intake-abandoned-ack-stops"
+guards = "An ack-only puller whose feed is abandoned clears its owed ack and stops"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_ack_only_puller_clears_its_owed_ack_when_the_feed_is_abandoned"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "                    let _ = self.store.set_ack_owed(module, false);"
+new = "                    let _ = self.store.set_ack_owed(module, true); // NON-VACUITY BREAK: keep acking an abandoned feed."
+
+[[control]]
+id = "intake-unknown-kind-is-acked-and-never-delivered"
+guards = "An entry of an unknown kind is acked as a no-op and never handed to the run, and the call stays open for a later entry"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_unknown_kind_is_acked_and_leaves_the_call_open_for_a_later_entry"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "        if !settles_a_call(entry) {"
+new = "        if false { // NON-VACUITY BREAK: classify an entry that settles nothing as deliverable."
+
+[[control]]
+id = "intake-unregistered-entry-is-a-no-op"
+guards = "An entry no registration names is acked as a no-op instead of being left owed"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_entry_with_no_registration_is_acked_as_a_no_op"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = '''            return Ok(Classified::NoOp);
+        };
+        if !scope_matches(&row.call, entry) {'''
+new = '''            return Ok(Classified::Blocked("unregistered".into())); // NON-VACUITY BREAK: retry an unregistered entry.
+        };
+        if !scope_matches(&row.call, entry) {'''
+
+[[control]]
+id = "intake-entry-scope-must-match-its-registration"
+guards = "An entry whose owner, ref or epoch differs from its registration's is never delivered"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_entry_whose_scope_differs_from_its_registration_is_a_no_op"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = '''        Some(scope) => {
+            scope.owner.as_owner_string() == entry.owner'''
+new = '''        Some(scope) => {
+            let _ = scope;
+            true || scope.owner.as_owner_string() == entry.owner // NON-VACUITY BREAK: ignore the entry's scope.'''
+
+[[control]]
+id = "intake-held-terminal-comes-from-its-own-module"
+guards = "An entry on one module's feed is never delivered to a call its WAL records as held by another module"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_entry_for_a_call_dispatched_to_another_module_is_a_no_op"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "        if !held.module.is_empty() && held.module != module {"
+new = "        if false && !held.module.is_empty() && held.module != module { // NON-VACUITY BREAK: deliver an entry from the wrong module."
+
+[[control]]
+id = "intake-dedupe-on-intake-key"
+guards = "An entry read again before its ack lands is handed to the run once: the second read finds the first delivery under its (provider, custodian, call_key, event_id) key"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::the_same_entry_read_twice_is_delivered_once"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = '''            if self.store.receipt(&key)?.is_some() {
+                continue;
+            }'''
+new = "            let _receipt = self.store.receipt(&key)?; // NON-VACUITY BREAK: hand a delivered entry over again."
+
+[[control]]
+id = "intake-answered-call-is-never-delivered-again"
+guards = "An entry whose held call already has its terminal is acked as a no-op and never written a second time, whatever the terminal is"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_entry_for_a_call_that_already_has_its_terminal_is_acked_and_not_delivered"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "        if view.facts.terminal(&held.tool_call_id).is_some() {"
+new = "        if false { // NON-VACUITY BREAK: treat an answered call as still waiting."
+
+[[control]]
+id = "intake-ack-through-the-providers-cursor"
+guards = "Every ack names exactly the cursor the provider's reply returned, never one broca made up"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_entry_for_a_held_call_is_delivered_then_acked_through_the_providers_cursor"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "        self.feed.ack(module, cursor).await?;"
+new = "        self.feed.ack(module, &Cursor { provider_incarnation: cursor.provider_incarnation.clone(), seq: cursor.seq + 1 }).await?; // NON-VACUITY BREAK: ack past the provider's cursor."
+
+[[control]]
+id = "intake-expired-entry-settles-its-call"
+guards = "An expired entry is the call's terminal answer: it is handed to the run like a result, never dropped as a no-op"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_expired_entry_is_delivered_as_the_calls_terminal"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "        EntryKind::Result | EntryKind::NotStarted | EntryKind::Expired"
+new = "        EntryKind::Result | EntryKind::NotStarted // NON-VACUITY BREAK: an expired entry settles nothing."
+
+[[control]]
+id = "intake-blocked-while-rebuilding"
+guards = "While the store is being rebuilt from the WALs, no entry is delivered and nothing is acked"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::while_the_store_is_rebuilding_nothing_is_delivered_or_acked"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "        if self.is_rebuilding() {"
+new = "        if false { // NON-VACUITY BREAK: trust a store that is still being rebuilt."
+
+[[control]]
+id = "intake-rebuild-registers-held-calls"
+guards = "A rebuilt store registers every held call its scan finds, so their sessions are opened again and their entries are not taken for unregistered"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::a_rebuilt_store_registers_held_calls_and_owes_their_feeds_an_ack"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "            match store.register_calls(&calls) {"
+new = "            match Ok::<(), String>(()) { // NON-VACUITY BREAK: a rebuild forgets the held calls it scanned."
+
+[[control]]
+id = "intake-rebuild-owes-the-ack"
+guards = "A rebuilt store marks every feed a held record names as owing an ack, so an ack owed before the store was lost is still made"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::a_rebuilt_store_registers_held_calls_and_owes_their_feeds_an_ack"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "                store.ensure_feed(&call.module, true)?;"
+new = "                store.ensure_feed(&call.module, false)?; // NON-VACUITY BREAK: forget the ack a lost store owed."
+
+[[control]]
+id = "intake-settled-registration-is-pruned"
+guards = "A registration whose call has its terminal and whose batch committed is pruned, so a later entry for it is unregistered and acked"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::a_settled_registration_is_pruned_and_a_held_one_is_kept"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "                    } else if registration_settled(&row.call.call_key, &records, &facts) {"
+new = "                    } else if false && registration_settled(&row.call.call_key, &records, &facts) { // NON-VACUITY BREAK: never prune."
+
+[[control]]
+id = "intake-held-registration-outlives-its-wait"
+guards = "A held call keeps its registration (and its puller) until its batch commits"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::a_settled_registration_is_pruned_and_a_held_one_is_kept"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = '''                    if facts.needs_intake() {
+                        holds = true;
+                    } else if'''
+new = '''                    if facts.needs_intake() {
+                        holds = true;
+                        self.store.remove(module, &row.call.call_key)?; // NON-VACUITY BREAK: prune a held call's registration.
+                    } else if'''
+
+[[control]]
+id = "held-slot-delivered-only-after-its-terminal-syncs"
+guards = "A late result deposited for a held call counts as delivered only once the run's batch has synced it as the call's terminal"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/held_slots.rs"
+expect_red = ["held_slots::tests::a_waiting_batch_takes_the_deposit_and_delivery_waits_for_its_sync"]
+file = "crates/broca-module/src/held_slots.rs"
+old = "        slot.delivered.push(tx);"
+new = "        let _ = tx.send(()); // NON-VACUITY BREAK: answer the deposit as delivered before the batch syncs it."
+
+[[control]]
+id = "subc-held-reply-stays-undeclared-without-the-test-switch"
+guards = "An installed held runtime declares no held-reply capability, sends no plain key and registers nothing unless the debug-only test switch is on"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
+expect_red = ["subc_plane::held_dispatch_tests::an_installed_runtime_without_the_route_declaration_leaves_every_call_unchanged"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = '''        self.provider_held.is_some() && self.declares_held_reply
+    }'''
+new = '''        self.provider_held.is_some() // NON-VACUITY BREAK: declare held-reply whenever the runtime is installed.
+    }'''
+
+[[control]]
+id = "subc-frozen-late-results-gates-plain-keys"
+guards = "A plain call carries its key only to a provider whose frozen plan declared late_results; an absent declaration is never read as one"
+runner = "cargo"
+package = "broca-subc"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-subc/src/subc_plane/held_dispatch_tests.rs"
+expect_red = ["subc_plane::held_dispatch_tests::plain_keys_require_late_results_identity_and_installed_seams"]
+file = "crates/broca-subc/src/subc_plane.rs"
+old = '''            late_results: declarations
+                .and_then(|declarations| declarations.late_results)
+                .unwrap_or(false),'''
+new = '''            late_results: declarations
+                .and_then(|declarations| declarations.late_results)
+                .unwrap_or(true), // NON-VACUITY BREAK: read an absent declaration as late_results.'''
+
+[[control]]
+id = "core-resume-routes-by-its-own-frozen-manifest"
+guards = "A resumed batch routes by the provider declarations its session's RunStarted froze, never by a manifest the resuming caller offers"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run/hook_tests.rs"
+expect_red = ["run::hook_tests::a_batch_reads_provider_declarations_only_from_the_frozen_manifest"]
+file = "crates/broca-core/src/run.rs"
+old = '''    let frozen_plan = if is_resume {
+        prior.manifest.as_ref()
+    } else {
+        control.manifest.as_ref()
+    };
+    if let Some(frozen_plan) = frozen_plan {
+        manifest = manifest'''
+new = '''    let frozen_plan = if is_resume {
+        control.manifest.as_ref() // NON-VACUITY BREAK: resume by the caller's manifest.
+    } else {
+        control.manifest.as_ref()
+    };
+    if let Some(frozen_plan) = frozen_plan {
+        manifest = manifest'''
+
+[[control]]
+id = "core-held-delivery-answered-after-its-terminal-syncs"
+guards = "The run tells the held lifecycle a late result is delivered only after the call's terminal is durable, so its entry is never acked over a terminal a crash could lose"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_sequential_pause_resume_syncs_before_successor"]
+file = "crates/broca-core/src/run.rs"
+old = '''                    sync_held_terminal(&mut result, ctx, plane.writer, hooks).await?;
+                    plane.held.complete(&result.result.tool_call_id);
+                    plane.terminal_synced(&result.result.tool_call_id).await;'''
+new = '''                    plane.terminal_synced(&result.result.tool_call_id).await; // NON-VACUITY BREAK: answer the delivery before the terminal syncs.
+                    sync_held_terminal(&mut result, ctx, plane.writer, hooks).await?;
+                    plane.held.complete(&result.result.tool_call_id);'''
+
+[[control]]
+id = "core-resumed-held-call-is-never-dispatched-again"
+guards = "A resumed batch waits for a held call's late result in its slot and never sends the call to its provider again"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/run.rs"
+expect_red = ["run::tests::provider_held_sequential_pause_resume_syncs_before_successor"]
+file = "crates/broca-core/src/run.rs"
+old = "            .find(|held| held.tool_call_id == call.tool_call_id)"
+new = "            .find(|_| false) // NON-VACUITY BREAK: re-dispatch a resumed held call."
+
+[[control]]
+id = "intake-facts-need-an-open-held-call"
+guards = "A registered call needs its feed only while it has an open held record or an owed batch barrier"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::a_registered_call_needs_its_feed_only_while_it_is_held"]
+file = "crates/broca-core/src/replay.rs"
+old = '''        !self.unreadable
+            && (self.barrier_owed'''
+new = '''        !self.unreadable
+            && (true || self.barrier_owed'''
+
+[[control]]
+id = "intake-held-successors-come-from-the-registered-read"
+guards = "A registered call's WAL read reports its sequential held successors, which boot recovery and the successor rule need"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::provider_held_tests::a_registered_call_needs_its_feed_only_while_it_is_held"]
+file = "crates/broca-core/src/replay.rs"
+old = "    facts.held_successors = if registered {"
+new = "    facts.held_successors = if false && registered { // NON-VACUITY BREAK: drop the held successors of a registered read."
+
+[[control]]
+id = "fold-keeps-a-held-range-without-a-store"
+guards = "A held range is never archived when the caller cannot prove the intake store's state"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/wal_fold/tests.rs"
+expect_red = ["wal_fold::tests::fold_skips_a_held_range_without_an_intake_store"]
+file = "crates/broca-core/src/wal_fold.rs"
+old = "    if matches!(held_ranges, HeldRanges::UnknownStore) && held.needs_intake() {"
+new = "    if false && matches!(held_ranges, HeldRanges::UnknownStore) && held.needs_intake() { // NON-VACUITY BREAK: archive a held range without a store."
+
+[[control]]
+id = "module-late-result-resumes-a-parked-held-run"
+guards = "A deposited late result makes the session's actor resume a run parked on held calls into its original batch; merely opening the session leaves it parked"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/actor.rs"
+expect_red = ["actor::tests::a_late_result_resumes_a_held_run_that_opening_alone_leaves_parked"]
+file = "crates/broca-module/src/actor.rs"
+old = "                && !self.resuming_for_late_result"
+new = "                // NON-VACUITY BREAK: keep a held run parked even when its late result arrived."
+
+[[control]]
+id = "intake-rebuild-skips-only-without-held-frames"
+guards = "A rebuild skips the WAL scan only when the state root's feature floor proves no provider-held frame was ever written"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::a_rebuilt_store_registers_held_calls_and_owes_their_feeds_an_ack"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "        .is_ok_and(|floor| !floor.contains(broca_wal::PROVIDER_HELD_FEATURE))"
+new = "        .is_ok_and(|_| true) // NON-VACUITY BREAK: skip the scan whatever the floor says."
+
+[[control]]
+id = "intake-empty-page-sends-no-ack"
+guards = "An idle poll whose page holds no entry sends no ack, so a held call's puller does not ack the provider every few seconds"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_puller.rs"
+expect_red = ["late_results_puller::tests::an_empty_page_sends_no_ack_and_settles_an_owed_one"]
+file = "crates/broca-module/src/late_results_puller.rs"
+old = "            if ackable && reply.entries.is_empty() {"
+new = "            if false && ackable && reply.entries.is_empty() { // NON-VACUITY BREAK: ack every idle poll."
+
+[[control]]
+id = "late-results-store-is-owner-only"
+platforms = ["linux", "macos"]
+guards = "late-results.db is created owner-only before SQLite opens it, so the state root holds no group- or world-readable file"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/late_results_store.rs"
+expect_red = ["late_results_store::tests::the_store_and_its_journal_are_owner_only"]
+file = "crates/broca-module/src/late_results_store.rs"
+old = '''        broca_store::create_private_sqlite(&path)
+            .map_err(|error| format!("create {} owner-only: {error}", path.display()))?;'''
+new = "        // NON-VACUITY BREAK: let SQLite create the store through the umask."

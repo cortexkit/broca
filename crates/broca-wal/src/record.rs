@@ -23,8 +23,8 @@ use serde_json::Value;
 
 mod plan_manifest;
 pub use plan_manifest::{
-    FetchOutcome, FrozenDeclaration, FrozenHoldArgument, FrozenReply, OpaqueJson, PlanManifest,
-    ProviderFetch,
+    FetchOutcome, FrozenDeclaration, FrozenHoldArgument, FrozenProviderDeclarations, FrozenReply,
+    FrozenResultFormat, OpaqueJson, PlanManifest, ProviderFetch,
 };
 mod compaction;
 pub use compaction::{
@@ -1348,6 +1348,27 @@ impl WalRecord {
         // `SubmissionRequest::client_message_id`). An older build would read the digest without
         // it and answer a re-send under the same `send_id` with another id as a plain retry,
         // where this build refuses it `send_id_reuse`, so the record is must-understand.
+        // A manifest that froze any provider declaration is must-understand: an older reader
+        // would skip the fields and read replies by a catalog that may have changed since.
+        let base = if matches!(
+            self,
+            WalRecord::RunStarted {
+                manifest: Some(manifest),
+                ..
+            } if manifest.fetches.iter().any(|fetch| {
+                matches!(
+                    &fetch.outcome,
+                    FetchOutcome::Answered {
+                        declarations_frozen: Some(declarations),
+                        ..
+                    } if !declarations.is_empty()
+                )
+            })
+        ) {
+            with_feature(base, crate::framing::PROVIDER_DECLARATIONS_FEATURE)
+        } else {
+            base
+        };
         let identity_digest = match self {
             WalRecord::RunStarted {
                 request_identity_digest,

@@ -21,6 +21,7 @@ pub mod connection;
 pub mod consent;
 pub mod content_v1;
 pub mod hook_plane;
+pub mod late_results;
 pub mod plan_fetch;
 mod role_route;
 pub mod scope_describe;
@@ -42,6 +43,7 @@ pub use consent::{
     ScopedConsentPlane, WithdrawalReply,
 };
 pub use hook_plane::SubcHookPlane;
+pub use late_results::{late_entry_tool_result, LateResultsError, LateResultsFeed};
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
 pub use scope_describe::{DescribedScope, ModuleScopeDescriber, ScopeDescriber};
 pub use session_door::{DoorCoverage, DoorRead, SessionDoorClient, SessionDoorError};
