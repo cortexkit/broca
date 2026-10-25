@@ -713,9 +713,29 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         service
     };
     let _system_one_sweep = system_one.spawn_sweeper(registry.stopping_signal());
+    // Private-content admission asks cerebellum whether a scope read the person's private
+    // content and Basal which providers a flow's approved version allows. Both questions ride
+    // the module connection `plan_conn` presents under broca's own principal; cerebellum and
+    // Basal admit only `reserved:broca`.
+    let llm_tools_identity = broca_protocol::BindIdentity::new(
+        state_root.to_string_lossy().to_string(),
+        "broca",
+        "llm-tools",
+    );
+    let llm_tools_asks = Arc::new(broca_module_serve::llm_tools::SubcAsks::new(
+        Arc::new(broca_subc::PrivateContentClient::new(
+            plan_conn.clone(),
+            llm_tools_identity.clone(),
+        )),
+        Arc::new(broca_subc::FlowProvidersClient::new(
+            plan_conn.clone(),
+            llm_tools_identity,
+        )),
+    ));
     let llm_tools = Arc::new(broca_module_serve::llm_tools::LlmTools::new(
         Arc::new(system_one.fork_for_tools()),
         broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?,
+        llm_tools_asks,
     ));
     let agent_data = Arc::new(broca_module_serve::agent_data::AgentDataService::new(
         state_root.clone(),

@@ -2,9 +2,11 @@
 //! paid outcomes use a separate System One instance so tool waits cannot starve classifiers.
 
 mod admission;
+mod private_content;
 mod route;
 
-pub use route::{LlmTools, CLASSIFY_TOOL_NAME};
+pub use private_content::{Asks, SubcAsks};
+pub use route::{LlmTools, NoPrivateContent, CLASSIFY_TOOL_NAME};
 
 /// No answer is released when its price cannot be measured. The contract tells the caller
 /// to charge its request ceiling against its budget rather than pretending the call was free.

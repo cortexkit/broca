@@ -29386,7 +29386,7 @@ new = "if false && (frozen.charge_basis != Some(broca_core::ChargeBasis::Metered
 
 [[control]]
 id = "llm-tool-private-unknown-denies-unlisted-provider"
-guards = "The conservative private-content fallback never sends content to an unlisted provider"
+guards = "A call with no stored answer is admitted by the private-content policy, so an unlisted provider never receives private content"
 runner = "cargo"
 package = "broca-module-serve"
 target = "--test llm_tools_route"
@@ -29394,8 +29394,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
 expect_red = ["memory_private_unknown_provider_is_not_dispatched"]
 file = "crates/broca-module-serve/src/llm_tools/route.rs"
-old = "if stored.is_none()"
-new = "if false && stored.is_none() // NON-VACUITY BREAK: execute an unlisted provider."
+old = "        if stored.is_none() {\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
+new = "        if stored.is_none() && admission.provider == \"never-a-provider\" { // NON-VACUITY BREAK: skip the policy for a fresh call.\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
 
 [[control]]
 id = "llm-tool-single-flight-joins-waiters"
@@ -29669,6 +29669,58 @@ expect_red = ["system_one::tool_admission_tests::frozen_admission_and_original_t
 file = "crates/broca-module-serve/src/system_one/mod.rs"
 old = "            admitted_at_ms,\n            Some((&args_digest, &admission)),"
 new = "            None, // NON-VACUITY BREAK: date retention from delayed execution.\n            Some((&args_digest, &admission)),"
+
+[[control]]
+id = "llm-tool-private-content-precedes-every-provider-attempt"
+guards = "A fresh model-tool call is checked against the scope's private content before any provider attempt"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
+expect_red = ["llm_tools::private_content::tests::a_marked_run_needs_approval_for_an_unlisted_provider_and_files_nothing"]
+file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
+old = "        if !marked.marked {\n            return Ok(());\n        }\n        // A live grant would also admit here; this code does not consult grants yet."
+new = "        if true { // NON-VACUITY BREAK: call a marked scope provider without asking anyone.\n            return Ok(());\n        }\n        // A live grant would also admit here; this code does not consult grants yet."
+
+[[control]]
+id = "llm-tool-private-content-unrecognized-source-files-no-card"
+guards = "A marked scope whose answer names no source broca can show ends without a card instead of with one that names nothing"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
+expect_red = ["llm_tools::private_content::tests::a_marked_answer_with_only_unknown_kinds_has_no_source_to_name"]
+file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
+old = "            let consent = if answered {\n                PRIVATE_CONTENT_UNKNOWN"
+new = "            let consent = if answered\n                && false { // NON-VACUITY BREAK: never take the answered branch, so an unknown source reads as unreachable.\n                PRIVATE_CONTENT_UNKNOWN"
+
+[[control]]
+id = "llm-tool-flow-providers-narrow-a-marked-flow"
+guards = "A marked flow may call only the base set and the providers Basal lists for its approved version"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
+expect_red = ["llm_tools::private_content::tests::a_marked_flow_calls_the_base_set_and_basals_list"]
+file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
+old = "        if !marked.marked {\n            return Ok(());\n        }\n        Err(encoded_refusal(\n            \"provider_not_allowed\","
+new = "        if true { // NON-VACUITY BREAK: let a marked flow call a provider its version never allowed.\n            return Ok(());\n        }\n        Err(encoded_refusal(\n            \"provider_not_allowed\","
+
+[[control]]
+id = "llm-tool-flow-refusal-is-passed-through"
+guards = "Basal's flow_not_approved refusal ends the call by name and is not cached"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
+expect_red = ["llm_tools::private_content::tests::an_unapproved_flow_is_refused_by_name_and_nothing_is_cached"]
+file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
+old = "                Ok(broca_subc::FlowPolicy::NotApproved { message }) => {\n                    return Err(encoded_refusal(\n                        broca_subc::flow_providers::FLOW_NOT_APPROVED,\n                        message,\n                        None,\n                    ))\n                }"
+new = "                Ok(broca_subc::FlowPolicy::NotApproved { message }) => {\n                    let _ = message; // NON-VACUITY BREAK: serve a flow Basal never approved.\n                    Vec::new()\n                }"
 
 [[control]]
 id = "intake-unheld-registration-never-starts-a-puller"

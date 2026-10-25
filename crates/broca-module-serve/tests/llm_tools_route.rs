@@ -791,6 +791,7 @@ fn direct_tools(
             advertise_tags: true,
             private_content_providers: vec!["typesafe".into()],
         },
+        Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
     ))
 }
 
@@ -915,6 +916,7 @@ fn tools_with_catalog(
                 vec![]
             },
         },
+        Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
     ))
 }
 
@@ -994,7 +996,8 @@ async fn memory_private_unknown_provider_is_not_dispatched() {
     )
     .unwrap();
     assert_eq!(error["code"], "not_started");
-    assert_eq!(error["detail"]["consent"], "private_content_unknown");
+    // No cerebellum answers this direct route, and no grant admits the provider.
+    assert_eq!(error["detail"]["consent"], "private_content_unreachable");
     assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
@@ -1060,6 +1063,7 @@ async fn memory_catalog_tag_switch_is_opt_in_and_preserves_invocation_modes() {
                 advertise_tags,
                 ..Default::default()
             },
+            Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
         ));
         let body = json!({"name":"tool.catalog","arguments":{"params":{}}}).to_string();
         let answer = tools
@@ -1116,6 +1120,7 @@ async fn memory_unmeasured_cost_is_a_stored_permanent_failure_without_an_answer(
             advertise_tags: true,
             private_content_providers: vec!["typesafe".into()],
         },
+        Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
     ));
     let body = direct_body(args(), Some("opaque"));
     let first = tools
@@ -1191,6 +1196,7 @@ async fn memory_in_process_single_flight_waiters_receive_the_same_answer() {
             advertise_tags: true,
             private_content_providers: vec!["typesafe".into()],
         },
+        Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
     ));
     let invoke = |tools: Arc<broca_module_serve::llm_tools::LlmTools>| {
         tokio::spawn(async move {
@@ -1783,11 +1789,13 @@ async fn unknown_private_content_never_executes_an_unlisted_provider() {
         return;
     };
     let route = rig.open(true, false).await;
+    // The daemon has no cerebellum to ask, and this machine has no grant, so nothing can tell
+    // this scope apart from a marked one.
     let error = refused_without_writes(&rig, &route, args(), "private", "not_started").await;
-    assert_eq!(error["detail"]["consent"], "private_content_unknown");
+    assert_eq!(error["detail"]["consent"], "private_content_unreachable");
     assert_eq!(
         route.call(args(), None).await.unwrap_err()["detail"]["consent"],
-        "private_content_unknown"
+        "private_content_unreachable"
     );
 }
 
@@ -1889,6 +1897,7 @@ async fn memory_nonfinal_transient_outcome_resumes_under_its_frozen_admission() 
             advertise_tags: true,
             private_content_providers: vec!["typesafe".into()],
         },
+        Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
     ));
     let body = direct_body(args(), Some("transient"));
     let failure: Value = serde_json::from_slice(
@@ -1956,6 +1965,7 @@ async fn memory_question_order_and_raw_json_survive_the_tool_adapter() {
             advertise_tags: true,
             private_content_providers: vec!["typesafe".into()],
         },
+        Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
     ));
     let body = br#"{"name":"llm_classify","arguments":{"model":"typesafe/jev-1.13.0","questions":{"z":{"type":"noul","instructions":"last alphabetically, first in the request"},"a":{"type":"noul","instructions":"second in the request"}},"item":{"state":{"huge":123456789012345678901234567890}},"max_cost_usd":0.01},"call_key":"raw"}"#;
     let result = tools

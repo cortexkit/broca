@@ -20,9 +20,11 @@ pub mod compaction_plane;
 pub mod connection;
 pub mod consent;
 pub mod content_v1;
+pub mod flow_providers;
 pub mod hook_plane;
 pub mod late_results;
 pub mod plan_fetch;
+pub mod private_content;
 mod role_route;
 pub mod scope_describe;
 pub mod session_door;
@@ -42,9 +44,11 @@ pub use consent::{
     AnswersPage, ConsentClient, ConsentError, ConsentRecord, ConsentState, FilingReply,
     ScopedConsentPlane, WithdrawalReply,
 };
+pub use flow_providers::{FlowPolicy, FlowProvidersClient, FlowProvidersError};
 pub use hook_plane::SubcHookPlane;
 pub use late_results::{late_entry_tool_result, LateResultsError, LateResultsFeed};
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
+pub use private_content::{PrivateContent, PrivateContentClient, PrivateContentError, SourceKind};
 pub use scope_describe::{DescribedScope, ModuleScopeDescriber, ScopeDescriber};
 pub use session_door::{DoorCoverage, DoorRead, SessionDoorClient, SessionDoorError};
 pub use subc_plane::SubcToolPlane;
