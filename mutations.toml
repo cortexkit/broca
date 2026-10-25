@@ -5775,9 +5775,11 @@ expect_red = ["ckdev::tests::publication_never_holds_a_writable_executable_descr
 expect_message = "test process holds a writable descriptor to publishable inode"
 platforms = ["linux"]
 file = "crates/broca-test-support/src/ckdev.rs"
-old = '''        let output = Command::new("/bin/cp")
-            .args(["-p", "/dev/fd/0"])
-            .arg(&temporary.path)
+old = '''        let mut output_path = OsString::from("of=");
+        output_path.push(&temporary.path);
+        let output = Command::new("/bin/dd")
+            .arg("bs=65536")
+            .arg(output_path)
             .stdin(std::process::Stdio::from(source.file.try_clone()?))
             .output()?;
         if !output.status.success() {
