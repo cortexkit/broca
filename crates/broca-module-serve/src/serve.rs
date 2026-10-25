@@ -1599,7 +1599,11 @@ async fn handle_control_request(
             ..
         } => {
             stall::method_context(1);
-            let role = match bind_role(role_versions.as_ref(), routes.system_one.is_some()) {
+            let role = match bind_target_role(
+                &target,
+                role_versions.as_ref(),
+                routes.system_one.is_some(),
+            ) {
                 Ok(role) => role,
                 Err(message) => {
                     return send_error(
@@ -4367,6 +4371,27 @@ impl RouteRole {
     fn is_sessionless(self) -> bool {
         self != Self::LlmRunner
     }
+}
+
+/// Tool-provider targets identify their role without a declaration. A declaration may pin
+/// that role's version, but cannot switch the target to another operation namespace.
+fn bind_target_role(
+    target: &subc_protocol::RouteTarget,
+    role_versions: Option<&std::collections::BTreeMap<String, String>>,
+    serves_classifier: bool,
+) -> Result<RouteRole, String> {
+    if !matches!(target, subc_protocol::RouteTarget::ToolProvider { .. }) {
+        return bind_role(role_versions, serves_classifier);
+    }
+    if let Some(roles) = role_versions {
+        if let Some(other) = roles.keys().find(|role| role.as_str() != "tool-provider") {
+            return Err(format!(
+                "a route serves one role; the tool-provider target conflicts with declared role {other}"
+            ));
+        }
+    }
+    bind_role(role_versions, serves_classifier)?;
+    Ok(RouteRole::ToolProvider)
 }
 
 /// Select a supported role, retaining llm-runner for legacy or unrelated declarations.
