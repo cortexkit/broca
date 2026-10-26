@@ -300,6 +300,14 @@ fn message(
 fn transcript_rows(frames: &[FramedRecord]) -> Result<Vec<(u64, Value)>, String> {
     use broca_core::placement::{AppendKind, Placement, PlacementAction};
     use broca_protocol::caller::ControlUnit;
+    let readable_len = broca_core::read_session_page(
+        &broca_core::StorePageSnapshot::empty(),
+        frames,
+        Some(0),
+        Some(1),
+    )
+    .map_err(|_| "cannot derive session.read transcript coordinates")?
+    .prompt_len;
     let times = broca_core::message_times::written_times(
         frames.iter().map(|f| &f.record),
         Placement::default(),
@@ -417,9 +425,30 @@ fn transcript_rows(frames: &[FramedRecord]) -> Result<Vec<(u64, Value)>, String>
         }
     }
     let mut state = broca_core::ControlProjectionState::default();
+    let source_times: HashMap<_, _> = frames
+        .iter()
+        .filter_map(|frame| {
+            let time = match &frame.record {
+                WalRecord::ModelStepFinished { written_at_ms, .. } => *written_at_ms,
+                WalRecord::ToolResult { finished_at_ms, .. } => *finished_at_ms,
+                WalRecord::ToolNoDispatch {
+                    dispatched_at_ms, ..
+                } => *dispatched_at_ms,
+                WalRecord::ApprovalRecorded { closed_at_ms, .. } => *closed_at_ms,
+                _ => None,
+            };
+            time.map(|time| (frame.seq, time))
+        })
+        .collect();
     for unit in broca_core::project_control_with_mids(frames, &mut state)? {
-        let ordinal = unit.message_ordinal;
-        let at_ms = ordinal.and_then(|n| times.get(&n).copied());
+        // A live control stream reserves coordinates before session.read exposes
+        // an open tool turn. Keep that reservation out of a transcript export.
+        let ordinal = unit
+            .message_ordinal
+            .filter(|ordinal| *ordinal < readable_len);
+        let at_ms = ordinal
+            .and_then(|n| times.get(&n).copied())
+            .or_else(|| source_times.get(&unit.cursor.wal_seq).copied());
         match unit.unit {
             ControlUnit::AssistantMessage { message: assistant } => rows.push((
                 unit.cursor.wal_seq,

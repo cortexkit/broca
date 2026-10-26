@@ -21,7 +21,8 @@ not zero. `--transcript` adds `message` rows containing text and complete tool
 arguments/results, plus a `reasoning` byte-count row per step, never reasoning text
 or provider continuation state. Message `ordinal` and `mid` use the same placement
 as `session.read`; multiple results in one tool-role message share its coordinate.
-Queued or steering inputs not yet placed have null coordinates. Transcript rows
+Messages not yet visible in `session.read`, including pending inputs and open
+tool turns before dispatch, have null coordinates. Transcript rows
 stay at their source record's position, even when a later boundary places them.
 Treat transcript exports as sensitive conversation data.
 

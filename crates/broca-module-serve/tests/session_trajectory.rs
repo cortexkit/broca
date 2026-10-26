@@ -560,3 +560,48 @@ fn session_trajectory_no_dispatch_preserves_unknown_result_metadata() {
     assert!(tool["content"].to_string().contains("not permitted"));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn session_trajectory_open_tool_turn_coordinates_follow_session_read() {
+    for count in [6, 8, 10] {
+        let root = root(&format!("open-turn-{count}"));
+        let bind = BindIdentity::new(root.join("worker"), "broca", "alfonso:bg_open");
+        let all = records(&bind);
+        let store = fixture(&root, &bind, &all[..count]);
+        let frames = store.read_records(&bind).unwrap();
+        let page =
+            broca_core::read_session_page(&StorePageSnapshot::empty(), &frames, Some(0), Some(500))
+                .unwrap();
+        let rows = trajectory::read(&root, &bind, true).unwrap();
+        for row in rows.iter().filter(|row| {
+            row["kind"] == "message" && (row["role"] == "assistant" || row["role"] == "tool")
+        }) {
+            let expected = page
+                .messages
+                .iter()
+                .find(|message| serde_json::to_value(message.message.role).unwrap() == row["role"]);
+            assert_eq!(
+                row["ordinal"],
+                json!(expected.map(|message| message.ordinal))
+            );
+            assert_eq!(
+                row["mid"],
+                json!(expected.map(|message| format!("m{}", message.ordinal)))
+            );
+            assert_eq!(
+                row["at_ms"],
+                if row["role"] == "assistant" {
+                    1350
+                } else {
+                    1500
+                }
+            );
+        }
+        if count == 6 {
+            assert_eq!(page.prompt_len, 1);
+        } else {
+            assert!(page.prompt_len >= 2);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
