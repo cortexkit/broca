@@ -163,6 +163,12 @@ fn stand_in_value(name: &str) -> String {
 
 async fn serve() -> Result<(), String> {
     let (module_id, nonce) = identity()?;
+    // A flow caller must connect under Basal's daemon-issued identity, not the scope owner's.
+    // The rig uses the optional nonce file to open that additional consumer connection.
+    if std::env::args().any(|arg| arg.starts_with("--SURFACE_NONCE_PATH=")) {
+        std::fs::write(stand_in_value("SURFACE_NONCE_PATH"), &nonce)
+            .map_err(|error| format!("write the consumer nonce: {error}"))?;
+    }
     let fixtures = PathBuf::from(stand_in_value("SURFACE_FIXTURES"));
     let requests = PathBuf::from(stand_in_value("SURFACE_REQUESTS"));
     let info = subc_transport::read_for_client(env("SUBC_CONNECTION"))
@@ -306,6 +312,12 @@ fn manifest(module_id: &str) -> ModuleManifest {
 }
 
 fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Result<Vec<u8>, Vec<u8>> {
+    if method == "flow.private_content_providers"
+        && (params["flow_id"].as_str().is_none()
+            || params.as_object().is_none_or(|params| params.keys().any(|key| key != "flow_id")))
+    {
+        return Err(br#"{"code":"invalid_params","message":"params must contain only flow_id"}"#.to_vec());
+    }
     if method == "private_content.query" {
         if let Some(field) = params.as_object().and_then(|params| {
             params
@@ -356,11 +368,11 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
         if method == "private_content.query" {
             return Ok(raw.as_bytes().to_vec());
         }
-        // A fixture that reads as an error is the module refusing the operation.
+        // Basal refuses with an error frame, while its successful fixture includes result.
         if value.get("code").is_some() {
-            return Err(serde_json::to_vec(&value).unwrap_or_default());
+            return Err(raw.as_bytes().to_vec());
         }
-        return Ok(serde_json::to_vec(&serde_json::json!({ "result": value })).unwrap_or_default());
+        return Ok(raw.as_bytes().to_vec());
     }
     // A cerebellum stand-in answers a scope it has no fixture for. The file naming any
     // `person_browser` fixture marks it as the whole file's answer, which is how a test says
@@ -422,5 +434,38 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&response).unwrap(),
             serde_json::json!({"private_content": false, "sources": []})
         );
+    }
+
+    #[test]
+    fn basal_rejects_unknown_params_in_an_error_frame() {
+        for params in [
+            serde_json::json!({"flow_id": "flow", "owner": {"kind": "reserved", "module_id": "broca"}}),
+            serde_json::json!({"flow_id": "flow", "future_field": true}),
+        ] {
+            let bytes = answer(&PathBuf::new(), "flow.private_content_providers", &params).unwrap_err();
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error, serde_json::json!({"code": "invalid_params", "message": "params must contain only flow_id"}));
+        }
+    }
+
+    #[test]
+    fn basal_fixtures_preserve_wrapped_successes_and_error_frames() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/scratch/basal-fixtures-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = root.join("fixtures.json");
+        for (body, refused) in [
+            (r#"{"result":{"flow_id":"flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":["typesafe","openai"]}}"#, false),
+            (r#"{"result":{"flow_id":"flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#, false),
+            (r#"{"code":"storage_unavailable","message":"storage is unavailable"}"#, true),
+        ] {
+            std::fs::write(&fixture, serde_json::json!([{
+                "match": {"method": "flow.private_content_providers"}, "stdout": body
+            }]).to_string()).unwrap();
+            let response = answer(&fixture, "flow.private_content_providers", &serde_json::json!({"flow_id": "flow"}));
+            let bytes = if refused { response.unwrap_err() } else { response.unwrap() };
+            assert_eq!(bytes, body.as_bytes());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

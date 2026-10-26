@@ -22,7 +22,6 @@ use std::time::Duration;
 use broca_protocol::BindIdentity;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use subc_protocol::Principal;
 
 use crate::connection::{ConnError, RouteOpenRetry, SubcConnection};
 
@@ -47,11 +46,19 @@ pub fn valid_provider_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// The approved version and its declared providers, as named by Basal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedFlowProviders {
+    pub version: u64,
+    pub code_hash: String,
+    pub providers: Vec<String>,
+}
+
 /// The providers a flow may call, or the reason its call is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowPolicy {
     /// The provider ids Basal listed for the flow's approved version.
-    Allowed(Vec<String>),
+    Allowed(ApprovedFlowProviders),
     /// Basal reports that the flow has no approved version. Broca refuses this call with
     /// Basal's own code and does not cache the answer: approval can change between calls.
     NotApproved { message: String },
@@ -113,6 +120,8 @@ pub struct FlowProvidersClient {
 #[serde(deny_unknown_fields)]
 struct Answer {
     flow_id: String,
+    version: u64,
+    code_hash: String,
     providers: Vec<String>,
 }
 
@@ -121,11 +130,7 @@ impl FlowProvidersClient {
         Self { conn, identity }
     }
 
-    pub async fn query(
-        &self,
-        owner: &Principal,
-        flow_id: &str,
-    ) -> Result<FlowPolicy, FlowProvidersError> {
+    pub async fn query(&self, flow_id: &str) -> Result<FlowPolicy, FlowProvidersError> {
         let route = self
             .conn
             .route_open_management_within(
@@ -135,11 +140,8 @@ impl FlowProvidersClient {
             )
             .await
             .map_err(|error| FlowProvidersError::Route(error.to_string()))?;
-        let body = serde_json::to_vec(&json!({
-            "method": FLOW_PROVIDERS_OP,
-            "params": {"owner": owner, "flow_id": flow_id},
-        }))
-        .map_err(|error| FlowProvidersError::Protocol(error.to_string()));
+        let body = serde_json::to_vec(&request_body(flow_id))
+            .map_err(|error| FlowProvidersError::Protocol(error.to_string()));
         let reply = match body {
             Ok(body) => match tokio::time::timeout(
                 QUERY_TIMEOUT,
@@ -157,6 +159,10 @@ impl FlowProvidersClient {
         let _ = self.conn.route_close(&route).await;
         reply
     }
+}
+
+fn request_body(flow_id: &str) -> Value {
+    json!({"method": FLOW_PROVIDERS_OP, "params": {"flow_id": flow_id}})
 }
 
 fn decode(
@@ -201,19 +207,66 @@ fn decode(
             "providers must be at most 16 ids of lowercase letters, digits or hyphens".into(),
         ));
     }
-    Ok(FlowPolicy::Allowed(result.providers))
+    if result.code_hash.len() != 64
+        || !result
+            .code_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(FlowProvidersError::Protocol(
+            "code_hash must be 64 lowercase hexadecimal characters".into(),
+        ));
+    }
+    Ok(FlowPolicy::Allowed(ApprovedFlowProviders {
+        version: result.version,
+        code_hash: result.code_hash,
+        providers: result.providers,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const BASAL_SUCCESS: &[u8] = br#"{"result":{"flow_id":"flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":["typesafe","openai"]}}"#;
+    const BASAL_EMPTY: &[u8] = br#"{"result":{"flow_id":"flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#;
+
+    #[test]
+    fn basal_approved_version_success_fixture_decodes() {
+        for (bytes, providers) in [
+            (BASAL_SUCCESS, vec!["typesafe".into(), "openai".into()]),
+            (BASAL_EMPTY, vec![]),
+        ] {
+            assert_eq!(
+                decode(Ok(Ok(bytes.to_vec())), "flow").unwrap(),
+                FlowPolicy::Allowed(ApprovedFlowProviders {
+                    version: 7,
+                    code_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .into(),
+                    providers,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn request_body_contains_only_flow_id() {
+        assert_eq!(
+            request_body("flow"),
+            json!({
+                "method": "flow.private_content_providers", "params": {"flow_id": "flow"}
+            })
+        );
+    }
+
     fn answer(
         flow_id: &str,
         providers: Value,
     ) -> Result<Result<Vec<u8>, subc_protocol::ErrorBody>, ConnError> {
         Ok(Ok(serde_json::to_vec(
-            &json!({"result": {"flow_id": flow_id, "providers": providers}}),
+            &json!({"result": {"flow_id": flow_id, "version": 7,
+                "code_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "providers": providers}}),
         )
         .unwrap()))
     }
@@ -223,7 +276,12 @@ mod tests {
         let policy = decode(answer("flow", json!(["cloudflare-workers-ai"])), "flow").unwrap();
         assert_eq!(
             policy,
-            FlowPolicy::Allowed(vec!["cloudflare-workers-ai".into()])
+            FlowPolicy::Allowed(ApprovedFlowProviders {
+                version: 7,
+                code_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .into(),
+                providers: vec!["cloudflare-workers-ai".into()]
+            })
         );
     }
 
@@ -256,6 +314,90 @@ mod tests {
         // An answer for another flow would apply one flow's approval to this one.
         assert!(matches!(
             decode(answer("other-flow", json!([])), "flow"),
+            Err(FlowProvidersError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn basal_error_frame_fixtures_keep_their_codes() {
+        for (bytes, code) in [
+            (
+                br#"{"code":"flow_not_approved","message":"flow has no approved version"}"#
+                    .as_slice(),
+                FLOW_NOT_APPROVED,
+            ),
+            (
+                br#"{"code":"not_permitted","message":"caller is not permitted"}"#,
+                "not_permitted",
+            ),
+            (
+                br#"{"code":"invalid_params","message":"unknown parameter"}"#,
+                "invalid_params",
+            ),
+            (
+                br#"{"code":"module_warming","message":"module is warming"}"#,
+                "module_warming",
+            ),
+            (
+                br#"{"code":"storage_unavailable","message":"storage is unavailable"}"#,
+                "storage_unavailable",
+            ),
+        ] {
+            let error: subc_protocol::ErrorBody = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(error.detail, None);
+            let policy = decode(Ok(Err(error)), "flow");
+            if code == FLOW_NOT_APPROVED {
+                assert_eq!(
+                    policy.unwrap(),
+                    FlowPolicy::NotApproved {
+                        message: "flow has no approved version".into()
+                    }
+                );
+            } else {
+                let error = policy.unwrap_err();
+                assert_eq!(error.code(), Some(code));
+                assert!(error.to_string().contains(code));
+            }
+        }
+    }
+
+    #[test]
+    fn approval_metadata_is_required_and_strictly_validated() {
+        let fixture: Value = serde_json::from_slice(BASAL_SUCCESS).unwrap();
+        for hash in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+            "é".repeat(32),
+        ] {
+            let mut value = fixture.clone();
+            value["result"]["code_hash"] = json!(hash);
+            assert!(matches!(
+                decode(Ok(Ok(serde_json::to_vec(&value).unwrap())), "flow"),
+                Err(FlowProvidersError::Protocol(_))
+            ));
+        }
+        for version in [json!(-1), json!(1.5), json!("7"), json!(null)] {
+            let mut value = fixture.clone();
+            value["result"]["version"] = version;
+            assert!(matches!(
+                decode(Ok(Ok(serde_json::to_vec(&value).unwrap())), "flow"),
+                Err(FlowProvidersError::Protocol(_))
+            ));
+        }
+        for field in ["version", "code_hash"] {
+            let mut value = fixture.clone();
+            value["result"].as_object_mut().unwrap().remove(field);
+            assert!(matches!(
+                decode(Ok(Ok(serde_json::to_vec(&value).unwrap())), "flow"),
+                Err(FlowProvidersError::Protocol(_))
+            ));
+        }
+        let mut value = fixture;
+        value["result"]["future_field"] = json!(true);
+        assert!(matches!(
+            decode(Ok(Ok(serde_json::to_vec(&value).unwrap())), "flow"),
             Err(FlowProvidersError::Protocol(_))
         ));
     }

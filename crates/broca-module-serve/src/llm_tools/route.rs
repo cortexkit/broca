@@ -30,7 +30,6 @@ impl super::Asks for NoPrivateContent {
 
     async fn flow_providers(
         &self,
-        _owner: subc_protocol::Principal,
         _flow_id: &str,
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
         Err(broca_subc::FlowProvidersError::Unanswered(

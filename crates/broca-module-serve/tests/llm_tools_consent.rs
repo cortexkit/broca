@@ -965,7 +965,6 @@ impl Asks for Marked {
     }
     async fn flow_providers(
         &self,
-        _: subc_protocol::Principal,
         _: &str,
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
         unreachable!("run only")

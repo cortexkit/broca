@@ -897,7 +897,6 @@ impl broca_module_serve::llm_tools::Asks for ProgramMarks {
 
     async fn flow_providers(
         &self,
-        _: subc_protocol::Principal,
         _: &str,
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
         panic!("a codemode program is not a flow")
