@@ -199,14 +199,18 @@ async fn native_kill_before_card_id_answered_while_down_adopts_answer() {
     cut(true).await;
 }
 
+/// A real Cingulate is not part of the shared fixture set, so this test has its own switch,
+/// like the Magic Context end-to-end test: `BROCA_REQUIRE_CINGULATE=1` turns a missing binary
+/// into a failure, and otherwise it skips loudly. `BROCA_REQUIRE_SUBC` alone must not, because
+/// CI requires the daemon fixtures but has no Cingulate build.
 fn required_binary(variable: &str) -> Option<PathBuf> {
     let path = std::env::var_os(variable)
         .map(PathBuf::from)
         .filter(|path| path.is_file());
     if path.is_none() {
         assert!(
-            std::env::var_os("BROCA_REQUIRE_SUBC").is_none(),
-            "required real-daemon fixture missing: set {variable}"
+            std::env::var_os("BROCA_REQUIRE_CINGULATE").is_none(),
+            "required real-Cingulate fixture missing: set {variable}"
         );
         eprintln!(
             "SKIP target Cingulate admission: set {variable}; no target-daemon claim is made"
@@ -223,7 +227,14 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
     let Some(cingulate) = required_binary("CINGULATE_BIN") else {
         return;
     };
-    let Some(surface) = required_binary("S6_SURFACE_BIN") else {
+    // The stand-in cerebellum is the shared fixture `FAKE_SURFACE_BIN`; `S6_SURFACE_BIN`
+    // overrides it for a run that wants a different build.
+    let surface_variable = if std::env::var_os("S6_SURFACE_BIN").is_some() {
+        "S6_SURFACE_BIN"
+    } else {
+        "FAKE_SURFACE_BIN"
+    };
+    let Some(surface) = required_binary(surface_variable) else {
         return;
     };
     let subc = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
