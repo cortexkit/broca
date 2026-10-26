@@ -1,9 +1,12 @@
 use broca_owner_only::OpenOptions;
+use broca_protocol::BindIdentity;
 #[cfg(unix)]
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::lease::LeaseHandle;
 
 #[cfg(test)]
 type Observer = Box<dyn FnMut(&str)>;
@@ -36,8 +39,55 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// What permits publishing a restored archive member as a session's live log.
+///
+/// Restoring writes a new live file, so it needs the same single-writer authority as
+/// an append. The owned writer open passes the live lease of its own tenure, and the
+/// restore refuses before any I/O unless that lease is the session's own. Lease-free
+/// store opens (guarded standalone fixtures and today's lease-returning writer open)
+/// keep their existing behaviour: their caller holds the session lease outside this
+/// signature, so they declare that explicitly instead of passing a token.
+pub(super) enum RestoreAuthority<'a> {
+    /// The open's owned session tenure; the same lease later moves into the writer.
+    OwnedTenure {
+        lease: &'a dyn LeaseHandle,
+        session: &'a BindIdentity,
+    },
+    /// A guarded open whose caller holds the lease outside this call.
+    GuardedStandalone,
+}
+
+impl RestoreAuthority<'_> {
+    /// Refuse a tenure that belongs to another session. The key is the namespaced
+    /// session lease key, so a lease for any other identity, backend or module fails.
+    fn verify(&self) -> io::Result<()> {
+        match self {
+            Self::OwnedTenure { lease, session } => {
+                if lease.key() == &crate::lease::lease_key_for(session) {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "archive restore refused: the tenure is not the session lease for '{}'",
+                            session.session
+                        ),
+                    ))
+                }
+            }
+            Self::GuardedStandalone => Ok(()),
+        }
+    }
+}
+
 /// Called only by append admission, with the session lease held and no live WAL open.
-pub(super) fn restore(path: &Path, payload: &[u8]) -> io::Result<()> {
+/// The authority is checked before the first filesystem operation.
+pub(super) fn restore(
+    path: &Path,
+    payload: &[u8],
+    authority: RestoreAuthority<'_>,
+) -> io::Result<()> {
+    authority.verify()?;
     observed("resolved");
     let parent = path.parent().expect("canonical WAL has a parent");
     // A restored state tree may contain archives without a wal directory. Sync each
@@ -99,6 +149,73 @@ pub(super) fn restore(path: &Path, payload: &[u8]) -> io::Result<()> {
     result
 }
 
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use crate::lease::{lease_key_for, FileLeaseStore, LeaseStore};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let root = broca_test_support::scratch_root().join(format!(
+            "broca-extraction-authority-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    #[test]
+    fn restore_refuses_another_sessions_tenure_before_any_io() {
+        let root = scratch("foreign");
+        let leases = FileLeaseStore::new(root.join("leases"));
+        let session = BindIdentity::new("/p", "runner", "mine");
+        let other = BindIdentity::new("/p", "runner", "theirs");
+        let foreign = leases.acquire(&lease_key_for(&other)).unwrap();
+        let path = root.join("wal/nested/session.wal");
+        let operations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = operations.clone();
+        OBSERVE.with(|hook| *hook.borrow_mut() = Some(Box::new(move |_| seen.set(seen.get() + 1))));
+        let error = restore(
+            &path,
+            b"archive payload",
+            RestoreAuthority::OwnedTenure {
+                lease: foreign.as_ref(),
+                session: &session,
+            },
+        )
+        .expect_err("a tenure for another session must not restore this log");
+        OBSERVE.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(operations.get(), 0, "refusal precedes every restore step");
+        assert!(
+            !root.join("wal").exists(),
+            "no directory, temporary or live file may be created"
+        );
+        drop(foreign);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_publishes_under_the_sessions_own_tenure() {
+        let root = scratch("own");
+        let leases = FileLeaseStore::new(root.join("leases"));
+        let session = BindIdentity::new("/p", "runner", "mine");
+        let lease = leases.acquire(&lease_key_for(&session)).unwrap();
+        let path = root.join("wal/session.wal");
+        restore(
+            &path,
+            b"archive payload",
+            RestoreAuthority::OwnedTenure {
+                lease: lease.as_ref(),
+                session: &session,
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"archive payload");
+        drop(lease);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 #[cfg(all(test, windows))]
 mod windows_acl_tests {
     use super::*;
@@ -116,7 +233,14 @@ mod windows_acl_tests {
                 assert_private(path);
                 output.set(output.get() + 1);
             },
-            || restore(&path, b"archive payload").unwrap(),
+            || {
+                restore(
+                    &path,
+                    b"archive payload",
+                    RestoreAuthority::GuardedStandalone,
+                )
+                .unwrap()
+            },
         );
         assert_eq!(
             seen.get(),

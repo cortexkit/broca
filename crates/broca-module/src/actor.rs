@@ -141,13 +141,38 @@ pub struct SendPlan {
     pub model_check: Option<Arc<broca_fetch_plan::Plan>>,
 }
 
+/// An actor's answer to [`LineageCmd::CutLock`].
+pub struct CutLockReply {
+    /// Why the session cannot move now, or `None` when it is idle.
+    pub busy: Option<String>,
+    /// Dropping or signalling this ends the cut's critical section for the actor.
+    pub release: oneshot::Sender<()>,
+    /// The session lease of an idle owned-tenure actor whose writer closed for a
+    /// mutating cut. It is handed over only after the writer's descriptor is gone,
+    /// and the actor retires instead of resuming when released.
+    pub tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
+}
+
+/// Who holds the session lease while an actor serves its session.
+enum ActorTenure {
+    /// A lease the actor was given beside its writer (the guarded spawn used by tests
+    /// and openers without a lease domain). The actor drops it after the writer is down.
+    Lease(#[allow(dead_code)] Box<dyn LeaseHandle>),
+    /// The writer task owns the tenure and releases it only after its WAL closes, so the
+    /// actor holds nothing it could drop early.
+    InWriter,
+}
+
 /// A command to the actor. Each carries a reply channel; the actor NEVER silently drops a
 /// command with a live reply (on close it replies `Reopen` so the caller re-routes).
 pub enum LineageCmd {
     /// Pause dispatch while the cut holds its actor critical section. The reply
     /// carries a release channel whose drop also unblocks a cancelled operation.
+    /// A mutating cut may instead retire an idle owned-tenure actor; see
+    /// [`crate::registry::CutLockMode`].
     CutLock {
-        reply: oneshot::Sender<(Option<String>, oneshot::Sender<()>)>,
+        reply: oneshot::Sender<CutLockReply>,
+        mode: crate::registry::CutLockMode,
     },
     RepairRetention {
         reply: oneshot::Sender<Result<(), String>>,
@@ -1308,12 +1333,13 @@ pub struct LineageActor<W: WalStore> {
     actor_jobs: Arc<crate::approval::ActorJobs>,
     key: LineageKey,
     gen: u64,
-    /// The session lease — held for the actor's whole lifetime, released (dropped) ONLY in
-    /// the close teardown AFTER the writer is shut down. `Option` so the teardown can drop
-    /// it in a controlled order. (The lease's epoch is already stamped on the pre-spawned
-    /// session writer's records for forensic correlation, so the actor needs no separate epoch
-    /// field.)
-    lease: Option<Box<dyn LeaseHandle>>,
+    /// The session tenure: the lease the actor holds itself (guarded spawn), or a marker
+    /// that the writer task owns it. Released (dropped) ONLY in the close teardown AFTER
+    /// the writer is shut down; `None` once that teardown ran. `Option` so the teardown
+    /// can drop it in a controlled order. (The lease's epoch is already stamped on the
+    /// pre-spawned session writer's records for forensic correlation, so the actor needs no
+    /// separate epoch field.)
+    lease: Option<ActorTenure>,
     /// The SESSION-scoped WAL writer: ONE writer for the whole lineage (the durability
     /// domain is the session/WAL file, not the run). Spawned once at open, drives every
     /// episode's records AND the coordinator's queue writes through ONE seq space, shut
@@ -1559,6 +1585,74 @@ impl<W: WalStore + 'static> LineageActor<W> {
         export_index: Option<Arc<dyn broca_core::ExportIndex>>,
         charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
     ) -> ActorHandle {
+        Self::spawn_holding(
+            key,
+            gen,
+            ActorTenure::Lease(lease),
+            writer,
+            executor,
+            wal_store,
+            registry,
+            idle_ttl,
+            fanout,
+            run_index,
+            materialized_store,
+            export_index,
+            charge_basis_resolver,
+        )
+    }
+
+    /// Spawn an actor whose writer task owns the session tenure. The actor holds no
+    /// lease of its own: the lease is released only when the writer closes, and a
+    /// mutating cut can take it over through the writer's consuming close.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_owned_with_export(
+        key: LineageKey,
+        gen: u64,
+        writer: Arc<WalHandle>,
+        executor: Arc<dyn RunExecutor>,
+        wal_store: Arc<W>,
+        registry: RegistryHandle,
+        idle_ttl: Duration,
+        fanout: crate::fanout::Fanout<W>,
+        run_index: Option<Arc<dyn broca_core::RunIndex>>,
+        materialized_store: Option<Arc<dyn broca_core::SessionStore>>,
+        export_index: Option<Arc<dyn broca_core::ExportIndex>>,
+        charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
+    ) -> ActorHandle {
+        Self::spawn_holding(
+            key,
+            gen,
+            ActorTenure::InWriter,
+            writer,
+            executor,
+            wal_store,
+            registry,
+            idle_ttl,
+            fanout,
+            run_index,
+            materialized_store,
+            export_index,
+            charge_basis_resolver,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_holding(
+        key: LineageKey,
+        gen: u64,
+        tenure: ActorTenure,
+        writer: Arc<WalHandle>,
+        executor: Arc<dyn RunExecutor>,
+        wal_store: Arc<W>,
+        registry: RegistryHandle,
+        idle_ttl: Duration,
+        fanout: crate::fanout::Fanout<W>,
+        run_index: Option<Arc<dyn broca_core::RunIndex>>,
+        materialized_store: Option<Arc<dyn broca_core::SessionStore>>,
+        export_index: Option<Arc<dyn broca_core::ExportIndex>>,
+        charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
+    ) -> ActorHandle {
         let (tx, rx) = mpsc::channel(64);
         let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
         let durable_head = writer.durable_head();
@@ -1583,7 +1677,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             actor_jobs: Arc::default(),
             key: key.clone(),
             gen,
-            lease: Some(lease),
+            lease: Some(tenure),
             writer: Some(writer),
             executor,
             wal_store,
@@ -1900,7 +1994,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// Returns true when an active run ended without a durable terminal and this actor generation
     /// must exit so the next generation recovers from the WAL before serving more work.
     async fn handle_cmd(&mut self, cmd: LineageCmd) -> bool {
-        if let LineageCmd::CutLock { reply } = cmd {
+        if let LineageCmd::CutLock { reply, mode } = cmd {
             let busy = if matches!(self.state, RunState::Active { .. }) {
                 Some("run_active".into())
             } else if self.has_pending() {
@@ -1918,8 +2012,22 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     Err(_) => Some("unknown".into()),
                 }
             };
+            if busy.is_none()
+                && mode == crate::registry::CutLockMode::Mutate
+                && !self.restart_admitting
+                && matches!(self.lease, Some(ActorTenure::InWriter))
+            {
+                return self.retire_for_cut(reply).await;
+            }
             let (release, wait) = oneshot::channel();
-            if reply.send((busy, release)).is_ok() {
+            if reply
+                .send(CutLockReply {
+                    busy,
+                    release,
+                    tenure: None,
+                })
+                .is_ok()
+            {
                 let _ = wait.await;
             }
             return false;
@@ -2241,7 +2349,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                     "session writer is poisoned: {error}"
                 )));
             }
-            LineageCmd::CutLock { reply } => {
+            LineageCmd::CutLock { reply, .. } => {
                 drop(reply);
             }
             LineageCmd::IdleTick
@@ -7067,7 +7175,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 LineageCmd::WarmFinished { warm } => {
                     let _ = warm.0.reply.send(WarmOutcome::Reopen);
                 }
-                LineageCmd::CutLock { reply } => {
+                LineageCmd::CutLock { reply, .. } => {
                     drop(reply);
                 }
                 LineageCmd::IdleTick
@@ -7839,6 +7947,160 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 format!("writer shutdown failed: {error}"),
             );
             tracing::error!(target: "lifecycle", session = %self.key.session, "writer shutdown failed; WAL requires recovery: {error}");
+        }
+    }
+
+    /// Retire this idle owned-tenure generation for a mutating cut.
+    ///
+    /// The writer closes before the reply, and its still-held session lease goes to the
+    /// cut with the reply, so the lease is never free between the writer closing and the
+    /// cut publishing its markers. The registry slot turns `Closing` first and stays so
+    /// until the cut releases this actor; a router that finds it waits, and the cut gate
+    /// the caller holds keeps new openers out. After release the generation answers what
+    /// queued behind the cut with a re-route and exits, so it never resumes with a closed
+    /// writer; the next opener acquires a fresh tenure and rechecks the move fence.
+    async fn retire_for_cut(&mut self, reply: oneshot::Sender<CutLockReply>) -> bool {
+        let (release, wait) = oneshot::channel();
+        let Some(close_token) = self.registry.begin_close(&self.key, self.gen) else {
+            // The registry no longer routes to this generation, so it is not the actor
+            // the cut locked. Refuse instead of closing a writer behind the registry.
+            if reply
+                .send(CutLockReply {
+                    busy: Some("unknown".into()),
+                    release,
+                    tenure: None,
+                })
+                .is_ok()
+            {
+                let _ = wait.await;
+            }
+            return false;
+        };
+        self.teardown_subscribers().await;
+        let (closed, tenure) = self.shutdown_writer_into_tenure().await;
+        let _ = tokio::time::timeout(
+            ON_SESSION_CLOSE_TIMEOUT,
+            self.executor.on_session_close(&self.key),
+        )
+        .await;
+        // The lease is in `tenure` now (or was released with the writer), so this
+        // generation holds nothing that a later teardown could release again.
+        drop(self.lease.take());
+        // A failed final sync or a writer that could not be joined leaves the session's
+        // durable state unproven, so the cut must not move it this time.
+        let busy = (!closed || tenure.is_none()).then(|| "unknown".to_string());
+        if reply
+            .send(CutLockReply {
+                busy,
+                release,
+                tenure,
+            })
+            .is_ok()
+        {
+            let _ = wait.await;
+        }
+        while let Ok(cmd) = self.rx.try_recv() {
+            Self::reply_retired(cmd);
+        }
+        while let Ok(cmd) = self.terminal_rx.try_recv() {
+            Self::reply_retired(cmd);
+        }
+        close_token.commit();
+        broca_memory_relief::note_freed();
+        true
+    }
+
+    /// Answer a command that reached a generation retired by a cut. Nothing is written
+    /// and nothing is acknowledged as done: callers re-route through the registry, which
+    /// opens a fresh generation or refuses a moving session.
+    fn reply_retired(cmd: LineageCmd) {
+        match cmd {
+            LineageCmd::RepairRetention { reply } => {
+                let _ = reply.send(Err("session actor is closing".into()));
+            }
+            LineageCmd::Send { reply, .. } => {
+                let _ = reply.send(SendOutcome::Reopen);
+            }
+            LineageCmd::Import { reply, .. } => {
+                let _ = reply.send(ImportOutcome::Reopen);
+            }
+            LineageCmd::Cancel { reply, .. } => {
+                let _ = reply.send(CancelOutcome::Reopen);
+            }
+            LineageCmd::Retract { reply, .. } => {
+                let _ = reply.send(RetractOutcome::Reopen);
+            }
+            LineageCmd::ResumeRestart { reply } | LineageCmd::ResumeHeld { reply } => {
+                let _ = reply.send(Err("session actor is closing".into()));
+            }
+            LineageCmd::Status { reply } => {
+                let _ = reply.send(LineageStatus::Closing);
+            }
+            LineageCmd::Subscribe { reply, .. } => {
+                let _ = reply.send(SubscribeOutcome::Reopen);
+            }
+            LineageCmd::Warm { reply, .. } => {
+                let _ = reply.send(WarmOutcome::Reopen);
+            }
+            LineageCmd::WarmFinished { warm } => {
+                let _ = warm.0.reply.send(WarmOutcome::Reopen);
+            }
+            // The run-state router retries on a dropped reply, which re-routes this lookup
+            // to the WAL or a fresh generation; a retired actor has no live run to report.
+            LineageCmd::RunState { reply, .. } => drop(reply),
+            LineageCmd::CutLock { reply, .. } => drop(reply),
+            // A retired generation was idle, so no run of its own can finish here.
+            LineageCmd::RunFinished { .. }
+            | LineageCmd::IdleTick
+            | LineageCmd::CompactionChanged { .. }
+            | LineageCmd::ApplyCompaction { .. } => {}
+            #[cfg(test)]
+            LineageCmd::RetainedAdmissionIdentityState { reply } => {
+                let _ = reply.send((usize::MAX, usize::MAX));
+            }
+            #[cfg(test)]
+            LineageCmd::PanicInActor => {}
+        }
+    }
+
+    /// Like [`Self::shutdown_writer`], but keep the session lease the writer task owned.
+    /// Returns whether the writer closed cleanly, and the still-held tenure, which exists
+    /// only once the writer thread has exited and its WAL descriptor is closed.
+    async fn shutdown_writer_into_tenure(
+        &mut self,
+    ) -> (bool, Option<broca_core::wal_writer::ClosedWriterTenure>) {
+        if let Some(task) = self.withdrawal_task.take() {
+            task.stop().await;
+        }
+        self.actor_jobs.join().await;
+        let Some(arc) = self.writer.take() else {
+            return (false, None);
+        };
+        match Arc::try_unwrap(arc) {
+            Ok(handle) => {
+                let (result, tenure) = handle.shutdown_into_tenure().await;
+                if let Err(error) = &result {
+                    self.registry.report_seal_failure(
+                        &self.key,
+                        self.gen,
+                        crate::registry::SealFailureStage::WriterShutdown,
+                        format!("writer shutdown failed: {error}"),
+                    );
+                    tracing::error!(target: "lifecycle", session = %self.key.session, "writer shutdown for a move failed; WAL requires recovery: {error}");
+                }
+                (result.is_ok(), tenure)
+            }
+            Err(arc) => {
+                // Another owner still holds the writer, so it cannot be joined and its
+                // tenure stays in the writer task. See `shutdown_writer` for why this
+                // must not happen; the move is refused rather than given a live writer.
+                debug_assert!(
+                    false,
+                    "session writer had a surviving clone at a move handoff"
+                );
+                let _ = arc.sync().await;
+                (false, None)
+            }
         }
     }
 
@@ -13170,3 +13432,306 @@ mod closed_poll_tests;
 #[cfg(test)]
 #[path = "actor_lifecycle_audit_tests.rs"]
 mod lifecycle_audit_tests;
+
+/// Moving a session whose writer task owns the session tenure: a mutating cut closes an
+/// idle actor's writer and takes over its lease before any marker changes, a busy actor
+/// refuses with its writer untouched, and an inspecting cut takes nothing.
+#[cfg(test)]
+mod owned_cut_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use broca_core::lease::WalLeaseDomain;
+    use broca_core::{
+        lease_key_for, FileLeaseStore, FileWalStore, LeaseError, LeaseStore, OutputEvent, RunError,
+        RunSummary,
+    };
+    use broca_protocol::BindIdentity;
+    use broca_wal::migration::{self, Freeze};
+
+    use super::tests::{min_config, text_req};
+    use super::{LineageCmd, LineageStatus, SendOutcome};
+    use crate::executor::{RunExecutor, RunJob, RunKind};
+    use crate::opener::DefaultOpener;
+    use crate::registry::{CutLockMode, LineageRegistry, OpenError};
+
+    const CUT: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Starts a run, acknowledges its admission and never finishes it.
+    struct HoldsAfterAdmission;
+
+    #[async_trait]
+    impl RunExecutor for HoldsAfterAdmission {
+        async fn execute(
+            &self,
+            job: RunJob,
+            _out: tokio::sync::mpsc::Sender<OutputEvent>,
+        ) -> Result<RunSummary, RunError> {
+            job.writer.record(broca_wal::WalRecord::RunStarted {
+                written_at_ms: None,
+                tags: None,
+                session_class: None,
+                retention: None,
+                hooks: None,
+                title: None,
+                on_restart: None,
+                keep_warm: None,
+                marker_order_version: None,
+                manifest: None,
+                scope: None,
+                send_id: None,
+                request_identity_digest: None,
+                project_id: None,
+                principal: None,
+                ts_ms: None,
+                run_id: job.req.run_id.clone(),
+                session: job.req.session.clone(),
+                config: Box::new(min_config()),
+                input: job.req.input.into(),
+                origin: broca_wal::RunOrigin::Fresh,
+                submission_id: None,
+            });
+            job.writer
+                .sync()
+                .await
+                .map_err(|error| RunError::Wal(error.to_string()))?;
+            if let Some(ack) = job.on_admitted {
+                let _ = ack.send(Ok(job.req.run_id));
+            }
+            std::future::pending().await
+        }
+    }
+
+    struct Rig {
+        root: std::path::PathBuf,
+        wal: Arc<FileWalStore>,
+        leases: FileLeaseStore,
+        registry: LineageRegistry,
+        session: BindIdentity,
+    }
+
+    impl Rig {
+        fn new(tag: &str) -> Self {
+            let root = broca_test_support::scratch_root()
+                .join(format!("broca-owned-cut-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("project")).unwrap();
+            migration::durable_dir(&root, &root.join("wal")).unwrap();
+            let wal = Arc::new(FileWalStore::new(root.join("wal")));
+            let opener = DefaultOpener::new(
+                Arc::new(FileLeaseStore::new(root.join("leases"))),
+                wal.clone(),
+                Arc::new(HoldsAfterAdmission),
+            )
+            .with_lease_domain(WalLeaseDomain::new(root.join("leases")))
+            .with_idle_ttl(Duration::from_secs(3600));
+            let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
+            Self {
+                leases: FileLeaseStore::new(root.join("leases")),
+                session: BindIdentity::new(root.join("project"), "runner", "session"),
+                root,
+                wal,
+                registry,
+            }
+        }
+
+        fn lease_held(&self) -> bool {
+            matches!(
+                self.leases.acquire(&lease_key_for(&self.session)),
+                Err(LeaseError::Held { .. })
+            )
+        }
+
+        async fn lock(&self, mode: CutLockMode) -> crate::registry::MoveSessionGuard {
+            self.registry
+                .lock_move_sessions_with_mode(std::slice::from_ref(&self.session), false, mode)
+                .await
+                .expect("cut lock")
+        }
+
+        async fn wait_until_closed(&self) {
+            for _ in 0..200 {
+                if self.registry.slot_state(&self.session).is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the retired actor never released its slot");
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn send_cmd(reply: tokio::sync::oneshot::Sender<SendOutcome>) -> LineageCmd {
+        let request = serde_json::from_value(serde_json::json!({
+            "model": broca_protocol::ModelHandle::new("stub", "m"),
+            "input": []
+        }))
+        .unwrap();
+        LineageCmd::Send {
+            session_class: None,
+            retention: None,
+            stop_sequences_named: false,
+            conversation_key: None,
+            title: None,
+            run_id: broca_protocol::RunId("after-retire".into()),
+            request: Box::new(request),
+            kind: RunKind::FreshOrResume,
+            key: super::SendKey::RunId,
+            skip_materialization: false,
+            delivery: broca_protocol::Delivery::Queue,
+            plan: None,
+            order: None,
+            reply,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_move_freeze_closes_writer_before_marker() {
+        let rig = Rig::new("freeze");
+        let old = rig.registry.actor_for(&rig.session).await.unwrap();
+        assert!(rig.lease_held(), "the open actor's writer holds the lease");
+        let path = rig.wal.wal_path(&rig.session);
+
+        let guard = rig.lock(CutLockMode::Mutate).await;
+        // Before any marker: the idle actor reported idle, closed its writer and handed
+        // its still-held lease to the guard, and its slot is retired while the cut gate
+        // is still held.
+        assert_eq!(guard.busy[0].1, None);
+        assert!(guard.holds_tenure(&rig.session));
+        assert_eq!(rig.registry.slot_state(&rig.session), Some("closing"));
+        assert!(
+            rig.lease_held(),
+            "the lease never became free during the handoff"
+        );
+
+        // A concurrent opener cannot cross the cut gate while the guard is held.
+        let registry = rig.registry.clone();
+        let session = rig.session.clone();
+        let mut opening =
+            tokio::spawn(async move { registry.actor_for(&session).await.map(|h| h.gen) });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut opening)
+                .await
+                .is_err(),
+            "an opener crossed the cut gate before the cut finished"
+        );
+        // The old generation does not dispatch while the cut works.
+        let (reply, mut status) = tokio::sync::oneshot::channel();
+        old.send(LineageCmd::Status { reply })
+            .await
+            .unwrap_or_else(|_| panic!("retiring actor stopped taking commands early"));
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut status)
+            .await
+            .is_err());
+
+        let before = std::fs::read(&path).unwrap();
+        migration::freeze(
+            &rig.root,
+            &path,
+            &Freeze {
+                cut_id: CUT.into(),
+                end_offset: before.len() as u64,
+                lineage_id: "lineage".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        drop(guard);
+
+        // Released, the old generation never resumes: queued work is re-routed, and a
+        // later send through its sender is refused or re-routed, never acknowledged.
+        assert_eq!(status.await.unwrap(), LineageStatus::Closing);
+        let (reply, sent) = tokio::sync::oneshot::channel();
+        if old.send(send_cmd(reply)).await.is_ok() {
+            assert!(matches!(sent.await, Ok(SendOutcome::Reopen) | Err(_)));
+        }
+        let opened = opening.await.unwrap();
+        assert!(
+            matches!(&opened, Err(OpenError::SessionMoving { cut_id }) if cut_id == CUT),
+            "the waiting opener must refuse the frozen session: {opened:?}"
+        );
+        rig.wait_until_closed().await;
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+        assert!(!rig.lease_held(), "the guard released the lease");
+
+        // Abort removes the freeze under a fresh cut lock; the next opener acquires a new
+        // tenure, checks the fence again and gets a new generation.
+        let guard = rig.lock(CutLockMode::Mutate).await;
+        assert_eq!(
+            guard.handed_tenures(),
+            0,
+            "no actor is open to hand anything"
+        );
+        migration::abort_freeze(&path, CUT).unwrap();
+        drop(guard);
+        let fresh = rig.registry.actor_for(&rig.session).await.unwrap();
+        assert_ne!(fresh.gen, old.gen, "the retired generation is never reused");
+        assert_eq!(
+            rig.registry.route_status(&rig.session).await.unwrap(),
+            LineageStatus::Idle
+        );
+        assert!(rig.lease_held(), "the fresh writer owns a new tenure");
+        assert!(rig.registry.stop_and_seal().await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_move_freeze_refuses_a_busy_actor_without_closing_it() {
+        let rig = Rig::new("busy");
+        rig.registry
+            .route_send(
+                &rig.session,
+                text_req(&rig.session, "r1"),
+                RunKind::FreshOrResume,
+            )
+            .await
+            .expect("admit a run that stays active");
+        let guard = rig.lock(CutLockMode::Mutate).await;
+        assert_eq!(guard.busy[0].1.as_deref(), Some("run_active"));
+        assert_eq!(guard.handed_tenures(), 0, "a busy actor keeps its writer");
+        assert_eq!(rig.registry.slot_state(&rig.session), Some("open"));
+        assert!(
+            rig.lease_held(),
+            "the busy actor's writer still holds the lease"
+        );
+        drop(guard);
+        assert!(matches!(
+            rig.registry.route_status(&rig.session).await.unwrap(),
+            LineageStatus::Active { .. }
+        ));
+        assert!(rig.lease_held());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inspecting_cut_lock_takes_no_tenure_from_an_idle_owned_actor() {
+        let rig = Rig::new("inspect");
+        let handle = rig.registry.actor_for(&rig.session).await.unwrap();
+        let guard = rig
+            .registry
+            .lock_move_sessions(std::slice::from_ref(&rig.session), false)
+            .await
+            .unwrap();
+        assert_eq!(guard.busy[0].1, None);
+        assert_eq!(guard.handed_tenures(), 0, "inspection takes no tenure");
+        assert!(!guard.holds_tenure(&rig.session));
+        assert_eq!(rig.registry.slot_state(&rig.session), Some("open"));
+        assert!(
+            rig.lease_held(),
+            "the paused actor's writer keeps the lease"
+        );
+        drop(guard);
+        let (reply, status) = tokio::sync::oneshot::channel();
+        handle
+            .send(LineageCmd::Status { reply })
+            .await
+            .unwrap_or_else(|_| panic!("the paused actor closed"));
+        assert_eq!(status.await.unwrap(), LineageStatus::Idle);
+        assert!(rig.lease_held());
+        assert!(rig.registry.stop_and_seal().await);
+    }
+}

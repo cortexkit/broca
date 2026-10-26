@@ -587,9 +587,38 @@ impl std::fmt::Display for ShutdownReport {
 }
 
 pub struct MoveSessionGuard {
+    /// Session leases handed over by idle owned-tenure actors that closed their writers
+    /// for a mutating cut. Declared first so they release before the cut gates and the
+    /// actor release signals: the retired actor keeps its registry slot `Closing` until
+    /// it is released, so no opener in this process races for the lease meanwhile.
+    tenures: Vec<(LineageKey, broca_core::wal_writer::ClosedWriterTenure)>,
     gates: Vec<tokio::sync::OwnedMutexGuard<()>>,
     actors: Vec<tokio::sync::oneshot::Sender<()>>,
     pub busy: Vec<(LineageKey, Option<String>)>,
+}
+
+impl MoveSessionGuard {
+    /// Whether this guard holds the session lease handed over by `key`'s closed actor.
+    pub fn holds_tenure(&self, key: &LineageKey) -> bool {
+        self.tenures.iter().any(|(held, _)| held == key)
+    }
+
+    /// How many closed actors handed their session lease to this guard.
+    pub fn handed_tenures(&self) -> usize {
+        self.tenures.len()
+    }
+}
+
+/// How a move holds an open session actor while it works on that session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutLockMode {
+    /// The move only reads. Open actors pause and later resume with their writer.
+    Inspect,
+    /// The move may publish or remove move markers for the session. An idle actor that
+    /// owns its tenure through its writer closes that writer and hands the still-held
+    /// lease to the guard, then retires once released. Other actors pause as for
+    /// `Inspect`; a busy actor refuses without changing its writer.
+    Mutate,
 }
 
 struct Inner {
@@ -1039,10 +1068,23 @@ impl LineageRegistry {
 
     /// Prevent opening absent actors and pause existing actors, in contract ref
     /// order. The returned guard remains held through the durable cut completion.
+    /// This is the inspection mode: no actor closes and the guard takes no tenure.
     pub async fn lock_move_sessions(
         &self,
         sessions: &[LineageKey],
         reject_open: bool,
+    ) -> Result<MoveSessionGuard, OpenError> {
+        self.lock_move_sessions_with_mode(sessions, reject_open, CutLockMode::Inspect)
+            .await
+    }
+
+    /// Like [`Self::lock_move_sessions`], choosing how open actors are held. In
+    /// [`CutLockMode::Mutate`] the guard may receive closed actors' session leases.
+    pub async fn lock_move_sessions_with_mode(
+        &self,
+        sessions: &[LineageKey],
+        reject_open: bool,
+        mode: CutLockMode,
     ) -> Result<MoveSessionGuard, OpenError> {
         let mut sorted = sessions.to_vec();
         sorted.sort_by_key(|key| {
@@ -1064,6 +1106,7 @@ impl LineageRegistry {
             )
         });
         let mut guard = MoveSessionGuard {
+            tenures: Vec::new(),
             gates: Vec::new(),
             actors: Vec::new(),
             busy: Vec::new(),
@@ -1101,14 +1144,23 @@ impl LineageRegistry {
                 }
                 let (reply, wait) = tokio::sync::oneshot::channel();
                 handle
-                    .send(crate::actor::LineageCmd::CutLock { reply })
+                    .send(crate::actor::LineageCmd::CutLock { reply, mode })
                     .await
                     .map_err(|_| OpenError::Open("actor closed during cut lock".into()))?;
-                let (busy, release) = wait
+                let crate::actor::CutLockReply {
+                    busy,
+                    release,
+                    tenure,
+                } = wait
                     .await
                     .map_err(|_| OpenError::Open("actor closed during cut lock".into()))?;
                 guard.busy.push((key.clone(), busy));
                 guard.actors.push(release);
+                if let Some(tenure) = tenure {
+                    // Only a mutating cut may take a session lease from an actor.
+                    debug_assert_eq!(mode, CutLockMode::Mutate);
+                    guard.tenures.push((key.clone(), tenure));
+                }
             }
             self.inner.opener.retire_idle_session_transport(&key);
         }
