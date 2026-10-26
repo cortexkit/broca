@@ -1591,7 +1591,17 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
         },
         message,
         status: None,
-        retry_after_secs: None,
+        // Only `response.failed` carries a retry time Codex reads; it ignores a bare `error`
+        // event's fields (`codex-api/src/sse/responses.rs:349-352`). The value is read from the
+        // provider's own message even when `message` above is replaced.
+        retry_after_secs: if nested {
+            crate::codex_retry_after::failed_response_retry_after(
+                error,
+                std::time::SystemTime::now(),
+            )
+        } else {
+            None
+        },
         provider_code: if billing_exhausted {
             Some(broca_protocol::error::BILLING_EXHAUSTED.to_owned())
         } else {

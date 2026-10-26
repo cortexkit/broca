@@ -218,10 +218,39 @@ async fn openai_http_credit_balance_exhausted_ends_billing_exhausted_with_the_fr
     assert_eq!(outcome.live.status, Some(429));
 }
 
+/// A rate-limit 429 that states a `Retry-After` is retried after exactly that time, five times,
+/// as Codex does. It is still `transient` after the retries run out.
 #[tokio::test]
-async fn openai_rate_limit_exceeded_429_still_retries() {
+async fn openai_rate_limit_exceeded_429_with_retry_after_still_retries() {
     let outcome = run_openai(
         "rate-limit",
+        vec![
+            ScriptResponse::Http {
+                status: 429,
+                headers: vec![("content-type", "application/json"), ("retry-after", "1")],
+                body: RATE_LIMIT_BODY.as_bytes(),
+            };
+            6
+        ],
+    )
+    .await;
+    assert_eq!(outcome.attempts, 6);
+    assert_eq!(outcome.waits, vec![Duration::from_secs(1); 5]);
+    assert_eq!(outcome.retries_used, 5);
+    assert_eq!(outcome.live, outcome.durable);
+    assert_eq!(outcome.live.provider_code.as_deref(), Some("rate_limited"));
+    assert_eq!(outcome.live.class, ErrorClass::Transient);
+    assert_eq!(outcome.live.status, Some(429));
+    assert_eq!(outcome.live.credential_id.as_deref(), Some(FROZEN_CREDENTIAL));
+}
+
+/// Codex ends a 429 without a server retry time at once (its `RetryLimit` retries only on the
+/// server's time). The "try again in 120ms" in the HTTP body is not a retry time: Codex reads
+/// that phrase only from a streamed `response.failed`. The class stays `transient`.
+#[tokio::test]
+async fn openai_rate_limit_exceeded_429_without_retry_after_ends_the_step() {
+    let outcome = run_openai(
+        "rate-limit-plain",
         vec![
             ScriptResponse::Http {
                 status: 429,
@@ -232,12 +261,65 @@ async fn openai_rate_limit_exceeded_429_still_retries() {
         ],
     )
     .await;
-    assert_eq!(outcome.attempts, 6);
-    assert_eq!(outcome.waits.len(), 5);
-    assert_eq!(outcome.retries_used, 5);
+    assert_eq!(outcome.attempts, 1);
+    assert!(outcome.waits.is_empty());
+    assert_eq!(outcome.retries_used, 0);
     assert_eq!(outcome.live, outcome.durable);
-    assert_eq!(outcome.live.provider_code.as_deref(), Some("rate_limited"));
     assert_eq!(outcome.live.class, ErrorClass::Transient);
     assert_eq!(outcome.live.status, Some(429));
-    assert_eq!(outcome.live.credential_id.as_deref(), Some(FROZEN_CREDENTIAL));
+    assert_eq!(outcome.live.retry_after_secs, None);
+}
+
+const RATE_LIMIT_FAILED_STREAM: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_rate_limited\"}}\n\n",
+    "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_rate_limited\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit reached for gpt-4.1. Please try again in 2s.\"}}}\n\n",
+);
+
+const OVERLOADED_FAILED_STREAM: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_overloaded\"}}\n\n",
+    "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_overloaded\",\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"overloaded\"}}}\n\n",
+);
+
+/// A streamed `rate_limit_exceeded` names its retry time in the message; as in Codex, each
+/// retry waits exactly that long, and the run error keeps it.
+#[tokio::test]
+async fn openai_streamed_rate_limit_waits_the_time_its_message_names() {
+    let outcome = run_openai(
+        "stream-rate-limit",
+        vec![
+            ScriptResponse::Http {
+                status: 200,
+                headers: vec![("content-type", "text/event-stream")],
+                body: RATE_LIMIT_FAILED_STREAM.as_bytes(),
+            };
+            6
+        ],
+    )
+    .await;
+    assert_eq!(outcome.attempts, 6);
+    assert_eq!(outcome.waits, vec![Duration::from_secs(2); 5]);
+    assert_eq!(outcome.live.retry_after_secs, Some(2.0));
+    assert_eq!(outcome.live.class, ErrorClass::Transient);
+}
+
+/// A streamed `server_is_overloaded` without a server retry time ends the step, as Codex's
+/// `ServerOverloaded` does.
+#[tokio::test]
+async fn openai_streamed_overload_without_retry_time_ends_the_step() {
+    let outcome = run_openai(
+        "stream-overloaded",
+        vec![
+            ScriptResponse::Http {
+                status: 200,
+                headers: vec![("content-type", "text/event-stream")],
+                body: OVERLOADED_FAILED_STREAM.as_bytes(),
+            };
+            6
+        ],
+    )
+    .await;
+    assert_eq!(outcome.attempts, 1);
+    assert!(outcome.waits.is_empty());
+    assert_eq!(outcome.live.provider_code.as_deref(), Some("server_is_overloaded"));
+    assert_eq!(outcome.live.class, ErrorClass::Transient);
 }

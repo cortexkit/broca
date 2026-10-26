@@ -79,11 +79,18 @@ including interrupted, conservatively avoid seeding a receipt. There is no cross
 socket warmup or cut-response continuation. Recorded profile absence remains legacy on resume;
 the renderer ABI does not change.
 
-A failed connection/upgrade (including timeout and HTTP refusal other than 401)
-falls back to HTTPS **before any response.create was sent**, within that same model attempt.
-The fallback is not an extra attempt. Upgrade 401 instead enters the existing token
-re-read/retry/pause path: an unavailable or unchanged token pauses, while a fresh same-account
-token gets one recovery attempt. No stale-token HTTPS fallback is made on a 401.
+A failed connection/upgrade (including timeout, and an HTTP refusal other than a 401, a 429 or
+a refusal carrying `Retry-After`) falls back to HTTPS **before any
+response.create was sent**, within that same model attempt. The fallback is not an extra
+attempt. Upgrade 401 instead enters the existing token re-read/retry/pause path: an
+unavailable or unchanged token pauses, while a fresh same-account token gets one recovery
+attempt. No stale-token HTTPS fallback is made on a 401.
+
+A refused upgrade that is a 429, or that carries a `Retry-After`, is the attempt's answer, as in
+Codex (`codex-api/src/endpoint/responses_websocket.rs:597-611`). Its status, the first 512 bytes
+of its body and its `Retry-After` header are classified like an HTTPS answer, and the retry rule
+below decides what follows. It is not sent over HTTPS at once, because that would re-send before
+the server's time.
 
 An upgrade 403 is not treated as a token rejection: freshly refreshed tokens have been seen to
 get the same 403. It triggers no credential re-read; the same attempt is sent over HTTPS and
@@ -93,12 +100,52 @@ and the rest of that run uses HTTPS. When the first 512 bytes of a refused upgra
 already classify as a ChatGPT usage limit, that refusal is reported directly without the HTTPS
 round trip. Every HTTP upgrade refusal logs one WARN with its status, the next step, and only
 the `cf-ray`, `x-request-id`, `request-id`, `server`, `content-type` and `x-codex-*` headers;
-the body is never logged or stored. Socket
-failures accumulate within a run; after six failures the remainder of that run uses HTTPS. A failure after sending
-is never immediately re-sent over HTTPS: it goes through the existing attempt retry
-schedule and wall budget. The threshold is retained across steps because an upgrade
-fallback can succeed over HTTPS and otherwise hide repeated socket failure. Existing
-retry limits are not extended by a transport change.
+the body is never logged or stored. Socket failures accumulate within a run; after six failures
+the remainder of that run uses HTTPS. A failure after sending is never immediately re-sent over
+HTTPS: it goes through the retry rule below. The threshold is retained across steps because an
+upgrade fallback can succeed over HTTPS and otherwise hide repeated socket failure. These
+transport choices do not reset the retry count.
+
+## Retries
+
+This family and the API-key `OpenAiResponses` family retry exactly as Codex does (revision
+af91f6ef2c), in `crates/broca-provider/src/transport_codex_retry.rs`. Codex runs both families
+through one retry path. Every other family keeps broca's schedule (six sends, 2 s doubling
+backoff, `Retry-After` capped at 120 s, 240 s waiting budget).
+
+- **Server retry time.** Only the `Retry-After` header (whole seconds or an HTTP date) counts,
+  read from an HTTPS answer, a refused upgrade, or the `headers` of a wrapped socket error frame
+  (nested `error.headers` first, then the top-level `headers`). `retry-after-ms` is not read. A
+  streamed `response.failed` contributes the `Retry-After` in its error's `headers`, or for
+  `rate_limit_exceeded` and `slow_down` the "try again in 11.054s" phrase in its message.
+- **Terminal or retried.** A 429 is retried only when the server gave a retry time, unless its
+  code is one Codex ends at once: `flex_unavailable`, `usage_limit_reached` (broca's
+  `account_limit_exhausted`), `usage_not_included`, or a quota or credit code (`insufficient_quota`,
+  `credit_balance_exhausted`, broca's `billing_exhausted`, and the organization and project
+  spend and usage limits). A `server_is_overloaded` 503 or streamed failure is also retried only
+  on a server time. Other retryable failures wait for the server's time when there is one, and
+  otherwise for Codex's backoff: 200 ms doubling per retry, times a factor drawn from 0.9..1.1,
+  with no cap. broca's own vetoes still end the step first: a permanent, auth or
+  context-overflow class, `x-should-retry: false`, an exhausted account or balance, a second
+  deterministic decode failure, and the 895-second response deadline.
+- **Waiting.** A server time is waited out in full, never capped, and never cut short. There is
+  no total waiting budget. If the caller's step deadline comes first, the step ends at once with
+  `retry_after_exceeds_deadline`, and the error keeps the server's last retry time.
+- **Counts.** An HTTPS send first gets Codex's request-layer retries: a connect failure, header
+  timeout, failure before a status, or 5xx answer is re-sent up to 4 times, waiting for the
+  server's time or 200 ms doubling (jittered the same way). A 429 skips that layer. After that,
+  up to 5 stream retries follow. Each one starts a fresh request layer. A connect failure is
+  retried without limit, waiting 5 s and doubling to 60 s with no jitter. It ignores any server
+  time and doesn't count against the 5 retries. Only cancel, shutdown or the step deadline
+  stop it. Each send writes one content-free attempt record, roughly 285 an hour while an
+  endpoint stays unreachable.
+- **Fallback.** When the 5 stream retries are spent on the socket, the run switches to HTTPS
+  for the rest of the run. It waits out the server's time if one was given, and starts a fresh
+  count of 5 retries. A step already on HTTPS is not switched again, so the next exhausted
+  count ends the step. Two mid-response cuts in a row do not switch transport.
+- **Durability.** Every retry sends the same rendered bytes. A wait observes cancel (the run
+  ends Cancelled), a closed receiver, and the shutdown seal (the run ends Interrupted), and it
+  holds no lock or attempt slot. A restart during a wait resumes the step the same way a restart between attempts does, with a fresh count.
 
 A close/error before completion is `chunk_error`. Code 1012 means server restart.
 At 895 seconds or later that cut follows the existing non-reissuable `response_deadline`
@@ -169,6 +216,12 @@ Targeted regression tests cover:
 
 - Connection reuse → `transport::websocket_tests::websocket_reuses_one_handshake_across_steps`.
 - Pre-send HTTPS fallback → `transport::websocket_tests::websocket_refused_upgrade_falls_back_without_double_sending`.
+- Upgrade 429 waits exactly its `Retry-After`, then falls back to HTTPS with a fresh count → `transport::websocket_tests::codex_upgrade_429_waits_out_retry_after_then_falls_back_to_https_with_a_fresh_count`.
+- Upgrade 429 without a retry time ends the step → `transport::websocket_tests::codex_upgrade_429_without_retry_after_ends_the_step`.
+- Server time past the step deadline → `transport::websocket_tests::codex_upgrade_retry_after_past_the_step_deadline_ends_the_step`.
+- Cancel during a long wait ends the run Cancelled → `transport::websocket_tests::codex_cancel_during_a_long_retry_after_wait_ends_the_run_cancelled`.
+- One fallback with a fresh count → `transport::websocket_tests::websocket_exhaustion_falls_back_to_https_once_with_a_fresh_codex_count`.
+- Codex retry decision and backoffs → `transport::codex_retry::tests`.
 - Durable transport evidence → `transport::websocket_tests::websocket_attempt_durably_records_transport_and_preserves_body_digest`.
 - Completion before close → `transport::websocket_tests::websocket_socket_stays_open_until_response_completed`.
 - Token refresh → `transport::websocket_tests::websocket_token_refresh_between_steps_reauthenticates_before_sending`.
