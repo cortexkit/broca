@@ -254,7 +254,8 @@ class WorkflowGraph(unittest.TestCase):
         build = next(s for s in fixtures['steps'] if s.get('name') == 'Build fixtures once')
         self.assertIn('"subconscious/target/debug/ck$suffix"', build['run'])
         verify = next(s for s in fixtures['steps'] if s.get('name') == 'Verify and package fixtures')
-        self.assertIn('for name in ck-subc fake-aft-stub ck ck-claustrum ck-auth fake-surface', verify['run'])
+        self.assertIn('names="ck-subc fake-aft-stub ck ck-claustrum ck-auth"', verify['run'])
+        self.assertIn('if [[ "$RUNNER_OS" != Windows ]]; then names="$names fake-surface"; fi', verify['run'])
         nightly = next(s for s in fixtures['steps'] if s.get('name') == 'Resolve nightly sibling revisions')
         self.assertEqual(nightly['if'], "github.event_name == 'schedule'")
         self.assertEqual(nightly['run'].count('git ls-remote'), 2)
@@ -278,7 +279,11 @@ class WorkflowGraph(unittest.TestCase):
         fixtures = self.workflow('fixtures.yml')['jobs']['fixtures']
         build = next(s for s in fixtures['steps'] if s.get('name') == 'Build fixtures once')['run']
         self.assertIn('cargo build --locked --manifest-path broca/crates/broca-module-serve/tests/support/fake-surface/Cargo.toml --target-dir fake-surface-target', build)
-        self.assertIn('cp "fake-surface-target/debug/fake-surface$suffix" fixtures/bin/', build)
+        self.assertIn('cp fake-surface-target/debug/fake-surface fixtures/bin/', build)
+        # The stand-in uses Unix descriptors and its tests run only on Linux and macOS, so the
+        # Windows fixture job must never try to compile it.
+        guard = build.index('if [[ "$RUNNER_OS" != Windows ]]; then')
+        self.assertLess(guard, build.index('fake-surface/Cargo.toml'))
         cache = next(s for s in fixtures['steps'] if s.get('id') == 'binaries')['with']['key']
         self.assertIn('fixtures-v3-', cache)
         self.assertIn("hashFiles('broca/crates/broca-module-serve/tests/support/fake-surface/**')", cache)
