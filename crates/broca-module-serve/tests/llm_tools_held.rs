@@ -46,6 +46,9 @@ fn stamp() -> SendScope {
             run_id: Some("run".into()),
         },
         owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
     })
 }
 

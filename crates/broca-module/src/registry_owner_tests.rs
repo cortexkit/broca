@@ -1831,6 +1831,9 @@ async fn bind_adoption_refuses_when_ownership_is_unknown() {
             ..scope("core")
         },
         owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
     };
     // 0: every read proven; 8: the suffix is unproven, so the whole log is decoded;
     // 6: the suffix read fails; 10: every range is unproven and the whole-log read fails.

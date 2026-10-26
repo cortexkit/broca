@@ -558,6 +558,9 @@ mod tests {
         SendScope::Stamped(BindScope {
             scope,
             owner_authorized: true,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
         })
     }
     fn history(episodes: &[(Option<BindPrincipal>, Option<SessionScope>)]) -> SessionOwnershipV1 {
@@ -918,6 +921,9 @@ mod agent_run_tests {
         SendScope::Stamped(BindScope {
             scope,
             owner_authorized: true,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
         })
     }
     fn frozen() -> SessionOwnershipV1 {
@@ -1134,6 +1140,9 @@ mod owner_access_tests {
             let send = SendScope::Stamped(broca_protocol::BindScope {
                 scope,
                 owner_authorized: true,
+                kind: broca_protocol::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
             });
             assert_eq!(decide_owner_access(&ownership, Some(&owner), &send), Ok(()));
         }

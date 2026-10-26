@@ -521,7 +521,7 @@ struct BindObservation {
 /// and its opener. The scoped bind establishes that the daemon allowed
 /// this opener to use the scope, either as its owner or as another module allowed to open
 /// routes under it. `owner_authorized` describes the scope owner's authority, not the opener's;
-/// broca grants no permission based on that flag or on agent delegation attributes.
+/// that flag alone grants no permission, nor do agent delegation attributes.
 fn to_bind_scope(
     stamp: &subc_protocol::scope::ScopeStamp,
     principal: Option<&subc_protocol::Principal>,
@@ -547,6 +547,23 @@ fn to_bind_scope(
             agent_id,
             run_id,
         },
+        kind: match stamp.kind {
+            subc_protocol::scope::ScopeKind::Head => broca_protocol::ScopeKind::Head,
+            subc_protocol::scope::ScopeKind::Worker => broca_protocol::ScopeKind::Worker,
+            subc_protocol::scope::ScopeKind::Ephemeral => broca_protocol::ScopeKind::Ephemeral,
+        },
+        parent: stamp.parent.as_ref().map(|parent| {
+            Box::new(broca_protocol::ScopeParent {
+                owner: to_bind_principal(&parent.owner),
+                scope_ref: parent.scope_ref.clone(),
+                scope_epoch: parent.scope_epoch,
+            })
+        }),
+        parent_state: stamp.parent_state.map(|state| match state {
+            subc_protocol::scope::ParentState::Linked => broca_protocol::ParentState::Linked,
+            subc_protocol::scope::ParentState::Pending => broca_protocol::ParentState::Pending,
+            subc_protocol::scope::ParentState::Ended => broca_protocol::ParentState::Ended,
+        }),
         owner_authorized: stamp.owner_authorized,
     }
 }
@@ -9002,6 +9019,46 @@ mod open_failed_wire_classes {
 #[cfg(test)]
 mod agent_run_writer_tests {
     use super::*;
+
+    #[test]
+    fn basal_program_bind_preserves_attested_parent_identity_and_state() {
+        use broca_protocol::{ParentState, ScopeKind};
+        for (wire_state, state) in [
+            ("linked", ParentState::Linked),
+            ("pending", ParentState::Pending),
+            ("ended", ParentState::Ended),
+        ] {
+            let stamp: subc_protocol::scope::ScopeStamp =
+                serde_json::from_value(serde_json::json!({
+                    "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
+                    "ref":"program-scope", "scope_epoch":7, "kind":"ephemeral",
+                    "owner_authorized": true,
+                    "attributes": {"agent_id":"program-agent", "run_id":"program-run"},
+                    "parent": {
+                        "owner":{"kind":"reserved", "module_id":"different-parent-owner"},
+                        "ref":"head-scope", "scope_epoch":3
+                    },
+                    "parent_state":wire_state
+                }))
+                .unwrap();
+            let basal = subc_protocol::Principal::Reserved {
+                module_id: "basal".into(),
+            };
+            let bind = to_bind_scope(&stamp, Some(&basal));
+            assert_eq!(bind.kind, ScopeKind::Ephemeral);
+            assert_eq!(bind.parent_state, Some(state));
+            assert!(bind.owner_authorized);
+            assert_eq!(bind.scope.agent_id.as_deref(), Some("program-agent"));
+            assert_eq!(bind.scope.run_id.as_deref(), Some("program-run"));
+            let parent = bind.parent.unwrap();
+            assert_eq!(
+                parent.owner.as_owner_string(),
+                "reserved:different-parent-owner"
+            );
+            assert_eq!(parent.scope_ref, "head-scope");
+            assert_eq!(parent.scope_epoch, 3);
+        }
+    }
 
     #[test]
     fn run_scope_deadline_does_not_change_frozen_scope_bytes() {
