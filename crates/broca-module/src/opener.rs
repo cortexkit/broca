@@ -6,12 +6,15 @@
 //! executor) so the admission concurrency is deterministically testable; this is the real
 //! one.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::lease::{OwnedWalTenure, WalLeaseDomain};
-use broca_core::{lease_key_for, LeaseError, LeaseHandle, LeaseStore, WalHandle, WalStore};
+use broca_core::{
+    lease_key_for, FileLeaseStore, LeaseError, LeaseHandle, LeaseStore, WalHandle, WalStore,
+};
 
 use crate::actor::{LineageActor, IDLE_TTL};
 use crate::executor::RunExecutor;
@@ -36,7 +39,42 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     /// a bare lease from `lease_store`, and the session writer task keeps that tenure
     /// until its WAL closes. Unset keeps the guarded open, where the actor holds the lease.
     lease_domain: Option<WalLeaseDomain>,
+    /// The directory `lease_store` acquires in, when the opener was built with
+    /// [`DefaultOpener::with_file_leases`]. A lease domain is accepted only for this same
+    /// directory; an opener built from an arbitrary `LeaseStore` cannot prove its root
+    /// and therefore accepts none.
+    lease_root: Option<PathBuf>,
 }
+
+/// [`DefaultOpener::with_lease_domain`] refused a domain that does not acquire in the
+/// lease store's own directory: owned and guarded acquisitions of one session would then
+/// take two different locks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseDomainRootMismatch {
+    /// The lease store's directory, or `None` when the opener cannot name it.
+    pub lease_store_root: Option<PathBuf>,
+    pub domain_root: PathBuf,
+}
+
+impl std::fmt::Display for LeaseDomainRootMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.lease_store_root {
+            Some(root) => write!(
+                f,
+                "lease domain root {} is not the lease store root {}",
+                self.domain_root.display(),
+                root.display()
+            ),
+            None => write!(
+                f,
+                "lease domain root {} cannot be matched: the opener's lease store root is unknown",
+                self.domain_root.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LeaseDomainRootMismatch {}
 
 /// The session authority an open holds between acquisition and the writer spawn.
 enum OpenAuthority {
@@ -44,6 +82,42 @@ enum OpenAuthority {
     Lease(Box<dyn LeaseHandle>),
     /// An owned tenure the writer open consumes and the writer task keeps.
     Tenure(OwnedWalTenure),
+}
+
+/// Refuse a tenure acquired under any lease directory but the opener's own, before the
+/// open performs any I/O with it.
+fn require_tenure_root(
+    tenure: &OwnedWalTenure,
+    lease_root: Option<&Path>,
+) -> Result<(), OpenError> {
+    if lease_root == Some(tenure.lease_root()) {
+        Ok(())
+    } else {
+        Err(OpenError::Open(format!(
+            "owned open refused: tenure acquired under {} but the opener's lease root is {}",
+            tenure.lease_root().display(),
+            lease_root.map_or_else(|| "unknown".into(), |root| root.display().to_string())
+        )))
+    }
+}
+
+impl<W: WalStore> DefaultOpener<FileLeaseStore, W> {
+    /// Build an opener whose file lease store acquires in `lease_root`. Unlike
+    /// [`DefaultOpener::new`], the opener knows that directory, so it can accept a lease
+    /// domain for the same directory through [`DefaultOpener::with_lease_domain`].
+    pub fn with_file_leases(
+        lease_root: PathBuf,
+        wal_store: Arc<W>,
+        executor: Arc<dyn RunExecutor>,
+    ) -> Self {
+        let mut opener = Self::new(
+            Arc::new(FileLeaseStore::new(lease_root.clone())),
+            wal_store,
+            executor,
+        );
+        opener.lease_root = Some(lease_root);
+        opener
+    }
 }
 
 impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
@@ -59,15 +133,27 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             export_index: None,
             charge_basis_resolver: None,
             lease_domain: None,
+            lease_root: None,
         }
     }
 
     /// Open actors under owned writer tenures minted by `domain`. The domain must name
     /// the same lease directory as the lease store, so owned and guarded acquisitions
-    /// of one session contend on one lock.
-    pub fn with_lease_domain(mut self, domain: WalLeaseDomain) -> Self {
+    /// of one session contend on one lock. A domain for any other directory, or any
+    /// domain when the opener cannot name its lease store's directory, is refused here,
+    /// before anything is acquired or opened.
+    pub fn with_lease_domain(
+        mut self,
+        domain: WalLeaseDomain,
+    ) -> Result<Self, LeaseDomainRootMismatch> {
+        if self.lease_root.as_deref() != Some(domain.lease_root()) {
+            return Err(LeaseDomainRootMismatch {
+                lease_store_root: self.lease_root.clone(),
+                domain_root: domain.lease_root().to_path_buf(),
+            });
+        }
         self.lease_domain = Some(domain);
-        self
+        Ok(self)
     }
 
     /// Override the idle-close TTL (tests use a short one to exercise the close races).
@@ -295,7 +381,13 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         };
         drop(projection_fence);
 
-        if matches!(authority, OpenAuthority::Tenure(_)) {
+        if let OpenAuthority::Tenure(tenure) = &authority {
+            // The domain was matched to the lease store's directory when configured; check
+            // the minted tenure as well, so no open proceeds under a different lock.
+            if let Err(error) = require_tenure_root(tenure, self.lease_root.as_deref()) {
+                drop(authority);
+                return Err(error);
+            }
             // The one move-fence validation of this tenure, before any mutation the open
             // performs: expiry deletion, archive restore, torn-tail recovery or lineage
             // creation. The check before acquisition proves nothing about the tenure, since
@@ -827,12 +919,13 @@ mod tests {
         let torn = torn_session_log(&store.inner, &key);
         let domain = WalLeaseDomain::new(root.join("leases"));
         let opener = Arc::new(
-            DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(root.join("leases"))),
+            DefaultOpener::with_file_leases(
+                root.join("leases"),
                 store.clone(),
                 Arc::new(NeverExecutor),
             )
-            .with_lease_domain(domain.clone()),
+            .with_lease_domain(domain.clone())
+            .expect("the domain names the lease store's directory"),
         );
         let registry = LineageRegistry::new(opener.clone());
 
@@ -883,12 +976,13 @@ mod tests {
         let domain = WalLeaseDomain::new(root.join("leases"));
         let leases = FileLeaseStore::new(root.join("leases"));
         let opener = Arc::new(
-            DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(root.join("leases"))),
+            DefaultOpener::with_file_leases(
+                root.join("leases"),
                 wal.clone(),
                 Arc::new(NeverExecutor),
             )
             .with_lease_domain(domain.clone())
+            .expect("the domain names the lease store's directory")
             .with_idle_ttl(Duration::from_millis(20)),
         );
         let registry = LineageRegistry::new(opener.clone());
@@ -931,6 +1025,69 @@ mod tests {
         broca_wal::migration::abort_freeze(&path, CUT).unwrap();
         drop(registry.actor_for(&key).await.expect("reopen after abort"));
         wait_for_actor_close(&registry, &key).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lease_domain_for_another_directory_is_refused_before_any_io() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("broca-opener-domain-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wal = Arc::new(broca_core::FileWalStore::new(root.join("wal")));
+
+        let refused = DefaultOpener::with_file_leases(
+            root.join("leases"),
+            wal.clone(),
+            Arc::new(NeverExecutor),
+        )
+        .with_lease_domain(WalLeaseDomain::new(root.join("other-leases")))
+        .err()
+        .expect("a domain for another directory must be refused");
+        assert_eq!(
+            refused,
+            LeaseDomainRootMismatch {
+                lease_store_root: Some(root.join("leases")),
+                domain_root: root.join("other-leases"),
+            }
+        );
+
+        // An opener built from an arbitrary lease store cannot name its directory, so it
+        // accepts no domain at all, not even one for the directory it happens to use.
+        let unknown = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(root.join("leases"))),
+            wal.clone(),
+            Arc::new(NeverExecutor),
+        )
+        .with_lease_domain(WalLeaseDomain::new(root.join("leases")))
+        .err()
+        .expect("an opener with an unknown lease root accepts no domain");
+        assert_eq!(unknown.lease_store_root, None);
+
+        assert!(
+            DefaultOpener::with_file_leases(root.join("leases"), wal, Arc::new(NeverExecutor))
+                .with_lease_domain(WalLeaseDomain::new(root.join("leases")))
+                .is_ok(),
+            "the lease store's own directory is accepted"
+        );
+        assert!(!root.exists(), "configuring the opener touched no file");
+    }
+
+    #[test]
+    fn owned_open_refuses_a_tenure_acquired_under_another_lease_root() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("broca-opener-tenure-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let key = BindIdentity::new(root.join("project"), "runner", "session");
+        let tenure = WalLeaseDomain::new(root.join("other-leases"))
+            .acquire(&key)
+            .expect("acquire under the other directory");
+        let leases = root.join("leases");
+        let error = require_tenure_root(&tenure, Some(&leases))
+            .expect_err("a tenure from another lease directory must not open");
+        assert!(error.to_string().contains("owned open refused"), "{error}");
+        assert!(require_tenure_root(&tenure, None).is_err());
+        assert!(require_tenure_root(&tenure, Some(&root.join("other-leases"))).is_ok());
+        drop(tenure);
         let _ = std::fs::remove_dir_all(root);
     }
 }

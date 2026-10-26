@@ -147,10 +147,19 @@ pub struct CutLockReply {
     pub busy: Option<String>,
     /// Dropping or signalling this ends the cut's critical section for the actor.
     pub release: oneshot::Sender<()>,
-    /// The session lease of an idle owned-tenure actor whose writer closed for a
-    /// mutating cut. It is handed over only after the writer's descriptor is gone,
-    /// and the actor retires instead of resuming when released.
+    /// Set when an idle owned-tenure actor retired for a mutating cut: it closed its
+    /// writer and will not resume when released.
+    pub retired: Option<RetiredForCut>,
+}
+
+/// What an actor retired by a mutating cut hands to the cut.
+pub struct RetiredForCut {
+    /// The session lease, handed over only after the writer's descriptor is gone.
+    /// `None` when the writer could not be closed and joined cleanly.
     pub tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
+    /// The close of the actor's registry slot, already `Closing`. The cut commits it
+    /// when it releases its gates, so the slot is absent before anyone else gets in.
+    pub close: crate::registry::CloseToken,
 }
 
 /// Who holds the session lease while an actor serves its session.
@@ -158,9 +167,20 @@ enum ActorTenure {
     /// A lease the actor was given beside its writer (the guarded spawn used by tests
     /// and openers without a lease domain). The actor drops it after the writer is down.
     Lease(#[allow(dead_code)] Box<dyn LeaseHandle>),
-    /// The writer task owns the tenure and releases it only after its WAL closes, so the
-    /// actor holds nothing it could drop early.
+    /// The writer task owns the tenure until its WAL closes; the close then hands the
+    /// still-held lease back to the actor's teardown (see [`WriterClosed`]), so the
+    /// actor never holds a lease it could drop while the writer is live.
     InWriter,
+}
+
+/// The outcome of [`LineageActor::shutdown_writer`].
+#[must_use = "a writer-owned tenure must be kept until the close teardown is done"]
+struct WriterClosed {
+    /// The writer was joined and its final sync succeeded.
+    clean: bool,
+    /// The session lease the writer task owned, held now only by this value. `None` when
+    /// the actor holds its own lease or the writer could not be joined.
+    tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
 }
 
 /// A command to the actor. Each carries a reply channel; the actor NEVER silently drops a
@@ -2024,7 +2044,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .send(CutLockReply {
                     busy,
                     release,
-                    tenure: None,
+                    retired: None,
                 })
                 .is_ok()
             {
@@ -7213,22 +7233,25 @@ impl<W: WalStore + 'static> LineageActor<W> {
         //   and lease-vs-writer windows (the Oracle's findings 8/9/15 at the session
         //   level, strictly stronger than the per-run writer shutdown).
         self.teardown_subscribers().await;
-        self.shutdown_writer().await; // drain + final fsync + join the SESSION writer
-                                      // Let the executor release any per-session resources keyed off a SHARED handle (the
-                                      // real executor sends a route GOODBYE so a shared subc consumer connection frees this
-                                      // session's tool-route channel — else it leaks channels across sessions). Best-effort
-                                      // and independent of the lease; done before the lease drops so the session is fully
-                                      // wound down by the time the slot shows Closed. BOUNDED by a timeout: this awaits
-                                      // external I/O (a wire send), and a stalled send must NOT hold the registry slot +
-                                      // lease open indefinitely (which would block every re-open of the session). On timeout
-                                      // we proceed with the close — the route channel lingers until the connection drops,
-                                      // a bounded warm-resource cost, never a correctness issue.
+        // drain + final fsync + join the SESSION writer; a writer-owned lease comes back here
+        let writer_tenure = self.shutdown_writer().await.tenure;
+        // Let the executor release any per-session resources keyed off a SHARED handle (the
+        // real executor sends a route GOODBYE so a shared subc consumer connection frees this
+        // session's tool-route channel — else it leaks channels across sessions). Best-effort
+        // and independent of the lease; done before the lease drops so the session is fully
+        // wound down by the time the slot shows Closed. BOUNDED by a timeout: this awaits
+        // external I/O (a wire send), and a stalled send must NOT hold the registry slot +
+        // lease open indefinitely (which would block every re-open of the session). On timeout
+        // we proceed with the close — the route channel lingers until the connection drops,
+        // a bounded warm-resource cost, never a correctness issue.
         let _ = tokio::time::timeout(
             ON_SESSION_CLOSE_TIMEOUT,
             self.executor.on_session_close(&self.key),
         )
         .await;
-        drop(self.lease.take()); // release the lease ONLY after the writer is fully down
+        // release the lease ONLY after the writer is fully down and the executor was told
+        drop(writer_tenure);
+        drop(self.lease.take());
         close_token.commit(); // registry slot → Closed; wake the re-open waiters
                               // The writer, fan-out and run state of this session are about to drop with the actor.
         broca_memory_relief::note_freed();
@@ -7249,12 +7272,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
         }
         self.stop_active_run().await;
         self.teardown_subscribers().await;
-        self.shutdown_writer().await;
+        let writer_tenure = self.shutdown_writer().await.tenure;
         let _ = tokio::time::timeout(
             ON_SESSION_CLOSE_TIMEOUT,
             self.executor.on_session_close(&self.key),
         )
         .await;
+        drop(writer_tenure);
         drop(self.lease.take());
     }
 
@@ -7265,12 +7289,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
         // teardown. Releasing the lease first would let a replacement append beside this child.
         self.stop_active_run().await;
         self.teardown_subscribers().await;
-        self.shutdown_writer().await;
+        let writer_tenure = self.shutdown_writer().await.tenure;
         let _ = tokio::time::timeout(
             ON_SESSION_CLOSE_TIMEOUT,
             self.executor.on_session_close(&self.key),
         )
         .await;
+        drop(writer_tenure);
         drop(self.lease.take());
         if let Some(close_token) = close_token {
             close_token.commit();
@@ -7354,8 +7379,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             );
         }
         self.teardown_subscribers().await;
-        self.shutdown_writer().await;
+        let writer_tenure = self.shutdown_writer().await.tenure;
         self.set_idle();
+        drop(writer_tenure);
         drop(self.lease.take());
     }
 
@@ -7897,19 +7923,31 @@ impl<W: WalStore + 'static> LineageActor<W> {
     /// has confirmed no run is Active and the
     /// finished run task dropped its `Arc` clone before posting `RunFinished`, so the actor
     /// holds the SOLE `Arc` — `Arc::try_unwrap` yields the owned `WalHandle` to consume for
-    /// a real `shutdown().await` (which joins the writer thread; a bare `sync()` would leave
-    /// the thread alive). If a stray clone somehow remained (it shouldn't), fall back to a
+    /// a real shutdown (which joins the writer thread; a bare `sync()` would leave the
+    /// thread alive). If a stray clone somehow remained (it shouldn't), fall back to a
     /// durable `sync()` barrier rather than block forever on the join.
-    async fn shutdown_writer(&mut self) {
+    ///
+    /// When the writer task owns the session tenure, the still-held lease comes back in
+    /// [`WriterClosed::tenure`] once the writer has exited. The caller keeps it until the
+    /// rest of its teardown is done and drops it where it would drop an actor-held lease,
+    /// so both tenure kinds release at the same point of the close.
+    async fn shutdown_writer(&mut self) -> WriterClosed {
         if let Some(task) = self.withdrawal_task.take() {
             task.stop().await;
         }
         self.actor_jobs.join().await;
         let Some(arc) = self.writer.take() else {
-            return;
+            return WriterClosed {
+                clean: false,
+                tenure: None,
+            };
         };
-        let result = match Arc::try_unwrap(arc) {
-            Ok(handle) => handle.shutdown().await, // drain + final fsync + join
+        let (result, joined, tenure) = match Arc::try_unwrap(arc) {
+            Ok(handle) => {
+                // drain + final fsync + join
+                let (result, tenure) = handle.shutdown_into_tenure().await;
+                (result, true, tenure)
+            }
             Err(arc) => {
                 // SOLE-OWNER INVARIANT VIOLATED: a clone of the session writer outlived the
                 // run at close time. This must NOT happen — by the teardown ordering the
@@ -7929,17 +7967,17 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 // surviving handle so every appended record is at least fsynced before the
                 // lease drops (the worst residual is then an unjoined-but-idle writer thread,
                 // not LOST durability). The thread itself drains + exits when its last Arc
-                // drops.
+                // drops; a writer-owned tenure stays with that thread until then.
                 debug_assert!(
                     false,
                     "session writer had a surviving clone at close — sole-owner invariant \
                      violated (a subscriber/task is holding the writer Arc); the writer task \
                      won't be joined before the lease drops"
                 );
-                arc.sync().await.map(|_| ())
+                (arc.sync().await.map(|_| ()), false, None)
             }
         };
-        if let Err(error) = result {
+        if let Err(error) = &result {
             self.registry.report_seal_failure(
                 &self.key,
                 self.gen,
@@ -7948,17 +7986,23 @@ impl<W: WalStore + 'static> LineageActor<W> {
             );
             tracing::error!(target: "lifecycle", session = %self.key.session, "writer shutdown failed; WAL requires recovery: {error}");
         }
+        WriterClosed {
+            clean: joined && result.is_ok(),
+            tenure,
+        }
     }
 
     /// Retire this idle owned-tenure generation for a mutating cut.
     ///
     /// The writer closes before the reply, and its still-held session lease goes to the
     /// cut with the reply, so the lease is never free between the writer closing and the
-    /// cut publishing its markers. The registry slot turns `Closing` first and stays so
-    /// until the cut releases this actor; a router that finds it waits, and the cut gate
-    /// the caller holds keeps new openers out. After release the generation answers what
-    /// queued behind the cut with a re-route and exits, so it never resumes with a closed
-    /// writer; the next opener acquires a fresh tenure and rechecks the move fence.
+    /// cut publishing its markers. The registry slot turns `Closing` first and its close
+    /// token goes to the cut too: the cut keeps the slot `Closing` while it works, then
+    /// releases the lease and commits the slot absent before it releases its gates, so
+    /// the next cut lock or opener never meets this generation half-closed. After release
+    /// the generation answers what queued behind the cut with a re-route and exits, so it
+    /// never resumes with a closed writer; the next opener acquires a fresh tenure and
+    /// rechecks the move fence.
     async fn retire_for_cut(&mut self, reply: oneshot::Sender<CutLockReply>) -> bool {
         let (release, wait) = oneshot::channel();
         let Some(close_token) = self.registry.begin_close(&self.key, self.gen) else {
@@ -7968,7 +8012,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 .send(CutLockReply {
                     busy: Some("unknown".into()),
                     release,
-                    tenure: None,
+                    retired: None,
                 })
                 .is_ok()
             {
@@ -7977,23 +8021,28 @@ impl<W: WalStore + 'static> LineageActor<W> {
             return false;
         };
         self.teardown_subscribers().await;
-        let (closed, tenure) = self.shutdown_writer_into_tenure().await;
+        let closed = self.shutdown_writer().await;
         let _ = tokio::time::timeout(
             ON_SESSION_CLOSE_TIMEOUT,
             self.executor.on_session_close(&self.key),
         )
         .await;
-        // The lease is in `tenure` now (or was released with the writer), so this
+        // The lease is in `closed.tenure` now (or still with an unjoined writer), so this
         // generation holds nothing that a later teardown could release again.
         drop(self.lease.take());
         // A failed final sync or a writer that could not be joined leaves the session's
         // durable state unproven, so the cut must not move it this time.
-        let busy = (!closed || tenure.is_none()).then(|| "unknown".to_string());
+        let busy = (!closed.clean || closed.tenure.is_none()).then(|| "unknown".to_string());
+        // If the cut has gone away, dropping the unsent reply releases the lease and
+        // commits the slot closed (an unresolved close token commits on drop).
         if reply
             .send(CutLockReply {
                 busy,
                 release,
-                tenure,
+                retired: Some(RetiredForCut {
+                    tenure: closed.tenure,
+                    close: close_token,
+                }),
             })
             .is_ok()
         {
@@ -8005,7 +8054,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
         while let Ok(cmd) = self.terminal_rx.try_recv() {
             Self::reply_retired(cmd);
         }
-        close_token.commit();
         broca_memory_relief::note_freed();
         true
     }
@@ -8060,47 +8108,6 @@ impl<W: WalStore + 'static> LineageActor<W> {
             }
             #[cfg(test)]
             LineageCmd::PanicInActor => {}
-        }
-    }
-
-    /// Like [`Self::shutdown_writer`], but keep the session lease the writer task owned.
-    /// Returns whether the writer closed cleanly, and the still-held tenure, which exists
-    /// only once the writer thread has exited and its WAL descriptor is closed.
-    async fn shutdown_writer_into_tenure(
-        &mut self,
-    ) -> (bool, Option<broca_core::wal_writer::ClosedWriterTenure>) {
-        if let Some(task) = self.withdrawal_task.take() {
-            task.stop().await;
-        }
-        self.actor_jobs.join().await;
-        let Some(arc) = self.writer.take() else {
-            return (false, None);
-        };
-        match Arc::try_unwrap(arc) {
-            Ok(handle) => {
-                let (result, tenure) = handle.shutdown_into_tenure().await;
-                if let Err(error) = &result {
-                    self.registry.report_seal_failure(
-                        &self.key,
-                        self.gen,
-                        crate::registry::SealFailureStage::WriterShutdown,
-                        format!("writer shutdown failed: {error}"),
-                    );
-                    tracing::error!(target: "lifecycle", session = %self.key.session, "writer shutdown for a move failed; WAL requires recovery: {error}");
-                }
-                (result.is_ok(), tenure)
-            }
-            Err(arc) => {
-                // Another owner still holds the writer, so it cannot be joined and its
-                // tenure stays in the writer task. See `shutdown_writer` for why this
-                // must not happen; the move is refused rather than given a live writer.
-                debug_assert!(
-                    false,
-                    "session writer had a surviving clone at a move handoff"
-                );
-                let _ = arc.sync().await;
-                (false, None)
-            }
         }
     }
 
@@ -13380,8 +13387,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             let _ = task.await;
         }
         self.fanout.expire(deadline).await;
-        // Child tasks are stopped before the shared writer closes and releases its lease.
-        self.shutdown_writer().await;
+        // Child tasks are stopped before the shared writer closes. A writer-owned lease
+        // comes back here and is held, like an actor-held lease, until the close is done.
+        let writer_tenure = self.shutdown_writer().await.tenure;
         // The lease still excludes writers. Export owed question identities before deleting
         // the expired content; the retention worker can then finish without this actor.
         if let Some(service) = self.registry.retention_service() {
@@ -13406,6 +13414,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             self.executor.on_session_close(&self.key),
         )
         .await;
+        drop(writer_tenure);
         drop(self.lease.take());
         close.commit();
         true
@@ -13513,19 +13522,47 @@ mod owned_cut_tests {
 
     impl Rig {
         fn new(tag: &str) -> Self {
+            Self::build(
+                tag,
+                true,
+                Arc::new(HoldsAfterAdmission),
+                Duration::from_secs(3600),
+            )
+        }
+
+        /// The production configuration today: no lease domain, so the actor holds a
+        /// bare lease beside its writer.
+        fn legacy(tag: &str) -> Self {
+            Self::build(
+                tag,
+                false,
+                Arc::new(HoldsAfterAdmission),
+                Duration::from_secs(3600),
+            )
+        }
+
+        fn build(
+            tag: &str,
+            owned: bool,
+            executor: Arc<dyn RunExecutor>,
+            idle_ttl: Duration,
+        ) -> Self {
             let root = broca_test_support::scratch_root()
                 .join(format!("broca-owned-cut-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("project")).unwrap();
             migration::durable_dir(&root, &root.join("wal")).unwrap();
             let wal = Arc::new(FileWalStore::new(root.join("wal")));
-            let opener = DefaultOpener::new(
-                Arc::new(FileLeaseStore::new(root.join("leases"))),
-                wal.clone(),
-                Arc::new(HoldsAfterAdmission),
-            )
-            .with_lease_domain(WalLeaseDomain::new(root.join("leases")))
-            .with_idle_ttl(Duration::from_secs(3600));
+            let opener =
+                DefaultOpener::with_file_leases(root.join("leases"), wal.clone(), executor);
+            let opener = if owned {
+                opener
+                    .with_lease_domain(WalLeaseDomain::new(root.join("leases")))
+                    .expect("the domain names the lease store's directory")
+            } else {
+                opener
+            }
+            .with_idle_ttl(idle_ttl);
             let registry = LineageRegistry::new_with_reader(Arc::new(opener), wal.clone(), None);
             Self {
                 leases: FileLeaseStore::new(root.join("leases")),
@@ -13643,6 +13680,10 @@ mod owned_cut_tests {
         .unwrap()
         .unwrap();
         drop(guard);
+        // The guard released the lease and committed the retired slot before it let
+        // anyone through its gates, so there is no half-closed slot left to wait for.
+        assert_eq!(rig.registry.slot_state(&rig.session), None);
+        assert!(!rig.lease_held(), "the guard released the lease");
 
         // Released, the old generation never resumes: queued work is re-routed, and a
         // later send through its sender is refused or re-routed, never acknowledged.
@@ -13656,9 +13697,7 @@ mod owned_cut_tests {
             matches!(&opened, Err(OpenError::SessionMoving { cut_id }) if cut_id == CUT),
             "the waiting opener must refuse the frozen session: {opened:?}"
         );
-        rig.wait_until_closed().await;
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
-        assert!(!rig.lease_held(), "the guard released the lease");
 
         // Abort removes the freeze under a fresh cut lock; the next opener acquires a new
         // tenure, checks the fence again and gets a new generation.
@@ -13733,5 +13772,148 @@ mod owned_cut_tests {
         assert_eq!(status.await.unwrap(), LineageStatus::Idle);
         assert!(rig.lease_held());
         assert!(rig.registry.stop_and_seal().await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mutating_cut_lock_pauses_an_idle_legacy_lease_actor_without_closing_it() {
+        // No lease domain, as in production today: the actor holds its own lease.
+        let rig = Rig::legacy("legacy-mutate");
+        let handle = rig.registry.actor_for(&rig.session).await.unwrap();
+        assert!(rig.lease_held());
+        let path = rig.wal.wal_path(&rig.session);
+        let before = std::fs::read(&path).ok();
+
+        let guard = rig.lock(CutLockMode::Mutate).await;
+        assert_eq!(guard.busy[0].1, None, "the idle actor reports idle");
+        assert_eq!(
+            guard.handed_tenures(),
+            0,
+            "a lease-holding actor hands nothing"
+        );
+        assert!(!guard.holds_tenure(&rig.session));
+        assert_eq!(
+            rig.registry.slot_state(&rig.session),
+            Some("open"),
+            "the actor is paused, not retired"
+        );
+        assert!(rig.lease_held(), "the paused actor keeps its own lease");
+        let (reply, mut status) = tokio::sync::oneshot::channel();
+        handle
+            .send(LineageCmd::Status { reply })
+            .await
+            .unwrap_or_else(|_| panic!("the paused actor closed"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut status)
+                .await
+                .is_err(),
+            "dispatch stays paused while the cut holds the actor"
+        );
+        assert_eq!(std::fs::read(&path).ok(), before, "the WAL is unchanged");
+        drop(guard);
+
+        assert_eq!(
+            status.await.unwrap(),
+            LineageStatus::Idle,
+            "the actor resumes"
+        );
+        let again = rig.registry.actor_for(&rig.session).await.unwrap();
+        assert_eq!(again.gen, handle.gen, "the same generation keeps serving");
+        assert!(
+            Arc::ptr_eq(&again.durable_head, &handle.durable_head),
+            "the same writer keeps serving"
+        );
+        assert!(rig.lease_held());
+        assert_eq!(std::fs::read(&path).ok(), before);
+        assert!(rig.registry.stop_and_seal().await);
+    }
+
+    // A current-thread runtime keeps the retired actor from running between the guard drop
+    // and the next lock, which is the window in which a slot left `Closing` would show.
+    #[tokio::test]
+    async fn back_to_back_mutating_cut_locks_find_the_retired_slot_already_closed() {
+        let rig = Rig::new("back-to-back");
+        let first = rig.registry.actor_for(&rig.session).await.unwrap();
+        let guard = rig.lock(CutLockMode::Mutate).await;
+        assert!(guard.holds_tenure(&rig.session));
+        drop(guard);
+        // Immediately, as a prepare followed at once by its abort or release would.
+        let guard = rig
+            .registry
+            .lock_move_sessions_with_mode(
+                std::slice::from_ref(&rig.session),
+                false,
+                CutLockMode::Mutate,
+            )
+            .await
+            .expect("the next mutating cut lock must not meet a half-closed slot");
+        assert!(guard.busy.is_empty(), "no actor is open any more");
+        assert!(!rig.lease_held(), "the earlier guard released the lease");
+        drop(guard);
+        let fresh = rig.registry.actor_for(&rig.session).await.unwrap();
+        assert_ne!(fresh.gen, first.gen);
+        assert!(rig.registry.stop_and_seal().await);
+    }
+
+    /// Records whether the session lease was still held when the executor was told the
+    /// session closed.
+    #[derive(Default)]
+    struct CloseProbe {
+        target: std::sync::OnceLock<(FileLeaseStore, BindIdentity)>,
+        held_at_close: std::sync::Mutex<Option<bool>>,
+    }
+
+    #[async_trait]
+    impl RunExecutor for CloseProbe {
+        async fn execute(
+            &self,
+            _job: RunJob,
+            _out: tokio::sync::mpsc::Sender<OutputEvent>,
+        ) -> Result<RunSummary, RunError> {
+            unreachable!("the close-order test never runs")
+        }
+
+        async fn on_session_close(&self, _session: &BindIdentity) {
+            let (leases, session) = self.target.get().expect("probe target set");
+            let held = matches!(
+                leases.acquire(&lease_key_for(session)),
+                Err(LeaseError::Held { .. })
+            );
+            *self.held_at_close.lock().unwrap() = Some(held);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_close_holds_the_session_lease_until_the_executor_is_told() {
+        for owned in [true, false] {
+            let probe = Arc::new(CloseProbe::default());
+            let rig = Rig::build(
+                if owned {
+                    "close-order-owned"
+                } else {
+                    "close-order-legacy"
+                },
+                owned,
+                probe.clone(),
+                Duration::from_millis(20),
+            );
+            assert!(probe
+                .target
+                .set((
+                    FileLeaseStore::new(rig.root.join("leases")),
+                    rig.session.clone()
+                ))
+                .is_ok());
+            drop(rig.registry.actor_for(&rig.session).await.unwrap());
+            rig.wait_until_closed().await;
+            assert_eq!(
+                *probe.held_at_close.lock().unwrap(),
+                Some(true),
+                "owned={owned}: the lease must outlive the executor's close notice"
+            );
+            assert!(
+                !rig.lease_held(),
+                "owned={owned}: the close released the lease"
+            );
+        }
     }
 }

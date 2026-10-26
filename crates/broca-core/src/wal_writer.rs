@@ -2187,6 +2187,44 @@ impl ClosedWriterTenure {
     }
 }
 
+/// A writer's WAL and the session lease beside it, held together until the writer thread
+/// takes them. Dropping it closes the WAL before releasing the lease, so no early exit
+/// between a writer open and its thread start leaves a writable WAL without its lease.
+struct WriterOwner {
+    wal: Option<Box<dyn Wal + Send>>,
+    lease: Option<Box<dyn LeaseHandle>>,
+}
+
+impl WriterOwner {
+    fn wal(&self) -> &(dyn Wal + Send) {
+        self.wal
+            .as_deref()
+            .expect("writer owner holds its WAL until handoff")
+    }
+
+    fn into_parts(mut self) -> (Box<dyn Wal + Send>, Option<Box<dyn LeaseHandle>>) {
+        let wal = self
+            .wal
+            .take()
+            .expect("writer owner holds its WAL until handoff");
+        (wal, self.lease.take())
+    }
+}
+
+impl Drop for WriterOwner {
+    fn drop(&mut self) {
+        drop(self.wal.take());
+        drop(self.lease.take());
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next writer thread spawn on this thread fail, as an exhausted thread
+    /// limit would, so tests can check what an unstarted writer releases and in what order.
+    static FAIL_NEXT_WRITER_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The loop's handle to the writer task.
 pub struct WalHandle {
     /// Advisory display placement follows accepted queue order, not the lagging fsync head.
@@ -2545,6 +2583,14 @@ impl WalHandle {
         observer: Option<RecordObserver>,
         lease: Option<Box<dyn LeaseHandle>>,
     ) -> Result<WalHandle, WalWriteError> {
+        // One owner holds the WAL and its lease from here until the writer thread takes
+        // them, so a panic while preparing the handle or a failed thread spawn still
+        // closes the WAL before the lease is released.
+        let owner = WriterOwner {
+            wal: Some(wal),
+            lease,
+        };
+        let wal = owner.wal();
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
         let next_seq = AtomicU64::new(last_seq + 1);
@@ -2569,27 +2615,36 @@ impl WalHandle {
                 })
             });
         let (tx, rx) = std_mpsc::channel::<WalCommand>();
+        let body = move || {
+            // writer_loop drops its WAL before the lease is released, even on unwind:
+            // the lease is bound outside writer_loop's frame, so an unwinding writer
+            // drops the WAL first. On a normal return the lease goes back to the
+            // joiner, which releases it or hands it over (see `shutdown_into_tenure`).
+            let (wal, lease) = owner.into_parts();
+            writer_loop(
+                wal,
+                fence,
+                rx,
+                observer,
+                writer_poisoned,
+                writer_durable_head,
+                writer_lineage_id,
+            );
+            lease
+        };
+        #[cfg(test)]
+        if FAIL_NEXT_WRITER_SPAWN.with(|fail| fail.replace(false)) {
+            // Mirrors a real spawn failure, which drops the unstarted closure.
+            drop(body);
+            return Err(WalWriteError::Failed(
+                "WAL writer thread spawn failed: injected".into(),
+            ));
+        }
         // recv() waits for the lifetime of the session, including while idle. A
         // resident writer must not consume a slot needed by finite blocking jobs.
         let join = std::thread::Builder::new()
             .name("broca-wal-writer".into())
-            .spawn(move || {
-                // writer_loop drops its WAL before the lease is released, even on unwind:
-                // the lease is bound outside writer_loop's frame, so an unwinding writer
-                // drops the WAL first. On a normal return the lease goes back to the
-                // joiner, which releases it or hands it over (see `shutdown_into_tenure`).
-                let lease = lease;
-                writer_loop(
-                    wal,
-                    fence,
-                    rx,
-                    observer,
-                    writer_poisoned,
-                    writer_durable_head,
-                    writer_lineage_id,
-                );
-                lease
-            })
+            .spawn(body)
             .map_err(|error| {
                 WalWriteError::Failed(format!("WAL writer thread spawn failed: {error}"))
             })?;

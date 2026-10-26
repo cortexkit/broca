@@ -709,3 +709,99 @@ async fn shutdown_into_tenure_of_a_standalone_writer_hands_back_nothing() {
     );
     assert!(dropped.load(Ordering::Acquire));
 }
+
+/// Records, in order, when a writer's WAL and its lease are dropped.
+type DropLog = Arc<Mutex<Vec<&'static str>>>;
+
+struct OrderWal {
+    log: DropLog,
+    panic_in_preparation: bool,
+}
+
+impl Drop for OrderWal {
+    fn drop(&mut self) {
+        self.log.lock().unwrap().push("wal");
+    }
+}
+
+impl Wal for OrderWal {
+    fn append(&mut self, _: u64, _: &WalRecord, _: bool) -> Result<u64, WalError> {
+        Ok(1)
+    }
+    fn sync(&self) -> Result<(), WalError> {
+        Ok(())
+    }
+    fn replay(&self) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        Ok(vec![])
+    }
+    fn tail_after_seq(&self, _: u64) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        Ok(vec![])
+    }
+    fn last_seq(&self) -> u64 {
+        0
+    }
+    fn append_budget(&self) -> Option<(u64, u64, u64)> {
+        // Read while the writer handle is prepared, after recovery is proven and before
+        // the writer thread exists.
+        if self.panic_in_preparation {
+            panic!("injected panic while preparing the writer handle");
+        }
+        None
+    }
+}
+
+#[derive(Debug)]
+struct OrderLease {
+    key: cortexkit_lease::LeaseKey,
+    log: DropLog,
+}
+
+impl LeaseHandle for OrderLease {
+    fn epoch(&self) -> u64 {
+        1
+    }
+    fn key(&self) -> &cortexkit_lease::LeaseKey {
+        &self.key
+    }
+}
+
+impl Drop for OrderLease {
+    fn drop(&mut self) {
+        self.log.lock().unwrap().push("lease");
+    }
+}
+
+fn order_parts(panic_in_preparation: bool) -> (DropLog, Box<OrderWal>, Box<OrderLease>) {
+    let log = DropLog::default();
+    let wal = Box::new(OrderWal {
+        log: log.clone(),
+        panic_in_preparation,
+    });
+    let lease = Box::new(OrderLease {
+        key: cortexkit_lease::LeaseKey::new("broca", "wal", "order-test"),
+        log: log.clone(),
+    });
+    (log, wal, lease)
+}
+
+#[test]
+fn writer_preparation_panic_closes_the_wal_before_the_lease() {
+    let (log, wal, lease) = order_parts(true);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        WalHandle::spawn_with_lease(wal, lease)
+    }));
+    assert!(outcome.is_err(), "the injected preparation panic must fire");
+    assert_eq!(*log.lock().unwrap(), vec!["wal", "lease"]);
+}
+
+#[test]
+fn writer_thread_spawn_failure_closes_the_wal_before_the_lease() {
+    let (log, wal, lease) = order_parts(false);
+    FAIL_NEXT_WRITER_SPAWN.with(|fail| fail.set(true));
+    let error = match WalHandle::spawn_with_lease(wal, lease) {
+        Ok(_) => panic!("the injected spawn failure must refuse the writer"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("spawn failed"), "{error}");
+    assert_eq!(*log.lock().unwrap(), vec!["wal", "lease"]);
+}

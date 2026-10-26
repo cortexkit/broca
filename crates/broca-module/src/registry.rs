@@ -587,25 +587,50 @@ impl std::fmt::Display for ShutdownReport {
 }
 
 pub struct MoveSessionGuard {
-    /// Session leases handed over by idle owned-tenure actors that closed their writers
-    /// for a mutating cut. Declared first so they release before the cut gates and the
-    /// actor release signals: the retired actor keeps its registry slot `Closing` until
-    /// it is released, so no opener in this process races for the lease meanwhile.
-    tenures: Vec<(LineageKey, broca_core::wal_writer::ClosedWriterTenure)>,
+    /// Actors retired by a mutating cut: each closed its writer, handed over the
+    /// still-held session lease (absent if the writer could not close cleanly), and left
+    /// its registry slot `Closing` under a close token this guard now owns. Dropping the
+    /// guard releases each lease and then commits each slot closed, all before the cut
+    /// gates release, so the next cut lock or opener finds the slot already absent
+    /// instead of racing the retired actor's exit.
+    retired: Vec<RetiredActor>,
     gates: Vec<tokio::sync::OwnedMutexGuard<()>>,
     actors: Vec<tokio::sync::oneshot::Sender<()>>,
     pub busy: Vec<(LineageKey, Option<String>)>,
 }
 
+/// One actor generation a mutating cut retired; see [`MoveSessionGuard`].
+struct RetiredActor {
+    key: LineageKey,
+    tenure: Option<broca_core::wal_writer::ClosedWriterTenure>,
+    close: CloseToken,
+}
+
+impl Drop for MoveSessionGuard {
+    fn drop(&mut self) {
+        // Release the lease before the slot turns absent, and turn the slot absent
+        // before the gates (dropped with the fields below) let anyone else in.
+        for retired in self.retired.drain(..) {
+            drop(retired.tenure);
+            retired.close.commit();
+        }
+    }
+}
+
 impl MoveSessionGuard {
     /// Whether this guard holds the session lease handed over by `key`'s closed actor.
     pub fn holds_tenure(&self, key: &LineageKey) -> bool {
-        self.tenures.iter().any(|(held, _)| held == key)
+        self.retired
+            .iter()
+            .any(|retired| &retired.key == key && retired.tenure.is_some())
     }
 
     /// How many closed actors handed their session lease to this guard.
     pub fn handed_tenures(&self) -> usize {
-        self.tenures.len()
+        self.retired
+            .iter()
+            .filter(|retired| retired.tenure.is_some())
+            .count()
     }
 }
 
@@ -616,8 +641,8 @@ pub enum CutLockMode {
     Inspect,
     /// The move may publish or remove move markers for the session. An idle actor that
     /// owns its tenure through its writer closes that writer and hands the still-held
-    /// lease to the guard, then retires once released. Other actors pause as for
-    /// `Inspect`; a busy actor refuses without changing its writer.
+    /// lease to the guard; the guard commits its slot closed when released. Other actors
+    /// pause as for `Inspect`; a busy actor refuses without changing its writer.
     Mutate,
 }
 
@@ -1106,7 +1131,7 @@ impl LineageRegistry {
             )
         });
         let mut guard = MoveSessionGuard {
-            tenures: Vec::new(),
+            retired: Vec::new(),
             gates: Vec::new(),
             actors: Vec::new(),
             busy: Vec::new(),
@@ -1150,16 +1175,20 @@ impl LineageRegistry {
                 let crate::actor::CutLockReply {
                     busy,
                     release,
-                    tenure,
+                    retired,
                 } = wait
                     .await
                     .map_err(|_| OpenError::Open("actor closed during cut lock".into()))?;
                 guard.busy.push((key.clone(), busy));
                 guard.actors.push(release);
-                if let Some(tenure) = tenure {
-                    // Only a mutating cut may take a session lease from an actor.
+                if let Some(crate::actor::RetiredForCut { tenure, close }) = retired {
+                    // Only a mutating cut may retire an actor or take its session lease.
                     debug_assert_eq!(mode, CutLockMode::Mutate);
-                    guard.tenures.push((key.clone(), tenure));
+                    guard.retired.push(RetiredActor {
+                        key: key.clone(),
+                        tenure,
+                        close,
+                    });
                 }
             }
             self.inner.opener.retire_idle_session_transport(&key);
