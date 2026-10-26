@@ -64,6 +64,7 @@ mod normalize_fixture;
 #[cfg(feature = "live")]
 mod openai_chat_e2e;
 mod openai_chat_golden;
+mod openai_media_render;
 mod openai_responses_chatgpt_render_golden;
 #[cfg(feature = "live")]
 mod openai_responses_e2e;

@@ -22,6 +22,15 @@ pub(crate) struct MediaRender<'a> {
 
 impl MediaRender<'_> {
     pub fn native(&self, media: &MediaRef, tool: bool) -> Result<&str, MediaMarkerReason> {
+        self.for_carrier(media, tool, MediaCarrier::Native)
+    }
+
+    pub fn for_carrier(
+        &self,
+        media: &MediaRef,
+        tool: bool,
+        expected: MediaCarrier,
+    ) -> Result<&str, MediaMarkerReason> {
         let profile = self
             .frozen
             .media
@@ -36,7 +45,7 @@ impl MediaRender<'_> {
         } else {
             kind.user_message
         };
-        if carrier != MediaCarrier::Native {
+        if carrier != expected || carrier == MediaCarrier::Marker {
             return Err(MediaMarkerReason::Carrier);
         }
         if !crate::person_media::accepts_mime(profile, media) {
