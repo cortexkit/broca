@@ -61,6 +61,16 @@ impl WireFamily for OpenAiChat {
         build_request_body(frozen, opts)
     }
 
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+    ) -> Value {
+        let media = crate::media_render::MediaRender { frozen, payloads };
+        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+    }
+
     fn endpoint(
         &self,
         frozen: &FrozenRenderConfig,
@@ -114,6 +124,14 @@ impl WireFamily for OpenAiChat {
 // ───────────────────────── request body ─────────────────────────
 
 fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    build_request_body_with_media(frozen, opts, None)
+}
+
+fn build_request_body_with_media(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -129,6 +147,7 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
         frozen.tool_call_content_empty_string,
         frozen.opencode_go_reasoning_signature,
         &name_map,
+        media,
     );
 
     let mut body = json!({
@@ -230,15 +249,21 @@ fn convert_messages(
     tool_call_content_empty_string: bool,
     opencode_go: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
+    let mut follow_up = Vec::new();
     for m in prompt {
+        // Finish every result in a parallel tool round before inserting a synthetic user turn.
+        if m.role != Role::Tool && !follow_up.is_empty() {
+            out.push(json!({"role":"user", "content":std::mem::take(&mut follow_up)}));
+        }
         match m.role {
             Role::System => {
                 out.push(json!({ "role": "system", "content": text_content(&m.content) }))
             }
             Role::User => {
-                out.push(json!({ "role": "user", "content": user_text_content(&m.content) }))
+                out.push(json!({ "role": "user", "content": user_text_content(&m.content, media) }))
             }
             Role::Assistant => out.push(convert_assistant(
                 m,
@@ -253,14 +278,57 @@ fn convert_messages(
                         out.push(json!({
                             "role": "tool",
                             "tool_call_id": tr.tool_call_id.0,
-                            "content": tool_output_text(&tr.output),
+                            "content": tool_output_with_media(tr, media, &mut follow_up),
                         }));
                     }
                 }
             }
         }
     }
+    if !follow_up.is_empty() {
+        out.push(json!({"role":"user", "content":follow_up}));
+    }
     out
+}
+
+fn tool_output_with_media(
+    result: &broca_protocol::ToolResult,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    follow_up: &mut Vec<Value>,
+) -> String {
+    let (ToolOutput::Parts { parts }, Some(media)) = (&result.output, media) else {
+        return tool_output_text(&result.output);
+    };
+    let grammar = super::openai_media::Grammar::Chat;
+    let mut text = Vec::new();
+    let mut blocks = Vec::new();
+    for part in parts {
+        match part {
+            broca_protocol::ToolOutputPart::Text { text: part } => text.push(part.clone()),
+            broca_protocol::ToolOutputPart::Media { media: reference } => {
+                let reason = match grammar.block(
+                    reference,
+                    Some(media),
+                    true,
+                    crate::media_profile::MediaCarrier::FollowUpUserMessage,
+                ) {
+                    Ok(block) => {
+                        blocks.push(block);
+                        broca_protocol::MediaMarkerReason::Carrier
+                    }
+                    Err(reason) => reason,
+                };
+                text.push(broca_protocol::content::media_not_shown_marker(
+                    reference, reason,
+                ));
+            }
+        }
+    }
+    if !blocks.is_empty() {
+        follow_up.push(grammar.text(&format!("Media from tool call {}:", result.tool_call_id.0)));
+        follow_up.extend(blocks);
+    }
+    text.join("\n")
 }
 
 /// An assistant turn: text content (or null) + any tool calls. Reasoning blocks are
@@ -413,17 +481,41 @@ fn echo_openrouter_details(message: &Message, wire: &mut Value) {
 }
 
 // Preserve user block boundaries without changing the legacy scalar form for one text block.
-fn user_text_content(blocks: &[ContentBlock]) -> Value {
+fn user_text_content(
+    blocks: &[ContentBlock],
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
     if blocks
         .iter()
         .any(|block| matches!(block, ContentBlock::Media(_)))
     {
-        return Value::Array(blocks.iter().filter_map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => Some(json!({"type":"text", "text":text})),
-            ContentBlock::Media(media) => Some(json!({"type":"text", "text":broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
-            ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. }
-            | ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_) => None,
-        }).collect());
+        return Value::Array(
+            blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                        Some(json!({"type":"text", "text":text}))
+                    }
+                    ContentBlock::Media(reference) => {
+                        let grammar = super::openai_media::Grammar::Chat;
+                        Some(
+                            grammar
+                                .block(
+                                    reference,
+                                    media,
+                                    false,
+                                    crate::media_profile::MediaCarrier::Native,
+                                )
+                                .unwrap_or_else(|reason| grammar.marker(reference, reason)),
+                        )
+                    }
+                    ContentBlock::Reasoning { .. }
+                    | ContentBlock::RedactedReasoning { .. }
+                    | ContentBlock::ToolCall(_)
+                    | ContentBlock::ToolResult(_) => None,
+                })
+                .collect(),
+        );
     }
     let texts: Vec<&str> = blocks
         .iter()

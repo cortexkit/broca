@@ -23,9 +23,7 @@ use broca_protocol::{
     provider::NormalizedEvent, request::CallOptions, EncryptedReasoningFormat, StepId,
 };
 
-use crate::families::openai_responses::{
-    build_prepared_request_body, OpenAiResponsesNormalizer, PreparedRequestBody,
-};
+use crate::families::openai_responses::{OpenAiResponsesNormalizer, PreparedRequestBody};
 use crate::wire::{
     AuthHandle, FrozenRenderConfig, HttpMethod, HttpRequest, NormalizeError, StreamNormalizer,
     WireFamily,
@@ -126,64 +124,81 @@ pub(crate) fn effort_plan(
     Some((anchor, updates))
 }
 
+fn build_request_body_with_media(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> serde_json::Value {
+    // The body STARTS from the shared OpenAI-Responses builder, then applies the codex
+    // backend's deltas — the ways the codex/responses backend is STRICTER than the
+    // platform /responses API (mirrors opencode's codex transform exactly):
+    let PreparedRequestBody {
+        mut body,
+        prepared,
+        effort_anchor,
+    } = super::openai_responses::build_prepared_request_body_with_media(frozen, opts, media);
+    // store:false — the codex backend REJECTS a request without it ("Store must be set
+    // to false"). The platform Responses API defaults store on the server side; codex
+    // enforces it in the body.
+    body["store"] = serde_json::Value::Bool(false);
+    // The codex backend rejects platform-only output and sampling controls as unsupported.
+    // They must be absent rather than defaulted, even when the caller supplied them.
+    // Because ChatGPT cannot enforce that cap, broca does not declare max_output_tokens.
+    if let Some(obj) = body.as_object_mut() {
+        for field in ["max_output_tokens", "temperature", "top_p"] {
+            obj.remove(field);
+        }
+    }
+    // prompt_cache_key — the run's session id, for codex backend-side prompt-cache
+    // locality across the run's turns. A per-run constant frozen into the render config,
+    // so a resume reproduces it from the frozen blob (deterministic, in the hash domain).
+    if let Some(key) = &frozen.prompt_cache_key {
+        body["prompt_cache_key"] = serde_json::Value::String(key.clone());
+    }
+    // The backend carries the frozen reasoning-effort value under reasoning.effort.
+    // Preserve any independently configured fields in the reasoning object.
+    if let Some(effort) = &frozen.reasoning_effort {
+        let reasoning = body
+            .as_object_mut()
+            .expect("OpenAI Responses body is an object")
+            .entry("reasoning")
+            .or_insert_with(|| serde_json::json!({}));
+        if !reasoning.is_object() {
+            *reasoning = serde_json::json!({});
+        }
+        reasoning["effort"] = serde_json::Value::String(effort.clone());
+    }
+    // Start with the planned effort; the shared builder has already placed later episode
+    // effort changes into the prepared input items.
+    if let Some(anchor) = effort_anchor {
+        body["reasoning"]["effort"] = serde_json::json!(anchor);
+    }
+    if let Some(service_tier) = &frozen.service_tier {
+        body["service_tier"] = serde_json::Value::String(service_tier.clone());
+    }
+    if let Some(wire) = &frozen.chatgpt_wire {
+        wire.apply(&mut body, prepared.as_ref());
+    }
+    body
+}
+
 impl WireFamily for OpenAiResponsesChatgpt {
     fn warm_body(&self, _frozen: &FrozenRenderConfig, base: &[u8]) -> Result<Vec<u8>, String> {
         crate::cache_warm::responses_warm_body(base)
     }
 
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> serde_json::Value {
-        // The body STARTS from the shared OpenAI-Responses builder, then applies the codex
-        // backend's deltas — the ways the codex/responses backend is STRICTER than the
-        // platform /responses API (mirrors opencode's codex transform exactly):
-        let PreparedRequestBody {
-            mut body,
-            prepared,
-            effort_anchor,
-        } = build_prepared_request_body(frozen, opts);
-        // store:false — the codex backend REJECTS a request without it ("Store must be set
-        // to false"). The platform Responses API defaults store on the server side; codex
-        // enforces it in the body.
-        body["store"] = serde_json::Value::Bool(false);
-        // The codex backend rejects platform-only output and sampling controls as unsupported.
-        // They must be absent rather than defaulted, even when the caller supplied them.
-        // Because ChatGPT cannot enforce that cap, broca does not declare max_output_tokens.
-        if let Some(obj) = body.as_object_mut() {
-            for field in ["max_output_tokens", "temperature", "top_p"] {
-                obj.remove(field);
-            }
-        }
-        // prompt_cache_key — the run's session id, for codex backend-side prompt-cache
-        // locality across the run's turns. A per-run constant frozen into the render config,
-        // so a resume reproduces it from the frozen blob (deterministic, in the hash domain).
-        if let Some(key) = &frozen.prompt_cache_key {
-            body["prompt_cache_key"] = serde_json::Value::String(key.clone());
-        }
-        // ChatGPT's pro tier is the backend's maximum reasoning effort (wire-captured from
-        // the native codex CLI; the models.dev reasoning.mode spelling 400s here). Insert
-        // only the effort so any independently configured reasoning fields remain intact.
-        if let Some(effort) = &frozen.reasoning_effort {
-            let reasoning = body
-                .as_object_mut()
-                .expect("OpenAI Responses body is an object")
-                .entry("reasoning")
-                .or_insert_with(|| serde_json::json!({}));
-            if !reasoning.is_object() {
-                *reasoning = serde_json::json!({});
-            }
-            reasoning["effort"] = serde_json::Value::String(effort.clone());
-        }
-        // The shared builder planned effort over the request as structured output prepares
-        // it, so the anchor covers the same prompt positions as the body's input.
-        if let Some(anchor) = effort_anchor {
-            body["reasoning"]["effort"] = serde_json::json!(anchor);
-        }
-        if let Some(service_tier) = &frozen.service_tier {
-            body["service_tier"] = serde_json::Value::String(service_tier.clone());
-        }
-        if let Some(wire) = &frozen.chatgpt_wire {
-            wire.apply(&mut body, prepared.as_ref());
-        }
-        body
+        build_request_body_with_media(frozen, opts, None)
+    }
+
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+    ) -> serde_json::Value {
+        let media = crate::media_render::MediaRender { frozen, payloads };
+        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
     }
 
     fn endpoint(
