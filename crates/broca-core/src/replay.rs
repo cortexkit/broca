@@ -36,6 +36,7 @@ use broca_wal::{
     DeferredDecision, DispatchOutcome, FramedRecord, LateDecision, LateExecution, NoDispatchReason,
     PauseReason, RunConfig, WalByteAnchor, WalLineageId, WalRecord, WithdrawElicitation,
 };
+use sha2::Digest;
 /// WAL-derived identity of the run that produced one transcript message.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunAttribution {
@@ -1853,9 +1854,10 @@ pub(crate) fn first_session_record_is_interrupted<'a>(
 /// full replay; a `RunStarted` appearing later in the tail overrides it for its episode.
 /// Passing `None` is the full-replay case (the first `RunStarted` sets the origin).
 ///
-/// Steers held at the indexed sequence are seeded separately: see
-/// [`replay_seeded_with_held_steers`]. This entry point carries none, so existing
-/// prefix-merge callers keep their behaviour while offset reads seed them.
+/// Steers held at the indexed sequence are seeded through the validated boundary
+/// entry point [`replay_seeded_at_validated_boundary`], which checks the stored
+/// boundary identity before replaying. This entry point carries no held steers, so
+/// existing prefix-merge callers keep their behaviour.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn replay_seeded<'a>(
     records: impl IntoIterator<Item = &'a WalRecord>,
@@ -1890,7 +1892,7 @@ pub(crate) fn replay_seeded<'a>(
 /// a new episode and discards them, matching the index which clears held steers
 /// when a new run starts.
 #[allow(clippy::too_many_arguments)]
-pub fn replay_seeded_with_held_steers<'a>(
+pub(crate) fn replay_seeded_with_held_steers<'a>(
     records: impl IntoIterator<Item = &'a WalRecord>,
     seed_origin: Option<broca_protocol::request::ModelHandle>,
     seed_run_id: Option<RunId>,
@@ -1912,6 +1914,200 @@ pub fn replay_seeded_with_held_steers<'a>(
         tag_seed,
         held_steers,
     )
+}
+
+/// Identity of one committed projection boundary, mirrored from the offset index so
+/// offset reads never depend on the store crate.
+///
+/// Each field copies the `projection_boundary` row column the indexer wrote at commit:
+/// the lineage the boundary was indexed under, the WAL sequence of its candidate
+/// frame, the exact byte range of that frame, the SHA-256 over those bytes, and the
+/// index's attested qualification. The validator below re-reads the frame from the log
+/// and compares every field; the wiring must pass the stored row through unmodified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedBoundary {
+    /// WAL identity the boundary was indexed under.
+    pub lineage_id: Option<String>,
+    /// WAL sequence of the boundary's candidate frame.
+    pub seq: u64,
+    /// Byte offset where the boundary frame starts.
+    pub frame_off: u64,
+    /// Byte offset just past the boundary frame.
+    pub frame_end: u64,
+    /// SHA-256 over the exact bytes `frame_off..frame_end`.
+    pub frame_identity: Vec<u8>,
+    /// The index's attested qualification: only a qualified boundary may seed a tail.
+    pub qualified: bool,
+}
+
+/// Why a seeded tail was refused: the caller replays the whole log instead.
+///
+/// Every reason names a boundary the index must advance past or a log that changed
+/// under it. The caller treats them all the same way, by taking the full-replay path;
+/// the reason exists so a test can pin which guard fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedFallback {
+    /// Which validation failed; always a static string so callers can match on it.
+    pub reason: &'static str,
+}
+
+/// Replay a WAL tail seeded only at a validated, committed projection boundary.
+///
+/// A bare sequence watermark cannot prove the log still holds the boundary it names:
+/// the log may have been restored shorter, replaced, or rewritten under the same
+/// lineage, and an unqualified cut may sit inside an open tool turn or behind a held
+/// steer the tail would then lose. So this entry point takes the boundary's stored
+/// identity, reads and decodes exactly that frame from `log`, and compares the
+/// sequence, the frame hash and the log lineage before replaying anything. Any
+/// mismatch — a missing, torn, moved, different-lineage or different-hash frame, an
+/// unqualified boundary, or a frame whose kind can never seed a tail — returns a
+/// [`SeedFallback`] instead of replaying. The future offset reads must call this,
+/// never the unvalidated engine below, so the wiring cannot skip the check.
+///
+/// `tail` holds the decoded frames after the index's durable end, `held_steers` the
+/// inputs the tail seed still holds at the cut, and `ordinal_base` the prefix length
+/// those rows cover; all three come from the same index snapshot as the boundary.
+/// A Setup in the tail still needs its own index catch-up first: see
+/// [`tail_contains_compaction_setup`].
+#[allow(clippy::too_many_arguments)]
+pub fn replay_seeded_at_validated_boundary(
+    log: &[u8],
+    boundary: &SeedBoundary,
+    tail: &[FramedRecord],
+    seed_origin: Option<broca_protocol::request::ModelHandle>,
+    seed_run_id: Option<RunId>,
+    seed_budget: Option<BudgetConfig>,
+    seed_budget_state: Option<crate::BudgetReplayStateV1>,
+    ordinal_base: u64,
+    require_caller_text: bool,
+    tag_seed: crate::tags::TagSeed,
+    held_steers: Vec<Message>,
+) -> Result<ReplayState, SeedFallback> {
+    if !boundary.qualified {
+        return Err(SeedFallback {
+            reason: "unqualified boundary",
+        });
+    }
+    if tail.iter().any(|frame| frame.seq <= boundary.seq) {
+        return Err(SeedFallback {
+            reason: "tail overlaps boundary",
+        });
+    }
+    let (off, end) = (
+        usize::try_from(boundary.frame_off).map_err(|_| SeedFallback {
+            reason: "boundary offset out of range",
+        })?,
+        usize::try_from(boundary.frame_end).map_err(|_| SeedFallback {
+            reason: "boundary offset out of range",
+        })?,
+    );
+    let frame_bytes = if off >= end || log.len() <= off {
+        return Err(SeedFallback {
+            reason: "boundary frame outside log",
+        });
+    } else if log.len() < end {
+        return Err(SeedFallback {
+            reason: "torn boundary frame",
+        });
+    } else {
+        &log[off..end]
+    };
+    let (framed, consumed) = match broca_wal::framing::decode_next(frame_bytes) {
+        broca_wal::framing::DecodeStep::Record { framed, consumed } => (*framed, consumed),
+        broca_wal::framing::DecodeStep::Lineage { .. } => {
+            return Err(SeedFallback {
+                reason: "boundary frame is not a record",
+            });
+        }
+        broca_wal::framing::DecodeStep::TornTail => {
+            return Err(SeedFallback {
+                reason: "torn boundary frame",
+            });
+        }
+        broca_wal::framing::DecodeStep::Corrupt(_) => {
+            return Err(SeedFallback {
+                reason: "corrupt boundary frame",
+            });
+        }
+        broca_wal::framing::DecodeStep::NewerWriter { .. } => {
+            return Err(SeedFallback {
+                reason: "newer boundary frame",
+            });
+        }
+    };
+    if consumed != frame_bytes.len() {
+        return Err(SeedFallback {
+            reason: "boundary frame length changed",
+        });
+    }
+    if framed.seq != boundary.seq {
+        return Err(SeedFallback {
+            reason: "boundary sequence mismatch",
+        });
+    }
+    if sha2::Sha256::digest(frame_bytes).as_slice() != boundary.frame_identity {
+        return Err(SeedFallback {
+            reason: "boundary frame identity mismatch",
+        });
+    }
+    if log_lineage_id(log) != boundary.lineage_id {
+        return Err(SeedFallback {
+            reason: "boundary lineage mismatch",
+        });
+    }
+    if !boundary_frame_is_seedable(&framed.record) {
+        return Err(SeedFallback {
+            reason: "boundary frame cannot seed a tail",
+        });
+    }
+    replay_seeded_with_held_steers(
+        tail.iter().map(|frame| &frame.record),
+        seed_origin,
+        seed_run_id,
+        seed_budget,
+        seed_budget_state,
+        ordinal_base,
+        require_caller_text,
+        tag_seed,
+        held_steers,
+    )
+    .map_err(|_| SeedFallback {
+        reason: "tail replay refused the seeded records",
+    })
+}
+
+/// The log's lineage identity as its first frame records it, if any.
+///
+/// A log the writer opened carries one seq-0 lineage frame; a record-only byte string
+/// assembled in a test carries none. Either way the value is compared verbatim against
+/// the boundary's attested lineage, so a restored or replaced log cannot pass.
+fn log_lineage_id(log: &[u8]) -> Option<String> {
+    match broca_wal::framing::decode_next(log) {
+        broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => Some(lineage_id.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether the boundary frame's record can ever seed a tail.
+///
+/// Only a committed turn boundary qualifies: a `TurnFinished`, a model step with no
+/// tool calls, or an import-seeded `RunStarted`. Anything else — a tool-calling step
+/// swallowed before its batch committed, a bare dispatch intent with an empty suffix
+/// after it, a queued or steered record held before unfinished tool work, or any
+/// informational record — leaves state the tail cannot reconstruct, so the reader
+/// falls back to a full replay even when the frame itself is intact.
+fn boundary_frame_is_seedable(record: &WalRecord) -> bool {
+    match record {
+        WalRecord::TurnFinished { .. } => true,
+        WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } if assistant_message.tool_calls().next().is_none() => true,
+        WalRecord::RunStarted {
+            origin: broca_wal::RunOrigin::SeededFrom { .. },
+            ..
+        } => true,
+        _ => false,
+    }
 }
 
 /// Whether a WAL tail holds a compaction Setup that renumbers indexed tags.
@@ -5118,7 +5314,11 @@ mod offset_tail_tests {
         SetupTagCheckpoint, WalRecord,
     };
 
-    use super::{replay, replay_seeded_with_held_steers, tail_contains_compaction_setup};
+    use super::{
+        replay, replay_seeded_at_validated_boundary, replay_seeded_with_held_steers,
+        tail_contains_compaction_setup, SeedBoundary,
+    };
+    use sha2::Digest;
 
     fn user(text: &str) -> Message {
         Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
@@ -5589,5 +5789,386 @@ mod offset_tail_tests {
         records.push(run_finished(RunFinishReason::Completed));
         let full = replay(&records).unwrap();
         assert!(!full.prompt.is_empty());
+    }
+
+    /// Encode test records as WAL bytes, one frame per record with gapless seqs.
+    fn encode_log(records: &[WalRecord]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            bytes.extend(
+                broca_wal::framing::encode(index as u64 + 1, 1, record).expect("encode test log"),
+            );
+        }
+        bytes
+    }
+
+    /// Every frame of test log bytes as `(byte start, byte end, frame)`.
+    /// `encode_log` output carries no lineage frame, so every entry is a record.
+    fn scan_frames(bytes: &[u8]) -> Vec<(u64, u64, FramedRecord)> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            match broca_wal::framing::decode_next(&bytes[off..]) {
+                broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                    out.push((off as u64, (off + consumed) as u64, *framed));
+                    off += consumed;
+                }
+                broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
+                    off += consumed;
+                }
+                broca_wal::framing::DecodeStep::TornTail => break,
+                _ => panic!("test log must decode at byte {off}"),
+            }
+        }
+        out
+    }
+
+    /// The stored identity for one scanned frame, as the index would have written it.
+    /// Test logs carry no lineage frame, so the attested lineage is `None`.
+    fn seed_boundary_for(
+        bytes: &[u8],
+        scanned: &[(u64, u64, FramedRecord)],
+        seq: u64,
+        qualified: bool,
+    ) -> SeedBoundary {
+        let (off, end, _) = scanned
+            .iter()
+            .find(|(_, _, framed)| framed.seq == seq)
+            .expect("boundary seq is in the scan");
+        SeedBoundary {
+            lineage_id: None,
+            seq,
+            frame_off: *off,
+            frame_end: *end,
+            frame_identity: sha2::Sha256::digest(&bytes[*off as usize..*end as usize]).to_vec(),
+            qualified,
+        }
+    }
+
+    /// Seeds for a tail starting after `cut` records, as the index snapshot carries them:
+    /// the open episode's model and run, the prefix length, and the steers still held.
+    fn seeds_at_cut(
+        records: &[WalRecord],
+        cut: usize,
+    ) -> (Option<ModelHandle>, Option<RunId>, u64, Vec<Message>) {
+        let prefix = replay(&records[..cut]).unwrap();
+        let origin = prefix
+            .run_config
+            .as_ref()
+            .map(|config| config.model.clone());
+        (
+            origin,
+            prefix.run_id.clone(),
+            prefix.prompt.len() as u64,
+            prefix.pending_steers.clone(),
+        )
+    }
+
+    /// A tail seeded at a validated boundary replays exactly what a full replay holds
+    /// past that boundary: a committed turn, a qualified no-tool step, and an
+    /// import-seeded episode each merge with their prefix.
+    #[test]
+    fn validated_boundary_seeds_and_equals_full_replay() {
+        let records = corpus_records();
+        let full = replay(&records).unwrap();
+        let bytes = encode_log(&records);
+        let scanned = scan_frames(&bytes);
+        let seed_at = |seq: u64| {
+            let boundary = seed_boundary_for(&bytes, &scanned, seq, true);
+            let cut = seq as usize;
+            let tail: Vec<FramedRecord> = scanned[cut..]
+                .iter()
+                .map(|(_, _, framed)| framed.clone())
+                .collect();
+            let (origin, run_id, ordinal_base, held) = seeds_at_cut(&records, cut);
+            let tail_state = replay_seeded_at_validated_boundary(
+                &bytes,
+                &boundary,
+                &tail,
+                origin,
+                run_id,
+                None,
+                None,
+                ordinal_base,
+                false,
+                Default::default(),
+                held,
+            )
+            .expect("valid boundary seeds");
+            let mut merged = replay(&records[..cut]).unwrap().prompt;
+            merged.extend(tail_state.prompt);
+            assert_eq!(prompt_shape(&merged), prompt_shape(&full.prompt));
+            assert_eq!(merged.len(), full.prompt.len());
+        };
+        // Committed tool turn, then a held steer placed at the episode close.
+        let turn_seq = records
+            .iter()
+            .position(|record| matches!(record, WalRecord::TurnFinished { .. }))
+            .expect("corpus commits a turn") as u64
+            + 1;
+        seed_at(turn_seq);
+        // Qualified no-tool step: the second episode's answer, terminal after it.
+        let step_seq = records
+            .iter()
+            .rposition(|record| {
+                matches!(
+                    record,
+                    WalRecord::ModelStepFinished { assistant_message, .. }
+                        if assistant_message.tool_calls().next().is_none()
+                )
+            })
+            .expect("corpus answers without tools") as u64
+            + 1;
+        seed_at(step_seq);
+        // Import-seeded episode: renders, owns nothing, still seeds from its start.
+        let import = non_attributable_records();
+        let import_full = replay(&import).unwrap();
+        let import_bytes = encode_log(&import);
+        let import_scanned = scan_frames(&import_bytes);
+        let boundary = seed_boundary_for(&import_bytes, &import_scanned, 1, true);
+        let import_tail: Vec<FramedRecord> = import_scanned[1..]
+            .iter()
+            .map(|(_, _, framed)| framed.clone())
+            .collect();
+        let (origin, run_id, ordinal_base, held) = seeds_at_cut(&import, 1);
+        let tail_state = replay_seeded_at_validated_boundary(
+            &import_bytes,
+            &boundary,
+            &import_tail,
+            origin,
+            run_id,
+            None,
+            None,
+            ordinal_base,
+            false,
+            Default::default(),
+            held,
+        )
+        .expect("seeded start seeds");
+        let mut merged = replay(&import[..1]).unwrap().prompt;
+        merged.extend(tail_state.prompt);
+        assert_eq!(prompt_shape(&merged), prompt_shape(&import_full.prompt));
+    }
+
+    /// Each way the log can stop matching its stored boundary falls back to a full
+    /// replay: a shorter restored copy, a torn frame, moved offsets, rewritten bytes,
+    /// a different lineage, and an unqualified boundary.
+    #[test]
+    fn validated_boundary_rejects_unreadable_or_moved_frames() {
+        let records = vec![
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            text_step(1, "answer"),
+        ];
+        let bytes = encode_log(&records);
+        let scanned = scan_frames(&bytes);
+        // Seed at the no-tool step; the suffix after it is the terminal.
+        let boundary = seed_boundary_for(&bytes, &scanned, 3, true);
+        let tail: Vec<FramedRecord> = scanned[3..].iter().map(|(_, _, f)| f.clone()).collect();
+        let (origin, run_id, ordinal_base, held) = seeds_at_cut(&records, 3);
+        let seed = |log: &[u8], boundary: &SeedBoundary, tail: &[FramedRecord]| {
+            replay_seeded_at_validated_boundary(
+                log,
+                boundary,
+                tail,
+                origin.clone(),
+                run_id.clone(),
+                None,
+                None,
+                ordinal_base,
+                false,
+                Default::default(),
+                held.clone(),
+            )
+        };
+        // A restored copy that ends before the boundary frame: missing.
+        let short = &bytes[..boundary.frame_off as usize];
+        assert_eq!(
+            seed(short, &boundary, &[]).unwrap_err().reason,
+            "boundary frame outside log"
+        );
+        // A copy torn inside the boundary frame.
+        let torn = &bytes[..boundary.frame_off as usize + 2];
+        assert_eq!(
+            seed(torn, &boundary, &[]).unwrap_err().reason,
+            "torn boundary frame"
+        );
+        // Offsets moved to the neighbouring frame: the sequence no longer matches.
+        let mut moved = boundary.clone();
+        let (next_off, next_end, _) = scanned[1].clone();
+        moved.frame_off = next_off;
+        moved.frame_end = next_end;
+        assert_eq!(
+            seed(&bytes, &moved, &[]).unwrap_err().reason,
+            "boundary sequence mismatch"
+        );
+        // Rewritten bytes under the same lineage: the frame codec rejects the rewrite.
+        let mut rewritten = bytes.clone();
+        let last = rewritten[boundary.frame_end as usize - 1].wrapping_add(1);
+        rewritten[boundary.frame_end as usize - 1] = last;
+        assert_eq!(
+            seed(&rewritten, &boundary, &[]).unwrap_err().reason,
+            "corrupt boundary frame"
+        );
+        // A stored identity that no longer matches intact bytes.
+        let mut forged = boundary.clone();
+        forged.frame_identity = vec![0u8; 32];
+        assert_eq!(
+            seed(&bytes, &forged, &[]).unwrap_err().reason,
+            "boundary frame identity mismatch"
+        );
+        // A log restored under a different lineage.
+        let mut relined = boundary.clone();
+        relined.lineage_id = Some("other-lineage".into());
+        assert_eq!(
+            seed(&bytes, &relined, &[]).unwrap_err().reason,
+            "boundary lineage mismatch"
+        );
+        // The frame is intact but the index never qualified it.
+        let mut unqualified = boundary.clone();
+        unqualified.qualified = false;
+        assert_eq!(
+            seed(&bytes, &unqualified, &tail).unwrap_err().reason,
+            "unqualified boundary"
+        );
+        // The intact, qualified boundary seeds.
+        seed(&bytes, &boundary, &tail).expect("valid boundary seeds");
+    }
+
+    /// Cuts no committed boundary can ever cover fall back even when their frame is
+    /// intact: a tool-calling step swallowed before its batch committed, an empty
+    /// suffix after a durable dispatch intent, and a queued or steered record held
+    /// before unfinished tool work. Each names a kind that can never seed a tail.
+    #[test]
+    fn invalid_states_fall_back_to_full_replay() {
+        let batch_id = BatchId("r1-b9".into());
+        let tool_step = WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(9),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("m9".into()),
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    tool_call_id: ToolCallId("c".into()),
+                    tool_name: "work".into(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                })],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        };
+        let batch_started = WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id: StepId(9),
+            planned_calls: vec![ToolCallId("c".into())],
+        };
+        let intent = WalRecord::ToolDispatchIntent {
+            dispatched_at_ms: None,
+            hooks: None,
+            batch_id: batch_id.clone(),
+            tool_call_id: ToolCallId("c".into()),
+            tool_name: Some("work".into()),
+            args: Arc::new(serde_json::json!({})),
+            module_id: None,
+            schema_pin: None,
+            approval_digest: None,
+            call_key: None,
+        };
+        let try_cut = |records: Vec<WalRecord>, cut_seq: u64| {
+            let bytes = encode_log(&records);
+            let scanned = scan_frames(&bytes);
+            // The caller claims the cut frame qualified; the kind gate still refuses.
+            let boundary = seed_boundary_for(&bytes, &scanned, cut_seq, true);
+            replay_seeded_at_validated_boundary(
+                &bytes,
+                &boundary,
+                &[],
+                None,
+                Some(RunId("r1".into())),
+                None,
+                None,
+                1,
+                false,
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap_err()
+            .reason
+        };
+        // A tool-calling step swallowed before its batch committed.
+        assert_eq!(
+            try_cut(
+                vec![
+                    run_started("r1", vec![user("task")]),
+                    step_started(9),
+                    tool_step.clone()
+                ],
+                3,
+            ),
+            "boundary frame cannot seed a tail"
+        );
+        // An empty suffix after a durable dispatch intent.
+        assert_eq!(
+            try_cut(
+                vec![
+                    run_started("r1", vec![user("task")]),
+                    step_started(9),
+                    tool_step,
+                    batch_started,
+                    intent,
+                ],
+                5,
+            ),
+            "boundary frame cannot seed a tail"
+        );
+        // A queued record, and a steered record, held before unfinished tool work.
+        let queued = WalRecord::Queued {
+            written_at_ms: None,
+            retention: None,
+            ts_ms: None,
+            keep_warm: None,
+            conversation_key: None,
+            submission_id: broca_protocol::SubmissionId("q".into()),
+            request: Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "model": serde_json::to_value(&run_config().model).unwrap(),
+                    "input": [],
+                }))
+                .unwrap(),
+            ),
+            request_identity_digest: None,
+            principal: None,
+            send_id: None,
+            title: None,
+            delivery: None,
+            hooks: None,
+        };
+        assert_eq!(
+            try_cut(
+                vec![
+                    run_started("r1", vec![user("task")]),
+                    step_started(9),
+                    queued
+                ],
+                3,
+            ),
+            "boundary frame cannot seed a tail"
+        );
+        assert_eq!(
+            try_cut(
+                vec![
+                    run_started("r1", vec![user("task")]),
+                    step_started(9),
+                    steered("held")
+                ],
+                3,
+            ),
+            "boundary frame cannot seed a tail"
+        );
     }
 }

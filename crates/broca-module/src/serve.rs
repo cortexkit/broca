@@ -3868,14 +3868,14 @@ fn media_preflight_error(error: broca_core::RunError) -> ServeError {
 /// WAL past its watermark. The offset index serves the same head from the session row
 /// and the newest message row's byte range: the head decodes only those frames, never
 /// the whole log. A Setup in the tail renumbers indexed tags, so the caller advances
-/// the index before serving when [`head_tail_needs_index_up`] is true. Later changes
+/// the index before serving when [`head_tail_needs_index_up`] is true. Production offset reads
 /// wire `broca.db` into `head_for`; this helper already pins the decode bound the head
 /// must keep.
 ///
 /// The head's byte range is the newest message row's `[lo_off, hi_off)`: one frame for a
 /// single-message turn, the turn's span for a tool turn whose two messages share it.
 /// With frame-decode counting on, serving the head decodes only that range.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 pub(crate) fn head_byte_range_for_offsets(
     newest: Option<&crate::registry::OffsetPageRow>,
 ) -> Option<(u64, u64)> {
@@ -3887,7 +3887,7 @@ pub(crate) fn head_byte_range_for_offsets(
 /// Delegates to the replay crate's detector so head, page and tail checks cannot drift
 /// apart. A durable Setup before its index commit (durable tail, stale index) forces a
 /// catch-up: recovery replays the Setup into the index before the head is served.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 pub(crate) fn head_tail_needs_index_up(tail: &[broca_wal::FramedRecord]) -> bool {
     broca_core::replay::tail_contains_compaction_setup(tail)
 }

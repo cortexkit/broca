@@ -4527,7 +4527,7 @@ impl Drop for CloseToken {
 /// Today's `route_read_page_view` replays from the materialized store or from byte zero.
 /// The offset index lets a read decode only the frames its page needs: each message row
 /// names the WAL byte range its message is built from, and the tail after `indexed_end`
-/// is decoded once. Later changes wire `broca.db` into this registry and advance the
+/// is decoded once. Production offset reads wire `broca.db` into this registry and advance the
 /// index when a Setup sits in the tail; these helpers already pin the byte-equality and
 /// decode-bounding properties those reads must keep.
 ///
@@ -4537,9 +4537,8 @@ impl Drop for CloseToken {
 /// `indexed_seq` are decoded from their indexed offsets and seeded into the tail replay,
 /// so the tail places them exactly as a full replay would.
 ///
-/// Staged for the offset reads later slices wire to `broca.db`; no production path
-/// calls these yet, so dead code is allowed until then.
-#[allow(dead_code)]
+/// Staged for the offset page reads; no production path calls these yet.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 pub(crate) struct OffsetPageRow {
     /// Transcript ordinal of the message.
     pub ord: u64,
@@ -4553,7 +4552,7 @@ pub(crate) struct OffsetPageRow {
 /// Returns `None` for an empty page. The range is contiguous because ordinals follow WAL
 /// order; a tool turn's two rows share the turn's range, so a page that splits the turn
 /// still decodes the whole turn once, never the whole log.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 pub(crate) fn page_byte_range_for_ordinals(
     rows: &[OffsetPageRow],
     from_ordinal: u64,
@@ -4583,7 +4582,7 @@ pub(crate) fn page_byte_range_for_ordinals(
 /// range stop the decode without an error, exactly as a read-only tail does. Decoding
 /// any other bytes is a caller bug: with counting on, a test asserts the count equals
 /// the frames of the requested range, never the whole log.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 pub(crate) fn decode_frames_at_offsets(
     bytes: &[u8],
     ranges: &[(u64, u64)],
@@ -4653,7 +4652,7 @@ pub(crate) fn decode_frames_at_offsets(
 /// show stale numbers. The caller advances the index (crash-cut: the Setup is durable
 /// before its index commit, so recovery replays it) and then serves. Delegates to the
 /// replay crate's detector so page and tail checks cannot drift apart.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
 pub(crate) fn setup_in_tail_needs_index_up(tail: &[broca_wal::FramedRecord]) -> bool {
     broca_core::replay::tail_contains_compaction_setup(tail)
 }
@@ -6189,6 +6188,7 @@ mod offset_page_tests {
         decode_frames_at_offsets, page_byte_range_for_ordinals, setup_in_tail_needs_index_up,
         OffsetPageRow,
     };
+    use sha2::Digest;
 
     fn user(text: &str) -> Message {
         Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
@@ -6588,19 +6588,36 @@ mod offset_page_tests {
     fn tail_replay_seeded_with_held_steers_matches_full_replay() {
         let (bytes, records) = corpus_wal();
         let full = broca_core::replay(&records.to_vec()).unwrap();
+        let (offsets, framed) = scan_offsets(&bytes);
         // Cut after the steer is recorded but before its placing terminal: the index holds
-        // it, the tail has not seen it. Seeding the tail with the held steer matches full.
-        let cut = records
+        // it, the tail has not seen it. The seeding boundary is the committed turn before
+        // the steer; the tail starts past the steer's frame with the steer seeded.
+        let steer_idx = records
             .iter()
             .position(|r| matches!(r, WalRecord::Steered { .. }))
-            .unwrap()
-            + 1;
-        let prefix_records: Vec<WalRecord> = records[..cut].to_vec();
-        let tail_records: Vec<WalRecord> = records[cut..].to_vec();
+            .unwrap();
+        let turn_idx = records[..steer_idx]
+            .iter()
+            .rposition(|r| matches!(r, WalRecord::TurnFinished { .. }))
+            .unwrap();
+        let (turn_off, turn_end) = offsets[turn_idx];
+        let boundary = broca_core::replay::SeedBoundary {
+            lineage_id: None,
+            seq: framed[turn_idx].seq,
+            frame_off: turn_off,
+            frame_end: turn_end,
+            frame_identity: sha2::Sha256::digest(&bytes[turn_off as usize..turn_end as usize])
+                .to_vec(),
+            qualified: true,
+        };
+        let tail: Vec<FramedRecord> = framed[steer_idx + 1..].to_vec();
+        let prefix_records: Vec<WalRecord> = records[..steer_idx + 1].to_vec();
         let prefix = broca_core::replay(&prefix_records).unwrap();
         assert_eq!(prefix.pending_steers.len(), 1);
-        let tail = broca_core::replay::replay_seeded_with_held_steers(
-            &tail_records,
+        let tail_state = broca_core::replay::replay_seeded_at_validated_boundary(
+            &bytes,
+            &boundary,
+            &tail,
             None,
             prefix.run_id.clone(),
             None,
@@ -6610,11 +6627,11 @@ mod offset_page_tests {
             Default::default(),
             prefix.pending_steers.clone(),
         )
-        .unwrap();
+        .expect("validated boundary seeds the held steer");
         let mut merged = prefix.prompt.clone();
-        merged.extend(tail.prompt.clone());
+        merged.extend(tail_state.prompt.clone());
         assert_eq!(prompt_shape(&merged), prompt_shape(&full.prompt));
-        let _ = bytes;
+        assert_eq!(merged.len(), full.prompt.len());
     }
 
     #[test]
