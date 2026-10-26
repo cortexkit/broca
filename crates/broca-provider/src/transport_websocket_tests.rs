@@ -42,6 +42,7 @@ fn cut_tool_events(ceiling: bool) -> Vec<Value> {
 
 #[derive(Default, Debug)]
 struct Observed {
+    closes_at_request: Vec<usize>,
     handshakes: usize,
     headers: Vec<BTreeMap<String, String>>,
     upgrade_bytes: Vec<Vec<u8>>,
@@ -212,7 +213,12 @@ impl Mock {
                             while let Some(Ok(message)) = socket.next().await {
                                 match message {
                                     WsMessage::Text(text) => {
-                                        seen.lock().unwrap().requests.push(text.as_bytes().to_vec());
+                                        {
+                                            let mut seen = seen.lock().unwrap();
+                                            let closes = seen.closes;
+                                            seen.closes_at_request.push(closes);
+                                            seen.requests.push(text.as_bytes().to_vec());
+                                        }
                                         notify.notify_one();
                                          let events = queue.lock().unwrap().pop_front().unwrap_or_else(text_events);
                                          let incomplete = !events.iter().any(|event| event["type"] == "response.completed");
@@ -1073,7 +1079,16 @@ async fn codex_tool_run(
         1,
         "one actual tool handler invocation"
     );
-    mock.wait_closes(1).await;
+    let retired_before_completion = expected_handshakes - 1;
+    if retired_before_completion > 0 {
+        mock.wait_closes(retired_before_completion).await;
+    }
+    assert_eq!(
+        mock.observed.lock().unwrap().closes,
+        retired_before_completion
+    );
+    provider.client.chatgpt_connections().retire_session(&bind);
+    mock.wait_closes(expected_handshakes).await;
     let records = wal.read_records(&bind).unwrap();
     assert_eq!(
         records
@@ -3372,6 +3387,9 @@ async fn websocket_wrapped_refusal_warn_carries_the_capped_frame() {
     assert_eq!(logged.len(), 1024);
     assert!(!logged.contains("PRIVATE-HEADER-VALUE"), "{logged}");
 }
+
+#[path = "transport_websocket_cross_run_tests.rs"]
+mod cross_run;
 
 /// A 429 capacity refusal in the shape OpenAI's Codex backend sends on a socket upgrade, with a
 /// `Retry-After` of several minutes.

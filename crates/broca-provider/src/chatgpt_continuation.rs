@@ -10,6 +10,39 @@ pub(crate) struct CompletedResponse {
 }
 
 impl CompletedResponse {
+    /// Conservatively charge owned receipt storage, including spare string/array capacity.
+    /// Map entries get extra room for tree/hash nodes and unused node slots; this is a
+    /// retention budget, not a claim to measure allocator or process RSS exactly.
+    #[cfg(feature = "live")]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        fn allocations(value: &Value) -> usize {
+            match value {
+                Value::String(text) => text.capacity(),
+                Value::Array(items) => {
+                    items.capacity() * std::mem::size_of::<Value>()
+                        + items.iter().map(allocations).sum::<usize>()
+                }
+                Value::Object(items) => {
+                    items.len()
+                        * 12
+                        * (std::mem::size_of::<String>()
+                            + std::mem::size_of::<Value>()
+                            + 4 * std::mem::size_of::<usize>())
+                        + items
+                            .iter()
+                            .map(|(key, value)| key.capacity() + allocations(value))
+                            .sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
+        std::mem::size_of::<Self>()
+            + self.response_id.capacity()
+            + self.output.capacity() * std::mem::size_of::<Value>()
+            + allocations(&self.request)
+            + self.output.iter().map(allocations).sum::<usize>()
+    }
+
     /// Codex 0.163.0 compares these eleven request properties before reusing a response.
     /// Delivery options, client metadata and access programs deliberately do not participate.
     pub fn suffix_start(&self, current: &Value) -> Result<usize, &'static str> {

@@ -187,6 +187,15 @@ pub trait RunExecutor: Send + Sync + 'static {
     /// a failure here must not block the close.
     async fn on_session_close(&self, _session: &BindIdentity) {}
 
+    /// Discard authenticated connection state when a session is deleted or moved.
+    fn retire_session_transport(&self, _session: &BindIdentity) {}
+
+    /// Drop only idle connections while a move probes whether a session is busy.
+    fn retire_idle_session_transport(&self, _session: &BindIdentity) {}
+
+    /// Discard idle and borrowed connections after the module's shutdown grace period.
+    fn retire_all_transports(&self) {}
+
     /// Called after the actor has durably written an `Interrupted` terminal for a run it
     /// sealed: one stopped by the module's shutdown, or one a crash left in flight. The run
     /// loop did not write that terminal, so an executor that reports each run's end hears of
