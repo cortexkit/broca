@@ -5931,27 +5931,22 @@ impl LineageRegistry {
             if let Some(probe) = probe {
                 probe();
             }
-            if run.is_none()
+            let meta = if run.is_none()
                 && service
                     .wal
                     .resolve_live_path(&key)
                     .map_err(|e| e.to_string())?
                     .is_none()
             {
-                let meta = store
+                store
                     .as_ref()
                     .map(|store| store.read_admission_snapshot(&key))
                     .transpose()?
-                    .flatten();
-                if service
-                    .wal
-                    .lineage_exists(&key, meta.as_ref())
-                    .map_err(|e| e.to_string())?
-                {
-                    return Ok(None);
-                }
-            }
-            service.expired_head(&key, run.as_deref(), head)
+                    .flatten()
+            } else {
+                None
+            };
+            service.expired_head_with_meta(&key, run.as_deref(), head, meta.as_ref())
         })
         .await
         .map_err(|e| OpenError::Open(e.to_string()))?

@@ -1,11 +1,230 @@
 use super::*;
 use broca_core::{ExportIndex, MaterializedStore, RunIndex, RunIndexState};
 use broca_protocol::{RunFinishReason, RunId};
+use broca_wal::Wal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MARKER: &str = "RETENTION-MODULE-CONTENT-SENTINEL-59137";
 
+fn archive_forever_sessions(rig: &Rig, count: usize) -> Vec<BindIdentity> {
+    let archive = rig.root.join("wal-archive/fold-1000.ark");
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    let mut writer = broca_wal::archive::ArchiveWriter::create(&archive)
+        .unwrap()
+        .without_feature_floor();
+    let mut keys = Vec::new();
+    for n in 0..count {
+        let key = BindIdentity::new(rig.root.join("project"), "runner", format!("archive-{n}"));
+        let mut wal = rig.service.wal.open(&key).unwrap();
+        wal.append(
+            1,
+            &started(&key, &format!("archive-run-{n}"), None, 100),
+            false,
+        )
+        .unwrap();
+        for _ in 0..4 {
+            wal.append(1, &large_expiry_step(), false).unwrap();
+        }
+        wal.append(1, &finished(200), true).unwrap();
+        drop(wal);
+        let path = rig.service.wal.wal_path(&key);
+        writer
+            .append(&broca_core::session_addr(&key), &fs::read(&path).unwrap())
+            .unwrap();
+        fs::remove_file(path).unwrap();
+        keys.push(key);
+    }
+    writer.seal().unwrap();
+    keys
+}
+
+#[cfg(unix)]
+#[test]
+fn archived_expiry_checks_bound_member_decodes() {
+    let rig = Rig::new();
+    let keys = archive_forever_sessions(&rig, 10);
+    let before = broca_wal::archive::expiry_io::counts();
+    let start = std::time::Instant::now();
+    for n in 0..1000 {
+        let key = &keys[n % keys.len()];
+        let run = (n % 2 == 0).then_some("archive-run-0");
+        assert_eq!(rig.service.expired(key, run).unwrap(), None);
+    }
+    let after = broca_wal::archive::expiry_io::counts();
+    let (opens, loads, decodes) = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+    eprintln!(
+        "archived expiry: 1000 checks, {} sessions, {:?}, {opens} archive opens, {loads} payload loads, {decodes} WAL member decodes",
+        keys.len(), start.elapsed()
+    );
+    assert!(decodes <= keys.len() as u64, "{decodes} member decodes");
+    assert!(opens <= keys.len() as u64, "{opens} archive opens");
+}
+
+#[tokio::test]
+async fn archived_expiry_cache_keeps_tombstones_and_newer_lineages_authoritative() {
+    let rig = Rig::new();
+    let key = archive_forever_sessions(&rig, 1).pop().unwrap();
+    let registry = rig.registry(None);
+    let id = rig
+        .service
+        .wal
+        .read_records_range(&key, 0, None, None)
+        .unwrap()
+        .lineage_id
+        .unwrap()
+        .to_string();
+    for _ in 0..2 {
+        registry.check_expired(&key, None).await.unwrap();
+        registry
+            .check_expired(&key, Some("archive-run-0"))
+            .await
+            .unwrap();
+    }
+    let stone = Tombstone {
+        next_tag: None,
+        next_notice_seq: None,
+        lineage_id: id,
+        expired_at_ms: 1234,
+        seq: 2,
+        completed_at_ms: None,
+    };
+    rig.service.write_tombstone(&key, &stone).unwrap();
+    for run in [None, Some("archive-run-0")] {
+        assert!(matches!(
+            registry.check_expired(&key, run).await,
+            Err(crate::registry::OpenError::Expired {
+                expired_at_ms: 1234
+            })
+        ));
+    }
+
+    // A restored or newly written live lineage wins over a cached archived predecessor.
+    let path = rig.service.wal.ephemeral_wal_path(&key);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let now = rig.service.clock.now_ms();
+    let mut wal = broca_wal::FileWal::open(&path)
+        .unwrap()
+        .with_feature_floor(rig.service.wal.feature_floor_path());
+    wal.append(
+        1,
+        &started(&key, "newer", Some(RETAINED_SECONDS), now),
+        false,
+    )
+    .unwrap();
+    wal.append(1, &finished(now), true).unwrap();
+    drop(wal);
+    registry.check_expired(&key, None).await.unwrap();
+    registry.check_expired(&key, Some("newer")).await.unwrap();
+
+    // Publish that newer generation under the same container name, not just a new path.
+    let archive = rig.root.join("wal-archive/fold-1000.ark");
+    let old_archive = fs::read(&archive).unwrap();
+    let replacement = rig.root.join("fold-1000.ark");
+    let mut writer = broca_wal::archive::ArchiveWriter::create(&replacement)
+        .unwrap()
+        .without_feature_floor();
+    writer
+        .append(&broca_core::session_addr(&key), &fs::read(&path).unwrap())
+        .unwrap();
+    writer.seal().unwrap();
+    fs::rename(replacement, &archive).unwrap();
+    fs::remove_file(path).unwrap();
+    for _ in 0..2 {
+        registry.check_expired(&key, None).await.unwrap();
+        registry.check_expired(&key, Some("newer")).await.unwrap();
+    }
+
+    fs::write(&archive, old_archive).unwrap();
+    assert!(matches!(
+        registry.check_expired(&key, None).await,
+        Err(crate::registry::OpenError::Expired {
+            expired_at_ms: 1234
+        })
+    ));
+
+    fs::remove_file(rig.root.join("wal-archive/fold-1000.ark")).unwrap();
+    assert!(matches!(
+        registry.check_expired(&key, None).await,
+        Err(crate::registry::OpenError::Expired {
+            expired_at_ms: 1234
+        })
+    ));
+}
+
 #[cfg(feature = "test-clock")]
+#[test]
+fn archived_expiry_cache_rechecks_retention_rows_clock_and_run_membership() {
+    let rig = Rig::new();
+    let now = rig.service.clock.now_ms();
+    let id = rig.seed(RETAINED_SECONDS, now, Some(now));
+    rig.service.rederive(&rig.key).unwrap();
+    let path = rig.service.wal.ephemeral_wal_path(&rig.key);
+    let archive = rig.root.join("wal-archive/fold-1000.ark");
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    let mut writer = broca_wal::archive::ArchiveWriter::create(&archive)
+        .unwrap()
+        .without_feature_floor();
+    writer
+        .append(
+            &broca_core::session_addr(&rig.key),
+            &fs::read(&path).unwrap(),
+        )
+        .unwrap();
+    writer.seal().unwrap();
+    fs::remove_file(path).unwrap();
+    let before = broca_wal::archive::expiry_io::counts();
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), None);
+    assert_eq!(rig.service.expired(&rig.key, Some("r1")).unwrap(), None);
+    let mut row = rig.store.lookup_retention_lineage(&id).unwrap().unwrap();
+    let deadline = row.expires_at_ms.unwrap();
+    fs::write(rig.root.join("test-clock"), br#"{"offset_ms":3600001}"#).unwrap();
+    rig.service.clock.refresh().unwrap();
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), Some(deadline));
+    assert_eq!(
+        rig.service.expired(&rig.key, Some("r1")).unwrap(),
+        Some(deadline)
+    );
+    assert_eq!(
+        rig.service.expired(&rig.key, Some("unknown")).unwrap(),
+        None
+    );
+    row.expires_at_ms = None;
+    row.expired_at_ms = Some(deadline);
+    rig.store.upsert_retention_lineage(&row, &[]).unwrap();
+    assert_eq!(rig.service.expired(&rig.key, None).unwrap(), Some(deadline));
+    let after = broca_wal::archive::expiry_io::counts();
+    if cfg!(unix) {
+        assert_eq!(after.2 - before.2, 1);
+    }
+}
+
+#[test]
+fn archived_expiry_cache_invalidates_on_publication_conflict_and_corruption() {
+    let rig = Rig::new();
+    let key = archive_forever_sessions(&rig, 1).pop().unwrap();
+    let archive = rig.root.join("wal-archive/fold-1000.ark");
+    assert_eq!(rig.service.expired(&key, None).unwrap(), None);
+    assert_eq!(rig.service.expired(&key, None).unwrap(), None);
+    let newer = rig.root.join("wal-archive/fold-2000.ark");
+    fs::copy(&archive, &newer).unwrap();
+    assert_eq!(rig.service.expired(&key, None).unwrap(), None);
+    fs::create_dir_all(rig.root.join("wal-archive-durable")).unwrap();
+    let conflict = rig.root.join("wal-archive-durable/fold-3000.ark");
+    fs::copy(&archive, &conflict).unwrap();
+    assert!(rig
+        .service
+        .expired(&key, None)
+        .unwrap_err()
+        .contains("conflicting archived WALs"));
+    fs::remove_file(conflict).unwrap();
+    assert_eq!(rig.service.expired(&key, None).unwrap(), None);
+    let mut bytes = fs::read(&newer).unwrap();
+    // Keep the filename and length unchanged: metadata identity must catch in-place damage.
+    bytes[100] ^= 1;
+    fs::write(&newer, bytes).unwrap();
+    assert!(rig.service.expired(&key, None).is_err());
+}
+
 fn large_expiry_step() -> WalRecord {
     WalRecord::ModelStepFinished {
         written_at_ms: None,

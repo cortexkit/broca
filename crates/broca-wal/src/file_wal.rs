@@ -2012,6 +2012,8 @@ pub fn read_verified_member_range(
     after_seq: u64,
     through_seq: Option<u64>,
 ) -> Result<WalRangeRead, WalError> {
+    #[cfg(any(test, feature = "test-io-trace"))]
+    crate::archive::expiry_io::decoded();
     let decoded = decode_bytes(bytes, 0, 1)?;
     select_decoded_range(
         decoded,
