@@ -76,6 +76,9 @@ mod retention_tests;
 #[path = "transport_websocket.rs"]
 mod responses_websocket;
 
+#[path = "transport_codex_retry.rs"]
+mod codex_retry;
+
 #[path = "transport_request_gzip.rs"]
 pub mod request_gzip;
 
@@ -1315,8 +1318,7 @@ impl StreamRateWindow {
 // jitter at its top, so they never reach RETRY_WALL_BUDGET. Retry-After waits can, and the budget
 // stops them: failed attempts with no response bytes plus waits may consume at most 240 s.
 // Streamed generation time is excluded: progress followed by a cut is not time spent waiting
-// for an unavailable provider. This applies to every wire family and both transports.
-// HTTPS recovery after socket exhaustion has its own bounded attempt and waiting allowance.
+// for an unavailable provider.
 //
 // Some failures are never re-sent at all, whatever the budget: permanent, auth and context
 // overflow classes, `x-should-retry: false`, an exhausted account, a refused service tier, and a
@@ -1325,6 +1327,12 @@ impl StreamRateWindow {
 // One exception adds a send: a 401 answered by a fresh token for the same credential is re-sent
 // once, outside MAX_ATTEMPTS but inside RETRY_WALL_BUDGET.
 // `drive_step_attempts` states the full rule where it applies it.
+//
+// The two OpenAI Responses families (`openai_responses` and `openai_responses_chatgpt`) do not
+// use this schedule. They take Codex's retry decision instead: see `codex_retry`. For them
+// there is no MAX_ATTEMPTS, cap on the server's time or waiting budget. The permanent-class,
+// `x-should-retry: false`, exhausted-account and second-decode-failure vetoes and the 401
+// re-send apply to them unchanged.
 const MAX_ATTEMPTS: usize = 6;
 const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(30);
@@ -2032,11 +2040,7 @@ where
     let mut decode_retries = 0usize;
     let mut escape_used = false;
     let mut retry_wait_spent = Duration::ZERO;
-    let mut phase_start = 0usize;
-    let mut phase_refreshes = 0usize;
-    let mut mid_response_closes = 0usize;
-    let mut socket_phase_seen = false;
-    let mut https_allowance_started = false;
+    let mut refreshes = 0usize;
     // How a token-refresh re-send counts (see the retry schedule above MAX_ATTEMPTS):
     // - Attempts: it is ONE send on top of MAX_ATTEMPTS, so the budget grows by one and a
     //   transient failure after the re-send still gets the full set of ordinary re-sends.
@@ -2045,7 +2049,15 @@ where
     // - Waiting: NOT exempt. Asking for a fresh token consumes the waiting allowance.
     // `credential_refresh` is the evidence the next attempt's record carries when it goes out
     // with a token refreshed inside this step, by either the 401 path or the pre-send check.
-    let mut attempt_budget = MAX_ATTEMPTS;
+    // The OpenAI Responses families count their retries the way Codex does, in `codex_retry`;
+    // for them the loop itself sets no attempt limit.
+    let mut codex =
+        codex_retry::applies(request.family).then(codex_retry::CodexRetryState::default);
+    let mut attempt_budget = if codex.is_some() {
+        usize::MAX
+    } else {
+        MAX_ATTEMPTS
+    };
     let mut credential_refresh: Option<CredentialRefresh> = None;
     // A step recovers from a 401 at most once, so a second 401 (even from the refreshed token)
     // ends the step. The expiry check before each attempt is not counted against this: it
@@ -2200,17 +2212,6 @@ where
             Err(failure) => failure.outcome.clone(),
         };
         let attempt_elapsed = retry_clock.attempt_elapsed(attempt_started);
-        if trace.transport.as_deref() == Some("websocket") {
-            socket_phase_seen = true;
-        } else if socket_phase_seen && !https_allowance_started {
-            // The session's six socket failures or ChatGPT HTTPS policy can select HTTPS
-            // inside the driver. Start its own allowance even when socket sends remained.
-            https_allowance_started = true;
-            phase_start = attempt_index;
-            phase_refreshes = 0;
-            attempt_budget = phase_start + MAX_ATTEMPTS;
-            retry_wait_spent = Duration::ZERO;
-        }
         if result.is_err() && trace.response_len == 0 {
             retry_wait_spent += attempt_elapsed;
         }
@@ -2283,8 +2284,8 @@ where
                         &mut served_account_ref,
                     );
                     credential_refresh = Some(refreshed.evidence);
-                    attempt_budget += 1;
-                    phase_refreshes += 1;
+                    attempt_budget = attempt_budget.saturating_add(1);
+                    refreshes += 1;
                     retry_wait_spent += retry_clock.elapsed_since(refresh_started);
                     warn_attempt_retry(&failure, &trace, "retrying", "credential_refresh");
                     // A new token needs no backoff; only the partial display is reset.
@@ -2303,7 +2304,7 @@ where
                 }
                 // The ordinal among ordinary attempts, leaving out a token-refresh re-send, so
                 // the backoff curve is the same with or without one.
-                let ordinary_index = attempt_index - phase_start - phase_refreshes;
+                let ordinary_index = attempt_index - refreshes;
                 if !failure.error.class.step_reissuable()
                     || failure.retry_forbidden
                     || (failure.cause == Some(AttemptCause::DeterministicDecode)
@@ -2313,80 +2314,112 @@ where
                     return Err((failure.error, attempt_index as u32));
                 }
 
-                let socket_attempt = trace.transport.as_deref() == Some("websocket")
-                    && failure.cause == Some(AttemptCause::TransportTransient);
-                if socket_attempt
-                    && failure.outcome == AttemptOutcome::ChunkError
-                    && trace.response_len > 0
-                {
-                    mid_response_closes += 1;
-                } else {
-                    mid_response_closes = 0;
-                }
-                let switching = socket_attempt
-                    && (mid_response_closes >= 2 || attempt_index + 1 >= attempt_budget);
-                if switching {
-                    websocket
-                        .expect("socket attempt has a session")
-                        .switch_to_https();
-                    // Keep the canonical request and global attempt ordinal; only the transport's
-                    // bounded allowance restarts. Failed attempts never publish the assembled
-                    // assistant message that the run loop uses to dispatch tools.
-                    phase_start = attempt_index + 1;
-                    https_allowance_started = true;
-                    phase_refreshes = 0;
-                    attempt_budget = phase_start + MAX_ATTEMPTS;
-                    retry_wait_spent = Duration::ZERO;
-                } else if attempt_index + 1 >= attempt_budget {
-                    warn_attempt_retry(&failure, &trace, "attempts_exhausted", "attempt_limit");
-                    return Err((failure.error, attempt_index as u32));
-                }
-
-                if failure.cause == Some(AttemptCause::DeterministicDecode) {
-                    decode_retries += 1;
-                }
-                let delay = retry_delay(&failure.error, ordinary_index);
-                if failure.error.status == Some(429)
-                    && failure.error.retry_after_secs.is_some()
-                    && deadline.is_some_and(|deadline| {
-                        delay >= deadline.saturating_duration_since(Instant::now())
-                    })
-                {
-                    warn_attempt_retry(
-                        &failure,
-                        &trace,
-                        "not_retryable",
-                        "retry_after_exceeds_deadline",
+                let delay = if let Some(codex) = codex.as_mut() {
+                    if failure.cause == Some(AttemptCause::DeterministicDecode) {
+                        decode_retries += 1;
+                    }
+                    let decision = codex.decide(
+                        &codex_retry::CodexFailure {
+                            error: &failure.error,
+                            outcome: &failure.outcome,
+                            https: trace.transport.as_deref() != Some("websocket"),
+                        },
+                        // Codex disables its WebSocket only where the transport could use one.
+                        || {
+                            request.family
+                                == Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
+                                && websocket.is_some_and(|session| session.try_switch_to_https())
+                        },
                     );
-                    return Err((failure.error, attempt_index as u32));
-                }
-                if retry_wait_spent + delay > RETRY_WALL_BUDGET {
-                    warn_attempt_retry(&failure, &trace, "wall_exhausted", "waiting_budget");
-                    return Err((failure.error, attempt_index as u32));
-                }
+                    let (delay, server_advised, decision, reason) = match decision {
+                        codex_retry::CodexDecision::Terminal { reason } => {
+                            let decision = if reason == "attempt_limit" {
+                                "attempts_exhausted"
+                            } else {
+                                "not_retryable"
+                            };
+                            warn_attempt_retry(&failure, &trace, decision, reason);
+                            return Err((failure.error, attempt_index as u32));
+                        }
+                        codex_retry::CodexDecision::Retry {
+                            delay,
+                            server_advised,
+                            reason,
+                        } => (delay, server_advised, "retrying", reason),
+                        codex_retry::CodexDecision::FallBackToHttps {
+                            delay,
+                            server_advised,
+                        } => (
+                            delay,
+                            server_advised,
+                            "switching_to_https",
+                            "socket_attempt_limit",
+                        ),
+                    };
+                    // The server's time is waited out in full, never cut short, so a deadline
+                    // that comes first ends the step now rather than after a wait that cannot
+                    // lead to a send.
+                    if server_advised
+                        && deadline.is_some_and(|deadline| {
+                            delay >= deadline.saturating_duration_since(Instant::now())
+                        })
+                    {
+                        warn_attempt_retry(
+                            &failure,
+                            &trace,
+                            "not_retryable",
+                            "retry_after_exceeds_deadline",
+                        );
+                        return Err((failure.error, attempt_index as u32));
+                    }
+                    warn_attempt_retry(&failure, &trace, decision, reason);
+                    delay
+                } else {
+                    // Only the ChatGPT family, which takes the branch above, uses a socket, so
+                    // every attempt here went out over HTTPS.
+                    if attempt_index + 1 >= attempt_budget {
+                        warn_attempt_retry(&failure, &trace, "attempts_exhausted", "attempt_limit");
+                        return Err((failure.error, attempt_index as u32));
+                    }
 
-                warn_attempt_retry(
-                    &failure,
-                    &trace,
-                    if switching {
-                        "switching_to_https"
-                    } else {
-                        "retrying"
-                    },
-                    if switching && mid_response_closes >= 2 {
-                        "consecutive_mid_response_closes"
-                    } else if switching {
-                        "socket_attempt_limit"
-                    } else {
-                        "transient_failure"
-                    },
-                );
+                    if failure.cause == Some(AttemptCause::DeterministicDecode) {
+                        decode_retries += 1;
+                    }
+                    let delay = retry_delay(&failure.error, ordinary_index);
+                    if failure.error.status == Some(429)
+                        && failure.error.retry_after_secs.is_some()
+                        && deadline.is_some_and(|deadline| {
+                            delay >= deadline.saturating_duration_since(Instant::now())
+                        })
+                    {
+                        warn_attempt_retry(
+                            &failure,
+                            &trace,
+                            "not_retryable",
+                            "retry_after_exceeds_deadline",
+                        );
+                        return Err((failure.error, attempt_index as u32));
+                    }
+                    if retry_wait_spent + delay > RETRY_WALL_BUDGET {
+                        warn_attempt_retry(&failure, &trace, "wall_exhausted", "waiting_budget");
+                        return Err((failure.error, attempt_index as u32));
+                    }
+
+                    warn_attempt_retry(&failure, &trace, "retrying", "transient_failure");
+                    delay
+                };
 
                 let wait_started = retry_clock.mark();
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Ok((Vec::new(), 0)),
                     _ = tx.closed() => return Ok((Vec::new(), 0)),
+                    // A shutdown during the wait seals the run Interrupted; no attempt is in
+                    // flight, so go quiet exactly as when the seal refuses the next attempt.
+                    _ = step_seal.tripped() => {
+                        tx.closed().await;
+                        return Ok((Vec::new(), 0));
+                    }
                     _ = retry_clock.sleep(delay) => {}
                 }
                 retry_wait_spent += retry_clock.elapsed_since(wait_started);
@@ -2846,7 +2879,11 @@ async fn drive_attempt(
         .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
     if !status.is_success() {
         let code = status.as_u16();
-        let retry_after_secs = parse_retry_after_header(resp.headers());
+        let retry_after_secs = if codex_retry::applies(request.family) {
+            codex_retry::retry_after_secs(resp.headers())
+        } else {
+            parse_retry_after_header(resp.headers())
+        };
         // Read before the body consumes the response: an account-limit refusal is told apart
         // from an ordinary rate limit only by its headers.
         let headers = response_headers(resp.headers());
@@ -5932,7 +5969,9 @@ mod tests {
         elapsed: Duration,
         response: ScriptResponse,
     ) -> (Vec<NormalizedEvent>, usize, usize) {
-        let server = ScriptedServer::start(vec![response; 6]).await;
+        // Room for the OpenAI Responses families' Codex schedule: six stream rounds of one send
+        // and four request-layer re-sends each. Other families stop after six sends.
+        let server = ScriptedServer::start(vec![response; 30]).await;
         let mut provider = retry_test_provider(&server, 0);
         Arc::make_mut(&mut provider.frozen).family_id = family;
         let waits = use_virtual_retry_waits(&mut provider);
@@ -6028,9 +6067,11 @@ mod tests {
             terminal_error(&events).provider_code.as_deref(),
             Some("response_deadline")
         );
-        assert_deadline_retry_count(&events, 5);
-        assert_eq!(sends, 6);
-        assert_eq!(waits, 5);
+        // Codex's schedule for an HTTPS 5xx: each of the six stream rounds (the first send and
+        // five stream retries) is one send plus four request-layer re-sends.
+        assert_deadline_retry_count(&events, 29);
+        assert_eq!(sends, 30);
+        assert_eq!(waits, 29);
     }
 
     /// Make one test provider's retry waits virtual: they return at once and count as elapsed
@@ -8190,12 +8231,15 @@ mod tests {
         assert!(waits.lock().unwrap().is_empty(), "no retry wait");
     }
 
+    /// An ordinary ChatGPT 429 is not an exhausted account. As in Codex it is retried only when
+    /// the server gave a retry time, and then after exactly that time; without one it ends the
+    /// step, still `transient`.
     #[tokio::test]
-    async fn an_ordinary_chatgpt_429_is_still_retried() {
+    async fn an_ordinary_chatgpt_429_retries_only_on_the_server_retry_time() {
         let server = ScriptedServer::start(vec![
             ScriptResponse::Http {
                 status: 429,
-                headers: Vec::new(),
+                headers: vec![("Retry-After", "3")],
                 body: br#"{"error":{"type":"rate_limit_exceeded","message":"Rate limit reached"}}"#,
             },
             ScriptResponse::Http {
@@ -8206,11 +8250,27 @@ mod tests {
         ])
         .await;
         let mut provider = chatgpt_retry_test_provider(&server);
-        use_virtual_retry_waits(&mut provider);
+        let waits = use_virtual_retry_waits(&mut provider);
 
         let events = collect_step_events(&provider, CancellationToken::new(), None).await;
         assert!(terminal_error_if_any(&events).is_none());
         assert_eq!(server.request_bodies().len(), 2);
+        assert_eq!(*waits.lock().unwrap(), vec![Duration::from_secs(3)]);
+
+        let server = ScriptedServer::start(vec![ScriptResponse::Http {
+            status: 429,
+            headers: Vec::new(),
+            body: br#"{"error":{"type":"rate_limit_exceeded","message":"Rate limit reached"}}"#,
+        }])
+        .await;
+        let mut provider = chatgpt_retry_test_provider(&server);
+        let waits = use_virtual_retry_waits(&mut provider);
+        let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+        let error = terminal_error(&events);
+        assert_eq!(error.class, ErrorClass::Transient);
+        assert!(!error.is_account_limit_exhausted());
+        assert_eq!(server.request_bodies().len(), 1);
+        assert!(waits.lock().unwrap().is_empty());
     }
 
     /// An Antigravity (Code Assist) quota-wall 429 body. Everything up to and including
@@ -8704,6 +8764,337 @@ mod tests {
             .is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(server.request_bodies().len(), 1);
+    }
+
+    /// A retry-test provider whose requests carry `family`, sent over plain HTTPS (the ChatGPT
+    /// family's socket is switched off), so the step takes that family's retry decision.
+    fn family_retry_test_provider(
+        server: &ScriptedServer,
+        family: WireFamilyId,
+    ) -> LiveProvider<RetryTestFamily> {
+        let mut provider = retry_test_provider(server, 0);
+        Arc::make_mut(&mut provider.frozen).family_id = family;
+        provider
+    }
+
+    const CODEX_FAMILIES: [WireFamilyId; 2] = [
+        WireFamilyId::OpenAiResponses,
+        WireFamilyId::OpenAiResponsesChatgpt,
+    ];
+
+    /// A 429 capacity refusal in the shape OpenAI's Codex backend sends.
+    const CAPACITY_429_BODY: &[u8] = br#"{"error":{"code":"turn_rate_limit_exceeded","message":"Codex is at capacity, please try again later","type":"rate_limit_error"},"status":429}"#;
+
+    fn attempt_digests(events: &[NormalizedEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) => {
+                    Some(attempt.request_body_sha256.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A 429 with `Retry-After: 469` waits exactly 469 s (no 120 s cap) and then sends the same
+    /// bytes again, for both OpenAI Responses families.
+    #[tokio::test]
+    async fn codex_families_wait_exactly_the_server_retry_after_and_resend_the_same_bytes() {
+        for family in CODEX_FAMILIES {
+            let server = ScriptedServer::start(vec![
+                ScriptResponse::Http {
+                    status: 429,
+                    headers: vec![("Retry-After", "469")],
+                    body: CAPACITY_429_BODY,
+                },
+                ScriptResponse::Http {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"success",
+                },
+            ])
+            .await;
+            let mut provider = family_retry_test_provider(&server, family);
+            let waits = use_virtual_retry_waits(&mut provider);
+
+            let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+            assert!(terminal_error_if_any(&events).is_none(), "{family:?}");
+            assert_eq!(
+                *waits.lock().unwrap(),
+                vec![Duration::from_secs(469)],
+                "{family:?}"
+            );
+            let bodies = server.request_bodies();
+            assert_eq!(bodies.len(), 2, "{family:?}");
+            assert_eq!(bodies[0], bodies[1], "{family:?}");
+            let digests = attempt_digests(&events);
+            assert_eq!(digests.len(), 2, "{family:?}");
+            assert_eq!(digests[0], digests[1], "{family:?}");
+        }
+    }
+
+    /// A 429 without a server retry time ends the step at once, as Codex's `RetryLimit` does.
+    /// `retry-after-ms` is not a retry time for these families: Codex does not read it.
+    #[tokio::test]
+    async fn codex_families_end_a_429_without_a_server_retry_time() {
+        for family in CODEX_FAMILIES {
+            for headers in [Vec::new(), vec![("retry-after-ms", "5000")]] {
+                let server = ScriptedServer::start(vec![
+                    ScriptResponse::Http {
+                        status: 429,
+                        headers: headers.clone(),
+                        body: CAPACITY_429_BODY,
+                    },
+                    ScriptResponse::Http {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: b"must not be sent",
+                    },
+                ])
+                .await;
+                let mut provider = family_retry_test_provider(&server, family);
+                let waits = use_virtual_retry_waits(&mut provider);
+
+                let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+                let error = terminal_error(&events);
+                assert_eq!(error.status, Some(429), "{family:?} {headers:?}");
+                assert_eq!(error.class, ErrorClass::Transient, "{family:?} {headers:?}");
+                assert_eq!(error.retry_after_secs, None, "{family:?} {headers:?}");
+                assert_eq!(server.request_bodies().len(), 1, "{family:?} {headers:?}");
+                assert!(waits.lock().unwrap().is_empty(), "{family:?} {headers:?}");
+            }
+        }
+    }
+
+    /// A step deadline that comes before the server's time ends the step at once, with the
+    /// server's time on the error. Without the deadline the same answer is retried (see
+    /// `codex_families_wait_exactly_the_server_retry_after_and_resend_the_same_bytes`).
+    #[tokio::test]
+    async fn codex_families_end_when_the_server_retry_after_is_past_the_step_deadline() {
+        for family in CODEX_FAMILIES {
+            let server = ScriptedServer::start(vec![
+                ScriptResponse::Http {
+                    status: 429,
+                    headers: vec![("Retry-After", "469")],
+                    body: CAPACITY_429_BODY,
+                },
+                ScriptResponse::Http {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"must not be sent",
+                },
+            ])
+            .await;
+            let mut provider = family_retry_test_provider(&server, family);
+            let waits = use_virtual_retry_waits(&mut provider);
+
+            let events = collect_step_events(
+                &provider,
+                CancellationToken::new(),
+                Some(Instant::now() + Duration::from_secs(100)),
+            )
+            .await;
+            let error = terminal_error(&events);
+            assert_eq!(error.status, Some(429), "{family:?}");
+            assert_eq!(error.retry_after_secs, Some(469.0), "{family:?}");
+            assert_eq!(server.request_bodies().len(), 1, "{family:?}");
+            assert!(waits.lock().unwrap().is_empty(), "{family:?}");
+        }
+    }
+
+    /// A ChatGPT `usage_limit_reached` 429 stays `account_limit_exhausted` with its reset time,
+    /// and ends the step even though it states a retry time: Codex never retries it.
+    #[tokio::test]
+    async fn codex_usage_limit_reached_stays_account_limit_exhausted() {
+        let server = ScriptedServer::start(vec![ScriptResponse::Http {
+            status: 429,
+            headers: vec![("Retry-After", "30")],
+            body: br#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1790021043,"eligible_promo":null,"resets_in_seconds":441721}}"#,
+        }])
+        .await;
+        let mut provider =
+            family_retry_test_provider(&server, WireFamilyId::OpenAiResponsesChatgpt);
+        let waits = use_virtual_retry_waits(&mut provider);
+
+        let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+        let error = terminal_error(&events);
+        assert!(error.is_account_limit_exhausted(), "{error:?}");
+        assert_eq!(error.resets_at_ms, Some(1_790_021_043_000));
+        assert_eq!(server.request_bodies().len(), 1);
+        assert!(waits.lock().unwrap().is_empty());
+    }
+
+    /// A cancel while the step waits out a long server retry time stops it promptly, before any
+    /// re-send. The wait is real time: nothing in it holds up the cancel.
+    #[tokio::test]
+    async fn codex_cancel_during_a_long_server_wait_stops_before_resend() {
+        for family in CODEX_FAMILIES {
+            let server = ScriptedServer::start(vec![
+                ScriptResponse::Http {
+                    status: 429,
+                    headers: vec![("Retry-After", "469")],
+                    body: CAPACITY_429_BODY,
+                },
+                ScriptResponse::Http {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"must not be sent",
+                },
+            ])
+            .await;
+            let provider = family_retry_test_provider(&server, family);
+            let cancel = CancellationToken::new();
+            let mut rx = provider.start_step(
+                StepId(1),
+                Arc::new(CallOptions::new(Vec::new())),
+                cancel.clone(),
+                None,
+            );
+            let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the 429 attempt is recorded");
+            assert!(
+                matches!(
+                    &first,
+                    Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }))
+                        if attempt.http_status == Some(429)
+                ),
+                "{first:?}"
+            );
+            // The record is published before the wait starts; cancel inside the wait.
+            let started = Instant::now();
+            cancel.cancel();
+            assert!(tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("the cancelled wait stops promptly")
+                .is_none());
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(server.request_bodies().len(), 1, "{family:?}");
+        }
+    }
+
+    /// An endpoint that refuses every connection is retried without limit, as Codex's
+    /// `unbounded_connection_retries` does: each round is one send and four request-layer
+    /// re-sends at Codex's backoff, then a connect wait of 5 s doubling to 60 s. Every send
+    /// leaves its attempt record. Only the caller's cancel ends it, promptly and without an
+    /// error.
+    #[tokio::test]
+    async fn codex_unreachable_endpoint_retries_until_cancelled() {
+        let address = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let mut frozen = openai_chat_frozen_config("retry-test");
+        frozen.family_id = WireFamilyId::OpenAiResponses;
+        frozen.base_url = Some(format!("http://{address}"));
+        let mut provider = LiveProvider::new(RetryTestFamily::new(0), frozen, AuthHandle::None);
+        let waits = use_virtual_retry_waits(&mut provider);
+        let cancel = CancellationToken::new();
+        let mut rx = provider.start_step(
+            StepId(1),
+            Arc::new(CallOptions::new(Vec::new())),
+            cancel.clone(),
+            None,
+        );
+        const SENDS: usize = 40;
+        let mut recorded = 0;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while recorded < SENDS {
+                match rx.recv().await {
+                    Some(NormalizedEvent::Control(ProviderControl::AttemptFinished {
+                        attempt,
+                    })) => {
+                        assert_eq!(attempt.outcome, AttemptOutcome::ConnectFailed);
+                        recorded += 1;
+                    }
+                    Some(NormalizedEvent::Control(ProviderControl::Error { error, .. })) => {
+                        panic!("an unreachable endpoint must not end the step: {error:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("the step ended before it was cancelled"),
+                }
+            }
+        })
+        .await
+        .expect("connect failures keep being retried");
+        cancel.cancel();
+        let started = Instant::now();
+        let rest = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut rest = Vec::new();
+            while let Some(event) = rx.recv().await {
+                rest.push(event);
+            }
+            rest
+        })
+        .await
+        .expect("the cancelled step stops promptly");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(terminal_error_if_any(&rest).is_none(), "{rest:?}");
+
+        let waits = waits.lock().unwrap().clone();
+        assert!(waits.len() >= SENDS - 1);
+        let connect_waits: Vec<_> = waits.iter().skip(4).step_by(5).copied().collect();
+        assert_eq!(
+            connect_waits[..7],
+            [5, 10, 20, 40, 60, 60, 60].map(Duration::from_secs)
+        );
+        for (index, wait) in waits.iter().enumerate().filter(|(index, _)| index % 5 != 4) {
+            let nominal = 200u64 << (index % 5);
+            let millis = wait.as_millis() as u64;
+            assert!(
+                millis >= nominal * 9 / 10 && millis < nominal * 11 / 10,
+                "request retry wait {index} was {wait:?}, not Codex's backoff around {nominal} ms"
+            );
+        }
+    }
+
+    /// Every family other than the two OpenAI Responses families keeps today's schedule: a
+    /// `Retry-After` is capped at 120 s, and a 429 without one is still retried on the 2 s
+    /// doubling backoff.
+    #[tokio::test]
+    async fn other_families_keep_the_capped_retry_after_and_retry_a_plain_429() {
+        for family in [
+            WireFamilyId::OpenAiChat,
+            WireFamilyId::AnthropicMessages,
+            WireFamilyId::Gemini,
+            WireFamilyId::BedrockConverse,
+            WireFamilyId::GoogleCodeAssist,
+        ] {
+            let server = ScriptedServer::start(vec![
+                ScriptResponse::Http {
+                    status: 429,
+                    headers: vec![("Retry-After", "469")],
+                    body: br#"{"error":{"message":"rate limited"}}"#,
+                },
+                ScriptResponse::Http {
+                    status: 429,
+                    headers: Vec::new(),
+                    body: br#"{"error":{"message":"rate limited"}}"#,
+                },
+                ScriptResponse::Http {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"success",
+                },
+            ])
+            .await;
+            let mut provider = family_retry_test_provider(&server, family);
+            let waits = use_virtual_retry_waits(&mut provider);
+
+            let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+            assert!(terminal_error_if_any(&events).is_none(), "{family:?}");
+            assert_eq!(server.request_bodies().len(), 3, "{family:?}");
+            let waits = waits.lock().unwrap();
+            assert_eq!(waits.len(), 2, "{family:?}");
+            assert_eq!(waits[0], super::MAX_RETRY_AFTER_DELAY, "{family:?}");
+            // The second failed attempt's computed wait: 4 s nominal, scaled by 0.8..=1.2.
+            assert!(
+                (Duration::from_millis(3_200)..=Duration::from_millis(4_800)).contains(&waits[1]),
+                "{family:?} waited {:?}",
+                waits[1]
+            );
+        }
     }
 
     #[tokio::test]
