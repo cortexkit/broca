@@ -2,8 +2,10 @@
 
 use rusqlite::Connection;
 
-pub(super) const SESSION_TABLES: &[&str] = &["message", "episode", "run", "setup"];
+pub(super) const SESSION_TABLES: &[&str] =
+    &["projection_boundary", "message", "episode", "run", "setup"];
 pub(super) const REBUILDABLE_TABLES: &[&str] = &[
+    "projection_boundary",
     "message",
     "episode",
     "run",
@@ -51,6 +53,27 @@ pub(super) fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             sid TEXT NOT NULL REFERENCES session(sid) ON DELETE CASCADE,
             digest TEXT NOT NULL, off INTEGER NOT NULL, PRIMARY KEY(sid,digest)
         );
+        CREATE TABLE IF NOT EXISTS projection_boundary (
+            sid TEXT NOT NULL REFERENCES session(sid) ON DELETE CASCADE,
+            seq INTEGER NOT NULL, lineage_id TEXT,
+            frame_off INTEGER NOT NULL, frame_end INTEGER NOT NULL,
+            frame_identity BLOB NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('turn_finished','no_tool_step','zero_step_seed')),
+            episode INTEGER NOT NULL, run_id TEXT, step_id INTEGER, batch_id TEXT,
+            qualified INTEGER NOT NULL CHECK(qualified IN (0,1)),
+            terminal_seq INTEGER, terminal_off INTEGER, terminal_end INTEGER, terminal_identity BLOB,
+            PRIMARY KEY(sid,seq),
+            CHECK(frame_end > frame_off),
+            CHECK((kind='turn_finished' AND qualified=1 AND terminal_seq IS NULL)
+                OR (kind!='turn_finished' AND
+                    ((qualified=0 AND terminal_seq IS NULL AND terminal_off IS NULL
+                        AND terminal_end IS NULL AND terminal_identity IS NULL)
+                    OR (qualified=1 AND terminal_seq IS NOT NULL AND terminal_off IS NOT NULL
+                        AND terminal_end IS NOT NULL AND terminal_identity IS NOT NULL
+                        AND terminal_seq > seq AND terminal_off >= frame_end
+                        AND terminal_end > terminal_off))))
+        );
+        CREATE INDEX IF NOT EXISTS projection_boundary_qualified ON projection_boundary(sid,qualified,seq);
         CREATE TABLE IF NOT EXISTS condemned (
             addr TEXT NOT NULL, lineage_id TEXT NOT NULL, removed_at_ms INTEGER NOT NULL,
             PRIMARY KEY(addr,lineage_id)

@@ -629,8 +629,139 @@ pub fn plan_projection(
 }
 
 /// The serialized placement seed belongs only to the rebuildable database, never
-/// to a WAL record. Bump when Placement, Batch, or OffsetSeed changes shape.
-pub const OFFSET_SEED_VERSION: u32 = 1;
+/// to a WAL record. Bump when Placement, Batch, OffsetSeed or its boundary state changes shape.
+pub const OFFSET_SEED_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProjectionBoundaryKind {
+    TurnFinished,
+    NoToolStep,
+    ZeroStepSeed,
+}
+
+impl ProjectionBoundaryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnFinished => "turn_finished",
+            Self::NoToolStep => "no_tool_step",
+            Self::ZeroStepSeed => "zero_step_seed",
+        }
+    }
+}
+
+/// Eligibility plus qualifying context, without message content or storage offsets.
+/// A terminal licenses the candidate's earlier sequence, never its own sequence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProjectionBoundaryFact {
+    pub seq: u64,
+    pub kind: ProjectionBoundaryKind,
+    pub episode: u64,
+    pub run_id: Option<String>,
+    pub step_id: Option<u64>,
+    pub batch_id: Option<String>,
+    pub qualified: bool,
+    pub terminal_seq: Option<u64>,
+}
+
+/// The single eligibility fold used by legacy projection planning and the offset
+/// index. Unqualified facts let the index retain a candidate's exact frame locator
+/// until its same-episode terminal arrives, even in a later indexing transaction.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProjectionBoundaryState {
+    pending_no_tool_steps: Vec<ProjectionBoundaryFact>,
+    pending_zero_step_seed: Option<ProjectionBoundaryFact>,
+    steer_pending: bool,
+    episode: Option<u64>,
+    run_id: Option<String>,
+    step_id: Option<u64>,
+    batch_id: Option<String>,
+}
+
+impl ProjectionBoundaryState {
+    fn candidate(&self, seq: u64, kind: ProjectionBoundaryKind) -> ProjectionBoundaryFact {
+        ProjectionBoundaryFact {
+            seq,
+            kind,
+            episode: self.episode.unwrap_or(0),
+            run_id: self.run_id.clone(),
+            step_id: self.step_id,
+            batch_id: self.batch_id.clone(),
+            qualified: false,
+            terminal_seq: None,
+        }
+    }
+
+    pub fn observe(&mut self, frame: &FramedRecord) -> Vec<ProjectionBoundaryFact> {
+        let mut facts = Vec::new();
+        match &frame.record {
+            WalRecord::RunStarted { run_id, origin, .. } => {
+                self.episode = Some(self.episode.map_or(0, |n| n + 1));
+                self.run_id = Some(run_id.0.clone());
+                self.step_id = None;
+                self.batch_id = None;
+                self.pending_no_tool_steps.clear();
+                self.pending_zero_step_seed = None;
+                if matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }) {
+                    let candidate = self.candidate(frame.seq, ProjectionBoundaryKind::ZeroStepSeed);
+                    self.pending_zero_step_seed = Some(candidate.clone());
+                    facts.push(candidate);
+                }
+            }
+            WalRecord::Steered { .. } | WalRecord::SendDelivered { input: Some(_), .. } => {
+                // Crossing this held input would exclude it from both the
+                // materialized prefix and a replay starting after the boundary.
+                self.steer_pending = true;
+            }
+            WalRecord::ModelStepFinished {
+                step_id,
+                assistant_message,
+                ..
+            } => {
+                self.pending_zero_step_seed = None;
+                self.step_id = Some(step_id.0);
+                self.batch_id = None;
+                if assistant_message.tool_calls().next().is_none() && !self.steer_pending {
+                    let candidate = self.candidate(frame.seq, ProjectionBoundaryKind::NoToolStep);
+                    self.pending_no_tool_steps.push(candidate.clone());
+                    facts.push(candidate);
+                }
+            }
+            WalRecord::StepStarted { step_id } => {
+                self.pending_zero_step_seed = None;
+                self.steer_pending = false;
+                self.step_id = Some(step_id.0);
+                self.batch_id = None;
+            }
+            WalRecord::ToolBatchStarted { batch_id, .. } => {
+                self.batch_id = Some(batch_id.0.clone())
+            }
+            WalRecord::RunFinished { .. } => {
+                self.steer_pending = false;
+                for mut candidate in self
+                    .pending_zero_step_seed
+                    .take()
+                    .into_iter()
+                    .chain(self.pending_no_tool_steps.drain(..))
+                {
+                    candidate.qualified = true;
+                    candidate.terminal_seq = Some(frame.seq);
+                    facts.push(candidate);
+                }
+            }
+            WalRecord::TurnFinished { step_id } if !self.steer_pending => {
+                self.step_id = Some(step_id.0);
+                let mut candidate = self.candidate(frame.seq, ProjectionBoundaryKind::TurnFinished);
+                candidate.qualified = true;
+                facts.push(candidate);
+            }
+            _ => {}
+        }
+        // Preamble records belong to an unattributable episode, just as they do
+        // in the offset projection. This metadata does not affect eligibility.
+        self.episode.get_or_insert(0);
+        facts
+    }
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OffsetAdmissionSeed {
@@ -680,6 +811,7 @@ pub struct OffsetEpisode {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OffsetSeed {
     placement: crate::placement::Placement,
+    boundary_state: ProjectionBoundaryState,
     pub episode: Option<OffsetEpisode>,
     pub admission: OffsetAdmissionSeed,
     held_steers: Vec<OffsetSource>,
@@ -704,6 +836,7 @@ pub struct OffsetDelta {
     pub truncate: Option<u64>,
     pub closed_episode: Option<OffsetEpisode>,
     pub reanchor: Option<(u64, u64)>,
+    pub boundaries: Vec<ProjectionBoundaryFact>,
 }
 
 impl OffsetSeed {
@@ -1072,6 +1205,7 @@ impl OffsetSeed {
         if let Some(ep) = &mut self.episode {
             ep.end_ord = head;
         }
+        delta.boundaries = self.boundary_state.observe(frame);
         Ok(delta)
     }
 }

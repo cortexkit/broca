@@ -165,6 +165,7 @@ pub(super) fn index_in_tx(
     let mut last_seq = cp.as_ref().and_then(|cp| cp.seq);
     let mut identity = cp.as_ref().and_then(|cp| cp.identity.clone());
     let mut seed = cp.and_then(|cp| cp.seed).unwrap_or_default();
+    let boundary_lineage = lineage_id.clone();
     tx.execute("INSERT INTO session (sid,project_root,harness,session_key,session_ref,lineage_id,location,indexed_off,indexed_end,head_ord,tail_seed,admission_seed)
         VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,'','') ON CONFLICT(sid) DO UPDATE SET session_ref=excluded.session_ref,location=excluded.location",
         params![key, log.bind.project_root.display().to_string(), log.bind.harness, log.bind.session, log.session_ref, lineage_id, log.location.as_str()])?;
@@ -226,13 +227,32 @@ pub(super) fn index_in_tx(
         if let Some(ep) = &seed.episode {
             write_episode(tx, &key, ep)?;
         }
+        let frame_identity = Sha256::digest(&remaining[..consumed]);
+        for fact in &delta.boundaries {
+            write_boundary(
+                tx,
+                &key,
+                lineage_id.as_deref(),
+                fact,
+                &frame,
+                offset,
+                end,
+                &frame_identity,
+            )?;
+        }
         if let Some((cut, checkpoint)) = delta.reanchor {
             reanchor(tx, &key, cut, checkpoint, &mut seed)?;
         }
         last_seq = Some(frame.seq);
         last_off = offset;
-        identity = Some(Sha256::digest(&remaining[..consumed]).to_vec());
+        identity = Some(frame_identity.to_vec());
         offset = end;
+    }
+    if boundary_lineage != lineage_id {
+        tx.execute(
+            "UPDATE projection_boundary SET lineage_id=?2 WHERE sid=?1",
+            params![key, lineage_id],
+        )?;
     }
     tx.execute("UPDATE session SET lineage_id=?2,indexed_seq=?3,indexed_off=?4,indexed_end=?5,indexed_identity=?6,head_ord=?7,tail_seed=?8,admission_seed=?9,frozen_policy=?10,last_activity_ms=?11,last_write_ms=?12,title_off=?13,lineage_off=?14 WHERE sid=?1",
         params![key,lineage_id,last_seq.map(u64_to_i64).transpose()?,u64_to_i64(last_off)?,u64_to_i64(offset)?,identity,u64_to_i64(seed.head_ord())?,seed.encode()?,serde_json::to_string(&seed.admission).map_err(|e| DbError::Invalid(e.to_string()))?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,lineage_off.map(u64_to_i64).transpose()?])?;
@@ -242,6 +262,47 @@ pub(super) fn index_in_tx(
         indexed_end: offset,
         head_ord: seed.head_ord(),
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the scanner supplies one verified frame and its locator"
+)]
+fn write_boundary(
+    tx: &Transaction<'_>,
+    key: &str,
+    lineage: Option<&str>,
+    fact: &broca_core::projection_plan::ProjectionBoundaryFact,
+    frame: &broca_wal::FramedRecord,
+    off: u64,
+    end: u64,
+    identity: &[u8],
+) -> Result<(), DbError> {
+    if let Some(terminal_seq) = fact.terminal_seq {
+        if terminal_seq != frame.seq {
+            return Err(DbError::Invalid(
+                "boundary qualifier differs from current frame".into(),
+            ));
+        }
+        let changed = tx.execute("UPDATE projection_boundary SET qualified=1,terminal_seq=?3,terminal_off=?4,terminal_end=?5,terminal_identity=?6
+            WHERE sid=?1 AND seq=?2 AND qualified=0 AND kind=?7 AND episode=?8 AND run_id IS ?9",
+            params![key,u64_to_i64(fact.seq)?,u64_to_i64(terminal_seq)?,u64_to_i64(off)?,u64_to_i64(end)?,identity,fact.kind.as_str(),u64_to_i64(fact.episode)?,fact.run_id])?;
+        if changed != 1 {
+            return Err(DbError::Invalid(
+                "boundary qualifier has no matching candidate".into(),
+            ));
+        }
+    } else {
+        if fact.seq != frame.seq {
+            return Err(DbError::Invalid(
+                "boundary candidate differs from current frame".into(),
+            ));
+        }
+        tx.execute("INSERT INTO projection_boundary (sid,seq,lineage_id,frame_off,frame_end,frame_identity,kind,episode,run_id,step_id,batch_id,qualified)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![key,u64_to_i64(fact.seq)?,lineage,u64_to_i64(off)?,u64_to_i64(end)?,identity,fact.kind.as_str(),u64_to_i64(fact.episode)?,fact.run_id,fact.step_id.map(u64_to_i64).transpose()?,fact.batch_id,fact.qualified])?;
+    }
+    Ok(())
 }
 
 fn write_episode(tx: &Transaction<'_>, key: &str, ep: &OffsetEpisode) -> Result<(), DbError> {
@@ -395,6 +456,195 @@ mod tests {
     fn r_rows(db: &OverhaulDb) -> Vec<(String, Vec<Vec<Value>>)> {
         rows(db, schema::REBUILDABLE_TABLES)
     }
+    fn qualified_boundaries(db: &OverhaulDb) -> Vec<u64> {
+        db.read_snapshot(|tx| {
+            let mut stmt =
+                tx.prepare("SELECT seq FROM projection_boundary WHERE qualified=1 ORDER BY seq")?;
+            let rows = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap()
+    }
+    fn encode_records(records: &[WalRecord]) -> Vec<u8> {
+        records
+            .iter()
+            .enumerate()
+            .flat_map(|(n, record)| encode(n as u64 + 1, 1, record).unwrap())
+            .collect()
+    }
+    fn boundary_cases() -> Vec<(&'static str, Vec<WalRecord>, Vec<u64>)> {
+        let source: Vec<_> = decoded(&fixture("scripts/fixtures/resume-close-out-sealed.wal"))
+            .into_iter()
+            .map(|(_, _, frame)| frame.record)
+            .collect();
+        let start = source
+            .iter()
+            .find(|r| matches!(r, WalRecord::RunStarted { .. }))
+            .unwrap()
+            .clone();
+        let step = source
+            .iter()
+            .find(|r| matches!(r, WalRecord::StepStarted { .. }))
+            .unwrap()
+            .clone();
+        let tool_pos = source.iter().position(|r| matches!(r, WalRecord::ModelStepFinished { assistant_message, .. } if assistant_message.tool_calls().next().is_some())).unwrap();
+        let intent_pos = source
+            .iter()
+            .position(|r| matches!(r, WalRecord::ToolDispatchIntent { .. }))
+            .unwrap();
+        let turn_pos = source
+            .iter()
+            .position(|r| matches!(r, WalRecord::TurnFinished { .. }))
+            .unwrap();
+        let mut text_step = source[tool_pos].clone();
+        if let WalRecord::ModelStepFinished {
+            assistant_message,
+            tags,
+            hooks,
+            ..
+        } = &mut text_step
+        {
+            *assistant_message = broca_protocol::AssistantMessage {
+                message_id: broca_protocol::MessageId("text-step".into()),
+                content: vec![broca_protocol::ContentBlock::Text {
+                    text: "text".into(),
+                }],
+            }
+            .into();
+            *tags = None;
+            *hooks = None;
+        }
+        let mut terminal = source
+            .iter()
+            .find(|r| matches!(r, WalRecord::RunFinished { .. }))
+            .unwrap()
+            .clone();
+        if let WalRecord::RunFinished { reason, .. } = &mut terminal {
+            *reason = broca_protocol::caller::RunFinishReason::Completed;
+        }
+        let (run_id, request) = match &start {
+            WalRecord::RunStarted {
+                run_id,
+                config,
+                input,
+                ..
+            } => (
+                run_id.clone(),
+                serde_json::from_value(serde_json::json!({
+                    "model": config.model, "input": input, "tools": config.tools,
+                }))
+                .unwrap(),
+            ),
+            _ => unreachable!(),
+        };
+        let paused = WalRecord::RunPaused {
+            run_id,
+            ts_ms: None,
+            reason: broca_protocol::PauseReason::AuthRequired,
+            error: None,
+        };
+        let queued = WalRecord::Queued {
+            written_at_ms: None,
+            retention: None,
+            ts_ms: None,
+            keep_warm: None,
+            conversation_key: None,
+            submission_id: broca_protocol::SubmissionId("boundary-queued".into()),
+            request: Box::new(request),
+            request_identity_digest: None,
+            principal: None,
+            send_id: None,
+            title: None,
+            delivery: None,
+            hooks: None,
+        };
+        let steer = decoded(&fixture(
+            "crates/broca-core/tests/fixtures/runner_tags_v1/steer_anthropic.wal",
+        ))
+        .into_iter()
+        .find_map(|(_, _, frame)| {
+            matches!(frame.record, WalRecord::Steered { .. }).then_some(frame.record)
+        })
+        .unwrap();
+        let mut seeded = start.clone();
+        if let WalRecord::RunStarted { origin, .. } = &mut seeded {
+            *origin = broca_wal::RunOrigin::SeededFrom {
+                origin_kind: broca_wal::SeedOriginKind::Import,
+                source_ref: "fixture:boundary".into(),
+                origin_device_pseudonym: None,
+                base_seq: None,
+            };
+        }
+        let mut next = start.clone();
+        if let WalRecord::RunStarted { run_id, .. } = &mut next {
+            run_id.0 = "next-episode".into();
+        }
+        let mut interposed = source[..=tool_pos].to_vec();
+        interposed.extend([queued, steer.clone()]);
+        interposed.extend_from_slice(&source[tool_pos + 1..=intent_pos]);
+        let mut steer_across_turn = source[..=intent_pos].to_vec();
+        steer_across_turn.push(steer);
+        steer_across_turn.extend_from_slice(&source[intent_pos + 1..=turn_pos]);
+        vec![
+            ("swallowed_tool_step", source[..=tool_pos].to_vec(), vec![]),
+            (
+                "empty_after_dispatch_intent",
+                source[..=intent_pos].to_vec(),
+                vec![],
+            ),
+            ("queued_steered_before_unfinished_tool", interposed, vec![]),
+            ("steer_across_turn", steer_across_turn, vec![]),
+            (
+                "committed_turn_without_episode_terminal",
+                source[..=turn_pos].to_vec(),
+                vec![turn_pos as u64 + 1],
+            ),
+            (
+                "no_tool_terminal",
+                vec![
+                    start.clone(),
+                    step.clone(),
+                    text_step.clone(),
+                    terminal.clone(),
+                ],
+                vec![3],
+            ),
+            (
+                "no_tool_paused",
+                vec![
+                    start.clone(),
+                    step.clone(),
+                    text_step.clone(),
+                    paused.clone(),
+                ],
+                vec![],
+            ),
+            (
+                "no_tool_open",
+                vec![start.clone(), step.clone(), text_step.clone()],
+                vec![],
+            ),
+            (
+                "zero_seed_terminal",
+                vec![seeded.clone(), terminal.clone()],
+                vec![1],
+            ),
+            ("zero_seed_paused", vec![seeded.clone(), paused], vec![]),
+            ("zero_seed_open", vec![seeded.clone()], vec![]),
+            (
+                "zero_seed_intervening_step",
+                vec![seeded, step.clone(), terminal.clone()],
+                vec![],
+            ),
+            (
+                "later_episode_terminal",
+                vec![start, step, text_step, next, terminal],
+                vec![],
+            ),
+        ]
+    }
     fn corpus() -> Vec<Vec<u8>> {
         let mut logs = vec![
             fixture("scripts/fixtures/resume-close-out-sealed.wal"),
@@ -534,7 +784,88 @@ mod tests {
         }
         assert!(inserted_budget);
         logs.push(budgeted);
+        // later_episode_terminal checks that a terminal cannot license a text
+        // step from an earlier unfinished episode. Full replay correctly refuses
+        // that invalid history. The other cases also compare indexed message
+        // ordinals and tag metadata with a full replay.
+        logs.extend(
+            boundary_cases()
+                .into_iter()
+                .filter(|(name, _, _)| *name != "later_episode_terminal")
+                .map(|(_, records, _)| encode_records(&records)),
+        );
         logs
+    }
+
+    #[test]
+    fn boundary_candidates_require_their_qualifying_context() {
+        for (name, records, expected) in boundary_cases() {
+            let bytes = encode_records(&records);
+            let bind = bind(&bytes);
+            let db = database();
+            db.db.index(&publication(&bind, &bytes)).unwrap();
+            assert_eq!(qualified_boundaries(&db.db), expected, "{name}");
+            let frames: Vec<_> = decoded(&bytes)
+                .into_iter()
+                .map(|(_, _, frame)| frame)
+                .collect();
+            assert_eq!(
+                expected.last().copied(),
+                broca_core::latest_projection_boundary(&frames, 0),
+                "{name}"
+            );
+            let rebuilt = database();
+            rebuilt
+                .db
+                .rebuild_session(&publication(&bind, &bytes))
+                .unwrap();
+            assert_eq!(r_rows(&db.db), r_rows(&rebuilt.db), "{name}");
+        }
+    }
+
+    #[test]
+    fn boundary_entries_identify_exact_frames_and_leave_terminals_beyond_the_boundary() {
+        for (name, records, _) in boundary_cases() {
+            let bytes = encode_records(&records);
+            let bind = bind(&bytes);
+            let db = database();
+            db.db.index(&publication(&bind, &bytes)).unwrap();
+            db.db.read_snapshot(|tx| {
+                let mut stmt = tx.prepare("SELECT seq,frame_off,frame_end,frame_identity,qualified,terminal_seq,terminal_off,terminal_end,terminal_identity,kind,episode,run_id,step_id,batch_id FROM projection_boundary ORDER BY seq")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let seq: u64 = row.get(0)?;
+                    let off: usize = row.get(1)?;
+                    let end: usize = row.get(2)?;
+                    let identity: Vec<u8> = row.get(3)?;
+                    assert_eq!(identity, Sha256::digest(&bytes[off..end]).as_slice(), "{name}");
+                    let DecodeStep::Record { framed, consumed } = decode_next(&bytes[off..end]) else { panic!("boundary is not a complete frame"); };
+                    assert_eq!(consumed, end-off);
+                    assert_eq!(framed.seq, seq);
+                    let kind: String = row.get(9)?;
+                    assert_eq!(row.get::<_,u64>(10)?, 0);
+                    let run_id: String = row.get(11)?;
+                    assert!(matches!(&records[0], WalRecord::RunStarted { run_id: id, .. } if id.0 == run_id));
+                    if kind == "zero_step_seed" { assert!(row.get::<_,Option<u64>>(12)?.is_none()); }
+                    else { assert!(row.get::<_,Option<u64>>(12)?.is_some()); }
+                    if kind == "turn_finished" { assert!(row.get::<_,Option<String>>(13)?.is_some()); }
+                    if row.get::<_,bool>(4)? && kind != "turn_finished" {
+                        let terminal_seq: u64 = row.get(5)?;
+                        let terminal_off: usize = row.get(6)?;
+                        let terminal_end: usize = row.get(7)?;
+                        let terminal_identity: Vec<u8> = row.get(8)?;
+                        assert!(terminal_seq > seq && terminal_off >= end);
+                        assert_eq!(terminal_identity, Sha256::digest(&bytes[terminal_off..terminal_end]).as_slice());
+                        assert!(matches!(decode_next(&bytes[terminal_off..terminal_end]), DecodeStep::Record { framed, .. }
+                            if framed.seq == terminal_seq && matches!(framed.record, WalRecord::RunFinished { .. })));
+                    }
+                    let mut rewritten = bytes[off..end].to_vec();
+                    *rewritten.last_mut().unwrap() ^= 1;
+                    assert_ne!(identity, Sha256::digest(&rewritten).as_slice(), "stale frame must not match stored integrity data");
+                }
+                Ok(())
+            }).unwrap();
+        }
     }
 
     #[test]
@@ -557,6 +888,22 @@ mod tests {
                     .map(|(_, _, f)| f.record)
                     .collect();
                 let replay = broca_core::replay(&records).unwrap();
+                let framed: Vec<_> = decoded(&bytes[..end])
+                    .into_iter()
+                    .map(|(_, _, frame)| frame)
+                    .collect();
+                let boundaries = qualified_boundaries(&incremental.db);
+                for watermark in std::iter::once(0).chain(framed.iter().map(|f| f.seq)) {
+                    assert_eq!(
+                        boundaries
+                            .iter()
+                            .copied()
+                            .filter(|seq| *seq > watermark)
+                            .max(),
+                        broca_core::latest_projection_boundary(&framed, watermark),
+                        "planner/index boundary disagreement at byte {end}, watermark {watermark}"
+                    );
+                }
                 assert_eq!(outcome.head_ord, replay.extent, "ordinal oracle at {end}");
                 let tags = incremental
                     .db
@@ -679,7 +1026,13 @@ mod tests {
             WalRecord::RunStarted { config, .. } => config.budget.clone(),
             _ => unreachable!(),
         };
-        assert!(OffsetSeed::decode(&encoded, budget).is_some());
+        assert!(OffsetSeed::decode(&encoded, budget.clone()).is_some());
+        let mut stale: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        stale[0] = (broca_core::projection_plan::OFFSET_SEED_VERSION - 1).into();
+        assert!(
+            OffsetSeed::decode(&stale.to_string(), budget).is_none(),
+            "a prior seed format must not guess boundary state"
+        );
         assert!(OffsetSeed::decode(&encoded, None).is_none());
     }
 
@@ -745,6 +1098,15 @@ mod tests {
         }
         let result: Result<(), DbError> = db.db.transaction(false, |tx| {
             index_in_tx(tx, &publication(&bind, &bytes), true)?;
+            let qualified: u64 = tx.query_row(
+                "SELECT COUNT(*) FROM projection_boundary WHERE qualified=1",
+                [],
+                |r| r.get(0),
+            )?;
+            assert!(
+                qualified > 0,
+                "the failed rebuild must reach boundary writes before COMMIT"
+            );
             Err(DbError::Invalid(
                 "injected rebuild failure before COMMIT".into(),
             ))
@@ -1023,6 +1385,132 @@ mod tests {
         }
         assert!(ahead > 0 && lagging > 0 && torn > 0 && repaired > 0);
         eprintln!("power-loss index matrix: {first_count} first cuts, {second_count} recovery cuts, {} unique states, {pairs} reconciled pairs; {ahead} ahead, {lagging} lagging, {torn} torn, {repaired} repaired; {refused} known non-tail refusals ({refused_pairs} refused pairs)", states.len());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn boundary_qualification_survives_shared_power_loss_cuts() {
+        use broca_crash_harness::power_loss::RecordingFs;
+        use broca_wal::fs_ops::with_fs_ops;
+        use broca_wal::{FileWal, Wal};
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+        for (name, records, _) in boundary_cases()
+            .into_iter()
+            .filter(|(name, _, _)| matches!(*name, "no_tool_terminal" | "zero_seed_terminal"))
+        {
+            let scratch = database();
+            let source = scratch._scratch.0.join("source");
+            std::fs::create_dir(&source).unwrap();
+            let path = source.join("wal/log");
+            {
+                let mut wal = FileWal::open(&path).unwrap();
+                for record in &records[..records.len() - 1] {
+                    wal.append(1, record, true).unwrap();
+                }
+            }
+            let candidate = std::fs::read(&path).unwrap();
+            let bind = bind(&candidate);
+            let db = database();
+            db.db.index(&publication(&bind, &candidate)).unwrap();
+            assert!(
+                qualified_boundaries(&db.db).is_empty(),
+                "{name}: candidate before terminal"
+            );
+            let recording = Arc::new(RecordingFs::new(&source).unwrap());
+            with_fs_ops(recording.clone(), || {
+                FileWal::open(&path)
+                    .unwrap()
+                    .append(1, records.last().unwrap(), false)
+                    .unwrap();
+            });
+            let precut = std::fs::read(&path).unwrap();
+            let frames = decoded(&precut);
+            let candidate_seq = frames[frames.len() - 2].2.seq;
+            let ends: Vec<_> = std::iter::once(0)
+                .chain(frames.iter().map(|(_, end, _)| *end))
+                .collect();
+            let first = recording.enumerate(1_000_000).unwrap();
+            let second = recording
+                .enumerate_recovery(
+                    &scratch._scratch.0.join("recovery-cuts"),
+                    1_000_000,
+                    |root| {
+                        FileWal::open(root.join("wal/log"))
+                            .map_err(std::io::Error::other)?
+                            .replay()
+                            .map_err(std::io::Error::other)?;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            let first_count = first.len();
+            let second_count = second.len();
+            let states: BTreeSet<_> = first
+                .into_iter()
+                .map(|cut| cut.state)
+                .chain(second.into_iter().map(|cut| cut.second.state))
+                .collect();
+            let mut qualified = 0;
+            let mut unqualified = 0;
+            let mut pairs = 0;
+            for (n, state) in states.iter().enumerate() {
+                let root = scratch._scratch.0.join(format!("survivor-{n}"));
+                state.install(&root).unwrap();
+                let wal = FileWal::open(root.join("wal/log")).unwrap();
+                let has_terminal = wal
+                    .replay()
+                    .unwrap()
+                    .iter()
+                    .any(|frame| matches!(frame.record, WalRecord::RunFinished { .. }));
+                let recovered = std::fs::read(root.join("wal/log")).unwrap();
+                let expected_lineage = match decode_next(&recovered) {
+                    DecodeStep::Lineage { lineage_id, .. } => lineage_id.to_string(),
+                    _ => panic!("the recovered log must retain its durable lineage frame"),
+                };
+                let expected = if has_terminal {
+                    qualified += 1;
+                    vec![candidate_seq]
+                } else {
+                    unqualified += 1;
+                    vec![]
+                };
+                let baseline = database();
+                baseline
+                    .db
+                    .rebuild_session(&publication(&bind, &recovered))
+                    .unwrap();
+                let expected_rows = r_rows(&baseline.db);
+                for end in &ends {
+                    let TestDb {
+                        db,
+                        _scratch: index_root,
+                    } = database();
+                    db.index(&publication(&bind, &precut[..*end])).unwrap();
+                    drop(db);
+                    let resumed = OverhaulDb::open(&index_root.0).unwrap();
+                    resumed.index(&publication(&bind, &recovered)).unwrap();
+                    assert_eq!(
+                        qualified_boundaries(&resumed),
+                        expected,
+                        "{name}: survivor {n}, prior end {end}"
+                    );
+                    assert_eq!(
+                        r_rows(&resumed),
+                        expected_rows,
+                        "{name}: survivor {n}, prior end {end}"
+                    );
+                    resumed.read_snapshot(|tx| {
+                        let mismatched: u64 = tx.query_row("SELECT COUNT(*) FROM projection_boundary WHERE lineage_id IS NOT ?1", [&expected_lineage], |row| row.get(0))?;
+                        assert_eq!(mismatched, 0, "boundary locators must retain the log's lineage");
+                        Ok(())
+                    }).unwrap();
+                    pairs += 1;
+                }
+            }
+            assert!(qualified > 0 && unqualified > 0);
+            eprintln!("boundary qualification {name}: {first_count} first cuts, {second_count} recovery cuts, {} unique states, {pairs} index/log pairs, {qualified} qualified, {unqualified} unqualified", states.len());
+        }
     }
 
     #[test]

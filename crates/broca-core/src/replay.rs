@@ -2942,70 +2942,21 @@ fn replay_seeded_with_compaction<'a>(
 /// Return the newest WAL sequence after `watermark` that a materialized store may
 /// safely fold into its projection.
 ///
-/// This helper is the single authority for projection boundaries so every store advances
-/// its watermark under the same replay-domain rule. A `TurnFinished` is always safe. A
+/// Planning and offset indexing use the same eligibility fold. A `TurnFinished`
+/// is safe only with no steer pending across it. A
 /// no-tool `ModelStepFinished` becomes safe only when a later `RunFinished` closes the same
 /// episode; the boundary remains at the step so the terminal record stays in the WAL tail.
 pub fn latest_projection_boundary(
     records: &[broca_wal::FramedRecord],
     watermark: u64,
 ) -> Option<u64> {
-    let mut latest = None;
-    let mut pending_no_tool_steps = Vec::new();
-    let mut pending_zero_step_seed = None;
-    // Whether a steered message has been written but not yet placed by a step boundary. A
-    // boundary with a steer pending across it is never offered: the store would fold the
-    // records before it without the steer, and a tail replay starting after it would never
-    // see the steer's record, so the message would be lost from the materialized transcript.
-    let mut steer_pending = false;
-
-    for framed in records {
-        match &framed.record {
-            WalRecord::RunStarted { origin, .. } => {
-                pending_no_tool_steps.clear();
-                pending_zero_step_seed =
-                    matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }).then_some(framed.seq);
-            }
-            WalRecord::Steered { .. } | WalRecord::SendDelivered { input: Some(_), .. } => {
-                steer_pending = true
-            }
-            WalRecord::ModelStepFinished {
-                assistant_message, ..
-            } if assistant_message.tool_calls().next().is_none() => {
-                pending_zero_step_seed = None;
-                if !steer_pending {
-                    pending_no_tool_steps.push(framed.seq);
-                }
-            }
-            WalRecord::StepStarted { .. } => {
-                pending_zero_step_seed = None;
-                steer_pending = false;
-            }
-            WalRecord::ModelStepFinished { .. } => {
-                pending_zero_step_seed = None;
-            }
-            WalRecord::RunFinished { .. } => {
-                steer_pending = false;
-                if let Some(seed_seq) = pending_zero_step_seed.take().filter(|seq| *seq > watermark)
-                {
-                    // Fold the imported prompt but leave RunFinished in the WAL tail so the
-                    // store-merge path retains the episode's durable idle classification.
-                    latest = Some(latest.map_or(seed_seq, |current: u64| current.max(seed_seq)));
-                }
-                for seq in pending_no_tool_steps.drain(..) {
-                    if seq > watermark {
-                        latest = Some(latest.map_or(seq, |current: u64| current.max(seq)));
-                    }
-                }
-            }
-            WalRecord::TurnFinished { .. } if !steer_pending && framed.seq > watermark => {
-                latest = Some(latest.map_or(framed.seq, |current: u64| current.max(framed.seq)));
-            }
-            _ => {}
-        }
-    }
-
-    latest
+    let mut state = crate::projection_plan::ProjectionBoundaryState::default();
+    records
+        .iter()
+        .flat_map(|frame| state.observe(frame))
+        .filter(|fact| fact.qualified && fact.seq > watermark)
+        .map(|fact| fact.seq)
+        .max()
 }
 
 /// A completed-step usage fold for one run id. The same durable records feed
