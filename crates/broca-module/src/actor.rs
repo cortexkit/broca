@@ -10822,6 +10822,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Waits, under the shared hang guard, until the registry holds no open or opening slot.
+    async fn wait_for_released_slot(registry: &LineageRegistry, description: &str) {
+        broca_test_support::wait_until(description, || {
+            let counts = registry.slot_counts();
+            std::future::ready(if counts.open == 0 && counts.opening == 0 {
+                Ok(())
+            } else {
+                Err(format!("slots={counts:?}"))
+            })
+        })
+        .await;
+    }
+
+    /// Waits, under the shared hang guard, until `counter` reads exactly `expected`.
+    async fn wait_for_count(description: &str, counter: &AtomicUsize, expected: usize) {
+        broca_test_support::wait_until(description, || {
+            let seen = counter.load(Ordering::SeqCst);
+            std::future::ready(if seen == expected {
+                Ok(())
+            } else {
+                Err(format!("count={seen}, expected={expected}"))
+            })
+        })
+        .await;
+    }
+
     /// After an idle actor-task panic completes emergency teardown, a subsequent send must open a
     /// fresh working actor (not fail on a dead command handle) and leave slot counts sane.
     #[tokio::test]
@@ -10851,33 +10877,21 @@ mod tests {
             "deliver panic command"
         );
 
-        for _ in 0..80 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let counts = registry.slot_counts();
-            if counts.open == 0 && counts.opening == 0 {
-                break;
-            }
-        }
-        assert_eq!(
-            registry.slot_counts().open,
-            0,
-            "Open slot must be cleared after actor panic"
-        );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while close_count.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("actor panic must trigger on_session_close cleanup");
+        wait_for_released_slot(&registry, "panic teardown clears the open slot").await;
+        wait_for_count(
+            "actor panic triggers on_session_close cleanup",
+            &close_count,
+            1,
+        )
+        .await;
         assert_eq!(close_count.load(Ordering::SeqCst), 1);
 
-        let second = tokio::time::timeout(
-            Duration::from_secs(5),
+        let second = broca_test_support::wait_for(
+            "second send on a fresh actor, not a dead handle",
             registry.route_send(&key, text_req(&key, "r2"), RunKind::FreshOrResume),
+            || format!("slots={:?}", registry.slot_counts()),
         )
         .await
-        .expect("second send must not hang on a dead handle")
         .expect("second send must open a fresh actor");
 
         assert!(
@@ -10923,30 +10937,14 @@ mod tests {
                 .expect("start first run"),
             SendOutcome::Active { .. }
         ));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while executor.starts.load(Ordering::SeqCst) < 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first execution starts");
+        wait_for_count("first execution starts", &executor.starts, 1).await;
         assert_eq!(active.load(Ordering::SeqCst), 1);
 
         assert!(
             first_handle.send(LineageCmd::PanicInActor).await.is_ok(),
             "deliver panic to active actor"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let counts = registry.slot_counts();
-                if counts.open == 0 && counts.opening == 0 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("panic teardown finalizes first actor");
+        wait_for_released_slot(&registry, "panic teardown finalizes the first actor").await;
 
         assert_eq!(
             active.load(Ordering::SeqCst),
@@ -10957,13 +10955,12 @@ mod tests {
         assert_eq!(executor.close_count.load(Ordering::SeqCst), 1);
 
         let second_handle = registry.actor_for(&key).await.expect("reopen actor");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while executor.starts.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("recovery starts the interrupted episode once");
+        wait_for_count(
+            "recovery starts the interrupted episode once",
+            &executor.starts,
+            2,
+        )
+        .await;
         assert_eq!(active.load(Ordering::SeqCst), 1);
         assert_eq!(
             executor.max_active.load(Ordering::SeqCst),
@@ -10975,18 +10972,189 @@ mod tests {
             second_handle.send(LineageCmd::PanicInActor).await.is_ok(),
             "stop recovered execution"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let counts = registry.slot_counts();
-                if active.load(Ordering::SeqCst) == 0 && counts.open == 0 && counts.opening == 0 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("recovered actor finishes panic teardown");
+        wait_for_count("recovered execution stops", &active, 0).await;
+        wait_for_released_slot(&registry, "recovered actor finishes panic teardown").await;
         assert_eq!(executor.close_count.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs that each hold until released. The first completes; the second returns an error
+    /// without writing a terminal, which sends the actor through its error teardown; any later
+    /// run is the reopened actor's recovery of that unfinished episode, and completes.
+    struct GaugeProbeExecutor {
+        starts: AtomicUsize,
+        start_signal: Semaphore,
+        release: Semaphore,
+    }
+
+    impl GaugeProbeExecutor {
+        fn new() -> Self {
+            Self {
+                starts: AtomicUsize::new(0),
+                start_signal: Semaphore::new(0),
+                release: Semaphore::new(0),
+            }
+        }
+
+        async fn wait_for_start(&self, description: &str) {
+            broca_test_support::wait_for(
+                description,
+                async {
+                    self.start_signal
+                        .acquire()
+                        .await
+                        .expect("start semaphore remains open")
+                        .forget();
+                },
+                || format!("starts={}", self.starts.load(Ordering::SeqCst)),
+            )
+            .await;
+        }
+    }
+
+    #[async_trait]
+    impl RunExecutor for GaugeProbeExecutor {
+        async fn execute(
+            &self,
+            mut job: RunJob,
+            _out: mpsc::Sender<OutputEvent>,
+        ) -> Result<RunSummary, RunError> {
+            let ordinal = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            // The recovery run continues the episode the failed run left open.
+            if ordinal <= 2 {
+                job.writer.record(WalRecord::RunStarted {
+                    written_at_ms: None,
+                    tags: None,
+                    session_class: None,
+                    retention: None,
+                    hooks: None,
+                    title: None,
+                    on_restart: None,
+                    keep_warm: None,
+                    marker_order_version: None,
+                    manifest: None,
+                    scope: None,
+                    send_id: None,
+                    request_identity_digest: None,
+                    project_id: None,
+                    principal: None,
+                    ts_ms: Some(100),
+                    run_id: job.req.run_id.clone(),
+                    session: job.req.session.clone(),
+                    config: Box::new(min_config()),
+                    input: job.req.input.clone().into(),
+                    origin: broca_wal::RunOrigin::Fresh,
+                    submission_id: job.req.submission_id.clone(),
+                });
+                job.writer.sync().await?;
+            }
+            if let Some(ack) = job.on_admitted.take() {
+                let _ = ack.send(Ok(job.req.run_id.clone()));
+            }
+            self.start_signal.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("release semaphore remains open")
+                .forget();
+            if ordinal == 2 {
+                return Err(RunError::Wal("injected failure before the terminal".into()));
+            }
+            job.writer.record(WalRecord::RunFinished {
+                interrupt_reason: None,
+                ts_ms: Some(200),
+                reason: RunFinishReason::Completed,
+                usage: Usage::default(),
+                error: None,
+                retries_used: 0,
+            });
+            job.writer.sync().await?;
+            Ok(RunSummary {
+                reason: RunFinishReason::Completed,
+                paused: None,
+                steps: 1,
+                usage: Usage::default(),
+                retries_used: 0,
+                final_step_finish_reason: None,
+            })
+        }
+    }
+
+    /// The registry's `runs_in_flight` gauge and the run state the actor reports must agree.
+    async fn assert_gauge_matches_run_state(
+        registry: &LineageRegistry,
+        key: &BindIdentity,
+        running: bool,
+    ) {
+        let status = registry.route_status(key).await.expect("status resolves");
+        assert_eq!(
+            matches!(status, LineageStatus::Active { .. }),
+            running,
+            "status={status:?}"
+        );
+        assert_eq!(
+            registry.slot_counts().runs_in_flight,
+            usize::from(running),
+            "the health gauge disagrees with run state {status:?}"
+        );
+    }
+
+    /// `runs_in_flight` is what an operator reads before a restart. A gauge stuck at 0 during a
+    /// live run reads exactly like a quiet module and invites a restart that cuts the run; one
+    /// stuck at 1 reads busy forever. So the gauge must follow the actor's real transitions:
+    /// raised while a run is live, cleared when it completes, gone with the slot when a failed
+    /// run tears the actor down, and raised again while the reopened actor recovers the
+    /// unfinished episode.
+    #[tokio::test]
+    async fn run_gauge_tracks_run_state_through_completion_error_teardown_and_recovery() {
+        let dir = broca_test_support::scratch_root()
+            .join(format!("broca-actor-run-gauge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        let key = BindIdentity::new(dir.join("proj"), "runner", "s1");
+        let executor = Arc::new(GaugeProbeExecutor::new());
+        let registry = LineageRegistry::new(Arc::new(SeamOpener {
+            lease_store: Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            wal_store: Arc::new(FileWalStore::new(dir.join("wal"))),
+            idle_ttl: Duration::from_secs(60),
+            executor: executor.clone(),
+        }));
+
+        assert!(matches!(
+            registry
+                .route_send(&key, text_req(&key, "r1"), RunKind::FreshOrResume)
+                .await
+                .expect("start the first run"),
+            SendOutcome::Active { .. }
+        ));
+        executor.wait_for_start("first run starts").await;
+        assert_gauge_matches_run_state(&registry, &key, true).await;
+        executor.release.add_permits(1);
+        wait_for_idle(&registry, &key).await;
+        assert_gauge_matches_run_state(&registry, &key, false).await;
+
+        assert!(matches!(
+            registry
+                .route_send(&key, text_req(&key, "r2"), RunKind::FreshOrResume)
+                .await
+                .expect("start the run that fails"),
+            SendOutcome::Active { .. }
+        ));
+        executor.wait_for_start("second run starts").await;
+        assert_gauge_matches_run_state(&registry, &key, true).await;
+        executor.release.add_permits(1);
+        wait_for_released_slot(&registry, "a run without a terminal tears the actor down").await;
+        assert_eq!(registry.slot_counts().runs_in_flight, 0);
+
+        registry.actor_for(&key).await.expect("reopen the session");
+        executor
+            .wait_for_start("the reopened actor recovers the unfinished episode")
+            .await;
+        assert_gauge_matches_run_state(&registry, &key, true).await;
+        executor.release.add_permits(1);
+        wait_for_idle(&registry, &key).await;
+        assert_gauge_matches_run_state(&registry, &key, false).await;
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11611,10 +11779,15 @@ mod tests {
         let registry = LineageRegistry::new(Arc::new(opener));
 
         registry.actor_for(&key).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), registry.route_status(&key))
-            .await
-            .expect("best-effort export failure must not hold startup recovery for retries")
-            .expect("finished lineage remains accessible while export storage is unavailable");
+        // Status must answer although every export attempt fails. The shared hang guard catches
+        // a recovery held behind export retries without turning startup into a latency budget.
+        broca_test_support::wait_for(
+            "status of a finished lineage whose export backfill fails",
+            registry.route_status(&key),
+            || format!("slots={:?}", registry.slot_counts()),
+        )
+        .await
+        .expect("finished lineage remains accessible while export storage is unavailable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11989,7 +12162,24 @@ mod tests {
         let registry = LineageRegistry::new(Arc::new(opener));
         registry.actor_for(&key).await.expect("open session");
 
-        tokio::time::sleep(Duration::from_millis(220)).await;
+        // Every idle tick (40ms here) tries to close, and closing first rereads the WAL, which
+        // fails. Wait for two such reads after the open: the second one proves the actor
+        // survived the first failed close attempt and ticked again.
+        wal_store.discard_read_attempt_signals();
+        for attempt in 1..=2 {
+            broca_test_support::wait_for(
+                "idle-tick close attempt rereads the failing WAL",
+                wal_store.wait_for_read_attempt(),
+                || {
+                    format!(
+                        "attempt={attempt}, reads={}, slot={:?}",
+                        wal_store.read_attempts(),
+                        registry.slot_state(&key)
+                    )
+                },
+            )
+            .await;
+        }
         assert_eq!(
             registry.slot_state(&key),
             Some("open"),
@@ -12030,12 +12220,14 @@ mod tests {
             healed_at.elapsed()
         );
 
-        for _ in 0..40 {
-            if registry.slot_state(&key).is_none() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        broca_test_support::wait_until("the drained actor closes on its idle tick", || {
+            let slot = registry.slot_state(&key);
+            std::future::ready(match slot {
+                None => Ok(()),
+                Some(state) => Err(format!("slot={state}")),
+            })
+        })
+        .await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12609,40 +12801,6 @@ mod import_idempotency_tests {
             ImportOutcome::Error(broca_core::ImportError::ImportIdReuse)
         );
         let _ = std::fs::remove_dir_all(root);
-    }
-}
-
-#[cfg(test)]
-mod run_gauge_transition_tests {
-    /// The health gauge and `RunState` must move together, and the compiler cannot require it.
-    ///
-    /// SUBC's asymmetry is why this is worth a mechanical check rather than care: a stuck-HIGH
-    /// gauge fails safe (an operator waits for a quiet window that never arrives, and nobody's
-    /// run is cut), while a stuck-LOW gauge is silently lethal — 0 is exactly what an idle module
-    /// looks like, so an operator checking before a restart cuts a run mid-generation.
-    ///
-    /// Asserting the invariant STRUCTURALLY rather than behaviourally is deliberate. Driving the
-    /// real transitions needs a lease, a writer and a spawned run task, and a test that models
-    /// the setters instead of calling them would pass while a new start path skipped the gauge —
-    /// which is the exact defect this exists to catch. Counting the assignment sites cannot be
-    /// satisfied by re-implementing the rule.
-    #[test]
-    fn run_state_is_only_assigned_inside_the_two_gauge_setters() {
-        let source = include_str!("actor.rs");
-        let assignments: Vec<&str> = source
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("self.state = "))
-            .collect();
-
-        assert_eq!(
-            assignments.len(),
-            2,
-            "expected exactly two assignments to self.state, both inside set_active/set_idle. \
-             A new one means a transition that may not have moved the health gauge: if it starts \
-             a run without raising it, runs_in_flight reads 0 during live work and an operator \
-             restarts into it. Route the new site through set_active or set_idle. Found: {assignments:?}"
-        );
     }
 }
 
