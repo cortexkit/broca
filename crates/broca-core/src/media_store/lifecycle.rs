@@ -600,6 +600,9 @@ impl MediaStore {
         // before starting a new deletion, so no other lineage's leftover can
         // appear concurrently; checking the exact paths for tombstone-known
         // lineages is sufficient and costs O(lineages), not O(WAL entries).
+        // Do not list a WAL tree here: the regression test counts
+        // `Step::WalDirectoryListed` emissions to prove none occur, so any
+        // future listing must emit that step or the test will miss it.
         if has_deleting_for_address(&wal, &address)?
             || wal
                 .media_store_class(&address)
