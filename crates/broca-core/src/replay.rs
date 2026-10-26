@@ -1940,6 +1940,20 @@ pub struct SeedBoundary {
     pub qualified: bool,
 }
 
+/// A decoded tail frame positioned in the log, as a bounded tail read returns it.
+///
+/// The validator requires byte contiguity: the first frame starts exactly where the
+/// boundary frame ends, so no record between them can silently vanish from the replay.
+/// Later frames must continue the sequence gaplessly; the wiring reads them in order
+/// from the durable log, so their offsets chain by construction and only the first is
+/// checked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionedFrame {
+    /// Byte offset where this frame starts in the log.
+    pub off: u64,
+    /// The decoded frame.
+    pub framed: FramedRecord,
+}
 /// Why a seeded tail was refused: the caller replays the whole log instead.
 ///
 /// Every reason names a boundary the index must advance past or a log that changed
@@ -1957,23 +1971,30 @@ pub struct SeedFallback {
 /// the log may have been restored shorter, replaced, or rewritten under the same
 /// lineage, and an unqualified cut may sit inside an open tool turn or behind a held
 /// steer the tail would then lose. So this entry point takes the boundary's stored
-/// identity, reads and decodes exactly that frame from `log`, and compares the
-/// sequence, the frame hash and the log lineage before replaying anything. Any
+/// identity, reads exactly that frame and the log's header frame through `read_at`,
+/// and compares the sequence, the frame hash and the log lineage before replaying
+/// anything. Only those two ranges are ever read: the cost stays flat while the log
+/// grows, which is what sparse resume needs on a 150k-message session. Any
 /// mismatch — a missing, torn, moved, different-lineage or different-hash frame, an
-/// unqualified boundary, or a frame whose kind can never seed a tail — returns a
-/// [`SeedFallback`] instead of replaying. The future offset reads must call this,
-/// never the unvalidated engine below, so the wiring cannot skip the check.
+/// unqualified boundary, a tail that is not contiguous with the boundary, or a frame
+/// whose kind can never seed a tail — returns a [`SeedFallback`] instead of replaying.
+/// The future offset reads must call this, never the unvalidated engine below, so the
+/// wiring cannot skip the check.
 ///
-/// `tail` holds the decoded frames after the index's durable end, `held_steers` the
-/// inputs the tail seed still holds at the cut, and `ordinal_base` the prefix length
-/// those rows cover; all three come from the same index snapshot as the boundary.
-/// A Setup in the tail still needs its own index catch-up first: see
+/// `read_at(offset, len)` reads up to `len` bytes at `offset`, returning fewer at or
+/// past the log's end and an error only on a real I/O failure (which also falls back,
+/// letting the full-replay path report it). `tail` holds the positioned frames after
+/// the boundary: the first must continue its sequence and start where it ends, with no
+/// gaps after that; an empty tail is valid only at the log's durable end. `held_steers`
+/// carries the inputs the tail seed still holds at the cut, and `ordinal_base` the
+/// prefix length those rows cover; all three come from the same index snapshot as the
+/// boundary. A Setup in the tail still needs its own index catch-up first: see
 /// [`tail_contains_compaction_setup`].
 #[allow(clippy::too_many_arguments)]
 pub fn replay_seeded_at_validated_boundary(
-    log: &[u8],
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
     boundary: &SeedBoundary,
-    tail: &[FramedRecord],
+    tail: &[PositionedFrame],
     seed_origin: Option<broca_protocol::request::ModelHandle>,
     seed_run_id: Option<RunId>,
     seed_budget: Option<BudgetConfig>,
@@ -1988,29 +2009,59 @@ pub fn replay_seeded_at_validated_boundary(
             reason: "unqualified boundary",
         });
     }
-    if tail.iter().any(|frame| frame.seq <= boundary.seq) {
+    if let Some((first, rest)) = tail.split_first() {
+        // The tail must continue the boundary with no gap: the first frame follows its
+        // sequence and starts where it ends, and no later frame skips one. Anything
+        // between them would silently vanish from the replay.
+        if first.framed.seq != boundary.seq + 1 {
+            return Err(SeedFallback {
+                reason: "tail not contiguous with boundary",
+            });
+        }
+        if first.off != boundary.frame_end {
+            return Err(SeedFallback {
+                reason: "tail byte offset mismatch",
+            });
+        }
+        let mut seq = first.framed.seq;
+        for positioned in rest {
+            seq += 1;
+            if positioned.framed.seq != seq {
+                return Err(SeedFallback {
+                    reason: "tail has a sequence gap",
+                });
+            }
+        }
+    } else if !durable_end_reached(read_at, boundary.frame_end)? {
+        // No tail is only valid at the log's durable end: bytes past the boundary mean
+        // records the caller did not supply.
         return Err(SeedFallback {
-            reason: "tail overlaps boundary",
+            reason: "empty tail before log end",
         });
     }
-    let (off, end) = (
-        usize::try_from(boundary.frame_off).map_err(|_| SeedFallback {
-            reason: "boundary offset out of range",
-        })?,
-        usize::try_from(boundary.frame_end).map_err(|_| SeedFallback {
-            reason: "boundary offset out of range",
-        })?,
-    );
-    let frame_bytes = if off >= end || log.len() <= off {
+    let frame_len = boundary
+        .frame_end
+        .checked_sub(boundary.frame_off)
+        .filter(|len| *len > 0)
+        .ok_or(SeedFallback {
+            reason: "boundary frame outside log",
+        })?;
+    // A short read is a shorter log, not an error: fewer bytes than the committed frame
+    // means the boundary was never durably written here (torn), and no bytes at all
+    // means the log ends before it (missing or moved). Both fall back.
+    let frame_bytes = read_at(boundary.frame_off, frame_len).map_err(|_| SeedFallback {
+        reason: "log unreadable",
+    })?;
+    let frame_bytes = if frame_bytes.is_empty() {
         return Err(SeedFallback {
             reason: "boundary frame outside log",
         });
-    } else if log.len() < end {
+    } else if (frame_bytes.len() as u64) < frame_len {
         return Err(SeedFallback {
             reason: "torn boundary frame",
         });
     } else {
-        &log[off..end]
+        &frame_bytes[..frame_len as usize]
     };
     let (framed, consumed) = match broca_wal::framing::decode_next(frame_bytes) {
         broca_wal::framing::DecodeStep::Record { framed, consumed } => (*framed, consumed),
@@ -2050,7 +2101,14 @@ pub fn replay_seeded_at_validated_boundary(
             reason: "boundary frame identity mismatch",
         });
     }
-    if log_lineage_id(log) != boundary.lineage_id {
+    // The log's header frame carries its lineage; only that fixed-size range is read.
+    // A record-only byte string assembled in a test carries none, and an unreadable
+    // header falls back the same as any other short log.
+    let header =
+        read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64).map_err(|_| SeedFallback {
+            reason: "log unreadable",
+        })?;
+    if log_lineage_id(&header) != boundary.lineage_id {
         return Err(SeedFallback {
             reason: "boundary lineage mismatch",
         });
@@ -2061,7 +2119,7 @@ pub fn replay_seeded_at_validated_boundary(
         });
     }
     replay_seeded_with_held_steers(
-        tail.iter().map(|frame| &frame.record),
+        tail.iter().map(|positioned| &positioned.framed.record),
         seed_origin,
         seed_run_id,
         seed_budget,
@@ -2076,13 +2134,30 @@ pub fn replay_seeded_at_validated_boundary(
     })
 }
 
-/// The log's lineage identity as its first frame records it, if any.
+/// Whether `off` is the log's durable end: a one-byte probe past it reads short.
+///
+/// The probe is the only read past the boundary an empty tail needs. Bytes past the
+/// end mean records the caller did not supply, so the reader falls back instead of
+/// serving a prefix that silently drops them.
+fn durable_end_reached(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    off: u64,
+) -> Result<bool, SeedFallback> {
+    match read_at(off, 1) {
+        Ok(bytes) => Ok(bytes.is_empty()),
+        Err(_) => Err(SeedFallback {
+            reason: "log unreadable",
+        }),
+    }
+}
+
+/// The log's lineage identity as its header frame records it, if any.
 ///
 /// A log the writer opened carries one seq-0 lineage frame; a record-only byte string
 /// assembled in a test carries none. Either way the value is compared verbatim against
 /// the boundary's attested lineage, so a restored or replaced log cannot pass.
-fn log_lineage_id(log: &[u8]) -> Option<String> {
-    match broca_wal::framing::decode_next(log) {
+fn log_lineage_id(header: &[u8]) -> Option<String> {
+    match broca_wal::framing::decode_next(header) {
         broca_wal::framing::DecodeStep::Lineage { lineage_id, .. } => Some(lineage_id.to_string()),
         _ => None,
     }
@@ -5316,7 +5391,7 @@ mod offset_tail_tests {
 
     use super::{
         replay, replay_seeded_at_validated_boundary, replay_seeded_with_held_steers,
-        tail_contains_compaction_setup, SeedBoundary,
+        tail_contains_compaction_setup, PositionedFrame, SeedBoundary,
     };
     use sha2::Digest;
 
@@ -5864,6 +5939,34 @@ mod offset_tail_tests {
         )
     }
 
+    /// A positioned reader over test bytes: short reads at or past the end, exactly like
+    /// a file read, counting returned bytes when asked.
+    fn log_reader<'b>(
+        bytes: &'b [u8],
+        counted: Option<&'b std::cell::Cell<u64>>,
+    ) -> impl Fn(u64, u64) -> std::io::Result<Vec<u8>> + 'b {
+        move |off: u64, len: u64| {
+            let off = off as usize;
+            let end = off.saturating_add(len as usize).min(bytes.len());
+            let out = bytes.get(off..end).unwrap_or(&[]).to_vec();
+            if let Some(counted) = counted {
+                counted.set(counted.get() + out.len() as u64);
+            }
+            Ok(out)
+        }
+    }
+
+    /// The positioned tail starting at scanned frame index `from`.
+    fn positioned_tail(scanned: &[(u64, u64, FramedRecord)], from: usize) -> Vec<PositionedFrame> {
+        scanned[from..]
+            .iter()
+            .map(|(off, _, framed)| PositionedFrame {
+                off: *off,
+                framed: framed.clone(),
+            })
+            .collect()
+    }
+
     /// A tail seeded at a validated boundary replays exactly what a full replay holds
     /// past that boundary: a committed turn, a qualified no-tool step, and an
     /// import-seeded episode each merge with their prefix.
@@ -5876,13 +5979,11 @@ mod offset_tail_tests {
         let seed_at = |seq: u64| {
             let boundary = seed_boundary_for(&bytes, &scanned, seq, true);
             let cut = seq as usize;
-            let tail: Vec<FramedRecord> = scanned[cut..]
-                .iter()
-                .map(|(_, _, framed)| framed.clone())
-                .collect();
+            let tail = positioned_tail(&scanned, cut);
             let (origin, run_id, ordinal_base, held) = seeds_at_cut(&records, cut);
+            let read_at = log_reader(&bytes, None);
             let tail_state = replay_seeded_at_validated_boundary(
-                &bytes,
+                &read_at,
                 &boundary,
                 &tail,
                 origin,
@@ -5926,13 +6027,11 @@ mod offset_tail_tests {
         let import_bytes = encode_log(&import);
         let import_scanned = scan_frames(&import_bytes);
         let boundary = seed_boundary_for(&import_bytes, &import_scanned, 1, true);
-        let import_tail: Vec<FramedRecord> = import_scanned[1..]
-            .iter()
-            .map(|(_, _, framed)| framed.clone())
-            .collect();
+        let import_tail = positioned_tail(&import_scanned, 1);
         let (origin, run_id, ordinal_base, held) = seeds_at_cut(&import, 1);
+        let read_at = log_reader(&import_bytes, None);
         let tail_state = replay_seeded_at_validated_boundary(
-            &import_bytes,
+            &read_at,
             &boundary,
             &import_tail,
             origin,
@@ -5959,16 +6058,19 @@ mod offset_tail_tests {
             run_started("r1", vec![user("task")]),
             step_started(1),
             text_step(1, "answer"),
+            run_finished(RunFinishReason::Completed),
         ];
+        let full = replay(&records).unwrap();
         let bytes = encode_log(&records);
         let scanned = scan_frames(&bytes);
         // Seed at the no-tool step; the suffix after it is the terminal.
         let boundary = seed_boundary_for(&bytes, &scanned, 3, true);
-        let tail: Vec<FramedRecord> = scanned[3..].iter().map(|(_, _, f)| f.clone()).collect();
+        let tail = positioned_tail(&scanned, 3);
         let (origin, run_id, ordinal_base, held) = seeds_at_cut(&records, 3);
-        let seed = |log: &[u8], boundary: &SeedBoundary, tail: &[FramedRecord]| {
+        let seed = |log: &[u8], boundary: &SeedBoundary, tail: &[PositionedFrame]| {
+            let read_at = log_reader(log, None);
             replay_seeded_at_validated_boundary(
-                log,
+                &read_at,
                 boundary,
                 tail,
                 origin.clone(),
@@ -5993,9 +6095,10 @@ mod offset_tail_tests {
             seed(torn, &boundary, &[]).unwrap_err().reason,
             "torn boundary frame"
         );
-        // Offsets moved to the neighbouring frame: the sequence no longer matches.
+        // Offsets moved to the neighbouring frame with nothing after it: the decoded
+        // sequence no longer matches the stored one.
         let mut moved = boundary.clone();
-        let (next_off, next_end, _) = scanned[1].clone();
+        let (next_off, next_end, _) = scanned[3].clone();
         moved.frame_off = next_off;
         moved.frame_end = next_end;
         assert_eq!(
@@ -6003,25 +6106,26 @@ mod offset_tail_tests {
             "boundary sequence mismatch"
         );
         // Rewritten bytes under the same lineage: the frame codec rejects the rewrite.
+        // The tail is present, so the probe is skipped and the frame itself is checked.
         let mut rewritten = bytes.clone();
         let last = rewritten[boundary.frame_end as usize - 1].wrapping_add(1);
         rewritten[boundary.frame_end as usize - 1] = last;
         assert_eq!(
-            seed(&rewritten, &boundary, &[]).unwrap_err().reason,
+            seed(&rewritten, &boundary, &tail).unwrap_err().reason,
             "corrupt boundary frame"
         );
         // A stored identity that no longer matches intact bytes.
         let mut forged = boundary.clone();
         forged.frame_identity = vec![0u8; 32];
         assert_eq!(
-            seed(&bytes, &forged, &[]).unwrap_err().reason,
+            seed(&bytes, &forged, &tail).unwrap_err().reason,
             "boundary frame identity mismatch"
         );
         // A log restored under a different lineage.
         let mut relined = boundary.clone();
         relined.lineage_id = Some("other-lineage".into());
         assert_eq!(
-            seed(&bytes, &relined, &[]).unwrap_err().reason,
+            seed(&bytes, &relined, &tail).unwrap_err().reason,
             "boundary lineage mismatch"
         );
         // The frame is intact but the index never qualified it.
@@ -6031,8 +6135,11 @@ mod offset_tail_tests {
             seed(&bytes, &unqualified, &tail).unwrap_err().reason,
             "unqualified boundary"
         );
-        // The intact, qualified boundary seeds.
-        seed(&bytes, &boundary, &tail).expect("valid boundary seeds");
+        // The intact, qualified boundary seeds, merging with its prefix.
+        let tail_state = seed(&bytes, &boundary, &tail).expect("valid boundary seeds");
+        let mut merged = replay(&records[..3]).unwrap().prompt;
+        merged.extend(tail_state.prompt);
+        assert_eq!(prompt_shape(&merged), prompt_shape(&full.prompt));
     }
 
     /// Cuts no committed boundary can ever cover fall back even when their frame is
@@ -6083,9 +6190,11 @@ mod offset_tail_tests {
             let bytes = encode_log(&records);
             let scanned = scan_frames(&bytes);
             // The caller claims the cut frame qualified; the kind gate still refuses.
+            // The cut frame is last, so the empty tail is at the durable end.
             let boundary = seed_boundary_for(&bytes, &scanned, cut_seq, true);
+            let read_at = log_reader(&bytes, None);
             replay_seeded_at_validated_boundary(
-                &bytes,
+                &read_at,
                 &boundary,
                 &[],
                 None,
@@ -6170,5 +6279,165 @@ mod offset_tail_tests {
             ),
             "boundary frame cannot seed a tail"
         );
+    }
+
+    /// The validator reads only the header frame and the boundary frame: the counted
+    /// bytes stay flat while the log grows, which is what sparse resume needs. The same
+    /// boundary in a 10-frame and a 10,000-frame log costs the same reads.
+    #[test]
+    fn validation_reads_do_not_grow_with_log_length() {
+        let mut small = vec![
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            text_step(1, "answer"),
+            run_finished(RunFinishReason::Completed),
+        ];
+        for i in 0..9996u64 {
+            small.push(WalRecord::ModelStepFinished {
+                written_at_ms: None,
+                tags: None,
+                hooks: None,
+                step_id: StepId(100 + i),
+                assistant_message: Arc::new(AssistantMessage {
+                    message_id: MessageId(format!("pad-{i}")),
+                    content: vec![ContentBlock::Text { text: "pad".into() }],
+                }),
+                usage: Usage::default(),
+                finish_reason: None,
+                retries_used: 0,
+                service_tier_used: None,
+                speed_used: None,
+            });
+        }
+        let small_bytes = encode_log(&small[..4]);
+        let big_bytes = encode_log(&small);
+        assert!(big_bytes.len() > 100 * small_bytes.len());
+        let check = |bytes: &[u8]| {
+            let scanned = scan_frames(&bytes[..small_bytes.len()]);
+            let boundary = seed_boundary_for(&small_bytes, &scanned, 3, true);
+            let tail = positioned_tail(&scanned, 3);
+            let (origin, run_id, ordinal_base, held) = seeds_at_cut(&small[..4], 3);
+            // Only 4 prefix records are replayed for seeds; the filler is never decoded.
+            let counted = std::cell::Cell::new(0u64);
+            let read_at = log_reader(bytes, Some(&counted));
+            replay_seeded_at_validated_boundary(
+                &read_at,
+                &boundary,
+                &tail,
+                origin,
+                run_id,
+                None,
+                None,
+                ordinal_base,
+                false,
+                Default::default(),
+                held,
+            )
+            .expect("valid boundary seeds");
+            counted.get()
+        };
+        let small_reads = check(&small_bytes);
+        let big_reads = check(&big_bytes);
+        assert_eq!(small_reads, big_reads);
+        assert!(
+            big_reads < 2048,
+            "two frames, not the log: {big_reads} bytes"
+        );
+        assert!(big_reads * 100 < big_bytes.len() as u64);
+    }
+
+    /// The tail must continue the boundary with no gap: a skipped first frame, a hole
+    /// inside, or a first frame starting anywhere but the boundary end all fall back.
+    /// An empty tail is valid only at the log's durable end.
+    #[test]
+    fn tail_contiguity_is_required() {
+        let records = vec![
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            text_step(1, "answer-a"),
+            step_started(2),
+            text_step(2, "answer-b"),
+            run_finished(RunFinishReason::Completed),
+        ];
+        let bytes = encode_log(&records);
+        let scanned = scan_frames(&bytes);
+        let boundary = seed_boundary_for(&bytes, &scanned, 3, true);
+        let (origin, run_id, ordinal_base, held) = seeds_at_cut(&records, 3);
+        let seed_with = |tail: &[PositionedFrame]| {
+            let read_at = log_reader(&bytes, None);
+            replay_seeded_at_validated_boundary(
+                &read_at,
+                &boundary,
+                tail,
+                origin.clone(),
+                run_id.clone(),
+                None,
+                None,
+                ordinal_base,
+                false,
+                Default::default(),
+                held.clone(),
+            )
+        };
+        let positioned = positioned_tail(&scanned, 3);
+        // A skipped first frame: the step record between them vanishes.
+        let mut gapped_start = positioned.clone();
+        gapped_start.remove(0);
+        assert_eq!(
+            seed_with(&gapped_start).unwrap_err().reason,
+            "tail not contiguous with boundary"
+        );
+        // A hole inside the tail.
+        let mut gapped_inside = positioned.clone();
+        gapped_inside.remove(1);
+        assert_eq!(
+            seed_with(&gapped_inside).unwrap_err().reason,
+            "tail has a sequence gap"
+        );
+        // The first frame starting anywhere but the boundary end.
+        let mut shifted = positioned.clone();
+        shifted[0].off += 1;
+        assert_eq!(
+            seed_with(&shifted).unwrap_err().reason,
+            "tail byte offset mismatch"
+        );
+        // No tail while the log continues past the boundary.
+        assert_eq!(
+            seed_with(&[]).unwrap_err().reason,
+            "empty tail before log end"
+        );
+    }
+
+    /// An empty tail at the log's durable end seeds: nothing follows the boundary, so
+    /// there is nothing to place and nothing to skip.
+    #[test]
+    fn empty_tail_valid_only_at_durable_end() {
+        let records = corpus_records();
+        let bytes = encode_log(&records);
+        let scanned = scan_frames(&bytes);
+        let turn_seq = records
+            .iter()
+            .position(|record| matches!(record, WalRecord::TurnFinished { .. }))
+            .expect("corpus commits a turn") as u64
+            + 1;
+        let boundary = seed_boundary_for(&bytes, &scanned, turn_seq, true);
+        // The log truncated to the boundary frame's end: the boundary is the durable end.
+        let cut_bytes = &bytes[..boundary.frame_end as usize];
+        let read_at = log_reader(cut_bytes, None);
+        let tail_state = replay_seeded_at_validated_boundary(
+            &read_at,
+            &boundary,
+            &[],
+            None,
+            Some(RunId("r1".into())),
+            None,
+            None,
+            3,
+            false,
+            Default::default(),
+            Vec::new(),
+        )
+        .expect("empty tail at the durable end seeds");
+        assert!(tail_state.prompt.is_empty());
     }
 }

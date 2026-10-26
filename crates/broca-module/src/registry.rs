@@ -6269,6 +6269,24 @@ mod offset_page_tests {
         }
     }
 
+    fn text_step(step: u64, text: &str) -> WalRecord {
+        WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(step),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId(format!("m{step}")),
+                content: vec![ContentBlock::Text { text: text.into() }],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        }
+    }
+
     fn run_finished(reason: RunFinishReason) -> WalRecord {
         WalRecord::RunFinished {
             interrupt_reason: None,
@@ -6586,36 +6604,58 @@ mod offset_page_tests {
 
     #[test]
     fn tail_replay_seeded_with_held_steers_matches_full_replay() {
-        let (bytes, records) = corpus_wal();
-        let full = broca_core::replay(&records.to_vec()).unwrap();
+        // No-tool step with a steer held before it: the boundary is the step, the tail is
+        // the terminal, and the seeded steer lands at the close exactly as full replay
+        // has it. The tail starts right after the boundary frame, so nothing vanishes.
+        let records = [
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            steered("held"),
+            text_step(1, "answer"),
+            run_finished(RunFinishReason::Completed),
+        ];
+        let full = broca_core::replay(records.as_ref()).unwrap();
+        assert_eq!(
+            prompt_shape(&full.prompt),
+            vec![
+                (Role::User, "task".into()),
+                (Role::Assistant, "answer".into()),
+                (Role::User, "held".into()),
+            ]
+        );
+        let mut bytes = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            bytes.extend(
+                broca_wal::framing::encode(index as u64 + 1, 1, record).expect("encode test log"),
+            );
+        }
         let (offsets, framed) = scan_offsets(&bytes);
-        // Cut after the steer is recorded but before its placing terminal: the index holds
-        // it, the tail has not seen it. The seeding boundary is the committed turn before
-        // the steer; the tail starts past the steer's frame with the steer seeded.
-        let steer_idx = records
-            .iter()
-            .position(|r| matches!(r, WalRecord::Steered { .. }))
-            .unwrap();
-        let turn_idx = records[..steer_idx]
-            .iter()
-            .rposition(|r| matches!(r, WalRecord::TurnFinished { .. }))
-            .unwrap();
-        let (turn_off, turn_end) = offsets[turn_idx];
+        // Boundary at the no-tool step (seq 4); the tail is the terminal alone.
         let boundary = broca_core::replay::SeedBoundary {
             lineage_id: None,
-            seq: framed[turn_idx].seq,
-            frame_off: turn_off,
-            frame_end: turn_end,
-            frame_identity: sha2::Sha256::digest(&bytes[turn_off as usize..turn_end as usize])
-                .to_vec(),
+            seq: 4,
+            frame_off: offsets[3].0,
+            frame_end: offsets[3].1,
+            frame_identity: sha2::Sha256::digest(
+                &bytes[offsets[3].0 as usize..offsets[3].1 as usize],
+            )
+            .to_vec(),
             qualified: true,
         };
-        let tail: Vec<FramedRecord> = framed[steer_idx + 1..].to_vec();
-        let prefix_records: Vec<WalRecord> = records[..steer_idx + 1].to_vec();
+        let tail = vec![broca_core::replay::PositionedFrame {
+            off: offsets[4].0,
+            framed: framed[4].clone(),
+        }];
+        let prefix_records: Vec<WalRecord> = records[..4].to_vec();
         let prefix = broca_core::replay(&prefix_records).unwrap();
         assert_eq!(prefix.pending_steers.len(), 1);
+        let read_at = move |off: u64, len: u64| -> std::io::Result<Vec<u8>> {
+            let off = off as usize;
+            let end = off.saturating_add(len as usize).min(bytes.len());
+            Ok(bytes.get(off..end).unwrap_or(&[]).to_vec())
+        };
         let tail_state = broca_core::replay::replay_seeded_at_validated_boundary(
-            &bytes,
+            &read_at,
             &boundary,
             &tail,
             None,
