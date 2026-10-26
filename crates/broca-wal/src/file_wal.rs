@@ -2613,7 +2613,7 @@ mod tests {
         [
             "010000000102000000000000000100000000000000e36c2cb768b1bc82603d9f2b9b5887e8e6ef59c06a9cff1568337df0a85031f87b",
             "000000000200000000000000000000000000000000401da6ea6a614dd6d773b1ba84c91ee6d981827bd0bdc5188aa2e5dbffba558c",
-            "020000000402000000000000000100000000000000bc8904cedfcc5d62bdcada4163a0277512d243828920eb0a756692a79632c3167b7d",
+            "020000000502000000000000000100000000000000dede443b9e38d392c3c40582d40136eada16de948804578ca1f6befda78053be7b7d",
         ].iter().map(|hex| hex.as_bytes().as_chunks::<2>().0.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()).collect()
     }
 
@@ -2695,7 +2695,7 @@ mod tests {
         for (frame, digest) in frames.iter().zip([
             "fc173954f8d37c3ab05dca617977688791396ed3ce890761a8ec309fa4a61003",
             "aadca446961718a022df99918817d44dc7b82e1d6a17bcda15982600f8ffd3a0",
-            "e798c4b8bf64d274cb865b2c095edfce1509ee08a10e1c645e04037b90565fb4",
+            "de7a77e7ce353f876cf1673c79fa5075406d9552a010fe1002d4b8600e306299",
         ]) {
             assert_eq!(format!("{:x}", Sha256::digest(frame)), digest);
         }
@@ -2709,7 +2709,7 @@ mod tests {
         ));
         assert!(matches!(
             crate::framing::decode_next(&frames[2]),
-            DecodeStep::Corrupt(FrameError::UnsupportedVersion { ver: 4 })
+            DecodeStep::Corrupt(FrameError::UnsupportedVersion { ver: 5 })
         ));
     }
 
