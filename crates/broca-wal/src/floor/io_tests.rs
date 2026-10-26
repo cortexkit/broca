@@ -327,8 +327,11 @@ fn crash_cuts_never_publish_a_frame_before_its_floor() {
     }
 }
 
+/// Benchmark, not a correctness test: prints the latency and floor I/O counts of 10,000 gated
+/// appends. Only the replay length is asserted, so a run that dropped appends cannot report a
+/// fast time; the floor's durability and memoized I/O are asserted by the active tests above.
 #[test]
-#[ignore = "synthetic 10,000-frame timing measurement; run explicitly with --ignored --nocapture"]
+#[ignore = "benchmark: 10,000 gated appends; run optimized with --ignored --nocapture"]
 fn gated_append_10000_measurement() {
     let root = super::tests::scratch("measurement");
     let floor = root.join(FEATURE_FLOOR_FILENAME);

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MARKER: &str = "RETENTION-MODULE-CONTENT-SENTINEL-59137";
 
-#[cfg(any(target_os = "linux", feature = "test-clock"))]
+#[cfg(feature = "test-clock")]
 fn large_expiry_step() -> WalRecord {
     WalRecord::ModelStepFinished {
         written_at_ms: None,

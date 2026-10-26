@@ -1408,6 +1408,9 @@ mod tests {
 
     #[test]
     fn provider_text_state_is_must_understand_before_record_decode() {
+        // One record is a steered frame decoded with the shipped table; a sibling test hides
+        // steer-queue/v1 process-wide.
+        let _table = lock_feature_table_for_test();
         let block = serde_json::json!({"type":"text_with_state","text":"","provider_state":{"format":"gemini","data":"opaque+/="}});
         let message = serde_json::json!({"role":"assistant","content":[block.clone()]});
         let run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/tmp/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"}});
@@ -1641,6 +1644,9 @@ mod tests {
     /// tags keep their ungated bytes.
     #[test]
     fn runner_tags_are_must_understand_and_older_readers_refuse_them_by_name() {
+        // One record is a steered frame decoded with the shipped table; a sibling test hides
+        // steer-queue/v1 process-wide.
+        let _table = lock_feature_table_for_test();
         let run = serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/tmp/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"origin":{"kind":"fresh"}});
         let result = serde_json::json!({"type":"tool_result","batch_id":"b","result":{"tool_call_id":"c","output":{"kind":"text","text":"r"}},"outcome":"completed"});
         let untagged = [
@@ -2097,6 +2103,8 @@ mod tests {
     /// through plain [`encode`], and this build reads it back intact.
     #[test]
     fn a_steered_record_is_a_gated_frame_requiring_steer_queue_v1_and_round_trips() {
+        // Decodes with the shipped table, which a sibling test edits to hide steer-queue/v1.
+        let _table = lock_feature_table_for_test();
         let record: WalRecord = serde_json::from_str(STEERED).unwrap();
         assert_eq!(record.required_features(), &[STEER_QUEUE_FEATURE]);
         let bytes = encode(5, 1, &record).unwrap();
@@ -2145,6 +2153,8 @@ mod tests {
     /// 1 as u64 LE, and the payload.
     #[test]
     fn a_dispatch_module_intent_is_a_gated_frame_requiring_dispatch_module_v1_and_round_trips() {
+        // Decodes with the shipped table, which a sibling test edits to hide dispatch-module/v1.
+        let _table = lock_feature_table_for_test();
         let record: WalRecord = serde_json::from_str(DISPATCH_MODULE_INTENT).unwrap();
         assert_eq!(record.required_features(), &[DISPATCH_MODULE_FEATURE]);
         let bytes = encode(1, 1, &record).unwrap();
@@ -2187,6 +2197,8 @@ mod tests {
     /// carry no schema digests) and a pin without a module both require `dispatch-module/v1`.
     #[test]
     fn either_dispatch_module_field_alone_gates_the_intent() {
+        // Decodes with the shipped table, which a sibling test edits to hide dispatch-module/v1.
+        let _table = lock_feature_table_for_test();
         let module_only = DISPATCH_MODULE_INTENT.replacen(
             r#","schema_pin":{"schema_digest":"sha256:5f2c","semantics":2}"#,
             "",
@@ -2592,6 +2604,9 @@ mod tests {
     /// golden and a declarations-only record. Feature refusal must precede payload decoding.
     #[test]
     fn a_build_without_step_transforms_refuses_hooked_wal_as_newer_writer() {
+        // The current-reader check decodes steered and module-naming intent frames with the
+        // shipped table; sibling tests hide steer-queue/v1 and dispatch-module/v1 process-wide.
+        let _table = lock_feature_table_for_test();
         let older: Vec<&str> = KNOWN_FEATURES
             .iter()
             .copied()
