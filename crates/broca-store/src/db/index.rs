@@ -22,6 +22,13 @@ impl LogLocation {
 
 /// `bytes` must end at the writer's durable publication boundary, not at a live
 /// file's speculative EOF. The index never writes, repairs or truncates the log.
+///
+/// Within one lineage, committed bytes are immutable. Normal transitions are
+/// appends or truncation of an unpublished torn tail; the checkpoint authenticates
+/// only the last indexed frame, not the entire preceding prefix. Any path that
+/// rewrites earlier bytes under the same lineage (including restore or archive
+/// reasoning pruning) must call [`OverhaulDb::forget_session`] before indexing
+/// again, even when the final indexed frame and its offsets are unchanged.
 pub struct PublishedSession<'a> {
     pub bind: &'a BindIdentity,
     pub session_ref: &'a str,
@@ -58,8 +65,19 @@ pub(super) fn sid(bind: &BindIdentity) -> Result<String, DbError> {
 }
 
 impl OverhaulDb {
-    /// Self-check before using indexed rows. A restored shorter or rewritten log
-    /// discards only this session's derived rows, in the same transaction as replay.
+    /// Discard only this session's rebuildable rows before a same-lineage rewrite.
+    /// Authoritative state and other sessions are never cleared by this operation.
+    pub fn forget_session(&self, bind: &BindIdentity) -> Result<(), DbError> {
+        let key = sid(bind)?;
+        self.transaction(false, |tx| clear_session(tx, &key))
+    }
+
+    /// Self-check the last indexed frame before using rows. A shorter log,
+    /// different lineage or changed checkpoint rebuilds only this session's
+    /// derived rows, in the same transaction as replay.
+    /// Earlier committed bytes must remain immutable within a lineage; callers
+    /// that rewrite them must first use [`Self::forget_session`]. The last-frame
+    /// self-check is a bounded guard, not authentication of the whole prefix.
     pub fn index(&self, log: &PublishedSession<'_>) -> Result<IndexOutcome, DbError> {
         self.transaction(false, |tx| index_in_tx(tx, log, false))
     }
@@ -524,6 +542,10 @@ mod tests {
         if let WalRecord::RunFinished { reason, .. } = &mut terminal {
             *reason = broca_protocol::caller::RunFinishReason::Completed;
         }
+        let mut interrupted = terminal.clone();
+        if let WalRecord::RunFinished { reason, .. } = &mut interrupted {
+            *reason = broca_protocol::caller::RunFinishReason::Interrupted;
+        }
         let (run_id, request) = match &start {
             WalRecord::RunStarted {
                 run_id,
@@ -581,11 +603,21 @@ mod tests {
         if let WalRecord::RunStarted { run_id, .. } = &mut next {
             run_id.0 = "next-episode".into();
         }
+        let mut next_paused = paused.clone();
+        if let (
+            WalRecord::RunPaused { run_id, .. },
+            WalRecord::RunStarted {
+                run_id: next_id, ..
+            },
+        ) = (&mut next_paused, &next)
+        {
+            *run_id = next_id.clone();
+        }
         let mut interposed = source[..=tool_pos].to_vec();
         interposed.extend([queued, steer.clone()]);
         interposed.extend_from_slice(&source[tool_pos + 1..=intent_pos]);
         let mut steer_across_turn = source[..=intent_pos].to_vec();
-        steer_across_turn.push(steer);
+        steer_across_turn.push(steer.clone());
         steer_across_turn.extend_from_slice(&source[intent_pos + 1..=turn_pos]);
         vec![
             ("swallowed_tool_step", source[..=tool_pos].to_vec(), vec![]),
@@ -631,12 +663,59 @@ mod tests {
                 vec![seeded.clone(), terminal.clone()],
                 vec![1],
             ),
+            (
+                "zero_seed_interrupted_terminal",
+                vec![seeded.clone(), interrupted],
+                vec![1],
+            ),
             ("zero_seed_paused", vec![seeded.clone(), paused], vec![]),
             ("zero_seed_open", vec![seeded.clone()], vec![]),
             (
                 "zero_seed_intervening_step",
                 vec![seeded, step.clone(), terminal.clone()],
                 vec![],
+            ),
+            (
+                "prior_boundary_with_paused_episode",
+                vec![
+                    start.clone(),
+                    step.clone(),
+                    text_step.clone(),
+                    terminal.clone(),
+                    next.clone(),
+                    step.clone(),
+                    text_step.clone(),
+                    next_paused,
+                ],
+                vec![3],
+            ),
+            (
+                "prior_boundary_with_terminal_less_episode",
+                vec![
+                    start.clone(),
+                    step.clone(),
+                    text_step.clone(),
+                    terminal.clone(),
+                    next.clone(),
+                    step.clone(),
+                    text_step.clone(),
+                ],
+                vec![3],
+            ),
+            (
+                "prior_boundary_with_steered_episode",
+                vec![
+                    start.clone(),
+                    step.clone(),
+                    text_step.clone(),
+                    terminal.clone(),
+                    next.clone(),
+                    steer,
+                    step.clone(),
+                    text_step.clone(),
+                    terminal.clone(),
+                ],
+                vec![3, 8],
             ),
             (
                 "later_episode_terminal",
@@ -843,12 +922,23 @@ mod tests {
                     assert_eq!(consumed, end-off);
                     assert_eq!(framed.seq, seq);
                     let kind: String = row.get(9)?;
-                    assert_eq!(row.get::<_,u64>(10)?, 0);
+                    let prefix_records = &records[..seq as usize];
+                    let starts: Vec<_> = prefix_records.iter().filter_map(|record| match record {
+                        WalRecord::RunStarted { run_id, .. } => Some(run_id), _ => None,
+                    }).collect();
+                    assert_eq!(row.get::<_,u64>(10)?, starts.len() as u64 - 1);
                     let run_id: String = row.get(11)?;
-                    assert!(matches!(&records[0], WalRecord::RunStarted { run_id: id, .. } if id.0 == run_id));
-                    if kind == "zero_step_seed" { assert!(row.get::<_,Option<u64>>(12)?.is_none()); }
-                    else { assert!(row.get::<_,Option<u64>>(12)?.is_some()); }
-                    if kind == "turn_finished" { assert!(row.get::<_,Option<String>>(13)?.is_some()); }
+                    assert_eq!(run_id, starts.last().unwrap().0);
+                    let expected_step = match &framed.record {
+                        WalRecord::ModelStepFinished { step_id, .. } | WalRecord::TurnFinished { step_id } => Some(step_id.0),
+                        WalRecord::RunStarted { .. } => None,
+                        _ => panic!("boundary points at a non-candidate frame"),
+                    };
+                    assert_eq!(row.get::<_,Option<u64>>(12)?, expected_step);
+                    let expected_batch = (kind == "turn_finished").then(|| prefix_records.iter().rev()
+                        .take_while(|record| !matches!(record, WalRecord::RunStarted { .. } | WalRecord::StepStarted { .. }))
+                        .find_map(|record| match record { WalRecord::ToolBatchStarted { batch_id, .. } => Some(batch_id.0.clone()), _ => None })).flatten();
+                    assert_eq!(row.get::<_,Option<String>>(13)?, expected_batch);
                     if row.get::<_,bool>(4)? && kind != "turn_finished" {
                         let terminal_seq: u64 = row.get(5)?;
                         let terminal_off: usize = row.get(6)?;
@@ -866,6 +956,120 @@ mod tests {
                 Ok(())
             }).unwrap();
         }
+    }
+
+    #[test]
+    fn qualified_boundaries_merge_prefix_and_tail_to_full_replay() {
+        let logs = corpus();
+        let mut checked = 0;
+        let mut saw_steered_tail = false;
+        let mut saw_paused_tail = false;
+        let mut saw_seeded_boundary = false;
+        let mut saw_episode_transition = false;
+        for (log_n, bytes) in logs.iter().enumerate() {
+            let bind = bind(bytes);
+            let db = database();
+            for (_, end, _) in decoded(bytes) {
+                db.db.index(&publication(&bind, &bytes[..end])).unwrap();
+                let framed: Vec<_> = decoded(&bytes[..end])
+                    .into_iter()
+                    .map(|(_, _, frame)| frame)
+                    .collect();
+                let full_records: Vec<_> =
+                    framed.iter().map(|frame| frame.record.clone()).collect();
+                let full = broca_core::replay(&full_records).unwrap();
+                for boundary in qualified_boundaries(&db.db) {
+                    let split = framed.partition_point(|frame| frame.seq <= boundary);
+                    let prefix_frames = &framed[..split];
+                    let prefix_records: Vec<_> = prefix_frames
+                        .iter()
+                        .map(|frame| frame.record.clone())
+                        .collect();
+                    let prefix_replay = broca_core::replay(&prefix_records).unwrap();
+                    let tail: Vec<_> = framed[split..]
+                        .iter()
+                        .map(|frame| frame.record.clone())
+                        .collect();
+                    let checkpoint =
+                        broca_core::AdmissionCheckpointV1::from_frames(prefix_frames).unwrap();
+                    let budget = checkpoint
+                        .last_episode
+                        .as_ref()
+                        .and_then(|episode| episode.budget_replay_state.clone());
+                    let config = prefix_replay.run_config.clone();
+                    let run_id = prefix_replay.run_id.clone();
+                    let check_simple_merge =
+                        config.as_ref().is_none_or(|config| config.budget.is_none());
+                    let prefix = broca_core::StorePrefix {
+                        prefix: prefix_replay.prompt,
+                        completed_steps: prefix_replay.completed_steps,
+                        usage: prefix_replay.usage,
+                        retries_used: prefix_replay.retries_used,
+                        last_step_usage: prefix_replay.last_step_usage,
+                        last_step_finish_reason: prefix_replay.last_step_finish_reason,
+                        watermark_seq: boundary,
+                        ..broca_core::StorePrefix::empty()
+                    };
+                    // Rebuild the stored prefix from the WAL without consulting
+                    // eligibility facts, then exercise the real prefix/tail merge.
+                    // Frozen config and budget facts are needed when a budget
+                    // message in the tail belongs to an episode opened before it.
+                    let merged =
+                        broca_core::resume_state_from_store(&prefix, &tail, config, run_id, budget)
+                            .unwrap_or_else(|error| {
+                                panic!("merge log {log_n}, end {end}, boundary {boundary}: {error}")
+                            })
+                            .prompt;
+                    assert_eq!(
+                        merged, full.prompt,
+                        "log {log_n}, end {end}, boundary {boundary}"
+                    );
+                    assert_eq!(
+                        merged
+                            .iter()
+                            .map(|message| message.part_tags())
+                            .collect::<Vec<_>>(),
+                        full.prompt
+                            .iter()
+                            .map(|message| message.part_tags())
+                            .collect::<Vec<_>>(),
+                        "tag metadata at log {log_n}, end {end}, boundary {boundary}"
+                    );
+                    if check_simple_merge {
+                        assert_eq!(
+                            broca_core::effective_context(&prefix, &tail).unwrap(),
+                            full.prompt,
+                            "plain context merge at log {log_n}, end {end}, boundary {boundary}"
+                        );
+                    }
+                    saw_steered_tail |= tail
+                        .iter()
+                        .any(|record| matches!(record, WalRecord::Steered { .. }));
+                    saw_paused_tail |= tail
+                        .iter()
+                        .any(|record| matches!(record, WalRecord::RunPaused { .. }));
+                    saw_seeded_boundary |= matches!(
+                        &framed[split - 1].record,
+                        WalRecord::RunStarted {
+                            origin: broca_wal::RunOrigin::SeededFrom { .. },
+                            ..
+                        }
+                    );
+                    saw_episode_transition |= tail
+                        .iter()
+                        .any(|record| matches!(record, WalRecord::RunStarted { .. }));
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 0
+                && saw_steered_tail
+                && saw_paused_tail
+                && saw_seeded_boundary
+                && saw_episode_transition
+        );
+        eprintln!("independent prefix/tail replay oracle: {checked} qualified cuts across {} logs; steered/paused tails, seeded terminals and episode transitions covered", logs.len());
     }
 
     #[test]
@@ -988,6 +1192,110 @@ mod tests {
     }
 
     #[test]
+    fn forget_session_reindexes_same_lineage_prefix_rewrites_without_touching_authoritative_rows() {
+        use broca_wal::{FileWal, Wal};
+        let (_, records, _) = boundary_cases()
+            .into_iter()
+            .find(|(name, _, _)| *name == "no_tool_terminal")
+            .unwrap();
+        let db = database();
+        let path = db._scratch.0.join("rewrite.wal");
+        {
+            let mut wal = FileWal::open(&path).unwrap();
+            for record in &records {
+                wal.append(1, record, true).unwrap();
+            }
+        }
+        let original = std::fs::read(&path).unwrap();
+        assert!(matches!(decode_next(&original), DecodeStep::Lineage { .. }));
+        let bind = bind(&original);
+        let frames = decoded(&original);
+        let (off, end, mut changed) = frames
+            .iter()
+            .find(|(_, _, frame)| matches!(frame.record, WalRecord::ModelStepFinished { .. }))
+            .unwrap()
+            .clone();
+        if let WalRecord::ModelStepFinished {
+            assistant_message, ..
+        } = &mut changed.record
+        {
+            std::sync::Arc::make_mut(assistant_message).content =
+                vec![broca_protocol::ContentBlock::Text {
+                    text: "edit".into(),
+                }];
+        }
+        let replacement = encode(changed.seq, changed.fence, &changed.record).unwrap();
+        assert_eq!(replacement.len(), end - off);
+        let mut rewritten = original.clone();
+        rewritten[off..end].copy_from_slice(&replacement);
+        let (checkpoint_off, checkpoint_end, _) = frames.last().unwrap();
+        assert_eq!(
+            &original[*checkpoint_off..*checkpoint_end],
+            &rewritten[*checkpoint_off..*checkpoint_end]
+        );
+
+        let mut other_records = records.clone();
+        let mut other_bind = bind.clone();
+        other_bind.session.push_str("-other");
+        if let WalRecord::RunStarted {
+            run_id, session, ..
+        } = &mut other_records[0]
+        {
+            *session = other_bind.clone();
+            run_id.0 = "other-index-session".into();
+        }
+        let other = encode_records(&other_records);
+        db.db.authoritative_transaction(|tx| {
+            tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
+            tx.execute_batch("CREATE TABLE retention_job (id TEXT PRIMARY KEY, evidence BLOB NOT NULL); INSERT INTO retention_job VALUES ('kept',X'000102FF');")?;
+            Ok(())
+        }).unwrap();
+        let authoritative = rows(&db.db, &["log_reader", "retention_job"]);
+        db.db.index(&publication(&other_bind, &other)).unwrap();
+        db.db.index(&publication(&bind, &original)).unwrap();
+        let original_rows = r_rows(&db.db);
+        // This intentionally violates the immutable-prefix contract: authenticating
+        // an unchanged checkpoint cannot detect this earlier rewrite. Keeping the
+        // stale boundary identity demonstrates exactly why callers must forget.
+        assert!(
+            !db.db
+                .index(&publication(&bind, &rewritten))
+                .unwrap()
+                .rebuilt
+        );
+        assert_eq!(r_rows(&db.db), original_rows);
+        let fresh = database();
+        fresh.db.index(&publication(&other_bind, &other)).unwrap();
+        let other_rows = r_rows(&fresh.db);
+        fresh
+            .db
+            .rebuild_session(&publication(&bind, &rewritten))
+            .unwrap();
+        assert_ne!(
+            original_rows,
+            r_rows(&fresh.db),
+            "the changed earlier boundary must have a different identity"
+        );
+
+        db.db.forget_session(&bind).unwrap();
+        assert_eq!(
+            r_rows(&db.db),
+            other_rows,
+            "forget must remove only the selected session's R rows"
+        );
+        assert_eq!(
+            rows(&db.db, &["log_reader", "retention_job"]),
+            authoritative
+        );
+        db.db.index(&publication(&bind, &rewritten)).unwrap();
+        assert_eq!(r_rows(&db.db), r_rows(&fresh.db));
+        assert_eq!(
+            rows(&db.db, &["log_reader", "retention_job"]),
+            authoritative
+        );
+    }
+
+    #[test]
     fn stale_undecodable_and_wrong_budget_seeds_rebuild() {
         let bytes = corpus().remove(0);
         let bind = bind(&bytes);
@@ -1034,6 +1342,37 @@ mod tests {
             "a prior seed format must not guess boundary state"
         );
         assert!(OffsetSeed::decode(&encoded, None).is_none());
+    }
+
+    #[test]
+    fn index_rebuilds_on_unsupported_inner_budget_version() {
+        let logs = corpus();
+        for budgeted in [false, true] {
+            let bytes = logs.iter().find(|bytes| decoded(bytes).iter().any(|(_, _, frame)|
+                matches!(&frame.record, WalRecord::RunStarted { config, .. } if config.budget.is_some())) == budgeted).unwrap();
+            let bind = bind(bytes);
+            let db = database();
+            db.db.index(&publication(&bind, bytes)).unwrap();
+            db.db
+                .authoritative_transaction(|tx| {
+                    let encoded: String =
+                        tx.query_row("SELECT tail_seed FROM session", [], |row| row.get(0))?;
+                    let mut seed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                    assert_eq!(seed[0], broca_core::projection_plan::OFFSET_SEED_VERSION);
+                    seed[1]["placement"]["budget"]["version"] = u32::MAX.into();
+                    tx.execute("UPDATE session SET tail_seed=?1", [seed.to_string()])?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(db.db.index(&publication(&bind, bytes)).unwrap().rebuilt,
+                "a current outer version must not authenticate an unsupported inner budget version (budgeted={budgeted})");
+            let fresh = database();
+            fresh
+                .db
+                .rebuild_session(&publication(&bind, bytes))
+                .unwrap();
+            assert_eq!(r_rows(&db.db), r_rows(&fresh.db));
+        }
     }
 
     #[test]

@@ -859,6 +859,16 @@ impl OffsetSeed {
         {
             return None;
         }
+        // A non-budgeted episode has an empty nudge domain. This fallback is
+        // only for validation; it is never restored as the episode's config.
+        let empty_budget = broca_protocol::request::BudgetConfig::default();
+        if !seed
+            .placement
+            .budget()
+            .is_valid_for(budget.as_ref().unwrap_or(&empty_budget))
+        {
+            return None;
+        }
         seed.budget_config = budget.clone();
         seed.placement = crate::placement::Placement::from_index_seed(seed.placement, budget);
         Some(seed)
