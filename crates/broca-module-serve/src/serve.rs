@@ -156,8 +156,13 @@ async fn log_served_request<F: std::future::Future>(
         .scope(std::cell::RefCell::new(None), async {
             let (output, actor_opened) =
                 broca_module::registry::with_request_actor_opened(catch_panic(future)).await;
-            if output.is_err() {
-                record_request_outcome("internal_error");
+            if output.is_err()
+                && !TERMINAL_SENT
+                    .try_with(|sent| sent.load(Ordering::SeqCst))
+                    .unwrap_or(false)
+            {
+                // reply_on_panic sends the wire code "transient" when no reply was claimed.
+                record_request_outcome("transient");
             }
             let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             // Hash only when a line will be emitted; the address hash never contains path or content.
@@ -5432,6 +5437,41 @@ mod tests {
         assert_eq!(logs.len(), 1, "{logs:?}");
         assert_eq!(logs[0].level, tracing::Level::WARN);
         assert_eq!(logs[0].fields["elapsed_ms"], "2001");
+    }
+
+    #[tokio::test]
+    async fn panicked_management_request_logs_the_wire_refusal_code() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        async fn panicking_handler() -> Result<(), ServeIoError> {
+            panic!("private handler state");
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("requests=debug"))
+            .with(RequestLogCapture(events.clone()));
+        let (writer, mut frames) = broca_diagnostics::channel(4, Arc::default());
+        let session = BrocaBindIdentity::new("/private/project", "runner", "panic");
+        reply_on_panic(
+            writer,
+            (1, 1, 1, 1),
+            log_served_request(OP_HEAD, &session, None, "reply", panicking_handler()),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        let frame = frames.recv().await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Error);
+        let refusal: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(refusal.code, "transient");
+        let events = events.lock().unwrap();
+        let logs: Vec<_> = events
+            .iter()
+            .filter(|event| event.target == "requests")
+            .collect();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].fields["outcome"], refusal.code);
+        assert!(!format!("{logs:?}").contains("private handler state"));
     }
 
     #[test]
