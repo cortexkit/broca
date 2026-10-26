@@ -213,6 +213,62 @@ async fn every_broca_spawn_site_pins_its_state_root() {
     for wrapper in wrappers {
         for explicit in [false, true] {
             let machine = Machine::new(&format!("{wrapper}-{explicit}"));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let key = vec![0x51; 32];
+            let daemon_id = [0x15; 16];
+            subc_transport::connection_file::write_atomic(
+                machine.connection_file(),
+                &subc_transport::connection_file::ConnectionInfo {
+                    schema: subc_transport::connection_file::SCHEMA_VERSION,
+                    wire_version: None,
+                    endpoints: vec![subc_transport::connection_file::Endpoint {
+                        host: "127.0.0.1".into(),
+                        port: listener.local_addr().unwrap().port(),
+                    }],
+                    key: key.clone(),
+                    daemon_id,
+                    pid: std::process::id(),
+                    daemon_ver: "isolation".into(),
+                },
+            )
+            .unwrap();
+            // Authentication lets boot reach its storage initialization. The stand-in
+            // offers no modules or providers, so it cannot authorize any application work.
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                subc_transport::authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "isolation",
+                    broca_test_support::STAND_IN_AUTH_DEADLINE,
+                )
+                .await
+                .unwrap();
+                while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
+                    let (ty, body) = match frame.header.ty {
+                        subc_protocol::FrameType::Request => (subc_protocol::FrameType::Error,
+                            br#"{"code":"unknown_method","message":"no services in the isolation stand-in"}"#.to_vec()),
+                        subc_protocol::FrameType::Ping => (subc_protocol::FrameType::Pong, vec![]),
+                        _ => continue,
+                    };
+                    let reply = subc_protocol::Frame::build(
+                        ty,
+                        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        body,
+                    )
+                    .unwrap();
+                    if subc_transport::write_frame(&mut stream, &reply)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
             let binary =
                 broca_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-broca"), &machine.0);
             let mut command: tokio::process::Command = match wrapper {
@@ -242,24 +298,36 @@ async fn every_broca_spawn_site_pins_its_state_root() {
                 .env_remove("SUBC_LAUNCH_NONCE_FD")
                 .env("SUBC_MODULE_ID", "broca")
                 .env("BROCA_STATE_ROOT", &inherited)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::fs::File::create(machine.0.join("boot.stdout.log")).unwrap())
+                .stderr(std::fs::File::create(machine.0.join("boot.stderr.log")).unwrap())
+                .kill_on_drop(true)
                 .current_dir(machine.0.join("cwd"));
             if explicit {
                 command.env("BROCA_STATE_ROOT", machine.new_root());
             } else {
                 command.env_remove("BROCA_STATE_ROOT");
             }
-            let output =
-                broca_test_support::wait_for("isolated child boot", command.output(), || {
-                    format!("wrapper: {wrapper}, explicit: {explicit}")
-                })
-                .await
-                .unwrap();
-            assert!(
-                !output.status.success(),
-                "the absent subc file must refuse boot"
-            );
-            // Startup opens the state-root stall log before dialing subc. This observes
-            // a real write without needing a daemon or allowing a child to reach a provider.
+            let mut child = command.spawn().unwrap();
+            broca_test_support::wait_until("isolated child storage initialization", || async {
+                if machine
+                    .new_root()
+                    .join("media-uploads/uploads.lock")
+                    .is_file()
+                {
+                    Ok(())
+                } else {
+                    Err(std::fs::read_to_string(machine.0.join("boot.stderr.log"))
+                        .unwrap_or_default())
+                }
+            })
+            .await;
+            for directory in ["leases", "wal-durable", "wal-archive-durable"] {
+                assert!(
+                    machine.new_root().join(directory).is_dir(),
+                    "{wrapper}: missing {directory}"
+                );
+            }
             let logs = machine.new_root().join("logs");
             let names: Vec<_> = std::fs::read_dir(&logs)
                 .unwrap()
@@ -281,6 +349,8 @@ async fn every_broca_spawn_site_pins_its_state_root() {
                 "{wrapper} used the connection-relative root"
             );
             assert_eq!(std::fs::read_dir(machine.0.join("cwd")).unwrap().count(), 0);
+            child.kill().await.unwrap();
+            server.abort();
             exercised.insert((wrapper, explicit));
         }
     }
