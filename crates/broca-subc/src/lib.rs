@@ -19,6 +19,7 @@
 pub mod compaction_plane;
 pub mod connection;
 pub mod consent;
+pub mod consent_card;
 pub mod content_v1;
 pub mod flow_providers;
 pub mod hook_plane;

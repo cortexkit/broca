@@ -47,6 +47,8 @@ compile_error!("catalog test-support cannot be enabled in a release build");
 pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "existence",
     "model.kind",
+    "model.name",
+    "provider.",
     "limit.context",
     "limit.output",
     "capability.attachment",
@@ -140,6 +142,8 @@ struct LoadedCatalog {
     carries_model_kinds: bool,
     /// An equal-version poll can add modalities that an older prefix list did not request.
     carries_input_modalities: bool,
+    /// A same-version poll can add names omitted by the previous prefix list.
+    carries_display_names: bool,
     /// Present rows this catalog left out or kept from the catalog it replaced, because their
     /// facts could not be used. Shared with an equal-version republish, which reuses the index
     /// these describe.
@@ -159,6 +163,13 @@ fn response_carries_input_modalities(response: &FusiformCatalogResponse) -> bool
         .models
         .values()
         .any(|facts| facts.contains_key("capability.input_modalities"))
+}
+
+fn response_carries_display_names(response: &FusiformCatalogResponse) -> bool {
+    response
+        .models
+        .values()
+        .any(|facts| facts.contains_key("model.name") || facts.contains_key("provider.name"))
 }
 
 fn response_carries_routing_facts(response: &FusiformCatalogResponse) -> bool {
@@ -343,6 +354,9 @@ struct ServingCatalog {
 /// Absent is never zero: a fact the catalog does not state stays `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelBatchRow {
+    /// Human display facts only. Missing or blank names never fall back to identifiers.
+    pub model_name: Option<String>,
+    pub provider_name: Option<String>,
     /// `model.kind` as served (`decision`, `extraction`, `chat`, ...); `None` when the row
     /// states no kind.
     pub kind: Option<String>,
@@ -389,12 +403,22 @@ fn batch_rate_nanos(value: Option<&Value>) -> Option<i64> {
 
 fn batch_row_of(model: &ServingModel, facts: &BTreeMap<String, Value>) -> ModelBatchRow {
     ModelBatchRow {
+        model_name: display_name_fact(facts, "model.name"),
+        provider_name: display_name_fact(facts, "provider.name"),
         kind: model.kind.clone(),
         context_tokens: model.context_limit,
         attachment: model.attachment == CapabilityFlag::Known(true),
         input_rate_nanos: batch_rate_nanos(facts.get("rate.input")),
         output_rate_nanos: batch_rate_nanos(facts.get("rate.output")),
     }
+}
+
+fn display_name_fact(facts: &BTreeMap<String, Value>, key: &str) -> Option<String> {
+    facts
+        .get(key)?
+        .as_str()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// What one assembly of fusiform's model map produced.
@@ -1366,7 +1390,7 @@ fn serving_model_from_facts(
     facts: &BTreeMap<String, Value>,
 ) -> Result<ServingModel, CatalogError> {
     Ok(ServingModel {
-        display_name: String::new(),
+        display_name: display_name_fact(facts, "model.name").unwrap_or_default(),
         base_url: None,
         cost: warm_cost_fact(facts),
         context_limit: context_fact(identity, facts)?,
@@ -1933,7 +1957,10 @@ impl CatalogCache {
             .clone()
     }
 
-    fn refresh_inner(&self, response: FusiformCatalogResponse) -> Result<(), CatalogRefreshError> {
+    fn refresh_inner(
+        &self,
+        mut response: FusiformCatalogResponse,
+    ) -> Result<(), CatalogRefreshError> {
         // WHEN THIS CAN ACTUALLY FIRE, per fusiform's serve predicates rather than observation:
         // `uncertain` needs an era with `boundary_at_ms > at`, and `withheld` needs a correction
         // window with `affected_until_ms >= at`. A boundary is stamped when the poll that detected
@@ -1986,6 +2013,24 @@ impl CatalogCache {
                 });
             }
             if response.catalog_version == current.catalog_version {
+                // Equal versions cannot withdraw a published name. Preserve those facts in
+                // the persisted response too, so a nameless poll cannot erase them on restart.
+                if current.carries_display_names {
+                    for (identity, facts) in &mut response.models {
+                        if let Some(row) = current.catalog.batch_rows.get(identity) {
+                            for (key, cached) in [
+                                ("model.name", &row.model_name),
+                                ("provider.name", &row.provider_name),
+                            ] {
+                                if display_name_fact(facts, key).is_none() {
+                                    if let Some(name) = cached {
+                                        facts.insert(key.into(), Value::String(name.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Same version, so the facts cannot have changed and the existing index is
                 // still correct — but only if the response is COMPLETE. A truncated or
                 // degraded response can carry the version of the document it was truncated
@@ -2020,6 +2065,7 @@ impl CatalogCache {
                     || response_carries_input_modalities(&response)
                         != current.carries_input_modalities
                     || response_carries_routing_facts(&response) != current.carries_routing_facts
+                    || response_carries_display_names(&response) != current.carries_display_names
                 {
                     let rebuilt = Arc::new(loaded(
                         &response,
@@ -2050,6 +2096,7 @@ impl CatalogCache {
                     carries_warm_rates: current.carries_warm_rates,
                     carries_model_kinds: current.carries_model_kinds,
                     carries_input_modalities: current.carries_input_modalities,
+                    carries_display_names: current.carries_display_names,
                     excluded_rows: Arc::clone(&current.excluded_rows),
                 });
                 self.install(refreshed);
@@ -2141,6 +2188,7 @@ impl CatalogCache {
             // The vendored snapshot serves no `model.kind`.
             carries_model_kinds: false,
             carries_input_modalities: false,
+            carries_display_names: false,
             excluded_rows: Arc::from([]),
         });
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
@@ -2211,6 +2259,7 @@ fn loaded(
         carries_warm_rates: response_carries_warm_rates(response),
         carries_model_kinds: response_carries_model_kinds(response),
         carries_input_modalities: response_carries_input_modalities(response),
+        carries_display_names: response_carries_display_names(response),
         excluded_rows: assembled.excluded_rows.into(),
     })
 }
@@ -3723,6 +3772,152 @@ mod tests {
         assert_eq!(schedule.input, Some(0.24));
     }
 
+    fn named_decision_response(version: i64) -> FusiformCatalogResponse {
+        let mut response = curated_response(version);
+        for (id, model, provider) in [
+            ("typesafe/jev-1.13.0", "Jev 1.13", "TypeSafe"),
+            (
+                "cloudflare-workers-ai/@cf/cloudflare/clef",
+                "Clef",
+                "Cloudflare Workers AI",
+            ),
+        ] {
+            let facts = response.models.get_mut(id).unwrap();
+            facts.insert("model.name".into(), serde_json::json!(model));
+            facts.insert("provider.name".into(), serde_json::json!(provider));
+        }
+        response
+    }
+
+    #[test]
+    fn requested_display_name_facts_reach_decision_rows_without_id_fallbacks() {
+        let mut response = named_decision_response(1);
+        for facts in response.models.values_mut() {
+            facts.retain(|key, _| {
+                FUSIFORM_FACT_PREFIXES
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            });
+        }
+        let cache = CatalogCache::empty();
+        cache.refresh(response).unwrap();
+        let snapshot = cache.snapshot().unwrap();
+        let jev = snapshot.model_batch_row("typesafe/jev-1.13.0").unwrap();
+        assert_eq!(jev.model_name.as_deref(), Some("Jev 1.13"));
+        assert_eq!(jev.provider_name.as_deref(), Some("TypeSafe"));
+        let clef = snapshot
+            .model_batch_row("cloudflare-workers-ai/@cf/cloudflare/clef")
+            .unwrap();
+        assert_eq!(clef.model_name.as_deref(), Some("Clef"));
+        assert_eq!(clef.provider_name.as_deref(), Some("Cloudflare Workers AI"));
+        assert_eq!(
+            snapshot
+                .model_batch_row("flash-absent")
+                .map(|row| row.provider_name),
+            None
+        );
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!(" "),
+            serde_json::json!(123),
+        ] {
+            let mut response = named_decision_response(2);
+            let facts = response.models.get_mut("typesafe/jev-1.13.0").unwrap();
+            facts.insert("model.name".into(), value.clone());
+            facts.insert("provider.name".into(), value);
+            let cache = CatalogCache::empty();
+            cache.refresh(response).unwrap();
+            let row = cache
+                .snapshot()
+                .unwrap()
+                .model_batch_row("typesafe/jev-1.13.0")
+                .unwrap();
+            assert_eq!(row.model_name, None);
+            assert_eq!(row.provider_name, None);
+        }
+    }
+
+    #[test]
+    fn same_version_names_rebuild_and_survive_nameless_polls_and_restart() {
+        let path = temp_lkg("decision-display-names");
+        let cache = CatalogCache::open(&path);
+        cache.refresh(curated_response(7)).unwrap();
+        let old = cache.snapshot().unwrap();
+        assert_eq!(
+            old.model_batch_row("typesafe/jev-1.13.0")
+                .unwrap()
+                .provider_name,
+            None
+        );
+        cache.refresh(named_decision_response(7)).unwrap();
+        let named = cache.snapshot().unwrap();
+        assert!(!old.shares_index_with(&named));
+        assert_eq!(
+            named
+                .model_batch_row("typesafe/jev-1.13.0")
+                .unwrap()
+                .provider_name
+                .as_deref(),
+            Some("TypeSafe")
+        );
+        let mut nameless = curated_response(7);
+        nameless
+            .models
+            .get_mut("typesafe/jev-1.13.0")
+            .unwrap()
+            .insert("limit.output".into(), serde_json::json!(10));
+        cache.refresh(nameless).unwrap();
+        drop(cache);
+        let reopened = CatalogCache::open(&path);
+        let jev = reopened
+            .snapshot()
+            .unwrap()
+            .model_batch_row("typesafe/jev-1.13.0")
+            .unwrap();
+        assert_eq!(jev.provider_name.as_deref(), Some("TypeSafe"));
+        assert_eq!(jev.model_name.as_deref(), Some("Jev 1.13"));
+        reopened.refresh(curated_response(8)).unwrap();
+        assert_eq!(
+            reopened
+                .snapshot()
+                .unwrap()
+                .model_batch_row("typesafe/jev-1.13.0")
+                .unwrap()
+                .provider_name,
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_provider_fact_is_ignored_without_excluding_a_served_row() {
+        let cache = CatalogCache::empty();
+        cache.refresh(named_decision_response(1)).unwrap();
+        let before = cache
+            .snapshot()
+            .unwrap()
+            .model_batch_row("typesafe/jev-1.13.0")
+            .unwrap();
+        let mut response = named_decision_response(2);
+        response
+            .models
+            .get_mut("typesafe/jev-1.13.0")
+            .unwrap()
+            .insert(
+                "provider.future_field".into(),
+                serde_json::json!({"unknown":[1,2,3]}),
+            );
+        cache.refresh(response).unwrap();
+        assert_eq!(cache.health(100).unwrap().rows_excluded, 0);
+        assert_eq!(
+            cache
+                .snapshot()
+                .unwrap()
+                .model_batch_row("typesafe/jev-1.13.0"),
+            Some(before)
+        );
+    }
+
     /// fusiform's served pages for its curated System One rows, vendored byte-for-byte from
     /// fusiform 69a15bb `crates/fusiform-module/fixtures/served-payloads.json` (cases "a curated
     /// decision model", "a curated extraction model" and "a provider served only through
@@ -3760,6 +3955,8 @@ mod tests {
         assert_eq!(
             jev,
             ModelBatchRow {
+                model_name: None,
+                provider_name: None,
                 kind: Some("decision".into()),
                 context_tokens: None,
                 attachment: false,

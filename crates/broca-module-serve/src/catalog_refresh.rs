@@ -860,6 +860,9 @@ mod tests {
                 args["fact_prefixes"],
                 serde_json::json!(FUSIFORM_FACT_PREFIXES)
             );
+            let prefixes = args["fact_prefixes"].as_array().unwrap();
+            assert!(prefixes.contains(&serde_json::json!("model.name")));
+            assert!(prefixes.contains(&serde_json::json!("provider.")));
         }
     }
 

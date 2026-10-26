@@ -115,6 +115,8 @@ impl BatchCatalog for Rows {
 
 fn row(kind: Option<&str>) -> ModelBatchRow {
     ModelBatchRow {
+        model_name: None,
+        provider_name: None,
         kind: kind.map(str::to_owned),
         context_tokens: None,
         attachment: false,

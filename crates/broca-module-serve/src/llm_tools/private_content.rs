@@ -10,16 +10,15 @@
 //!   source kinds a card would name. No answer, an error or a timeout counts as marked and is
 //!   not cached, so the next call asks again.
 //! - *Which providers?* An unmarked run may call any provider. A marked run may call local
-//!   models and the providers on the operator's configured list. (A live grant will also admit
-//!   one once grants are consulted; this code does not look at grants yet.) A flow never raises
+//!   models and the providers on the operator's configured list. The route also checks live
+//!   grants before filing a consent card. A flow never raises
 //!   a card: its extra providers come from Basal's answer for the flow's approved version, a
 //!   flow Basal has not approved is refused by name, and a marked flow asking for a provider
 //!   outside its set is refused `provider_not_allowed`.
 //!
-//! This policy files no consent cards. A marked run asking for a provider it may not call ends
-//! `not_started` with `detail.consent: "consent_required"` and writes nothing at all, and a
-//! marked scope with no recognized source kind ends `private_content_unknown` because there is
-//! no source a card could name.
+//! This policy itself writes nothing. A marked run needing approval returns `consent_required`
+//! to the route, which checks a grant, holds a caller that supplies a `call_key` and declares
+//! held-reply support, or returns that refusal. No recognized source means no card can be filed.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -215,6 +214,17 @@ impl PrivateContent {
         }
     }
 
+    /// Refresh immediately before a card is filed. A failed refresh keeps the recognized
+    /// cached sources; a successful marked refresh adds sources rather than losing old ones.
+    pub(super) async fn card_sources(&self, scope: &SendScope) -> Vec<broca_subc::SourceKind> {
+        let Some(identity) = ScopeIdentity::of(scope) else {
+            return Vec::new();
+        };
+        self.ask(&identity).await;
+        self.cached(&identity)
+            .map_or_else(Vec::new, |marked| marked.sources)
+    }
+
     fn listed(&self, provider: &str) -> bool {
         self.config
             .private_content_providers
@@ -232,7 +242,7 @@ impl PrivateContent {
         if !marked.marked {
             return Ok(());
         }
-        // A live grant would also admit here; this code does not consult grants yet.
+        // The route checks live grants before acting on this policy's consent refusal.
         if marked.sources.is_empty() {
             let consent = if answered {
                 PRIVATE_CONTENT_UNKNOWN
@@ -328,6 +338,16 @@ impl PrivateContent {
     /// a marked one, and an answer equal to the cached one changes nothing.
     fn remember(&self, identity: ScopeIdentity, scope: MarkedScope) {
         let mut marked = self.marked.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cached) = marked.get_mut(&identity) {
+            if cached.marked && scope.marked {
+                for source in scope.sources {
+                    if !cached.sources.contains(&source) {
+                        cached.sources.push(source);
+                    }
+                }
+                return;
+            }
+        }
         let keep = marked
             .get(&identity)
             .is_some_and(|cached| cached.same_as(&scope) || (cached.marked && !scope.marked));

@@ -239,6 +239,8 @@ impl BatchCatalog for Rows {
 /// (0.24 and 0.038 USD per million tokens), output stated free, contexts 65,536 and 24,576.
 fn catalog() -> Arc<Rows> {
     let row = |context, input| ModelBatchRow {
+        model_name: None,
+        provider_name: None,
         kind: Some("decision".into()),
         context_tokens: Some(context),
         attachment: true,

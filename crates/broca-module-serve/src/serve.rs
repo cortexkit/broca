@@ -450,6 +450,7 @@ struct BindObservation {
     /// The daemon's scope stamp on the bind, or why there is none. Every send over the route
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
+    reads_held_reply: bool,
 }
 
 /// Preserve the scope identity, including the agent and run identifiers of an agent-run scope
@@ -1405,7 +1406,12 @@ where
                             let answer = match service {
                                 Some(service) => tokio::spawn(async move {
                                     service
-                                        .answer(&frame.body, bind.principal.as_ref(), &bind.scope)
+                                        .answer_with_capabilities(
+                                            &frame.body,
+                                            bind.principal.as_ref(),
+                                            &bind.scope,
+                                            bind.reads_held_reply,
+                                        )
                                         .await
                                 })
                                 .await
@@ -1596,6 +1602,7 @@ async fn handle_control_request(
             scope,
             target,
             role_versions,
+            consumer_capabilities,
             ..
         } => {
             stall::method_context(1);
@@ -1636,6 +1643,9 @@ async fn handle_control_request(
                 project_id: identity.project_id.clone(),
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
+                reads_held_reply: cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
+                    consumer_capabilities.as_deref(),
+                ),
             };
             if !serves_bind_target(&target, bind.role, routes.llm_tools.is_some()) {
                 return send_error(
@@ -7422,6 +7432,7 @@ mod tests {
                     project_id: None,
                     principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
+                    reads_held_reply: false,
                 },
                 cancel,
                 refusal: Ok(None),

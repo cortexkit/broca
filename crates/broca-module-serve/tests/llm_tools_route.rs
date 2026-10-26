@@ -730,6 +730,8 @@ struct FixedCatalog;
 impl broca_module_serve::system_one::BatchCatalog for FixedCatalog {
     fn row(&self, _: &str) -> Option<broca_catalog::ModelBatchRow> {
         Some(broca_catalog::ModelBatchRow {
+            model_name: None,
+            provider_name: None,
             kind: Some("decision".into()),
             context_tokens: None,
             attachment: false,
