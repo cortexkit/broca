@@ -126,6 +126,32 @@ jobs:
       - name: Verify clean worktree
         run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
 
+  wal-reader:
+    name: WAL reader (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: wal-reader
+          cache-on-failure: 'true'
+      - name: Golden v4 codec and broca unlink while reader holds a log
+        shell: bash
+        run: |
+          cargo test --locked -p broca-wal-reader
+          cargo test --locked -p broca-wal --lib framing::tests::v4
+      - name: Verify clean worktree
+        shell: bash
+        run: test -z "$(git status --porcelain)" || { git status --short; git diff; exit 1; }
+
   integration-build:
     name: Archive (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
@@ -350,7 +376,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     if: always()
-    needs: [lint, scripts, unit, production-features, store-contention-macos, integration-build, fixtures, integration, linux-deploy]
+    needs: [lint, scripts, unit, production-features, store-contention-macos, integration-build, fixtures, integration, linux-deploy, wal-reader]
     runs-on: ubuntu-latest
     strategy:
       matrix:
