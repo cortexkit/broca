@@ -344,6 +344,22 @@ struct ArchiveLookup {
     member: Option<broca_wal::archive::ArchiveMember>,
 }
 
+/// Filesystem metadata identity of the archive inventory, used to validate cached
+/// expiry facts without retaining WAL record contents.
+/// Non-Unix stores cannot supply a stable identity and must not reuse those caches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveIdentity(Vec<ArchiveFileIdentity>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArchiveFileIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
 #[cfg(test)]
 thread_local! {
     static ARCHIVE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1014,6 +1030,55 @@ impl FileWalStore {
             }
         }
         Ok(exists.then_some(paths))
+    }
+
+    /// Expiry facts are reusable only while the archive inventory's metadata identity
+    /// is unchanged. Publication, removal and metadata-visible changes invalidate it.
+    /// This uses metadata only; it neither opens containers nor reads member payloads.
+    pub fn archive_identity(&self) -> Result<Option<ArchiveIdentity>, WalError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Some(mut paths) = self.archive_containers()? else {
+                return Ok(None);
+            };
+            paths.sort();
+            let mut files = Vec::with_capacity(paths.len());
+            for path in paths {
+                let meta = match std::fs::metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(WalError::Io(e)),
+                };
+                files.push(ArchiveFileIdentity {
+                    path,
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                    bytes: meta.len(),
+                    modified: (meta.mtime(), meta.mtime_nsec()),
+                    changed: (meta.ctime(), meta.ctime_nsec()),
+                });
+            }
+            Ok(Some(ArchiveIdentity(files)))
+        }
+        #[cfg(not(unix))]
+        Ok(None)
+    }
+
+    /// A sealed archive is already durable, so expiry needs no separate flush/read pair.
+    /// If no archived member is found, return `None` so the caller follows its normal
+    /// live-WAL read path, including the durability flush when needed.
+    pub fn read_archived_for_expiry(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<(WalRangeRead, u64)>, WalError> {
+        self.check_move(session, false)?;
+        self.archived_member(session)?
+            .member
+            .map(|member| {
+                member_range(&member, 0, None).map(|read| (read, member.info.payload_len))
+            })
+            .transpose()
     }
 
     /// Build the archive membership cache now, so the first new session after a restart
