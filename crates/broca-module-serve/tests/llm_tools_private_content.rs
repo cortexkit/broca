@@ -23,6 +23,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MODEL: &str = "typesafe/jev-1.13.0";
 
+// Cerebellum fbcc6766, docs/contracts/private-content-query-v1.md. These reply bodies come from
+// the following vectors; SHA-256s identify whole golden-file documents for provenance only:
+// crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json
+// whole-file SHA-256 eb4c452cadd0b5d48e8855db366c599c3dcccb3408da1ea403fa5d8703032d1c
+// crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json
+// whole-file SHA-256 e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2
+// crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json
+// whole-file SHA-256 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc
+const CEREBELLUM_MARKED: &str = r#"{"private_content":true,"sources":["signed_in_site"]}"#;
+const CEREBELLUM_UNMARKED: &str = r#"{"private_content":false,"sources":[]}"#;
+const CEREBELLUM_REFUSAL: &str = r#"{"context":null,"detail":{"field":"owner","reason_code":"unknown_field"},"outcome":"invalid_request","session":null}"#;
+
 #[derive(Default)]
 struct Provider {
     calls: Mutex<usize>,
@@ -871,9 +883,7 @@ async fn unreachable_cerebellum_counts_as_marked_and_asks_again_on_every_call() 
     // treat as "no answer".
     let Some(rig) = Rig::start(
         "unreachable",
-        Stub::Answering(
-            r#"{"outcome":"invalid_request","context":null,"session":null,"detail":{"field":"owner","reason_code":"unknown_field"}}"#,
-        ),
+        Stub::Answering(CEREBELLUM_REFUSAL),
         Stub::Unreachable,
     )
     .await
@@ -911,7 +921,7 @@ async fn unreachable_cerebellum_counts_as_marked_and_asks_again_on_every_call() 
 async fn an_unmarked_run_calls_an_unlisted_provider() {
     let Some(rig) = Rig::start(
         "unmarked",
-        Stub::Answering(r#"{"private_content":false,"sources":[]}"#),
+        Stub::Answering(CEREBELLUM_UNMARKED),
         Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
     )
     .await
@@ -937,7 +947,7 @@ async fn an_unmarked_run_calls_an_unlisted_provider() {
 async fn a_marked_run_ends_not_started_consent_required_and_files_nothing() {
     let Some(rig) = Rig::start(
         "marked",
-        Stub::Answering(r#"{"private_content":true,"sources":["person_browser"]}"#),
+        Stub::Answering(CEREBELLUM_MARKED),
         Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
     )
     .await
@@ -978,7 +988,7 @@ async fn a_marked_run_with_an_unknown_source_files_no_card() {
 async fn a_marked_flow_uses_basals_approved_version_and_ownerless_request() {
     let Some(rig) = Rig::start(
         "approved-flow",
-        Stub::Answering(r#"{"private_content":true,"sources":["person_browser"]}"#),
+        Stub::Answering(CEREBELLUM_MARKED),
         Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":["typesafe","openai"]}}"#),
     ).await else { return; };
     let route = rig.open("flow", true).await;
@@ -1000,7 +1010,7 @@ async fn a_marked_flow_uses_basals_approved_version_and_ownerless_request() {
 async fn a_marked_flow_with_no_declared_providers_gets_no_extra_provider() {
     let Some(rig) = Rig::start(
         "empty-flow",
-        Stub::Answering(r#"{"private_content":true,"sources":["person_browser"]}"#),
+        Stub::Answering(CEREBELLUM_MARKED),
         Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
     ).await else { return; };
     let route = rig.open("flow", true).await;
@@ -1047,7 +1057,7 @@ async fn basal_error_frames_never_authorize_extra_providers_or_cache_a_failure()
     ] {
         let Some(rig) = Rig::start(
             name,
-            Stub::Answering(r#"{"private_content":true,"sources":["person_browser"]}"#),
+            Stub::Answering(CEREBELLUM_MARKED),
             Stub::Answering(fixture),
         )
         .await

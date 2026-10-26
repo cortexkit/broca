@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broca_protocol::BindIdentity;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::connection::{ConnError, RouteOpenRetry, SubcConnection};
@@ -185,11 +185,8 @@ impl PrivateContentClient {
             .map_err(|error| PrivateContentError::Route(error.to_string()))?;
         // Close the route once the question is answered or timed out. A cancelled question
         // relies on the connection ending, since this code never reaches the close.
-        let body = serde_json::to_vec(&json!({
-            "method": PRIVATE_CONTENT_QUERY,
-            "params": request_params(scope_ref, parent_scope_ref),
-        }))
-        .map_err(|error| PrivateContentError::Protocol(error.to_string()));
+        let body = request_body(scope_ref, parent_scope_ref)
+            .map_err(|error| PrivateContentError::Protocol(error.to_string()));
         let reply = match body {
             Ok(body) => match tokio::time::timeout(
                 QUERY_TIMEOUT,
@@ -209,12 +206,31 @@ impl PrivateContentClient {
     }
 }
 
-fn request_params(scope_ref: &str, parent_scope_ref: Option<&str>) -> Value {
-    let mut params = json!({"scope_ref": scope_ref});
-    if let Some(parent) = parent_scope_ref {
-        params["parent_scope_ref"] = json!(parent);
+fn request_body(
+    scope_ref: &str,
+    parent_scope_ref: Option<&str>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    // Cerebellum's private-content-query-v1 contract puts method before params; within params,
+    // scope_ref precedes the parent ref, when present (`parent_scope_ref`). Struct serialization
+    // preserves that order; a JSON map sorts parent_scope_ref before scope_ref instead.
+    #[derive(Serialize)]
+    struct Params<'a> {
+        scope_ref: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_scope_ref: Option<&'a str>,
     }
-    params
+    #[derive(Serialize)]
+    struct Request<'a> {
+        method: &'static str,
+        params: Params<'a>,
+    }
+    serde_json::to_vec(&Request {
+        method: PRIVATE_CONTENT_QUERY,
+        params: Params {
+            scope_ref,
+            parent_scope_ref,
+        },
+    })
 }
 
 fn decode(
@@ -260,6 +276,7 @@ fn decode(
     })?;
     Ok(PrivateContent {
         marked: result.private_content,
+        // Preserve Cerebellum's source order, rather than sorting token names alphabetically.
         sources: result
             .sources
             .iter()
@@ -272,15 +289,26 @@ fn decode(
 mod tests {
     use super::*;
 
-    const CEREBELLUM_MARKED: &[u8] = br#"{"private_content":true,"sources":["person_browser"]}"#;
+    // Cerebellum fbcc6766, docs/contracts/private-content-query-v1.md.
+    // These are reply bodies from the vectors below. Hashes identify the whole golden-file
+    // documents for provenance only, not the body bytes:
+    // crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json
+    // whole-file SHA-256 eb4c452cadd0b5d48e8855db366c599c3dcccb3408da1ea403fa5d8703032d1c
+    // crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json
+    // whole-file SHA-256 e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2
+    // crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json
+    // whole-file SHA-256 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc
+    const CEREBELLUM_MARKED: &[u8] = br#"{"private_content":true,"sources":["signed_in_site"]}"#;
     const CEREBELLUM_UNMARKED: &[u8] = br#"{"private_content":false,"sources":[]}"#;
-    const CEREBELLUM_REFUSAL: &[u8] = br#"{"outcome":"invalid_request","context":null,"session":null,"detail":{"field":"owner","reason_code":"unknown_field"}}"#;
+    const CEREBELLUM_REFUSAL: &[u8] = br#"{"context":null,"detail":{"field":"owner","reason_code":"unknown_field"},"outcome":"invalid_request","session":null}"#;
 
     #[test]
     fn cerebellum_bare_success_fixtures_decode() {
+        assert_eq!(CEREBELLUM_MARKED.len(), 53);
+        assert_eq!(CEREBELLUM_UNMARKED.len(), 38);
         let marked = decode(Ok(Ok(CEREBELLUM_MARKED.to_vec()))).unwrap();
         assert!(marked.marked);
-        assert_eq!(marked.sources, vec![SourceKind::PersonBrowser]);
+        assert_eq!(marked.sources, vec![SourceKind::SignedInSite]);
         assert_eq!(
             decode(Ok(Ok(CEREBELLUM_UNMARKED.to_vec()))).unwrap(),
             PrivateContent::unmarked()
@@ -288,16 +316,20 @@ mod tests {
     }
 
     #[test]
-    fn query_request_has_no_owner_and_omits_an_absent_parent() {
-        let run = request_params("run", None);
-        assert_eq!(run, json!({"scope_ref":"run"}));
-        let program = request_params("program", Some("head"));
+    fn query_request_bytes_follow_cerebellums_contract() {
+        assert_eq!(request_body("test-session", None).unwrap().len(), 72);
+        assert_eq!(request_body("unmarked-scope", None).unwrap().len(), 74);
         assert_eq!(
-            program,
-            json!({
-                "scope_ref":"program",
-                "parent_scope_ref":"head"
-            })
+            request_body("test-session", None).unwrap(),
+            br#"{"method":"private_content.query","params":{"scope_ref":"test-session"}}"#
+        );
+        assert_eq!(
+            request_body("unmarked-scope", None).unwrap(),
+            br#"{"method":"private_content.query","params":{"scope_ref":"unmarked-scope"}}"#
+        );
+        assert_eq!(
+            request_body("program", Some("head")).unwrap(),
+            br#"{"method":"private_content.query","params":{"scope_ref":"program","parent_scope_ref":"head"}}"#
         );
     }
 
@@ -322,6 +354,7 @@ mod tests {
 
     #[test]
     fn cerebellum_refusal_names_only_diagnostic_tokens() {
+        assert_eq!(CEREBELLUM_REFUSAL.len(), 116);
         let error = decode(Ok(Ok(CEREBELLUM_REFUSAL.to_vec()))).unwrap_err();
         assert_eq!(error.code(), Some("invalid_request"));
         assert!(error.to_string().contains("unknown_field"));
