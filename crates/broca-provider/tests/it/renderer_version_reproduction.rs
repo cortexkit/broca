@@ -203,10 +203,6 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
         ))
         .expect("OpenAI Chat v4 pins are JSON"),
     );
-    pins.extend(
-        serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/pre_native_media.json"))
-            .expect("pre-native-media pins are JSON"),
-    );
     let legacy_opts = legacy_call_options();
     let chat_v4_opts = openai_chat_v4_call_options();
     let mut proven = BTreeSet::new();
@@ -267,6 +263,46 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
     assert!(
         !proven.is_empty(),
         "no reproducible declaration was checked"
+    );
+}
+
+/// Preparing native media must not change existing runs before media admission is enabled.
+/// Their frozen configs omit the profile, so both the ordinary renderer and the explicit
+/// media hooks must retain the bytes pinned at Anthropic v2 and Bedrock v4.
+#[test]
+fn anthropic_and_bedrock_without_media_keep_their_pinned_old_version_bytes() {
+    let pins: Vec<Value> =
+        serde_json::from_str(include_str!("../fixtures/pre_native_media.json")).unwrap();
+    let opts = legacy_call_options();
+    let mut checked = Vec::new();
+    for case in pins {
+        let frozen: FrozenRenderConfig = serde_json::from_value(case["frozen"].clone()).unwrap();
+        assert!(frozen.media.is_none());
+        assert_eq!(serde_json::to_value(&frozen).unwrap(), case["frozen"]);
+        let expected = case["body"].as_str().unwrap().as_bytes();
+        let family = renderer(frozen.family_id);
+        assert_eq!(family.render(&frozen, &opts), expected);
+        assert_eq!(family.render_with_media(&frozen, &opts, &[]), expected);
+        #[cfg(feature = "live")]
+        assert_eq!(
+            broca_provider::media_request::render_prepared(
+                family,
+                &frozen,
+                &opts,
+                None,
+                &|_| panic!("an absent bundle must not project the prompt"),
+            )
+            .unwrap(),
+            expected,
+        );
+        checked.push((frozen.family_id, frozen.renderer_version));
+    }
+    assert_eq!(
+        checked,
+        vec![
+            (WireFamilyId::AnthropicMessages, 2),
+            (WireFamilyId::BedrockConverse, 4),
+        ],
     );
 }
 

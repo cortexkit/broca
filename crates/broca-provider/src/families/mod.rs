@@ -325,16 +325,12 @@ pub enum EarlierRendererVersion {
 pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, EarlierRendererVersion)] {
     use EarlierRendererVersion::{NotReproducible, Reproducible};
     match family {
-        WireFamilyId::AnthropicMessages => &[
-            (
-                1,
-                NotReproducible(
-                    "v2 renders CallOptions.generation (temperature, top_p, stop_sequences)",
-                ),
+        WireFamilyId::AnthropicMessages => &[(
+            1,
+            NotReproducible(
+                "v2 renders CallOptions.generation (temperature, top_p, stop_sequences)",
             ),
-            // Media payloads are explicit request inputs; v2 configs lack the media gate.
-            (2, Reproducible),
-        ],
+        )],
         WireFamilyId::OpenAiChat => &[
             (
                 1,
@@ -369,8 +365,6 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
                     "earlier versions sent no toolConfig on a finalize request whose history carries tool blocks",
                 ),
             ),
-            // v5's native media requires the new frozen media profile.
-            (4, Reproducible),
         ],
         WireFamilyId::OpenAiResponses => &[
             (
@@ -643,8 +637,7 @@ pub fn resolve_frozen(
 /// rendered request shape — a change means a resume can't reproduce the original
 /// request bytes.
 /// v2: render `CallOptions.generation` (`temperature`, `top_p`, `stop_sequences`).
-/// v3: native image/document payloads under the frozen media profile.
-pub const ANTHROPIC_RENDERER_VERSION: u32 = 3;
+pub const ANTHROPIC_RENDERER_VERSION: u32 = 2;
 
 /// The required identity that must lead the Anthropic system content under the
 /// Claude-subscription OAuth shape — the provider rejects the request without it.
@@ -806,8 +799,7 @@ pub fn openai_chat_frozen_config(wire_model_id: impl Into<String>) -> FrozenRend
 /// v2: normalize model-visible tool names at the render edge.
 /// v3: bound new per-call output limits by the frozen model maximum; retain v2 replay bytes.
 /// v4: keep tool definitions when finalizing a conversation that has tool-call history.
-/// v5: native inline media under the frozen media profile.
-pub const BEDROCK_RENDERER_VERSION: u32 = 5;
+pub const BEDROCK_RENDERER_VERSION: u32 = 4;
 
 /// Default AWS region used by the convenience Bedrock frozen config. Real provider
 /// specs resolve the region from `AuthKind::SigV4`.
