@@ -67,7 +67,7 @@ class PathDependencyGate(unittest.TestCase):
         # Force the Windows default on every host; Ł includes a UTF-8 byte that
         # cp1252 cannot decode, so omitting the reader's explicit encoding fails.
         with patch("locale.getpreferredencoding", return_value="cp1252"), \
-                patch("locale.getencoding", return_value="cp1252", create=True), \
+                patch("subprocess._text_encoding", return_value="cp1252", create=True), \
                 patch("subprocess.run", side_effect=emit_metadata):
             result = run_metadata(self.manifest, offline=True)
         self.assertEqual(result.returncode, 0, result.stderr)
