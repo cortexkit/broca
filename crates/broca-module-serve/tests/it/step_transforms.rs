@@ -10,28 +10,163 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use subc_protocol::Frame;
 
-struct TimedHook {
-    inner: broca_subc::SubcHookPlane,
-    elapsed: Arc<Mutex<Vec<Duration>>>,
+struct ObservedHook {
+    inner: Arc<dyn broca_core::HookPlane>,
+    completions: Arc<Mutex<Vec<bool>>>,
 }
 #[async_trait::async_trait]
-impl broca_core::HookPlane for TimedHook {
+impl broca_core::HookPlane for ObservedHook {
     async fn hook(
         &self,
         provider: &str,
         bind: &broca_protocol::BindIdentity,
         call: broca_core::hooks::HookCall,
     ) -> Result<HookAnswer, broca_core::HookUnavailable> {
-        struct Elapsed<'a>(tokio::time::Instant, &'a Mutex<Vec<Duration>>);
-        impl Drop for Elapsed<'_> {
+        struct Completion<'a> {
+            completed: bool,
+            observed: &'a Mutex<Vec<bool>>,
+        }
+        impl Drop for Completion<'_> {
             fn drop(&mut self) {
-                self.1.lock().unwrap().push(self.0.elapsed());
+                self.observed.lock().unwrap().push(self.completed);
             }
         }
-        // The future is dropped by core's deadline. Measuring its lifetime includes route
-        // discovery and open, but excludes admission and the next model step.
-        let _elapsed = Elapsed(tokio::time::Instant::now(), &self.elapsed);
-        self.inner.hook(provider, bind, call).await
+        let mut completion = Completion {
+            completed: false,
+            observed: &self.completions,
+        };
+        let answer = self.inner.hook(provider, bind, call).await;
+        completion.completed = true;
+        answer
+    }
+}
+
+async fn controlled_hook_deadlines() {
+    use broca_core::{
+        hooks::{HookPlan, HookRuntime, Trace},
+        WalStore,
+    };
+    use cortexkit_role_step_transform_provider::hook::Subject;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct OpeningHook {
+        delay: Duration,
+        dispatches: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl broca_core::HookPlane for OpeningHook {
+        async fn hook(
+            &self,
+            _: &str,
+            _: &broca_protocol::BindIdentity,
+            _: broca_core::hooks::HookCall,
+        ) -> Result<HookAnswer, broca_core::HookUnavailable> {
+            tokio::time::sleep(self.delay).await;
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+    // The literals distinguish the subscription deadline from the global 30-second cap.
+    // A route opening past either deadline must be dropped before dispatching a request.
+    for (budget, route_ms, expires_ms, expected_dispatches) in [
+        (2000, 500, 2000, 1),
+        (2000, 2001, 2000, 0),
+        (31000, 30001, 30000, 0),
+    ] {
+        let sub = subscription("pre_user", None, "refuse", budget);
+        let frozen = broca_wal::PlanManifest {
+            plan: broca_wal::OpaqueJson::from_json_text(
+                plan(std::slice::from_ref(&sub), false).to_string(),
+            )
+            .unwrap(),
+            plan_identity: String::new(),
+            composition_digest: String::new(),
+            tools: vec![].into(),
+            system_text: String::new(),
+            system_digest: String::new(),
+            join_version: 1,
+            role_versions: Default::default(),
+            fetches: vec![],
+            declarations: vec![broca_wal::FrozenDeclaration {
+                provider: MODULE.into(),
+                answer: broca_wal::OpaqueJson::from_json_text(
+                    json!({"subscriptions":[sub]}).to_string(),
+                )
+                .unwrap(),
+            }],
+        };
+        let plan = HookPlan::from_manifest(&frozen).unwrap();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let completions = Arc::new(Mutex::new(Vec::new()));
+        let plane: Arc<dyn broca_core::HookPlane> = Arc::new(ObservedHook {
+            inner: Arc::new(OpeningHook {
+                delay: Duration::from_millis(route_ms),
+                dispatches: dispatches.clone(),
+            }),
+            completions: completions.clone(),
+        });
+        let root = broca_test_support::scratch_root().join(format!(
+            "hook-clock-{budget}-{route_ms}-{}",
+            std::process::id()
+        ));
+        let bind = broca_protocol::BindIdentity::new(&root, "caller", "clock");
+        let store = broca_core::FileWalStore::new(root.join("wal"));
+        let writer = broca_core::WalHandle::spawn(store.open(&bind).unwrap(), 1).unwrap();
+        let runtime = HookRuntime {
+            plan: &plan,
+            plane: &plane,
+            bind: &bind,
+            writer: &writer,
+            cancel: None,
+            stop: None,
+            seal: None,
+        };
+        let started = tokio::time::Instant::now();
+        let mut chain = Box::pin(runtime.chain(
+            Subject::PreUser {
+                blocks: vec!["input".into()],
+                mark: None,
+                delivery: None,
+            },
+            Trace::default(),
+            |_| true,
+        ));
+        assert!(futures::poll!(chain.as_mut()).is_pending());
+        if expected_dispatches == 1 {
+            tokio::time::advance(Duration::from_millis(route_ms)).await;
+            assert!(futures::poll!(chain.as_mut()).is_pending());
+        }
+        let before_deadline = started + Duration::from_millis(expires_ms - 1);
+        tokio::time::advance(before_deadline - tokio::time::Instant::now()).await;
+        assert!(
+            futures::poll!(chain.as_mut()).is_pending(),
+            "budget must not expire early"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let std::task::Poll::Ready(output) = futures::poll!(chain.as_mut()) else {
+            panic!("hook must time out at its deadline")
+        };
+        assert_eq!(
+            output.refusal,
+            Some((MODULE.into(), "unavailable".into(), true))
+        );
+        assert!(
+            output.cancellation.is_none(),
+            "deadline expiry is not caller cancellation"
+        );
+        assert_eq!(
+            *completions.lock().unwrap(),
+            [false],
+            "the unfinished route/RPC future was dropped"
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            expected_dispatches,
+            "a cancelled route must never dispatch later"
+        );
+        drop(chain);
+        writer.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -487,6 +622,18 @@ async fn post_tool_caps_before_hooks_without_truncating_applied_ops() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_hook_budget_includes_route_open_and_hanging_provider() {
+    // Exact timer arithmetic runs on its own current-thread clock, not on the daemon's
+    // multithreaded socket runtime.
+    tokio::task::spawn_blocking(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(controlled_hook_deadlines());
+    })
+    .await
+    .unwrap();
     for (hook, phase) in [
         ("pre_user", None),
         ("post_assistant", None),
@@ -494,9 +641,8 @@ async fn each_hook_budget_includes_route_open_and_hanging_provider() {
         ("pre_tool", Some("validate")),
         ("post_tool", None),
     ] {
-        // Long enough that the request always reaches the hanging provider, even after a slow
-        // route open on a loaded runner, so the provider-reached assertion is not a race; the
-        // upper bound below still proves the budget covers the route open.
+        // The real route must reach one hanging provider, emit an unavailable outcome,
+        // and drop the unfinished route/RPC future when the hook times out.
         let budget = 2000;
         let (mut rig, daemon, state, plan) = start(
             // A bare phase name: Debug output of the Option would put quotes in the path,
@@ -524,21 +670,30 @@ async fn each_hook_budget_includes_route_open_and_hanging_provider() {
             },
             Step::Text("done"),
         ]);
-        let elapsed_calls = Arc::new(Mutex::new(Vec::new()));
+        let completions = Arc::new(Mutex::new(Vec::new()));
         let conn = Arc::new(
             broca_subc::SubcConnection::connect(&daemon.connection_file)
                 .await
                 .unwrap(),
         );
-        rig.set_hook_plane(Arc::new(TimedHook {
-            inner: broca_subc::SubcHookPlane::new(conn),
-            elapsed: elapsed_calls.clone(),
+        rig.set_hook_plane(Arc::new(ObservedHook {
+            inner: Arc::new(broca_subc::SubcHookPlane::new(conn)),
+            completions: completions.clone(),
         }));
-        result(&send(&mut rig, "first", Some(&plan), None).await);
-        let records = values(&rig.wait_for_finished(1).await);
-        let timings = elapsed_calls.lock().unwrap().clone();
-        assert_eq!(timings.len(), 1);
-        let elapsed = timings[0];
+        let records = broca_test_support::wait_for(
+            "hanging hook timeout",
+            async {
+                result(&send(&mut rig, "first", Some(&plan), None).await);
+                values(&rig.wait_for_finished(1).await)
+            },
+            || format!("{hook}: hooks observed: {}", state.hooks().len()),
+        )
+        .await;
+        assert_eq!(
+            *completions.lock().unwrap(),
+            [false],
+            "{hook}: timeout drops the unfinished route/RPC"
+        );
         assert!(
             records
                 .iter()
@@ -549,14 +704,6 @@ async fn each_hook_budget_includes_route_open_and_hanging_provider() {
             state.hooks().len(),
             1,
             "{hook}: the real provider was reached"
-        );
-        assert!(
-            elapsed >= Duration::from_millis(budget),
-            "{hook} returned before the hanging hook budget"
-        );
-        assert!(
-            elapsed <= Duration::from_millis(budget.min(broca_core::STEP_TRANSFORM_HOOK_CAP) + 250),
-            "{hook}: {elapsed:?}"
         );
         finish(rig, daemon).await;
     }

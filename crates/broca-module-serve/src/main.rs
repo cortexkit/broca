@@ -2658,8 +2658,8 @@ mod executor {
     /// Drives the real agentic loop for each run: resolves the provider from the catalog
     /// (or a base_url override), dispatches tools through the shared `SubcToolPlane`, and
     /// threads the admission ack so the coordinator admits a run only once it's durable.
-    pub struct LiveLoopExecutor {
-        wal_store: Arc<FileWalStore>,
+    pub struct LiveLoopExecutor<W = FileWalStore> {
+        wal_store: Arc<W>,
         /// The SQLite session store is both the durable run index and the materialized
         /// transcript prefix store used by resume and `session.read`.
         session_store: Arc<broca_store::SqliteStore>,
@@ -2718,9 +2718,22 @@ mod executor {
         cc_prompt_wal_bytes: Arc<std::sync::atomic::AtomicU64>,
     }
 
-    impl LiveLoopExecutor {
+    /// The executor also needs the file store's bounded prompt reader and installation path.
+    /// Bulk record reads stay on `WalStore` so decorators can observe redundant history reads;
+    /// `file_store` is only for bounded prompt counting and the installation path.
+    pub trait ExecutorWalStore: WalStore {
+        fn file_store(&self) -> &FileWalStore;
+    }
+
+    impl ExecutorWalStore for FileWalStore {
+        fn file_store(&self) -> &FileWalStore {
+            self
+        }
+    }
+
+    impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
         pub fn new(
-            wal_store: Arc<FileWalStore>,
+            wal_store: Arc<W>,
             session_store: Arc<broca_store::SqliteStore>,
             plane: Arc<SubcToolPlane>,
             provider_base_url: Option<String>,
@@ -2763,7 +2776,6 @@ mod executor {
             last_episode_frozen_config: Option<&serde_json::Value>,
             durable_head: u64,
         ) -> Option<String> {
-            use broca_core::WalStore as _;
             use broca_module_serve::claude_code_identity::{
                 first_durable_cc_version_suffix, inherited_cc_version_suffix,
             };
@@ -2843,7 +2855,9 @@ mod executor {
             let session = req.session.clone();
             let counted =
                 broca_diagnostics::spawn_blocking(broca_diagnostics::JobKind::WalRead, move || {
-                    wal_store.human_prompt_count(&session, durable_head, base.as_ref())
+                    wal_store
+                        .file_store()
+                        .human_prompt_count(&session, durable_head, base.as_ref())
                 })
                 .await
                 .map_err(|error| {
@@ -3369,7 +3383,7 @@ mod executor {
     }
 
     #[async_trait]
-    impl RunExecutor for LiveLoopExecutor {
+    impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
         async fn media_profile(
             &self,
             request: &broca_protocol::request::SubmissionRequest,
@@ -3893,9 +3907,10 @@ mod executor {
                         None => {
                             broca_module_serve::claude_code_identity::load_or_create_install_id(
                                 self.wal_store
+                                    .file_store()
                                     .root()
                                     .parent()
-                                    .unwrap_or(self.wal_store.root()),
+                                    .unwrap_or(self.wal_store.file_store().root()),
                             )
                             .map_err(|error| {
                                 format!("ChatGPT installation identity unavailable: {error}")
@@ -4235,14 +4250,8 @@ mod executor {
         include!("recorded_resume_tests.rs");
         include!("vault_request_tests.rs");
         include!("role_plane_tests.rs");
-
-        fn evict_for_provider_rejection(cache: &VaultLkgCache, credential_id: &str, status: u16) {
-            let Some(record_version) = cache.get(credential_id).map(|token| token.record_version)
-            else {
-                return;
-            };
-            super::evict_for_provider_rejection(cache, credential_id, status, record_version);
-        }
+        include!("admission_wal_read_budget_tests.rs");
+        include!("credential_source_guard_tests.rs");
 
         /// A new episode whose request has `inherit_frozen_cache` set (a steer or interrupt
         /// that omitted `cache`) takes the cache policy and caller cache key frozen in the
@@ -5331,32 +5340,19 @@ mod executor {
         }
 
         #[test]
-        fn authoritative_auth_failures_evict_lkg_entries() {
-            let cache = VaultLkgCache::default();
-            cache.insert("apikey:openai".into(), cached_token(None));
-            evict_if_vault_authoritative(
-                &cache,
-                "apikey:openai",
-                LkgErrorClass::CredentialUnusable,
-            );
-            assert!(cache.get("apikey:openai").is_none());
-
-            cache.insert("apikey:openai".into(), cached_token(None));
-            evict_for_provider_rejection(&cache, "apikey:openai", 401);
-            assert!(cache.get("apikey:openai").is_none());
-
-            cache.insert("apikey:openai".into(), cached_token(None));
-            evict_for_provider_rejection(&cache, "apikey:openai", 500);
-            assert!(cache.get("apikey:openai").is_some());
-        }
-
-        #[test]
         fn provider_rejection_evicts_only_the_failed_record_version() {
             let credential_id = "apikey:openai";
             let cache = VaultLkgCache::default();
             let mut current = cached_token(None);
             current.record_version = 8;
             cache.insert(credential_id.into(), current);
+
+            super::evict_for_provider_rejection(&cache, credential_id, 500, 8);
+            assert_eq!(
+                cache.get(credential_id).map(|token| token.record_version),
+                Some(8),
+                "a provider outage is not a verdict on the credential"
+            );
 
             super::evict_for_provider_rejection(&cache, credential_id, 401, 7);
             assert_eq!(
