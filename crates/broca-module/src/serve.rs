@@ -3861,3 +3861,214 @@ fn media_preflight_error(error: broca_core::RunError) -> ServeError {
         },
     }
 }
+
+/// Offset-based head for overhaul roots only (not yet serving production).
+///
+/// Today's `head_for` serves the newest page of one message through the store and the
+/// WAL past its watermark. The offset index serves the same head from the session row
+/// and the newest message row's byte range: the head decodes only those frames, never
+/// the whole log. A Setup in the tail renumbers indexed tags, so the caller advances
+/// the index before serving when [`head_tail_needs_index_up`] is true. Production offset reads
+/// wire `broca.db` into `head_for`; this helper already pins the decode bound the head
+/// must keep.
+///
+/// The head's byte range is the newest message row's `[lo_off, hi_off)`: one frame for a
+/// single-message turn, the turn's span for a tool turn whose two messages share it.
+/// With frame-decode counting on, serving the head decodes only that range.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+pub(crate) fn head_byte_range_for_offsets(
+    newest: Option<&crate::registry::OffsetPageRow>,
+) -> Option<(u64, u64)> {
+    newest.map(|row| (row.lo_off, row.hi_off))
+}
+
+/// Whether a head whose tail holds a durable Setup may be served from the current index.
+///
+/// Delegates to the replay crate's detector so head, page and tail checks cannot drift
+/// apart. A durable Setup before its index commit (durable tail, stale index) forces a
+/// catch-up: recovery replays the Setup into the index before the head is served.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+pub(crate) fn head_tail_needs_index_up(tail: &[broca_wal::FramedRecord]) -> bool {
+    broca_core::replay::tail_contains_compaction_setup(tail)
+}
+
+/// Offset head decode-bounding and Setup catch-up tests.
+///
+/// Pins that the head decodes only its own row range and that a Setup in the tail
+/// forces an index catch-up before serving, including the crash-cut where the Setup is
+/// durable but its index commit has not happened.
+#[cfg(test)]
+mod offset_head_tests {
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    use broca_protocol::{
+        caller::RunFinishReason,
+        content::{AssistantMessage, ContentBlock, Message, Role},
+        request::ModelHandle,
+        BindIdentity, MessageId, RunId, StepId, Usage,
+    };
+    use broca_wal::{
+        CompactionMessageKind, FramedRecord, RunConfig, RunOrigin, SetupTagCheckpoint, WalRecord,
+    };
+
+    use super::{head_byte_range_for_offsets, head_tail_needs_index_up};
+    use crate::registry::{decode_frames_at_offsets, OffsetPageRow};
+
+    fn user(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    fn run_started() -> WalRecord {
+        WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: RunId("r1".into()),
+            session: BindIdentity::new("/tmp/project", "runner", "session"),
+            config: Box::new(RunConfig {
+                turn_directives_v1: None,
+                render_tags: false,
+                computed_tags: None,
+                model: ModelHandle::new("stub", "m"),
+                tools: vec![].into(),
+                tool_choice: Default::default(),
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::Value::Null,
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: Vec::new(),
+                context_management: None,
+            }),
+            input: vec![user("task")].into(),
+            origin: RunOrigin::Fresh,
+            submission_id: None,
+        }
+    }
+
+    fn text_step() -> WalRecord {
+        WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(1),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("m1".into()),
+                content: vec![ContentBlock::Text {
+                    text: "answer".into(),
+                }],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        }
+    }
+
+    fn run_finished() -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason: RunFinishReason::Completed,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    fn encode_log(records: &[WalRecord]) -> (Vec<u8>, Vec<(u64, u64)>) {
+        let mut bytes = Vec::new();
+        let mut offsets = Vec::new();
+        for (i, record) in records.iter().enumerate() {
+            let start = bytes.len() as u64;
+            bytes.extend(broca_wal::framing::encode(i as u64 + 1, 1, record).expect("encode"));
+            offsets.push((start, bytes.len() as u64));
+        }
+        (bytes, offsets)
+    }
+
+    #[test]
+    fn head_decodes_only_its_range_and_catches_setup_in_tail() {
+        let records = vec![
+            run_started(),
+            WalRecord::StepStarted { step_id: StepId(1) },
+            text_step(),
+            run_finished(),
+        ];
+        let (bytes, offsets) = encode_log(&records);
+        // The head is the newest message's row: here the single answer frame.
+        let newest = OffsetPageRow {
+            ord: 1,
+            lo_off: offsets[2].0,
+            hi_off: offsets[2].1,
+        };
+        let range = head_byte_range_for_offsets(Some(&newest)).expect("head range");
+        assert_eq!(range, (offsets[2].0, offsets[2].1));
+        assert!(head_byte_range_for_offsets(None).is_none());
+        // With counting on, the head decodes one frame, not the whole log.
+        let counter = Cell::new(0u64);
+        let head = decode_frames_at_offsets(&bytes, &[range], Some(&counter)).expect("head decode");
+        assert_eq!(head.len(), 1);
+        assert_eq!(counter.get(), 1);
+        assert!(counter.get() < records.len() as u64);
+        assert!(matches!(
+            head[0].record,
+            WalRecord::ModelStepFinished { .. }
+        ));
+        // No Setup in this tail: no catch-up.
+        let tail: Vec<FramedRecord> = head;
+        assert!(!head_tail_needs_index_up(&tail));
+        // A durable Setup in the tail forces a catch-up before the head is served.
+        // Crash-cut: these Setup bytes are durable while its index commit has not happened;
+        // the reader sees the Setup past the indexed end and advances the index first.
+        let mut with_setup = tail.clone();
+        with_setup.push(FramedRecord {
+            seq: with_setup.len() as u64 + 10,
+            fence: 1,
+            record: WalRecord::CompactionMessage {
+                provider: "test".into(),
+                kind: CompactionMessageKind::Setup,
+                compaction_id: "cmp-1".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                replacement: Arc::new(Vec::new()),
+                sha256: "0".repeat(64),
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: Some(SetupTagCheckpoint {
+                    tag_checkpoint: 3,
+                    cut: "m1".into(),
+                }),
+                ride_wait_ms: None,
+            },
+        });
+        assert!(head_tail_needs_index_up(&with_setup));
+    }
+}
