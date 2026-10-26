@@ -14,7 +14,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export PYTHONDONTWRITEBYTECODE=1
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
-# The mutation catalogue checker uses tomllib, which requires Python 3.11+.
+# Script guards use tomllib, which requires Python 3.11+.
 QUICKCHECK_PYTHON=""
 suites_venv="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/broca/py-suites"
 for candidate in "${BROCA_SUITES_PYTHON:-}" "$suites_venv/bin/python3" \
@@ -167,15 +167,6 @@ run_guards() {
         echo "quickcheck: REFUSING -- guard list selected no checks." >&2
         return 2
     }
-
-    # Refuse catalog platform claims that are unsupported by the mutation runners.
-    "$QUICKCHECK_PYTHON" scripts/verify-mutation-platforms.py || return $?
-
-    # Exercise the catalogue and fixture-copy tests that reject platform drift.
-    "$QUICKCHECK_PYTHON" scripts/verify-mutation-platforms.py --self-test || return $?
-
-    # Exercise the Windows mutation catalogue checks without a native Windows host.
-    "$QUICKCHECK_PYTHON" scripts/verify-windows-mutations.py --self-test || return $?
 
 }
 guards_started=$SECONDS

@@ -165,14 +165,14 @@ and shared virtual-time idle bounds. Existing WAL pinned-byte tests
 retain every old record unchanged and include present/absent transport evidence.
 
 
-Mutation controls to exercise with targeted tests:
+Targeted regression tests cover:
 
-- Disable connection reuse → `transport::websocket_tests::websocket_reuses_one_handshake_across_steps`.
-- Skip pre-send HTTPS fallback → `transport::websocket_tests::websocket_refused_upgrade_falls_back_without_double_sending`.
-- Drop transport evidence → `transport::websocket_tests::websocket_attempt_durably_records_transport_and_preserves_body_digest`.
-- Close before completion → `transport::websocket_tests::websocket_socket_stays_open_until_response_completed`.
-- Reuse a socket authenticated with an old token → `transport::websocket_tests::websocket_token_refresh_between_steps_reauthenticates_before_sending`.
-- Leave a socket pump stuck in a write after cancel → `transport::responses_websocket::pump_tests::cancel_interrupts_a_blocked_socket_write`.
+- Connection reuse → `transport::websocket_tests::websocket_reuses_one_handshake_across_steps`.
+- Pre-send HTTPS fallback → `transport::websocket_tests::websocket_refused_upgrade_falls_back_without_double_sending`.
+- Durable transport evidence → `transport::websocket_tests::websocket_attempt_durably_records_transport_and_preserves_body_digest`.
+- Completion before close → `transport::websocket_tests::websocket_socket_stays_open_until_response_completed`.
+- Token refresh → `transport::websocket_tests::websocket_token_refresh_between_steps_reauthenticates_before_sending`.
+- Socket-pump cancellation → `transport::responses_websocket::pump_tests::cancel_interrupts_a_blocked_socket_write`.
 
 The catalog also proves a WebSocket step followed by a reconstructed HTTPS warm across
 caller scopes, clamped scopes, session-derived scopes and the legacy fallback. The
@@ -181,5 +181,4 @@ match across pipes, as does the body's `prompt_cache_key` (absent on both for th
 fallback). Socket-only `openai-beta`, `thread-id`, `x-client-request-id`, WebSocket upgrade
 and compression headers are intentionally absent from the HTTPS warm; they are not cache
 affinity differences. See `live::tests::websocket_step_and_recorded_https_warm_share_cache_affinity`
-in `crates/broca-catalog/src/live.rs`. Additional mutation candidates are the diagnostic
-privacy switch and the reconstructed warm's session-affinity header.
+in `crates/broca-catalog/src/live.rs`.

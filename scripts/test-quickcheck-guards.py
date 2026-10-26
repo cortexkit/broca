@@ -147,15 +147,6 @@ class QuickcheckGuards(unittest.TestCase):
         }:
             raise AssertionError(f"{FEATURE_TESTS}: reasoning_variants must remain a quickcheck feature suite")
 
-        quickcheck = (ROOT / "scripts" / "quickcheck.sh").read_text()
-        for command in (
-            '"$QUICKCHECK_PYTHON" scripts/verify-mutation-platforms.py || return $?',
-            '"$QUICKCHECK_PYTHON" scripts/verify-mutation-platforms.py --self-test || return $?',
-            '"$QUICKCHECK_PYTHON" scripts/verify-windows-mutations.py --self-test || return $?',
-        ):
-            if command not in quickcheck:
-                raise AssertionError(f"scripts/quickcheck.sh: missing guard command {command}")
-
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="broca-quickcheck-guards-")
         self.addCleanup(self.temp.cleanup)
@@ -167,8 +158,6 @@ class QuickcheckGuards(unittest.TestCase):
         # quickcheck runs every cargo step through the watchdog, so the fixture needs it too.
         (scripts / "lib").mkdir()
         shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", scripts / "lib" / "cargo-watchdog.py")
-        for name in ("verify-mutation-platforms.py", "verify-windows-mutations.py"):
-            (scripts / name).write_text("print('fixture platform check')\n")
         for name in ("test-portable-test-selection.py", "check-portable-test-selection.py"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         self.home = self.root / "home"

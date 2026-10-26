@@ -20,10 +20,8 @@ with `BROCA_UPDATE_SYNTHETIC_CAPTURE_EVENTS=1 cargo test --locked -p broca-provi
 --test it synthetic_capture_replay::`, then run again without the variable. This is
 not a scrubber and must not be used to bless unreviewed live traffic.
 
-The table's tests are prefixed `synthetic_capture_replay::`. Their mutation controls
-are named `synthetic-replay-<test-name-with-hyphens>` in root `mutations.toml`; each
-corrupts the family's output-usage parser by one token and must fail only its named
-test under an exact filter. Existing service-tier readers continue checking the same
+The table's tests are prefixed `synthetic_capture_replay::`.
+Existing service-tier readers continue checking the same
 field precedence independently of these new snapshots.
 
 | Artifact | Offline test | Preserved response shape |

@@ -175,9 +175,8 @@ late-execution candidate. Declined or unanswered readbacks get no report.
 
 The fixture verifier proves provenance, coverage and local contract vectors,
 not production admission, WAL ordering, cancellation or dispatch. The following
-named runtime tests belong to the implementations that change those paths;
-each runtime property needs a mutations.toml row that deliberately breaks the
-production path and makes its named test fail. A fixture-only test can check a
+named runtime tests belong to the implementations that change those paths.
+A fixture-only test can check a
 contract example but cannot establish actual dispatch or durability behavior.
 
 - Plan admission: `approval_plan_extra_options_refused_before_wal`; refuse
@@ -185,7 +184,7 @@ contract example but cannot establish actual dispatch or durability behavior.
   decline-option emission in elicitation.rs:431-455 until generic consent defines
   extras. Do not drop extras at filing.
 - Core recovery: `consent_refile_race_adopts_answer_and_withdraws_duplicate` and
-  `consent_recovery_conflicting_decisions_refused`, each with its own mutation row.
+  `consent_recovery_conflicting_decisions_refused`.
 - Consent adapter: `consent_request_body_has_no_identity_keys`, comparing actual
   sent body to the golden; never infer identity from body metadata.
 - Core/adapter binding: live, recovered-held and late mismatches refuse by name;

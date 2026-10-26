@@ -86,8 +86,7 @@ def main() -> int:
     # `classify`, the guard shares the classifier's opinion of what is protected -- so a
     # classifier that wrongly calls a 69-byte file sweepable reports it as sweepable BOTH
     # times, the comparison matches, and the guard passes while the protected class is being
-    # deleted. Proven by mutation: widening the predicate to `size <= LINEAGE_FRAME_LEN`
-    # exits 0 with this line absent.
+    # deleted.
     #
     # A guard drawn from the thing it guards can only confirm self-consistency. This counts
     # the bytes directly.

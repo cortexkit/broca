@@ -85,8 +85,8 @@ correlation section gives `requester_ref` no uniqueness meaning.
 
 Downstream recovery tests must inject settlement deterministically between the
 first feed read and filing, then assert adoption and withdrawal of the new card.
-A separate conflicting-decisions test must refuse. Each runtime test needs its
-own mutation row; fixture-only tests cannot prove execution/recovery ordering.
+A separate conflicting-decisions test must refuse. Fixture-only tests cannot
+prove execution/recovery ordering.
 
 ## Acknowledgment, reporting and late intake
 
@@ -96,9 +96,7 @@ The cursor is a store-global log position; an acknowledgment discards that
 owner's settlements through the position. Broca sends no `consent.ack`. It reads from `since: 0` and deduplicates locally by
 card id, following continuation pages. An upstream acknowledgment hides settled
 cards from requester reads, so a run must not discard another run's answers.
-The existing no-ack choice requires a two-run regression and a
-`no-ack-on-owner-feed` runtime mutation; branch A/B ack-ordering mutations do not
-apply.
+The existing no-ack choice requires a two-run runtime regression.
 
 Only approving calls get `consent.report_execution`. Report `executed` for a
 completed provider invocation (including provider error output),

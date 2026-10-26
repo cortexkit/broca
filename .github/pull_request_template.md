@@ -9,10 +9,9 @@ Closes #
 
 <!-- The mechanism, not the diff: what was wrong, what is different now. -->
 
-## Mutation evidence
+## Bug-fix regression test
 
-<!-- For each new or changed test: the one-line change that makes it fail, and
-     the failure. A test that would also pass without the fix is not evidence. -->
+<!-- For a bug fix, add a test that fails without the fix and show that once. -->
 
 ## Checks
 

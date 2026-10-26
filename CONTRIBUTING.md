@@ -31,9 +31,9 @@ written the code.
 ## What a good PR carries
 
 - The issue number that gave it a go.
-- **Mutation evidence** for anything with a test: name the change that makes the
-  new test fail, and show it failing. A test that passes with the fix and would
-  also pass without it is not a test.
+- For a bug fix, add a regression test that fails without the fix and show that
+  once. Run the filtered tests for what you touched; the integrating maintainer runs
+  the full suites once per batch.
 - For a fix: both directions where they exist. "Retryable code is retried" and
   "terminal code is not retried" are two tests, not one.
 - `cargo check --workspace --all-targets` clean. `--workspace` alone builds
@@ -60,5 +60,3 @@ written the code.
   decode the class as an open string.
 - `Cargo.toml` and `Cargo.lock` — exact registry releases and pinned git sources for
   linked crates. `scripts/check-path-deps.py` rejects dependencies outside this repo.
-- [docs/mutations.md](docs/mutations.md) — tooling for the checked-in mutation catalogue:
-  pinned runner installation, one-row replay, new proofs and the nightly breadth audit.

@@ -125,8 +125,7 @@ tryhard = { git = "https://github.com/cortexkit/commons", rev = "fe59258998db489
 panic = "unwind"
 
 # Test rigs hash full debug executables before launching their dev-named copies.
-# The mutation runner runs a whole integration target serially under one deadline;
-# optimize hashing so repeated rig startups do not consume that test-run budget.
+# Optimize hashing so repeated rig startups do not dominate integration test time.
 [profile.dev.package.broca-test-support]
 opt-level = 3
 

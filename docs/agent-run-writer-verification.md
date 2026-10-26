@@ -69,23 +69,3 @@ admission, the work-scope requirement, the actor fallback and the direct-core
 run guard all produce it only with agent-run writing disabled. Encoding an
 explicitly constructed refusal remains possible, but no writer send constructs
 one.
-
-## Mutation controls
-
-These identifiers name executable controls in root `mutations.toml`. Each entry
-introduces a defect and names the tests that must detect it. Replay an entry with
-`ckdev-mutate run --only ID`, substituting one identifier below for `ID`, then
-run `ckdev-mutate check` to validate the catalogue anchors and exact test names:
-
-- `agent-run-writer-enabled`
-- `agent-run-writer-capability`
-- `agent-run-fresh-refusal-before-header` (real daemon required)
-- `agent-run-wal-must-understand`
-- `agent-run-frozen-run-id-before-wal`
-- `agent-run-frozen-agent-id-before-wal`
-- `agent-run-export-attribution`
-- `agent-run-bind-preserves-attribution`
-- `agent-run-carrier-before-wal`
-- `agent-run-tools-before-wal`
-- `agent-run-stamp-delegation-fence`
-- `agent-run-direct-core-writer-fence`

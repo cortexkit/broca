@@ -58,7 +58,7 @@ assert args[args.index('--limit') + 1] == '100'
 mode = os.environ.get('CI_MODE', 'green')
 if mode == 'query-error': sys.exit(17)
 assert 'event' in args[args.index('--json') + 1].split(','), 'release judges runs by event'
-runs = [{'name': n, 'databaseId': i, 'headSha': os.environ['EXPECT_SHA'], 'status': 'completed', 'conclusion': 'success', 'event': 'push'} for i,n in enumerate(('CI', 'Mutation catalogue'), 1)]
+runs = [{'name': n, 'databaseId': i, 'headSha': os.environ['EXPECT_SHA'], 'status': 'completed', 'conclusion': 'success', 'event': 'push'} for i,n in enumerate(('CI', 'Unrelated audit'), 1)]
 scheduled = dict(runs[0], databaseId=9, event='schedule')
 if mode == 'empty': runs = []
 elif mode == 'scheduled-failed': runs.append(dict(scheduled, conclusion='failure'))
@@ -67,9 +67,9 @@ elif mode == 'scheduled-pending': runs.append(dict(scheduled, status='in_progres
 elif mode == 'only-scheduled': runs[0]['event'] = 'schedule'
 elif mode == 'second-push-failed': runs.append(dict(runs[0], databaseId=8, conclusion='failure'))
 elif mode == 'missing-ci': runs = runs[1:]
-elif mode == 'missing-mutations': runs = runs[:1]
-elif mode == 'mutations-failed': runs[1]['conclusion'] = 'failure'
-elif mode == 'mutations-pending': runs[1]['status'] = 'in_progress'; runs[1]['conclusion'] = ''
+elif mode == 'missing-audit': runs = runs[:1]
+elif mode == 'audit-failed': runs[1]['conclusion'] = 'failure'
+elif mode == 'audit-pending': runs[1]['status'] = 'in_progress'; runs[1]['conclusion'] = ''
 elif mode == 'failed': runs[0]['conclusion'] = 'failure'
 elif mode == 'pending': runs[0]['status'] = 'in_progress'; runs[0]['conclusion'] = ''
 elif mode == 'cancelled': runs[0]['conclusion'] = 'cancelled'
@@ -129,10 +129,9 @@ print(json.dumps(runs))
     def test_missing_ci_workflow_refuses(self):
         self.assert_not_tagged_or_staged(self.release(CI_MODE='missing-ci'))
 
-    def test_mutation_runs_never_hold_a_release(self):
-        # Only CI gates a release: a missing, failed or still-running mutation replay is a
-        # work item, and the commit still tags and stages.
-        for mode in ('missing-mutations', 'mutations-failed', 'mutations-pending'):
+    def test_unrelated_workflow_runs_never_hold_a_release(self):
+        # Only CI gates a release; unrelated workflow runs must not block tagging or staging.
+        for mode in ('missing-audit', 'audit-failed', 'audit-pending'):
             with self.subTest(mode=mode):
                 self.git('tag', '-d', 'v0.3.198') if self.git('tag', '--list', 'v0.3.198').stdout else None
                 result = self.release(CI_MODE=mode)
