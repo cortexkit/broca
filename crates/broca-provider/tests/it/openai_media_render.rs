@@ -152,6 +152,49 @@ fn chatgpt_audio_remains_mime_blocked_until_live_types_are_known() {
 }
 
 #[test]
+fn chatgpt_audio_requires_both_live_flag_and_frozen_mime_allowlist() {
+    let media = [reference(MediaKind::Audio, "audio/wav")];
+    for tool in [false, true] {
+        let mut frozen = frozen(WireFamilyId::OpenAiResponsesChatgpt, MediaQuirk::Openai);
+        let opts = request(&media, tool);
+        let profile = frozen.media.as_mut().unwrap();
+        profile.audio.user_message = MediaCarrier::Native;
+        profile.audio.tool_result = MediaCarrier::Native;
+        profile.chatgpt_audio_mime_types = vec!["audio/wav".into()];
+        let denied = render(&OpenAiResponsesChatgpt, &frozen, &opts, &media, tool);
+        assert!(!denied.to_string().contains("YWJj"));
+        frozen
+            .media
+            .as_mut()
+            .unwrap()
+            .live_gated
+            .chatgpt_input_audio = true;
+        let body = render(&OpenAiResponsesChatgpt, &frozen, &opts, &media, tool);
+        let content = &body["input"][0][if tool { "output" } else { "content" }];
+        assert_eq!(
+            content[1],
+            json!({"type":"input_audio", "audio_url":"data:audio/wav;base64,YWJj"})
+        );
+        let other = [reference(MediaKind::Audio, "audio/mpeg")];
+        let denied = render(
+            &OpenAiResponsesChatgpt,
+            &frozen,
+            &request(&other, tool),
+            &other,
+            tool,
+        );
+        assert!(denied.to_string().contains("reason=mime"));
+        assert!(!denied.to_string().contains("YWJj"));
+        let round_trip: FrozenRenderConfig =
+            serde_json::from_value(serde_json::to_value(&frozen).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.media.unwrap().chatgpt_audio_mime_types,
+            ["audio/wav"]
+        );
+    }
+}
+
+#[test]
 fn chat_user_image_file_and_audio_use_the_chat_grammar() {
     let frozen = frozen(WireFamilyId::OpenAiChat, MediaQuirk::Openai);
     let media = [

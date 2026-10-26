@@ -124,7 +124,7 @@ impl ProviderHttpClient {
     }
 
     /// The client for a request: the decoding one only for Anthropic's first-party host.
-    fn for_host(&self, anthropic_api_host: bool) -> &reqwest::Client {
+    pub fn for_host(&self, anthropic_api_host: bool) -> &reqwest::Client {
         if anthropic_api_host {
             &self.decoding
         } else {
@@ -589,6 +589,19 @@ fn build_retry_normalizer<F: WireFamily>(
 pub fn build_provider_http_client() -> ProviderHttpClient {
     ProviderHttpClient::build(
         provider_client_builder,
+        request_gzip::RequestGzipPolicy::from_env(),
+    )
+}
+
+/// The provider client for bounded operator probes. Redirects and automatic HTTP retries
+/// would spend uncounted requests, so each explicit send must be a single attempt.
+pub fn build_single_attempt_http_client() -> ProviderHttpClient {
+    ProviderHttpClient::build(
+        || {
+            provider_client_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+        },
         request_gzip::RequestGzipPolicy::from_env(),
     )
 }

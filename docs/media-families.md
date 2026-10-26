@@ -25,6 +25,64 @@ Rules every entry follows:
   hold a kind, the profile uses the follow-up user message (only after a live check
   shows the provider accepts it and prompt caching stays stable) or a marker.
 
+### Running the live checks
+
+Only an operator runs live checks, on the Mac outside a worker sandbox.
+The bounded probe uses the explicit prepared-media renderer, the family's real
+endpoint and normalizer, and broca's HTTP client with redirects and automatic
+retries disabled. It never prints a credential, handle, request headers, response
+body or provider error message. Unknown provider codes are `other_redacted`.
+
+```sh
+# Default dry-run: 7 example families, at most 21 planned requests; sends nothing.
+cargo run --locked -p broca-provider --features live --example media-live-check -- --dry-run
+# Copy/edit examples/media-live/plan.json under the provider crate first. Keep only
+# families serving real traffic and select one actual serving route per family.
+cargo run --locked -p broca-provider --features live --example media-live-check -- --dry-run --plan <plan.json>
+BROCA_LIVE_TESTS=1 cargo run --locked -p broca-provider --features live --example media-live-check -- --live --plan <plan.json>
+```
+
+The example plan is a template, not catalog evidence or a current model list.
+Set the actual wire model, named dev-tools credential, provider `quirk` (for a
+compatible endpoint), and any `base_url`, `aws_region` or Code Assist `project_id`.
+An optional non-secret `frozen` object supplies a serving `FrozenRenderConfig`
+including provider-specific identity and quirks instead of family defaults. No
+token or capability handle belongs in the plan. Credentials are read by name only
+through the dev-tools handle map and subc, and only after `--live` and
+`BROCA_LIVE_TESTS=1`. `--subc` and `--timeout-secs` are optional.
+
+One route consumes all three request slots for its family; duplicate families
+are refused before credential access. Request 1 checks person PNG/PDF input where
+the profile carries it. Request 2 checks a tool PNG/PDF with different readable
+values, using the candidate follow-up user carrier where necessary. Request 3
+extends the same history to measure cache stability. ChatGPT also checks user
+and tool audio in request 1 (`audio/wav`) and request 2 (`audio/mpeg`), with four
+different spoken values. Candidate MIME types are not claims of acceptance.
+Fixtures are synthetic and checked in beside the example; no session data is read.
+
+Dry-run JSON lines list family, wire model, profile, carrier, media kind, MIME,
+decoded byte size, digest, and complete rendered request size/digest. Live lines
+report HTTP status, allowlisted provider code, usage including cached tokens, and
+fixed-string media-check booleans, never the answer. `cache_stable` requires a
+positive reported cache hit on request 2 and no decrease on request 3; missing
+usage, zero hits or interrupted runs are inconclusive, not passes. Media checks
+must also pass independently. A provider rejection spends a slot and is never
+retried. The probe only changes candidate profiles in memory, never the production
+registry or a running admission's frozen config.
+
+Paste results beside the matching profile below in this format (one row per
+request; use `not serving` for a family not exercised):
+
+| operator-run UTC / revision | wire model / endpoint profile | request / carrier / MIME | HTTP / provider code | media checks | input / cached / cache-write / output tokens | cache stable | decision |
+|---|---|---|---|---|---|---|---|
+| pending | pending | pending | pending | pending | pending | unmeasured | keep gate unset |
+
+Record refusals as well as passes. A pass for one compatible provider or Gemini
+generation does not enable another profile. A ChatGPT audio pass records exactly
+the accepted MIME set in the frozen profile, as well as the carrier flag. Code
+Assist's current all-kind flag must not be enabled from PNG/PDF-only evidence:
+audio/video remain unverified by those checks. Untested profiles retain markers.
+
 ## Kinds, MIME types and catalog modalities
 
 broca stores four kinds. The MIME type is detected from the bytes at capture.
@@ -148,6 +206,9 @@ person's media is refused (`carrier`) and tool media renders as markers.
 
 ## `anthropic_messages` (Anthropic Messages API)
 
+**Live check:** pending operator-run results; native image/PDF carriers are documented,
+not yet verified by this probe.
+
 Sources: https://platform.claude.com/docs/en/build-with-claude/vision ·
 https://platform.claude.com/docs/en/build-with-claude/pdf-support ·
 https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls ·
@@ -180,6 +241,9 @@ https://platform.claude.com/docs/en/api/overview (request size limits)
     page plus the page's image cost, which needs a page count broca does not extract.
 
 ## `bedrock_converse` (AWS Bedrock Converse)
+
+**Live check:** pending operator-run results; native image/PDF carriers are documented,
+not yet verified by this probe.
 
 Sources: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Message.html ·
 https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ContentBlock.html ·
@@ -215,6 +279,10 @@ https://platform.claude.com/docs/en/api/overview (Bedrock request size)
 
 ## `openai_responses` (OpenAI Responses API)
 
+**Live check:** pending operator-run results; native image/PDF carriers are documented,
+not yet verified by this probe. The Meta Responses profile is separately untested
+and its follow-up-user carrier remains a marker.
+
 Sources: https://developers.openai.com/api/docs/guides/images-vision ·
 https://developers.openai.com/api/docs/guides/file-inputs ·
 https://developers.openai.com/api/docs/guides/function-calling ·
@@ -246,6 +314,10 @@ https://developers.openai.com/api/reference/resources/responses/methods/create
 
 ## `openai_responses_chatgpt` (ChatGPT / Codex backend)
 
+**Live check:** pending operator-run results. `input_audio` remains off and its frozen
+MIME allowlist empty. Probe candidates are `audio/wav` and `audio/mpeg`, in both user
+messages and tool results; neither is accepted until measured live.
+
 The ChatGPT backend takes the Responses body at the ChatGPT Codex endpoint and has no
 public reference. The primary source is OpenAI's own Codex client, which serializes
 these items directly into that body:
@@ -268,6 +340,9 @@ https://github.com/openai/codex/blob/ffda54f5b8d5595eb0963594de32e206f98cc77f/co
 - **Token estimate:** image: the `openai_responses` rule. Audio: fixed estimate.
 
 ## `openai_chat` (OpenAI Chat Completions grammar)
+
+**Live check:** pending operator-run acceptance and positive cache-stability results.
+OpenAI's tool-media follow-up-user carrier remains a marker.
 
 Sources: https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create ·
 https://developers.openai.com/api/docs/guides/images-vision ·
@@ -292,6 +367,9 @@ OpenAI's own Chat Completions endpoint.
 
 ### `openai_chat` profile: OpenRouter (quirk `openrouter`)
 
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. Another provider's pass does not enable this profile.
+
 Sources: https://openrouter.ai/docs/guides/overview/multimodal/image-understanding ·
 https://openrouter.ai/docs/guides/overview/multimodal/pdfs ·
 https://openrouter.ai/docs/guides/overview/multimodal/audio ·
@@ -315,6 +393,9 @@ https://openrouter.ai/docs/api/reference/overview
 
 ### `openai_chat` profile: xAI (quirk `xai`)
 
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. Another provider's pass does not enable this profile.
+
 Sources: https://docs.x.ai/developers/model-capabilities/images/understanding ·
 https://docs.x.ai/developers/rest-api-reference/inference/chat-completions
 
@@ -333,6 +414,9 @@ https://docs.x.ai/developers/rest-api-reference/inference/chat-completions
   the models the overlay overrides to `openai_chat`.
 
 ### `openai_chat` profile: DeepSeek (quirk `deepseek`)
+
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. Another provider's pass does not enable this profile.
 
 Sources: https://api-docs.deepseek.com/guides/vision ·
 https://api-docs.deepseek.com/api/create-chat-completion
@@ -353,6 +437,9 @@ https://api-docs.deepseek.com/api/create-chat-completion
 
 ### `openai_chat` profile: Kimi (quirk `kimi`)
 
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. Another provider's pass does not enable this profile.
+
 Sources: https://platform.kimi.ai/docs/guide/use-kimi-vision-model ·
 https://platform.kimi.ai/docs/api/chat
 
@@ -370,6 +457,9 @@ https://platform.kimi.ai/docs/api/chat
   estimate-tokens endpoint, not a formula).
 
 ### `openai_chat` profile: Meta (quirk `meta`)
+
+**Live check:** pending operator-run acceptance and cache-stability results; tool media
+remain markers. This does not cover the separate Meta Responses profile.
 
 The `llama` provider's Llama API documentation now redirects to the Meta Model API
 documentation, which covers both Chat Completions and Responses.
@@ -395,6 +485,10 @@ https://dev.meta.ai/docs/protocols/chat-completions
   endpoint.
 
 ## `gemini` (Gemini API and Vertex AI `generateContent`)
+
+**Live check:** pending operator-run results. Gemini 3's native image/PDF tool carrier
+is documented but unverified here; earlier Gemini's follow-up-user carrier stays
+a marker until its own acceptance and cache-stability check passes.
 
 Sources: https://ai.google.dev/gemini-api/docs/image-understanding ·
 https://ai.google.dev/gemini-api/docs/document-processing ·
@@ -443,6 +537,10 @@ https://github.com/googleapis/python-genai/blob/main/google/genai/types.py
     a duration.
 
 ## `google_codeassist` (Antigravity / Code Assist)
+
+**Live check:** pending operator-run results for both generation profiles. All Code
+Assist production media gates remain unset; a PNG/PDF pass cannot enable untested
+audio/video carriers.
 
 The Code Assist endpoint (`cloudcode-pa`) wraps a Gemini `generateContent` request in
 an envelope and has no public reference. The primary source is Google's own client,

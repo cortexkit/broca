@@ -158,6 +158,13 @@ pub(crate) fn accepts_mime(profile: &MediaProfile, media: &MediaRef) -> bool {
         },
         MediaKind::Document => mime == "application/pdf",
         MediaKind::Audio => match profile.profile {
+            OpenaiResponsesChatgpt => {
+                profile.live_gated.chatgpt_input_audio
+                    && profile
+                        .chatgpt_audio_mime_types
+                        .iter()
+                        .any(|allowed| allowed == mime)
+            }
             OpenaiChat | MetaChat | MetaResponses => matches!(mime, "audio/wav" | "audio/mpeg"),
             Openrouter => mime == "audio/wav",
             Bedrock => matches!(

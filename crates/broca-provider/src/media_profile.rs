@@ -445,6 +445,10 @@ pub struct MediaProfile {
     /// The live-gated carriers that were enabled when this profile was frozen.
     #[serde(default, skip_serializing_if = "LiveGates::is_unset")]
     pub live_gated: LiveGates,
+    /// ChatGPT audio MIME types established by the live check. A carrier flag alone cannot
+    /// admit an undocumented type; keeping the measured set frozen also protects replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chatgpt_audio_mime_types: Vec<String>,
 }
 
 impl MediaProfile {
@@ -818,6 +822,7 @@ fn build_profile(
         context_tokens: window,
         aging: AgingThresholds::derived(entry.request_cap_bytes, window),
         live_gated: gates,
+        chatgpt_audio_mime_types: Vec::new(),
     }
 }
 

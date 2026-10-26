@@ -1,0 +1,9 @@
+[
+  {"family":"anthropic_messages","model":"claude-sonnet-4-5","credential":"apikey:anthropic"},
+  {"family":"bedrock_converse","model":"REPLACE-WITH-SERVING-MODEL","credential":"apikey:amazon-bedrock","aws_region":"us-east-1"},
+  {"family":"openai_responses","model":"gpt-4.1","credential":"apikey:openai"},
+  {"family":"openai_responses_chatgpt","model":"gpt-5.1-codex","credential":"chatgpt:openai"},
+  {"family":"openai_chat","model":"gpt-4.1","credential":"apikey:openai"},
+  {"family":"gemini","model":"gemini-3-flash-preview","credential":"apikey:google"},
+  {"family":"google_codeassist","model":"gemini-3-flash-preview","credential":"antigravity:google","project_id":"REPLACE-WITH-SERVING-PROJECT"}
+]
