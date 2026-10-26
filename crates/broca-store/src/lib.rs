@@ -38,6 +38,7 @@ use busy::STORE_BUSY_TIMEOUT;
 pub mod bus_events;
 pub mod compaction_facts;
 pub mod compaction_receipts;
+pub mod db;
 pub mod export_index;
 mod fold_identities;
 pub mod grants;

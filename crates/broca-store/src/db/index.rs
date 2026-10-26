@@ -1,0 +1,818 @@
+use broca_core::projection_plan::{u64_to_i64, OffsetEpisode, OffsetSeed};
+use broca_protocol::BindIdentity;
+use broca_wal::framing::{decode_next, DecodeStep};
+use rusqlite::{params, OptionalExtension, Transaction};
+use sha2::{Digest, Sha256};
+
+use super::{schema, DbError, OverhaulDb};
+
+#[derive(Debug, Clone, Copy)]
+pub enum LogLocation {
+    Live,
+    Archived,
+}
+impl LogLocation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Archived => "archived",
+        }
+    }
+}
+
+/// `bytes` must end at the writer's durable publication boundary, not at a live
+/// file's speculative EOF. The index never writes, repairs or truncates the log.
+pub struct PublishedSession<'a> {
+    pub bind: &'a BindIdentity,
+    pub session_ref: &'a str,
+    pub location: LogLocation,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexOutcome {
+    pub rebuilt: bool,
+    pub indexed_seq: Option<u64>,
+    pub indexed_end: u64,
+    pub head_ord: u64,
+}
+
+struct Checkpoint {
+    seq: Option<u64>,
+    off: u64,
+    end: u64,
+    identity: Option<Vec<u8>>,
+    lineage: Option<String>,
+    lineage_off: Option<u64>,
+    seed: Option<OffsetSeed>,
+}
+
+pub(super) fn sid(bind: &BindIdentity) -> Result<String, DbError> {
+    bind.validate_keyable().map_err(DbError::Invalid)?;
+    Ok(format!(
+        "{}\u{1f}{}\u{1f}{}",
+        bind.project_root.display(),
+        bind.harness,
+        bind.session
+    ))
+}
+
+impl OverhaulDb {
+    /// Self-check before using indexed rows. A restored shorter or rewritten log
+    /// discards only this session's derived rows, in the same transaction as replay.
+    pub fn index(&self, log: &PublishedSession<'_>) -> Result<IndexOutcome, DbError> {
+        self.transaction(false, |tx| index_in_tx(tx, log, false))
+    }
+}
+
+pub(super) fn clear_session(tx: &Transaction<'_>, key: &str) -> Result<(), DbError> {
+    for table in schema::SESSION_TABLES {
+        tx.execute(&format!("DELETE FROM {table} WHERE sid=?1"), [key])?;
+    }
+    tx.execute("DELETE FROM session WHERE sid=?1", [key])?;
+    Ok(())
+}
+
+fn lineage(bytes: &[u8]) -> Result<(Option<String>, usize), DbError> {
+    match decode_next(bytes) {
+        DecodeStep::Lineage {
+            lineage_id,
+            consumed,
+        } => Ok((Some(lineage_id.to_string()), consumed)),
+        DecodeStep::NewerWriter { missing, .. } => {
+            Err(DbError::Invalid(format!("newer WAL writer: {missing:?}")))
+        }
+        DecodeStep::Corrupt(e) => Err(DbError::Invalid(format!("corrupt WAL: {e}"))),
+        _ => Ok((None, 0)),
+    }
+}
+
+fn matches_checkpoint(cp: &Checkpoint, bytes: &[u8], lineage: &Option<String>) -> bool {
+    if &cp.lineage != lineage || cp.end > bytes.len() as u64 || cp.seed.is_none() {
+        return false;
+    }
+    let Some(seq) = cp.seq else {
+        return cp.identity.is_none();
+    };
+    let Some(range) = bytes.get(cp.off as usize..cp.end as usize) else {
+        return false;
+    };
+    match decode_next(range) {
+        DecodeStep::Record { framed, consumed } => {
+            framed.seq == seq
+                && cp.identity.as_deref() == Some(Sha256::digest(&range[..consumed]).as_slice())
+        }
+        _ => false,
+    }
+}
+
+fn load_seed(encoded: &str, bytes: &[u8]) -> Option<OffsetSeed> {
+    let value: serde_json::Value = serde_json::from_str(encoded).ok()?;
+    let budget = match value.get(1)?.get("admission")?.get("run_started")?.as_u64() {
+        Some(off) => match decode_next(bytes.get(usize::try_from(off).ok()?..)?) {
+            DecodeStep::Record { framed, .. } => match framed.record {
+                broca_wal::WalRecord::RunStarted { config, .. } => config.budget,
+                _ => return None,
+            },
+            _ => return None,
+        },
+        None => None,
+    };
+    OffsetSeed::decode(encoded, budget)
+}
+
+pub(super) fn index_in_tx(
+    tx: &Transaction<'_>,
+    log: &PublishedSession<'_>,
+    force: bool,
+) -> Result<IndexOutcome, DbError> {
+    let key = sid(log.bind)?;
+    let (initial_lineage, origin_end) = lineage(log.bytes)?;
+    let mut lineage_id = initial_lineage.clone();
+    let checkpoint = tx.query_row(
+        "SELECT indexed_seq,indexed_off,indexed_end,indexed_identity,lineage_id,tail_seed,lineage_off FROM session WHERE sid=?1",
+        [&key], |r| Ok(Checkpoint { seq: r.get(0)?, off: r.get(1)?, end: r.get(2)?, identity: r.get(3)?, lineage: r.get(4)?,
+            seed: load_seed(&r.get::<_, String>(5)?, log.bytes), lineage_off: r.get(6)? }))
+        .optional()?;
+    if let Some(off) = checkpoint.as_ref().and_then(|cp| cp.lineage_off) {
+        lineage_id = log
+            .bytes
+            .get(off as usize..)
+            .and_then(|bytes| match decode_next(bytes) {
+                DecodeStep::Lineage { lineage_id, .. } => Some(lineage_id.to_string()),
+                _ => None,
+            });
+    }
+    let rebuilt = force
+        || checkpoint
+            .as_ref()
+            .is_some_and(|cp| !matches_checkpoint(cp, log.bytes, &lineage_id));
+    let cp = if rebuilt {
+        clear_session(tx, &key)?;
+        None
+    } else {
+        checkpoint
+    };
+    if rebuilt {
+        lineage_id = initial_lineage;
+    }
+    let mut lineage_off = cp
+        .as_ref()
+        .and_then(|cp| cp.lineage_off)
+        .or_else(|| (origin_end > 0).then_some(0));
+    let mut offset = cp.as_ref().map_or(origin_end as u64, |cp| cp.end);
+    let mut last_off = cp.as_ref().map_or(0, |cp| cp.off);
+    let mut last_seq = cp.as_ref().and_then(|cp| cp.seq);
+    let mut identity = cp.as_ref().and_then(|cp| cp.identity.clone());
+    let mut seed = cp.and_then(|cp| cp.seed).unwrap_or_default();
+    tx.execute("INSERT INTO session (sid,project_root,harness,session_key,session_ref,lineage_id,location,indexed_off,indexed_end,head_ord,tail_seed,admission_seed)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,'','') ON CONFLICT(sid) DO UPDATE SET session_ref=excluded.session_ref,location=excluded.location",
+        params![key, log.bind.project_root.display().to_string(), log.bind.harness, log.bind.session, log.session_ref, lineage_id, log.location.as_str()])?;
+    while offset < log.bytes.len() as u64 {
+        let remaining = &log.bytes[offset as usize..];
+        let (frame, consumed) = match decode_next(remaining) {
+            DecodeStep::Record { framed, consumed } => (framed, consumed),
+            // A published torn append is not a committed frame. Keep the verified
+            // boundary so a later complete publication can index the whole frame.
+            DecodeStep::TornTail => break,
+            DecodeStep::Lineage {
+                lineage_id: found,
+                consumed,
+            } => {
+                let found = found.to_string();
+                if lineage_id.as_ref().is_some_and(|id| id != &found) {
+                    return Err(DbError::Invalid("conflicting WAL lineage metadata".into()));
+                }
+                lineage_id = Some(found);
+                lineage_off = Some(offset);
+                offset += consumed as u64;
+                continue;
+            }
+            DecodeStep::Corrupt(e) => {
+                return Err(DbError::Invalid(format!("corrupt WAL at {offset}: {e}")))
+            }
+            DecodeStep::NewerWriter { missing, .. } => {
+                return Err(DbError::Invalid(format!("newer WAL writer: {missing:?}")))
+            }
+        };
+        if last_seq.is_some_and(|seq| seq.checked_add(1) != Some(frame.seq)) {
+            return Err(DbError::Invalid(format!(
+                "noncontiguous WAL sequence at {offset}"
+            )));
+        }
+        let end = offset + consumed as u64;
+        if let broca_wal::WalRecord::RunStarted { session, .. } = &frame.record {
+            if session != log.bind {
+                return Err(DbError::Invalid(
+                    "WAL bind identity differs from indexed session".into(),
+                ));
+            }
+        }
+        let delta = seed.observe(&frame, offset, end)?;
+        if let Some(to) = delta.truncate {
+            tx.execute(
+                "DELETE FROM message WHERE sid=?1 AND ord>=?2",
+                params![key, u64_to_i64(to)?],
+            )?;
+        }
+        for (ord, source) in delta.messages {
+            tx.execute("INSERT INTO message (sid,ord,lo_seq,lo_off,hi_off,input_start,input_end,tag_base,tag_n,tag_high,flags) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                ON CONFLICT(sid,ord) DO UPDATE SET lo_seq=excluded.lo_seq,lo_off=excluded.lo_off,hi_off=excluded.hi_off,input_start=excluded.input_start,input_end=excluded.input_end,tag_base=excluded.tag_base,tag_n=excluded.tag_n,tag_high=excluded.tag_high,flags=excluded.flags",
+                params![key,u64_to_i64(ord)?,u64_to_i64(source.lo_seq)?,u64_to_i64(source.lo_off)?,u64_to_i64(source.hi_off)?,u64_to_i64(source.input_start)?,u64_to_i64(source.input_end)?,source.tag_base.map(u64_to_i64).transpose()?,u64_to_i64(source.tag_n)?,u64_to_i64(source.tag_high)?,source.flags])?;
+        }
+        if let Some(ep) = delta.closed_episode {
+            write_episode(tx, &key, &ep)?;
+        }
+        if let Some(ep) = &seed.episode {
+            write_episode(tx, &key, ep)?;
+        }
+        if let Some((cut, checkpoint)) = delta.reanchor {
+            reanchor(tx, &key, cut, checkpoint, &mut seed)?;
+        }
+        last_seq = Some(frame.seq);
+        last_off = offset;
+        identity = Some(Sha256::digest(&remaining[..consumed]).to_vec());
+        offset = end;
+    }
+    tx.execute("UPDATE session SET lineage_id=?2,indexed_seq=?3,indexed_off=?4,indexed_end=?5,indexed_identity=?6,head_ord=?7,tail_seed=?8,admission_seed=?9,frozen_policy=?10,last_activity_ms=?11,last_write_ms=?12,title_off=?13,lineage_off=?14 WHERE sid=?1",
+        params![key,lineage_id,last_seq.map(u64_to_i64).transpose()?,u64_to_i64(last_off)?,u64_to_i64(offset)?,identity,u64_to_i64(seed.head_ord())?,seed.encode()?,serde_json::to_string(&seed.admission).map_err(|e| DbError::Invalid(e.to_string()))?,seed.frozen_policy.map(u64_to_i64).transpose()?,seed.last_activity_ms.map(u64_to_i64).transpose()?,seed.last_write_ms.map(u64_to_i64).transpose()?,seed.title_off.map(u64_to_i64).transpose()?,lineage_off.map(u64_to_i64).transpose()?])?;
+    Ok(IndexOutcome {
+        rebuilt,
+        indexed_seq: last_seq,
+        indexed_end: offset,
+        head_ord: seed.head_ord(),
+    })
+}
+
+fn write_episode(tx: &Transaction<'_>, key: &str, ep: &OffsetEpisode) -> Result<(), DbError> {
+    tx.execute("INSERT INTO episode (sid,n,run_id,attributable,run_started_seq,run_started_off,first_ord,step_first_ord,end_ord,tag_seed,terminal_off,terminal_kind)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(sid,n) DO UPDATE SET end_ord=excluded.end_ord,step_first_ord=excluded.step_first_ord,terminal_off=excluded.terminal_off,terminal_kind=excluded.terminal_kind",
+        params![key,u64_to_i64(ep.n)?,ep.run_id,ep.run_id.is_some(),ep.run_started_seq.map(u64_to_i64).transpose()?,ep.run_started_off.map(u64_to_i64).transpose()?,u64_to_i64(ep.first_ord)?,ep.step_first_ord.map(u64_to_i64).transpose()?,u64_to_i64(ep.end_ord)?,u64_to_i64(ep.tag_seed)?,ep.terminal_off.map(u64_to_i64).transpose()?,ep.terminal_kind])?;
+    if let Some(run_id) = &ep.run_id {
+        tx.execute("INSERT INTO run (run_id,sid,episode,state,state_seq,last_step_off,terminal_off,submission_id,request_identity_digest)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(run_id) DO UPDATE SET state=excluded.state,state_seq=excluded.state_seq,last_step_off=excluded.last_step_off,terminal_off=excluded.terminal_off WHERE run.sid=excluded.sid",
+            params![run_id,key,u64_to_i64(ep.n)?,ep.state,u64_to_i64(ep.state_seq)?,ep.last_step_off.map(u64_to_i64).transpose()?,ep.terminal_off.map(u64_to_i64).transpose()?,ep.submission_id,ep.request_identity_digest])?;
+    }
+    Ok(())
+}
+
+fn reanchor(
+    tx: &Transaction<'_>,
+    key: &str,
+    cut: u64,
+    checkpoint: u64,
+    seed: &mut OffsetSeed,
+) -> Result<(), DbError> {
+    let mut stmt = tx.prepare("SELECT ord,tag_base,tag_n,tag_high,flags FROM message WHERE sid=?1 AND ord>=?2 ORDER BY ord")?;
+    let rows = stmt
+        .query_map(params![key, u64_to_i64(cut)?], |r| {
+            Ok((
+                r.get::<_, u64>(0)?,
+                r.get::<_, Option<u64>>(1)?,
+                r.get::<_, u64>(2)?,
+                r.get::<_, u64>(3)?,
+                r.get::<_, u32>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.first().is_none_or(|r| r.0 != cut) {
+        return Ok(());
+    }
+    let mut high = checkpoint.max(rows[0].1.unwrap_or(0));
+    for (ord, _, n, stored_high, flags) in rows {
+        if flags & 2 != 0 {
+            let base = high;
+            high = high
+                .checked_add(n)
+                .ok_or_else(|| DbError::Invalid("tag numbering overflow".into()))?;
+            tx.execute(
+                "UPDATE message SET tag_base=?3,tag_high=?4 WHERE sid=?1 AND ord=?2",
+                params![key, u64_to_i64(ord)?, u64_to_i64(base)?, u64_to_i64(high)?],
+            )?;
+        } else {
+            high = high.max(stored_high);
+        }
+    }
+    seed.tag_high = high;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use broca_wal::framing::encode;
+    use broca_wal::{FramedRecord, WalRecord};
+    use rusqlite::types::Value;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    struct TestDb {
+        db: OverhaulDb,
+        _scratch: Scratch,
+    }
+    fn database() -> TestDb {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = broca_test_support::scratch_root().join(format!(
+            "offset-db-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state-format"), b"broca-state/2\n").unwrap();
+        let db = OverhaulDb::open(&root).unwrap();
+        TestDb {
+            db,
+            _scratch: Scratch(root),
+        }
+    }
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(name),
+        )
+        .unwrap()
+    }
+    fn decoded(bytes: &[u8]) -> Vec<(usize, usize, FramedRecord)> {
+        let mut records = Vec::new();
+        let mut off = 0;
+        while off < bytes.len() {
+            match decode_next(&bytes[off..]) {
+                DecodeStep::Lineage { consumed, .. } => off += consumed,
+                DecodeStep::Record { framed, consumed } => {
+                    records.push((off, off + consumed, *framed));
+                    off += consumed;
+                }
+                DecodeStep::TornTail => break,
+                _ => panic!("fixture decode at {off}"),
+            }
+        }
+        records
+    }
+    fn bind(bytes: &[u8]) -> BindIdentity {
+        decoded(bytes)
+            .into_iter()
+            .find_map(|(_, _, f)| match f.record {
+                WalRecord::RunStarted { session, .. } => Some(session),
+                _ => None,
+            })
+            .unwrap()
+    }
+    fn publication<'a>(bind: &'a BindIdentity, bytes: &'a [u8]) -> PublishedSession<'a> {
+        PublishedSession {
+            bind,
+            session_ref: "s-test",
+            location: LogLocation::Live,
+            bytes,
+        }
+    }
+    fn rows(db: &OverhaulDb, tables: &[&str]) -> Vec<(String, Vec<Vec<Value>>)> {
+        db.read_snapshot(|tx| {
+            tables
+                .iter()
+                .map(|table| {
+                    let mut stmt = tx.prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))?;
+                    let count = stmt.column_count();
+                    let values = stmt
+                        .query_map([], |r| {
+                            (0..count)
+                                .map(|i| r.get(i))
+                                .collect::<rusqlite::Result<Vec<Value>>>()
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(((*table).into(), values))
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+    fn r_rows(db: &OverhaulDb) -> Vec<(String, Vec<Vec<Value>>)> {
+        rows(db, schema::REBUILDABLE_TABLES)
+    }
+    fn corpus() -> Vec<Vec<u8>> {
+        let mut logs = vec![
+            fixture("scripts/fixtures/resume-close-out-sealed.wal"),
+            fixture("scripts/fixtures/resume-close-out-unsealed.wal"),
+            fixture("crates/broca-core/tests/fixtures/runner_tags_v1/steer_anthropic.wal"),
+        ];
+        // A multi-episode sample with long, distinctive caller content and titles
+        // exercises the same frozen start/step/tool/terminal shapes as real sessions.
+        let records = decoded(&logs[0]);
+        let mut sample = Vec::new();
+        let mut seq = 0;
+        for episode in 0..3 {
+            for (_, _, frame) in &records {
+                let mut record = frame.record.clone();
+                if let WalRecord::RunStarted {
+                    run_id,
+                    title,
+                    input,
+                    ..
+                } = &mut record
+                {
+                    run_id.0 = format!("production-shaped-{episode}");
+                    *title = Some("distinctive-private-title".into());
+                    *input = std::sync::Arc::new(vec![broca_protocol::Message::new(
+                        broca_protocol::Role::User,
+                        vec![broca_protocol::ContentBlock::Text {
+                            text: "distinctive-private-input".repeat(100),
+                        }],
+                    )]);
+                }
+                sample.extend(encode(seq, frame.fence, &record).unwrap());
+                seq += 1;
+            }
+        }
+        logs.push(sample);
+        let mut budgeted = Vec::new();
+        let mut steer = decoded(&logs[2])
+            .into_iter()
+            .find_map(|(_, _, f)| matches!(f.record, WalRecord::Steered { .. }).then_some(f.record))
+            .unwrap();
+        if let WalRecord::Steered { input, tags, .. } = &mut steer {
+            *input = std::sync::Arc::new(vec![broca_protocol::Message::new(
+                broca_protocol::Role::User,
+                vec![broca_protocol::ContentBlock::Text {
+                    text: "PRIVATE-HELD-STEER".into(),
+                }],
+            )]);
+            *tags = None;
+        }
+        let threshold = records
+            .iter()
+            .find_map(|(_, _, f)| match &f.record {
+                WalRecord::ModelStepFinished {
+                    assistant_message, ..
+                } if assistant_message.tool_calls().count() != 0 => {
+                    Some(assistant_message.tool_calls().count() as u64)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let mut planner = OffsetSeed::default();
+        let mut inserted_budget = false;
+        let mut run_id = None;
+        let mut seq = 0;
+        for (_, _, frame) in &records {
+            let mut record = frame.record.clone();
+            if let WalRecord::RunStarted {
+                config, run_id: id, ..
+            } = &mut record
+            {
+                run_id = Some(id.clone());
+                config.computed_tags = Some(broca_wal::ComputedTagRules { checkpoint: 0 });
+                config.render_tags = true;
+                config.budget = Some(broca_protocol::request::BudgetConfig {
+                    nudges: vec![broca_protocol::request::BudgetNudge {
+                        at_tool_calls: threshold,
+                        text: "PRIVATE-NUDGE".into(),
+                    }],
+                    finalize_text: "PRIVATE-FINALIZE".into(),
+                    ..Default::default()
+                });
+            }
+            let is_start = matches!(record, WalRecord::RunStarted { .. });
+            let is_batch = matches!(record, WalRecord::ToolBatchFinished { .. });
+            planner
+                .observe(
+                    &FramedRecord {
+                        seq,
+                        fence: 1,
+                        record: record.clone(),
+                    },
+                    0,
+                    1,
+                )
+                .unwrap();
+            budgeted.extend(encode(seq, 1, &record).unwrap());
+            seq += 1;
+            if is_start {
+                planner
+                    .observe(
+                        &FramedRecord {
+                            seq,
+                            fence: 1,
+                            record: steer.clone(),
+                        },
+                        0,
+                        1,
+                    )
+                    .unwrap();
+                budgeted.extend(encode(seq, 1, &steer).unwrap());
+                seq += 1;
+            }
+            if is_batch && !inserted_budget {
+                let record = WalRecord::BudgetFired {
+                    run_id: run_id.clone().unwrap(),
+                    kind: broca_protocol::request::BudgetKind::Nudge,
+                    threshold,
+                    ordinal: planner.head_ord(),
+                    caller_text: Some("PRIVATE-NUDGE".into()),
+                    tags: None,
+                };
+                planner
+                    .observe(
+                        &FramedRecord {
+                            seq,
+                            fence: 1,
+                            record: record.clone(),
+                        },
+                        0,
+                        1,
+                    )
+                    .unwrap();
+                budgeted.extend(encode(seq, 1, &record).unwrap());
+                seq += 1;
+                inserted_budget = true;
+            }
+        }
+        assert!(inserted_budget);
+        logs.push(budgeted);
+        logs
+    }
+
+    #[test]
+    fn incremental_rows_equal_rebuild_for_crash_cut_corpus_and_production_shaped_sample() {
+        for bytes in corpus() {
+            let bind = bind(&bytes);
+            let incremental = database();
+            let rebuilt = database();
+            for (_, end, _) in decoded(&bytes) {
+                let log = publication(&bind, &bytes[..end]);
+                let outcome = incremental.db.index(&log).unwrap();
+                rebuilt.db.rebuild_session(&log).unwrap();
+                assert_eq!(
+                    r_rows(&incremental.db),
+                    r_rows(&rebuilt.db),
+                    "at byte {end}"
+                );
+                let records: Vec<_> = decoded(&bytes[..end])
+                    .into_iter()
+                    .map(|(_, _, f)| f.record)
+                    .collect();
+                let replay = broca_core::replay(&records).unwrap();
+                assert_eq!(outcome.head_ord, replay.extent, "ordinal oracle at {end}");
+                let tags = incremental
+                    .db
+                    .read_snapshot(|tx| {
+                        let mut stmt = tx.prepare(
+                            "SELECT tag_base,tag_n,tag_high,flags FROM message ORDER BY ord",
+                        )?;
+                        let rows = stmt
+                            .query_map([], |r| {
+                                Ok((
+                                    r.get::<_, Option<u64>>(0)?,
+                                    r.get::<_, u64>(1)?,
+                                    r.get::<_, u64>(2)?,
+                                    r.get::<_, u32>(3)?,
+                                ))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        Ok(rows)
+                    })
+                    .unwrap();
+                assert_eq!(tags.len(), replay.prompt.len());
+                for (row, message) in tags.iter().zip(&replay.prompt) {
+                    assert_eq!(
+                        row.2,
+                        message.part_tags().map_or(0, |tags| tags.high()),
+                        "tag high at {end}"
+                    );
+                    if row.3 & 2 != 0 {
+                        assert_eq!(
+                            row.0,
+                            message
+                                .part_tags()
+                                .and_then(|tags| tags.computed)
+                                .map(|tags| tags.base)
+                        );
+                    }
+                }
+                incremental
+                    .db
+                    .read_snapshot(|tx| {
+                        let seed: String =
+                            tx.query_row("SELECT tail_seed FROM session", [], |r| r.get(0))?;
+                        for text in [
+                            "distinctive-private-input",
+                            "distinctive-private-title",
+                            "PRIVATE-NUDGE",
+                            "PRIVATE-FINALIZE",
+                            "PRIVATE-HELD-STEER",
+                        ] {
+                            assert!(!seed.contains(text), "index seed copied content: {text}");
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn index_self_check_rebuilds_on_shorter_log() {
+        let bytes = corpus().remove(0);
+        let bind = bind(&bytes);
+        let db = database();
+        db.db.index(&publication(&bind, &bytes)).unwrap();
+        let frames = decoded(&bytes);
+        let end = frames[frames.len() - 2].1;
+        let short = publication(&bind, &bytes[..end]);
+        assert!(db.db.index(&short).unwrap().rebuilt);
+        let expected = database();
+        expected.db.rebuild_session(&short).unwrap();
+        assert_eq!(r_rows(&db.db), r_rows(&expected.db));
+        let (off, _, last) = &frames[frames.len() - 2];
+        let mut rewritten = bytes[..*off].to_vec();
+        rewritten.extend(encode(last.seq, last.fence + 1, &last.record).unwrap());
+        assert!(
+            db.db
+                .index(&publication(&bind, &rewritten))
+                .unwrap()
+                .rebuilt,
+            "changed frame identity must rebuild even with the same seq"
+        );
+    }
+
+    #[test]
+    fn stale_undecodable_and_wrong_budget_seeds_rebuild() {
+        let bytes = corpus().remove(0);
+        let bind = bind(&bytes);
+        for invalid in ["[0,{}]", "not-json"] {
+            let db = database();
+            db.db.index(&publication(&bind, &bytes)).unwrap();
+            db.db
+                .authoritative_transaction(|tx| {
+                    tx.execute("UPDATE session SET tail_seed=?1", [invalid])?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(db.db.index(&publication(&bind, &bytes)).unwrap().rebuilt);
+        }
+        let mut seed = OffsetSeed::default();
+        let mut frame = decoded(&bytes)
+            .into_iter()
+            .find(|(_, _, f)| matches!(f.record, WalRecord::RunStarted { .. }))
+            .unwrap()
+            .2;
+        if let WalRecord::RunStarted { config, .. } = &mut frame.record {
+            config.budget = Some(broca_protocol::request::BudgetConfig {
+                nudges: vec![broca_protocol::request::BudgetNudge {
+                    at_tool_calls: 1,
+                    text: "PRIVATE-NUDGE".into(),
+                }],
+                finalize_text: "PRIVATE-FINALIZE".into(),
+                ..Default::default()
+            });
+        }
+        seed.observe(&frame, 0, 123).unwrap();
+        let encoded = seed.encode().unwrap();
+        assert!(!encoded.contains("PRIVATE-NUDGE"));
+        assert!(!encoded.contains("PRIVATE-FINALIZE"));
+        let budget = match &frame.record {
+            WalRecord::RunStarted { config, .. } => config.budget.clone(),
+            _ => unreachable!(),
+        };
+        assert!(OffsetSeed::decode(&encoded, budget).is_some());
+        assert!(OffsetSeed::decode(&encoded, None).is_none());
+    }
+
+    #[test]
+    fn rebuild_skips_authoritative() {
+        let db = database();
+        let tables = [
+            "log_reader",
+            "retention_job",
+            "withdrawal_debt",
+            "withdrawal_stop",
+            "compaction_view_receipt",
+            "bus_event_outbox",
+            "bus_event_ack",
+            "compaction_notice_outbox",
+            "classify_claim",
+        ];
+        db.db.authoritative_transaction(|tx| {
+            tx.execute("INSERT INTO log_reader VALUES ('reader',1,'declared')", [])?;
+            // Future owners define these state-machine schemas. Unknown tables
+            // must survive rebuild just as the already-owned log_reader does.
+            for table in &tables[1..] {
+                tx.execute_batch(&format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, payload BLOB NOT NULL); INSERT INTO {table} VALUES ('row',X'000102FF');"))?;
+            }
+            Ok(())
+        }).unwrap();
+        let before = rows(&db.db, &tables);
+        let bytes = corpus().remove(0);
+        let bind = bind(&bytes);
+        db.db.index(&publication(&bind, &bytes)).unwrap();
+        db.db.rebuild_session(&publication(&bind, &bytes)).unwrap();
+        db.db
+            .rebuild(
+                [publication(&bind, &bytes)],
+                &super::super::LedgerRows {
+                    condemned: &[],
+                    address_floors: &[],
+                },
+            )
+            .unwrap();
+        assert_eq!(before, rows(&db.db, &tables));
+    }
+
+    #[test]
+    fn index_commit_failure_preserves_both_rows_and_indexed_seq() {
+        let bytes = corpus().remove(0);
+        let bind = bind(&bytes);
+        let frames = decoded(&bytes);
+        let db = database();
+        db.db
+            .index(&publication(&bind, &bytes[..frames[0].1]))
+            .unwrap();
+        let before = r_rows(&db.db);
+        for (_, end, _) in &frames[1..] {
+            let result: Result<(), DbError> = db.db.transaction(false, |tx| {
+                index_in_tx(tx, &publication(&bind, &bytes[..*end]), false)?;
+                Err(DbError::Invalid(
+                    "injected failure immediately before COMMIT".into(),
+                ))
+            });
+            assert!(result.is_err());
+            assert_eq!(r_rows(&db.db), before);
+        }
+        let result: Result<(), DbError> = db.db.transaction(false, |tx| {
+            index_in_tx(tx, &publication(&bind, &bytes), true)?;
+            Err(DbError::Invalid(
+                "injected rebuild failure before COMMIT".into(),
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(r_rows(&db.db), before);
+    }
+
+    #[test]
+    fn synchronous_switches_before_each_transaction_and_errors_rollback() {
+        let db = database();
+        for full in [false, true, false, true, false] {
+            db.db
+                .transaction(full, |tx| {
+                    let mode: i64 = tx.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+                    assert_eq!(mode, if full { 2 } else { 1 });
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let bytes = corpus().remove(0);
+        let bind = bind(&bytes);
+        let before = r_rows(&db.db);
+        let error: Result<(), DbError> = db.db.transaction(false, |tx| {
+            index_in_tx(tx, &publication(&bind, &bytes), false)?;
+            Err(DbError::Invalid("abort before commit".into()))
+        });
+        assert!(error.is_err());
+        assert_eq!(before, r_rows(&db.db));
+        db.db.index(&publication(&bind, &bytes)).unwrap();
+        assert_ne!(before, r_rows(&db.db));
+    }
+
+    #[test]
+    fn refuses_legacy_roots_and_corrupt_or_newer_suffixes_without_mutation() {
+        let db = database();
+        std::fs::remove_file(db._scratch.0.join("state-format")).unwrap();
+        assert!(OverhaulDb::open(&db._scratch.0).is_err());
+        let mut bytes = corpus().remove(0);
+        let bind = bind(&bytes);
+        let frames = decoded(&bytes);
+        let end = frames[frames.len() - 2].1;
+        db.db.index(&publication(&bind, &bytes[..end])).unwrap();
+        let before = r_rows(&db.db);
+        *bytes.last_mut().unwrap() ^= 1;
+        assert!(db.db.index(&publication(&bind, &bytes)).is_err());
+        assert_eq!(before, r_rows(&db.db));
+        let last = &frames.last().unwrap().2;
+        let mut newer = bytes[..end].to_vec();
+        newer.extend(
+            broca_wal::framing::encode_with_requires(
+                last.seq,
+                last.fence,
+                &["unrecognized-index-feature/v1"],
+                &last.record,
+            )
+            .unwrap(),
+        );
+        let error = db.db.index(&publication(&bind, &newer)).unwrap_err();
+        assert!(error.to_string().contains("newer WAL writer"));
+        assert_eq!(before, r_rows(&db.db));
+        assert!(db
+            .db
+            .read_snapshot(|tx| {
+                tx.execute("DELETE FROM session", [])?;
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(before, r_rows(&db.db));
+    }
+}

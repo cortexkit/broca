@@ -41,7 +41,7 @@ pub enum PlacementAction {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Batch {
     id: Option<BatchId>,
     planned: Vec<ToolCallId>,
@@ -51,13 +51,16 @@ struct Batch {
 
 /// The next ordinal is absolute, including a materialized prefix not held in memory.
 /// A projection watermark never splits a held steer or an open tool batch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Changes to persisted Placement or Batch fields require bumping
+/// `projection_plan::OFFSET_SEED_VERSION`; incompatible index seeds are rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Placement {
     next: u64,
     steers: u64,
     assistant_held: bool,
     batch: Option<Batch>,
     run_id: Option<RunId>,
+    #[serde(skip)]
     budget_config: Option<BudgetConfig>,
     budget: BudgetReplayStateV1,
     import_start: Option<u64>,
@@ -71,6 +74,13 @@ impl Default for Placement {
 }
 
 impl Placement {
+    /// Rehydrate an index seed with the episode's independently verified frozen
+    /// config. Budget message text is deliberately absent from serialized seeds.
+    pub fn from_index_seed(mut seed: Self, budget_config: Option<BudgetConfig>) -> Self {
+        seed.budget_config = budget_config;
+        seed
+    }
+
     pub fn new(next: u64) -> Self {
         Self::seeded(next, None, None, BudgetReplayStateV1::default(), 0)
     }
