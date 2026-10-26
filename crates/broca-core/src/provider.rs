@@ -26,6 +26,12 @@ pub struct StepRuntime {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Exclusively acquire any in-memory connection retained for this full session bind.
+    fn bind_run_transport(&self, _session: &broca_protocol::BindIdentity) {}
+
+    /// Pin the freshly resolved credential record version before acquiring run transport.
+    fn set_credential_revision(&self, _revision: u64) {}
+
     async fn step_with_runtime(
         &self,
         step_id: StepId,
@@ -43,9 +49,14 @@ pub trait Provider: Send + Sync {
             }
         }
     }
-    /// Release run-local network state on completion, cancellation, graceful stop or task abort.
+    /// Retire network state on cancellation, graceful stop, task abort or another abnormal exit.
     /// The loop calls this even if a caller retains the provider for a later run.
     fn close_run_transport(&self) {}
+
+    /// Release transport after a durably completed run. Abnormal exits still close it.
+    fn complete_run_transport(&self) {
+        self.close_run_transport();
+    }
 
     /// Whether a strict schema compiler refusal permits this run's one non-strict resend.
     fn structured_output_grammar_rejection(&self, _error: &broca_protocol::ProviderError) -> bool {
@@ -200,6 +211,14 @@ pub trait Provider: Send + Sync {
 /// `run_loop` directly, without the loop needing to know the concrete type.
 #[async_trait]
 impl Provider for Box<dyn Provider> {
+    fn bind_run_transport(&self, session: &broca_protocol::BindIdentity) {
+        (**self).bind_run_transport(session);
+    }
+
+    fn set_credential_revision(&self, revision: u64) {
+        (**self).set_credential_revision(revision);
+    }
+
     async fn step_with_runtime(
         &self,
         step_id: StepId,
@@ -210,6 +229,10 @@ impl Provider for Box<dyn Provider> {
     }
     fn close_run_transport(&self) {
         (**self).close_run_transport();
+    }
+
+    fn complete_run_transport(&self) {
+        (**self).complete_run_transport();
     }
 
     fn structured_output_grammar_rejection(&self, error: &broca_protocol::ProviderError) -> bool {

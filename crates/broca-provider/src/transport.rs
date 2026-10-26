@@ -76,6 +76,8 @@ mod retention_tests;
 #[path = "transport_websocket.rs"]
 mod responses_websocket;
 
+pub use responses_websocket::Connections as ChatgptConnections;
+
 #[path = "transport_request_gzip.rs"]
 pub mod request_gzip;
 
@@ -97,6 +99,7 @@ pub struct ProviderHttpClient {
     /// `api.anthropic.com` only. Decodes gzip, deflate, brotli and zstd responses as they stream.
     decoding: reqwest::Client,
     request_gzip: request_gzip::RequestGzipPolicy,
+    chatgpt_connections: ChatgptConnections,
 }
 
 impl ProviderHttpClient {
@@ -117,6 +120,7 @@ impl ProviderHttpClient {
             identity: build(false),
             decoding: build(true),
             request_gzip,
+            chatgpt_connections: ChatgptConnections::default(),
         }
     }
 
@@ -140,6 +144,11 @@ impl ProviderHttpClient {
         &self.identity
     }
 
+    /// The executor-owned, full-session-bind socket owner; never serialized or global.
+    pub fn chatgpt_connections(&self) -> &ChatgptConnections {
+        &self.chatgpt_connections
+    }
+
     /// A client that sends `api.anthropic.com` to a local test server, with its own gzip latch.
     #[cfg(test)]
     fn resolving_anthropic_api_to(address: std::net::SocketAddr, gzip_enabled: bool) -> Self {
@@ -159,6 +168,7 @@ impl From<reqwest::Client> for ProviderHttpClient {
             identity: client.clone(),
             decoding: client,
             request_gzip: request_gzip::RequestGzipPolicy::isolated(false),
+            chatgpt_connections: ChatgptConnections::default(),
         }
     }
 }
@@ -182,6 +192,7 @@ pub struct LiveProvider<F: WireFamily + 'static> {
     /// the historical behavior: the 401 ends the step.
     pub(crate) refresher: Option<Arc<dyn CredentialRefresher>>,
     websocket: Arc<responses_websocket::Session>,
+    websocket_lease: std::sync::Mutex<Option<responses_websocket::Lease>>,
     #[cfg(test)]
     escape_client_builds: std::sync::Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-harness"))]
@@ -645,6 +656,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             frozen_account_ref: None,
             refresher: None,
             websocket: Arc::new(responses_websocket::Session::default()),
+            websocket_lease: std::sync::Mutex::new(None),
             #[cfg(test)]
             escape_client_builds: std::sync::Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-harness"))]
@@ -780,6 +792,24 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
 
 #[async_trait]
 impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
+    fn set_credential_revision(&self, revision: u64) {
+        self.auth.write().unwrap().revision = revision;
+    }
+
+    fn bind_run_transport(&self, session: &broca_protocol::BindIdentity) {
+        if self.frozen.family_id == crate::spec::WireFamilyId::OpenAiResponsesChatgpt
+            && self.frozen.chatgpt_wire.is_some()
+        {
+            let mut lease = self.websocket_lease.lock().unwrap();
+            if lease.is_none() {
+                *lease = self
+                    .client
+                    .chatgpt_connections
+                    .acquire(session, &self.websocket);
+            }
+        }
+    }
+
     fn reasoning_is_prefix_bound(&self) -> bool {
         self.frozen.family_id.thinking_is_prefix_bound()
     }
@@ -818,6 +848,14 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         )
     }
     fn close_run_transport(&self) {
+        self.websocket.close();
+        self.websocket_lease.lock().unwrap().take();
+    }
+
+    fn complete_run_transport(&self) {
+        if let Some(lease) = self.websocket_lease.lock().unwrap().take() {
+            lease.complete(&self.websocket);
+        }
         self.websocket.close();
     }
 

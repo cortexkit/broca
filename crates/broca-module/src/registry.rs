@@ -434,6 +434,9 @@ enum Entry {
 /// executor) so the admission concurrency is deterministically testable.
 #[async_trait]
 pub trait LineageOpener: Send + Sync {
+    fn retire_session_transport(&self, _session: &LineageKey) {}
+    fn retire_all_transports(&self) {}
+
     async fn media_profile(
         &self,
         _request: &broca_protocol::request::SubmissionRequest,
@@ -1103,9 +1106,10 @@ impl LineageRegistry {
                 let (busy, release) = wait
                     .await
                     .map_err(|_| OpenError::Open("actor closed during cut lock".into()))?;
-                guard.busy.push((key, busy));
+                guard.busy.push((key.clone(), busy));
                 guard.actors.push(release);
             }
+            self.inner.opener.retire_session_transport(&key);
         }
         Ok(guard)
     }
@@ -3776,6 +3780,7 @@ impl LineageRegistry {
             .await;
         }
         self.inner.seal.cancel();
+        self.inner.opener.retire_all_transports();
         loop {
             let counts = self.slot_counts();
             if counts.open + counts.opening + counts.closing == 0 {
@@ -4539,6 +4544,60 @@ mod tests {
         ) -> Result<ActorHandle, OpenError> {
             unreachable!("not used in this test")
         }
+    }
+
+    #[derive(Default)]
+    struct TransportOpener {
+        retired: Mutex<Vec<LineageKey>>,
+        shutdowns: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LineageOpener for TransportOpener {
+        fn retire_session_transport(&self, session: &LineageKey) {
+            self.retired.lock().unwrap().push(session.clone());
+        }
+
+        fn retire_all_transports(&self) {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn open(
+            &self,
+            _key: &LineageKey,
+            _gen: u64,
+            _registry: RegistryHandle,
+        ) -> Result<ActorHandle, OpenError> {
+            unreachable!("transport invalidation must not open an actor")
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_transport_move_and_deletion_invalidate_without_opening_actors() {
+        let opener = Arc::new(TransportOpener::default());
+        let registry = LineageRegistry::new(opener.clone());
+        let key = key();
+        let _guard = registry
+            .lock_move_sessions(std::slice::from_ref(&key), false)
+            .await
+            .unwrap();
+        registry.evict_retention_caches(&key);
+        assert_eq!(*opener.retired.lock().unwrap(), vec![key.clone(), key]);
+    }
+
+    #[tokio::test]
+    async fn retained_transport_shutdown_invalidates_even_without_open_actors() {
+        let opener = Arc::new(TransportOpener::default());
+        let registry = LineageRegistry::new(opener.clone());
+        assert!(
+            registry
+                .stop_and_seal_with_budget(
+                    std::time::Duration::ZERO,
+                    std::time::Duration::from_secs(1)
+                )
+                .await
+        );
+        assert_eq!(opener.shutdowns.load(Ordering::SeqCst), 1);
     }
 
     struct GaugeOpener {
@@ -5918,6 +5977,7 @@ impl LineageRegistry {
         }) {
             return;
         }
+        self.inner.opener.retire_session_transport(key);
         self.inner.read_proofs.lock().unwrap().remove(key);
         self.inner.dispatch_cache.lock().unwrap().remove(key);
         self.inner.frozen_senders.lock().unwrap().remove(key);

@@ -88,6 +88,14 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
     fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
         self.run_index.clone()
     }
+
+    fn retire_session_transport(&self, session: &LineageKey) {
+        self.executor.retire_session_transport(session);
+    }
+
+    fn retire_all_transports(&self) {
+        self.executor.retire_all_transports();
+    }
     async fn media_profile(
         &self,
         request: &broca_protocol::request::SubmissionRequest,

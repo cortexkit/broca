@@ -1500,13 +1500,24 @@ where
     #[cfg(feature = "test-clock")]
     let control = &test_control;
     // A guard also covers unwind and task abort, where an async cleanup call cannot run.
-    struct RunTransportGuard<'a, P: Provider>(&'a P);
+    struct RunTransportGuard<'a, P: Provider> {
+        provider: &'a P,
+        completed: bool,
+    }
     impl<P: Provider> Drop for RunTransportGuard<'_, P> {
         fn drop(&mut self) {
-            self.0.close_run_transport();
+            if self.completed {
+                self.provider.complete_run_transport();
+            } else {
+                self.provider.close_run_transport();
+            }
         }
     }
-    let _transport_guard = RunTransportGuard(provider);
+    let mut transport_guard = RunTransportGuard {
+        provider,
+        completed: false,
+    };
+    provider.bind_run_transport(&req.session);
     // If the run can't even reconstruct its resume state (a WAL read / replay failure
     // BEFORE any RunStarted barrier), the run never durably admits — fire the
     // admission-ack with the error so the coordinator replies an error, not a ghost
@@ -1595,7 +1606,7 @@ where
     // RunPaused) is durable before the terminal is observable. The writer is NOT shut down
     // here; that's the caller's lifecycle decision (per-run wrapper shuts it down, the
     // coordinator keeps it live for the next episode).
-    run_body_with_projector(
+    let result = run_body_with_projector(
         req,
         prior,
         last_input,
@@ -1613,7 +1624,11 @@ where
         on_admitted,
         approval_frames,
     )
-    .await
+    .await;
+    transport_guard.completed = result.as_ref().is_ok_and(|summary| {
+        summary.reason == RunFinishReason::Completed && summary.paused.is_none()
+    });
+    result
 }
 
 type ReconstructedPrior = (

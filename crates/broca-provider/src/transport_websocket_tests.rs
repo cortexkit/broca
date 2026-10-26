@@ -1073,7 +1073,16 @@ async fn codex_tool_run(
         1,
         "one actual tool handler invocation"
     );
-    mock.wait_closes(1).await;
+    let retired_before_completion = expected_handshakes - 1;
+    if retired_before_completion > 0 {
+        mock.wait_closes(retired_before_completion).await;
+    }
+    assert_eq!(
+        mock.observed.lock().unwrap().closes,
+        retired_before_completion
+    );
+    provider.client.chatgpt_connections().retire_session(&bind);
+    mock.wait_closes(expected_handshakes).await;
     let records = wal.read_records(&bind).unwrap();
     assert_eq!(
         records
@@ -3313,3 +3322,6 @@ async fn websocket_wrapped_refusal_warn_carries_the_capped_frame() {
     assert_eq!(logged.len(), 1024);
     assert!(!logged.contains("PRIVATE-HEADER-VALUE"), "{logged}");
 }
+
+#[path = "transport_websocket_cross_run_tests.rs"]
+mod cross_run;

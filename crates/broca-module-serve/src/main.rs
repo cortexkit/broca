@@ -3703,12 +3703,20 @@ mod executor {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    self.provider_client
+                        .chatgpt_connections()
+                        .retire_session(&job.req.session);
                     if let Some(ack) = job.on_admitted {
                         let _ = ack.send(Err(e.clone()));
                     }
                     return Err(e);
                 }
             };
+            if resolution.pause.is_some() || resolution.method != Some(AuthMethod::Chatgpt) {
+                self.provider_client
+                    .chatgpt_connections()
+                    .retire_session(&job.req.session);
+            }
             // Public sends enter as FreshOrResume because the wire cannot know whether the
             // credential has been repaired. Once auth succeeds, mark the core attempt as
             // auth-resolved so an AuthRequired replay continues; core ignores that signal for
@@ -3978,6 +3986,10 @@ mod executor {
                 }
             };
 
+            if let Some(revision) = resolution.record_version {
+                resolved.provider.set_credential_revision(revision);
+            }
+
             // (provider, auth-method) CONSISTENCY GUARD: a method that IMPLIES a wire family
             // (the wire-changing methods) must match the family the provider actually
             // resolved — else a frozen mismatch (e.g. a code-assist token against the plain
@@ -4196,6 +4208,9 @@ mod executor {
                     post_run_wire_auth_status(&summary, self.wal_store.clone(), session.clone())
                         .await
                 {
+                    self.provider_client
+                        .chatgpt_connections()
+                        .retire_session(&session);
                     report_rejection_after_run(
                         vault,
                         &cred_id,
@@ -4217,6 +4232,7 @@ mod executor {
         }
 
         async fn on_session_close(&self, session: &BindIdentity) {
+            self.retire_session_transport(session);
             // Retire this session's tool and role routes on their shared consumer connections.
             self.plane.close_session_routes(session).await;
             if let Some(hooks) = &self.hooks {
@@ -4225,6 +4241,16 @@ mod executor {
             if let Some(plane) = &self.compaction_plane {
                 plane.close_session_routes(session).await;
             }
+        }
+
+        fn retire_session_transport(&self, session: &BindIdentity) {
+            self.provider_client
+                .chatgpt_connections()
+                .retire_session(session);
+        }
+
+        fn retire_all_transports(&self) {
+            self.provider_client.chatgpt_connections().clear();
         }
     }
 
