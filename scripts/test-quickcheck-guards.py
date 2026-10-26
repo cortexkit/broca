@@ -98,7 +98,7 @@ class QuickcheckGuards(unittest.TestCase):
                     raise AssertionError(f"{GUARDS}:{line_number}: {symbol} is no longer a test")
             cls.entries.append((package, target, filter_name, features, source_name, symbol))
         required = {
-            ("broca-module", "it", "every_open_failed_site_chooses_a_class"),
+            ("broca-module", "it", "default_refusals_carry_their_retry_class"),
             ("broca-module-serve", "it", "wal_known_features_prints_the_sorted_table_and_nothing_else"),
             ("broca-module-serve", "launch_nonce", "no_shipped_code_reads_a_launch_nonce_variable_directly"),
             ("broca-module-serve", "it", "every_broca_spawn_site_pins_its_state_root"),

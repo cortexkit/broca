@@ -1,6 +1,6 @@
 # package|cargo-test-target|test-filter|features|source-file|test-function|reason
-# Inventories every ServeError::Open construction and its explicit error class.
-broca-module|it|open_failed_classes::|broca-module/test-clock|crates/broca-module/tests/it/open_failed_classes.rs|every_open_failed_site_chooses_a_class|Keeps the open-error classification inventory synchronized with serve.rs.
+# Pins the retry class each default ServeHandler refusal carries.
+broca-module|it|open_failed_classes::|broca-module/test-clock|crates/broca-module/tests/it/open_failed_classes.rs|default_refusals_carry_their_retry_class|Keeps the default refusals' error classes pinned when serve.rs changes.
 # Pins the sorted WAL feature names exposed by the daemon's read-only probe.
 broca-module-serve|it|wal_known_features::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/wal_known_features.rs|wal_known_features_prints_the_sorted_table_and_nothing_else|Protects the known-feature table used by placement tooling.
 # Admission read-budget and credential-source regressions run in ck-broca's bin tests above.
