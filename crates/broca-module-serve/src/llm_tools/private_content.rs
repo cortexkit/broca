@@ -86,11 +86,6 @@ impl ScopeIdentity {
                 }),
         })
     }
-
-    /// The daemon's owner principal, for the questions that name an owner.
-    fn owner_principal(&self) -> Principal {
-        owner_principal(&self.owner)
-    }
 }
 
 /// The daemon principal a frozen scope names, from the stamp's owner spelling
@@ -124,7 +119,6 @@ pub trait Asks: Send + Sync {
     /// Cerebellum's union of the scope and linked parent's marks, or `None` if unanswered.
     async fn marked(
         &self,
-        owner: Principal,
         scope_ref: &str,
         parent_scope_ref: Option<&str>,
     ) -> Option<broca_subc::PrivateContent>;
@@ -132,7 +126,6 @@ pub trait Asks: Send + Sync {
     /// Basal's answer for the flow's approved version, or why there is none.
     async fn flow_providers(
         &self,
-        owner: Principal,
         flow_id: &str,
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError>;
 }
@@ -159,13 +152,12 @@ impl SubcAsks {
 impl Asks for SubcAsks {
     async fn marked(
         &self,
-        owner: Principal,
         scope_ref: &str,
         parent_scope_ref: Option<&str>,
     ) -> Option<broca_subc::PrivateContent> {
         match self
             .private_content
-            .query(&owner, scope_ref, parent_scope_ref)
+            .query(scope_ref, parent_scope_ref)
             .await
         {
             Ok(answer) => Some(answer),
@@ -181,10 +173,9 @@ impl Asks for SubcAsks {
 
     async fn flow_providers(
         &self,
-        owner: Principal,
         flow_id: &str,
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
-        self.flow_providers.query(&owner, flow_id).await
+        self.flow_providers.query(flow_id).await
     }
 }
 
@@ -210,7 +201,7 @@ pub(super) struct PrivateContent {
     config: LlmToolsConfig,
     asks: Arc<dyn Asks>,
     marked: Mutex<BTreeMap<ScopeIdentity, MarkedScope>>,
-    flows: Mutex<BTreeMap<ScopeIdentity, Vec<String>>>,
+    flows: Mutex<BTreeMap<ScopeIdentity, broca_subc::ApprovedFlowProviders>>,
 }
 
 impl PrivateContent {
@@ -290,38 +281,42 @@ impl PrivateContent {
         provider: &str,
     ) -> Result<(), Vec<u8>> {
         let allowed = match self.cached_flow(identity) {
-            Some(allowed) => allowed,
-            None => match self
-                .asks
-                .flow_providers(identity.owner_principal(), flow_id)
-                .await
-            {
-                Ok(broca_subc::FlowPolicy::Allowed(providers)) => {
+            Some(allowed) => Some(allowed),
+            None => match self.asks.flow_providers(flow_id).await {
+                Ok(broca_subc::FlowPolicy::Allowed(approved)) => {
                     self.flows
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .insert(identity.clone(), providers.clone());
-                    providers
+                        .insert(identity.clone(), approved.clone());
+                    Some(approved)
                 }
                 // Basal's refusal is the call's refusal. Nothing is written and nothing is
                 // cached: a flow's approved version can change, and only a new question sees it.
                 Ok(broca_subc::FlowPolicy::NotApproved { message }) => {
+                    tracing::warn!(target: "llm_tools", flow = flow_id,
+                        code = broca_subc::flow_providers::FLOW_NOT_APPROVED,
+                        "flow has no approved version; the flow may call the base set only");
                     return Err(encoded_refusal(
                         broca_subc::flow_providers::FLOW_NOT_APPROVED,
                         message,
                         None,
-                    ))
+                    ));
                 }
                 // No Basal, no such operation, or no answer: the base set only, not cached.
                 Err(error) => {
-                    tracing::info!(target: "llm_tools", flow = flow_id,
+                    tracing::warn!(target: "llm_tools", flow = flow_id,
+                        code = error.code().unwrap_or("unavailable"),
                         "flow providers unavailable ({error}); the flow may call the base set only");
-                    Vec::new()
+                    None
                 }
             },
         };
-        if allowed.iter().any(|listed| listed == provider) {
-            return Ok(());
+        if let Some(approved) = allowed {
+            tracing::info!(target: "llm_tools", flow = flow_id, version = approved.version,
+                code_hash = %approved.code_hash, "using the flow's approved provider policy");
+            if approved.providers.iter().any(|listed| listed == provider) {
+                return Ok(());
+            }
         }
         // A flow broca asked about is one cerebellum may have marked. An unmarked flow may call
         // any provider; Basal's list adds providers to the base set for a marked one.
@@ -348,7 +343,6 @@ impl PrivateContent {
             // Cerebellum deliberately keys marks by ref alone across owners and epochs. The
             // daemon-attested full parent remains in our cache key, but its ref is the query API.
             .marked(
-                identity.owner_principal(),
                 &identity.scope_ref,
                 identity
                     .parent
@@ -403,7 +397,7 @@ impl PrivateContent {
             .cloned()
     }
 
-    fn cached_flow(&self, identity: &ScopeIdentity) -> Option<Vec<String>> {
+    fn cached_flow(&self, identity: &ScopeIdentity) -> Option<broca_subc::ApprovedFlowProviders> {
         self.flows
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -503,7 +497,6 @@ mod tests {
     impl Asks for Stub {
         async fn marked(
             &self,
-            _owner: Principal,
             _scope_ref: &str,
             _parent_scope_ref: Option<&str>,
         ) -> Option<broca_subc::PrivateContent> {
@@ -516,7 +509,6 @@ mod tests {
 
         async fn flow_providers(
             &self,
-            _owner: Principal,
             _flow_id: &str,
         ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
             self.flow_asks.fetch_add(1, Ordering::SeqCst);
@@ -744,13 +736,21 @@ mod tests {
     #[tokio::test]
     async fn an_unmarked_flow_unknown_to_basal_is_served() {
         let stub = Stub::answering(broca_subc::PrivateContent::unmarked())
-            .answering_flows(broca_subc::FlowPolicy::Allowed(Vec::new()));
+            .answering_flows(approved_providers(Vec::new()));
         let policy = policy(listed(), stub.clone());
         admitted(policy.admit(&flow(1), "cloudflare-workers-ai").await);
         // Basal is asked once for the life of the flow's scope identity, and an unmarked flow
         // may then call a provider Basal never named.
         admitted(policy.admit(&flow(1), "typesafe").await);
         assert_eq!(stub.flow_asks.load(Ordering::SeqCst), 1);
+    }
+
+    fn approved_providers(providers: Vec<String>) -> broca_subc::FlowPolicy {
+        broca_subc::FlowPolicy::Allowed(broca_subc::ApprovedFlowProviders {
+            version: 7,
+            code_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            providers,
+        })
     }
 
     #[tokio::test]
@@ -761,11 +761,17 @@ mod tests {
             },
         );
         let policy = policy(listed(), stub.clone());
+        let logs = broca_test_support::LogCapture::new();
         for _ in 0..2 {
-            let error = refused(policy.admit(&flow(1), "typesafe").await);
+            let error = refused(logs.scope_future(policy.admit(&flow(1), "typesafe")).await);
             assert_eq!(error["code"], "flow_not_approved");
         }
         assert_eq!(stub.flow_asks.load(Ordering::SeqCst), 2);
+        assert!(logs
+            .events()
+            .iter()
+            .any(|event| event.level == tracing::Level::WARN
+                && event.fields.get("code").map(String::as_str) == Some("flow_not_approved")));
     }
 
     #[tokio::test]
@@ -784,9 +790,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_marked_flow_calls_the_base_set_and_basals_list() {
-        let stub = Stub::answering(marked(&["person_browser"])).answering_flows(
-            broca_subc::FlowPolicy::Allowed(vec!["cloudflare-workers-ai".into()]),
-        );
+        let stub = Stub::answering(marked(&["person_browser"]))
+            .answering_flows(approved_providers(vec!["cloudflare-workers-ai".into()]));
         let policy = policy(listed(), stub.clone());
         admitted(policy.admit(&flow(1), "anthropic").await);
         admitted(policy.admit(&flow(1), "cloudflare-workers-ai").await);
@@ -794,5 +799,84 @@ mod tests {
         assert_eq!(error["code"], "provider_not_allowed");
         // Basal is asked once for the life of the flow's scope identity.
         assert_eq!(stub.flow_asks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn approved_flow_metadata_is_logged_on_fresh_and_cached_use() {
+        let stub = Stub::answering(marked(&["person_browser"]))
+            .answering_flows(approved_providers(vec!["typesafe".into()]));
+        let policy = policy(listed(), stub.clone());
+        let logs = broca_test_support::LogCapture::new();
+        logs.scope_future(async {
+            admitted(policy.admit(&flow(1), "typesafe").await);
+            admitted(policy.admit(&flow(1), "typesafe").await);
+        })
+        .await;
+        assert_eq!(stub.flow_asks.load(Ordering::SeqCst), 1);
+        let events: Vec<_> = logs
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.target == "llm_tools"
+                    && event.level == tracing::Level::INFO
+                    && event.message() == "using the flow's approved provider policy"
+            })
+            .collect();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(event.fields["version"], "7");
+            assert_eq!(
+                event.fields["code_hash"],
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_approved_flow_providers_add_nothing_to_the_base_set() {
+        let stub = Stub::answering(marked(&["person_browser"]))
+            .answering_flows(approved_providers(vec![]));
+        let policy = policy(listed(), stub.clone());
+        admitted(policy.admit(&flow(1), "anthropic").await);
+        assert_eq!(stub.flow_asks.load(Ordering::SeqCst), 0);
+        for _ in 0..2 {
+            assert_eq!(
+                refused(policy.admit(&flow(1), "typesafe").await)["code"],
+                "provider_not_allowed"
+            );
+        }
+        assert_eq!(stub.flow_asks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn permanent_and_transient_basal_refusals_warn_and_never_expand_the_base_set() {
+        for code in [
+            "not_permitted",
+            "invalid_params",
+            "module_warming",
+            "storage_unavailable",
+        ] {
+            let stub = Stub::answering(marked(&["person_browser"]));
+            *stub.flow.lock().unwrap() = Some(Err(broca_subc::FlowProvidersError::Refused {
+                code: code.into(),
+                message: "Basal refused the lookup".into(),
+                detail: None,
+            }));
+            let policy = policy(listed(), stub.clone());
+            admitted(policy.admit(&flow(1), "anthropic").await);
+            assert_eq!(stub.flow_asks.load(Ordering::SeqCst), 0);
+            let logs = broca_test_support::LogCapture::new();
+            for _ in 0..2 {
+                let error = logs.scope_future(policy.admit(&flow(1), "typesafe")).await;
+                assert_eq!(refused(error)["code"], "provider_not_allowed");
+            }
+            assert_eq!(stub.flow_asks.load(Ordering::SeqCst), 2);
+            assert!(policy.flows.lock().unwrap().is_empty());
+            assert!(logs
+                .events()
+                .iter()
+                .any(|event| event.level == tracing::Level::WARN
+                    && event.fields.get("code").map(String::as_str) == Some(code)));
+        }
     }
 }

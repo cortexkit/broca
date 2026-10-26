@@ -270,7 +270,10 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
     let scopes = root.join("scopes.json");
     std::fs::write(&scopes, json!([{"ref":"run","scope_epoch":1,"kind":"head","attributes":{"agent_id":"example-agent","run_id":"run"},"carriers":[{"principal":{"kind":"reserved","module_id":"broca"}}]}]).to_string()).unwrap();
     let fixtures = root.join("cerebellum.json");
-    std::fs::write(&fixtures, json!([{"match":{"method":"private_content.query"},"stdout":"{\"private_content\":true,\"sources\":[\"person_browser\"]}"}]).to_string()).unwrap();
+    // Cerebellum fbcc6766, crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json.
+    // Whole-file SHA-256 (provenance only, not body bytes):
+    // eb4c452cadd0b5d48e8855db366c599c3dcccb3408da1ea403fa5d8703032d1c.
+    std::fs::write(&fixtures, json!([{"match":{"method":"private_content.query"},"stdout":"{\"private_content\":true,\"sources\":[\"signed_in_site\"]}"}]).to_string()).unwrap();
     let handoff = root.join("cerebellum.sh");
     std::fs::write(&handoff, format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --subc) export SUBC_CONNECTION=\"$2\"; shift 2;; *) shift;; esac; done\nexec '{}' --module-id cerebellum --SURFACE_FIXTURES={} --SURFACE_REQUESTS={}\n", surface.display(), hex_path(&fixtures), hex_path(&root.join("queries")))).unwrap();
     use std::os::unix::fs::PermissionsExt;

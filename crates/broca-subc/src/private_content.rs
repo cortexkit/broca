@@ -19,9 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broca_protocol::BindIdentity;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use subc_protocol::Principal;
 
 use crate::connection::{ConnError, RouteOpenRetry, SubcConnection};
 
@@ -144,13 +143,12 @@ impl From<ConnError> for PrivateContentError {
     }
 }
 
-/// The published answer: `private_content`, plus `sources`, which may be omitted and then
-/// decodes as an empty list.
+/// The bare answer on cerebellum's management surface.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Answer {
     private_content: bool,
-    sources: Option<Vec<String>>,
+    sources: Vec<String>,
 }
 
 /// Asks cerebellum one `private_content.query`.
@@ -164,14 +162,13 @@ impl PrivateContentClient {
         Self { conn, identity }
     }
 
-    /// Ask whether the scope `owner`/`scope_ref` read the person's private content.
+    /// Ask whether `scope_ref` read the person's private content.
     ///
     /// `parent_scope_ref` is sent only when the caller has one: a program run whose head read
     /// the person's Chrome pastes that content into itself, so cerebellum unions the head's
     /// marks into the run's answer. A flow has no parent and omits it.
     pub async fn query(
         &self,
-        owner: &Principal,
         scope_ref: &str,
         parent_scope_ref: Option<&str>,
     ) -> Result<PrivateContent, PrivateContentError> {
@@ -188,11 +185,8 @@ impl PrivateContentClient {
             .map_err(|error| PrivateContentError::Route(error.to_string()))?;
         // Close the route once the question is answered or timed out. A cancelled question
         // relies on the connection ending, since this code never reaches the close.
-        let body = serde_json::to_vec(&json!({
-            "method": PRIVATE_CONTENT_QUERY,
-            "params": request_params(owner, scope_ref, parent_scope_ref),
-        }))
-        .map_err(|error| PrivateContentError::Protocol(error.to_string()));
+        let body = request_body(scope_ref, parent_scope_ref)
+            .map_err(|error| PrivateContentError::Protocol(error.to_string()));
         let reply = match body {
             Ok(body) => match tokio::time::timeout(
                 QUERY_TIMEOUT,
@@ -212,14 +206,31 @@ impl PrivateContentClient {
     }
 }
 
-fn request_params(owner: &Principal, scope_ref: &str, parent_scope_ref: Option<&str>) -> Value {
-    // `owner` is the daemon's scope identity, in the same shape `scope.describe` takes, so the
-    // receiving module never has to parse a display string broca invented.
-    let mut params = json!({"owner": owner, "scope_ref": scope_ref});
-    if let Some(parent) = parent_scope_ref {
-        params["parent_scope_ref"] = json!(parent);
+fn request_body(
+    scope_ref: &str,
+    parent_scope_ref: Option<&str>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    // Cerebellum's private-content-query-v1 contract puts method before params; within params,
+    // scope_ref precedes the parent ref, when present (`parent_scope_ref`). Struct serialization
+    // preserves that order; a JSON map sorts parent_scope_ref before scope_ref instead.
+    #[derive(Serialize)]
+    struct Params<'a> {
+        scope_ref: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_scope_ref: Option<&'a str>,
     }
-    params
+    #[derive(Serialize)]
+    struct Request<'a> {
+        method: &'static str,
+        params: Params<'a>,
+    }
+    serde_json::to_vec(&Request {
+        method: PRIVATE_CONTENT_QUERY,
+        params: Params {
+            scope_ref,
+            parent_scope_ref,
+        },
+    })
 }
 
 fn decode(
@@ -236,17 +247,38 @@ fn decode(
         }
         Err(error) => return Err(PrivateContentError::from(error)),
     };
-    #[derive(Deserialize)]
-    struct Envelope {
-        result: Answer,
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        PrivateContentError::Protocol("invalid JSON; top-level keys unavailable".into())
+    })?;
+    if let Some(outcome) = value.get("outcome") {
+        // Refusal bodies can carry context and session data. Keep only diagnostic tokens,
+        // since this error is printed in a warning rather than returned as private content.
+        let detail = value.get("detail").map(|detail| {
+            let mut safe = serde_json::Map::new();
+            for key in ["reason_code", "field"] {
+                if let Some(token) = detail.get(key).and_then(Value::as_str) {
+                    safe.insert(key.into(), json!(token));
+                }
+            }
+            Value::Object(safe)
+        });
+        return Err(PrivateContentError::Refused {
+            code: outcome.as_str().unwrap_or("unknown_outcome").into(),
+            message: "request refused".into(),
+            detail,
+        });
     }
-    let Envelope { result } = serde_json::from_slice::<Envelope>(&bytes)
-        .map_err(|error| PrivateContentError::Protocol(error.to_string()))?;
+    let keys = value
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>());
+    let result: Answer = serde_json::from_value(value).map_err(|_| {
+        PrivateContentError::Protocol(format!("unexpected reply shape; top-level keys: {keys:?}"))
+    })?;
     Ok(PrivateContent {
         marked: result.private_content,
+        // Preserve Cerebellum's source order, rather than sorting token names alphabetically.
         sources: result
             .sources
-            .unwrap_or_default()
             .iter()
             .map(|token| SourceKind::from_wire(token))
             .collect(),
@@ -257,31 +289,54 @@ fn decode(
 mod tests {
     use super::*;
 
+    // Cerebellum fbcc6766, docs/contracts/private-content-query-v1.md.
+    // These are reply bodies from the vectors below. Hashes identify the whole golden-file
+    // documents for provenance only, not the body bytes:
+    // crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json
+    // whole-file SHA-256 eb4c452cadd0b5d48e8855db366c599c3dcccb3408da1ea403fa5d8703032d1c
+    // crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json
+    // whole-file SHA-256 e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2
+    // crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json
+    // whole-file SHA-256 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc
+    const CEREBELLUM_MARKED: &[u8] = br#"{"private_content":true,"sources":["signed_in_site"]}"#;
+    const CEREBELLUM_UNMARKED: &[u8] = br#"{"private_content":false,"sources":[]}"#;
+    const CEREBELLUM_REFUSAL: &[u8] = br#"{"context":null,"detail":{"field":"owner","reason_code":"unknown_field"},"outcome":"invalid_request","session":null}"#;
+
     #[test]
-    fn query_request_omits_a_parent_it_was_not_given() {
-        let owner = Principal::Reserved {
-            module_id: "owner".into(),
-        };
-        let run = request_params(&owner, "run", None);
+    fn cerebellum_bare_success_fixtures_decode() {
+        assert_eq!(CEREBELLUM_MARKED.len(), 53);
+        assert_eq!(CEREBELLUM_UNMARKED.len(), 38);
+        let marked = decode(Ok(Ok(CEREBELLUM_MARKED.to_vec()))).unwrap();
+        assert!(marked.marked);
+        assert_eq!(marked.sources, vec![SourceKind::SignedInSite]);
         assert_eq!(
-            run,
-            json!({"owner":{"kind":"reserved","module_id":"owner"},"scope_ref":"run"})
+            decode(Ok(Ok(CEREBELLUM_UNMARKED.to_vec()))).unwrap(),
+            PrivateContent::unmarked()
         );
-        let program = request_params(&owner, "program", Some("head"));
+    }
+
+    #[test]
+    fn query_request_bytes_follow_cerebellums_contract() {
+        assert_eq!(request_body("test-session", None).unwrap().len(), 72);
+        assert_eq!(request_body("unmarked-scope", None).unwrap().len(), 74);
         assert_eq!(
-            program,
-            json!({
-                "owner":{"kind":"reserved","module_id":"owner"},
-                "scope_ref":"program",
-                "parent_scope_ref":"head"
-            })
+            request_body("test-session", None).unwrap(),
+            br#"{"method":"private_content.query","params":{"scope_ref":"test-session"}}"#
+        );
+        assert_eq!(
+            request_body("unmarked-scope", None).unwrap(),
+            br#"{"method":"private_content.query","params":{"scope_ref":"unmarked-scope"}}"#
+        );
+        assert_eq!(
+            request_body("program", Some("head")).unwrap(),
+            br#"{"method":"private_content.query","params":{"scope_ref":"program","parent_scope_ref":"head"}}"#
         );
     }
 
     #[test]
     fn answers_decode_marks_and_keep_unknown_sources() {
         let answer = decode(Ok(Ok(serde_json::to_vec(&json!({
-            "result": {"private_content": true, "sources": ["person_browser", "future_kind"]}
+            "private_content": true, "sources": ["person_browser", "desktop_app", "signed_in_site", "future_kind"]
         }))
         .unwrap())))
         .unwrap();
@@ -290,15 +345,42 @@ mod tests {
             answer.sources,
             vec![
                 SourceKind::PersonBrowser,
+                SourceKind::DesktopApp,
+                SourceKind::SignedInSite,
                 SourceKind::Other("future_kind".into())
             ]
         );
-        let unmarked = decode(Ok(Ok(serde_json::to_vec(&json!({
-            "result": {"private_content": false}
-        }))
-        .unwrap())))
-        .unwrap();
-        assert_eq!(unmarked, PrivateContent::unmarked());
+    }
+
+    #[test]
+    fn cerebellum_refusal_names_only_diagnostic_tokens() {
+        assert_eq!(CEREBELLUM_REFUSAL.len(), 116);
+        let error = decode(Ok(Ok(CEREBELLUM_REFUSAL.to_vec()))).unwrap_err();
+        assert_eq!(error.code(), Some("invalid_request"));
+        assert!(error.to_string().contains("unknown_field"));
+        assert!(error.to_string().contains("owner"));
+        let error = decode(Ok(Ok(br#"{"outcome":"invalid_request","context":"PRIVATE_CONTEXT","session":"PRIVATE_SESSION","detail":{"field":"scope_ref","message":"PRIVATE_DETAIL"}}"#.to_vec()))).unwrap_err();
+        assert!(error.to_string().contains("scope_ref"));
+        assert!(!error.to_string().contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn protocol_errors_name_keys_without_values() {
+        for bytes in [
+            br#"{"result":{"private_content":false},"secret":"PRIVATE_VALUE"}"#.as_slice(),
+            br#"{"private_content":"PRIVATE_VALUE","sources":[]}"#,
+            br#"{"private_content":false}"#,
+            br#"["PRIVATE_VALUE"]"#,
+            b"not JSON PRIVATE_VALUE",
+        ] {
+            let error = decode(Ok(Ok(bytes.to_vec()))).unwrap_err();
+            assert!(matches!(error, PrivateContentError::Protocol(_)));
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("top-level keys"));
+            assert!(!diagnostic.contains("PRIVATE_VALUE"));
+        }
+        let error = decode(Ok(Ok(br#"{"unexpected":"PRIVATE_VALUE"}"#.to_vec()))).unwrap_err();
+        assert!(error.to_string().contains("unexpected"));
     }
 
     #[test]
