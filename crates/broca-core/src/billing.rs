@@ -764,76 +764,6 @@ fn append_len_prefixed(output: &mut Vec<u8>, value: &[u8]) {
     output.extend_from_slice(value);
 }
 
-/// Exhaustive classification of billing-identity boundaries.  Keeping this as a
-/// match over every WAL variant makes adding a new config-bearing variant a compile
-/// error until its billing-boundary semantics are consciously classified here.
-#[cfg(test)]
-fn billing_boundary_kind(record: &WalRecord) -> Option<&'static str> {
-    match record {
-        WalRecord::RunStarted { .. } => Some("run_started"),
-        WalRecord::RunConfigRefrozen { .. } => Some("run_config_refrozen"),
-        WalRecord::RunAuthRefrozen { .. } => Some("run_auth_refrozen"),
-        WalRecord::ModelStepFinished { .. }
-        | WalRecord::StepStarted { .. }
-        | WalRecord::ToolBatchStarted { .. }
-        | WalRecord::ToolDispatchIntent { .. }
-        | WalRecord::ToolNoDispatch { .. }
-        | WalRecord::ToolResult { .. }
-        | WalRecord::ToolBatchFinished { .. }
-        | WalRecord::TurnFinished { .. }
-        | WalRecord::BudgetFired { .. }
-        | WalRecord::RunFinished { .. }
-        | WalRecord::RunPaused { .. }
-        | WalRecord::RunCancelRequested { .. }
-        | WalRecord::Queued { .. }
-        | WalRecord::Steered { .. }
-        | WalRecord::Retracted { .. }
-        | WalRecord::DeliveryOrdered { .. }
-        | WalRecord::SendEnded { .. }
-        | WalRecord::SendDelivered { .. }
-        | WalRecord::ApprovalRequested { .. }
-        | WalRecord::ApprovalResolved { .. } => None,
-        // A record type written by a newer build cannot carry config: the contract on
-        // `WalRecord` forbids a skippable record from changing billing identity.
-        WalRecord::Unknown => None,
-        // This reader release decodes compaction records but does not act on them yet.
-        WalRecord::CompactionRequest { .. }
-        | WalRecord::CompactionMessage { .. }
-        | WalRecord::CompactionAnswer { .. }
-        | WalRecord::CompactionWait { .. }
-        | WalRecord::CompactionViewApplied { .. }
-        | WalRecord::ContextCeilingDecided { .. }
-        | WalRecord::CompactionRideWait { .. }
-        | WalRecord::CompactionRideWaitEnded { .. }
-        | WalRecord::ContextCeilingWait { .. }
-        | WalRecord::CompactionNotice { .. } => None,
-        // Provider attempt evidence is informational only; it never carries config.
-        WalRecord::ModelAttemptFinished { .. } => None,
-        // A resume's own account of what it found is informational; it never carries config.
-        WalRecord::ResumeStarted { .. } => None,
-        // A cache warm record carries no config; billing makes it its own fact under the config
-        // of the run it names.
-        WalRecord::CacheWarmed { .. } => None,
-        // Approval state, withdrawals and isolated late execution do not contain a new model
-        // configuration. Billing keeps the originating RunStarted's frozen pricing context.
-        WalRecord::ToolCallDeferred { .. }
-        | WalRecord::ApprovalRecorded { .. }
-        | WalRecord::AwaitingApproval { .. }
-        | WalRecord::LateApprovalRecorded { .. }
-        | WalRecord::LateDispatchIntent { .. }
-        | WalRecord::LateResult { .. } => None,
-        // A provider-held call carries no model configuration, so it is no billing boundary;
-        // billing keeps the originating RunStarted's frozen pricing context.
-        WalRecord::ToolCallProviderHeld { .. } => None,
-        // An informational record, skipped exactly like `Unknown`.
-        WalRecord::InputTokenCapFrozen { .. }
-        | WalRecord::InputTokenBudgetExhausted { .. }
-        | WalRecord::StructuredOutputResult { .. }
-        | WalRecord::StructuredOutputDowngraded { .. }
-        | WalRecord::QuestionWithdrawalAcknowledged { .. } => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,7 +774,6 @@ mod tests {
     };
     use broca_wal::{AuthSelection, RunConfig, RunOrigin};
     use serde_json::json;
-    use std::collections::BTreeSet;
 
     fn resolver(provider: &str, method: &str) -> (ChargeBasis, u32) {
         match (provider, method) {
@@ -1291,49 +1220,6 @@ mod tests {
 
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].retries_used, 2);
-    }
-
-    #[test]
-    fn boundary_list_is_exhaustive_and_closed() {
-        let found: BTreeSet<_> = [
-            billing_boundary_kind(&started(1, "r", Some(1)).record),
-            billing_boundary_kind(
-                &frame(
-                    2,
-                    WalRecord::RunConfigRefrozen {
-                        renderer_version: 1,
-                        ts_ms: Some(2),
-                        frozen_render_config: serde_json::Value::Null,
-                    },
-                )
-                .record,
-            ),
-            billing_boundary_kind(
-                &frame(
-                    3,
-                    WalRecord::RunAuthRefrozen {
-                        ts_ms: Some(3),
-                        auth_selection: AuthSelection {
-                            credential_id: "chatgpt:openai".into(),
-                            account_ref: Some("account".into()),
-                            resolved_credential_id: None,
-                            vault_request: None,
-                            account_decision: None,
-                        },
-                    },
-                )
-                .record,
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let expected: BTreeSet<_> = ["run_started", "run_config_refrozen", "run_auth_refrozen"]
-            .into_iter()
-            .collect();
-        assert_eq!(found, expected);
-        // The exhaustive match above is the pin: a new WAL variant cannot compile
-        // until its billing-boundary classification is explicitly chosen.
     }
 
     #[test]

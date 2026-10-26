@@ -395,17 +395,6 @@ fn code_assist_reads_the_same_header_and_records_none_without_it() {
 
 // ───────────── End to end: HTTP response → transport → normalizer → run loop → WAL ─────────────
 
-// A file-level `cfg` would delete this module when the feature is off and report "0 tests ok";
-// gating a module keeps a visible notice instead.
-#[cfg(not(feature = "live"))]
-#[test]
-fn the_end_to_end_cases_need_the_live_feature() {
-    eprintln!(
-        "SKIP service_tier_used end-to-end cases: compiled without the live feature. \
-         Re-run with `-F broca-provider/live` to execute them."
-    );
-}
-
 #[cfg(feature = "live")]
 mod end_to_end {
     use super::*;

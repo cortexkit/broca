@@ -202,7 +202,8 @@ fn google_codeassist_session_envelope_matches_golden() {
 #[test]
 fn google_codeassist_render_matches_golden() {
     let frozen = golden_frozen();
-    let bytes = GoogleCodeAssist.render(&frozen, &fixed_request());
+    let bytes =
+        render_golden_support::render_without_bundle(&GoogleCodeAssist, &frozen, &fixed_request());
     let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
 
     if render_golden_support::update_if_requested(

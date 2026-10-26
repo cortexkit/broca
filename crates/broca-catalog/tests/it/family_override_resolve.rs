@@ -7,19 +7,6 @@
 //!
 //! No network: it inspects the resolved provider's RENDERED bytes (the boxed provider exposes
 //! `render_request`), so it needs no live credential — a dummy token suffices.
-// A file-level `cfg` DELETES this file when the feature is off, and a deleted file reports
-// "running 0 tests ... test result: ok" -- indistinguishable at a glance from a suite that
-// ran and passed, and impossible to instrument because no code survives to carry a notice.
-// Gating a module instead leaves this shell compiled, so the absence can announce itself.
-#[cfg(not(all(feature = "bundled-catalog", feature = "live")))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP family_override_resolve: compiled without its feature, so none of its cases exist. \
-         This reports `ok` -- re-run with `-F broca-catalog/live` to execute them."
-    );
-}
-
 #[cfg(all(feature = "bundled-catalog", feature = "live"))]
 use crate::common;
 

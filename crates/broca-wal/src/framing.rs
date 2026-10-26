@@ -22,6 +22,10 @@
 //! is what makes rolling back to them safe: they stop instead of skipping or misreading a record
 //! a newer build wrote.
 //!
+//! Overhaul roots additionally use version 4, with requirements in a CRC32C-
+//! protected header and a separate payload SHA-256. Its codec lives in
+//! `broca-wal-reader`; legacy encode entry points keep their original bytes.
+//!
 //! SHA-256 (not crc32) because this is a source-of-truth log; records are
 //! low-volume (off the hot path) so a strong digest is cheap. `len` is capped +
 //! validated before allocation, so a corrupt length can't force a huge alloc.
@@ -81,6 +85,8 @@ impl std::fmt::Display for WalLineageId {
 pub enum FrameError {
     Serialize(serde_json::Error),
     Deserialize(serde_json::Error),
+    /// Version 4 header or encoding failure from the shared codec.
+    V4(broca_wal_reader::Error),
     /// `len` exceeded `MAX_PAYLOAD_LEN`.
     PayloadTooLarge {
         len: u32,
@@ -115,6 +121,7 @@ impl std::fmt::Display for FrameError {
         match self {
             FrameError::Serialize(e) => write!(f, "serialize record: {e}"),
             FrameError::Deserialize(e) => write!(f, "deserialize record: {e}"),
+            FrameError::V4(e) => write!(f, "{e}"),
             FrameError::PayloadTooLarge { len } => {
                 write!(
                     f,
@@ -152,6 +159,7 @@ const LINEAGE_PAYLOAD_LEN: u32 = 16;
 /// Framing version of a gated record: its payload is `{"requires": [...], "record": ...}`,
 /// and a reader must know every feature name in `requires` before it interprets `record`.
 pub const GATED_FRAMING_VERSION: u8 = 3;
+pub const V4_FRAMING_VERSION: u8 = broca_wal_reader::frame::VERSION;
 pub const INTERRUPT_REASON_FEATURE: &str = "interrupt-reason/v1";
 pub const TURN_DIRECTIVES_FEATURE: &str = "turn-directives/v1";
 /// A `RunStarted`, `Queued` or `Steered` record whose `request_identity_digest` carries the
@@ -498,15 +506,7 @@ struct GatedRequires<'a> {
 /// Whether `name` is in the capability grammar: one or more of `[a-z0-9-]`, then `/v`, then
 /// one or more ASCII digits.
 fn is_feature_name(name: &str) -> bool {
-    let Some((stem, version)) = name.split_once("/v") else {
-        return false;
-    };
-    !stem.is_empty()
-        && stem
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !version.is_empty()
-        && version.bytes().all(|b| b.is_ascii_digit())
+    broca_wal_reader::features::is_feature_name(name)
 }
 
 fn compute_digest(ver: u8, seq: u64, fence: u64, payload: &[u8]) -> [u8; DIGEST_LEN] {
@@ -521,6 +521,9 @@ fn compute_digest(ver: u8, seq: u64, fence: u64, payload: &[u8]) -> [u8; DIGEST_
 /// Verify the fixed frame envelope without interpreting its version or payload.
 /// Intact bytes that this reader rejects may belong to a newer writer, not a crash.
 pub(crate) fn digest_verifies(buf: &[u8]) -> bool {
+    if buf.get(4) == Some(&V4_FRAMING_VERSION) {
+        return broca_wal_reader::frame::digest_verifies(buf);
+    }
     if buf.len() < HEADER_LEN {
         return false;
     }
@@ -601,6 +604,25 @@ pub fn encode_with_requires(
     })
     .map_err(FrameError::Serialize)?;
     frame(GATED_FRAMING_VERSION, seq, fence, &payload)
+}
+
+/// Encode an overhaul-root record with caller-supplied writer metadata. This is
+/// deliberately separate from legacy encoding: adding the codec must not turn
+/// version 4 writes on for existing state roots.
+pub fn encode_v4(
+    metadata: broca_wal_reader::frame::Metadata,
+    requires: &[&str],
+    record: &WalRecord,
+) -> Result<Vec<u8>, FrameError> {
+    let own = record.required_features();
+    let requires: Vec<&str> = requires.iter().chain(own.iter()).copied().collect();
+    let payload = serde_json::to_vec(record).map_err(FrameError::Serialize)?;
+    broca_wal_reader::frame::encode(metadata, &requires, &payload).map_err(|error| match error {
+        broca_wal_reader::Error::InvalidFeatureName { name } => {
+            FrameError::InvalidFeatureName { name }
+        }
+        error => FrameError::V4(error),
+    })
 }
 
 /// Frame an already-serialized record payload, with the same header and digest as
@@ -719,6 +741,9 @@ fn decode_projected_with<T>(
     known: &[&str],
     project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
 ) -> DecodeStep<T> {
+    if buf.get(4) == Some(&V4_FRAMING_VERSION) {
+        return decode_v4_projected(buf, known, project);
+    }
     if buf.len() < HEADER_LEN {
         return DecodeStep::TornTail; // not even a full header → torn
     }
@@ -785,6 +810,50 @@ fn decode_projected_with<T>(
             consumed: total,
         },
         Err(e) => DecodeStep::Corrupt(FrameError::Deserialize(e)),
+    }
+}
+
+fn decode_v4_projected<T>(
+    buf: &[u8],
+    known: &[&str],
+    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
+) -> DecodeStep<T> {
+    use broca_wal_reader::features::Policy;
+    use broca_wal_reader::frame::{decode_next_with_policy, DecodeStep as V4Step};
+
+    let known: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|name| !forgotten_for_test(name))
+        .chain(TEST_KNOWN_FEATURES.iter().copied())
+        .collect();
+    match decode_next_with_policy(buf, &known, Policy::All) {
+        Ok(V4Step::Incomplete) => DecodeStep::TornTail,
+        Ok(V4Step::PayloadCorrupt { header, .. }) => {
+            DecodeStep::Corrupt(FrameError::DigestMismatch {
+                seq: header.metadata.seq,
+            })
+        }
+        Ok(V4Step::Frame(frame)) => {
+            let metadata = frame.header.metadata;
+            match project(metadata.seq, metadata.fence, frame.payload) {
+                Ok(record) => DecodeStep::Record {
+                    framed: Box::new(record),
+                    consumed: frame.consumed,
+                },
+                Err(error) => DecodeStep::Corrupt(FrameError::Deserialize(error)),
+            }
+        }
+        Err(broca_wal_reader::Error::NewerWriter { features }) => DecodeStep::NewerWriter {
+            ver: V4_FRAMING_VERSION,
+            missing: features,
+        },
+        Err(error) => DecodeStep::Corrupt(FrameError::V4(error)),
+        // Policy::All never skips: every unknown name is a whole-log refusal.
+        Ok(V4Step::Skipped { header, .. }) => DecodeStep::NewerWriter {
+            ver: V4_FRAMING_VERSION,
+            missing: header.requires,
+        },
     }
 }
 
@@ -884,6 +953,125 @@ mod tests {
 
     fn rec(n: u64) -> WalRecord {
         WalRecord::TurnFinished { step_id: StepId(n) }
+    }
+
+    fn v4_metadata() -> broca_wal_reader::frame::Metadata {
+        broca_wal_reader::frame::Metadata {
+            seq: 7,
+            fence: 3,
+            appended_ms: 123,
+            writer_id: [5; 16],
+        }
+    }
+
+    #[test]
+    fn v4_round_trip_and_projection_delegate_to_shared_codec() {
+        let bytes = encode_v4(v4_metadata(), &[], &rec(1)).unwrap();
+        assert_eq!(bytes[4], V4_FRAMING_VERSION);
+        assert!(digest_verifies(&bytes));
+        match decode_next(&bytes) {
+            DecodeStep::Record { framed, consumed } => {
+                assert_eq!(consumed, bytes.len());
+                assert_eq!((framed.seq, framed.fence), (7, 3));
+                assert_eq!(framed.record, rec(1));
+            }
+            _ => panic!("expected v4 record"),
+        }
+        assert!(matches!(
+            decode_projected(&bytes, |seq, fence, payload| {
+                assert_eq!((seq, fence), (7, 3));
+                serde_json::from_slice::<WalRecord>(payload)
+            }),
+            DecodeStep::Record { .. }
+        ));
+        // Existing roots must not start writing v4 merely because it is readable.
+        assert_eq!(encode(7, 3, &rec(1)).unwrap()[4], FRAMING_VERSION);
+    }
+
+    #[test]
+    fn v4_unknown_features_refuse_before_record_projection() {
+        for feature in ["future-content/v1", "bill-future/v1"] {
+            let bytes =
+                broca_wal_reader::frame::encode(v4_metadata(), &[feature], b"not JSON").unwrap();
+            match decode_projected::<()>(&bytes, |_, _, _| {
+                panic!("must not interpret unknown record")
+            }) {
+                DecodeStep::NewerWriter { ver, missing } => {
+                    assert_eq!(ver, V4_FRAMING_VERSION);
+                    assert_eq!(missing, vec![feature]);
+                }
+                _ => panic!("unknown feature must refuse the whole log"),
+            }
+        }
+    }
+
+    #[test]
+    fn v4_own_features_are_required_and_unknown_names_do_not_panic_writer() {
+        let mut value: serde_json::Value = serde_json::from_str(
+            include_str!("../tests/fixtures/before_message_times.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        value["written_at_ms"] = serde_json::json!(42);
+        value["session_class"] = serde_json::json!("head");
+        value["config"]["budget"] = serde_json::json!({"max_input_tokens":5});
+        let record: WalRecord = serde_json::from_value(value).unwrap();
+        let bytes = encode_v4(v4_metadata(), &["future-content/v1"], &record).unwrap();
+        let header = broca_wal_reader::frame::decode_header(&bytes)
+            .unwrap()
+            .unwrap();
+        for feature in record.required_features() {
+            assert!(header.requires.iter().any(|name| name == feature));
+        }
+        assert!(matches!(
+            decode_next(&bytes),
+            DecodeStep::NewerWriter { .. }
+        ));
+        assert!(matches!(
+            encode_v4(v4_metadata(), &["Bad/v1"], &record),
+            Err(FrameError::InvalidFeatureName { .. })
+        ));
+    }
+
+    #[test]
+    fn v4_corruption_distinguishes_header_from_payload() {
+        let bytes = encode_v4(v4_metadata(), &[], &rec(1)).unwrap();
+        let mut header_bad = bytes.clone();
+        header_bad[21] ^= 1;
+        assert!(matches!(
+            decode_next(&header_bad),
+            DecodeStep::Corrupt(FrameError::V4(
+                broca_wal_reader::Error::HeaderCorrupt { .. }
+            ))
+        ));
+        let mut payload_bad = bytes;
+        *payload_bad.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            decode_next(&payload_bad),
+            DecodeStep::Corrupt(FrameError::DigestMismatch { seq: 7 })
+        ));
+    }
+
+    #[test]
+    fn v4_broca_unlinks_log_held_open_by_reader() {
+        use std::io::Read;
+        let dir = broca_test_support::scratch_root()
+            .join(format!("v4-reader-unlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.wal");
+        let bytes = encode_v4(v4_metadata(), &[], &rec(1)).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut held = broca_wal_reader::open_log(&path).unwrap();
+        std::fs::remove_file(&path)
+            .expect("a read-only billing handle must not block broca's unlink");
+        assert!(!path.exists());
+        let mut read = Vec::new();
+        held.read_to_end(&mut read).unwrap();
+        assert_eq!(read, bytes);
+        drop(held);
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
@@ -1032,20 +1220,20 @@ mod tests {
     ///
     /// Builds that predate gated frames refuse a version-3 frame with exactly this wording,
     /// "unsupported WAL framing version 3", and that refusal is what makes rolling back to
-    /// them safe once version-3 frames exist. This build reads version 3, so the property is
+    /// them safe once version-3 frames exist. This build reads versions 3 and 4, so the property is
     /// asserted for the next unknown version: if a future build writes a new framing version,
     /// rolling back to this build must meet the same named refusal.
     #[test]
     fn an_unknown_framing_version_is_refused_as_unsupported() {
         let bytes = frame_with_version(
-            4,
+            5,
             1,
             1,
             br#"{"requires":["test-feature/v1"],"record":{"type":"turn_finished","step_id":1}}"#,
         );
         match decode_next(&bytes) {
-            DecodeStep::Corrupt(error @ FrameError::UnsupportedVersion { ver: 4 }) => {
-                assert_eq!(error.to_string(), "unsupported WAL framing version 4");
+            DecodeStep::Corrupt(error @ FrameError::UnsupportedVersion { ver: 5 }) => {
+                assert_eq!(error.to_string(), "unsupported WAL framing version 5");
             }
             _ => panic!("expected an unsupported-version refusal"),
         }

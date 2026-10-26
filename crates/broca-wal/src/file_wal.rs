@@ -7,12 +7,11 @@
 
 use std::{
     cell::{Cell, RefCell},
-    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
-use broca_owner_only::OpenOptions;
+use crate::fs_ops::{self, File, OpenOptions};
 
 use crate::{
     framing::{
@@ -471,7 +470,7 @@ pub struct FileWal {
 /// directory fsync -- is the wrong place for a filesystem sweep. The repair verb lives in the
 /// store-maintenance binary where an operator can run it once.
 fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
-    broca_owner_only::create_dir_all(dir)
+    fs_ops::create_dir_all(dir)
 }
 
 fn mint_lineage_id() -> Result<WalLineageId, WalError> {
@@ -559,7 +558,7 @@ impl FileWal {
         let source_parent = self.path.parent().unwrap().to_path_buf();
         crate::migration::durable_dir(parent.parent().unwrap_or(parent), parent)
             .map_err(WalError::Io)?;
-        std::fs::rename(&self.path, destination).map_err(WalError::Io)?;
+        fs_ops::rename(&self.path, destination).map_err(WalError::Io)?;
         self.path = destination.to_path_buf();
         self.dir_needs_sync.set(true);
         self.sync()?;
@@ -638,12 +637,12 @@ impl FileWal {
     ) -> Result<Self, WalError> {
         crate::migration::guard(&path, &session_ref, true)?;
         #[cfg(windows)]
-        broca_owner_only::validate_if_exists(&path).map_err(WalError::Io)?;
+        fs_ops::validate_if_exists(&path).map_err(WalError::Io)?;
         let mut newly_created_dirs = Vec::new();
         if let Some(parent) = path.parent() {
             let mut candidate = parent;
             while !candidate.as_os_str().is_empty()
-                && !candidate.try_exists().map_err(WalError::Io)?
+                && !fs_ops::try_exists(candidate).map_err(WalError::Io)?
             {
                 newly_created_dirs.push(candidate.to_path_buf());
                 let Some(next) = candidate.parent() else {
@@ -693,7 +692,7 @@ impl FileWal {
         // write-data right SetEndOfFile needs → "Access is denied"); a plain write handle
         // has it. A clean cut (no torn bytes) makes valid_end == the file size, so this is
         // skipped then.
-        if let Ok(meta) = std::fs::metadata(&path) {
+        if let Ok(meta) = fs_ops::metadata(&path) {
             if meta.len() > valid_end {
                 open_observed("truncate");
                 let trunc = OpenOptions::new()
@@ -1241,7 +1240,7 @@ pub fn replay_file(path: impl AsRef<Path>, max_bytes: u64) -> Result<Vec<FramedR
 /// error is not evidence either way, and answering `false` for it would be the same defect
 /// this function exists to remove.
 pub fn wal_file_exists(path: impl AsRef<Path>) -> Result<bool, WalError> {
-    match std::fs::metadata(path.as_ref()) {
+    match fs_ops::metadata(path.as_ref()) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(WalError::Io(e)),
@@ -1911,7 +1910,7 @@ fn metadata_file_id(_metadata: &std::fs::Metadata) -> Option<u64> {
 /// provide one. Read-side durability caches use this only to invalidate a proof after the WAL is
 /// replaced; callers without an identity must take a fresh flush barrier instead.
 pub fn file_identity(path: impl AsRef<Path>) -> Result<Option<u64>, WalError> {
-    let metadata = match std::fs::metadata(path) {
+    let metadata = match fs_ops::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(WalError::Io(error)),
@@ -2613,7 +2612,7 @@ mod tests {
         [
             "010000000102000000000000000100000000000000e36c2cb768b1bc82603d9f2b9b5887e8e6ef59c06a9cff1568337df0a85031f87b",
             "000000000200000000000000000000000000000000401da6ea6a614dd6d773b1ba84c91ee6d981827bd0bdc5188aa2e5dbffba558c",
-            "020000000402000000000000000100000000000000bc8904cedfcc5d62bdcada4163a0277512d243828920eb0a756692a79632c3167b7d",
+            "020000000502000000000000000100000000000000dede443b9e38d392c3c40582d40136eada16de948804578ca1f6befda78053be7b7d",
         ].iter().map(|hex| hex.as_bytes().as_chunks::<2>().0.iter().map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect()).collect()
     }
 
@@ -2695,7 +2694,7 @@ mod tests {
         for (frame, digest) in frames.iter().zip([
             "fc173954f8d37c3ab05dca617977688791396ed3ce890761a8ec309fa4a61003",
             "aadca446961718a022df99918817d44dc7b82e1d6a17bcda15982600f8ffd3a0",
-            "e798c4b8bf64d274cb865b2c095edfce1509ee08a10e1c645e04037b90565fb4",
+            "de7a77e7ce353f876cf1673c79fa5075406d9552a010fe1002d4b8600e306299",
         ]) {
             assert_eq!(format!("{:x}", Sha256::digest(frame)), digest);
         }
@@ -2709,7 +2708,7 @@ mod tests {
         ));
         assert!(matches!(
             crate::framing::decode_next(&frames[2]),
-            DecodeStep::Corrupt(FrameError::UnsupportedVersion { ver: 4 })
+            DecodeStep::Corrupt(FrameError::UnsupportedVersion { ver: 5 })
         ));
     }
 

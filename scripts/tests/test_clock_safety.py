@@ -96,7 +96,7 @@ elif args[:2] == ["nextest", "list"]:
     print(json.dumps({"test-count": 1}))
 elif args[:2] == ["nextest", "run"]:
     name = os.environ["CLOCK_GATE_SENTINEL"]
-    if "broca-module-serve/test-clock" not in args:
+    if "broca-module-serve/test-clock" not in args and "--archive-file" not in args:
         name = "ordinary_test"
     progress = os.environ.get("CLOCK_GATE_PROGRESS", "(1/1) ")
     print(os.environ.get("CLOCK_GATE_STATUS", "PASS") + " [0.001s] " + progress + "broca-module::it " + name)
@@ -182,10 +182,22 @@ class TestClockGate(unittest.TestCase):
         run_steps = "\n".join(s.get("run", "") for s in jobs["integration"]["steps"])
         self.assertIn("scripts/ci-integration.sh build", build_steps)
         self.assertIn("scripts/ci-integration.sh run", run_steps)
-        shard_gate = (ROOT / "scripts/ci-integration.sh").read_text()
-        self.assertIn("source scripts/rust-test-gate.sh", shard_gate)
-        self.assertIn(SENTINEL, shard_gate)
-        self.assertIn("test-clock sentinel did not execute successfully", shard_gate)
+        shutil.copy2(ROOT / "scripts/ci-integration.sh", self.root / "scripts/ci-integration.sh")
+        for sentinel, status, expected in ((SENTINEL, "PASS", 0),
+                                           ("ordinary_test", "PASS", 1),
+                                           (SENTINEL, "SKIP", 1)):
+            with self.subTest(sentinel=sentinel, status=status):
+                result = subprocess.run(
+                    ["bash", "scripts/ci-integration.sh", "run", "fixture.tar.zst", "1/2"],
+                    cwd=self.root, env={**self.env, "CLOCK_GATE_SENTINEL": sentinel,
+                                       "CLOCK_GATE_STATUS": status},
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("CI shard: test-clock sentinel did not execute successfully", result.stderr)
+                else:
+                    self.assertIn("CI shard: executed test-clock sentinel", result.stdout)
         # The suite list lives in scripts/script-suites.sh, which CI and the local gate call.
         self.assertTrue(any(step.get("run") == "scripts/script-suites.sh" for step in jobs["scripts"]["steps"]))
         suites = (ROOT / "scripts/script-suites.sh").read_text()

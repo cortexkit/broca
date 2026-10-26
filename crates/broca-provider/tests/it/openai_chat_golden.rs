@@ -20,7 +20,7 @@ use serde_json::json;
 /// `system` role, not a top-level field), a user turn, an assistant turn with a tool
 /// call (`tool_calls[]` with `function.arguments` as a STRING), a tool-result turn
 /// (`role:"tool"`), and two tools (`{type:function, function:{...parameters}}`).
-fn fixed_request() -> CallOptions {
+pub(super) fn fixed_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
             cache_prefix_blocks: None,
@@ -100,13 +100,14 @@ fn fixed_request() -> CallOptions {
     opts
 }
 
-const GOLDEN: &str = include_str!("../fixtures/openai_chat_render_golden.json");
+pub(super) const GOLDEN: &str = include_str!("../fixtures/openai_chat_render_golden.json");
 const GOLDEN_VERSION: &str = include_str!("../fixtures/openai_chat_render_golden.json.version");
 
 #[test]
 fn openai_chat_render_matches_golden() {
     let frozen = openai_chat_frozen_config("gpt-4o");
-    let bytes = OpenAiChat.render(&frozen, &fixed_request());
+    let bytes =
+        render_golden_support::render_without_bundle(&OpenAiChat, &frozen, &fixed_request());
     let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
 
     if render_golden_support::update_if_requested(

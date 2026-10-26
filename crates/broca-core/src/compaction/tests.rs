@@ -668,7 +668,7 @@ async fn ride_after(
 /// deadline, ended once the ride resolves, and the control lane reports it as
 /// `compaction_wait`. A ride answered sooner records nothing, and a session whose Setup gave no
 /// `ride_wait_ms` keeps broca's own short ride deadline.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_slow_ride_is_reported_as_a_compaction_wait_and_a_fast_one_is_not() {
     let mut state = CompactionState {
         ride_wait_ms: Some(4000),

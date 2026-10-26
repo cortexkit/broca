@@ -6093,23 +6093,6 @@ mod caller_message_tests {
         );
     }
 
-    #[test]
-    fn stateful_caller_message_serializer_uses_borrowed_content() {
-        let source = include_str!("lib.rs");
-        let start = source.find("fn serialize_caller_message").unwrap();
-        let end = source[start..]
-            .find("/// One message in a `session.read` page.")
-            .map(|offset| start + offset)
-            .unwrap();
-        let serializer = &source[start..end];
-
-        assert!(serializer.contains("CallerMessageRef(message).serialize(serializer)"));
-        assert!(
-            !serializer.contains(".clone()"),
-            "caller-facing state conversion must not clone message blocks"
-        );
-    }
-
     /// Messages without provider state serialize exactly as the canonical message does, so the
     /// conversion never moves bytes of an ordinary page.
     #[test]

@@ -210,3 +210,41 @@ pub(super) async fn capture(
     }
     result
 }
+
+#[cfg(all(test, feature = "test-attachments"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_classifier_returns_decoded_bytes_awaiting_capture() {
+        assert!(broca_protocol::attachments_enabled());
+        let hex = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
+        let png: Vec<u8> = hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let (result, pending) = super::super::map_call_tool_result(
+            &ToolCallId("capture-call".into()),
+            &serde_json::json!({"content": [{"type": "image", "mimeType": "image/png", "data": STANDARD.encode(&png)}]}),
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].index, 0);
+        assert_eq!(pending[0].bytes, png);
+        assert_eq!(pending[0].metadata.kind, MediaKind::Image);
+        assert_eq!(pending[0].metadata.mime, "image/png");
+        assert_eq!(pending[0].metadata.byte_size, 69);
+        assert_eq!(
+            pending[0].metadata.sha256,
+            "b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"
+        );
+        let ToolOutput::Parts { parts } = result.output else {
+            panic!("image must produce output parts")
+        };
+        assert_eq!(parts, [ToolOutputPart::Text {
+            text: "[media not shown: kind=image mime=image/png bytes=69 sha256=b1ff9c8ea3a7 reason=undecodable]".into(),
+        }]);
+    }
+}

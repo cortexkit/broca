@@ -13,6 +13,7 @@ pub mod bedrock_converse;
 pub use bedrock_converse::BedrockConverse;
 
 pub mod openai_chat;
+mod openai_media;
 
 pub use openai_chat::OpenAiChat;
 

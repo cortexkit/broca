@@ -5,11 +5,10 @@
 //! Removing the seal as well makes the file indistinguishable from a crashed fold, so it
 //! must remain unreadable. This module never repairs or publishes such a file.
 
-use broca_owner_only::OpenOptions;
+use crate::fs_ops::{File, OpenOptions};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    fs::File,
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };

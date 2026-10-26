@@ -42,6 +42,7 @@ fn cut_tool_events(ceiling: bool) -> Vec<Value> {
 
 #[derive(Default, Debug)]
 struct Observed {
+    closes_at_request: Vec<usize>,
     handshakes: usize,
     headers: Vec<BTreeMap<String, String>>,
     upgrade_bytes: Vec<Vec<u8>>,
@@ -212,7 +213,12 @@ impl Mock {
                             while let Some(Ok(message)) = socket.next().await {
                                 match message {
                                     WsMessage::Text(text) => {
-                                        seen.lock().unwrap().requests.push(text.as_bytes().to_vec());
+                                        {
+                                            let mut seen = seen.lock().unwrap();
+                                            let closes = seen.closes;
+                                            seen.closes_at_request.push(closes);
+                                            seen.requests.push(text.as_bytes().to_vec());
+                                        }
                                         notify.notify_one();
                                          let events = queue.lock().unwrap().pop_front().unwrap_or_else(text_events);
                                          let incomplete = !events.iter().any(|event| event["type"] == "response.completed");
@@ -1073,7 +1079,16 @@ async fn codex_tool_run(
         1,
         "one actual tool handler invocation"
     );
-    mock.wait_closes(1).await;
+    let retired_before_completion = expected_handshakes - 1;
+    if retired_before_completion > 0 {
+        mock.wait_closes(retired_before_completion).await;
+    }
+    assert_eq!(
+        mock.observed.lock().unwrap().closes,
+        retired_before_completion
+    );
+    provider.client.chatgpt_connections().retire_session(&bind);
+    mock.wait_closes(expected_handshakes).await;
     let records = wal.read_records(&bind).unwrap();
     assert_eq!(
         records
@@ -1280,10 +1295,12 @@ fn codex_previous_response_retry_advice_is_nested_first_with_top_level_fallback(
             serde_json::json!({"Retry-After":"2"}),
             Some(2.0),
         ),
+        // Codex reads only `Retry-After` for a Responses request, never `retry-after-ms`
+        // (`http-client/src/retry_after.rs:19-22`).
         (
             serde_json::json!({"Retry-After-Ms":"250"}),
             serde_json::json!({}),
-            Some(0.25),
+            None,
         ),
         (Value::Null, Value::Null, None),
     ] {
@@ -2711,8 +2728,12 @@ async fn logged_step(
     (events, logs)
 }
 
+/// Two long WebSocket cuts in a row do not move the step to HTTPS. Codex switches transport only
+/// once its five stream retries are spent (`core/src/responses_retry.rs:120-139`), so the third
+/// attempt goes out on a fresh socket and completes there, and the next step stays on the
+/// socket too.
 #[tokio::test]
-async fn websocket_two_long_stream_cuts_switch_to_https_and_complete() {
+async fn websocket_two_long_stream_cuts_retry_on_the_socket_and_complete() {
     let partial = vec![serde_json::json!({"type":"response.output_text.delta","delta":"partial"})];
     let mock = Mock::start_gated(vec![partial.clone(), partial, text_events()]).await;
     let mut provider = provider(&mock);
@@ -2723,18 +2744,16 @@ async fn websocket_two_long_stream_cuts_switch_to_https_and_complete() {
         let recorded = attempts(&events);
         assert_eq!(recorded.len(), 3);
         assert_eq!(recorded[2].outcome, AttemptOutcome::Complete);
-        assert_eq!(recorded[2].transport.as_deref(), Some("https"));
+        assert_eq!(recorded[2].transport.as_deref(), Some("websocket"));
         assert!(recorded
             .iter()
             .all(|attempt| attempt.request_body_sha256 == recorded[0].request_body_sha256));
         let warnings = logs.0.lock().unwrap();
         assert_eq!(warnings.len(), 2);
-        assert_eq!(warnings[0]["retry_decision"], "retrying");
-        assert_eq!(warnings[1]["retry_decision"], "switching_to_https");
-        assert_eq!(
-            warnings[1]["retry_reason"],
-            "consecutive_mid_response_closes"
-        );
+        for warning in warnings.iter() {
+            assert_eq!(warning["retry_decision"], "retrying");
+            assert_eq!(warning["retry_reason"], "transient_failure");
+        }
         assert_eq!(warnings[0]["socket_generation"], "1");
         assert_eq!(warnings[1]["socket_generation"], "2");
         for warning in warnings.iter() {
@@ -2755,19 +2774,16 @@ async fn websocket_two_long_stream_cuts_switch_to_https_and_complete() {
     })
     .await
     .unwrap();
-    assert_eq!(mock.observed.lock().unwrap().requests.len(), 2);
-    assert_eq!(mock.observed.lock().unwrap().http_bodies.len(), 1);
+    assert_eq!(mock.observed.lock().unwrap().requests.len(), 3);
+    assert!(mock.observed.lock().unwrap().http_bodies.is_empty());
     provider.retry_clock.virtual_retry_attempts = None;
     let events = step(&provider, 2, &opts()).await;
-    assert_eq!(attempts(&events)[0].transport.as_deref(), Some("https"));
+    assert_eq!(attempts(&events)[0].transport.as_deref(), Some("websocket"));
     let seen = mock.observed.lock().unwrap();
-    assert_eq!(seen.requests[0], seen.requests[1]);
-    let mut socket_body: Value = serde_json::from_slice(&seen.requests[0]).unwrap();
-    socket_body.as_object_mut().unwrap().remove("type");
-    assert_eq!(
-        socket_body,
-        serde_json::from_slice::<Value>(&seen.http_bodies[0]).unwrap()
-    );
+    assert!(seen.requests[..3]
+        .iter()
+        .all(|request| request == &seen.requests[0]));
+    assert!(seen.http_bodies.is_empty());
 }
 
 #[tokio::test]
@@ -2800,40 +2816,94 @@ async fn websocket_attempt_exhaustion_recovers_the_same_step_over_https() {
     assert_eq!(seen.http_bodies[0], provider.render_request(&opts()));
 }
 
+/// The number of sends Codex makes on one transport before it gives up: the first send plus
+/// `stream_max_retries` (5) retries.
+const CODEX_SENDS_PER_TRANSPORT: usize = super::codex_retry::STREAM_MAX_RETRIES as usize + 1;
+
+/// Asserts each wait is Codex's stream backoff for its retry: 200 ms doubling per retry, with a
+/// jitter factor in 0.9..1.1 (`async-utils/src/backoff.rs:12-17`).
+fn assert_codex_stream_backoffs(waits: &[Duration]) {
+    for (index, wait) in waits.iter().enumerate() {
+        let nominal = 200u64 << index;
+        let millis = wait.as_millis() as u64;
+        assert!(
+            millis >= nominal * 9 / 10 && millis < nominal * 11 / 10,
+            "retry {} waited {wait:?}, not Codex's backoff around {nominal} ms",
+            index + 1
+        );
+    }
+}
+
+/// One rule for the socket and HTTPS, Codex's: six socket sends (the first plus five retries),
+/// then the run switches to HTTPS once and starts a fresh count of six sends there. HTTPS is
+/// not switched again, so the sixth HTTPS failure ends the step. Every send carries the same
+/// rendered bytes.
 #[tokio::test]
-async fn websocket_https_recovery_has_a_separate_bounded_allowance() {
-    let mut replies = vec![vec![]; MAX_ATTEMPTS];
-    replies.extend((0..MAX_ATTEMPTS).map(|_| vec![serde_json::json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"unavailable"}}})]));
+async fn websocket_exhaustion_falls_back_to_https_once_with_a_fresh_codex_count() {
+    let mut replies = vec![vec![]; CODEX_SENDS_PER_TRANSPORT];
+    replies.extend((0..CODEX_SENDS_PER_TRANSPORT).map(|_| vec![serde_json::json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"unavailable"}}})]));
     let mock = Mock::start(replies, true, false).await;
     let mut provider = provider(&mock);
-    provider.retry_clock.virtual_waits = Some(Arc::new(Mutex::new(Vec::new())));
+    let waits = Arc::new(Mutex::new(Vec::new()));
+    provider.retry_clock.virtual_waits = Some(Arc::clone(&waits));
     let events = step(&provider, 1, &opts()).await;
-    assert_eq!(attempts(&events).len(), 2 * MAX_ATTEMPTS);
+    let recorded = attempts(&events);
+    assert_eq!(recorded.len(), 2 * CODEX_SENDS_PER_TRANSPORT);
+    for (index, attempt) in recorded.iter().enumerate() {
+        let expected = if index < CODEX_SENDS_PER_TRANSPORT {
+            "websocket"
+        } else {
+            "https"
+        };
+        assert_eq!(
+            attempt.transport.as_deref(),
+            Some(expected),
+            "attempt {index}"
+        );
+        assert_eq!(attempt.request_body_sha256, recorded[0].request_body_sha256);
+    }
     terminal_error(&events);
+    let waits = waits.lock().unwrap();
+    // Five socket backoffs, no wait for the switch (no server time), five HTTPS backoffs that
+    // start again from 200 ms.
+    assert_eq!(waits.len(), 11);
+    assert_codex_stream_backoffs(&waits[..5]);
+    assert_eq!(waits[5], Duration::ZERO);
+    assert_codex_stream_backoffs(&waits[6..]);
     let seen = mock.observed.lock().unwrap();
-    assert_eq!(seen.requests.len(), MAX_ATTEMPTS);
-    assert_eq!(seen.http_bodies.len(), MAX_ATTEMPTS);
+    assert_eq!(seen.requests.len(), CODEX_SENDS_PER_TRANSPORT);
+    assert_eq!(seen.http_bodies.len(), CODEX_SENDS_PER_TRANSPORT);
     assert!(seen
         .http_bodies
         .iter()
         .all(|body| body == &seen.http_bodies[0]));
 }
 
+/// The OpenAI Responses families have no total waiting budget: attempts worth 245 s of
+/// no-byte failures keep retrying, as Codex does, and the step completes after the switch to
+/// HTTPS.
 #[tokio::test]
-async fn websocket_no_bytes_failures_still_exhaust_the_waiting_wall() {
-    let mock = Mock::start(vec![vec![]; MAX_ATTEMPTS], true, false).await;
+async fn websocket_no_bytes_failures_have_no_waiting_wall() {
+    let mock = Mock::start(vec![vec![]; CODEX_SENDS_PER_TRANSPORT], true, false).await;
     let mut provider = provider(&mock);
-    virtual_attempts(&mut provider, &[100, 145, 0, 0, 0, 0, 0]);
+    virtual_attempts(&mut provider, &[100, 145, 0, 0, 0, 0, 1]);
     let (events, logs) = logged_step(&provider).await;
-    assert_eq!(attempts(&events).len(), 2);
-    terminal_error(&events);
-    assert_eq!(
-        logs.0.lock().unwrap()[1]["retry_decision"],
-        "wall_exhausted"
+    let recorded = attempts(&events);
+    assert_eq!(recorded.len(), CODEX_SENDS_PER_TRANSPORT + 1);
+    assert_eq!(recorded.last().unwrap().outcome, AttemptOutcome::Complete);
+    assert_eq!(recorded.last().unwrap().transport.as_deref(), Some("https"));
+    assert!(
+        !logs
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.get("retry_decision").map(String::as_str)
+                == Some("wall_exhausted"))
     );
     let seen = mock.observed.lock().unwrap();
-    assert_eq!(seen.requests.len(), 2);
-    assert!(seen.http_bodies.is_empty());
+    assert_eq!(seen.requests.len(), CODEX_SENDS_PER_TRANSPORT);
+    assert_eq!(seen.http_bodies.len(), 1);
 }
 
 #[tokio::test]
@@ -2966,12 +3036,16 @@ async fn websocket_retried_tool_step_dispatches_only_the_successful_completion()
     assert!(recorded[..3]
         .iter()
         .all(|attempt| attempt.0 == recorded[0].0));
-    assert_eq!(recorded[2].1.as_deref(), Some("https"));
+    // Two cuts do not switch transport (Codex switches only after five retries), so the
+    // completing retry is the third socket send.
+    assert_eq!(recorded[2].1.as_deref(), Some("websocket"));
     assert_eq!(*recorded[2].2, AttemptOutcome::Complete);
     let seen = mock.observed.lock().unwrap();
-    assert_eq!(seen.requests.len(), 2);
-    assert_eq!(seen.requests[0], seen.requests[1]);
-    assert_eq!(seen.http_bodies.len(), 2);
+    assert_eq!(seen.requests.len(), 4);
+    assert!(seen.requests[..3]
+        .iter()
+        .all(|request| request == &seen.requests[0]));
+    assert!(seen.http_bodies.is_empty());
 }
 
 #[tokio::test]
@@ -3312,4 +3386,223 @@ async fn websocket_wrapped_refusal_warn_carries_the_capped_frame() {
     assert!(logged.contains(MODEL_REFUSAL_TEXT), "{logged}");
     assert_eq!(logged.len(), 1024);
     assert!(!logged.contains("PRIVATE-HEADER-VALUE"), "{logged}");
+}
+
+#[path = "transport_websocket_cross_run_tests.rs"]
+mod cross_run;
+
+/// A 429 capacity refusal in the shape OpenAI's Codex backend sends on a socket upgrade, with a
+/// `Retry-After` of several minutes.
+const CAPACITY_BODY: &str = r#"{"error":{"code":"turn_rate_limit_exceeded","message":"Codex is at capacity, please try again later","type":"rate_limit_error"},"status":429}"#;
+
+fn capacity_refusal(retry_after: Option<&'static str>) -> UpgradeRefusal {
+    let mut headers = vec![("content-type", "application/json")];
+    headers.extend(retry_after.map(|value| ("retry-after", value)));
+    UpgradeRefusal {
+        status: 429,
+        headers,
+        body: CAPACITY_BODY.into(),
+    }
+}
+
+/// A refused upgrade's 429 with `Retry-After: 469` is the attempt's answer: broca waits exactly
+/// 469 s before each re-send, with no cap, five times; then it switches the run to HTTPS, still
+/// waiting the server's 469 s first, and starts a fresh count of six HTTPS sends. Nothing is
+/// sent over HTTPS before the server's time, and every send carries the same rendered bytes.
+#[tokio::test]
+async fn codex_upgrade_429_waits_out_retry_after_then_falls_back_to_https_with_a_fresh_count() {
+    let failed = serde_json::json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"unavailable"}}});
+    let mock = Mock::start(vec![vec![failed]; CODEX_SENDS_PER_TRANSPORT], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(capacity_refusal(Some("469")));
+    let mut provider = provider(&mock);
+    let waits = Arc::new(Mutex::new(Vec::new()));
+    provider.retry_clock.virtual_waits = Some(Arc::clone(&waits));
+    let events = step(&provider, 1, &opts()).await;
+
+    let recorded = attempts(&events);
+    assert_eq!(recorded.len(), 2 * CODEX_SENDS_PER_TRANSPORT);
+    for (index, attempt) in recorded.iter().enumerate() {
+        assert_eq!(attempt.request_body_sha256, recorded[0].request_body_sha256);
+        if index < CODEX_SENDS_PER_TRANSPORT {
+            assert_eq!(attempt.transport.as_deref(), Some("websocket"), "{index}");
+            assert_eq!(attempt.outcome, AttemptOutcome::HttpError, "{index}");
+            assert_eq!(attempt.http_status, Some(429), "{index}");
+        } else {
+            assert_eq!(attempt.transport.as_deref(), Some("https"), "{index}");
+        }
+    }
+    let error = terminal_error(&events);
+    assert_eq!(error.class, ErrorClass::Transient);
+    let waits = waits.lock().unwrap();
+    assert_eq!(waits.len(), 11);
+    assert_eq!(
+        waits[..6],
+        [Duration::from_secs(469); 6],
+        "five socket retries and the switch to HTTPS each wait exactly the server's time"
+    );
+    assert_codex_stream_backoffs(&waits[6..]);
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, CODEX_SENDS_PER_TRANSPORT);
+    assert!(
+        seen.requests.is_empty(),
+        "no response.create on a refused upgrade"
+    );
+    assert_eq!(seen.http_bodies.len(), CODEX_SENDS_PER_TRANSPORT);
+    assert!(seen
+        .http_bodies
+        .iter()
+        .all(|body| body == &provider.render_request(&opts())));
+}
+
+/// A refused upgrade's 429 without a server retry time ends the step, as Codex's `RetryLimit`
+/// does, and is not sent over HTTPS first.
+#[tokio::test]
+async fn codex_upgrade_429_without_retry_after_ends_the_step() {
+    let mock = Mock::start(vec![text_events()], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(capacity_refusal(None));
+    let mut provider = provider(&mock);
+    let waits = Arc::new(Mutex::new(Vec::new()));
+    provider.retry_clock.virtual_waits = Some(Arc::clone(&waits));
+    let events = step(&provider, 1, &opts()).await;
+    assert_eq!(attempts(&events).len(), 1);
+    let error = terminal_error(&events);
+    assert_eq!(error.status, Some(429));
+    assert_eq!(error.class, ErrorClass::Transient);
+    assert_eq!(error.retry_after_secs, None);
+    assert!(waits.lock().unwrap().is_empty());
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 1);
+    assert!(seen.http_bodies.is_empty());
+}
+
+/// A step deadline that comes before the server's time ends the step at once with
+/// `retry_after_exceeds_deadline`, keeping the server's time on the error, instead of waiting
+/// for a send the deadline would not allow.
+#[tokio::test]
+async fn codex_upgrade_retry_after_past_the_step_deadline_ends_the_step() {
+    let mock = Mock::start(vec![text_events()], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(capacity_refusal(Some("469")));
+    let provider = provider(&mock);
+    let body = provider.render_request(&opts());
+    let digest = RequestDigest::of(&body);
+    let mut request: PreparedHttpRequest = provider
+        .family
+        .endpoint(&provider.frozen, &provider.current_auth().auth, body)
+        .into();
+    request.family = Some(crate::spec::WireFamilyId::OpenAiResponsesChatgpt);
+    let (tx, mut rx) = mpsc::channel(256);
+    let logs = super::chunk_error_tests::ProviderWarnings::default();
+    let started = Instant::now();
+    let result = {
+        use tracing::instrument::WithSubscriber;
+        drive_step_attempts(
+            &provider.client,
+            &provider.clock,
+            request,
+            &digest,
+            None,
+            None,
+            || ToolNameRestoringNormalizer {
+                live_progress: None,
+                inner: provider.family.normalizer(&provider.frozen, StepId(1)),
+                names: Arc::new(crate::tool_name_alias::ToolNameMap::build(&[], &[])),
+            },
+            &tx,
+            &CancellationToken::new(),
+            Some(Instant::now() + Duration::from_secs(100)),
+            StepSeal {
+                seal: None,
+                step_id: StepId(1),
+                cache_ttl_ms: None,
+            },
+            &provider.retry_clock,
+            Some(&provider.websocket),
+            &AtomicUsize::new(0),
+        )
+        .with_subscriber(logs.clone())
+        .await
+    };
+    drop(tx);
+    while rx.recv().await.is_some() {}
+    let (error, retries_used) = result.expect_err("the step ends");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(retries_used, 0);
+    assert_eq!(error.status, Some(429));
+    assert_eq!(error.retry_after_secs, Some(469.0));
+    let warnings = logs.0.lock().unwrap();
+    let decision = warnings
+        .iter()
+        .find(|warning| warning.contains_key("retry_reason"))
+        .expect("the retry decision is logged");
+    assert_eq!(decision["retry_reason"], "retry_after_exceeds_deadline");
+    assert_eq!(mock.observed.lock().unwrap().handshakes, 1);
+}
+
+/// A caller cancel while the run waits out a long server retry time ends the run promptly, as
+/// Cancelled, without another send. The wait uses the real clock: it holds nothing the cancel
+/// has to get past.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_cancel_during_a_long_retry_after_wait_ends_the_run_cancelled() {
+    let mock = Mock::start(vec![], false, false).await;
+    *mock.upgrade_refusal.lock().unwrap() = Some(capacity_refusal(Some("469")));
+    let provider = provider(&mock);
+    let dir = broca_test_support::scratch_root().join(format!(
+        "ws-cancel-during-retry-wait-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let bind = BindIdentity::new(dir.join("project"), "websocket", "cancel-during-wait");
+    let wal = FileWalStore::new(dir.join("wal"));
+    let lease = FileLeaseStore::new(dir.join("lease"));
+    let plane = StubToolPlane::new();
+    let cancel = CancellationToken::new();
+    let control = broca_core::RunControl {
+        cancel: Some(cancel.clone()),
+        ..Default::default()
+    };
+    let (tx, mut rx) = mpsc::channel(256);
+    let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let canceller = async {
+        // The refusal and its attempt record come first; the cancel then lands in the wait.
+        broca_test_support::wait_until("the refused upgrade is recorded", || async {
+            let refused = mock.observed.lock().unwrap().handshakes >= 1;
+            let recorded = wal.read_records(&bind).is_ok_and(|records| {
+                records
+                    .iter()
+                    .any(|frame| matches!(frame.record, WalRecord::ModelAttemptFinished { .. }))
+            });
+            if refused && recorded {
+                Ok(())
+            } else {
+                Err(format!("refused={refused} recorded={recorded}"))
+            }
+        })
+        .await;
+        cancel.cancel();
+        Instant::now()
+    };
+    let run = broca_core::run_loop_with_control(
+        tool_run_request(&bind),
+        &provider,
+        &plane,
+        &lease,
+        &AllowAll,
+        &wal,
+        None,
+        control,
+        &tx,
+    );
+    let (summary, cancelled_at) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(run, canceller)
+    })
+    .await
+    .expect("the cancelled run ends without waiting out the server's time");
+    assert!(cancelled_at.elapsed() < Duration::from_secs(5));
+    assert_eq!(summary.unwrap().reason, RunFinishReason::Cancelled);
+    drop(tx);
+    collect.await.unwrap();
+    let seen = mock.observed.lock().unwrap();
+    assert_eq!(seen.handshakes, 1, "no re-send before the server's time");
+    assert!(seen.http_bodies.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
 }

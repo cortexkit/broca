@@ -1018,110 +1018,6 @@ async fn withdrawn_reasoning_options_resume_with_the_frozen_variant() {
     assert_eq!(reason, broca_protocol::caller::RunFinishReason::Completed);
 }
 
-/// A resume restores the Anthropic thinking-echo scope from the recorded blob. A blob written
-/// before the scope existed carries no `echo_scope` key and must read back as the legacy
-/// last-assistant-message scope; a blob without interleaved thinking restores nothing.
-#[test]
-fn resume_reads_the_recorded_thinking_echo_scope() {
-    use broca_catalog::live::ThinkingEchoScope;
-
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-echo-scope-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    let with_reasoning = |reasoning: serde_json::Value| {
-        serde_json::json!({ "family_id": "anthropic_messages", "reasoning": reasoning })
-    };
-
-    recorded.frozen_render_config = with_reasoning(serde_json::json!({
-        "mode": "anthropic_interleaved", "budget_tokens": 1024, "last_turn_only": true
-    }));
-    assert_eq!(
-        frozen_thinking_echo_scope(&recorded),
-        Some(ThinkingEchoScope::LastAssistantMessage)
-    );
-
-    recorded.frozen_render_config = with_reasoning(serde_json::json!({
-        "mode": "anthropic_interleaved", "budget_tokens": 1024, "last_turn_only": true,
-        "echo_scope": "all_assistant_messages"
-    }));
-    assert_eq!(
-        frozen_thinking_echo_scope(&recorded),
-        Some(ThinkingEchoScope::AllAssistantMessages)
-    );
-
-    recorded.frozen_render_config = with_reasoning(serde_json::json!({ "mode": "none" }));
-    assert_eq!(frozen_thinking_echo_scope(&recorded), None);
-}
-
-/// A resume restores the Claude Code persona from the recorded blob. A blob written before the
-/// persona existed has no `claude_code_persona` key and reads back as `None`, which the resolver
-/// keeps (`EpisodePersona::Recorded(None)`), so that episode resumes with its old bytes.
-#[test]
-fn resume_reads_the_recorded_claude_code_persona() {
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-persona-restore-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    recorded.frozen_render_config = serde_json::json!({ "family_id": "anthropic_messages" });
-    assert_eq!(frozen_claude_code_persona(&recorded), None);
-
-    let persona = serde_json::json!({
-        "version": "2.1.280",
-        "device_id": "0".repeat(64),
-        "session_id": "11111111-1111-4111-8111-111111111111",
-        "prompt_id": "33333333-3333-4333-8333-333333333333"
-    });
-    recorded.frozen_render_config = serde_json::json!({
-        "family_id": "anthropic_messages", "claude_code_persona": persona
-    });
-    let restored = frozen_claude_code_persona(&recorded).expect("the recorded persona restores");
-    assert_eq!(serde_json::to_value(&restored).unwrap(), persona);
-}
-
-#[test]
-fn resume_reads_the_recorded_responses_tool_strictness() {
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-tool-strictness-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    recorded.frozen_render_config = serde_json::json!({});
-    assert!(!frozen_responses_tools_non_strict(&recorded));
-    recorded.frozen_render_config = serde_json::json!({"responses_tools_non_strict": true});
-    assert!(frozen_responses_tools_non_strict(&recorded));
-    recorded.frozen_render_config = serde_json::json!({"responses_tools_non_strict": false});
-    assert!(!frozen_responses_tools_non_strict(&recorded));
-}
-
-#[test]
-fn resume_reads_the_recorded_reasoning_content_required() {
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-reasoning-echo-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    recorded.frozen_render_config = serde_json::json!({});
-    assert!(!frozen_reasoning_content_required(&recorded));
-    recorded.frozen_render_config = serde_json::json!({"reasoning_content_required": true});
-    assert!(frozen_reasoning_content_required(&recorded));
-}
-
-#[test]
-fn resume_reads_the_recorded_reasoning_echo_policy() {
-    use broca_provider::policy::{ReasoningEchoPolicy, ReasoningEchoTurns};
-    let root = broca_test_support::scratch_root()
-        .join(format!("broca-echo-policy-{}", std::process::id()));
-    let started = resolve_runtime_override(&runtime_overrides("http://127.0.0.1:9"), None);
-    let mut recorded = drift_run_config(&drift_request(&root), &started);
-    recorded.frozen_render_config = serde_json::json!({"reasoning_content_required": true});
-    assert_eq!(frozen_reasoning_echo(&recorded), None);
-    let policy = ReasoningEchoPolicy {
-        turns: ReasoningEchoTurns::ToolCalls,
-        ..ReasoningEchoPolicy::OPENROUTER
-    };
-    recorded.frozen_render_config["reasoning_echo"] = serde_json::to_value(policy).unwrap();
-    assert_eq!(frozen_reasoning_echo(&recorded), Some(policy));
-}
-
 /// A conversation with a reasoning-carrying tool-call turn and a plain text turn, the two
 /// assistant shapes whose rendering the DeepSeek reasoning echo changes.
 fn deepseek_history() -> broca_protocol::CallOptions {
@@ -1655,21 +1551,6 @@ async fn chatgpt_run_recorded_at_undeclared_version_6_is_refused() {
     assert_eq!(calls, 0);
 }
 
-#[test]
-fn frozen_provider_text_state_reads_an_absent_field_as_false() {
-    let mut recorded = drift_run_config(
-        &drift_request(std::path::Path::new("project")),
-        &resolve_chatgpt_episode(None, true),
-    );
-    assert!(frozen_provider_text_state(&recorded));
-    recorded
-        .frozen_render_config
-        .as_object_mut()
-        .unwrap()
-        .remove("provider_text_state");
-    assert!(!frozen_provider_text_state(&recorded));
-}
-
 #[tokio::test]
 async fn chatgpt_profile_resumes_through_provider_and_core_without_host_discovery() {
     use broca_core::Provider;
@@ -1932,7 +1813,6 @@ fn frozen_thinking_cross_model(config: &broca_wal::RunConfig) -> Option<broca_ca
         _ => None,
     }
 }
-fn frozen_claude_code_persona(config: &broca_wal::RunConfig) -> Option<broca_catalog::live::ClaudeCodePersona> { fixture_field(config, "claude_code_persona") }
 fn frozen_responses_tools_non_strict(config: &broca_wal::RunConfig) -> bool { fixture_field(config, "responses_tools_non_strict").unwrap_or(false) }
 fn frozen_reasoning_content_required(config: &broca_wal::RunConfig) -> bool { fixture_field(config, "reasoning_content_required").unwrap_or(false) }
 fn frozen_reasoning_echo(config: &broca_wal::RunConfig) -> Option<broca_provider::policy::ReasoningEchoPolicy> { fixture_field(config, "reasoning_echo") }

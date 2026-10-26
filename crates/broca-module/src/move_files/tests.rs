@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "websocket_tests.rs"]
+mod websocket;
 use crate::cut_state::CutStore;
 use crate::registry::{ActorHandle, LineageKey, LineageOpener, OpenError, RegistryHandle};
 use broca_core::WalStore;

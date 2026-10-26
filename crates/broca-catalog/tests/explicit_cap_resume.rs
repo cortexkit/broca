@@ -1,11 +1,5 @@
 //! An admitted episode keeps its output cap when the live catalog changes.
 
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!("SKIP explicit_cap_resume: re-run with -F broca-catalog/live");
-}
-
 #[cfg(feature = "live")]
 mod gated {
     use std::collections::BTreeMap;

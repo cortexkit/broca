@@ -6,6 +6,9 @@
 //! macOS, is assessed by the code-signing check the first time it runs, so per-file binaries made
 //! the suite slow to build and slow to start.
 
+// Fixtures deliberately prepare and inspect files outside the production seam.
+#![allow(clippy::disallowed_methods)]
+
 mod archive_inventory;
 mod archive_reader_perf;
 mod compaction_reader;

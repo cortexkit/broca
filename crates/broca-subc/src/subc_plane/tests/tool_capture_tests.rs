@@ -383,14 +383,3 @@ async fn over_store_maximum_is_a_marker_and_publishes_nothing() {
         0
     );
 }
-
-#[test]
-fn image_classifier_returns_decoded_bytes_awaiting_capture() {
-    assert!(broca_protocol::attachments_enabled());
-    let (result, pending) = map_call_tool_result(
-        &ToolCallId("capture-call".into()),
-        &json!({"content":[media_block("image", "image/png", &png())]}),
-    );
-    assert_eq!(pending.len(), 1);
-    assert_eq!(parts(&result).len(), 1);
-}

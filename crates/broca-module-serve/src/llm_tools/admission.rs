@@ -33,8 +33,8 @@ pub(super) fn hash(value: &Value) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Scope admission precedes argument decoding: a flow carrier cannot use an unscoped or
-/// agent-scoped bind even when the call's model-visible arguments are malformed.
+/// Scope admission precedes argument decoding so an invalid carrier scope cannot reach
+/// argument, catalog or storage admission.
 pub(super) fn admit(
     principal: Option<&BindPrincipal>,
     scope: &SendScope,
@@ -48,10 +48,35 @@ pub(super) fn admit(
     if broca_core::scope_admission::is_flow_only(principal)
         && stamp.and_then(|s| s.flow_id.as_ref()).is_none()
     {
-        return Err(refusal(
-            "flow_scope_required",
-            "Basal model tools require a daemon-stamped flow scope",
-        ));
+        let SendScope::Stamped(bind) = scope else {
+            return Err(basal_scope_required());
+        };
+        if !bind.owner_authorized
+            || bind.kind != broca_protocol::ScopeKind::Ephemeral
+            || bind.scope.agent_id.is_none()
+            || bind.scope.run_id.is_none()
+        {
+            return Err(basal_scope_required());
+        }
+        let Some(parent) = &bind.parent else {
+            return Err(basal_scope_required());
+        };
+        match bind.parent_state {
+            Some(broca_protocol::ParentState::Linked) => {}
+            Some(broca_protocol::ParentState::Pending) => {
+                return Err(Refusal::new(
+                    "parent_scope_pending",
+                    format!(
+                        "Basal program parent scope {} owned by {} at epoch {} has not synced with the daemon",
+                        parent.scope_ref,
+                        parent.owner.as_owner_string(),
+                        parent.scope_epoch,
+                    ),
+                )
+                .with_detail(RefusalDetail::new(ErrorClass::Transient)));
+            }
+            _ => return Err(basal_scope_required()),
+        }
     }
     let stamped = stamp.ok_or_else(|| {
         refusal(
@@ -142,4 +167,11 @@ pub(super) fn admit(
         params,
         provider: request.model.split('/').next().unwrap_or_default().into(),
     })
+}
+
+fn basal_scope_required() -> Refusal {
+    refusal(
+        "flow_scope_required",
+        "Basal model tools require a daemon-stamped flow or an authorized ephemeral program run with a linked parent scope",
+    )
 }
