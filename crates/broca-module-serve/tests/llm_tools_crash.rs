@@ -344,15 +344,34 @@ async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope(
     })
     .await;
     let request = json!({"name":"llm_classify","arguments":{"model":"typesafe/jev-1.13.0","questions":{"q":{"type":"noul","instructions":"Likely?"}},"item":{"state":"example private content"},"max_cost_usd":1},"call_key":"cingulate-admission"});
-    let reply = conn
-        .route_unary_reply(
-            &route,
-            serde_json::to_vec(&request).unwrap(),
-            Duration::from_secs(30),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+    // broca's route can open before the stand-in cerebellum has registered, and a call in that
+    // window fails closed as unreachable without writing anything, so it is asked again, as the
+    // private-content tests do. Any other refusal is the answer and fails the test.
+    let reply = broca_test_support::wait_until("a call that reaches cerebellum", || async {
+        match conn
+            .route_unary_reply(
+                &route,
+                serde_json::to_vec(&request).unwrap(),
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|error| format!("{error:?}"))?
+        {
+            Ok(reply) => Ok(reply),
+            Err(error)
+                if error
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("consent"))
+                    .and_then(Value::as_str)
+                    == Some("private_content_unreachable") =>
+            {
+                Err(format!("cerebellum is not reachable yet: {error:?}"))
+            }
+            Err(error) => panic!("the admission call was refused: {error:?}"),
+        }
+    })
+    .await;
     let reply: Value = serde_json::from_slice(&reply).unwrap();
     assert_eq!(
         reply["held"]["reason"], "consent",

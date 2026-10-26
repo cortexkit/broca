@@ -420,6 +420,17 @@ impl SessionClient {
         decode_result_envelope(&response, error_context)
     }
 
+    /// Replay a unary management operation without decoding either its reply or refusal body.
+    pub async fn management_raw(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<Result<Vec<u8>, Vec<u8>>, ConnError> {
+        self.conn
+            .route_request_terminal(&self.cmd_route, request_body(method, params)?)
+            .await
+    }
+
     /// Return the response body unchanged so callers that need byte fidelity can read it before
     /// any JSON decoding takes place.
     async fn request_raw<P: serde::Serialize>(

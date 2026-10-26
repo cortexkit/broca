@@ -9,6 +9,36 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "management-request-slow-warn-threshold"
+guards = "Management replies above two seconds are visible at WARN even with default INFO filtering"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::slow_management_request_warns_at_default_level"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "if elapsed_us > 2_000_000 {"
+new = "if elapsed_us > 3_000_000 { // NON-VACUITY BREAK: hide replies between two and three seconds."
+
+[[control]]
+id = "wal-bounded-tail-snapshot-not-safety-cap"
+guards = "A concurrent append after stat cannot turn the snapshot length into a one-byte-short safety cap"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::bounded_tail_snapshot_ignores_append_after_stat_without_loosening_cap"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = """    file.seek(SeekFrom::Start(start)).map_err(WalError::Io)?;
+    let mut suffix = Vec::new();
+    file.take(file_size - start)
+        .read_to_end(&mut suffix)
+        .map_err(WalError::Io)?;"""
+new = "let suffix = read_open_file_capped(file, start, file_size, file_size)?; // NON-VACUITY BREAK: treat the observed length as a safety cap."
+
+[[control]]
 id = "store-nonadvancing-projection-preserves-wal-anchor"
 platforms = ["linux", "macos"]
 guards = "A terminal-only projection preserves the byte anchor at the unchanged watermark so the next admission reads only the WAL tail"
@@ -5945,8 +5975,8 @@ target = "--test it"
 test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
 expect_red = ["plan_admission::reader_refuses_frozen_step_transform_session_without_plan"]
 file = "crates/broca-module-serve/src/serve.rs"
-old = "            if !handler.hook_plane_available() && handler.frozen_plan_requires_hooks(&session).await\n            {"
-new = "            if false && !handler.hook_plane_available() && handler.frozen_plan_requires_hooks(&session).await\n            { // NON-VACUITY BREAK: ignore the frozen transform plan"
+old = "            if !handler.hook_plane_available() && handler.frozen_plan_requires_hooks(session).await\n            {"
+new = "            if false && !handler.hook_plane_available() && handler.frozen_plan_requires_hooks(session).await\n            { // NON-VACUITY BREAK: ignore the frozen transform plan"
 
 [[control]]
 id = "anthropic-http-context-overflow-classification"
@@ -9028,8 +9058,8 @@ test_file = "crates/broca-module-serve/tests/it/plan_admission.rs"
 select = "expected"
 expect_red = ["plan_admission::approve_with_refuse_is_admitted_and_declaration_is_frozen"]
 file = "crates/broca-module-serve/src/serve.rs"
-old = "&& handler.frozen_plan_requires_approval(&session).await"
-new = "&& false && handler.frozen_plan_requires_approval(&session).await // NON-VACUITY BREAK: bypass frozen approval scope guard"
+old = "&& handler.frozen_plan_requires_approval(session).await"
+new = "&& false && handler.frozen_plan_requires_approval(session).await // NON-VACUITY BREAK: bypass frozen approval scope guard"
 
 [[control]]
 id = "serve-boot-terminal-withdrawal-debt"
@@ -24508,8 +24538,8 @@ test_file = "crates/broca-module-serve/src/serve.rs"
 expect_red = ["serve::tests::an_oversized_subscribe_unit_ends_the_stream_with_a_typed_error"]
 expect_message = "an oversized unit must end the stream with a typed error"
 file = "crates/broca-module-serve/src/serve.rs"
-old = "            if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {\n                let _ = send_undeliverable_unit("
-new = "            if frame_bytes > usize::MAX - 1 { // NON-VACUITY BREAK: no transport frame guard on stream data.\n                let _ = send_undeliverable_unit("
+old = "                    if frame_bytes > broca_wire::SUBC_MAX_FRAME_BYTES as usize {\n                        let _ = send_undeliverable_unit("
+new = "                    if frame_bytes > usize::MAX - 1 { // NON-VACUITY BREAK: no transport frame guard on stream data.\n                        let _ = send_undeliverable_unit("
 
 [[control]]
 id = "fanout-attach-builds-only-delivered-units"
