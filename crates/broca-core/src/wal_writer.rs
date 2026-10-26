@@ -28,7 +28,7 @@ use broca_wal::{
 };
 use tokio::sync::{broadcast, oneshot};
 
-use crate::lease::LeaseHandle;
+use crate::lease::{LeaseHandle, OwnedWalTenure};
 
 mod extraction;
 mod projection_reader;
@@ -2313,6 +2313,132 @@ impl WalHandle {
             check_store.check_move(&check_session, true)
         }));
         Ok((handle, lease))
+    }
+
+    /// Open and prove a session WAL under the caller-owned tenure, then start its
+    /// writer task which retains that tenure until the WAL is closed.
+    ///
+    /// The tenure is consumed: the blocking recovery closure owns it until the
+    /// descriptor exists, and the writer task owns it after that. No second
+    /// acquisition happens inside the store open; a second holder that tries to
+    /// acquire the same session while this writer lives gets `Held`. Cancellation
+    /// before the await returns leaves authority with the blocking closure until
+    /// its descriptor is gone, and cancellation after spawn leaves it with the
+    /// draining writer task. The caller gets only the handle, never a
+    /// separately droppable lease, so the lock cannot be released early while
+    /// the WAL stays writable.
+    pub async fn open_and_spawn_owned<W>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+    ) -> Result<WalHandle, WalOpenError>
+    where
+        W: WalStore + 'static,
+    {
+        Self::open_and_spawn_owned_with_retention(wal_store, session, tenure, observer, None).await
+    }
+
+    /// Like [`Self::open_and_spawn_owned`] but with admission's already-validated
+    /// first-send retention policy. The tenure remains owned through directory
+    /// selection and recovery.
+    pub async fn open_and_spawn_owned_with_retention<W>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+        retention: Option<u64>,
+    ) -> Result<WalHandle, WalOpenError>
+    where
+        W: WalStore + 'static,
+    {
+        Self::open_and_spawn_owned_with_class(wal_store, session, tenure, observer, retention, None)
+            .await
+    }
+
+    pub async fn open_and_spawn_owned_with_class<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+    ) -> Result<WalHandle, WalOpenError> {
+        // Bind before touching I/O: a wrong tenure refuses without creating
+        // directories or files, truncating a torn tail, or writing lineage.
+        // The tenure is consumed on both paths.
+        if let Err(error) = tenure.require_session(&session) {
+            return Err(WalOpenError::Failed(WalWriteError::Failed(format!(
+                "owned WAL open refused: {error}"
+            ))));
+        }
+        // The completed open, with deliberate teardown order. On cancellation
+        // the blocking task still runs to completion and its result is dropped
+        // without a receiver: this Drop closes the writable descriptor before
+        // the tenure releases, even on that path. Success moves both out and
+        // leaves this guard empty, so its drop is a no-op.
+        struct OpenedOwned {
+            wal: Option<Box<dyn Wal + Send>>,
+            lease: Option<Box<dyn LeaseHandle>>,
+            last_seq: u64,
+            fence: u64,
+        }
+        impl Drop for OpenedOwned {
+            fn drop(&mut self) {
+                let wal = self.wal.take();
+                drop(wal);
+                let lease = self.lease.take();
+                drop(lease);
+            }
+        }
+        let check_store = wal_store.clone();
+        let check_session = session.clone();
+        let opened = spawn_blocking(JobKind::WalWriter, move || {
+            // Authority stays with this closure until the descriptor is gone:
+            // no second acquisition happens here, the caller-owned lease is
+            // reused through the store open.
+            let lease = tenure.into_lease();
+            let fence = lease.epoch();
+            let (wal, lease) = wal_store
+                .open_writer(&session, retention, session_class.as_deref(), lease)
+                .map_err(WalOpenError::from_wal)?;
+            // `prove_recovery` drops the descriptor before returning its
+            // error, so by the time its Err reaches here the WAL is already
+            // closed and only the tenure remains in the guard below.
+            let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::Failed)?;
+            Ok::<_, WalOpenError>(OpenedOwned {
+                wal: Some(wal),
+                lease: Some(lease),
+                last_seq,
+                fence,
+            })
+        })
+        .await
+        .map_err(|error| {
+            WalOpenError::Failed(WalWriteError::Failed(format!(
+                "WAL open/recovery task failed: {error}"
+            )))
+        })??;
+        let mut opened = opened;
+        let wal = opened
+            .wal
+            .take()
+            .expect("owned open holds its WAL until handoff");
+        let lease = opened
+            .lease
+            .take()
+            .expect("owned open holds its tenure until handoff");
+        let (last_seq, fence) = (opened.last_seq, opened.fence);
+        // The writer task owns the lease until the WAL is closed: dropping the
+        // handle without shutdown still joins through the task, and shutdown
+        // joins before the task drops the lease. No separate lease is returned.
+        let mut handle = Self::spawn_proven_observed(wal, last_seq, fence, observer, Some(lease))
+            .map_err(WalOpenError::Failed)?;
+        handle.bind_media_capture(check_store.as_ref(), &check_session);
+        handle.move_check = Some(Arc::new(move || {
+            check_store.check_move(&check_session, true)
+        }));
+        Ok(handle)
     }
 
     fn prove_recovery(
