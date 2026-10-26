@@ -259,6 +259,16 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             description: Some("Acknowledge the stamped caller's late model-tool results.".into()),
         },
         ManagementOperation {
+            name: "permissions.list".into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Permissions routes only: list private-content grants for the operator.".into()),
+        },
+        ManagementOperation {
+            name: "permissions.revoke".into(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Permissions routes only: revoke one private-content grant for the operator.".into()),
+        },
+        ManagementOperation {
             name: OP_RESOLVE.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some(
@@ -463,6 +473,7 @@ pub fn manifest_configured(
             // its classifier `role.describe` lists.
             cortexkit_role_classifier::PROVIDES.to_string(),
             "tool-provider/v1".to_string(),
+            "permissions/v1".to_string(),
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
         ],
@@ -582,11 +593,11 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
+                "provides": ["llm-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),
-            "broca declares runner, agent-data, classifier and model-tool roles, flow and agent-run scope handling, and requires or denies nothing"
+            "broca declares runner, agent-data, classifier, model-tool and permissions roles, flow and agent-run scope handling, and requires or denies nothing"
         );
         //
         // `consumes` has skip_serializing_if = "Vec::is_empty" since subc-protocol 0.19.0, so

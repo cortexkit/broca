@@ -166,8 +166,15 @@ impl ConsentIo for FakeIo {
     async fn withdraw(&self, _: &SessionScope, id: &str) {
         self.withdrawn.lock().unwrap().push(id.into());
     }
-    async fn run_live(&self, _: &SessionScope) -> bool {
-        self.live.load(Ordering::SeqCst)
+    async fn run_live(
+        &self,
+        _: &SessionScope,
+    ) -> broca_module_serve::llm_tools::consent::RunLiveness {
+        if self.live.load(Ordering::SeqCst) {
+            broca_module_serve::llm_tools::consent::RunLiveness::Live
+        } else {
+            broca_module_serve::llm_tools::consent::RunLiveness::Ended
+        }
     }
 }
 

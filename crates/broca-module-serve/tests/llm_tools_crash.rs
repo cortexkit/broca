@@ -51,8 +51,11 @@ impl ConsentIo for DiskIo {
     async fn withdraw(&self, _: &SessionScope, id: &str) {
         std::fs::write(self.root.join("withdrawn"), id).unwrap();
     }
-    async fn run_live(&self, _: &SessionScope) -> bool {
-        true
+    async fn run_live(
+        &self,
+        _: &SessionScope,
+    ) -> broca_module_serve::llm_tools::consent::RunLiveness {
+        broca_module_serve::llm_tools::consent::RunLiveness::Live
     }
 }
 
