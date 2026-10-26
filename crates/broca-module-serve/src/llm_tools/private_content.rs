@@ -124,7 +124,6 @@ pub trait Asks: Send + Sync {
     /// Cerebellum's union of the scope and linked parent's marks, or `None` if unanswered.
     async fn marked(
         &self,
-        owner: Principal,
         scope_ref: &str,
         parent_scope_ref: Option<&str>,
     ) -> Option<broca_subc::PrivateContent>;
@@ -159,13 +158,12 @@ impl SubcAsks {
 impl Asks for SubcAsks {
     async fn marked(
         &self,
-        owner: Principal,
         scope_ref: &str,
         parent_scope_ref: Option<&str>,
     ) -> Option<broca_subc::PrivateContent> {
         match self
             .private_content
-            .query(&owner, scope_ref, parent_scope_ref)
+            .query(scope_ref, parent_scope_ref)
             .await
         {
             Ok(answer) => Some(answer),
@@ -348,7 +346,6 @@ impl PrivateContent {
             // Cerebellum deliberately keys marks by ref alone across owners and epochs. The
             // daemon-attested full parent remains in our cache key, but its ref is the query API.
             .marked(
-                identity.owner_principal(),
                 &identity.scope_ref,
                 identity
                     .parent
@@ -503,7 +500,6 @@ mod tests {
     impl Asks for Stub {
         async fn marked(
             &self,
-            _owner: Principal,
             _scope_ref: &str,
             _parent_scope_ref: Option<&str>,
         ) -> Option<broca_subc::PrivateContent> {

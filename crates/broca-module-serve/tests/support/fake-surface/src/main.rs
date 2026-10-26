@@ -306,6 +306,19 @@ fn manifest(module_id: &str) -> ModuleManifest {
 }
 
 fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Result<Vec<u8>, Vec<u8>> {
+    if method == "private_content.query" {
+        if let Some(field) = params.as_object().and_then(|params| {
+            params
+                .keys()
+                .find(|key| !matches!(key.as_str(), "scope_ref" | "parent_scope_ref"))
+        }) {
+            return Ok(serde_json::to_vec(&serde_json::json!({
+                "outcome": "invalid_request", "context": null, "session": null,
+                "detail": {"field": field, "reason_code": "unknown_field"}
+            }))
+            .unwrap());
+        }
+    }
     let refused = |code: &str, message: String| {
         serde_json::to_vec(&ErrorBody::new(code, message)).unwrap_or_default()
     };
@@ -338,6 +351,11 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
             Ok(value) => value,
             Err(error) => return Err(refused("internal_error", format!("bad fixture: {error}"))),
         };
+        // Cerebellum sends both answers and refusals as bare response bodies. Preserve the
+        // fixture bytes so the rig cannot hide a client that expects a result envelope.
+        if method == "private_content.query" {
+            return Ok(raw.as_bytes().to_vec());
+        }
         // A fixture that reads as an error is the module refusing the operation.
         if value.get("code").is_some() {
             return Err(serde_json::to_vec(&value).unwrap_or_default());
@@ -350,7 +368,7 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
     if method == "private_content.query" {
         let marked = text.contains("person_browser");
         return Ok(serde_json::to_vec(&serde_json::json!({
-            "result": {"private_content": marked, "sources": []}
+            "private_content": marked, "sources": []
         }))
         .unwrap_or_default());
     }
@@ -359,7 +377,6 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
         format!("the stand-in surface does not serve {method}"),
     ))
 }
-
 fn append(path: &PathBuf, line: &str) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -368,4 +385,42 @@ fn append(path: &PathBuf, line: &str) -> Result<(), String> {
         .map_err(|error| format!("open the request log: {error}"))?;
     file.write_all(line.as_bytes())
         .map_err(|error| format!("write the request log: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_content_rejects_unknown_params_with_a_normal_refusal_body() {
+        let response = answer(
+            &PathBuf::new(),
+            "private_content.query",
+            &serde_json::json!({
+                "scope_ref": "run", "owner": {"kind": "reserved", "module_id": "broca"}
+            }),
+        )
+        .unwrap();
+        let expected: serde_json::Value = serde_json::from_slice(br#"{"outcome":"invalid_request","context":null,"session":null,"detail":{"field":"owner","reason_code":"unknown_field"}}"#).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn private_content_default_answer_is_bare() {
+        let response = answer(
+            &PathBuf::new(),
+            "private_content.query",
+            &serde_json::json!({
+                "scope_ref": "run", "parent_scope_ref": "head"
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response).unwrap(),
+            serde_json::json!({"private_content": false, "sources": []})
+        );
+    }
 }

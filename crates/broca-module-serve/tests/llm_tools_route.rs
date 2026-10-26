@@ -880,16 +880,9 @@ struct ProgramMarks {
 impl broca_module_serve::llm_tools::Asks for ProgramMarks {
     async fn marked(
         &self,
-        owner: subc_protocol::Principal,
         scope_ref: &str,
         parent_scope_ref: Option<&str>,
     ) -> Option<broca_subc::PrivateContent> {
-        assert_eq!(
-            owner,
-            subc_protocol::Principal::Reserved {
-                module_id: "prefrontal-core".into()
-            }
-        );
         assert_eq!(scope_ref, "program-scope");
         self.queries
             .lock()

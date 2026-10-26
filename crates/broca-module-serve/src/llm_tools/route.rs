@@ -22,7 +22,6 @@ pub struct NoPrivateContent;
 impl super::Asks for NoPrivateContent {
     async fn marked(
         &self,
-        _owner: subc_protocol::Principal,
         _scope_ref: &str,
         _parent_scope_ref: Option<&str>,
     ) -> Option<broca_subc::PrivateContent> {

@@ -4,10 +4,10 @@
 //! The route asks cerebellum and Basal, so the rig has to answer as both. It does that with
 //! `fake-surface`, a stand-in module (its own package under `tests/support/fake-surface`) that
 //! declares the two management operations and serves them from a fixture file. `Stub::Answering`
-//! gives it a fixture; a fixture whose value is an error body is returned as the module's own
-//! refusal, which is how Basal's `flow_not_approved` and an unreadable cerebellum answer are
-//! delivered. The `owner` and `cingulate` stand-ins are `fake-aft-stub`, which declares no
-//! management surface, so the daemon refuses a request aimed at either of them.
+//! gives it a fixture. Cerebellum's answers and outcome refusals are bare response bodies;
+//! Basal's error bodies use error frames. The `owner` and `cingulate` stand-ins are
+//! `fake-aft-stub`, which declares no management surface, so the daemon refuses a request
+//! aimed at either of them.
 
 // The handoff uses /bin/sh and records kernel process identities for cleanup.
 // Those identity helpers are implemented only on Linux and macOS.
@@ -87,8 +87,8 @@ enum Stub {
     /// what a module that does not serve the operation answers, except `private_content.query`,
     /// which gets the stand-in's default answer (see `fake-surface`).
     Unreachable,
-    /// Use this JSON as the matching fixture's `stdout`: an error body refuses the request, any
-    /// other value is wrapped in `{result}`.
+    /// Use this JSON as the matching fixture's `stdout`: Cerebellum sends it verbatim;
+    /// Basal wraps answers in `{result}` and sends error bodies in error frames.
     Answering(&'static str),
 }
 
@@ -872,7 +872,7 @@ async fn unreachable_cerebellum_counts_as_marked_and_asks_again_on_every_call() 
     let Some(rig) = Rig::start(
         "unreachable",
         Stub::Answering(
-            r#"{"code":"private_content_unavailable","message":"cerebellum cannot tell"}"#,
+            r#"{"outcome":"invalid_request","context":null,"session":null,"detail":{"field":"owner","reason_code":"unknown_field"}}"#,
         ),
         Stub::Unreachable,
     )
@@ -922,6 +922,15 @@ async fn an_unmarked_run_calls_an_unlisted_provider() {
     let result = admitted_with_retry(&rig, &route, "unmarked").await;
     assert!(result["cost_usd"].is_number());
     assert_eq!(rig.cerebellum_queries(), 1);
+    let requests = std::fs::read_to_string(rig.root.join("cerebellum.requests")).unwrap();
+    let params: Value = serde_json::from_str(
+        requests
+            .lines()
+            .find_map(|line| line.strip_prefix("private_content.query "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(params, json!({"scope_ref": "run"}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

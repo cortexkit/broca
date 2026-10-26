@@ -957,12 +957,7 @@ impl ClassifierProvider for Provider {
 struct Marked;
 #[async_trait::async_trait]
 impl Asks for Marked {
-    async fn marked(
-        &self,
-        _: subc_protocol::Principal,
-        _: &str,
-        _: Option<&str>,
-    ) -> Option<broca_subc::PrivateContent> {
+    async fn marked(&self, _: &str, _: Option<&str>) -> Option<broca_subc::PrivateContent> {
         Some(broca_subc::PrivateContent {
             marked: true,
             sources: vec![broca_subc::SourceKind::PersonBrowser],
