@@ -4252,6 +4252,12 @@ mod executor {
         fn retire_all_transports(&self) {
             self.provider_client.chatgpt_connections().clear();
         }
+
+        fn retire_idle_session_transport(&self, session: &BindIdentity) {
+            self.provider_client
+                .chatgpt_connections()
+                .retire_idle_session(session);
+        }
     }
 
     #[cfg(test)]

@@ -42,6 +42,7 @@ fn cut_tool_events(ceiling: bool) -> Vec<Value> {
 
 #[derive(Default, Debug)]
 struct Observed {
+    closes_at_request: Vec<usize>,
     handshakes: usize,
     headers: Vec<BTreeMap<String, String>>,
     upgrade_bytes: Vec<Vec<u8>>,
@@ -212,7 +213,12 @@ impl Mock {
                             while let Some(Ok(message)) = socket.next().await {
                                 match message {
                                     WsMessage::Text(text) => {
-                                        seen.lock().unwrap().requests.push(text.as_bytes().to_vec());
+                                        {
+                                            let mut seen = seen.lock().unwrap();
+                                            let closes = seen.closes;
+                                            seen.closes_at_request.push(closes);
+                                            seen.requests.push(text.as_bytes().to_vec());
+                                        }
                                         notify.notify_one();
                                          let events = queue.lock().unwrap().pop_front().unwrap_or_else(text_events);
                                          let incomplete = !events.iter().any(|event| event["type"] == "response.completed");

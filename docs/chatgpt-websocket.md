@@ -29,13 +29,17 @@ owner keyed by the full session bind (project root, harness, session), on by def
 Each run borrows exclusively; other sessions cannot borrow its socket. Failure, changed
 authentication, cancellation, graceful stop and task abort retire it. Before reuse,
 all connection-scoped headers are compared exactly with the authenticated headers;
-only `x-codex-turn-metadata` is turn-scoped and is also sent in each request's current
-client metadata. A refreshed token requires a fresh
+only turn id and start time inside `x-codex-turn-metadata` may vary. Its stable
+installation/session/thread/window fields still fence the connection; current turn
+metadata is also sent in each request. A refreshed token requires a fresh
 handshake and discards old routing state. Run shutdown interrupts both reads and blocked
 request/Pong writes; even the final close write is bounded to one second. Frozen-versus-served account mismatches pause
 before any socket frame is sent. Failure budgets, forced HTTPS and server turn state
 remain run-local. The owner retains at most 64 idle sockets, evicts the oldest idle
-entry at capacity, and closes idle sockets after 10 minutes without requiring another
+entry at capacity. A shared 64 MiB conservative owned-receipt byte budget also evicts
+oldest idle entries; a single receipt over the budget is not retained. The charge
+includes string/array capacities and room for map storage, not process RSS. The owner
+closes idle sockets after 10 minutes without requiring another
 run. The 40-minute absolute age starts at establishment, never at checkout. Session
 close, deletion, move, observed credential rejection and shutdown discard retained
 state. Nothing is persisted; a restart begins with full input. A new
@@ -120,6 +124,14 @@ The named `previous_response_not_found` code is recognized before generic status
 including missing status and wrapped 400. Broca retires the failed socket and retries with full
 input through the normal accounted attempt loop, not a same-attempt resend. Retry advice is read from
 nested error headers first, with top-level fallback when nested advice is unusable.
+
+A move's busy probe retires only idle retained sockets, never an active run's
+transport. Invalidating an active entry cancels its socket without resetting that
+run's failure budget, forced-HTTPS choice or turn state. A server
+`websocket_connection_limit_reached` error closes that credential's idle retained
+sockets before the ordinary accounted retry, leaving other credentials and active
+runs alone. A reused socket that the peer closes after checkout is logged and still
+uses the existing accounted recovery path.
 
 ## Durable evidence
 

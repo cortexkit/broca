@@ -190,6 +190,9 @@ pub trait RunExecutor: Send + Sync + 'static {
     /// Discard authenticated connection state when a session is deleted or moved.
     fn retire_session_transport(&self, _session: &BindIdentity) {}
 
+    /// Drop only idle connections while a move probes whether a session is busy.
+    fn retire_idle_session_transport(&self, _session: &BindIdentity) {}
+
     /// Discard idle and borrowed connections after the module's shutdown grace period.
     fn retire_all_transports(&self) {}
 

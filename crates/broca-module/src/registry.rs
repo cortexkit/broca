@@ -435,6 +435,7 @@ enum Entry {
 #[async_trait]
 pub trait LineageOpener: Send + Sync {
     fn retire_session_transport(&self, _session: &LineageKey) {}
+    fn retire_idle_session_transport(&self, _session: &LineageKey) {}
     fn retire_all_transports(&self) {}
 
     async fn media_profile(
@@ -1109,7 +1110,7 @@ impl LineageRegistry {
                 guard.busy.push((key.clone(), busy));
                 guard.actors.push(release);
             }
-            self.inner.opener.retire_session_transport(&key);
+            self.inner.opener.retire_idle_session_transport(&key);
         }
         Ok(guard)
     }
@@ -4555,6 +4556,10 @@ mod tests {
     #[async_trait]
     impl LineageOpener for TransportOpener {
         fn retire_session_transport(&self, session: &LineageKey) {
+            self.retired.lock().unwrap().push(session.clone());
+        }
+
+        fn retire_idle_session_transport(&self, session: &LineageKey) {
             self.retired.lock().unwrap().push(session.clone());
         }
 

@@ -93,6 +93,10 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOp
         self.executor.retire_session_transport(session);
     }
 
+    fn retire_idle_session_transport(&self, session: &LineageKey) {
+        self.executor.retire_idle_session_transport(session);
+    }
+
     fn retire_all_transports(&self) {
         self.executor.retire_all_transports();
     }

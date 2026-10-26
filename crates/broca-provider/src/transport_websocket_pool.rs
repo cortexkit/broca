@@ -6,11 +6,22 @@ use std::{collections::HashMap, sync::Weak};
 
 const MAX_RETAINED: usize = 64;
 const MAX_IDLE: Duration = Duration::from_secs(10 * 60);
+const MAX_RECEIPT_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Default)]
 struct Entries {
     sessions: HashMap<BindIdentity, Entry>,
     next_lease: u64,
+    max_receipt_bytes: usize,
+}
+
+impl Default for Entries {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            next_lease: 0,
+            max_receipt_bytes: MAX_RECEIPT_BYTES,
+        }
+    }
 }
 
 struct Entry {
@@ -21,6 +32,7 @@ struct Entry {
 
 struct Retained {
     socket: Arc<Socket>,
+    receipt_bytes: usize,
     since: Instant,
     expiry: tokio::task::JoinHandle<()>,
 }
@@ -49,6 +61,14 @@ pub(in crate::transport) struct Lease {
 }
 
 impl Connections {
+    #[cfg(test)]
+    pub(in crate::transport) fn with_byte_budget(max_receipt_bytes: usize) -> Self {
+        Self(Arc::new(Mutex::new(Entries {
+            max_receipt_bytes,
+            ..Entries::default()
+        })))
+    }
+
     pub(in crate::transport) fn acquire(
         &self,
         bind: &BindIdentity,
@@ -108,6 +128,57 @@ impl Connections {
         }
     }
 
+    /// A move's busy probe must not disturb an active run, even when the move is refused.
+    pub fn retire_idle_session(&self, bind: &BindIdentity) {
+        let mut entries = self.0.lock().unwrap();
+        if entries
+            .sessions
+            .get(bind)
+            .is_some_and(|entry| entry.retained.is_some())
+        {
+            if let Some(entry) = entries.sessions.remove(bind) {
+                close_entry(entry);
+            }
+        }
+    }
+
+    pub(in crate::transport) fn retire_idle_credential(&self, request: &PreparedHttpRequest) {
+        let mut entries = self.0.lock().unwrap();
+        let keys: Vec<_> = entries
+            .sessions
+            .iter()
+            .filter_map(|(bind, entry)| {
+                let socket = &entry.retained.as_ref()?.socket;
+                let matches = match (&socket.credential_id, &request.credential_id) {
+                    (Some(saved), Some(current)) => saved == current,
+                    (None, None) => {
+                        let auth = |headers: &[(String, String)]| {
+                            headers
+                                .iter()
+                                .filter(|(name, _)| {
+                                    name.eq_ignore_ascii_case("authorization")
+                                        || name.eq_ignore_ascii_case("chatgpt-account-id")
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        };
+                        let saved = auth(&socket.headers);
+                        !saved.is_empty() && saved == auth(&request.headers)
+                    }
+                    _ => false,
+                };
+                matches.then(|| bind.clone())
+            })
+            .collect();
+        let retired = keys.len();
+        for key in keys {
+            if let Some(entry) = entries.sessions.remove(&key) {
+                close_entry(entry);
+            }
+        }
+        tracing::info!(target: "provider", reason = "connection_limit", retired, "Retiring credential's idle Responses websockets before accounted retry");
+    }
+
     /// Retire all authenticated state on credential revocation or executor shutdown.
     pub fn clear(&self) {
         let entries = std::mem::take(&mut self.0.lock().unwrap().sessions);
@@ -119,7 +190,7 @@ impl Connections {
 
 fn close_entry(entry: Entry) {
     if let Some(session) = entry.active.upgrade() {
-        session.close();
+        session.retire_socket();
     }
     if let Some(retained) = entry.retained {
         retained.socket.shutdown.cancel();
@@ -149,13 +220,30 @@ impl Lease {
             socket.shutdown.cancel();
             return;
         }
-        if entries
-            .sessions
-            .values()
-            .filter(|entry| entry.retained.is_some())
-            .count()
-            >= MAX_RETAINED
-        {
+        let receipt_bytes = socket.continuation.lock().unwrap().as_ref().map_or(
+            0,
+            crate::chatgpt_continuation::CompletedResponse::retained_bytes,
+        );
+        if receipt_bytes > entries.max_receipt_bytes {
+            socket.shutdown.cancel();
+            tracing::info!(target: "provider", reason = "receipt_too_large", "Retiring Responses websocket beyond retained receipt byte budget");
+            return;
+        }
+        loop {
+            let (count, bytes) = entries
+                .sessions
+                .values()
+                .filter_map(|entry| entry.retained.as_ref())
+                .fold((0usize, 0usize), |(count, bytes), retained| {
+                    (count + 1, bytes + retained.receipt_bytes)
+                });
+            let reason = if count >= MAX_RETAINED {
+                "capacity"
+            } else if bytes + receipt_bytes > entries.max_receipt_bytes {
+                "receipt_bytes"
+            } else {
+                break;
+            };
             let oldest = entries
                 .sessions
                 .iter()
@@ -171,7 +259,7 @@ impl Lease {
                 if let Some(entry) = entries.sessions.remove(&oldest) {
                     close_entry(entry);
                 }
-                tracing::info!(target: "provider", reason = "capacity", "Retiring retained Responses websocket");
+                tracing::info!(target: "provider", reason, "Retiring retained Responses websocket");
             }
         }
         let deadline = (now + MAX_IDLE).min(socket.established_at + MAX_SOCKET_AGE);
@@ -201,6 +289,7 @@ impl Lease {
                 active: Weak::new(),
                 retained: Some(Retained {
                     socket,
+                    receipt_bytes,
                     since: now,
                     expiry,
                 }),
@@ -222,5 +311,29 @@ impl Drop for Lease {
                 close_entry(entry);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_retirement_preserves_per_run_fallback_and_turn_state() {
+        let pool = Connections::default();
+        let session = Arc::new(Session::default());
+        let bind = BindIdentity::new("/project", "harness", "session");
+        let _lease = pool.acquire(&bind, &session).unwrap();
+        {
+            let mut state = session.state.lock().unwrap();
+            state.failures = 3;
+            state.force_https = true;
+            state.turn_state = Some("current-turn".into());
+        }
+        pool.retire_session(&bind);
+        let state = session.state.lock().unwrap();
+        assert_eq!(state.failures, 3);
+        assert!(state.force_https);
+        assert_eq!(state.turn_state.as_deref(), Some("current-turn"));
     }
 }

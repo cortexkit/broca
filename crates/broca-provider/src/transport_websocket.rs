@@ -340,6 +340,12 @@ impl Default for Session {
 }
 
 impl Session {
+    fn retire_socket(&self) {
+        if let Some(socket) = self.state.lock().unwrap().socket.take() {
+            socket.shutdown.cancel();
+        }
+    }
+
     fn take_completed_socket(&self) -> Option<Arc<Socket>> {
         let mut state = self.state.lock().unwrap();
         let socket = state.socket.take()?;
@@ -567,16 +573,33 @@ fn connection_identity_matches(socket: &Socket, request: &PreparedHttpRequest) -
     {
         return false;
     }
-    // Turn metadata is sent on every response.create too. All other headers, including
-    // credentials, account and routing, must still match exactly before reusing a socket.
-    let connection_scoped = |(name, _): &&(String, String)| {
-        !request.codex_wire || !name.eq_ignore_ascii_case("x-codex-turn-metadata")
+    // Turn id/time also travel in every response.create. Stable identity inside the
+    // metadata header, and every other header, still fence the authenticated connection.
+    socket.headers.len() == request.headers.len()
+        && socket.headers.iter().zip(&request.headers).all(
+            |((saved_name, saved), (name, current))| {
+                saved_name == name
+                    && if request.codex_wire && name.eq_ignore_ascii_case("x-codex-turn-metadata") {
+                        stable_turn_metadata_matches(saved, current)
+                    } else {
+                        saved == current
+                    }
+            },
+        )
+}
+
+fn stable_turn_metadata_matches(saved: &str, current: &str) -> bool {
+    let stable = |text: &str| {
+        let mut value: Value = serde_json::from_str(text).ok()?;
+        let object = value.as_object_mut()?;
+        object.remove("turn_id");
+        object.remove("turn_started_at_unix_ms");
+        Some(value)
     };
-    socket
-        .headers
-        .iter()
-        .filter(connection_scoped)
-        .eq(request.headers.iter().filter(connection_scoped))
+    match (stable(saved), stable(current)) {
+        (Some(saved), Some(current)) => saved == current,
+        _ => saved == current,
+    }
 }
 
 struct AttemptActivity(tokio::sync::watch::Sender<bool>);
@@ -850,6 +873,12 @@ pub(super) async fn drive(
         if trace.transport.as_deref() != Some("websocket") {
             return failure;
         }
+        if trace.socket_reused == Some(true)
+            && session.state.lock().unwrap().socket.as_ref()
+                .is_some_and(|socket| socket.closed.load(Ordering::Acquire))
+        {
+            tracing::info!(target: "provider", reason = "peer_closed_after_checkout", "Reused Responses websocket closed; leaving recovery to the accounted attempt loop");
+        }
         // An upgrade refused for authentication is not a socket failure: the shared 401 path
         // re-reads the credential and tries the socket again, so it must not count toward the
         // switch to HTTPS for the rest of the run.
@@ -1093,6 +1122,12 @@ async fn drive_socket(
         if let Ok(raw) = &record {
             if let Ok(value) = serde_json::from_slice(raw) {
                 session.observe_turn_state(&value);
+                if value["type"] == "error"
+                    && value.pointer("/error/code").and_then(Value::as_str)
+                        == Some("websocket_connection_limit_reached")
+                {
+                    client.chatgpt_connections.retire_idle_credential(request);
+                }
                 if value["type"] == "response.completed" {
                     *completed_id.lock().unwrap() =
                         value["response"]["id"].as_str().map(str::to_owned);
