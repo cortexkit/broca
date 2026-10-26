@@ -1058,11 +1058,7 @@ async fn record_paid(
     })
     .await?;
     if held {
-        let service_for_flush = Arc::clone(service);
-        tokio::task::spawn_blocking(move || service_for_flush.flush_facts())
-            .await
-            .map_err(|_| internal_refusal("usage export task failed"))?
-            .map_err(|_| internal_refusal("usage export is unavailable; re-send the batch"))?;
+        service.publish_facts().await?;
         let mut metrics = service.metrics.lock().unwrap_or_else(|p| p.into_inner());
         match &outcome_for_metrics.outcome {
             Outcome::Answered(_) => metrics.items_answered += 1,

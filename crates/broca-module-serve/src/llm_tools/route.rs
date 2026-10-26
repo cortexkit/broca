@@ -284,6 +284,7 @@ impl LlmTools {
                     &self
                         .system
                         .replay_tool(&admission.params, stored)
+                        .await
                         .map_err(error)?,
                 );
                 if held.is_some() {
@@ -570,3 +571,7 @@ fn convert(reply: &RawValue) -> Answer {
     })?;
     Ok(result)
 }
+
+#[cfg(test)]
+#[path = "route_tests.rs"]
+mod tests;
