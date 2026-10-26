@@ -465,3 +465,100 @@ fn preview_preserves_all_files_and_lease_epochs_and_respects_live_writers() {
     drop(lease);
     assert_eq!(sweep(&root).unwrap().objects_removed, 1);
 }
+
+#[derive(Default)]
+struct CountingSteps {
+    listed: usize,
+    synced: usize,
+}
+
+impl StorageSteps for CountingSteps {
+    fn reached(&mut self, step: Step) -> io::Result<()> {
+        match step {
+            Step::WalDirectoryListed => self.listed += 1,
+            Step::WalDirectorySynced => self.synced += 1,
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn no_media_skips_wal_scan_and_barrier() {
+    let (root, store, session) = fixture();
+    // A large unrelated WAL directory proves the per-deletion cost does not
+    // scale with directory size: the fixed code performs no WAL listing at all.
+    let wal_dir = root.join("wal-ephemeral");
+    broca_owner_only::create_dir_all(&wal_dir).unwrap();
+    for n in 0..50u32 {
+        fs::write(wal_dir.join(format!("{n:016x}.wal")), b"unrelated").unwrap();
+    }
+    // Even with a live WAL present there is nothing to protect, so removal
+    // succeeds without scanning or syncing.
+    let live = wal_dir.join(format!("{}.wal", session_addr(&session)));
+    fs::write(&live, b"live").unwrap();
+    let mut steps = CountingSteps::default();
+    store.remove_session_with(&session, &mut steps).unwrap();
+    assert_eq!(
+        steps.listed, 0,
+        "no-media deletion must not list WAL directories"
+    );
+    assert_eq!(
+        steps.synced, 0,
+        "no-media deletion must skip the WAL barrier"
+    );
+}
+
+#[test]
+fn with_media_uses_exact_checks_not_wal_listings() {
+    let (root, store, session) = fixture();
+    let path = accepted(&root, &store, &session);
+    broca_owner_only::create_dir_all(root.join("wal-ephemeral")).unwrap();
+    for n in 0..50u32 {
+        fs::write(
+            root.join("wal-ephemeral").join(format!("{n:016x}.wal")),
+            b"unrelated",
+        )
+        .unwrap();
+    }
+    fs::remove_file(path).unwrap();
+    let mut steps = CountingSteps::default();
+    store.remove_session_with(&session, &mut steps).unwrap();
+    assert_eq!(
+        steps.listed, 0,
+        "media deletion must not list WAL directories; exact checks only"
+    );
+    assert!(
+        steps.synced > 0,
+        "the WAL barrier must still run before dropping media entries"
+    );
+    assert!(!manifest(&store, &session).exists());
+}
+
+#[test]
+fn deleting_exact_check_refuses_while_deleting_exists() {
+    let (root, store, session) = fixture();
+    let path = accepted(&root, &store, &session);
+    fs::remove_file(path).unwrap();
+    let address = session_addr(&session);
+    let lineage = "testlineage";
+    let expired = root
+        .join("wal-ephemeral")
+        .join(format!("{address}.expired"));
+    broca_owner_only::create_dir_all(&expired).unwrap();
+    fs::write(expired.join(lineage), br#"{"lineage_id":"testlineage"}"#).unwrap();
+    let deleting = root
+        .join("wal-ephemeral")
+        .join(format!("{address}.{lineage}.deleting"));
+    fs::write(&deleting, b"deleting").unwrap();
+    let mut steps = CountingSteps::default();
+    assert!(
+        store.remove_session_with(&session, &mut steps).is_err(),
+        "an exact .deleting match must refuse like the old prefix scan"
+    );
+    assert_eq!(steps.listed, 0);
+    fs::remove_file(&deleting).unwrap();
+    let mut steps = CountingSteps::default();
+    store.remove_session_with(&session, &mut steps).unwrap();
+    assert!(!manifest(&store, &session).exists());
+}

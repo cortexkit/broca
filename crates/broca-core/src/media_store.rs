@@ -333,6 +333,11 @@ enum Step {
     RefsSynced,
     WalAppended,
     WalDirectorySynced,
+    // Test seam: counted by the regression tests to prove no WAL directory is
+    // listed. Production code intentionally never emits it after the fix, so
+    // allow the resulting dead-code warning in non-test builds.
+    #[allow(dead_code)]
+    WalDirectoryListed,
 }
 
 trait StorageSteps {
