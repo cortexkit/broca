@@ -36,7 +36,10 @@
 use broca_protocol::{provider::NormalizedEvent, request::CallOptions, StepContext, StepId};
 use serde_json::{json, Value};
 
-use crate::families::gemini::{build_request_body, GeminiNormalizer};
+use crate::families::gemini::{
+    build_request_body, build_request_body_with_media, GeminiNormalizer,
+};
+use crate::media_render::{InlineMedia, MediaRender};
 use crate::sse::SseDecoder;
 use crate::wire::{
     AuthHandle, FrozenRenderConfig, HttpMethod, HttpRequest, NormalizeError, StreamNormalizer,
@@ -68,64 +71,76 @@ const ENVELOPE_REQUEST_TYPE: &str = "agent";
 
 pub struct GoogleCodeAssist;
 
+fn build_envelope(frozen: &FrozenRenderConfig, opts: &CallOptions, mut inner: Value) -> Value {
+    // Start with the shared Gemini body, then apply the generation defaults selected by the
+    // frozen Antigravity wire tier. Different Gemini families use different thinking knobs.
+    apply_antigravity_generation_defaults(&mut inner, frozen);
+
+    // requestId MUST be deterministic — REQUIRE the run/step identity. A missing
+    // step_context is a precondition violation (the loop always populates it); rendering
+    // a default/empty/random id here would be a silent cache-stability break no golden
+    // catches (goldens always populate it). Fail loud instead.
+    let step = opts.step_context.as_ref().unwrap_or_else(|| {
+        panic!(
+            "google_codeassist render requires CallOptions.step_context (the deterministic \
+                 requestId derives from run_id + step_index); it was None"
+        )
+    });
+    let request_id = if let Some(identity) = &frozen.codeassist_identity {
+        let index = identity.step_offset.saturating_add(step.step_index);
+        inner["sessionId"] = json!(identity.session_id);
+        inner["labels"] = json!({
+            "last_step_index": index.saturating_sub(1).to_string(),
+            "trajectory_id": identity.trajectory_id,
+            "used_claude": "false",
+            "used_claude_conservative": "false",
+        });
+        // Real clients use wall-clock millis per call. Pin the time at admission and
+        // advance it per step so rendering a retry or a resumed step never reads a clock.
+        let timestamp = identity
+            .admitted_at_ms
+            .saturating_add(step.step_index.saturating_sub(1));
+        format!(
+            "agent/{}/{timestamp}/{}/{index}",
+            identity.agent_id, identity.trajectory_id
+        )
+    } else {
+        build_request_id(step)
+    };
+
+    let project = frozen.project_id.clone().unwrap_or_else(|| {
+        panic!("google_codeassist render requires FrozenRenderConfig.project_id; it was missing")
+    });
+    let envelope = json!({
+        "project": project,
+        "requestId": request_id,
+        "request": inner,
+        "model": frozen.wire_model_id,
+        "userAgent": ENVELOPE_USER_AGENT,
+        "requestType": ENVELOPE_REQUEST_TYPE,
+    });
+    // The shaped envelope value. `render` emits it with canonical (sorted-key) bytes —
+    // the same determinism mechanism every JSON family uses. The backend parses JSON without
+    // depending on object-key order. Sorting keys gives equivalent envelopes stable bytes for
+    // cache/resume hashing.
+    envelope
+}
+
 impl WireFamily for GoogleCodeAssist {
     fn shape(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-        // Start with the shared Gemini body, then apply the generation defaults selected by the
-        // frozen Antigravity wire tier. Different Gemini families use different thinking knobs.
-        let mut inner = build_request_body(frozen, opts);
-        apply_antigravity_generation_defaults(&mut inner, frozen);
+        build_envelope(frozen, opts, build_request_body(frozen, opts))
+    }
 
-        // requestId MUST be deterministic — REQUIRE the run/step identity. A missing
-        // step_context is a precondition violation (the loop always populates it); rendering
-        // a default/empty/random id here would be a silent cache-stability break no golden
-        // catches (goldens always populate it). Fail loud instead.
-        let step = opts.step_context.as_ref().unwrap_or_else(|| {
-            panic!(
-                "google_codeassist render requires CallOptions.step_context (the deterministic \
-                 requestId derives from run_id + step_index); it was None"
-            )
-        });
-        let request_id = if let Some(identity) = &frozen.codeassist_identity {
-            let index = identity.step_offset.saturating_add(step.step_index);
-            inner["sessionId"] = json!(identity.session_id);
-            inner["labels"] = json!({
-                "last_step_index": index.saturating_sub(1).to_string(),
-                "trajectory_id": identity.trajectory_id,
-                "used_claude": "false",
-                "used_claude_conservative": "false",
-            });
-            // Real clients use wall-clock millis per call. Pin the time at admission and
-            // advance it per step so rendering a retry or a resumed step never reads a clock.
-            let timestamp = identity
-                .admitted_at_ms
-                .saturating_add(step.step_index.saturating_sub(1));
-            format!(
-                "agent/{}/{timestamp}/{}/{index}",
-                identity.agent_id, identity.trajectory_id
-            )
-        } else {
-            build_request_id(step)
-        };
-
-        let project = frozen.project_id.clone().unwrap_or_else(|| {
-            panic!(
-                "google_codeassist render requires FrozenRenderConfig.project_id; it was missing"
-            )
-        });
-        let envelope = json!({
-            "project": project,
-            "requestId": request_id,
-            "request": inner,
-            "model": frozen.wire_model_id,
-            "userAgent": ENVELOPE_USER_AGENT,
-            "requestType": ENVELOPE_REQUEST_TYPE,
-        });
-        // The shaped envelope value. `render` emits it with canonical (sorted-key) bytes —
-        // the same determinism mechanism every JSON family uses. The backend parses JSON
-        // order-independently, so the reference's insertion order isn't wire-required; sorted
-        // keys keep this family consistent with the cache/resume hash domain (and the
-        // envelope field set is fixed, so the bytes are stable).
-        envelope
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[InlineMedia<'_>],
+    ) -> Value {
+        let media = MediaRender { frozen, payloads };
+        let inner =
+            build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media));
+        build_envelope(frozen, opts, inner)
     }
 
     fn endpoint(
