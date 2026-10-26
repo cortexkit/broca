@@ -954,32 +954,47 @@ impl OpenAiChatNormalizer {
                 .and_then(Value::as_u64)
                 .or_else(|| u.get(k).and_then(Value::as_u64))
         };
-        // INCLUSIVE, SO SUBTRACTED: OpenAI's `cache_write_tokens` is part of `prompt_tokens`,
-        // exactly like `cached_tokens`. Measured live on 2026-09-28 against metered chat
-        // completions with `gpt-6-luna` and one ~3.2k-token prompt: the writing call reported
-        // prompt_tokens 3173 with cache_write_tokens 3170 and total_tokens 3177 (prompt plus 4
-        // completion), and the reading call prompt_tokens 3173 with cached_tokens 3170. The
-        // openai-python type lists it in the prompt-token breakdown ("The unadjusted number of
-        // prompt tokens written to cache"), and OpenRouter's documented example (prompt 194,
-        // write 100, total 196) fits the same reading. Leaving it inside fresh input counted
-        // every written token twice.
+        // INCLUSIVE, SO SUBTRACTED: both spellings of the cache-write count are part of
+        // `prompt_tokens`, exactly like `cached_tokens`, so each must come out of fresh input or
+        // every written token is counted twice -- once as fresh input, once as a cache write.
         //
-        // NOT SUBTRACTED: `cache_creation_input_tokens`. No captured response in this repo shows
-        // whether a gateway using that spelling (Alibaba) counts it inside `prompt_tokens`, so
-        // it is recorded without touching fresh input. Reopen this with an Alibaba capture.
-        match at("cache_write_tokens") {
+        // `cache_write_tokens` (OpenAI, OpenRouter): measured live on 2026-09-28 against metered
+        // chat completions with `gpt-6-luna` and one ~3.2k-token prompt. The writing call
+        // reported prompt_tokens 3173 with cache_write_tokens 3170 and total_tokens 3177 (prompt
+        // plus 4 completion), and the reading call prompt_tokens 3173 with cached_tokens 3170.
+        // The openai-python type lists it in the prompt-token breakdown ("The unadjusted number
+        // of prompt tokens written to cache"), and OpenRouter's documented example (prompt 194,
+        // write 100, total 196) fits the same reading.
+        //
+        // `cache_creation_input_tokens` (Alibaba / DashScope Model Studio) counts inside
+        // `prompt_tokens` too, per the provider's own documentation:
+        //
+        // - Context Cache (<https://www.alibabacloud.com/help/en/model-studio/context-cache>),
+        //   explicit-cache usage example: the first request reports prompt_tokens 2174 with cache
+        //   creation 2156 and cache hits 0, and the next request reports prompt_tokens 2174 with
+        //   creation 0 and hits 2156. The same page computes uncached input as prompt_tokens
+        //   minus creation minus hits, and its FAQ says tokens after the cache marker count in
+        //   the input total but in neither creation nor hits. Billing treats creation (about
+        //   125% of input), hits (10%) and the rest (standard) as three prices for ONE token
+        //   class, not as charges on top of each other.
+        // - Chat Completions reference
+        //   (<https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-openai-chat-completions>):
+        //   `total_tokens = prompt_tokens + completion_tokens`, and
+        //   `cache_creation_input_tokens` is listed as a detail OF `prompt_tokens`.
+        //
+        // WHEN BOTH SPELLINGS APPEAR, `cache_write_tokens` wins and the two are never added:
+        // they name the same counter, so summing them would report one write twice. A response
+        // carrying both is a gateway translating between spellings, not a provider counting two
+        // separate kinds of writes.
+        let written = at("cache_write_tokens").or_else(|| at("cache_creation_input_tokens"));
+        match written {
             Some(written) => merge_inclusive_input_tokens_with_writes(
                 &mut self.usage,
                 g("prompt_tokens"),
                 cached,
                 Some(written),
             ),
-            None => {
-                merge_inclusive_input_tokens(&mut self.usage, g("prompt_tokens"), cached);
-                if let Some(x) = at("cache_creation_input_tokens") {
-                    self.usage.cache_write_tokens = Some(x);
-                }
-            }
+            None => merge_inclusive_input_tokens(&mut self.usage, g("prompt_tokens"), cached),
         }
         let completion = g("completion_tokens");
         let reasoning = u
