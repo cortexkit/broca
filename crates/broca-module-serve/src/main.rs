@@ -729,7 +729,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         )),
         Arc::new(broca_subc::FlowProvidersClient::new(
             plan_conn.clone(),
-            llm_tools_identity,
+            llm_tools_identity.clone(),
         )),
     ));
     let held_calls = Arc::new(broca_module_serve::llm_tools::held::HeldCalls::new(
@@ -749,11 +749,25 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?,
             llm_tools_asks,
         )
-        .with_held(held_calls),
+        .with_held(held_calls.clone())
+        .with_consent(
+            Arc::new(broca_module_serve::llm_tools::consent::Consent::new(
+                held_calls.store.clone(),
+                Arc::new(broca_module_serve::llm_tools::consent::SubcConsentIo::new(
+                    plan_conn.clone(),
+                    llm_tools_identity,
+                    scope_describer.clone(),
+                )),
+            )),
+            registry.stopping_signal(),
+        ),
     );
     llm_tools
         .recover_authorized()
         .map_err(|error| ServeIoError(format!("recover authorized held calls: {error}")))?;
+    llm_tools
+        .recover_consent()
+        .map_err(|error| ServeIoError(format!("recover consent cards: {error}")))?;
     let agent_data = Arc::new(broca_module_serve::agent_data::AgentDataService::new(
         state_root.clone(),
         registry.as_ref().clone(),

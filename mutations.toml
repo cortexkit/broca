@@ -29394,8 +29394,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
 expect_red = ["memory_private_unknown_provider_is_not_dispatched"]
 file = "crates/broca-module-serve/src/llm_tools/route.rs"
-old = "        if stored.is_none() && held.is_none() {\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
-new = "        if stored.is_none() && held.is_none() && admission.provider == \"never-a-provider\" { // NON-VACUITY BREAK: skip the policy for a fresh call.\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
+old = "if stored.is_none() && held.is_none() {"
+new = "if stored.is_none() && held.is_none() && admission.provider == \"never-a-provider\" { // NON-VACUITY BREAK: skip the policy for a fresh call."
 
 [[control]]
 id = "llm-tool-single-flight-joins-waiters"
@@ -29680,8 +29680,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
 expect_red = ["llm_tools::private_content::tests::a_marked_run_needs_approval_for_an_unlisted_provider_and_files_nothing"]
 file = "crates/broca-module-serve/src/llm_tools/private_content.rs"
-old = "        if !marked.marked {\n            return Ok(());\n        }\n        // A live grant would also admit here; this code does not consult grants yet."
-new = "        if true { // NON-VACUITY BREAK: call a marked scope provider without asking anyone.\n            return Ok(());\n        }\n        // A live grant would also admit here; this code does not consult grants yet."
+old = "        if !marked.marked {\n            return Ok(());\n        }\n        // The route checks live grants before acting on this policy's consent refusal."
+new = "        if true { // NON-VACUITY BREAK: call a marked scope provider without asking anyone.\n            return Ok(());\n        }\n        // The route checks live grants before acting on this policy's consent refusal."
 
 [[control]]
 id = "llm-tool-private-content-unrecognized-source-files-no-card"
@@ -31050,8 +31050,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
 expect_red = ["joining_replacement_and_restart_never_extend_individual_deadlines"]
 file = "crates/broca-store/src/grants.rs"
-old = "row.card_id = card.card_id.clone();"
-new = "row.card_id = card.card_id.clone(); row.deadline_at_ms += HOLD_MS; // NON-VACUITY BREAK: refile extends the deadline."
+old = "row.card_id = card.card_id.clone();\n                if card.card_id.is_some() { row.state = HeldState::Held; }"
+new = "row.card_id = card.card_id.clone(); row.deadline_at_ms += HOLD_MS; // NON-VACUITY BREAK: refile extends the deadline.\n                if card.card_id.is_some() { row.state = HeldState::Held; }"
 
 [[control]]
 id = "llm-held-authorization-source-cas"
@@ -31206,8 +31206,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
 expect_red = ["answer_page_is_atomic_first_decision_wins_and_revoke_survives_replay"]
 file = "crates/broca-store/src/grants.rs"
-old = "if matches!(card.state, CardState::Allowed | CardState::Denied) {"
-new = "if false && matches!(card.state, CardState::Allowed | CardState::Denied) { /* NON-VACUITY BREAK: reapply settled cards. */"
+old = "if matches!(card.state, CardState::Allowed | CardState::Denied) { continue; }"
+new = "if false && matches!(card.state, CardState::Allowed | CardState::Denied) { continue; } /* NON-VACUITY BREAK: reapply settled cards. */"
 
 [[control]]
 id = "llm-held-late-run-allow"
@@ -31338,3 +31338,328 @@ expect_red = ["authorized_replay_uses_first_admitted_request_bytes"]
 file = "crates/broca-module-serve/src/llm_tools/route.rs"
 old = "admission.params.clone_from(params);"
 new = "let _ = params; // NON-VACUITY BREAK: execute the retry's re-encoded request."
+
+[[control]]
+id = "llm-consent-filing-key-lock"
+guards = "One key serializes the request through reply persistence"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["concurrent_same_content_files_one_card_and_replacement_serializes_delayed_reply"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "let lock = self.key_lock(&request.dedup_key);\n        let filing_guard = lock.lock().await;"
+new = "let _lock = self.key_lock(&request.dedup_key); let filing_guard = Arc::new(()); // NON-VACUITY BREAK: do not hold the key lock across filing."
+
+[[control]]
+id = "llm-consent-join-same-content"
+guards = "Identical concurrent calls join the existing pending card"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["concurrent_same_content_files_one_card_and_replacement_serializes_delayed_reply"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "if current.state == CardState::Pending && current.content == card.content {"
+new = "if false && current.state == CardState::Pending && current.content == card.content { // NON-VACUITY BREAK: file a duplicate."
+
+[[control]]
+id = "llm-consent-refusal-is-final"
+guards = "Every explicit requester refusal ends consent_unavailable and mints no grant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["filing_refusals_finalize_without_grants_but_transport_and_unreadable_stay_filing"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "Err(ConsentError::Refused { .. }) => {"
+new = "Err(ConsentError::Refused { .. }) if false => { // NON-VACUITY BREAK: mistake refusals for uncertain delivery."
+
+[[control]]
+id = "llm-consent-recovery-lookup-before-refile"
+guards = "A settled answer is adopted before sending a replacement"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["recovery_reads_all_pages_before_refiling_and_adopts_a_settled_card"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "if !self.scan(&scope, key, now).await? {"
+new = "if false && !self.scan(&scope, key, now).await? { // NON-VACUITY BREAK: refile before looking for an answer."
+
+[[control]]
+id = "llm-consent-recovery-lookup-after-refile"
+guards = "A second lookup adopts a card answered while the replacement was in flight"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["recovery_adopts_older_answer_after_refile_and_opposite_duplicate_cannot_win"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "let lookup_complete = self.scan(&scope, key, now).await?;"
+new = "let lookup_complete = true; // NON-VACUITY BREAK: skip the lookup after persisting the replacement."
+
+[[control]]
+id = "llm-consent-replaced-await-fence"
+guards = "An old waiter cannot settle a surviving replacement card"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["stale_await_after_replacement_cannot_authorize_the_new_card"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "if current.card_id != card.card_id {"
+new = "if false && current.card_id != card.card_id { // NON-VACUITY BREAK: let an obsolete waiter settle the new card."
+
+[[control]]
+id = "llm-consent-reference-fence"
+guards = "Only the card reference shared by its held calls can decide it"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["uncorrelated_answer_never_mints_a_grant"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = '|| record.fields.get("requester_ref").and_then(Value::as_str)'
+new = '|| false && record.fields.get("requester_ref").and_then(Value::as_str) /* NON-VACUITY BREAK: accept another reference. */'
+
+[[control]]
+id = "llm-consent-late-run-liveness"
+guards = "A late run-only answer for an ended or unknown run records no grant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["late_answers_keep_24h_grants_but_ended_run_allow_records_nothing"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "let run_live = !matches!(decision, Decision::AllowRun) || self.io.run_live(scope).await;"
+new = "let run_live = true; let _ = scope; // NON-VACUITY BREAK: mint a late grant for an ended run."
+
+[[control]]
+id = "llm-consent-await-observed-decision-time"
+guards = "The deadline race uses the reply time rather than the time await started"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["await_reply_after_deadline_cannot_authorize_with_wait_start_time"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "self.settle_calls(&current, (self.clock)())?;"
+new = "self.settle_calls(&current, now)?; // NON-VACUITY BREAK: authorize using the stale wait-start clock."
+
+[[control]]
+id = "llm-consent-caller-format-gate"
+guards = "An undeclared caller is never given a held reply it cannot collect"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["real_tool_path_captures_card_golden_and_ordinary_or_keyless_route_never_holds"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "let hold_caller = if reads_held_reply {"
+new = "let hold_caller = if true { let _ = reads_held_reply; // NON-VACUITY BREAK: hold an undeclared caller."
+
+[[control]]
+id = "llm-consent-dedup-generation"
+guards = "Revocation selects a fresh consent card key without using a raw consumer call key"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["dedup_key_uses_full_scope_provider_and_revocation_generation"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = '"generation":self.store.generation(agent,provider)?'
+new = '"generation":0 /* NON-VACUITY BREAK: reuse a revoked card key. */'
+
+[[control]]
+id = "llm-consent-late-answer-cutoff"
+guards = "An await crossing the last deadline plus 24 hours records no late grant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["await_crossing_late_answer_cutoff_records_no_grant"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "if reading_closed {"
+new = "if false && reading_closed { // NON-VACUITY BREAK: intentionally ignore the late cutoff."
+
+[[control]]
+id = "llm-consent-no-expiry-capability"
+guards = "Only Cingulate advertising no-expiry may receive a card without a deadline"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+expect_red = ["llm_tools::consent::tests::no_expiry_requires_target_capability"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "module == broca_subc::consent::CONSENT_MODULE"
+new = "matches!(module, _) /* NON-VACUITY BREAK: accept another provider's declaration. */"
+
+[[control]]
+id = "llm-consent-published-provider-name-required"
+guards = "A missing published provider name refuses before filing, never exposing an id"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["missing_provider_display_name_refuses_before_card_or_hold_is_written"]
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = "row.provider_name.as_deref()?"
+new = 'row.provider_name.as_deref().unwrap_or("provider identifier") /* NON-VACUITY BREAK: display an identifier when the provider has no name. */'
+
+[[control]]
+id = "llm-consent-catalog-name-prefix"
+guards = "Published provider names must be requested, not lost by the fact prefix filter"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::requested_display_name_facts_reach_decision_rows_without_id_fallbacks"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = '"provider.",'
+new = '/* NON-VACUITY BREAK: stop requesting provider names. */'
+
+[[control]]
+id = "llm-consent-catalog-name-preservation"
+guards = "A nameless same-version poll must not erase cached published names or their LKG copy"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::same_version_names_rebuild_and_survive_nameless_polls_and_restart"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = "if current.carries_display_names {"
+new = "if false && current.carries_display_names { // NON-VACUITY BREAK: erase names on a same-version poll."
+
+[[control]]
+id = "llm-consent-catalog-open-facts"
+guards = "Unknown provider facts do not exclude a valid decision-model row"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::unknown_provider_fact_is_ignored_without_excluding_a_served_row"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = 'display_name: display_name_fact(facts, "model.name").unwrap_or_default(),'
+new = 'display_name: { if facts.keys().any(|key| key.starts_with("provider.") && key != "provider.name") { let _ = model_kind_fact(identity, &BTreeMap::from([("model.kind".into(), serde_json::json!({}))]))?; } display_name_fact(facts, "model.name").unwrap_or_default() }, /* NON-VACUITY BREAK: close the provider fact vocabulary. */'
+
+[[control]]
+id = "llm-consent-catalog-same-version-name-rebuild"
+guards = "Newly requested display-name facts rebuild an equal-version nameless LKG index"
+runner = "cargo"
+package = "broca-catalog"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-catalog/src/runtime.rs"
+expect_red = ["runtime::tests::same_version_names_rebuild_and_survive_nameless_polls_and_restart"]
+file = "crates/broca-catalog/src/runtime.rs"
+old = "|| response_carries_display_names(&response) != current.carries_display_names"
+new = "/* NON-VACUITY BREAK: reuse a nameless index when names first arrive. */"
+
+[[control]]
+id = "llm-consent-recovery-locks-page-keys"
+guards = "Recovery settles every page's cards under their own filing locks"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["recovery_page_locks_every_card_without_cross_key_deadlock"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "if key != active_key {"
+new = "if false && key != active_key { // NON-VACUITY BREAK: settle another key during filing."
+
+[[control]]
+id = "llm-consent-recovery-scope-lock-order"
+guards = "Two recoveries acquire their shared feed lock before taking different key locks"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["recovery_page_locks_every_card_without_cross_key_deadlock"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "let _feed_guard = feed.lock().await;\n        let lock = self.key_lock(key);\n        let _guard = lock.lock().await;"
+new = "let lock = self.key_lock(key);\n        let _guard = lock.lock().await;\n        let _feed_guard = feed.lock().await; // NON-VACUITY BREAK: invert the feed/key lock order."
+
+[[control]]
+id = "llm-consent-recovery-post-lookup-owed"
+guards = "A durable refile id stays filing until the second recovery lookup completes"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["failed_post_refile_lookup_remains_filing_across_restart"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "filed.state = if recovering {"
+new = "filed.state = if false && recovering { // NON-VACUITY BREAK: forget the post-refile lookup after a crash."
+
+[[control]]
+id = "llm-consent-recovery-late-answer-cutoff"
+guards = "An unrelated recovery page cannot revive a card whose reading window ended"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["recovery_feed_never_revives_a_card_past_its_last_reading_deadline"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "if !answer_in_window {"
+new = "if false && !answer_in_window { // NON-VACUITY BREAK: adopt an answer beyond another card's reading window."
+
+[[control]]
+id = "llm-consent-held-live-grant-reconciliation"
+guards = "A new 24-hour grant resumes calls already held in another run without another card"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["a_new_24h_grant_releases_a_different_runs_waiting_call_without_refiling"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "if row.state != HeldState::Held {"
+new = "if row.state == HeldState::Held { // NON-VACUITY BREAK: skip held calls covered by a live grant."
+
+[[control]]
+id = "llm-consent-held-settled-card-startup"
+guards = "Startup does not strand a held row whose card and grant committed before authorization"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["startup_resumes_a_held_call_whose_card_and_grant_committed_before_authorization"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "for row in consent.store.recovering(self.system.tool_now())? {"
+new = "for row in std::iter::empty::<HeldCall>() { // NON-VACUITY BREAK: ignore held rows under settled cards."
+
+[[control]]
+id = "llm-consent-late-deny-preserves-deadline-outcome"
+guards = "A deny after the deadline records policy but cannot relabel the old call denied"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_consent"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
+expect_red = ["a_late_deny_records_the_run_deny_but_the_overdue_call_is_pending"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "let outcome = if now >= row.deadline_at_ms {"
+new = "let outcome = if false && now >= row.deadline_at_ms { // NON-VACUITY BREAK: relabel a timed-out call as denied."

@@ -615,6 +615,8 @@ pub(super) async fn run_inner(
         let frozen: FrozenRow = serde_json::from_str(&admission.frozen_row)
             .map_err(|_| internal_refusal("the stored tool price does not decode"))?;
         Some(broca_catalog::ModelBatchRow {
+            model_name: None,
+            provider_name: None,
             kind: Some(DECISION_KIND.into()),
             context_tokens: None,
             attachment: false,

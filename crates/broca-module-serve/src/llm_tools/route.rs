@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use broca_protocol::{BindPrincipal, SendScope};
-use broca_store::grants::{GrantsStore, HeldCall, HeldState};
+use broca_store::grants::{GrantsStore, HeldCall, HeldState, HoldRequest};
 use broca_store::system_one::{BatchScope, Outcome, StoredBatch};
 use cortexkit_llm_tools::classify;
 use cortexkit_role_classifier::errors::Refusal;
@@ -63,6 +63,9 @@ pub struct LlmTools {
     private_content: PrivateContent,
     flights: Mutex<HashMap<String, Flight>>,
     held: Arc<super::held::HeldCalls>,
+    consent: Option<Arc<super::consent::Consent>>,
+    consent_workers: Mutex<std::collections::HashSet<String>>,
+    consent_stop: tokio_util::sync::CancellationToken,
 }
 
 impl LlmTools {
@@ -81,6 +84,9 @@ impl LlmTools {
             config,
             private_content,
             flights: Mutex::new(HashMap::new()),
+            consent: None,
+            consent_workers: Mutex::new(std::collections::HashSet::new()),
+            consent_stop: tokio_util::sync::CancellationToken::new(),
             held: Arc::new(super::held::HeldCalls::new(
                 Arc::new(GrantsStore::open_in_memory().expect("in-memory grants store opens")),
                 crate::serve::process_launch_id().into(),
@@ -91,6 +97,117 @@ impl LlmTools {
     pub fn with_held(mut self, held: Arc<super::held::HeldCalls>) -> Self {
         self.held = held;
         self
+    }
+
+    pub fn with_consent(
+        mut self,
+        consent: Arc<super::consent::Consent>,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        assert!(
+            Arc::ptr_eq(&consent.store, &self.held.store),
+            "consent and replay must share their authority"
+        );
+        self.consent = Some(consent);
+        self.consent_stop = stop;
+        self
+    }
+
+    pub fn recover_consent(self: &Arc<Self>) -> Result<(), broca_store::grants::GrantsError> {
+        if let Some(consent) = &self.consent {
+            for card in consent.store.pending_cards()? {
+                self.watch_consent(card.dedup_key);
+            }
+            for row in consent.store.recovering(self.system.tool_now())? {
+                if matches!(row.state, HeldState::Filing | HeldState::Held) {
+                    self.watch_consent(row.dedup_key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn watch_consent(self: &Arc<Self>, key: String) {
+        if !self
+            .consent_workers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.clone())
+        {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let work = async {
+                let Some(consent) = &service.consent else {
+                    return;
+                };
+                loop {
+                    let now = service.system.tool_now();
+                    if let Err(error) = consent.resume_granted(now).await {
+                        tracing::warn!(%error, "held-call grant reconciliation failed");
+                    }
+                    let _ = service.recover_authorized();
+                    let Ok(Some(card)) = consent.store.card(&key) else {
+                        return;
+                    };
+                    let Ok(rows) = consent.store.card_calls(&key, now) else {
+                        return;
+                    };
+                    if rows
+                        .last()
+                        .is_none_or(|row| now >= row.deadline_at_ms.saturating_add(86_400_000))
+                    {
+                        return;
+                    }
+                    if matches!(
+                        card.state,
+                        broca_store::grants::CardState::Allowed
+                            | broca_store::grants::CardState::Denied
+                    ) {
+                        let _ = service.recover_authorized();
+                        let waiting = consent.store.card_calls(&key, now).is_ok_and(|rows| {
+                            rows.iter()
+                                .any(|row| matches!(row.state, HeldState::Filing | HeldState::Held))
+                        });
+                        if !waiting {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    if card.state == broca_store::grants::CardState::Filing {
+                        if let Err(error) = consent.recover(&key, now).await {
+                            tracing::warn!(%error, "consent filing recovery failed");
+                        }
+                    } else {
+                        match consent.wait_once(&key, now).await {
+                            Ok(false) => {
+                                if let Err(error) =
+                                    consent.resume_granted(service.system.tool_now()).await
+                                {
+                                    tracing::warn!(%error, "held-call grant reconciliation failed");
+                                }
+                                let _ = service.recover_authorized();
+                                return;
+                            }
+                            Ok(true) => (),
+                            Err(error) => {
+                                tracing::warn!(%error, "consent await persistence failed")
+                            }
+                        }
+                    }
+                    let _ = service.recover_authorized();
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            };
+            tokio::select! { _ = service.consent_stop.cancelled() => (), _ = work => () }
+            service
+                .consent_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+        });
     }
 
     /// Only previously authorized rows dispatch on startup. Filing and held rows remain in
@@ -117,18 +234,31 @@ impl LlmTools {
                     params,
                 };
                 let _ = service
-                    .call(admission, true, &SendScope::Internal, Some(row))
+                    .call(admission, true, &SendScope::Internal, Some(row), None)
                     .await;
             });
         }
         Ok(())
     }
 
+    /// In-process entrypoint for callers that already support held replies. Wire routes must
+    /// use `answer_with_capabilities` with the daemon's bind declaration instead.
     pub async fn answer(
         self: &Arc<Self>,
         body: &[u8],
         principal: Option<&BindPrincipal>,
         scope: &SendScope,
+    ) -> Answer {
+        self.answer_with_capabilities(body, principal, scope, true)
+            .await
+    }
+
+    pub async fn answer_with_capabilities(
+        self: &Arc<Self>,
+        body: &[u8],
+        principal: Option<&BindPrincipal>,
+        scope: &SendScope,
+        reads_held_reply: bool,
     ) -> Answer {
         let call: ToolCallRequest = serde_json::from_slice(body)
             .map_err(|e| error(Refusal::invalid_params("request", e.to_string())))?;
@@ -177,7 +307,13 @@ impl LlmTools {
                 } else {
                     None
                 };
-                self.call(admission, call.call_key.is_some(), scope, held)
+                let caller = principal.map(BindPrincipal::as_owner_string);
+                let hold_caller = if reads_held_reply {
+                    caller.as_deref().zip(call.call_key.as_deref())
+                } else {
+                    None
+                };
+                self.call(admission, call.call_key.is_some(), scope, held, hold_caller)
                     .await
             }
             _ => Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
@@ -216,6 +352,7 @@ impl LlmTools {
             "semantics":1, "capabilities":[], "description":"Classify one item with a decision model.",
             "input_schema":schema,
             "modes":cortexkit_llm_tools::MODES,
+            "result_format":cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY,
         });
         if self.config.advertise_tags {
             tool["capabilities"] = json!([classify::TAG]);
@@ -242,12 +379,16 @@ impl LlmTools {
         keyed: bool,
         scope: &SendScope,
         held: Option<HeldCall>,
+        hold_caller: Option<(&str, &str)>,
     ) -> Answer {
         if let Some(row) = &held {
             match row.state {
                 HeldState::Final => return super::held::HeldCalls::final_reply(row),
                 HeldState::Filing | HeldState::Held => {
-                    return super::held::HeldCalls::held_reply(row)
+                    if hold_caller.is_none() {
+                        return Err(super::held::not_started("consent_required").into_bytes());
+                    }
+                    return super::held::HeldCalls::held_reply(row);
                 }
                 HeldState::Authorized => {
                     let Some(params) = &row.request else {
@@ -327,9 +468,93 @@ impl LlmTools {
         // a repeat must return the bytes it already paid for even after the operator's list
         // changed or cerebellum started marking the scope.
         if stored.is_none() && held.is_none() {
-            self.private_content
-                .admit(scope, &admission.provider)
-                .await?;
+            if let Err(refusal) = self.private_content.admit(scope, &admission.provider).await {
+                let reason: Value = serde_json::from_slice(&refusal).unwrap_or(Value::Null);
+                let consent_reason = reason["detail"]["consent"].as_str().unwrap_or("");
+                if !matches!(
+                    consent_reason,
+                    "consent_required" | "private_content_unknown" | "private_content_unreachable"
+                ) {
+                    return Err(refusal);
+                }
+                let Some(consent) = &self.consent else {
+                    return Err(refusal);
+                };
+                let SendScope::Stamped(bind) = scope else {
+                    return Err(refusal);
+                };
+                let agent = bind.scope.agent_id.as_deref().unwrap_or("");
+                let identity = super::consent::identity(&bind.scope);
+                let now = self.system.tool_now();
+                if consent
+                    .store
+                    .denied(agent, &identity, &admission.provider)
+                    .map_err(consent_error)?
+                {
+                    return Err(super::held::not_started("denied").into_bytes());
+                }
+                if !consent
+                    .granted(&bind.scope, &admission.provider, now)
+                    .await
+                    .map_err(consent_error)?
+                {
+                    if consent_reason != "consent_required" {
+                        return Err(refusal);
+                    }
+                    let Some((principal, call_key)) = hold_caller else {
+                        return Err(refusal);
+                    };
+                    let params: Value =
+                        serde_json::from_str(&admission.params).map_err(consent_error)?;
+                    let model = params["model"].as_str().unwrap_or("");
+                    let display_row = self.system.tool_model_row(model);
+                    let Some((provider_label, model_label)) = display_row
+                        .as_ref()
+                        .and_then(crate::system_one::consent_model_labels)
+                    else {
+                        return Err(super::held::not_started("consent_unavailable").into_bytes());
+                    };
+                    let sources = self.private_content.card_sources(scope).await;
+                    let dedup_key = consent
+                        .dedup_key(agent, &admission.provider, &identity)
+                        .map_err(consent_error)?;
+                    let body = broca_subc::consent_card::private_content_card(
+                        provider_label,
+                        model_label,
+                        &sources,
+                        &dedup_key,
+                    )
+                    .map_err(consent_error)?;
+                    let frozen = serde_json::to_value(&pricing).map_err(consent_error)?;
+                    let row = consent
+                        .file(
+                            HoldRequest {
+                                batch_id: admission.batch_id.clone(),
+                                scope: identity,
+                                batch_scope: admission.scope.clone(),
+                                principal: principal.into(),
+                                call_key: call_key.into(),
+                                agent_id: agent.into(),
+                                provider: admission.provider.clone(),
+                                model: model.into(),
+                                request: admission.params.clone(),
+                                args_digest: admission.args_digest.clone(),
+                                frozen_row: frozen["frozen_row"].as_str().unwrap_or("").into(),
+                                dedup_key: dedup_key.clone(),
+                                admitted_at_ms: now,
+                            },
+                            body,
+                            now,
+                        )
+                        .await
+                        .map_err(consent_error)?;
+                    self.watch_consent(dedup_key);
+                    return match row.state {
+                        HeldState::Final => super::held::HeldCalls::final_reply(&row),
+                        _ => super::held::HeldCalls::held_reply(&row),
+                    };
+                }
+            }
         }
         let receiver = {
             let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
@@ -435,6 +660,11 @@ impl LlmTools {
         }
         Ok(())
     }
+}
+
+fn consent_error(error: impl std::fmt::Display) -> Vec<u8> {
+    tracing::warn!(%error, "model-tool consent is unavailable");
+    super::held::not_started("consent_unavailable").into_bytes()
 }
 
 async fn await_flight(mut receiver: watch::Receiver<Option<Answer>>) -> Answer {

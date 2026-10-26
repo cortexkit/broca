@@ -189,6 +189,17 @@ pub struct ModelPin {
 /// answer, and be billed, as 1.13.0.
 const JEV_1_13_0_WIRE: &str = cortexkit_role_classifier::provider::models::JEV_1_13_0;
 
+/// Consent uses only the catalog's human labels. A missing display fact is not permission
+/// to show a provider or model identifier on the person's approval card.
+pub(crate) fn consent_model_labels(row: &ModelBatchRow) -> Option<(&str, &str)> {
+    let provider = row.provider_name.as_deref()?;
+    let model = row.model_name.as_deref()?;
+    if provider.trim().is_empty() || model.trim().is_empty() {
+        return None;
+    }
+    Some((provider, model))
+}
+
 impl ModelPin {
     /// TypeSafe's Jev 1.13.0, text only. Its question limit is the role's own question-id
     /// space at the clef bound, since TypeSafe states none.
@@ -404,6 +415,10 @@ impl SystemOne {
         stored: Option<&broca_store::system_one::StoredBatch>,
     ) -> Result<ToolAdmission, Refusal> {
         classify::admit_tool(self, params, stored)
+    }
+
+    pub(crate) fn tool_model_row(&self, model: &str) -> Option<ModelBatchRow> {
+        self.catalog.row(model)
     }
 
     pub(crate) fn replay_tool(
@@ -748,6 +763,8 @@ mod tool_admission_tests {
         fn row(&self, _: &str) -> Option<ModelBatchRow> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.present.load(Ordering::SeqCst).then(|| ModelBatchRow {
+                model_name: None,
+                provider_name: None,
                 kind: Some("decision".into()),
                 context_tokens: None,
                 attachment: false,

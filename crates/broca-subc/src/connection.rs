@@ -1197,6 +1197,33 @@ impl SubcConnection {
         outcome
     }
 
+    /// Native integration probes need to declare the same paired result formats as a held
+    /// tool-plane caller. This opener is absent from release builds and grants no identity.
+    #[cfg(debug_assertions)]
+    pub async fn route_open_tool_provider_held_v1_for_tests(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
+    ) -> ConnResult<RouteHandle> {
+        self.route_open_target_with_capabilities(
+            RouteTarget::ToolProvider {
+                module_id: module_id.into(),
+            },
+            identity,
+            scope,
+            Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+            Some(vec![
+                cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY.into(),
+                cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
+            ]),
+        )
+        .await
+    }
+
     /// Open an unscoped module-level role using the same bind translation and retry machinery
     /// as step-transform hooks. The caller bounds the entire route-open future.
     pub(crate) async fn route_open_role_within(

@@ -254,7 +254,30 @@ impl GrantsStore {
     }
 
     pub fn hold(&self, request: HoldRequest) -> Result<HoldAdmission> {
+        self.hold_with_card(request, None)
+    }
+
+    /// Persist the initial display body with the call so a crash before the network send
+    /// never leaves filing recovery dependent on a fresh catalog or private-content query.
+    pub fn hold_with_card(
+        &self,
+        request: HoldRequest,
+        card: Option<&Card>,
+    ) -> Result<HoldAdmission> {
         self.write(|tx| {
+            if let Some(card) = card {
+                if card.dedup_key != request.dedup_key
+                    || card.scope != request.scope
+                    || card.agent_id != request.agent_id
+                    || card.provider != request.provider
+                    || card.state != CardState::Filing
+                    || card.card_id.is_some()
+                {
+                    return Err(GrantsError(
+                        "initial consent card does not match held call".into(),
+                    ));
+                }
+            }
             if let Some(row) = read_call(tx, &request.batch_id, request.admitted_at_ms)? {
                 return Ok(
                     if row.scope != request.scope
@@ -269,6 +292,12 @@ impl GrantsStore {
                         HoldAdmission::Replay(row)
                     },
                 );
+            }
+            if let Some(card) = card {
+                tx.execute(
+                    "INSERT INTO cards VALUES (?1,?2) ON CONFLICT(dedup_key) DO NOTHING",
+                    params![card.dedup_key, encode(card)?],
+                )?;
             }
             tx.execute(
                 "DELETE FROM late_results WHERE batch_id=?1",
@@ -308,6 +337,16 @@ impl GrantsStore {
                     encode(&row)?
                 ],
             )?;
+            let mut row = row;
+            if card.is_some() {
+                if let Some(existing) = read_card(tx, &row.dedup_key)? {
+                    if existing.card_id.is_some() {
+                        row.card_id = existing.card_id;
+                        row.state = HeldState::Held;
+                        save_call(tx, &row)?;
+                    }
+                }
+            }
             Ok(HoldAdmission::Inserted(row))
         })
     }
@@ -343,6 +382,51 @@ impl GrantsStore {
             &self.conn.lock().unwrap_or_else(|p| p.into_inner()),
             dedup_key,
         )
+    }
+
+    /// Final calls remain discoverable while their cards may still receive a late answer.
+    pub fn card_calls(&self, dedup_key: &str, now_ms: i64) -> Result<Vec<HeldCall>> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn.prepare("SELECT body FROM held_calls WHERE dedup_key=?1 AND admitted_at_ms>?2 ORDER BY admitted_at_ms")?;
+        let rows = stmt.query_map(
+            params![dedup_key, now_ms.saturating_sub(RETENTION_MS)],
+            |r| r.get::<_, String>(0),
+        )?;
+        rows.map(|r| decode(&r?)).collect()
+    }
+
+    pub fn pending_cards(&self) -> Result<Vec<Card>> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn.prepare("SELECT body FROM cards ORDER BY dedup_key")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let cards: Vec<Card> = rows.map(|r| decode(&r?)).collect::<Result<_>>()?;
+        Ok(cards
+            .into_iter()
+            .filter(|card| matches!(card.state, CardState::Filing | CardState::Pending))
+            .collect())
+    }
+
+    /// A requester refusal means there is no card to wait on and mints no run denial.
+    pub fn refuse_card(&self, dedup_key: &str, body: &str, now_ms: i64) -> Result<()> {
+        self.write(|tx| {
+            let Some(card) = read_card(tx, dedup_key)? else {
+                return Ok(());
+            };
+            if matches!(card.state, CardState::Allowed | CardState::Denied) {
+                return Ok(());
+            }
+            let mut stmt = tx.prepare(
+                "SELECT body FROM held_calls WHERE dedup_key=?1 AND state IN ('filing','held')",
+            )?;
+            let rows = stmt
+                .query_map([dedup_key], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for row in rows {
+                finalize(tx, decode(&row)?, FinalKind::NotStarted, body, true, now_ms)?;
+            }
+            tx.execute("DELETE FROM cards WHERE dedup_key=?1", [dedup_key])?;
+            Ok(())
+        })
     }
 
     pub fn generation(&self, agent_id: &str, provider: &str) -> Result<u64> {
@@ -408,6 +492,26 @@ impl GrantsStore {
         answers: &[CardAnswer],
         now_ms: i64,
     ) -> Result<()> {
+        self.apply_answers(scope, Some(cursor), answers, now_ms)
+    }
+
+    /// An await result settles a card without advancing the recovery feed cursor.
+    pub fn apply_answer(
+        &self,
+        scope: &ScopeIdentity,
+        answer: CardAnswer,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.apply_answers(scope, None, &[answer], now_ms)
+    }
+
+    fn apply_answers(
+        &self,
+        scope: &ScopeIdentity,
+        cursor: Option<&str>,
+        answers: &[CardAnswer],
+        now_ms: i64,
+    ) -> Result<()> {
         self.write(|tx| {
             for answer in answers {
                 let Some(mut card) = read_card(tx, &answer.dedup_key)? else {
@@ -442,8 +546,18 @@ impl GrantsStore {
                     }
                 }
                 tx.execute("UPDATE cards SET body=?2 WHERE dedup_key=?1", params![card.dedup_key, encode(&card)?])?;
+                let mut stmt = tx.prepare("SELECT body FROM held_calls WHERE dedup_key=?1 AND state IN ('filing','held')")?;
+                let rows = stmt.query_map([&card.dedup_key], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+                for body in rows {
+                    let mut row: HeldCall = decode(&body)?;
+                    row.card_id = card.card_id.clone();
+                    row.state = HeldState::Held;
+                    save_call(tx, &row)?;
+                }
             }
-            tx.execute("INSERT INTO cursors VALUES (?1,?2) ON CONFLICT(scope) DO UPDATE SET cursor=excluded.cursor", params![encode(scope)?, cursor])?;
+            if let Some(cursor) = cursor {
+                tx.execute("INSERT INTO cursors VALUES (?1,?2) ON CONFLICT(scope) DO UPDATE SET cursor=excluded.cursor", params![encode(scope)?, cursor])?;
+            }
             Ok(())
         })
     }

@@ -132,6 +132,8 @@ struct JevOnly;
 impl BatchCatalog for JevOnly {
     fn row(&self, catalog_id: &str) -> Option<broca_catalog::ModelBatchRow> {
         (catalog_id == JEV_1_13_0).then(|| broca_catalog::ModelBatchRow {
+            model_name: None,
+            provider_name: None,
             kind: Some("decision".into()),
             context_tokens: None,
             attachment: false,
