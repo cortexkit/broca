@@ -628,6 +628,9 @@ fn absolute_path(path: &Path) -> io::Result<PathBuf> {
     Ok(normalized)
 }
 
+// Off Unix, any initial file is refused before inode numbering, so the two inode
+// parameters only travel through the directory recursion there.
+#[cfg_attr(not(unix), allow(clippy::only_used_in_recursion))]
 fn snapshot(
     root: &Path,
     relative: &Path,
