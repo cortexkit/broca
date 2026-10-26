@@ -7185,7 +7185,6 @@ mod tests {
         const TOKEN_EXPIRED_BODY: &str = r#"{"error":{"message":"Your authentication token has expired.","type":"invalid_request_error","code":"token_expired"}}"#;
         const UPSTREAM_KEY_MESSAGE: &str = concat!(
             "401: chatgpt_upstream_key_rejected: the ChatGPT backend rejected an OpenAI API key ",
-            // Split so this copy is not a second match for the diagnostic's mutation anchor.
             "on its own side (broca sent the account's OAuth token, not a key); ",
             "not a credential failure."
         );

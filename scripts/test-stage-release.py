@@ -48,9 +48,9 @@ def staging_block():
     block = src[start:end]
     # Guard against extracting something that no longer contains what these arms are about.
     # These are present in BOTH the fixed and the pre-fix versions on purpose. A guard naming
-    # something only the FIX has (`STAGING_TMP`) would make the mutation below fail with
+    # something only the FIX has (`STAGING_TMP`) would make the pre-fix case below fail with
     # "extraction is wrong" instead of "the seam has residue" -- a red test that demonstrates
-    # nothing, which is how a mutation stops being evidence.
+    # nothing about staging residue.
     for required in ("codesign", "shasum -c", "$SEAM"):
         if required not in block:
             raise AssertionError(

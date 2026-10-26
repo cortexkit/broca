@@ -487,24 +487,18 @@ pub fn manifest_configured(
             // declaring Serial would tell subc to gate every session behind one in-flight call
             // and serialise a fleet that already schedules itself.
             //
-            // BOTH HALVES ARE PINNED, and the cross-session half was verified by mutation
-            // rather than by reading:
+            // Both halves are covered by runtime tests:
             //
             // WITHIN-SESSION ORDERING --
             // `delayed_terminal_send_retry_does_not_queue_behind_active_run`.
             //
             // CROSS-SESSION OVERLAP -- `concurrent_sessions_sharing_one_tool_module_are_isolated`
             // drives five sessions through one shared tool route, and its ConcurrencyProbe fails
-            // if ANY run finishes before all five are admitted. Replacing its tokio::join! with
-            // sequential awaits reddens it BY NAME. So a global lock that made this surface
+            // if ANY run finishes before all five are admitted. So a global lock that made this surface
             // secretly Serial would be caught, which is what the declaration actually asserts.
             //
-            // RUN THAT MUTATION WITH BROCA_REQUIRE_AIMOCK=1 AND BROCA_REQUIRE_SUBC=1. Unguarded,
-            // the rig returns early when a dependency is missing and reports a pass having
-            // executed nothing -- which is exactly how this comment briefly claimed the
-            // OPPOSITE, off a 15s 'pass' that was startup timeouts rather than serialised
-            // sessions. The guards exist so an experiment cannot silently test nothing, and an
-            // unguarded mutation run is evidence in neither direction.
+            // Run the cross-session test with BROCA_REQUIRE_AIMOCK=1 and BROCA_REQUIRE_SUBC=1.
+            // Without these guards, a missing dependency can return early without testing overlap.
             concurrency: Concurrency::ModuleManaged,
             // The request/response ops: send/retract/cancel change state (Mutate); status
             // is a point-read (Query).
@@ -705,7 +699,7 @@ mod provenance_tests {
         // PINNED AS AN INDEPENDENT LITERAL, and the first version of this test was VACUOUS
         // for want of that. It compared the declaration against CATALOG_POLL_INTERVAL -- but
         // the declaration is BUILT from that constant, so both sides moved together and the
-        // test passed happily with the interval mutated to 15 minutes. A guard drawn from the
+        // test would pass even if the interval changed to 15 minutes. A guard drawn from the
         // thing it guards can only ever confirm self-consistency.
         //
         // The two risks are different and need different mechanisms. The DECLARATION reads the
@@ -738,8 +732,8 @@ mod provenance_tests {
     /// Replaces a text search over this file, and the replacement is the point. The old test
     /// grepped the production half for `wire_crate_version: None` -- itself already the repaired
     /// form of a test that had been outright unfailable, because it originally searched the WHOLE
-    /// file and the literal inside its own assertion satisfied it (issue #9, confirmed by
-    /// mutation). Even scoped correctly, a text search pins the SPELLING of a decision rather
+    /// file and the literal inside its own assertion satisfied it (issue #9).
+    /// Even scoped correctly, a text search pins the SPELLING of a decision rather
     /// than its OUTCOME, so it could not survive the construction moving into a helper.
     ///
     /// Two facts pinned, one of which is a live behaviour change:
@@ -890,7 +884,7 @@ mod provenance_tests {
     /// It originally searched the WHOLE file, which made it unfailable: the literal it looks for
     /// appears inside its own assertion, so the corpus contained the answer regardless of what
     /// the field said. Setting `wire_crate_version: Some("0.13.0".to_string())` left it GREEN.
-    /// Reported from outside (issue #9) and confirmed by mutation before this rewrite.
+    /// Reported from outside (issue #9) before this rewrite.
     ///
     /// A guard whose own source is part of the corpus it searches satisfies itself. Splitting at
     /// the `#[cfg(test)]` boundary is what makes the corpus the thing under test rather than the

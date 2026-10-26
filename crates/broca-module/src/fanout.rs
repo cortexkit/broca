@@ -1280,8 +1280,7 @@ mod tests {
 
         // A GAP IS THE ARM THIS TEST DID NOT HAVE, and its absence is why the defect
         // shipped: a DisplayGap rides in a Delivery::Display envelope, so a match on the
-        // envelope alone counted display LOSS as a delivery. The mutation that restores
-        // the envelope-only match passes every other assertion here.
+        // envelope alone counted display LOSS as a delivery.
         let before_gap_d = display_deliveries();
         let before_gap_g = display_gaps();
         assert!(matches!(

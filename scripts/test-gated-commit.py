@@ -216,8 +216,6 @@ class QuickcheckSelection(unittest.TestCase):
         shutil.copy2(ROOT / "scripts/lib/cargo-watchdog.py", library / "cargo-watchdog.py")
         shutil.copy2(ROOT / "scripts/quickcheck-guards.list", self.root / "scripts")
         shutil.copy2(ROOT / "scripts/quickcheck-feature-tests.list", self.root / "scripts")
-        for name in ("verify-mutation-platforms.py", "verify-windows-mutations.py"):
-            (self.root / "scripts" / name).write_text("print('fixture platform check')\n")
         for name in ("test-portable-test-selection.py", "check-portable-test-selection.py"):
             shutil.copy2(ROOT / "scripts" / name, self.root / "scripts")
         bins = self.root / ".cargo/bin"
