@@ -73,6 +73,9 @@ fn stamped() -> SendScope {
     SendScope::Stamped(BindScope {
         scope: head_scope(),
         owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
     })
 }
 
@@ -341,6 +344,9 @@ async fn the_migration_adopts_only_a_session_whose_every_episode_recorded_the_ow
                     &BindScope {
                         scope: head_scope(),
                         owner_authorized: true,
+                        kind: broca_protocol::ScopeKind::Head,
+                        parent: None,
+                        parent_state: None,
                     },
                 )
                 .await

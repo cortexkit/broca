@@ -24,6 +24,7 @@ impl super::Asks for NoPrivateContent {
         &self,
         _owner: subc_protocol::Principal,
         _scope_ref: &str,
+        _parent_scope_ref: Option<&str>,
     ) -> Option<broca_subc::PrivateContent> {
         None
     }

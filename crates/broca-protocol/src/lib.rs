@@ -86,7 +86,10 @@ pub use request::{
     ModelHandle, ResponseFormat, StepContext, StopCondition, SubmissionRequest, Tool, ToolChoice,
     ToolReply,
 };
-pub use session::{BindIdentity, BindPrincipal, BindScope, SendScope, SessionScope};
+pub use session::{
+    BindIdentity, BindPrincipal, BindScope, ParentState, ScopeKind, ScopeParent, SendScope,
+    SessionScope,
+};
 pub use usage::Usage;
 pub mod run_events;
 
