@@ -99,3 +99,36 @@ pub fn update_if_requested(
     fs::write(version_path, format!("{current_version}\n")).expect("write render golden version");
     true
 }
+/// Exercise the explicit no-bundle path against the same bytes the golden test pins.
+pub(crate) fn render_without_bundle(
+    family: &dyn broca_provider::wire::WireFamily,
+    frozen: &broca_provider::wire::FrozenRenderConfig,
+    opts: &broca_protocol::CallOptions,
+) -> Vec<u8> {
+    let original = family.render(frozen, opts);
+    #[cfg(feature = "live")]
+    {
+        let mut frozen = frozen.clone();
+        for with_profile in [false, true] {
+            if with_profile {
+                frozen.media = Some(broca_provider::media_profile::select_media_profile(
+                    frozen.family_id,
+                    Some(broca_provider::media_profile::MediaQuirk::Anthropic),
+                    &frozen.wire_model_id,
+                    broca_provider::spec::InputModalities::default(),
+                    None,
+                ));
+            }
+            let bytes = broca_provider::media_request::render_prepared(
+                family,
+                &frozen,
+                opts,
+                None,
+                &|_| panic!("no bundle must not project the prompt"),
+            )
+            .unwrap();
+            assert_eq!(bytes, original, "no-bundle {:?} drifted", frozen.family_id);
+        }
+    }
+    original
+}

@@ -42,6 +42,19 @@ impl WireFamily for BedrockConverse {
         build_request_body(frozen, opts)
     }
 
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+    ) -> Value {
+        let media = crate::media_render::MediaRender {
+            frozen,
+            payloads: media,
+        };
+        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+    }
+
     fn endpoint(
         &self,
         frozen: &FrozenRenderConfig,
@@ -131,6 +144,14 @@ impl WireFamily for BedrockConverse {
 // ───────────────────────── request body ─────────────────────────
 
 fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    build_request_body_with_media(frozen, opts, None)
+}
+
+fn build_request_body_with_media(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -154,7 +175,7 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
         })
     });
     let system = convert_system(frozen, &opts.prompt, marker_policy.is_some());
-    let messages = convert_messages(frozen, opts, &name_map, &id_map);
+    let messages = convert_messages(frozen, opts, &name_map, &id_map, media);
 
     if !system.is_empty() {
         body.insert("system".to_string(), Value::Array(system));
@@ -426,6 +447,7 @@ fn convert_messages(
     opts: &CallOptions,
     name_map: &crate::tool_name_alias::ToolNameMap,
     id_map: &crate::tool_id_alias::ToolIdMap,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Vec<Value> {
     opts.prompt
         .iter()
@@ -437,7 +459,7 @@ fn convert_messages(
                     message.origin.as_ref(),
                     opts.target_model.as_ref(),
                 );
-            convert_message(message, name_map, id_map, echo_reasoning)
+            convert_message(message, name_map, id_map, echo_reasoning, media)
         })
         // Bedrock rejects messages left empty after unsupported reasoning is stripped.
         .filter(|message| {
@@ -454,23 +476,26 @@ fn convert_message(
     name_map: &crate::tool_name_alias::ToolNameMap,
     id_map: &crate::tool_id_alias::ToolIdMap,
     echo_reasoning: bool,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Option<Value> {
     match message.role {
         Role::System => None,
         Role::User => Some(json!({
             "role": "user",
-            "content": convert_content(&message.content, name_map, id_map, false),
+            "content": convert_content(&message.content, name_map, id_map, false, media),
         })),
         Role::Assistant => Some(json!({
             "role": "assistant",
-            "content": convert_content(&message.content, name_map, id_map, echo_reasoning),
+            "content": convert_content(&message.content, name_map, id_map, echo_reasoning, None),
         })),
         Role::Tool => {
             let content: Vec<Value> = message
                 .content
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::ToolResult(result) => Some(convert_tool_result(result, id_map)),
+                    ContentBlock::ToolResult(result) => {
+                        Some(convert_tool_result(result, id_map, media))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -484,11 +509,12 @@ fn convert_content(
     name_map: &crate::tool_name_alias::ToolNameMap,
     id_map: &crate::tool_id_alias::ToolIdMap,
     echo_reasoning: bool,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Vec<Value> {
     blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Media(media) => Some(json!({"text": broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
+            ContentBlock::Media(reference) => Some(media_block(reference, media, false)),
             // Drop an empty text part (Bedrock rejects `text:""`). Defensive against foreign input; the owned normalizers never emit empty text.
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
                 if text.is_empty() =>
@@ -505,7 +531,7 @@ fn convert_content(
                     "input": call.input,
                 }
             })),
-            ContentBlock::ToolResult(result) => Some(convert_tool_result(result, id_map)),
+            ContentBlock::ToolResult(result) => Some(convert_tool_result(result, id_map, media)),
             // AWS ReasoningTextBlock, Contents/signature: multi-turn reasoning text and its
             // signature must be returned unmodified. Keep empty signed blocks and source order.
             // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ReasoningTextBlock.html
@@ -528,11 +554,12 @@ fn convert_content(
 fn convert_tool_result(
     result: &broca_protocol::content::ToolResult,
     id_map: &crate::tool_id_alias::ToolIdMap,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Value {
     json!({
         "toolResult": {
             "toolUseId": id_map.wire_id(&result.tool_call_id.0),
-            "content": convert_tool_output(&result.output),
+            "content": convert_tool_output_with_media(&result.output, media),
             "status": if result.is_error { "error" } else { "success" },
         }
     })
@@ -560,6 +587,93 @@ fn convert_tool_output(output: &ToolOutput) -> Vec<Value> {
         ToolOutput::Error { message } if message.is_empty() => vec![json!({ "json": message })],
         ToolOutput::Error { message } => vec![json!({ "text": message })],
     }
+}
+
+fn convert_tool_output_with_media(
+    output: &ToolOutput,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Vec<Value> {
+    if let (ToolOutput::Parts { parts }, Some(media)) = (output, media) {
+        return parts
+            .iter()
+            .map(|part| match part {
+                broca_protocol::ToolOutputPart::Text { text } if text.is_empty() => {
+                    json!({"json":text})
+                }
+                broca_protocol::ToolOutputPart::Text { text } => json!({"text":text}),
+                broca_protocol::ToolOutputPart::Media { media: reference } => {
+                    media_block(reference, Some(media), true)
+                }
+            })
+            .collect();
+    }
+    convert_tool_output(output)
+}
+
+fn media_block(
+    reference: &broca_protocol::MediaRef,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    tool: bool,
+) -> Value {
+    use broca_protocol::MediaMarkerReason;
+    let payload = media
+        .ok_or(MediaMarkerReason::Carrier)
+        .and_then(|media| media.native(reference, tool));
+    match payload {
+        Ok(base64) => {
+            let (kind, format) = match (reference.kind, reference.mime.as_str()) {
+                (broca_protocol::MediaKind::Image, "image/png") => ("image", "png"),
+                (broca_protocol::MediaKind::Image, "image/jpeg") => ("image", "jpeg"),
+                (broca_protocol::MediaKind::Image, "image/gif") => ("image", "gif"),
+                (broca_protocol::MediaKind::Image, "image/webp") => ("image", "webp"),
+                (broca_protocol::MediaKind::Document, "application/pdf") => ("document", "pdf"),
+                (broca_protocol::MediaKind::Audio, mime) => (
+                    "audio",
+                    match mime {
+                        "audio/wav" | "audio/x-wav" => "wav",
+                        "audio/mp3" => "mp3",
+                        "audio/mpeg" => "mpeg",
+                        "audio/aac" => "aac",
+                        "audio/flac" => "flac",
+                        "audio/ogg" => "ogg",
+                        "audio/mp4" | "audio/x-m4a" => "m4a",
+                        _ => return media_marker(reference, MediaMarkerReason::Mime),
+                    },
+                ),
+                (broca_protocol::MediaKind::Video, mime) => (
+                    "video",
+                    match mime {
+                        "video/mp4" => "mp4",
+                        "video/quicktime" => "mov",
+                        "video/webm" => "webm",
+                        "video/x-flv" => "flv",
+                        "video/mpeg" => "mpeg",
+                        "video/mpg" => "mpg",
+                        "video/x-ms-wmv" => "wmv",
+                        "video/3gpp" => "three_gp",
+                        "video/x-matroska" => "mkv",
+                        _ => return media_marker(reference, MediaMarkerReason::Mime),
+                    },
+                ),
+                _ => return media_marker(reference, MediaMarkerReason::Mime),
+            };
+            let mut block = json!({"format":format, "source":{"bytes":base64}});
+            if kind == "document" {
+                // A neutral deterministic name satisfies Converse without forwarding an
+                // untrusted filename that the model might interpret as an instruction.
+                block["name"] = json!("document");
+            }
+            json!({kind:block})
+        }
+        Err(reason) => media_marker(reference, reason),
+    }
+}
+
+fn media_marker(
+    reference: &broca_protocol::MediaRef,
+    reason: broca_protocol::MediaMarkerReason,
+) -> Value {
+    json!({"text":broca_protocol::content::media_not_shown_marker(reference, reason)})
 }
 
 fn convert_inference_config(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {

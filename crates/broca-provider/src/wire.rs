@@ -12,6 +12,10 @@
 //! bytes are a PURE function of those two inputs. That's what makes the bytes
 //! reproducible on resume: freeze the `FrozenRenderConfig` once, and every later
 //! re-render of the same step produces identical bytes.
+//! The explicit media hooks additionally accept verified per-request payloads. They still
+//! perform no storage I/O and observe no ambient state: preparation supplies the same bytes
+//! from the session's captured objects on retry and resume. An absent prepared bundle uses
+//! the original two-input renderer unchanged.
 //!
 //! This module is the PURE contract — traits + the frozen-config type — with no
 //! transport. The adapter that implements the loop's `Provider` trait by driving a
@@ -492,6 +496,29 @@ pub trait WireFamily: Send + Sync {
     /// override this, but every current family uses the default.
     fn render(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<u8> {
         broca_protocol::canonical_json_bytes(&self.shape(frozen, opts))
+    }
+
+    /// Low-level shaping with explicit verified payloads. `opts.prompt` is the prepared,
+    /// optionally tagged prompt. Families with native media override this hook; families not
+    /// yet supporting it retain their carrier markers. No payloads enter the frozen config.
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        _media: &[crate::media_render::InlineMedia<'_>],
+    ) -> Value {
+        self.shape(frozen, opts)
+    }
+
+    /// Low-level emission hook, including any family-specific signing. Live callers should
+    /// use `media_request::render_prepared` to enforce limits on these complete emitted bytes.
+    fn render_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        media: &[crate::media_render::InlineMedia<'_>],
+    ) -> Vec<u8> {
+        broca_protocol::canonical_json_bytes(&self.shape_with_media(frozen, opts, media))
     }
 
     /// The HTTP shape (method, URL, headers) for `body`. Auth attaches HERE, after

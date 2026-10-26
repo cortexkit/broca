@@ -176,6 +176,14 @@ mod gated {
     #[test]
     fn anthropic_render_matches_golden() {
         let bytes = provider().render_request(&fixed_request());
+        assert_eq!(
+            bytes,
+            render_golden_support::render_without_bundle(
+                &AnthropicMessages,
+                &anthropic_frozen_config("claude-opus-4-8"),
+                &fixed_request(),
+            )
+        );
         let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
 
         if render_golden_support::update_if_requested(
