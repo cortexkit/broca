@@ -31821,3 +31821,104 @@ expect_red = ["a_late_deny_records_the_run_deny_but_the_overdue_call_is_pending"
 file = "crates/broca-module-serve/src/llm_tools/consent.rs"
 old = "let outcome = if now >= row.deadline_at_ms {"
 new = "let outcome = if false && now >= row.deadline_at_ms { // NON-VACUITY BREAK: relabel a timed-out call as denied."
+
+[[control]]
+id = "media-request-family-token-rules"
+guards = "Image token estimates follow documented family patch rules rather than encoded bytes"
+runner = "cargo"
+package = "broca-provider"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_profile.rs"
+expect_red = ["media_profile::tests::media_token_estimates_follow_family_rules_not_encoded_bytes"]
+file = "crates/broca-provider/src/media_profile.rs"
+old = '(u64::from(w).div_ceil(28) * u64::from(h).div_ceil(28)).min(4_784)'
+new = '1 // NON-VACUITY BREAK: erase the Anthropic image patch cost.'
+
+[[control]]
+id = "media-request-durable-input-protection"
+guards = "Protection belongs to an admitted occurrence through its first durable step, not to a digest or a send attempt"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_request/tests.rs"
+expect_red = ["media_request::tests::durable_steer_boundary_protects_occurrences_not_shared_digests"]
+file = "crates/broca-core/src/media_request.rs"
+old = 'capture.person && capture.first_step.is_none_or(|step| step == self.boundary)'
+new = 'false // NON-VACUITY BREAK: expire admitted media before their first step.'
+
+[[control]]
+id = "media-request-independent-token-aging"
+guards = "Either byte or token trigger starts hysteretic aging and both targets must be met"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_request/tests.rs"
+expect_red = ["media_request::tests::independent_byte_and_token_triggers_reduce_to_both_targets"]
+file = "crates/broca-provider/src/media_request.rs"
+old = 'if self.bytes > thresholds.byte_trigger || self.tokens > thresholds.token_trigger {'
+new = 'if self.bytes > thresholds.byte_trigger { // NON-VACUITY BREAK: ignore token pressure.'
+
+[[control]]
+id = "media-request-measures-produced-base64"
+guards = "Prepared bundles count the actual encoded bytes, not the smaller decoded payload"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_request/tests.rs"
+expect_red = ["media_request::tests::fresh_protected_bundle_over_trigger_is_full_on_retry_and_every_resume_cut"]
+file = "crates/broca-provider/src/media_request.rs"
+old = 'self.base64.len() as u64'
+new = 'self.reference.byte_size // NON-VACUITY BREAK: budget decoded rather than encoded bytes.'
+
+[[control]]
+id = "media-request-tool-before-person-cap-marking"
+guards = "Request-cap pressure removes oldest tool media before older person media"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_request/tests.rs"
+expect_red = ["media_request::tests::limits_remove_oldest_tools_before_people_and_exhaust_before_refusing"]
+file = "crates/broca-provider/src/media_request.rs"
+old = '.min_by_key(|(_, media)| (!media.tool, media.id))'
+new = '.min_by_key(|(_, media)| (media.tool, media.id)) // NON-VACUITY BREAK: strip people before tools.'
+
+[[control]]
+id = "media-request-count-dependent-dimensions"
+guards = "Dimension limits use the shown request count and stop marking at the count threshold"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_request/tests.rs"
+expect_red = ["media_request::tests::count_dependent_dimensions_stop_at_threshold_or_when_large_images_are_gone"]
+file = "crates/broca-provider/src/media_request.rs"
+old = '.max_image_side(counts[0], counts[1])'
+new = '.max_image_side(0, 0) // NON-VACUITY BREAK: hide the request image count from dimension limits.'
+
+[[control]]
+id = "media-request-replay-aging-boundaries"
+guards = "A WAL resume rebuilds previous aging reductions instead of aging only once at the final step"
+runner = "cargo"
+package = "broca-provider"
+features = ["live"]
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-provider/src/media_request/tests.rs"
+expect_red = ["media_request::tests::durable_wal_replay_rebuilds_running_aging_after_each_screenshot_step"]
+file = "crates/broca-provider/src/media_request.rs"
+old = '''broca_wal::WalRecord::ModelStepFinished { .. } => {
+                    state.apply(&active, AgingEvent::Boundary);
+                    step_open = false;'''
+new = '''broca_wal::WalRecord::ModelStepFinished { .. } => {
+                    // NON-VACUITY BREAK: forget each historical step's aging boundary.
+                    step_open = false;'''

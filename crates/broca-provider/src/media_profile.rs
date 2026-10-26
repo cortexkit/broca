@@ -19,7 +19,7 @@
 
 use std::fmt;
 
-use broca_protocol::content::MediaKind;
+use broca_protocol::content::{MediaKind, MediaRef};
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{InputModalities, ModelSpec, ProviderSpec, WireFamilyId};
@@ -448,6 +448,47 @@ pub struct MediaProfile {
 }
 
 impl MediaProfile {
+    /// Estimate tokens from the family facts table, never from compressed or base64 size.
+    /// Missing dimensions use the fixed image budget rather than guessing a small image.
+    pub fn media_tokens(&self, media: &MediaRef) -> u64 {
+        if media.kind != MediaKind::Image {
+            return match media.kind {
+                MediaKind::Document => 30_000,
+                MediaKind::Audio => 16_000,
+                MediaKind::Video => 64_000,
+                MediaKind::Image => unreachable!(),
+            };
+        }
+        let dimensions = media
+            .width
+            .zip(media.height)
+            .filter(|(w, h)| *w > 0 && *h > 0);
+        match self.profile {
+            MediaProfileId::Anthropic | MediaProfileId::Bedrock => dimensions
+                .map_or(4_800, |(w, h)| {
+                    (u64::from(w).div_ceil(28) * u64::from(h).div_ceil(28)).min(4_784)
+                }),
+            MediaProfileId::OpenaiResponses
+            | MediaProfileId::OpenaiResponsesChatgpt
+            | MediaProfileId::OpenaiChat => dimensions.map_or(4_800, |(w, h)| {
+                let patches = (u64::from(w).div_ceil(32) * u64::from(h).div_ceil(32)).min(30_000);
+                (patches * 6).div_ceil(5)
+            }),
+            MediaProfileId::Deepseek => 1_024,
+            MediaProfileId::Gemini3 | MediaProfileId::CodeAssistGemini3 => 1_120,
+            MediaProfileId::Gemini | MediaProfileId::CodeAssistGemini => {
+                dimensions.map_or(4_800, |(w, h)| {
+                    if w <= 384 && h <= 384 {
+                        258
+                    } else {
+                        258 * u64::from(w).div_ceil(768) * u64::from(h).div_ceil(768)
+                    }
+                })
+            }
+            _ => 4_800,
+        }
+    }
+
     /// What this profile does with one kind of media.
     pub fn kind(&self, kind: MediaKind) -> &KindProfile {
         match kind {
@@ -1311,6 +1352,64 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+    #[test]
+    fn media_token_estimates_follow_family_rules_not_encoded_bytes() {
+        let mut media = broca_protocol::MediaRef {
+            kind: MediaKind::Image,
+            mime: "image/png".into(),
+            byte_size: 3,
+            sha256: "a".repeat(64),
+            width: Some(769),
+            height: Some(385),
+        };
+        let mut profile = select(WireFamilyId::AnthropicMessages, None, "claude");
+        for (id, expected) in [
+            (MediaProfileId::Anthropic, 392),
+            (MediaProfileId::Bedrock, 392),
+            (MediaProfileId::OpenaiResponses, 390),
+            (MediaProfileId::OpenaiResponsesChatgpt, 390),
+            (MediaProfileId::OpenaiChat, 390),
+            (MediaProfileId::Deepseek, 1_024),
+            (MediaProfileId::Gemini3, 1_120),
+            (MediaProfileId::CodeAssistGemini3, 1_120),
+            (MediaProfileId::Gemini, 516),
+            (MediaProfileId::CodeAssistGemini, 516),
+            (MediaProfileId::Openrouter, 4_800),
+            (MediaProfileId::Xai, 4_800),
+            (MediaProfileId::Kimi, 4_800),
+            (MediaProfileId::MetaChat, 4_800),
+            (MediaProfileId::MetaResponses, 4_800),
+            (MediaProfileId::Conservative, 4_800),
+        ] {
+            profile.profile = id;
+            assert_eq!(profile.media_tokens(&media), expected, "{id:?}");
+            media.byte_size = 30_000_000;
+            assert_eq!(
+                profile.media_tokens(&media),
+                expected,
+                "compressed size changed {id:?} tokens"
+            );
+            media.byte_size = 3;
+        }
+        profile.profile = MediaProfileId::Anthropic;
+        media.width = Some(8_000);
+        media.height = Some(8_000);
+        assert_eq!(profile.media_tokens(&media), 4_784);
+        profile.profile = MediaProfileId::OpenaiResponses;
+        assert_eq!(profile.media_tokens(&media), 36_000);
+        profile.profile = MediaProfileId::Gemini;
+        media.width = Some(384);
+        media.height = Some(384);
+        assert_eq!(profile.media_tokens(&media), 258);
+        for (kind, expected) in [
+            (MediaKind::Document, 30_000),
+            (MediaKind::Audio, 16_000),
+            (MediaKind::Video, 64_000),
+        ] {
+            media.kind = kind;
+            assert_eq!(profile.media_tokens(&media), expected);
         }
     }
 }

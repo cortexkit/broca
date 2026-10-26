@@ -28,6 +28,7 @@ pub mod import;
 pub mod input_budget;
 pub mod lease;
 pub mod media_provenance;
+pub mod media_request;
 pub mod media_store;
 pub mod media_uploads;
 pub mod media_validation;

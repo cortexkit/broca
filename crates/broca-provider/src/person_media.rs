@@ -142,7 +142,7 @@ pub fn check_protected_payload<'a>(
     Ok(())
 }
 
-fn accepts_mime(profile: &MediaProfile, media: &MediaRef) -> bool {
+pub(crate) fn accepts_mime(profile: &MediaProfile, media: &MediaRef) -> bool {
     use crate::media_profile::MediaProfileId::*;
     let mime = media.mime.as_str();
     match media.kind {
