@@ -367,6 +367,38 @@ fn openai_without_media_keep_their_pinned_old_version_bytes() {
     }
 }
 
+/// The explicit media hook must preserve the existing golden bytes for runs admitted before
+/// media profiles existed, including Code Assist's deterministic envelope.
+#[test]
+fn gemini_and_codeassist_without_media_keep_their_pinned_old_version_bytes() {
+    use crate::{gemini_render_golden as gemini, google_codeassist_render_golden as codeassist};
+    for (family, mut frozen, opts, expected, version) in [
+        (
+            WireFamilyId::Gemini,
+            gemini::golden_frozen(),
+            gemini::fixed_request(),
+            gemini::GOLDEN,
+            4,
+        ),
+        (
+            WireFamilyId::GoogleCodeAssist,
+            codeassist::golden_frozen(),
+            codeassist::fixed_request(),
+            codeassist::GOLDEN,
+            7,
+        ),
+    ] {
+        frozen.renderer_version = version;
+        assert!(frozen.media.is_none());
+        let expected = expected.trim_end_matches('\n').as_bytes();
+        assert_eq!(renderer(family).render(&frozen, &opts), expected);
+        assert_eq!(
+            renderer(family).render_with_media(&frozen, &opts, &[]),
+            expected
+        );
+    }
+}
+
 #[cfg(feature = "live")]
 mod live {
     use broca_core::provider::Provider;

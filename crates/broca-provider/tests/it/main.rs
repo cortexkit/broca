@@ -51,6 +51,7 @@ mod frozen_config_excludes_raw;
 mod frozen_config_resume;
 #[cfg(feature = "live")]
 mod gemini_e2e;
+mod gemini_media_render;
 mod gemini_merged_text_regression;
 mod gemini_render_golden;
 mod gemini_thought_parts;
