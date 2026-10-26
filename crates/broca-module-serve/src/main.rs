@@ -22,6 +22,9 @@ use subc_protocol::SUBC_MODULE_ID_ENV;
 use subc_transport::{authenticate_client, connection_file};
 use tokio::net::TcpStream;
 
+mod state_format;
+use state_format::BackgroundTask;
+
 const DEFAULT_MODULE_ID: &str = "broca";
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const EMBEDDED_ENGRAM_CATALOG: &[u8] = include_bytes!("../../../engram-catalog.json");
@@ -152,6 +155,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let workers_ai_base_url = provider_overrides
         .base_url(broca_module_serve::system_one::workers_ai::PROVIDER_ID)
         .map(str::to_owned);
+    // Whether a NEW state root is created in the overhaul format; see `state_format`.
+    let state_format_config =
+        broca_module_serve::config::StateFormatConfig::load_default().map_err(ServeIoError)?;
     let stop_signal = shutdown_signal()?;
     // Where the WAL, leases and run index live. Resolved before any connection is made so a
     // machine that cannot place its durable state refuses to start by name instead of first
@@ -160,6 +166,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let state_root = broca_module_serve::state_root::resolve_for_launch(&conn_path)
         .map_err(|e| ServeIoError(e.to_string()))?
         .path;
+    // DECIDE THE STATE FORMAT BEFORE ANY OTHER STARTUP WORK TOUCHES THE ROOT, the stall log
+    // just below included. A new root that is to become a `broca-state/2` root gets its marker first, so a
+    // power loss can never leave other files on it without one (which would read as a legacy
+    // root). A marker naming an unknown format refuses here, before anything is written.
+    let state_format = state_format::prepare(&state_root, state_format_config.overhaul_opt_in)
+        .map_err(|e| ServeIoError(e.to_string()))?;
+    state_format
+        .check_request_dumps(|key| std::env::var_os(key))
+        .map_err(ServeIoError)?;
     let _stall_watchdog = broca_module_serve::stall::start(&state_root)?;
     // An optional provider base_url override (the mock/openai-compatible path; e.g. aimock).
     // When unset, the run's model id is resolved through the catalog.
@@ -267,7 +282,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             "could not publish the backup catalog; continuing to serve: {error}"
         );
     }
-    let _archive_timer = archive_config.spawn(state_root.clone());
+    let _archive_timer = state_format
+        .start(BackgroundTask::ArchiveScheduler, || {
+            archive_config.spawn(state_root.clone())
+        })
+        .flatten();
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     let bus_hints = Arc::new(broca_module_serve::bus_events::Hints::default());
     let mut wal_store =
@@ -418,34 +437,36 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let catch_up_index = run_index.clone();
     let catch_up_wal = wal_store.clone();
     let catch_up_resolver = charge_basis_table.clone();
-    let _export_catch_up = spawn_blocking(JobKind::Recovery, move || {
-        let started = std::time::Instant::now();
-        match broca_core::catch_up_usage_exports(
-            catch_up_index.as_ref(),
-            catch_up_wal.as_ref(),
-            catch_up_resolver.as_ref(),
-        ) {
-            // SAY IT FINISHED, AND HOW LONG IT TOOK, even when there was nothing to do. This
-            // arm used to log nothing, so "finished in 50 ms" and "still running 20 s after
-            // boot" were the same observation from outside. This pass shares the store's single
-            // connection with admission's snapshot read, so it was the first suspect for the
-            // first send after a respawn that was never admitted. Measured at 2-5.5 s, it had
-            // always finished before that send; the stall was the archive membership build,
-            // prewarmed below.
-            Ok(0) => tracing::info!(
-                target: "export",
-                "usage-export startup catch-up finished in {} ms; nothing missed",
-                started.elapsed().as_millis()
-            ),
-            Ok(count) => tracing::warn!(
-                target: "export",
-                "caught up {count} missed usage-export run(s) in {} ms",
-                started.elapsed().as_millis()
-            ),
-            Err(error) => {
-                tracing::warn!(target: "export", "usage-export startup catch-up failed: {error}")
+    let _export_catch_up = state_format.start(BackgroundTask::UsageExport, || {
+        spawn_blocking(JobKind::Recovery, move || {
+            let started = std::time::Instant::now();
+            match broca_core::catch_up_usage_exports(
+                catch_up_index.as_ref(),
+                catch_up_wal.as_ref(),
+                catch_up_resolver.as_ref(),
+            ) {
+                // SAY IT FINISHED, AND HOW LONG IT TOOK, even when there was nothing to do. This
+                // arm used to log nothing, so "finished in 50 ms" and "still running 20 s after
+                // boot" were the same observation from outside. This pass shares the store's
+                // single connection with admission's snapshot read, so it was the first suspect
+                // for the first send after a respawn that was never admitted. Measured at
+                // 2-5.5 s, it had always finished before that send; the stall was the archive
+                // membership build, prewarmed below.
+                Ok(0) => tracing::info!(
+                    target: "export",
+                    "usage-export startup catch-up finished in {} ms; nothing missed",
+                    started.elapsed().as_millis()
+                ),
+                Ok(count) => tracing::warn!(
+                    target: "export",
+                    "caught up {count} missed usage-export run(s) in {} ms",
+                    started.elapsed().as_millis()
+                ),
+                Err(error) => {
+                    tracing::warn!(target: "export", "usage-export startup catch-up failed: {error}")
+                }
             }
-        }
+        })
     });
     // Build the archive membership cache now, off the send path. Otherwise the first NEW
     // session after a restart builds it inside admission: 10,821 ms cold on production
@@ -650,8 +671,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opener_builder = DefaultOpener::new(lease_store, wal_store, executor)
         .with_run_index(run_index.clone())
         .with_materialized_store(run_index.clone())
-        .with_export_index(run_index.clone())
         .with_charge_basis_resolver(charge_basis_table.clone());
+    // Each finished run's usage-export fact. An overhaul root exports nothing.
+    if state_format.runs(BackgroundTask::UsageExport) {
+        opener_builder = opener_builder.with_export_index(run_index.clone());
+    }
     if let Some(ttl) = idle_ttl {
         opener_builder = opener_builder.with_idle_ttl(ttl);
     }
@@ -688,21 +712,24 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         let clef = workers_ai(broca_module_serve::system_one::workers_ai::CLEF_MODEL_PATH)?;
         let clef_flash =
             workers_ai(broca_module_serve::system_one::workers_ai::CLEF_FLASH_MODEL_PATH)?;
-        let service = Arc::new(
-            broca_module_serve::system_one::SystemOne::new(
-                store,
-                broca_module_serve::serve::process_launch_id(),
-                Arc::new(broca_module_serve::system_one::LiveCatalog),
-                vec![
-                    broca_module_serve::system_one::ModelPin::jev(Arc::new(typesafe)),
-                    broca_module_serve::system_one::ModelPin::clef(clef),
-                    broca_module_serve::system_one::ModelPin::clef_flash(clef_flash),
-                ],
-                config,
-                registry.batches_in_flight_gauge(),
-            )
-            .with_export(run_index.clone(), charge_basis_table),
+        let service = broca_module_serve::system_one::SystemOne::new(
+            store,
+            broca_module_serve::serve::process_launch_id(),
+            Arc::new(broca_module_serve::system_one::LiveCatalog),
+            vec![
+                broca_module_serve::system_one::ModelPin::jev(Arc::new(typesafe)),
+                broca_module_serve::system_one::ModelPin::clef(clef),
+                broca_module_serve::system_one::ModelPin::clef_flash(clef_flash),
+            ],
+            config,
+            registry.batches_in_flight_gauge(),
         );
+        // System One's export bridge into the usage export. An overhaul root exports nothing.
+        let service = Arc::new(if state_format.runs(BackgroundTask::UsageExport) {
+            service.with_export(run_index.clone(), charge_basis_table)
+        } else {
+            service
+        });
         let released = service
             .release_abandoned()
             .map_err(|e| ServeIoError(format!("release System One batches left running: {e}")))?;
@@ -712,7 +739,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         service
     };
-    let _system_one_sweep = system_one.spawn_sweeper(registry.stopping_signal());
+    // System One's batch sweep deletes batches, so it counts as retention: an overhaul root runs
+    // none.
+    let _system_one_sweep = state_format.start(BackgroundTask::RetentionSweeper, || {
+        system_one.spawn_sweeper(registry.stopping_signal())
+    });
     // Private-content admission asks cerebellum whether a scope read the person's private
     // content and Basal which providers a flow's approved version allows. Both questions ride
     // the module connection `plan_conn` presents under broca's own principal; cerebellum and
@@ -786,14 +817,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .boot_retention()
         .await
         .map_err(|error| ServeIoError(format!("retention boot recovery: {error}")))?;
-    let retention_sweep = {
+    let retention_sweep = state_format.start(BackgroundTask::RetentionSweeper, || {
         let registry = registry.clone();
         tokio::spawn(async move {
             if registry.run_retention_sweeper().await.is_err() {
                 tracing::warn!(target: "retention", "retention sweep stopped; durable recovery required");
             }
         })
-    };
+    });
     let bus_stop = tokio_util::sync::CancellationToken::new();
     let _bus_stop_guard = bus_stop.clone().drop_guard();
     let bus_connector: Arc<dyn broca_module_serve::bus_events::BusConnector> =
@@ -1038,7 +1069,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             // Stop the sweep supervisor so it cannot start another deletion. Interrupted
             // blocking deletions are recoverable from their durable tombstones on next boot;
             // joining this supervisor is not a blocking-pool drain.
-            let _ = retention_sweep.await;
+            if let Some(sweep) = retention_sweep {
+                let _ = sweep.await;
+            }
             // Tokio runtime destruction waits for blocking filesystem tasks. A stuck fsync must
             // not turn the bounded seal attempt into an unbounded shutdown -- so the process ends
             // here rather than by returning. HOW it ends is the part that matters:
@@ -1059,7 +1092,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             let sealed = registry.stop_and_seal().await;
             let report = registry.shutdown_report().expect("stop records its outcome");
             // Stop the sweep supervisor; incomplete deletions recover from durable tombstones.
-            let _ = retention_sweep.await;
+            if let Some(sweep) = retention_sweep {
+                let _ = sweep.await;
+            }
             if sealed {
                 // STAYS AT WARN, and it looks exactly like the boot statements demoted to info
                 // in this same commit: true on every clean shutdown, naming no fault. The
