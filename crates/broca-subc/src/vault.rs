@@ -2600,6 +2600,7 @@ mod tests {
             ("vault_locked", VaultError::VaultLocked),
             ("corrupt", VaultError::Corrupt),
             ("too_many_items", VaultError::TooManyItems),
+            ("ttl_unsatisfiable", VaultError::TtlUnsatisfiable),
         ];
         for (code, want) in cases {
             let body = json!({ "result": { "error": { "code": code } } });
@@ -2755,9 +2756,60 @@ mod tests {
         let mut reply = list_scoped_reply_in(CLAUSTRUM_WIRE_CONTRACT);
         reply["result"]["added_later"] = json!(true);
         reply["result"]["credentials"][0]["added_later"] = json!(1);
+        let list = decode_list_scoped_reply(&reply).unwrap();
+        assert_scoped_credentials(&list);
+    }
+
+    fn assert_scoped_credentials(list: &ScopedList) {
+        let rows: Vec<_> = list
+            .credentials
+            .iter()
+            .map(|row| {
+                (
+                    row.id.as_str(),
+                    row.credential_type.as_str(),
+                    row.state.as_str(),
+                    row.auth_method.as_deref(),
+                    row.provider_ids
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
         assert_eq!(
-            decode_list_scoped_reply(&reply).unwrap().credentials.len(),
-            5
+            rows,
+            vec![
+                (
+                    "antigravity:google",
+                    "oauth",
+                    "active",
+                    Some("antigravity"),
+                    vec!["google-antigravity"]
+                ),
+                (
+                    "apikey:openrouter",
+                    "apikey",
+                    "active",
+                    Some("apikey"),
+                    vec!["openrouter"]
+                ),
+                ("chatgpt:openai", "oauth", "active", Some("chatgpt"), vec![]),
+                (
+                    "github_app:plex-alfonso",
+                    "github_app",
+                    "active",
+                    None,
+                    vec![]
+                ),
+                (
+                    "oauth:anthropic",
+                    "oauth",
+                    "active",
+                    Some("oauth"),
+                    vec!["anthropic", "claude-code"]
+                ),
+            ]
         );
     }
 
@@ -2868,6 +2920,11 @@ mod tests {
                 .expect("CK_CLAUSTRUM_BIN is <checkout>/target/<profile>/ck-claustrum")
                 .to_path_buf()
         } else {
+            assert!(
+                non_empty("BROCA_REQUIRE_VAULT").is_none()
+                    && std::env::var("CI").as_deref() != Ok("true"),
+                "claustrum source-tip comparison requires CK_CLAUSTRUM_CHECKOUT or CK_CLAUSTRUM_BIN in the required vault lane"
+            );
             eprintln!("CK_CLAUSTRUM_CHECKOUT and CK_CLAUSTRUM_BIN unset: no claustrum checkout to compare against");
             return;
         };
@@ -2885,7 +2942,7 @@ mod tests {
         let conn = status_connection(vec![Ok(list_scoped_reply_in(CLAUSTRUM_WIRE_CONTRACT))]);
         let client = supervised_client(conn.clone());
         let list = client.list_scoped().await.unwrap();
-        assert_eq!(list.credentials.len(), 5);
+        assert_scoped_credentials(&list);
         assert_eq!(
             sent_bodies(&conn),
             vec![json!({"method": "credential.list_scoped", "params": {}})]

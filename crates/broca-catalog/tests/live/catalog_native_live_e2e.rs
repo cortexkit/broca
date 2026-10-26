@@ -11,19 +11,6 @@
 //!
 //! Requires `BROCA_LIVE_TESTS=1` and a vault dev-tools handle for `oauth:anthropic`.
 //! Skips cleanly when either is absent. Secrets are never echoed.
-// A file-level `cfg` DELETES this file when the feature is off, and a deleted file reports
-// "running 0 tests ... test result: ok" -- indistinguishable at a glance from a suite that
-// ran and passed, and impossible to instrument because no code survives to carry a notice.
-// Gating a module instead leaves this shell compiled, so the absence can announce itself.
-#[cfg(not(all(feature = "bundled-catalog", feature = "live")))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP catalog_native_live_e2e: compiled without its feature, so none of its cases exist. \
-         This reports `ok` -- re-run with `-F broca-catalog/live` to execute them."
-    );
-}
-
 #[cfg(all(feature = "bundled-catalog", feature = "live"))]
 use crate::common;
 

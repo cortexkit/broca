@@ -17,6 +17,7 @@
 //! by writing a temporary file in the same directory and renaming it over the old one, so a
 //! reader never sees a half-written floor.
 
+use crate::fs_ops;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -53,7 +54,7 @@ fn remember_durable_floor(path: PathBuf, floor: BTreeSet<String>) {
 /// The names in the floor at `path`. A missing file is an empty floor: nothing gated has been
 /// written here yet. A file that exists but cannot be read is an error, never an empty floor.
 pub fn read_floor(path: &Path) -> std::io::Result<BTreeSet<String>> {
-    match std::fs::read_to_string(path) {
+    match fs_ops::read_to_string(path) {
         Ok(text) => Ok(text
             .lines()
             .map(str::trim)
@@ -86,11 +87,11 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
     if !dir.as_os_str().is_empty() {
         #[cfg(test)]
         io_tests::observe(io_tests::Io::CreateDir)?;
-        broca_owner_only::create_dir_all(dir)?;
+        fs_ops::create_dir_all(dir)?;
     }
     // Lock a stable sibling, never the floor inode that rename replaces. Different
     // session leases do not serialize updates to this shared machine-wide file.
-    let mut options = broca_owner_only::OpenOptions::new();
+    let mut options = fs_ops::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(test)]
     io_tests::observe(io_tests::Io::Open)?;
@@ -112,10 +113,10 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
         // its parent directory. Visibility now does not prove the rename durable.
         // Sync through a writable handle: Windows `FlushFileBuffers` refuses a read-only one
         // with "Access is denied", while unix accepts either.
-        if path.try_exists()? {
+        if fs_ops::try_exists(path)? {
             #[cfg(test)]
             io_tests::observe(io_tests::Io::Open)?;
-            let file = std::fs::OpenOptions::new().write(true).open(path)?;
+            let file = fs_ops::OpenOptions::ordinary().write(true).open(path)?;
             #[cfg(test)]
             io_tests::observe(io_tests::Io::FileSync)?;
             file.sync_all()?;
@@ -129,7 +130,7 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
     let temp = temp_path(path);
     let contents: String = floor.iter().map(|name| format!("{name}\n")).collect();
     let written = (|| {
-        let mut options = broca_owner_only::OpenOptions::new();
+        let mut options = fs_ops::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(test)]
         io_tests::observe(io_tests::Io::Open)?;
@@ -140,10 +141,10 @@ pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
         file.sync_all()?;
         #[cfg(test)]
         io_tests::observe(io_tests::Io::Rename)?;
-        std::fs::rename(&temp, path)
+        fs_ops::rename(&temp, path)
     })();
     if let Err(error) = written {
-        let _ = std::fs::remove_file(&temp);
+        let _ = fs_ops::remove_file(&temp);
         return Err(error);
     }
     #[cfg(test)]

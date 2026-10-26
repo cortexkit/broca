@@ -771,6 +771,9 @@ fn stamped(epoch: u64, owner: &str) -> broca_protocol::SendScope {
             run_id: Some("run".into()),
         },
         owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
     })
 }
 
@@ -779,6 +782,24 @@ fn direct_tools(
     provider: Arc<CountedProvider>,
     store: Arc<broca_store::SystemOneStore>,
     export: Arc<broca_store::SqliteStore>,
+) -> Arc<broca_module_serve::llm_tools::LlmTools> {
+    direct_tools_with_private_content(
+        clock,
+        provider,
+        store,
+        export,
+        vec!["typesafe".into()],
+        Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
+    )
+}
+
+fn direct_tools_with_private_content(
+    clock: Arc<std::sync::atomic::AtomicI64>,
+    provider: Arc<CountedProvider>,
+    store: Arc<broca_store::SystemOneStore>,
+    export: Arc<broca_store::SqliteStore>,
+    private_content_providers: Vec<String>,
+    asks: Arc<dyn broca_module_serve::llm_tools::Asks>,
 ) -> Arc<broca_module_serve::llm_tools::LlmTools> {
     use broca_module_serve::system_one::{Config, ModelPin, SystemOne, LLM_CLASSIFY_STORE_ROLE};
     let system = SystemOne::new(
@@ -801,9 +822,9 @@ fn direct_tools(
         Arc::new(system),
         broca_module_serve::config::LlmToolsConfig {
             advertise_tags: true,
-            private_content_providers: vec!["typesafe".into()],
+            private_content_providers,
         },
-        Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
+        asks,
     ))
 }
 
@@ -821,6 +842,293 @@ fn owner() -> broca_protocol::BindPrincipal {
     }
 }
 
+fn program_scope() -> broca_protocol::SendScope {
+    use broca_protocol::{BindPrincipal, ParentState, ScopeKind, ScopeParent, SendScope};
+    let mut scope = stamped(7, "prefrontal-core");
+    let SendScope::Stamped(bind) = &mut scope else {
+        unreachable!();
+    };
+    bind.scope.scope_ref = "program-scope".into();
+    bind.scope.sender = Some(BindPrincipal::Reserved {
+        module_id: "basal".into(),
+    });
+    bind.scope.agent_id = Some("program-agent".into());
+    bind.scope.run_id = Some("program-run".into());
+    bind.kind = ScopeKind::Ephemeral;
+    bind.parent = Some(Box::new(ScopeParent {
+        owner: BindPrincipal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        scope_ref: "head-scope".into(),
+        scope_epoch: 3,
+    }));
+    bind.parent_state = Some(ParentState::Linked);
+    scope
+}
+
+fn program_batch_id() -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(br#"{"call_key":"program","owner":"reserved:prefrontal-core","principal":"reserved:basal","scope_epoch":7,"scope_ref":"program-scope"}"#))
+}
+
+struct ProgramMarks {
+    parent_answer: Option<broca_subc::PrivateContent>,
+    queries: Mutex<Vec<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl broca_module_serve::llm_tools::Asks for ProgramMarks {
+    async fn marked(
+        &self,
+        owner: subc_protocol::Principal,
+        scope_ref: &str,
+        parent_scope_ref: Option<&str>,
+    ) -> Option<broca_subc::PrivateContent> {
+        assert_eq!(
+            owner,
+            subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into()
+            }
+        );
+        assert_eq!(scope_ref, "program-scope");
+        self.queries
+            .lock()
+            .unwrap()
+            .push(parent_scope_ref.map(str::to_owned));
+        match parent_scope_ref {
+            Some("head-scope") => self.parent_answer.clone(),
+            None => Some(broca_subc::PrivateContent::unmarked()),
+            other => panic!("unexpected parent {other:?}"),
+        }
+    }
+
+    async fn flow_providers(
+        &self,
+        _: subc_protocol::Principal,
+        _: &str,
+    ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
+        panic!("a codemode program is not a flow")
+    }
+}
+
+#[tokio::test]
+async fn memory_basal_program_parent_marks_and_missing_answers_block_egress() {
+    for (parent_answer, consent) in [
+        (
+            Some(broca_subc::PrivateContent {
+                marked: true,
+                sources: vec![broca_subc::SourceKind::PersonBrowser],
+            }),
+            "consent_required",
+        ),
+        (None, "private_content_unreachable"),
+    ] {
+        let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
+        let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+        let provider = Arc::new(CountedProvider::default());
+        let marks = Arc::new(ProgramMarks {
+            parent_answer,
+            queries: Mutex::default(),
+        });
+        let tools = direct_tools_with_private_content(
+            Arc::new(std::sync::atomic::AtomicI64::new(1000)),
+            provider.clone(),
+            store.clone(),
+            export.clone(),
+            Vec::new(),
+            marks.clone(),
+        );
+        let basal = broca_protocol::BindPrincipal::Reserved {
+            module_id: "basal".into(),
+        };
+        let error: Value = serde_json::from_slice(
+            &tools
+                .answer(
+                    &direct_body(args(), Some("program")),
+                    Some(&basal),
+                    &program_scope(),
+                )
+                .await
+                .unwrap_err(),
+        )
+        .unwrap();
+        assert_eq!(error["code"], "not_started");
+        assert_eq!(error["detail"]["consent"], consent);
+        assert_eq!(
+            *marks.queries.lock().unwrap(),
+            vec![Some("head-scope".into())]
+        );
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(store
+            .lookup("llm.classify", &program_batch_id())
+            .unwrap()
+            .is_none());
+        assert!(store.pending_facts().unwrap().is_empty());
+        assert!(export.read_export_page(None, 100).unwrap().facts.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn memory_basal_program_with_unmarked_parent_calls_an_unlisted_provider() {
+    let provider = Arc::new(CountedProvider::default());
+    let marks = Arc::new(ProgramMarks {
+        parent_answer: Some(broca_subc::PrivateContent::unmarked()),
+        queries: Mutex::default(),
+    });
+    let tools = direct_tools_with_private_content(
+        Arc::new(std::sync::atomic::AtomicI64::new(1000)),
+        provider.clone(),
+        Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+        Arc::new(broca_store::SqliteStore::open_in_memory().unwrap()),
+        Vec::new(),
+        marks.clone(),
+    );
+    let basal = broca_protocol::BindPrincipal::Reserved {
+        module_id: "basal".into(),
+    };
+    tools
+        .answer(
+            &direct_body(args(), Some("program")),
+            Some(&basal),
+            &program_scope(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        *marks.queries.lock().unwrap(),
+        vec![Some("head-scope".into())]
+    );
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn memory_basal_program_run_is_admitted_and_billed_to_its_own_run() {
+    let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
+    let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+    let provider = Arc::new(CountedProvider::default());
+    let tools = direct_tools(
+        Arc::new(std::sync::atomic::AtomicI64::new(1000)),
+        provider.clone(),
+        store.clone(),
+        export.clone(),
+    );
+    let basal = broca_protocol::BindPrincipal::Reserved {
+        module_id: "basal".into(),
+    };
+    let answer = tools
+        .answer(
+            &direct_body(args(), Some("program")),
+            Some(&basal),
+            &program_scope(),
+        )
+        .await
+        .unwrap();
+    let result: cortexkit_llm_tools::classify::Result = serde_json::from_str(answer.get()).unwrap();
+    cortexkit_llm_tools::classify::validate_result(&result).unwrap();
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .lookup("llm.classify", &program_batch_id())
+            .unwrap()
+            .unwrap()
+            .scope,
+        Some(broca_store::system_one::BatchScope::Run {
+            agent_id: "program-agent".into(),
+            run_id: "program-run".into(),
+        })
+    );
+    let facts = export.read_export_page(None, 100).unwrap().facts;
+    assert_eq!(facts.len(), 1);
+    let fact = serde_json::to_value(&facts[0].segment).unwrap();
+    assert_eq!(fact["run_id"], "program-run");
+    assert!(fact.get("flow_id").is_none());
+}
+
+#[tokio::test]
+async fn memory_basal_program_scope_refusals_are_write_free() {
+    use broca_protocol::{ParentState, ScopeKind, SendScope};
+    for case in [
+        "head",
+        "worker",
+        "unauthorized",
+        "missing-agent",
+        "missing-run",
+        "neither",
+        "no-parent",
+        "pending",
+        "ended",
+        "no-parent-state",
+    ] {
+        let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
+        let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+        let provider = Arc::new(CountedProvider::default());
+        let tools = direct_tools(
+            Arc::new(std::sync::atomic::AtomicI64::new(1000)),
+            provider.clone(),
+            store.clone(),
+            export.clone(),
+        );
+        let mut scope = program_scope();
+        let SendScope::Stamped(bind) = &mut scope else {
+            unreachable!()
+        };
+        match case {
+            "head" => bind.kind = ScopeKind::Head,
+            "worker" => bind.kind = ScopeKind::Worker,
+            "unauthorized" => bind.owner_authorized = false,
+            "missing-agent" => bind.scope.agent_id = None,
+            "missing-run" => bind.scope.run_id = None,
+            "neither" => {
+                bind.scope.agent_id = None;
+                bind.scope.run_id = None;
+            }
+            "no-parent" => bind.parent = None,
+            "pending" => bind.parent_state = Some(ParentState::Pending),
+            "ended" => bind.parent_state = Some(ParentState::Ended),
+            "no-parent-state" => bind.parent_state = None,
+            _ => unreachable!(),
+        }
+        let basal = broca_protocol::BindPrincipal::Reserved {
+            module_id: "basal".into(),
+        };
+        let error: Value = serde_json::from_slice(
+            &tools
+                .answer(&direct_body(args(), Some("program")), Some(&basal), &scope)
+                .await
+                .unwrap_err(),
+        )
+        .unwrap();
+        if case == "pending" {
+            assert_eq!(error["code"], "parent_scope_pending");
+            assert_eq!(error["detail"]["class"], "transient");
+            let message = error["message"].as_str().unwrap();
+            assert!(message.contains("head-scope"));
+            assert!(message.contains("reserved:prefrontal-core"));
+            assert!(message.contains("epoch 3"));
+        } else {
+            assert_eq!(error["code"], "flow_scope_required", "{case}: {error}");
+            assert!(error["message"].as_str().unwrap().contains("program run"));
+        }
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{case}"
+        );
+        assert!(
+            store
+                .lookup("llm.classify", &program_batch_id())
+                .unwrap()
+                .is_none(),
+            "{case}"
+        );
+        assert!(store.pending_facts().unwrap().is_empty(), "{case}");
+        assert!(
+            export.read_export_page(None, 100).unwrap().facts.is_empty(),
+            "{case}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn memory_scope_guards_run_before_argument_and_catalog_admission() {
     let provider = Arc::new(CountedProvider::default());
@@ -834,7 +1142,12 @@ async fn memory_scope_guards_run_before_argument_and_catalog_admission() {
         module_id: "basal".into(),
     };
     let body = direct_body(json!({}), Some("scope"));
-    for scope in [broca_protocol::SendScope::default(), stamped(1, "owner")] {
+    let mut neither_flow_nor_run = stamped(1, "owner");
+    if let broca_protocol::SendScope::Stamped(bind) = &mut neither_flow_nor_run {
+        bind.scope.agent_id = None;
+        bind.scope.run_id = None;
+    }
+    for scope in [broca_protocol::SendScope::default(), neither_flow_nor_run] {
         let error: Value =
             serde_json::from_slice(&tools.answer(&body, Some(&basal), &scope).await.unwrap_err())
                 .unwrap();
@@ -2141,4 +2454,47 @@ async fn memory_flow_scope_is_admitted_without_inventing_an_agent_run() {
         })
     );
     assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn memory_basal_flow_with_run_ids_keeps_flow_precedence() {
+    let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
+    let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+    let provider = Arc::new(CountedProvider::default());
+    let tools = direct_tools(
+        Arc::new(std::sync::atomic::AtomicI64::new(1000)),
+        provider.clone(),
+        store.clone(),
+        export.clone(),
+    );
+    let mut scope = program_scope();
+    if let broca_protocol::SendScope::Stamped(bind) = &mut scope {
+        bind.scope.flow_id = Some("tool-flow".into());
+        bind.kind = broca_protocol::ScopeKind::Worker;
+        bind.owner_authorized = false;
+        bind.parent_state = Some(broca_protocol::ParentState::Ended);
+    }
+    let basal = broca_protocol::BindPrincipal::Reserved {
+        module_id: "basal".into(),
+    };
+    tools
+        .answer(&direct_body(args(), Some("program")), Some(&basal), &scope)
+        .await
+        .unwrap();
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .lookup("llm.classify", &program_batch_id())
+            .unwrap()
+            .unwrap()
+            .scope,
+        Some(broca_store::system_one::BatchScope::Flow {
+            flow_id: "tool-flow".into()
+        })
+    );
+    let facts = export.read_export_page(None, 100).unwrap().facts;
+    assert_eq!(facts.len(), 1);
+    let fact = serde_json::to_value(&facts[0].segment).unwrap();
+    assert_eq!(fact["flow_id"], "tool-flow");
+    assert!(fact.get("run_id").is_none());
 }

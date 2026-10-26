@@ -1,5 +1,6 @@
 //! Feature-forgetting is process-wide, so this binary contains exactly one test.
 #![cfg(feature = "test-known-feature")]
+#![allow(clippy::disallowed_methods)] // Fixture I/O is not a production WAL path.
 
 use broca_wal::{framing, FileWal, WalError, WalRecord};
 

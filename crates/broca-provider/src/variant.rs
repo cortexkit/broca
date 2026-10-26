@@ -562,10 +562,22 @@ mod tests {
 
     #[test]
     fn repeated_names_keep_first_position_and_last_settings() {
-        let options = ReasoningOptions::Entries(
-            vec![json!({"type": "effort", "values": ["low", "high", "low"]})].into(),
+        let request = |effort: &str| VariantRequest::OpenAiChat {
+            effort: effort.into(),
+        };
+        let variants = dedupe_like_a_js_map(vec![
+            ("low".into(), request("low")),
+            ("high".into(), request("high")),
+            ("low".into(), request("override")),
+        ]);
+        assert_eq!(
+            variants
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "high"]
         );
-        let derived = derive_variants(WireFamilyId::OpenAiChat, "m", &options, None);
-        assert_eq!(derived.names(), ["low", "high"]);
+        assert_eq!(variants[0].1, request("override"));
+        assert_eq!(variants[1].1, request("high"));
     }
 }

@@ -26,14 +26,6 @@
 //!   their served `successor` fact.
 //! - Native endpoint fields in the synthetic fixtures keep reasoning tests independent of
 //!   SDK endpoint defaults. Live routing decode vectors are tested separately.
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP reasoning_variants: compiled without the live feature, so none of its cases \
-         exist. Re-run with `-F broca-catalog/live` to execute them."
-    );
-}
 
 #[cfg(feature = "live")]
 mod gated {

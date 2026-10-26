@@ -6,7 +6,7 @@
 //!
 //! - *Marked?* Cerebellum says whether a scope read the person's Chrome, a desktop app or a site
 //!   where they are signed in. Only a "marked" answer is cached, keyed by the full scope
-//!   identity (owner, reference and epoch, plus the flow id for a flow), together with the
+//!   identity (owner, reference and epoch, plus the flow id or linked parent), together with the
 //!   source kinds a card would name. No answer, an error or a timeout counts as marked and is
 //!   not cached, so the next call asks again.
 //! - *Which providers?* An unmarked run may call any provider. A marked run may call local
@@ -50,6 +50,14 @@ pub(super) struct ScopeIdentity {
     scope_ref: String,
     scope_epoch: u64,
     flow_id: Option<String>,
+    parent: Option<ParentIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ParentIdentity {
+    owner: String,
+    scope_ref: String,
+    scope_epoch: u64,
 }
 
 impl ScopeIdentity {
@@ -64,6 +72,18 @@ impl ScopeIdentity {
             scope_ref: bind.scope.scope_ref.clone(),
             scope_epoch: bind.scope.scope_epoch,
             flow_id: bind.scope.flow_id.clone(),
+            parent: bind
+                .parent
+                .as_ref()
+                .filter(|_| {
+                    bind.scope.flow_id.is_none()
+                        && bind.parent_state == Some(broca_protocol::ParentState::Linked)
+                })
+                .map(|parent| ParentIdentity {
+                    owner: parent.owner.as_owner_string(),
+                    scope_ref: parent.scope_ref.clone(),
+                    scope_epoch: parent.scope_epoch,
+                }),
         })
     }
 
@@ -101,9 +121,13 @@ impl MarkedScope {
 /// The questions this policy asks, abstracted so tests drive the decision without a daemon.
 #[async_trait::async_trait]
 pub trait Asks: Send + Sync {
-    /// Cerebellum's answer for the scope, or `None` when cerebellum did not answer.
-    async fn marked(&self, owner: Principal, scope_ref: &str)
-        -> Option<broca_subc::PrivateContent>;
+    /// Cerebellum's union of the scope and linked parent's marks, or `None` if unanswered.
+    async fn marked(
+        &self,
+        owner: Principal,
+        scope_ref: &str,
+        parent_scope_ref: Option<&str>,
+    ) -> Option<broca_subc::PrivateContent>;
 
     /// Basal's answer for the flow's approved version, or why there is none.
     async fn flow_providers(
@@ -137,8 +161,13 @@ impl Asks for SubcAsks {
         &self,
         owner: Principal,
         scope_ref: &str,
+        parent_scope_ref: Option<&str>,
     ) -> Option<broca_subc::PrivateContent> {
-        match self.private_content.query(&owner, scope_ref, None).await {
+        match self
+            .private_content
+            .query(&owner, scope_ref, parent_scope_ref)
+            .await
+        {
             Ok(answer) => Some(answer),
             Err(error) => {
                 // A question broca could not fully ask is answered in the only safe direction,
@@ -316,7 +345,16 @@ impl PrivateContent {
     async fn ask(&self, identity: &ScopeIdentity) -> (MarkedScope, bool) {
         let Some(answer) = self
             .asks
-            .marked(identity.owner_principal(), &identity.scope_ref)
+            // Cerebellum deliberately keys marks by ref alone across owners and epochs. The
+            // daemon-attested full parent remains in our cache key, but its ref is the query API.
+            .marked(
+                identity.owner_principal(),
+                &identity.scope_ref,
+                identity
+                    .parent
+                    .as_ref()
+                    .map(|parent| parent.scope_ref.as_str()),
+            )
             .await
         else {
             return (
@@ -467,6 +505,7 @@ mod tests {
             &self,
             _owner: Principal,
             _scope_ref: &str,
+            _parent_scope_ref: Option<&str>,
         ) -> Option<broca_subc::PrivateContent> {
             self.marked_asks.fetch_add(1, Ordering::SeqCst);
             if self.marked_fails.load(Ordering::SeqCst) {
@@ -512,6 +551,9 @@ mod tests {
                 run_id: Some("run".into()),
             },
             owner_authorized: true,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
         })
     }
 
@@ -529,12 +571,63 @@ mod tests {
                 run_id: None,
             },
             owner_authorized: true,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
         })
     }
 
     /// The cache key a scope produces.
     fn identity(scope: &SendScope) -> ScopeIdentity {
         ScopeIdentity::of(scope).expect("a stamped scope has an identity")
+    }
+
+    #[test]
+    fn only_linked_run_parents_enter_the_private_content_cache_identity() {
+        use broca_protocol::{BindPrincipal, ParentState, ScopeParent};
+        let mut scope = run(1);
+        if let SendScope::Stamped(bind) = &mut scope {
+            bind.parent = Some(Box::new(ScopeParent {
+                owner: BindPrincipal::Reserved {
+                    module_id: "parent-owner".into(),
+                },
+                scope_ref: "head".into(),
+                scope_epoch: 8,
+            }));
+            bind.parent_state = Some(ParentState::Linked);
+        }
+        let linked = identity(&scope);
+        assert_eq!(
+            linked.parent,
+            Some(ParentIdentity {
+                owner: "reserved:parent-owner".into(),
+                scope_ref: "head".into(),
+                scope_epoch: 8,
+            })
+        );
+        for state in [None, Some(ParentState::Pending), Some(ParentState::Ended)] {
+            let mut other = scope.clone();
+            if let SendScope::Stamped(bind) = &mut other {
+                bind.parent_state = state;
+            }
+            assert!(identity(&other).parent.is_none());
+        }
+        let mut other = scope.clone();
+        if let SendScope::Stamped(bind) = &mut other {
+            bind.scope.flow_id = Some("flow".into());
+        }
+        assert!(identity(&other).parent.is_none());
+        for (owner, epoch) in [("another-owner", 8), ("parent-owner", 9)] {
+            let mut other = scope.clone();
+            if let SendScope::Stamped(bind) = &mut other {
+                let parent = bind.parent.as_mut().unwrap();
+                parent.owner = BindPrincipal::Reserved {
+                    module_id: owner.into(),
+                };
+                parent.scope_epoch = epoch;
+            }
+            assert_ne!(identity(&other), linked);
+        }
     }
 
     fn marked(kinds: &[&str]) -> broca_subc::PrivateContent {

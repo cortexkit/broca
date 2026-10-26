@@ -60,7 +60,7 @@ trait ReadAt: Sync {
 
 impl ReadAt for File {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        std::os::unix::fs::FileExt::read_exact_at(self, buf, offset)
+        File::read_exact_at(self, buf, offset)
     }
 }
 
@@ -259,7 +259,8 @@ impl Cache {
             // This removes a missing subject, not changed contents under a stable
             // key. Never broaden it to rebuild an entry for a live mutable file.
             // Stat outside the map lock; permission and other errors retain it.
-            if !std::fs::metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            if !crate::fs_ops::metadata(&path)
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
             {
                 continue;
             }

@@ -90,7 +90,7 @@ pub(super) fn before<'a>(
     bytes: &[u8],
 ) -> io::Result<Option<Publication<'a>>> {
     if path.parent() != Some(state_root.join("agent-data/cuts").as_path())
-        || !ready(state_root).try_exists()?
+        || !fs::try_exists(&ready(state_root))?
     {
         return Ok(None);
     }
@@ -115,7 +115,7 @@ pub(super) fn before<'a>(
 
 pub fn rebuild(state_root: &Path) -> io::Result<()> {
     let _lock = WRITE.lock().unwrap_or_else(|error| error.into_inner());
-    if ready(state_root).try_exists()? {
+    if fs::try_exists(&ready(state_root))? {
         unlink(&ready(state_root))?;
     }
     durable_dir(state_root, &root(state_root))?;
@@ -147,7 +147,7 @@ pub fn rebuild(state_root: &Path) -> io::Result<()> {
 
 pub(super) fn check(wal_root: &Path, reference: &str) -> io::Result<Option<Option<String>>> {
     let state_root = wal_root.parent().unwrap_or(Path::new("."));
-    if !ready(state_root).try_exists()? {
+    if !fs::try_exists(&ready(state_root))? {
         return Ok(None);
     }
     if reference.len() != 32 || !reference.bytes().all(|b| b.is_ascii_hexdigit()) {

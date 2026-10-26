@@ -1,5 +1,6 @@
 use super::*;
 use crate::{FileWal, Wal, WalRecord};
+use std::fs;
 fn root(tag: &str) -> PathBuf {
     let root = broca_test_support::scratch_root()
         .join(format!("move-sidecars-{}-{tag}", std::process::id()));
@@ -132,8 +133,8 @@ fn successful_sync_events_require_the_actual_sync_call_to_succeed() {
     use super::io_trace::{self, Event};
     use std::{cell::RefCell, rc::Rc};
     let root = root("successful-sync-observation");
-    let file = fs::File::create(root.join("data")).unwrap();
-    let unsyncable = fs::File::open("/dev/null").unwrap();
+    let file = crate::fs_ops::File::create(root.join("data")).unwrap();
+    let unsyncable = crate::fs_ops::File::open("/dev/null").unwrap();
     let events = Rc::new(RefCell::new(Vec::new()));
     let observed = events.clone();
     let _trace = io_trace::install(move |event| {
