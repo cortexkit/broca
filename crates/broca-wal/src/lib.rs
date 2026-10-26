@@ -12,6 +12,7 @@ mod directory_sync;
 pub mod file_wal;
 pub mod floor;
 pub mod framing;
+pub mod fs_ops;
 pub mod record;
 
 pub use file_wal::{

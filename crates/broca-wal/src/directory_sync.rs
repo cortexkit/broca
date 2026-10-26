@@ -12,12 +12,11 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     {
         #[cfg(test)]
         fail_if_injected(path)?;
-        std::fs::File::open(path)?.sync_all()
+        crate::fs_ops::sync_dir(path)
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        Ok(())
+        crate::fs_ops::sync_dir(path)
     }
 }
 
