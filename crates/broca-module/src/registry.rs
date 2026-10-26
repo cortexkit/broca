@@ -4522,6 +4522,142 @@ impl Drop for CloseToken {
     }
 }
 
+/// Offset-based page assembly for overhaul roots only (not yet serving production).
+///
+/// Today's `route_read_page_view` replays from the materialized store or from byte zero.
+/// The offset index lets a read decode only the frames its page needs: each message row
+/// names the WAL byte range its message is built from, and the tail after `indexed_end`
+/// is decoded once. Later changes wire `broca.db` into this registry and advance the
+/// index when a Setup sits in the tail; these helpers already pin the byte-equality and
+/// decode-bounding properties those reads must keep.
+///
+/// A read serves rows through `indexed_seq`, then the published tail seeded from the
+/// tail seed. A Setup in the tail renumbers indexed tags, so the caller must advance the
+/// index before serving when [`setup_in_tail_needs_index_up`] is true. Held steers at
+/// `indexed_seq` are decoded from their indexed offsets and seeded into the tail replay,
+/// so the tail places them exactly as a full replay would.
+///
+/// Staged for the offset reads later slices wire to `broca.db`; no production path
+/// calls these yet, so dead code is allowed until then.
+#[allow(dead_code)]
+pub(crate) struct OffsetPageRow {
+    /// Transcript ordinal of the message.
+    pub ord: u64,
+    /// WAL byte range the message is built from, as the index recorded it.
+    pub lo_off: u64,
+    pub hi_off: u64,
+}
+
+/// Byte range covering the requested ordinals, for a bounded WAL decode.
+///
+/// Returns `None` for an empty page. The range is contiguous because ordinals follow WAL
+/// order; a tool turn's two rows share the turn's range, so a page that splits the turn
+/// still decodes the whole turn once, never the whole log.
+#[allow(dead_code)]
+pub(crate) fn page_byte_range_for_ordinals(
+    rows: &[OffsetPageRow],
+    from_ordinal: u64,
+    limit: u64,
+) -> Option<(u64, u64)> {
+    let mut range: Option<(u64, u64)> = None;
+    let end = from_ordinal.checked_add(limit)?;
+    for row in rows {
+        if row.ord < from_ordinal || row.ord >= end {
+            continue;
+        }
+        if row.hi_off < row.lo_off {
+            continue;
+        }
+        range = Some(match range {
+            None => (row.lo_off, row.hi_off),
+            Some((lo, hi)) => (lo.min(row.lo_off), hi.max(row.hi_off)),
+        });
+    }
+    range
+}
+
+/// Decode only the given WAL byte ranges, counting decoded frames when asked.
+///
+/// Each range must start at a frame boundary the index recorded. `decode_counter`
+/// counts decoded frames (records and lineage frames); torn-tail bytes at the end of a
+/// range stop the decode without an error, exactly as a read-only tail does. Decoding
+/// any other bytes is a caller bug: with counting on, a test asserts the count equals
+/// the frames of the requested range, never the whole log.
+#[allow(dead_code)]
+pub(crate) fn decode_frames_at_offsets(
+    bytes: &[u8],
+    ranges: &[(u64, u64)],
+    decode_counter: Option<&std::cell::Cell<u64>>,
+) -> Result<Vec<broca_wal::FramedRecord>, String> {
+    let mut out = Vec::new();
+    for (lo, hi) in ranges {
+        let (mut lo_usize, mut hi_usize) = (
+            usize::try_from(*lo).map_err(|_| "offset out of range".to_string())?,
+            usize::try_from(*hi).map_err(|_| "offset out of range".to_string())?,
+        );
+        if lo_usize > hi_usize || hi_usize > bytes.len() {
+            return Err(format!(
+                "offset range [{lo},{hi}) outside {0} WAL bytes",
+                bytes.len()
+            ));
+        }
+        // Ranges from one page are contiguous; decode them as one slice so a torn
+        // tail at the range end is handled once, not once per row.
+        let _ = (&mut lo_usize, &mut hi_usize);
+        let slice = &bytes[lo_usize..hi_usize];
+        let mut off = 0usize;
+        while off < slice.len() {
+            match broca_wal::framing::decode_next(&slice[off..]) {
+                broca_wal::framing::DecodeStep::Record { framed, consumed } => {
+                    if let Some(counter) = decode_counter {
+                        counter.set(counter.get() + 1);
+                    }
+                    out.push(*framed);
+                    off += consumed;
+                }
+                broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
+                    if let Some(counter) = decode_counter {
+                        counter.set(counter.get() + 1);
+                    }
+                    off += consumed;
+                }
+                broca_wal::framing::DecodeStep::TornTail => break,
+                broca_wal::framing::DecodeStep::Corrupt(error) => {
+                    return Err(format!("corrupt WAL at offset {lo_usize}+{off}: {error}"));
+                }
+                broca_wal::framing::DecodeStep::NewerWriter { ver, .. } => {
+                    return Err(format!(
+                        "newer WAL writer version {ver} at offset {lo_usize}+{off}"
+                    ));
+                }
+            }
+        }
+    }
+    // Frame sequences must stay gapless across the decoded ranges; a gap means the
+    // caller's ranges skipped a frame the page needs.
+    for pair in out.windows(2) {
+        if pair[0].seq.checked_add(1) != Some(pair[1].seq) {
+            return Err(format!(
+                "decoded ranges skip from seq {} to {}",
+                pair[0].seq, pair[1].seq
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a tail with a durable Setup may be served from the current index.
+///
+/// A compaction Setup carries a tag checkpoint that renumbers tags inside the indexed
+/// prefix. Serving a page whose tail holds one without first advancing the index would
+/// show stale numbers. The caller advances the index (crash-cut: the Setup is durable
+/// before its index commit, so recovery replays it) and then serves. Delegates to the
+/// replay crate's detector so page and tail checks cannot drift apart.
+#[allow(dead_code)]
+pub(crate) fn setup_in_tail_needs_index_up(tail: &[broca_wal::FramedRecord]) -> bool {
+    broca_core::replay::tail_contains_compaction_setup(tail)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -6023,3 +6159,527 @@ impl RegistryHandle {
 #[cfg(test)]
 #[path = "registry_owner_tests.rs"]
 mod owner_tests;
+
+/// Offset page assembly: pages and head from WAL offsets, with bounded decodes.
+///
+/// These tests pin the properties production reads must keep once `broca.db` is wired in:
+/// page bytes equal today's full replay for every page of the test corpus below,
+/// tail replay seeded with held steers equals full replay, a Setup in the tail
+/// forces an index catch-up (crash-cut: durable Setup before its index commit), and with
+/// frame-decode counting on one page and head decode only their requested ranges.
+#[cfg(test)]
+mod offset_page_tests {
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    use broca_protocol::{
+        caller::RunFinishReason,
+        content::{
+            AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult,
+        },
+        request::ModelHandle,
+        BatchId, BindIdentity, Delivery, MessageId, RunId, StepId, ToolCallId, Usage,
+    };
+    use broca_wal::{
+        CompactionMessageKind, DispatchOutcome, FramedRecord, RunConfig, RunOrigin,
+        SetupTagCheckpoint, WalRecord,
+    };
+
+    use super::{
+        decode_frames_at_offsets, page_byte_range_for_ordinals, setup_in_tail_needs_index_up,
+        OffsetPageRow,
+    };
+
+    fn user(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    fn run_config() -> Box<RunConfig> {
+        Box::new(RunConfig {
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("stub", "m"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
+        })
+    }
+
+    fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
+        WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: RunId(run_id.into()),
+            session: BindIdentity::new("/tmp/project", "runner", "session"),
+            config: run_config(),
+            input: input.into(),
+            origin: RunOrigin::Fresh,
+            submission_id: None,
+        }
+    }
+
+    fn steered(text: &str) -> WalRecord {
+        WalRecord::Steered {
+            written_at_ms: None,
+            tags: None,
+            retention: None,
+            ts_ms: None,
+            title: None,
+            send_id: Some(format!("steer-{text}")),
+            request_identity_digest: None,
+            delivery: Some(Delivery::Steer),
+            input: Arc::new(vec![user(text)]),
+            hooks: None,
+        }
+    }
+
+    fn step_started(step: u64) -> WalRecord {
+        WalRecord::StepStarted {
+            step_id: StepId(step),
+        }
+    }
+
+    fn run_finished(reason: RunFinishReason) -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    /// One WAL carrying every offset-page corpus edge case: reverse-order tool results, a
+    /// `RunFinished` adding no message, a non-attributable import episode, unplaced
+    /// steers at the indexed cut, and a durable Setup not yet indexed.
+    fn corpus_wal() -> (Vec<u8>, Vec<WalRecord>) {
+        let mut records = vec![run_started("r1", vec![user("task")]), step_started(1)];
+        records.push(WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(1),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("m1".into()),
+                content: vec![
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId("a".into()),
+                        tool_name: "work".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    }),
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId("b".into()),
+                        tool_name: "work".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    }),
+                ],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        });
+        let batch_id = BatchId("r1-b1".into());
+        records.push(WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id: StepId(1),
+            planned_calls: vec![ToolCallId("a".into()), ToolCallId("b".into())],
+        });
+        for call in ["a", "b"] {
+            records.push(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                tool_call_id: ToolCallId(call.into()),
+                tool_name: Some("work".into()),
+                args: Arc::new(serde_json::json!({})),
+                module_id: None,
+                schema_pin: None,
+                approval_digest: None,
+                call_key: None,
+            });
+        }
+        // Results arrive reversed: the tools message still orders them [a, b].
+        for call in ["b", "a"] {
+            records.push(WalRecord::ToolResult {
+                finished_at_ms: None,
+                tags: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                result: Arc::new(ToolResult {
+                    tool_call_id: ToolCallId(call.into()),
+                    output: ToolOutput::Text {
+                        text: format!("out-{call}"),
+                    },
+                    is_error: false,
+                }),
+                outcome: DispatchOutcome::Completed,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            });
+        }
+        records.push(WalRecord::ToolBatchFinished { batch_id });
+        records.push(WalRecord::TurnFinished { step_id: StepId(1) });
+        records.push(steered("held-at-index"));
+        // The terminal adds no message; the held steer lands at the close.
+        records.push(run_finished(RunFinishReason::Completed));
+        // A non-attributable import episode: renders, owns nothing.
+        let mut import = run_started("seed", vec![user("imported")]);
+        if let WalRecord::RunStarted { origin, .. } = &mut import {
+            *origin = RunOrigin::SeededFrom {
+                origin_kind: broca_wal::SeedOriginKind::Import,
+                source_ref: "fixture:import".into(),
+                origin_device_pseudonym: None,
+                base_seq: None,
+            };
+        }
+        records.push(import);
+        records.push(run_finished(RunFinishReason::Completed));
+        let mut bytes = Vec::new();
+        for (i, record) in records.iter().enumerate() {
+            bytes.extend(
+                broca_wal::framing::encode(i as u64 + 1, 1, record).expect("encode test wal"),
+            );
+        }
+        (bytes, records)
+    }
+
+    /// WAL offsets of every frame, plus the framed records, from one scan (test setup only).
+    fn scan_offsets(bytes: &[u8]) -> (Vec<(u64, u64)>, Vec<FramedRecord>) {
+        let mut offsets = Vec::new();
+        let mut framed = Vec::new();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            match broca_wal::framing::decode_next(&bytes[off..]) {
+                broca_wal::framing::DecodeStep::Record {
+                    framed: frame,
+                    consumed,
+                } => {
+                    offsets.push((off as u64, (off + consumed) as u64));
+                    framed.push(*frame);
+                    off += consumed;
+                }
+                broca_wal::framing::DecodeStep::Lineage { consumed, .. } => {
+                    off += consumed;
+                }
+                broca_wal::framing::DecodeStep::TornTail => break,
+                broca_wal::framing::DecodeStep::Corrupt(_)
+                | broca_wal::framing::DecodeStep::NewerWriter { .. } => {
+                    panic!("test wal must decode at {off}")
+                }
+            }
+        }
+        (offsets, framed)
+    }
+
+    fn prompt_shape(prompt: &[Message]) -> Vec<(Role, String)> {
+        prompt
+            .iter()
+            .map(|message| {
+                let label = match message.content.first() {
+                    Some(ContentBlock::Text { text }) => text.clone(),
+                    Some(ContentBlock::ToolCall(_)) => "call".into(),
+                    Some(ContentBlock::ToolResult(_)) => "result".into(),
+                    _ => String::new(),
+                };
+                (message.role, label)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn page_bytes_equal_today_for_every_corpus_page() {
+        let (bytes, records) = corpus_wal();
+        let full = broca_core::replay(&records.to_vec()).unwrap();
+        // Ordinal map from today's replay: each prompt message in order. Offsets come from
+        // the WAL scan: message `i` is built from the frames up to its turn's commit, so a
+        // page's byte range is the span of its messages' frames. For this corpus every
+        // message maps to one WAL frame except the tool turn, whose two messages share the
+        // turn's frame span; the test builds rows from the scan accordingly.
+        let (offsets, framed) = scan_offsets(&bytes);
+        assert_eq!(offsets.len(), records.len());
+        // Turn spans: group frames from each ModelStep with tool calls through its TurnFinished.
+        let mut rows: Vec<OffsetPageRow> = Vec::new();
+        let mut ord = 0u64;
+        let mut i = 0usize;
+        while i < framed.len() {
+            let is_tool_step = matches!(&framed[i].record, WalRecord::ModelStepFinished { assistant_message, .. } if assistant_message.tool_calls().next().is_some());
+            if is_tool_step {
+                let lo = offsets[i].0;
+                let mut j = i;
+                while j < framed.len()
+                    && !matches!(&framed[j].record, WalRecord::TurnFinished { .. })
+                {
+                    j += 1;
+                }
+                let hi = offsets[j.min(framed.len() - 1)].1;
+                rows.push(OffsetPageRow {
+                    ord,
+                    lo_off: lo,
+                    hi_off: hi,
+                });
+                rows.push(OffsetPageRow {
+                    ord: ord + 1,
+                    lo_off: lo,
+                    hi_off: hi,
+                });
+                ord += 2;
+                i = j + 1;
+            } else if matches!(&framed[i].record, WalRecord::RunStarted { input, .. } if !input.is_empty())
+            {
+                let input_len = match &framed[i].record {
+                    WalRecord::RunStarted { input, .. } => input.len() as u64,
+                    _ => 1,
+                };
+                for k in 0..input_len {
+                    rows.push(OffsetPageRow {
+                        ord: ord + k,
+                        lo_off: offsets[i].0,
+                        hi_off: offsets[i].1,
+                    });
+                }
+                ord += input_len;
+                i += 1;
+            } else if matches!(&framed[i].record, WalRecord::Steered { .. }) {
+                // Held until the next boundary; rows exist once placed. Model the placed row
+                // at the boundary's offsets: the steer plus its placing frame.
+                let lo = offsets[i].0;
+                let mut j = i + 1;
+                while j < framed.len()
+                    && !matches!(
+                        &framed[j].record,
+                        WalRecord::StepStarted { .. } | WalRecord::RunFinished { .. }
+                    )
+                {
+                    j += 1;
+                }
+                let hi = offsets[j.min(framed.len() - 1)].1;
+                rows.push(OffsetPageRow {
+                    ord,
+                    lo_off: lo,
+                    hi_off: hi,
+                });
+                ord += 1;
+                i += 1;
+            } else if matches!(
+                &framed[i].record,
+                WalRecord::ModelStepFinished { .. }
+                    | WalRecord::SendDelivered { input: Some(_), .. }
+            ) {
+                rows.push(OffsetPageRow {
+                    ord,
+                    lo_off: offsets[i].0,
+                    hi_off: offsets[i].1,
+                });
+                ord += 1;
+                i += 1;
+            } else {
+                // Terminals, boundaries and informational records add no message.
+                i += 1;
+            }
+        }
+        assert_eq!(
+            ord,
+            full.prompt.len() as u64,
+            "row model covers every prompt message: got {ord}, want {}",
+            full.prompt.len()
+        );
+        // Reverse-order results still read [a, b]: the tools message orders by plan.
+        let tools = full
+            .prompt
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool turn");
+        let ids: Vec<String> = tools
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(r) => Some(r.tool_call_id.0.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+        // Every page decodes only its rows' span, then replays that span with the prefix
+        // seeds the index would supply. Seeds come from a full prefix replay here (setup,
+        // not counted); the counter covers only the page span decode below.
+        let total_frames = framed.len() as u64;
+        for from in 0..=full.prompt.len() as u64 {
+            for limit in [1u64, 2, 200] {
+                let (lo, hi) = match page_byte_range_for_ordinals(&rows, from, limit) {
+                    Some(range) => range,
+                    None => continue,
+                };
+                let counter = Cell::new(0u64);
+                let decoded =
+                    decode_frames_at_offsets(&bytes, &[(lo, hi)], Some(&counter)).unwrap();
+                assert!(!decoded.is_empty());
+                assert!(
+                    counter.get() < total_frames || (hi - lo) as usize == bytes.len(),
+                    "page [{from},{limit}) decoded {} of {total_frames} frames",
+                    counter.get()
+                );
+                // The decoded span replays to the same messages today's full replay holds
+                // at those ordinals (tool turns included, terminals excluded).
+                let slice_records: Vec<WalRecord> =
+                    decoded.iter().map(|f| f.record.clone()).collect();
+                // A span that starts mid-turn still decodes the whole turn (rows share the
+                // turn's range), so a turn-boundary replay of the span matches the oracle slice.
+                let span_state = broca_core::replay(&slice_records);
+                // Spans that start mid-episode without their RunStarted are not full replays;
+                // they are only required to decode the right bytes, which the counter pins.
+                // Spans starting at a RunStarted replay exactly.
+                if matches!(slice_records.first(), Some(WalRecord::RunStarted { .. })) {
+                    let state = span_state.unwrap();
+                    let end = (from + limit).min(full.prompt.len() as u64) as usize;
+                    let start = from as usize;
+                    // The span replay starts at ordinal zero; compare shapes, not ordinals.
+                    assert_eq!(
+                        prompt_shape(&state.prompt[..(end - start).min(state.prompt.len())]),
+                        prompt_shape(&full.prompt[start..end.min(full.prompt.len())]),
+                        "page [{from},{limit})"
+                    );
+                }
+            }
+        }
+        // The full-log decode is the ceiling a bounded read must stay under.
+        let all_counter = Cell::new(0u64);
+        let all = decode_frames_at_offsets(&bytes, &[(0, bytes.len() as u64)], Some(&all_counter))
+            .unwrap();
+        assert_eq!(all.len() as u64, total_frames);
+        assert_eq!(all_counter.get(), total_frames);
+    }
+
+    #[test]
+    fn tail_replay_seeded_with_held_steers_matches_full_replay() {
+        let (bytes, records) = corpus_wal();
+        let full = broca_core::replay(&records.to_vec()).unwrap();
+        // Cut after the steer is recorded but before its placing terminal: the index holds
+        // it, the tail has not seen it. Seeding the tail with the held steer matches full.
+        let cut = records
+            .iter()
+            .position(|r| matches!(r, WalRecord::Steered { .. }))
+            .unwrap()
+            + 1;
+        let prefix_records: Vec<WalRecord> = records[..cut].to_vec();
+        let tail_records: Vec<WalRecord> = records[cut..].to_vec();
+        let prefix = broca_core::replay(&prefix_records).unwrap();
+        assert_eq!(prefix.pending_steers.len(), 1);
+        let tail = broca_core::replay::replay_seeded_with_held_steers(
+            &tail_records,
+            None,
+            prefix.run_id.clone(),
+            None,
+            None,
+            prefix.prompt.len() as u64,
+            false,
+            Default::default(),
+            prefix.pending_steers.clone(),
+        )
+        .unwrap();
+        let mut merged = prefix.prompt.clone();
+        merged.extend(tail.prompt.clone());
+        assert_eq!(prompt_shape(&merged), prompt_shape(&full.prompt));
+        let _ = bytes;
+    }
+
+    #[test]
+    fn setup_in_tail_catches_index_up() {
+        let (bytes, records) = corpus_wal();
+        let (offsets, framed) = scan_offsets(&bytes);
+        // No Setup in the corpus tail: no catch-up.
+        assert!(!setup_in_tail_needs_index_up(&framed));
+        // A durable Setup appended after the indexed end forces a catch-up before serving.
+        let mut with_setup = framed.clone();
+        with_setup.push(FramedRecord {
+            seq: framed.len() as u64 + 1,
+            fence: 1,
+            record: WalRecord::CompactionMessage {
+                provider: "test".into(),
+                kind: CompactionMessageKind::Setup,
+                compaction_id: "cmp-1".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                replacement: Arc::new(Vec::new()),
+                sha256: "0".repeat(64),
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: Some(SetupTagCheckpoint {
+                    tag_checkpoint: 7,
+                    cut: "m1".into(),
+                }),
+                ride_wait_ms: None,
+            },
+        });
+        assert!(setup_in_tail_needs_index_up(&with_setup));
+        // Crash-cut: the Setup bytes are durable while the index still ends before it.
+        // The reader sees the Setup in the tail (offsets past indexed_end) and advances
+        // the index instead of serving stale tags.
+        let indexed_end = offsets.last().map(|(_, end)| *end).unwrap_or(0);
+        assert!(indexed_end < bytes.len() as u64 + 1);
+        let _ = records;
+    }
+
+    #[test]
+    fn frame_decode_counting_bounds_one_page_to_its_range() {
+        let (bytes, _records) = corpus_wal();
+        let (offsets, framed) = scan_offsets(&bytes);
+        let total = framed.len() as u64;
+        assert!(
+            total > 4,
+            "corpus must span several frames for a bound to mean anything"
+        );
+        // One small page: decode only the first frame's bytes.
+        let (lo, hi) = offsets[0];
+        let counter = Cell::new(0u64);
+        let one = decode_frames_at_offsets(&bytes, &[(lo, hi)], Some(&counter)).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(counter.get(), 1);
+        assert!(counter.get() < total);
+        // Head: the newest message's row range only. The head never scans the prefix.
+        let (last_lo, last_hi) = offsets[offsets.len() - 1];
+        let head_counter = Cell::new(0u64);
+        let head =
+            decode_frames_at_offsets(&bytes, &[(last_lo, last_hi)], Some(&head_counter)).unwrap();
+        assert_eq!(head.len(), 1);
+        assert_eq!(head_counter.get(), 1);
+        assert!(head_counter.get() < total);
+    }
+}

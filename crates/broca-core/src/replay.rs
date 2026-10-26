@@ -1509,6 +1509,7 @@ pub fn replay_projection_tail(
         (seed.prefix_len, seed.prefix_len > 0),
         seed.admission_checkpoint.compaction.as_ref(),
         seed.tag_seed,
+        Vec::new(),
     )?;
     let mut starts_new_episode = false;
     let mut tail_updates_last_step_usage = false;
@@ -1851,6 +1852,10 @@ pub(crate) fn first_session_record_is_interrupted<'a>(
 /// (the prefix's trailing assistant origin) so those turns are stamped identically to a
 /// full replay; a `RunStarted` appearing later in the tail overrides it for its episode.
 /// Passing `None` is the full-replay case (the first `RunStarted` sets the origin).
+///
+/// Steers held at the indexed sequence are seeded separately: see
+/// [`replay_seeded_with_held_steers`]. This entry point carries none, so existing
+/// prefix-merge callers keep their behaviour while offset reads seed them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn replay_seeded<'a>(
     records: impl IntoIterator<Item = &'a WalRecord>,
@@ -1871,7 +1876,61 @@ pub(crate) fn replay_seeded<'a>(
         (ordinal_base, require_caller_text),
         None,
         tag_seed,
+        Vec::new(),
     )
+}
+
+/// Tail replay seeded with the steers held at the indexed sequence.
+///
+/// A steer recorded before the index caught up waits for the next step boundary:
+/// it is not in the materialized prefix, and a replay of only the tail would lose
+/// it. The caller decodes those held inputs from their indexed offsets and passes
+/// them here in WAL order; the tail places them at its first `StepStarted` or
+/// `RunFinished` exactly as a full replay would. A `RunStarted` in the tail opens
+/// a new episode and discards them, matching the index which clears held steers
+/// when a new run starts.
+#[allow(clippy::too_many_arguments)]
+pub fn replay_seeded_with_held_steers<'a>(
+    records: impl IntoIterator<Item = &'a WalRecord>,
+    seed_origin: Option<broca_protocol::request::ModelHandle>,
+    seed_run_id: Option<RunId>,
+    seed_budget: Option<BudgetConfig>,
+    seed_budget_state: Option<crate::BudgetReplayStateV1>,
+    ordinal_base: u64,
+    require_caller_text: bool,
+    tag_seed: crate::tags::TagSeed,
+    held_steers: Vec<Message>,
+) -> Result<ReplayState, ReplayError> {
+    replay_seeded_with_compaction(
+        records,
+        seed_origin,
+        seed_run_id,
+        seed_budget,
+        seed_budget_state,
+        (ordinal_base, require_caller_text),
+        None,
+        tag_seed,
+        held_steers,
+    )
+}
+
+/// Whether a WAL tail holds a compaction Setup that renumbers indexed tags.
+///
+/// A Setup's `tag_checkpoint` renumbers tags inside the already-indexed prefix,
+/// so a read whose tail contains one must advance the index before serving: the
+/// stored tag numbers below the cut are stale. Informational compaction records
+/// without a checkpoint, and Step answers, never trigger this.
+pub fn tail_contains_compaction_setup(frames: &[FramedRecord]) -> bool {
+    frames.iter().any(|frame| {
+        matches!(
+            &frame.record,
+            WalRecord::CompactionMessage {
+                kind: broca_wal::CompactionMessageKind::Setup,
+                tag_checkpoint: Some(_),
+                ..
+            }
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1884,6 +1943,7 @@ fn replay_seeded_with_compaction<'a>(
     position: (u64, bool),
     seed_compaction: Option<&crate::compaction::CompactionCheckpoint>,
     tag_seed: crate::tags::TagSeed,
+    held_steers: Vec<Message>,
 ) -> Result<ReplayState, ReplayError> {
     let (ordinal_base, require_caller_text) = position;
     let mut placement = Placement::seeded(
@@ -1893,6 +1953,33 @@ fn replay_seeded_with_compaction<'a>(
         seed_budget_state.clone().unwrap_or_default(),
         0,
     );
+    // Held steers recorded before the tail are pending input of the episode open at
+    // the cut. Replay them through placement as synthetic steers so the tail's
+    // first step boundary places held and new steers together, exactly as a full
+    // replay would. A `RunStarted` in the tail opens a new episode and clears
+    // them, matching the index which drops held steers when a new run starts.
+    // Synthetic records carry only the input length placement reads; no budget,
+    // delivery or tag state is synthesized.
+    for held in &held_steers {
+        let synthetic = WalRecord::Steered {
+            written_at_ms: None,
+            input: vec![held.clone()].into(),
+            tags: None,
+            retention: None,
+            ts_ms: None,
+            title: None,
+            send_id: None,
+            request_identity_digest: None,
+            delivery: None,
+            hooks: None,
+        };
+        placement
+            .observe(&synthetic)
+            .map_err(|reason| ReplayError::CorruptLineage {
+                episode_run_id: seed_run_id.clone().unwrap_or_else(|| RunId(String::new())),
+                reason,
+            })?;
+    }
     // Tag numbers under the computed rules, given in the order the transcript renders: each
     // message as it is placed in the prompt, a run's rules from its `RunStarted` on.
     let mut numbering = crate::tags::TagNumbering::new(tag_seed, 0);
@@ -1931,6 +2018,7 @@ fn replay_seeded_with_compaction<'a>(
         attributable: run_id.as_ref().is_some_and(|id| !id.0.is_empty()),
         seeded_last_ordinal: ordinal_base.checked_sub(1),
         origin: seed_origin,
+        pending_steers: held_steers,
         ..Episode::default()
     };
     let mut episode_step_spans: Vec<std::ops::Range<usize>> = Vec::new();
@@ -5004,5 +5092,502 @@ mod projected_episode_tests {
                 .collect::<Vec<_>>(),
             vec![Some(None), Some(Some(4))]
         );
+    }
+}
+
+/// Offset tail replay: the indexed prefix holds messages by offset and the
+/// tail is replayed from the indexed sequence with held steers seeded.
+///
+/// These tests pin the seeded tail against a full replay at every cut, including the
+/// corpus edge cases page assembly must preserve. They run on records, not bytes,
+/// so a byte-level offset reader that decodes the same records inherits the property.
+#[cfg(test)]
+mod offset_tail_tests {
+    use std::sync::Arc;
+
+    use broca_protocol::{
+        caller::RunFinishReason,
+        content::{
+            AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult,
+        },
+        request::ModelHandle,
+        BatchId, BindIdentity, Delivery, MessageId, RunId, StepId, ToolCallId, Usage,
+    };
+    use broca_wal::{
+        CompactionMessageKind, DispatchOutcome, FramedRecord, RunConfig, RunOrigin,
+        SetupTagCheckpoint, WalRecord,
+    };
+
+    use super::{replay, replay_seeded_with_held_steers, tail_contains_compaction_setup};
+
+    fn user(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    fn run_config() -> Box<RunConfig> {
+        Box::new(RunConfig {
+            turn_directives_v1: None,
+            render_tags: false,
+            computed_tags: None,
+            model: ModelHandle::new("stub", "m"),
+            tools: vec![].into(),
+            tool_choice: Default::default(),
+            generation: Default::default(),
+            response_format: Default::default(),
+            provider_options: serde_json::Value::Null,
+            cache_tiers: serde_json::Value::Null,
+            context_epoch: 0,
+            renderer_version: 1,
+            frozen_render_config: serde_json::Value::Null,
+            auth_selection: None,
+            tools_were_omitted: false,
+            budget: None,
+            context_limit: None,
+            work_class: None,
+            variant: None,
+            service_tier: None,
+            stop_when: Vec::new(),
+            context_management: None,
+        })
+    }
+
+    fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
+        WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: RunId(run_id.into()),
+            session: BindIdentity::new("/tmp/project", "runner", "session"),
+            config: run_config(),
+            input: input.into(),
+            origin: RunOrigin::Fresh,
+            submission_id: None,
+        }
+    }
+
+    fn seeded_run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
+        let mut record = run_started(run_id, input);
+        if let WalRecord::RunStarted { origin, .. } = &mut record {
+            *origin = RunOrigin::SeededFrom {
+                origin_kind: broca_wal::SeedOriginKind::Import,
+                source_ref: "fixture:import".into(),
+                origin_device_pseudonym: None,
+                base_seq: None,
+            };
+        }
+        record
+    }
+
+    fn steered(text: &str) -> WalRecord {
+        WalRecord::Steered {
+            written_at_ms: None,
+            tags: None,
+            retention: None,
+            ts_ms: None,
+            title: None,
+            send_id: Some(format!("steer-{text}")),
+            request_identity_digest: None,
+            delivery: Some(Delivery::Steer),
+            input: Arc::new(vec![user(text)]),
+            hooks: None,
+        }
+    }
+
+    fn step_started(step: u64) -> WalRecord {
+        WalRecord::StepStarted {
+            step_id: StepId(step),
+        }
+    }
+
+    fn text_step(step: u64, text: &str) -> WalRecord {
+        WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(step),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId(format!("m{step}")),
+                content: vec![ContentBlock::Text { text: text.into() }],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        }
+    }
+
+    fn run_finished(reason: RunFinishReason) -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    fn setup_message(seq: u64) -> FramedRecord {
+        FramedRecord {
+            seq,
+            fence: 1,
+            record: WalRecord::CompactionMessage {
+                provider: "test".into(),
+                kind: CompactionMessageKind::Setup,
+                compaction_id: "cmp-1".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                replacement: Arc::new(Vec::new()),
+                sha256: "0".repeat(64),
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: Some(SetupTagCheckpoint {
+                    tag_checkpoint: 7,
+                    cut: "m1".into(),
+                }),
+                ride_wait_ms: None,
+            },
+        }
+    }
+
+    fn framed(seq: u64, record: WalRecord) -> FramedRecord {
+        FramedRecord {
+            seq,
+            fence: 1,
+            record,
+        }
+    }
+
+    /// The corpus edge cases page assembly must preserve, as one WAL: a tool
+    /// turn whose results arrive in reverse plan order, a `RunFinished` that adds no
+    /// message, a second episode, and a steer held across the first episode's close.
+    fn corpus_records() -> Vec<WalRecord> {
+        let mut records = vec![run_started("r1", vec![user("task")]), step_started(1)];
+        // One model step with two tool calls, planned as [a, b] but arriving as [b, a].
+        // The tools message orders results by plan, not by arrival.
+        records.push(WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: StepId(1),
+            assistant_message: Arc::new(AssistantMessage {
+                message_id: MessageId("m1".into()),
+                content: vec![
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId("a".into()),
+                        tool_name: "work".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    }),
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId("b".into()),
+                        tool_name: "work".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    }),
+                ],
+            }),
+            usage: Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        });
+        let batch_id = BatchId("r1-b1".into());
+        records.push(WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id: StepId(1),
+            planned_calls: vec![ToolCallId("a".into()), ToolCallId("b".into())],
+        });
+        for call in ["a", "b"] {
+            records.push(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                tool_call_id: ToolCallId(call.into()),
+                tool_name: Some("work".into()),
+                args: Arc::new(serde_json::json!({})),
+                module_id: None,
+                schema_pin: None,
+                approval_digest: None,
+                call_key: None,
+            });
+        }
+        for call in ["b", "a"] {
+            records.push(WalRecord::ToolResult {
+                finished_at_ms: None,
+                tags: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                result: Arc::new(ToolResult {
+                    tool_call_id: ToolCallId(call.into()),
+                    output: ToolOutput::Text {
+                        text: format!("out-{call}"),
+                    },
+                    is_error: false,
+                }),
+                outcome: DispatchOutcome::Completed,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            });
+        }
+        records.push(WalRecord::ToolBatchFinished { batch_id });
+        records.push(WalRecord::TurnFinished { step_id: StepId(1) });
+        records.push(steered("held-across-close"));
+        // The terminal adds no message; the held steer lands at the close.
+        records.push(run_finished(RunFinishReason::Completed));
+        // A second episode under a new run id.
+        records.push(run_started("r2", vec![user("next")]));
+        records.push(step_started(1));
+        records.push(text_step(1, "answer"));
+        records.push(run_finished(RunFinishReason::Completed));
+        records
+    }
+
+    fn non_attributable_records() -> Vec<WalRecord> {
+        // An import-seeded episode: messages render, but no run owns them.
+        vec![
+            seeded_run_started("seed", vec![user("imported")]),
+            run_finished(RunFinishReason::Completed),
+        ]
+    }
+
+    fn prompt_shape(prompt: &[Message]) -> Vec<(Role, String)> {
+        prompt
+            .iter()
+            .map(|message| {
+                let label = match message.content.first() {
+                    Some(ContentBlock::Text { text }) => text.clone(),
+                    Some(ContentBlock::ToolCall(_)) => "call".into(),
+                    Some(ContentBlock::ToolResult(_)) => "result".into(),
+                    _ => String::new(),
+                };
+                (message.role, label)
+            })
+            .collect()
+    }
+
+    /// Seeds a tail replay at `cut` from the prefix replay, mirroring what the offset
+    /// index stores: the episode origin, run id and budget of the open episode, the
+    /// ordinal base, and the steers still held at the cut.
+    fn tail_state_at_cut(records: &[WalRecord], cut: usize) -> (Vec<Message>, super::ReplayState) {
+        let prefix = replay(&records[..cut]).unwrap();
+        let suffix: Vec<WalRecord> = records[cut..].to_vec();
+        let held = prefix.pending_steers.clone();
+        let tail = replay_seeded_with_held_steers(
+            &suffix,
+            prefix
+                .run_config
+                .as_ref()
+                .map(|config| config.model.clone())
+                .or(prefix
+                    .prompt
+                    .iter()
+                    .find_map(|message| message.origin.clone())),
+            prefix.run_id.clone(),
+            prefix
+                .run_config
+                .as_ref()
+                .and_then(|config| config.budget.clone()),
+            None,
+            prefix.prompt.len() as u64,
+            false,
+            crate::tags::TagSeed::default(),
+            held.clone(),
+        )
+        .unwrap();
+        (held, tail)
+    }
+
+    #[test]
+    fn tail_seeds_held_steers() {
+        // A steer held before the first step boundary must appear once, at that
+        // boundary, when the tail is replayed with it seeded.
+        let records = vec![
+            run_started("r1", vec![user("task")]),
+            steered("held"),
+            step_started(1),
+            text_step(1, "answer"),
+            run_finished(RunFinishReason::Completed),
+        ];
+        let full = replay(&records).unwrap();
+        assert_eq!(
+            prompt_shape(&full.prompt),
+            vec![
+                (Role::User, "task".into()),
+                (Role::User, "held".into()),
+                (Role::Assistant, "answer".into()),
+            ]
+        );
+        // The cut falls after the steer is recorded but before its step boundary:
+        // the prefix holds it, the tail has not seen it.
+        let cut = 2;
+        let prefix = replay(&records[..cut]).unwrap();
+        assert_eq!(
+            prompt_shape(&prefix.pending_steers),
+            vec![(Role::User, "held".into())]
+        );
+        let tail_records: Vec<WalRecord> = records[cut..].to_vec();
+        let seeded = replay_seeded_with_held_steers(
+            &tail_records,
+            None,
+            prefix.run_id.clone(),
+            None,
+            None,
+            prefix.prompt.len() as u64,
+            false,
+            crate::tags::TagSeed::default(),
+            prefix.pending_steers.clone(),
+        )
+        .unwrap();
+        let mut merged = prefix.prompt.clone();
+        merged.extend(seeded.prompt.clone());
+        assert_eq!(prompt_shape(&merged), prompt_shape(&full.prompt));
+        // Without the seed the held steer is lost: the seeded tail is the only one
+        // that equals the full replay. This is the break the seeding guards.
+        let unseeded = super::replay_seeded(
+            &tail_records,
+            None,
+            prefix.run_id.clone(),
+            None,
+            None,
+            prefix.prompt.len() as u64,
+            false,
+            crate::tags::TagSeed::default(),
+        )
+        .unwrap();
+        assert_ne!(prompt_shape(&unseeded.prompt), prompt_shape(&seeded.prompt));
+        assert_eq!(unseeded.prompt.len() + 1, seeded.prompt.len());
+    }
+
+    #[test]
+    fn tail_replay_equals_full_replay_at_every_cut() {
+        for records in [corpus_records(), non_attributable_records()] {
+            let full = replay(&records).unwrap();
+            for cut in 0..=records.len() {
+                let prefix = replay(&records[..cut]);
+                // A cut inside a corrupt lineage is not a servable prefix; the full
+                // replay and the prefix replay refuse it together.
+                let prefix = match prefix {
+                    Ok(prefix) => prefix,
+                    Err(_) => {
+                        assert!(replay(&records).is_err());
+                        continue;
+                    }
+                };
+                // The index commits whole turns: a cut inside an open tool turn has no
+                // rows for that turn, and its tail needs the turn's held assistant and
+                // batch plan, not just held steers. Those cuts are not servable prefix
+                // boundaries, so the seeded tail is only required to match at cuts
+                // where no tool turn is open. Detect an open turn by scanning for a
+                // tool-call step without its TurnFinished or RunFinished.
+                if tool_turn_open(&records[..cut]) {
+                    continue;
+                }
+                let (_held, tail) = tail_state_at_cut(&records, cut);
+                let mut merged = prefix.prompt.clone();
+                merged.extend(tail.prompt.clone());
+                assert_eq!(
+                    prompt_shape(&merged),
+                    prompt_shape(&full.prompt),
+                    "merged tail at cut {cut} of {} records",
+                    records.len()
+                );
+                // Attributable episodes keep their run; the import episode owns nothing.
+                assert_eq!(merged.len(), full.prompt.len(), "cut {cut}");
+            }
+        }
+    }
+
+    /// Whether the prefix ends inside an open tool turn: a model step with tool calls
+    /// whose batch has not finished and whose episode has not closed. The offset index
+    /// holds no rows for that turn yet, so no read splits the prefix here.
+    fn tool_turn_open(prefix: &[WalRecord]) -> bool {
+        let mut open = false;
+        for record in prefix {
+            match record {
+                WalRecord::ModelStepFinished {
+                    assistant_message, ..
+                } if assistant_message.tool_calls().next().is_some() => {
+                    open = true;
+                }
+                WalRecord::TurnFinished { .. } | WalRecord::RunFinished { .. } => {
+                    open = false;
+                }
+                WalRecord::RunStarted { .. } => {
+                    open = false;
+                }
+                _ => {}
+            }
+        }
+        open
+    }
+
+    #[test]
+    fn setup_in_tail_catches_index_up() {
+        // A compaction Setup durable but not yet indexed sits in the tail. The
+        // detector names it so the reader advances the index before serving: the
+        // stored tag numbers below the cut are stale until it does.
+        let mut records = vec![
+            run_started("r1", vec![user("task")]),
+            step_started(1),
+            text_step(1, "answer"),
+        ];
+        let setup_seq = records.len() as u64 + 1;
+        let framed_tail: Vec<FramedRecord> = records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| framed(i as u64 + 1, r.clone()))
+            .collect();
+        assert!(!tail_contains_compaction_setup(&framed_tail));
+        let mut with_setup = framed_tail.clone();
+        with_setup.push(setup_message(setup_seq));
+        assert!(tail_contains_compaction_setup(&with_setup));
+        // A Step answer without a checkpoint never forces a catch-up.
+        let step_answer = FramedRecord {
+            seq: setup_seq,
+            fence: 1,
+            record: WalRecord::CompactionMessage {
+                provider: "test".into(),
+                kind: CompactionMessageKind::Step,
+                compaction_id: "cmp-1".into(),
+                version: 1,
+                range: broca_wal::CompactionRange { from: 0, to: 0 },
+                replacement: Arc::new(Vec::new()),
+                sha256: "0".repeat(64),
+                request_id: None,
+                cursor: None,
+                call_when: None,
+                stability: None,
+                ceiling: None,
+                tag_checkpoint: None,
+                ride_wait_ms: None,
+            },
+        };
+        assert!(!tail_contains_compaction_setup(&[step_answer]));
+        // The tail past the Setup still replays: the catch-up is an index advance,
+        // not a replay refusal.
+        records.push(with_setup.last().unwrap().record.clone());
+        records.push(run_finished(RunFinishReason::Completed));
+        let full = replay(&records).unwrap();
+        assert!(!full.prompt.is_empty());
     }
 }

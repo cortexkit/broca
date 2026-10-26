@@ -1,0 +1,63 @@
+# Safety proofs for crash recovery, authorization, wire compatibility and retained data.
+# Replay serially with cortexkit-mutate 0.8.0 (binary ckdev-mutate). Reports live in
+# target/mutations/.
+# Use the runner's default build/test deadlines; do not calibrate budgets on a workstation.
+# only = false allows other tests of the same property in that test target to fail
+# on the break without failing the row. A cross-target catch is a test in a different
+# target of the package going red; the nightly --broad audit reports those catches.
+# hub marks a break deliberately caught by several targets asserting a shared property.
+# Add it only after a broad replay shows those targets, with that property as its reason.
+
+[[control]]
+id = "x3-tail-seeds-held-steers"
+guards = "Tail replay seeds steers held at the indexed sequence; without the seed a held steer never reaches the tail's first step boundary"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::offset_tail_tests::tail_seeds_held_steers"]
+file = "crates/broca-core/src/replay.rs"
+old = "        pending_steers: held_steers,"
+new = "        pending_steers: Vec::new(), // NON-VACUITY BREAK: drop the held-steer seed so a tail replay loses steers held at the indexed sequence."
+
+[[control]]
+id = "x3-setup-in-tail-catches-index-up"
+guards = "A compaction Setup in the tail forces an index catch-up before serving; a Step answer without a checkpoint never does"
+runner = "cargo"
+package = "broca-core"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-core/src/replay.rs"
+expect_red = ["replay::offset_tail_tests::setup_in_tail_catches_index_up"]
+file = "crates/broca-core/src/replay.rs"
+old = """                kind: broca_wal::CompactionMessageKind::Setup,
+                tag_checkpoint: Some(_),"""
+new = """                kind: broca_wal::CompactionMessageKind::Step,
+                tag_checkpoint: Some(_), // NON-VACUITY BREAK: a Setup never forces an index catch-up."""
+
+[[control]]
+id = "x3-page-setup-check-catches-index-up"
+guards = "Offset page assembly refuses to serve a tail holding a durable Setup without first advancing the index"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/registry.rs"
+expect_red = ["registry::offset_page_tests::setup_in_tail_catches_index_up"]
+file = "crates/broca-module/src/registry.rs"
+old = "    broca_core::replay::tail_contains_compaction_setup(tail)"
+new = "    let _ = tail;\n    false // NON-VACUITY BREAK: a Setup in the tail never forces an index catch-up."
+
+[[control]]
+id = "x3-head-decodes-only-its-range"
+guards = "Head is served from the newest message row's byte range and decodes only those frames, never the whole log"
+runner = "cargo"
+package = "broca-module"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module/src/serve.rs"
+expect_red = ["serve::offset_head_tests::head_decodes_only_its_range_and_catches_setup_in_tail"]
+file = "crates/broca-module/src/serve.rs"
+old = "    newest.map(|row| (row.lo_off, row.hi_off))"
+new = "    newest.map(|row| (0, row.hi_off)) // NON-VACUITY BREAK: the head scans from byte zero instead of its row range."
