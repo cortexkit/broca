@@ -113,12 +113,18 @@ impl AgentDataService {
         broca_store::session_refs::cleanup_legacy_inventory(
             self.wal.root().parent().unwrap_or(self.wal.root()),
         )
-        .map_err(unavailable)?;
+        .map_err(|error| unavailable(format!("cleanup_legacy_inventory: {error}")))?;
         broca_wal::migration::rebuild_fence_index(
             self.wal.root().parent().unwrap_or(self.wal.root()),
         )
-        .map_err(unavailable)?;
-        self.cuts.reconcile_boot(&self.artifacts).await?;
+        .map_err(|error| unavailable(format!("rebuild_fence_index: {error}")))?;
+        self.cuts
+            .reconcile_boot(&self.artifacts)
+            .await
+            .map_err(|mut error| {
+                error.message = format!("cuts.reconcile_boot: {}", error.message);
+                error
+            })?;
         if !self
             .index
             .session_refs(std::iter::empty())
