@@ -12,6 +12,25 @@ use serde::{Deserialize, Serialize};
 pub struct CapturedMedia(Arc<BTreeMap<String, Vec<MediaRef>>>);
 
 impl CapturedMedia {
+    /// Detect capture-bearing records before allocating an index. Most records, including
+    /// every record in a media-free session, need no capture collection at all.
+    pub(crate) fn captures_any(record: &WalRecord) -> bool {
+        match record {
+            WalRecord::RunStarted { input, .. } | WalRecord::Steered { input, .. } => input
+                .iter()
+                .any(|message| super::media_refs(&message.content).next().is_some()),
+            WalRecord::Queued { request, .. } => request
+                .input
+                .iter()
+                .any(|message| super::media_refs(&message.content).next().is_some()),
+            WalRecord::ToolResult { result, .. } | WalRecord::LateResult { result, .. } => {
+                matches!(&result.output, broca_protocol::ToolOutput::Parts { parts }
+                    if parts.iter().any(|part| matches!(part, broca_protocol::ToolOutputPart::Media { .. })))
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

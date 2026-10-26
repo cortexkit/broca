@@ -31089,3 +31089,31 @@ expect_red = ["compaction::view::tests::media::media_replacements_read_their_rel
 file = "crates/broca-core/src/compaction/view.rs"
 old = ") -> bool {\n    super::media_refs(&candidate.content).next().is_some()"
 new = ") -> bool {\n    false // NON-VACUITY BREAK: do not read released media sources"
+
+[[control]]
+id = "compaction-media-free-checkpoint-capture-allocation"
+guards = "Folding media-free records before Setup allocates no temporary capture index"
+runner = "cargo"
+package = "broca-core"
+target = "--test capture_allocation"
+select = "expected"
+test_file = "crates/broca-core/tests/capture_allocation.rs"
+expect_red = ["media_free_records_do_not_allocate_capture_indexes"]
+expect_message = "checkpoint captures allocated"
+file = "crates/broca-core/src/compaction.rs"
+old = 'if CapturedMedia::captures_any(record) {'
+new = 'if true || CapturedMedia::captures_any(record) { // NON-VACUITY BREAK: allocate captures for every pre-Setup record'
+
+[[control]]
+id = "wal-media-free-append-capture-allocation"
+guards = "The WAL append capture collector allocates nothing for media-free records"
+runner = "cargo"
+package = "broca-core"
+target = "--test capture_allocation"
+select = "expected"
+test_file = "crates/broca-core/tests/capture_allocation.rs"
+expect_red = ["media_free_records_do_not_allocate_capture_indexes"]
+expect_message = "append captures allocated"
+file = "crates/broca-core/src/wal_writer.rs"
+old = 'if crate::compaction::CapturedMedia::captures_any(record) {'
+new = 'if true || crate::compaction::CapturedMedia::captures_any(record) { // NON-VACUITY BREAK: allocate captures on every WAL append'

@@ -2108,6 +2108,23 @@ impl WalHandle {
         captured
     }
 
+    /// Exercise only enqueue's capture work, without counting command boxing or channel storage.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn capture_for_append_for_test(&self, seq: u64, record: &WalRecord) {
+        self.capture_for_append(seq, record);
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn has_pending_media_capture_for_test(&self, reference: &broca_protocol::MediaRef) -> bool {
+        self.pending_media
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, captured)| captured.contains(reference))
+    }
+
     pub fn media_capture(&self) -> Option<crate::tool_media::ToolMediaCapture> {
         self.media_capture.clone()
     }
@@ -2685,14 +2702,7 @@ impl WalHandle {
             ),
             _ => {}
         }
-        let mut captures = crate::compaction::CapturedMedia::default();
-        captures.fold(&record);
-        if !captures.is_empty() {
-            self.pending_media
-                .lock()
-                .unwrap()
-                .push_back((seq, captures));
-        }
+        self.capture_for_append(seq, &record);
         if self
             .tx
             .send(WalCommand::Append {
@@ -2707,6 +2717,19 @@ impl WalHandle {
             return RecordOutcome::Refused(WalWriteError::Failed(error));
         }
         RecordOutcome::Accepted(seq)
+    }
+
+    fn capture_for_append(&self, seq: u64, record: &WalRecord) {
+        if crate::compaction::CapturedMedia::captures_any(record) {
+            let mut captures = crate::compaction::CapturedMedia::default();
+            captures.fold(record);
+            if !captures.is_empty() {
+                self.pending_media
+                    .lock()
+                    .unwrap()
+                    .push_back((seq, captures));
+            }
+        }
     }
 
     fn size_scope(&self) -> retained_size::SizeScope {

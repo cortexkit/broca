@@ -93,10 +93,12 @@ impl CompactionCheckpoint {
             Self::State(state) => state.fold(record),
             Self::Captures(captured) => captured.fold(record),
             Self::None => {
-                let mut captured = CapturedMedia::default();
-                captured.fold(record);
-                if !captured.is_empty() {
-                    *self = Self::Captures(captured);
+                if CapturedMedia::captures_any(record) {
+                    let mut captured = CapturedMedia::default();
+                    captured.fold(record);
+                    if !captured.is_empty() {
+                        *self = Self::Captures(captured);
+                    }
                 }
             }
         }
