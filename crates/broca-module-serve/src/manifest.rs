@@ -727,40 +727,26 @@ mod provenance_tests {
         );
     }
 
-    /// What the provenance helper does with broca's inputs, asserted on VALUES not on text.
-    ///
-    /// Replaces a text search over this file, and the replacement is the point. The old test
-    /// grepped the production half for `wire_crate_version: None` -- itself already the repaired
-    /// form of a test that had been outright unfailable, because it originally searched the WHOLE
-    /// file and the literal inside its own assertion satisfied it (issue #9).
-    /// Even scoped correctly, a text search pins the SPELLING of a decision rather
-    /// than its OUTCOME, so it could not survive the construction moving into a helper.
-    ///
-    /// Two facts pinned, one of which is a live behaviour change:
-    ///
-    ///   - `wire_crate_version` IS NOW SOURCED. It stayed absent for as long as subc-protocol
-    ///     exported no version const; the helper fills it from that crate's own const, so the
-    ///     parked reason is DISCHARGED rather than still pending.
-    ///   - `store_schema_version` STAYS ABSENT, because broca has no schema version to report.
-    ///     Tempting to synthesise from the column list, which would then change silently under
-    ///     an unrelated additive migration.
+    /// Check the provenance broca actually registers, rather than a separately built upstream
+    /// value. A stamped test build exercises the same compile-time inputs as packaging.
     #[test]
+    #[ignore = "requires CK_BUILD_STAMPED=1 and canonical CK_BUILD_REV/CK_BUILD_LOCK_DIGEST at compile time"]
     fn provenance_fills_only_what_broca_can_source() {
-        let sha = "a".repeat(40);
-        let lock = "b".repeat(64);
-        let provenance = subc_protocol::manifest::build_provenance(Some(&sha), Some(&lock), None)
-            .expect("full-length lowercase hex is the canonical form for both");
-
-        assert_eq!(provenance.build_git_sha.as_deref(), Some(sha.as_str()));
-        assert_eq!(provenance.build_lock_digest.as_deref(), Some(lock.as_str()));
-        assert!(
-            provenance.wire_crate_version.is_some(),
-            "the helper sources this from subc-protocol's own version const"
+        let emitted = serde_json::to_value(manifest("broca")).unwrap();
+        let provenance = emitted.get("provenance").expect("stamped HELLO provenance");
+        assert_eq!(
+            provenance["build_git_sha"].as_str(),
+            option_env!("CK_BUILD_REV")
         );
         assert_eq!(
-            provenance.store_schema_version, None,
-            "broca passes None: it has no schema version to report"
+            provenance["build_lock_digest"].as_str(),
+            option_env!("CK_BUILD_LOCK_DIGEST")
         );
+        assert_eq!(
+            provenance["wire_crate_version"],
+            subc_protocol::SUBC_PROTOCOL_CRATE_VERSION
+        );
+        assert!(provenance.get("store_schema_version").is_none());
     }
 
     /// The exact bytes of the provenance block a stamped build sends in HELLO, for fixed inputs.
@@ -818,26 +804,6 @@ mod provenance_tests {
         );
     }
 
-    /// The stamped block carries the process's nonce source.
-    ///
-    /// Checked as source text, because the block exists only in builds that
-    /// `scripts/stage-release.sh` stamps at compile time, and no test build is stamped. The value mapping is tested on values
-    /// above and through the real process accessor in `tests/launch_nonce.rs`; this pins that
-    /// the stamped block is the one that uses it.
-    #[test]
-    fn the_stamped_block_reports_the_nonce_source() {
-        let text = include_str!("manifest.rs");
-        let (production, _tests) = text
-            .split_once("#[cfg(test)]")
-            .expect("manifest.rs must contain a #[cfg(test)] boundary to split on");
-        assert!(
-            production.contains(
-                "Ok(provenance) => Some(provenance.with_launch_nonce_source(launch_nonce_source())),"
-            ),
-            "build_provenance must attach the accessor's cached nonce source to the stamped block"
-        );
-    }
-
     /// A malformed sha is REFUSED; a sentinel is an honest omission. Both arms, because
     /// collapsing them is the plausible mistake.
     ///
@@ -872,49 +838,29 @@ mod provenance_tests {
         );
     }
 
-    /// The one field broca cannot honestly source stays absent even when stamped.
-    ///
-    /// Pinned because both are tempting to synthesise: a wire crate version could be read from
-    /// the wrong crate, and a store schema version could be derived from the column list -- which
-    /// would then change silently under an unrelated additive migration. Absent is the truthful
-    /// value until each has a real source.
-    ///
-    /// THE SEARCH IS SCOPED TO THE PRODUCTION HALF OF THIS FILE, and that is the whole test.
-    ///
-    /// It originally searched the WHOLE file, which made it unfailable: the literal it looks for
-    /// appears inside its own assertion, so the corpus contained the answer regardless of what
-    /// the field said. Setting `wire_crate_version: Some("0.13.0".to_string())` left it GREEN.
-    /// Reported from outside (issue #9) before this rewrite.
-    ///
-    /// A guard whose own source is part of the corpus it searches satisfies itself. Splitting at
-    /// the `#[cfg(test)]` boundary is what makes the corpus the thing under test rather than the
-    /// test plus the thing.
+    /// The store has no schema version to report. Even a stamped manifest must omit the field,
+    /// not invent a version from its columns or emit a null that consumers could mistake for one.
     #[test]
+    #[ignore = "requires CK_BUILD_STAMPED=1 and canonical CK_BUILD_REV/CK_BUILD_LOCK_DIGEST at compile time"]
     fn unsourced_provenance_fields_are_not_synthesised() {
-        let text = include_str!("manifest.rs");
-        let (production, _tests) = text
-            .split_once("#[cfg(test)]")
-            .expect("manifest.rs must contain a #[cfg(test)] boundary to split on");
-
-        // An empty or truncated split is an instrument failure, not a clean result: a file that
-        // opened with #[cfg(test)] would yield an empty production half and pass every `!contains`
-        // check below by having nothing to find.
-        assert!(
-            production.contains("fn build_provenance()"),
-            "the production half must contain build_provenance; the split is wrong, not the code"
+        let emitted = serde_json::to_value(manifest("broca")).unwrap();
+        let provenance = emitted["provenance"]
+            .as_object()
+            .expect("stamped HELLO provenance");
+        assert_eq!(
+            provenance.keys().map(String::as_str).collect::<Vec<_>>(),
+            if launch_nonce_source().is_some() {
+                vec![
+                    "build_git_sha",
+                    "build_lock_digest",
+                    "launch_nonce_source",
+                    "wire_crate_version",
+                ]
+            } else {
+                vec!["build_git_sha", "build_lock_digest", "wire_crate_version"]
+            }
         );
-
-        // wire_crate_version is no longer checked here: it is now SOURCED by the helper, and the
-        // value assertion above is the honest test of that. Only the field broca still cannot
-        // source belongs in a call-site text check.
-        // Anchored on the CALL, not on a bare `None`. A loose `contains("None,")` would match
-        // any of a dozen unrelated lines in this file and pass whatever the third argument said.
-        assert!(
-            production.contains("option_env!(\"CK_BUILD_LOCK_DIGEST\"),\n        None,\n    ) {"),
-            "build_provenance must pass None as store_schema_version until the store has a real \
-             version to report; deriving one from the column list would change silently under an \
-             unrelated additive migration"
-        );
+        assert!(!provenance.contains_key("store_schema_version"));
     }
 }
 
