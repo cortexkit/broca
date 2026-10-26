@@ -467,6 +467,25 @@ fn settled_episode(frames: &[broca_wal::FramedRecord]) -> Option<String> {
     settled_terminal(frames).map(|(_, reason)| reason)
 }
 
+/// Public-head reading for [`settle_compaction`]: `(run_id, state)`, or
+/// `None` while the head is unreadable.
+pub(super) type PublicHead = Option<(String, String)>;
+
+/// Boxed head-probe future behind [`HeadProbe`].
+pub(super) type HeadFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = PublicHead> + Send>>;
+
+/// Corroboration probe consulted when [`settle_compaction`] finds a visible
+/// WAL terminal.
+pub(super) type HeadProbe<'a> = &'a mut (dyn FnMut() -> HeadFuture + Send);
+
+/// Marker for [`settle_compaction`] callers that treat a visible file terminal
+/// as sufficient: their run is live and its terminal was synced before any
+/// reply, or (in the fixture unit test) no head service exists at all.
+pub(super) fn file_terminal_is_enough() -> Option<HeadProbe<'static>> {
+    None
+}
+
 fn settlement_records() -> Vec<broca_wal::FramedRecord> {
     use broca_protocol::{BindIdentity, ModelHandle, RunFinishReason, RunId};
     use broca_wal::{FramedRecord, WalRecord as R};
@@ -629,10 +648,14 @@ async fn compaction_settle_poller_observes_terminal_before_idle_view_and_notice(
         writer.append(frame.fence, &frame.record, false).unwrap();
     }
     writer.sync().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), subject.settle_compaction(session))
-        .await
-        .expect("poller ignored the current run's terminal after idle compaction metadata")
-        .unwrap();
+    // Fixture WAL is synced directly with no daemon or head service: the file terminal is the assertion.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        subject.settle_compaction(session, file_terminal_is_enough()),
+    )
+    .await
+    .expect("poller ignored the current run's terminal after idle compaction metadata")
+    .unwrap();
     let evidence = subject.shared.evidence.lock().unwrap();
     let observed = evidence.last().unwrap();
     assert!(
@@ -705,15 +728,18 @@ async fn settlement_requires_public_head_terminal_for_visible_wal_terminal() {
     );
 
     let head = std::sync::Arc::new(Mutex::new(Some(("sealed".to_owned(), "active".to_owned()))));
-    let probe = || {
+    let mut probe = {
         let head = head.clone();
-        async move { head.lock().unwrap().clone() }
+        move || -> HeadFuture {
+            let head = head.clone();
+            Box::pin(async move { head.lock().unwrap().clone() })
+        }
     };
     // A visible-but-unsynced terminal never counts as settled, even though the
     // old file-only poller would have returned at once.
     let blocked = tokio::time::timeout(
         Duration::from_millis(200),
-        subject.settle_compaction_with_head(session, probe),
+        subject.settle_compaction(session, Some(&mut probe)),
     )
     .await;
     assert!(
@@ -723,13 +749,16 @@ async fn settlement_requires_public_head_terminal_for_visible_wal_terminal() {
 
     // A terminal for a different run is not corroboration of this one.
     *head.lock().unwrap() = Some(("other".to_owned(), "interrupted".to_owned()));
-    let probe = || {
+    let mut probe = {
         let head = head.clone();
-        async move { head.lock().unwrap().clone() }
+        move || -> HeadFuture {
+            let head = head.clone();
+            Box::pin(async move { head.lock().unwrap().clone() })
+        }
     };
     let blocked = tokio::time::timeout(
         Duration::from_millis(200),
-        subject.settle_compaction_with_head(session, probe),
+        subject.settle_compaction(session, Some(&mut probe)),
     )
     .await;
     assert!(
@@ -740,13 +769,16 @@ async fn settlement_requires_public_head_terminal_for_visible_wal_terminal() {
     // Publishing the durable head unblocks the same poller: the public `head`
     // now reports this run as `interrupted`.
     *head.lock().unwrap() = Some(("sealed".to_owned(), "interrupted".to_owned()));
-    let probe = || {
+    let mut probe = {
         let head = head.clone();
-        async move { head.lock().unwrap().clone() }
+        move || -> HeadFuture {
+            let head = head.clone();
+            Box::pin(async move { head.lock().unwrap().clone() })
+        }
     };
     tokio::time::timeout(
         Duration::from_secs(5),
-        subject.settle_compaction_with_head(session, probe),
+        subject.settle_compaction(session, Some(&mut probe)),
     )
     .await
     .expect("corroborated settle must return once the public head is terminal")
@@ -784,16 +816,21 @@ async fn settlement_requires_public_head_terminal_for_visible_wal_terminal() {
     }
     let probe_polls = polls.clone();
     let head_for_gate = head.clone();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        subject.settle_compaction_with_head(session, move || {
+    let mut probe = {
+        let head_for_gate = head_for_gate.clone();
+        let probe_polls = probe_polls.clone();
+        move || -> HeadFuture {
             let head_for_gate = head_for_gate.clone();
             let probe_polls = probe_polls.clone();
-            async move {
+            Box::pin(async move {
                 probe_polls.fetch_add(1, Ordering::SeqCst);
                 head_for_gate.lock().unwrap().clone()
-            }
-        }),
+            })
+        }
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        subject.settle_compaction(session, Some(&mut probe)),
     )
     .await
     .expect("a held model call must settle without waiting for the public head")
@@ -863,7 +900,11 @@ impl BrocaSubject {
         &self,
         session: &str,
     ) -> Result<cortexkit_role_llm_runner_conformance::CompactionObservation, HarnessError> {
-        self.settle_compaction(session).await?;
+        // Returns in-process call and model-input counts without consulting the
+        // public head: it runs after the session route already corroborated the
+        // terminal (or with no restart), and it has no route of its own to poll.
+        self.settle_compaction(session, file_terminal_is_enough())
+            .await?;
         let sessions = self.shared.compaction.lock().unwrap();
         let state = sessions
             .get(session)
@@ -966,19 +1007,17 @@ impl BrocaSubject {
         Some((run_id, state))
     }
 
-    /// Wait for compaction work with a public-head corroboration of any visible
-    /// terminal. A held model call still settles at once; a WAL terminal only
-    /// settles once `read_head` reports the same run as terminal. A terminal
-    /// that is only visible in the file never counts as settled.
-    pub(super) async fn settle_compaction_with_head<F, Fut>(
+    /// Wait until compaction work settles. A held model call still settles at
+    /// once. A WAL terminal settles at once when `read_head` is `None` (see
+    /// [`file_terminal_is_enough`]); when `Some`, the same run must also
+    /// report terminal through the public head, so a terminal that is only
+    /// visible in the file never counts as settled. The hang guard bounds the
+    /// whole poll, not each head read.
+    pub(super) async fn settle_compaction(
         &self,
         session: &str,
-        mut read_head: F,
-    ) -> Result<(), HarnessError>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Option<(String, String)>>,
-    {
+        mut read_head: Option<HeadProbe<'_>>,
+    ) -> Result<(), HarnessError> {
         let root = self.compaction_root(session)?;
         // Each return names why the work counts as settled, so a failure dump can tell an early
         // return from a genuine one.
@@ -1003,14 +1042,23 @@ impl BrocaSubject {
                     // Idle compaction may append a view and notice after a terminal.
                     // Only a newer RunStarted makes that terminal irrelevant to settling.
                     if let Some((run_id, reason)) = settled_terminal(&frames) {
-                        if let Some((head_run, head_state)) = read_head().await {
-                            if head_run == run_id
-                                && cortexkit_role_llm_runner::run::RunState::parse(&head_state)
-                                    .is_terminal()
-                            {
-                                return format!(
-                                    "{reason}; corroborated by public head {head_run} {head_state}"
-                                );
+                        match read_head.as_mut() {
+                            // The caller opted out of corroboration: accept the visible
+                            // file terminal.
+                            None => return reason,
+                            Some(probe) => {
+                                if let Some((head_run, head_state)) = probe().await {
+                                    if head_run == run_id
+                                        && cortexkit_role_llm_runner::run::RunState::parse(
+                                            &head_state,
+                                        )
+                                        .is_terminal()
+                                    {
+                                        return format!(
+                                            "{reason}; corroborated by public head {head_run} {head_state}"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1047,67 +1095,11 @@ impl BrocaSubject {
         }
     }
 
-    pub(super) async fn settle_compaction(&self, session: &str) -> Result<(), HarnessError> {
-        let root = self.compaction_root(session)?;
-        // Each return names why the work counts as settled, so a failure dump can tell an early
-        // return from a genuine one.
-        let settled = broca_test_support::event_timeout(
-            "compaction work settles",
-            async {
-                loop {
-                    let ready = {
-                        let states = self.shared.compaction.lock().unwrap();
-                        let Some(state) = states.get(session) else {
-                            return "no compaction script installed".to_owned();
-                        };
-                        (!state.gates.is_empty())
-                            .then(|| format!("{} held model call(s)", state.gates.len()))
-                    };
-                    if let Some(reason) = ready {
-                        return reason;
-                    }
-                    let frames = broca_core::FileWalStore::new(root.join("wal"))
-                        .read_records(&self.bind_identity(session))
-                        .unwrap_or_default();
-                    // Idle compaction may append a view and notice after a terminal.
-                    // Only a newer RunStarted makes that terminal irrelevant to settling.
-                    if let Some(reason) = settled_episode(&frames) {
-                        return reason;
-                    }
-                    if root.join("test-compaction-reached").exists() {
-                        return "test-compaction-reached marker exists".to_owned();
-                    }
-                    sleep(Duration::from_millis(10)).await;
-                }
-            },
-            || {
-                broca_test_support::record_kinds(
-                    broca_core::FileWalStore::new(root.join("wal"))
-                        .read_records(&self.bind_identity(session))
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|f| &f.record),
-                )
-            },
-        )
-        .await;
-        match settled {
-            Ok(reason) => {
-                eprintln!("compaction settled session={session}: {reason}");
-                self.shared.note(session, format_args!("settled: {reason}"));
-                Ok(())
-            }
-            Err(_) => {
-                self.shared
-                    .note(session, "compaction settle hang guard expired");
-                Err(HarnessError::new(format!(
-                    "compaction work did not settle for {session}"
-                )))
-            }
-        }
-    }
     pub(super) async fn release_model_compaction(&self, session: &str) -> Result<(), HarnessError> {
-        self.settle_compaction(session).await?;
+        // The initial settle returns on the held model gate before any terminal
+        // is consulted.
+        self.settle_compaction(session, file_terminal_is_enough())
+            .await?;
         let gate = self
             .shared
             .compaction
@@ -1120,7 +1112,9 @@ impl BrocaSubject {
             .ok_or_else(|| HarnessError::new("no held model call"))?;
         HoldGate::set(&gate.released, &gate.released_wake);
         sleep(Duration::from_millis(20)).await;
-        self.settle_compaction(session).await
+        // Settles the just-released live run, whose terminal the actor syncs before reporting.
+        self.settle_compaction(session, file_terminal_is_enough())
+            .await
     }
     pub(super) fn durable_setup(
         &self,
