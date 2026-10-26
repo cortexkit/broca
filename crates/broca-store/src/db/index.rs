@@ -753,6 +753,278 @@ mod tests {
         assert_eq!(r_rows(&db.db), before);
     }
 
+    /// SQLite is taken as-is: NORMAL can lose its latest index commits, while a
+    /// restore can leave it ahead of the log. Only log I/O is power-cut here;
+    /// transaction rollback is covered separately by the pre-COMMIT error test.
+    #[cfg(unix)]
+    #[test]
+    fn power_loss_reconciliation_matches_rebuild_for_ahead_and_lagging_indexes() {
+        use broca_crash_harness::power_loss::{RecordingFs, State};
+        use broca_wal::fs_ops::with_fs_ops;
+        use broca_wal::{FileWal, Wal};
+        use std::collections::BTreeSet;
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let scratch = database();
+        let source = scratch._scratch.0.join("source");
+        std::fs::create_dir(&source).unwrap();
+        let recording = Arc::new(RecordingFs::new(&source).unwrap());
+        let original = corpus().remove(0);
+        let bind = bind(&original);
+        let start = decoded(&original)
+            .into_iter()
+            .find_map(|(_, _, frame)| {
+                matches!(frame.record, WalRecord::RunStarted { .. }).then_some(frame.record)
+            })
+            .unwrap();
+        let pending = WalRecord::ModelStepFinished {
+            written_at_ms: None,
+            tags: None,
+            hooks: None,
+            step_id: broca_protocol::StepId(1),
+            assistant_message: broca_protocol::AssistantMessage {
+                message_id: broca_protocol::MessageId("pending".into()),
+                content: vec![broca_protocol::ContentBlock::Text {
+                    text: "p".repeat(9000),
+                }],
+            }
+            .into(),
+            usage: broca_protocol::Usage::default(),
+            finish_reason: None,
+            retries_used: 0,
+            service_tier_used: None,
+            speed_used: None,
+        };
+        with_fs_ops(recording.clone(), || {
+            let mut wal = FileWal::open(source.join("wal/log")).unwrap();
+            wal.append(1, &start, true).unwrap();
+            wal.append(
+                1,
+                &WalRecord::StepStarted {
+                    step_id: broca_protocol::StepId(1),
+                },
+                true,
+            )
+            .unwrap();
+            wal.append(1, &pending, false).unwrap();
+        });
+        let precut = std::fs::read(source.join("wal/log")).unwrap();
+        let frames = decoded(&precut);
+        let known_non_tail_refusal = |error: &broca_wal::WalError, bytes: &[u8]| {
+            let broca_wal::WalError::Corrupt { offset, .. } = error else {
+                return false;
+            };
+            // The writer has no durable synced-length boundary: an earlier
+            // damaged region before an authentic later frame is refused rather
+            // than guessed away. Keep that known availability gap explicit.
+            (0..bytes.len()).filter(|off| *off > *offset).any(|off| {
+                match decode_next(&bytes[off..]) {
+                    DecodeStep::Record { framed, .. } => frames
+                        .iter()
+                        .any(|(_, _, expected)| expected == framed.as_ref()),
+                    _ => false,
+                }
+            })
+        };
+        let mut index_ends = vec![0];
+        index_ends.extend(frames.iter().map(|(_, end, _)| *end));
+
+        // The budget refuses an incomplete exploration; it never samples away
+        // states. Deduplication below merges only byte-identical filesystems.
+        let first = recording.enumerate(1_000_000).unwrap();
+        let last_cut = first.iter().map(|cut| cut.cut).max().unwrap();
+        assert!(
+            first.iter().any(|cut| cut.cut == last_cut
+                && matches!(
+                    cut.family,
+                    broca_crash_harness::power_loss::Family::SyncedOnly
+                )
+                && cut
+                    .state
+                    .files
+                    .get(Path::new("wal/log"))
+                    .is_some_and(|bytes| decoded(bytes).len() + 1 == frames.len())),
+            "the final unsynced append must be lost in some final-cut states"
+        );
+        let second = recording
+            .enumerate_recovery(
+                &scratch._scratch.0.join("recovery-cuts"),
+                1_000_000,
+                |root| {
+                    match FileWal::open(root.join("wal/log")) {
+                        Ok(wal) => {
+                            wal.replay().map_err(std::io::Error::other)?;
+                        }
+                        Err(error) => {
+                            let bytes = std::fs::read(root.join("wal/log"))?;
+                            assert!(
+                                known_non_tail_refusal(&error, &bytes),
+                                "unexpected WAL recovery refusal: {error}"
+                            );
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(!first.is_empty() && !second.is_empty());
+        assert!(
+            second.iter().any(|cut| cut.second.cut > 0),
+            "recovery must itself have cut points"
+        );
+        assert!(
+            second.iter().any(
+                |cut| cut
+                    .first
+                    .state
+                    .files
+                    .get(Path::new("wal/log"))
+                    .is_some_and(|first| cut
+                        .second
+                        .state
+                        .files
+                        .get(Path::new("wal/log"))
+                        .is_some_and(|second| second.len() < first.len()))
+            ),
+            "a cut during recovery must retain the real torn-tail truncation"
+        );
+        let first_count = first.len();
+        let second_count = second.len();
+        let states: BTreeSet<State> = first
+            .into_iter()
+            .map(|cut| cut.state)
+            .chain(second.into_iter().map(|cut| cut.second.state))
+            .collect();
+        let mut ahead = 0;
+        let mut lagging = 0;
+        let mut torn = 0;
+        let mut repaired = 0;
+        let mut pairs = 0;
+        let mut refused = 0;
+        let mut refused_pairs = 0;
+        for (n, state) in states.iter().enumerate() {
+            let before = state
+                .files
+                .get(Path::new("wal/log"))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut off = 0;
+            while off < before.len() {
+                match decode_next(&before[off..]) {
+                    DecodeStep::Record { consumed, .. } | DecodeStep::Lineage { consumed, .. } => {
+                        off += consumed
+                    }
+                    DecodeStep::TornTail | DecodeStep::Corrupt(_) => {
+                        torn += 1;
+                        break;
+                    }
+                    DecodeStep::NewerWriter { .. } => panic!("power cut invented a newer feature"),
+                }
+            }
+            let root = scratch._scratch.0.join(format!("survivor-{n}"));
+            state.install(&root).unwrap();
+            let wal = match FileWal::open(root.join("wal/log")) {
+                Ok(wal) => wal,
+                Err(error) => {
+                    assert!(
+                        known_non_tail_refusal(&error, before),
+                        "unexpected WAL recovery refusal: {error}"
+                    );
+                    refused += 1;
+                    let fresh = database();
+                    assert!(fresh
+                        .db
+                        .rebuild_session(&publication(&bind, before))
+                        .is_err());
+                    for end in &index_ends {
+                        let TestDb {
+                            db,
+                            _scratch: index_root,
+                        } = database();
+                        db.index(&publication(&bind, &precut[..*end])).unwrap();
+                        let rows_before = r_rows(&db);
+                        drop(db);
+                        let resumed = OverhaulDb::open(&index_root.0).unwrap();
+                        assert!(
+                            resumed.index(&publication(&bind, before)).is_err(),
+                            "a refused log must not serve an indexed prefix"
+                        );
+                        assert_eq!(
+                            r_rows(&resumed),
+                            rows_before,
+                            "refusal must not partially rewrite the index"
+                        );
+                        refused_pairs += 1;
+                    }
+                    continue;
+                }
+            };
+            let recovered_frames = wal.replay().unwrap();
+            let recovered = std::fs::read(root.join("wal/log")).unwrap();
+            let mut verified_end = 0;
+            while verified_end < recovered.len() {
+                verified_end += match decode_next(&recovered[verified_end..]) {
+                    DecodeStep::Record { consumed, .. } | DecodeStep::Lineage { consumed, .. } => {
+                        consumed
+                    }
+                    _ => panic!("recovery left a damaged frame at {verified_end}"),
+                };
+            }
+            repaired += usize::from(before != recovered);
+            assert!(recovered_frames.len() <= frames.len());
+            for (actual, (_, _, expected)) in recovered_frames.iter().zip(&frames) {
+                assert_eq!(actual, expected, "recovery fabricated a non-prefix record");
+            }
+            let baseline = database();
+            let expected = baseline
+                .db
+                .rebuild_session(&publication(&bind, &recovered))
+                .unwrap();
+            let expected_rows = r_rows(&baseline.db);
+            assert_eq!(expected.indexed_end, verified_end as u64);
+            assert_eq!(expected.indexed_seq, recovered_frames.last().map(|f| f.seq));
+            let records: Vec<_> = recovered_frames.iter().map(|f| f.record.clone()).collect();
+            assert_eq!(
+                expected.head_ord,
+                broca_core::replay(&records).unwrap().extent
+            );
+            for end in &index_ends {
+                let TestDb {
+                    db,
+                    _scratch: index_root,
+                } = database();
+                let prior = db.index(&publication(&bind, &precut[..*end])).unwrap();
+                ahead += usize::from(prior.indexed_end > expected.indexed_end);
+                lagging += usize::from(prior.indexed_end < expected.indexed_end);
+                drop(db);
+                // Reopen the actual SQLite file rather than constructing its
+                // post-crash rows in memory or assuming the index and log agree.
+                let resumed = OverhaulDb::open(&index_root.0).unwrap();
+                let reconciled = resumed.index(&publication(&bind, &recovered)).unwrap();
+                assert_eq!(
+                    r_rows(&resumed),
+                    expected_rows,
+                    "survivor {n}, prior index end {end}"
+                );
+                assert_eq!(reconciled.indexed_seq, expected.indexed_seq);
+                assert_eq!(reconciled.indexed_end, expected.indexed_end);
+                assert_eq!(reconciled.indexed_end, verified_end as u64);
+                resumed
+                    .read_snapshot(|tx| {
+                        let high: Option<u64> =
+                            tx.query_row("SELECT MAX(hi_off) FROM message", [], |row| row.get(0))?;
+                        assert!(high.is_none_or(|end| end <= reconciled.indexed_end));
+                        Ok(())
+                    })
+                    .unwrap();
+                pairs += 1;
+            }
+        }
+        assert!(ahead > 0 && lagging > 0 && torn > 0 && repaired > 0);
+        eprintln!("power-loss index matrix: {first_count} first cuts, {second_count} recovery cuts, {} unique states, {pairs} reconciled pairs; {ahead} ahead, {lagging} lagging, {torn} torn, {repaired} repaired; {refused} known non-tail refusals ({refused_pairs} refused pairs)", states.len());
+    }
+
     #[test]
     fn synchronous_switches_before_each_transaction_and_errors_rollback() {
         let db = database();
