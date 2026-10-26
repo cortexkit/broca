@@ -2049,6 +2049,7 @@ pub struct WalHandle {
     input_token_limit: AtomicU64,
     move_check: Option<Arc<dyn Fn() -> Result<(), WalError> + Send + Sync>>,
     media_capture: Option<crate::tool_media::ToolMediaCapture>,
+    pending_media: Mutex<std::collections::VecDeque<(u64, crate::compaction::CapturedMedia)>>,
     fence: u64,
     append_budget: Option<Mutex<AppendBudget>>,
     tx: std_mpsc::Sender<WalCommand>,
@@ -2095,6 +2096,35 @@ pub struct WalHandle {
 }
 
 impl WalHandle {
+    /// Transfer only captures covered by a successful WAL barrier. Appends racing after that
+    /// barrier wait for the next one, so an uncommitted steer cannot authorize rendered media.
+    pub(crate) fn take_media_captures(&self) -> crate::compaction::CapturedMedia {
+        let head = self.durable_head.load(Ordering::SeqCst);
+        let mut pending = self.pending_media.lock().unwrap();
+        let mut captured = crate::compaction::CapturedMedia::default();
+        while pending.front().is_some_and(|(seq, _)| *seq <= head) {
+            captured.extend(pending.pop_front().expect("front checked").1);
+        }
+        captured
+    }
+
+    /// Exercise only enqueue's capture work, without counting command boxing or channel storage.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn capture_for_append_for_test(&self, seq: u64, record: &WalRecord) {
+        self.capture_for_append(seq, record);
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn has_pending_media_capture_for_test(&self, reference: &broca_protocol::MediaRef) -> bool {
+        self.pending_media
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, captured)| captured.contains(reference))
+    }
+
     pub fn media_capture(&self) -> Option<crate::tool_media::ToolMediaCapture> {
         self.media_capture.clone()
     }
@@ -2288,6 +2318,7 @@ impl WalHandle {
             input_token_limit: AtomicU64::new(0),
             move_check: None,
             media_capture: None,
+            pending_media: Mutex::default(),
             fence,
             append_budget,
             tx,
@@ -2671,6 +2702,7 @@ impl WalHandle {
             ),
             _ => {}
         }
+        self.capture_for_append(seq, &record);
         if self
             .tx
             .send(WalCommand::Append {
@@ -2685,6 +2717,19 @@ impl WalHandle {
             return RecordOutcome::Refused(WalWriteError::Failed(error));
         }
         RecordOutcome::Accepted(seq)
+    }
+
+    fn capture_for_append(&self, seq: u64, record: &WalRecord) {
+        if crate::compaction::CapturedMedia::captures_any(record) {
+            let mut captures = crate::compaction::CapturedMedia::default();
+            captures.fold(record);
+            if !captures.is_empty() {
+                self.pending_media
+                    .lock()
+                    .unwrap()
+                    .push_back((seq, captures));
+            }
+        }
     }
 
     fn size_scope(&self) -> retained_size::SizeScope {

@@ -14,6 +14,74 @@ use std::sync::{
 #[path = "held_history_tests.rs"]
 mod held_history;
 
+pub(super) fn image() -> broca_protocol::MediaRef {
+    broca_protocol::MediaRef {
+        kind: broca_protocol::MediaKind::Image,
+        mime: "image/png".into(),
+        byte_size: 68,
+        sha256: "a".repeat(64),
+        width: Some(1),
+        height: Some(1),
+    }
+}
+
+pub(super) fn altered_media() -> Vec<broca_protocol::MediaRef> {
+    let mut variants = vec![image(); 6];
+    variants[0].sha256 = "b".repeat(64);
+    variants[1].mime = "image/jpeg".into();
+    variants[2].byte_size += 1;
+    variants[3].width = Some(2);
+    variants[4].height = Some(2);
+    variants[5].kind = broca_protocol::MediaKind::Document;
+    variants[5].width = None;
+    variants[5].height = None;
+    variants
+}
+
+#[test]
+fn initial_media_must_equal_a_reference_in_its_replaced_range() {
+    let mut transcript = vec![
+        Message::new(Role::User, vec![ContentBlock::Media(image())]),
+        text(Role::Assistant, "answer"),
+        text(Role::User, "tail"),
+    ];
+    broca_protocol::content::stamp_ordinals(&mut transcript);
+    let replacement = |reference| {
+        encoded(&Message::new(
+            Role::User,
+            vec![ContentBlock::Media(reference)],
+        ))
+    };
+    assert!(validate_initial(
+        &initial(Range::new(0, 1), vec![replacement(image())]),
+        &transcript
+    )
+    .is_some());
+    refused(
+        initial(Range::new(1, 2), vec![replacement(image())]),
+        &transcript,
+    );
+    for reference in altered_media() {
+        refused(
+            initial(Range::new(0, 1), vec![replacement(reference)]),
+            &transcript,
+        );
+    }
+}
+
+#[tokio::test]
+async fn setup_with_uncaptured_media_records_nothing() {
+    let mut answer = ready();
+    answer["initial"]["replacement"] =
+        json!([Message::new(Role::User, vec![ContentBlock::Media(image())])]);
+    let (outcome, records) = run_setup(answer).await;
+    assert_eq!(
+        outcome.unwrap_err().provider_code.as_deref(),
+        Some("compaction_unavailable")
+    );
+    assert!(records.is_empty());
+}
+
 pub(super) fn text(role: Role, text: &str) -> Message {
     Message::new(role, vec![ContentBlock::Text { text: text.into() }])
 }

@@ -5144,6 +5144,7 @@ where
                 match Box::pin(runtime.setup(setup, &raw)).await {
                     Ok(mut state) => {
                         state.history = compaction_history.clone();
+                        state.captured = prior.compaction.captured().cloned().unwrap_or_default();
                         // A moved session's Setup checkpoint anchors the numbers at its cut
                         // before anything of this run is rendered with a number.
                         if let (Some(_), Some(checkpoint)) = (computed_tags, &state.tag_checkpoint)
@@ -5166,6 +5167,11 @@ where
                     }
                 }
             }
+            compaction_state
+                .as_mut()
+                .expect("Setup is durable")
+                .captured
+                .extend(writer.take_media_captures());
             render_new_tags(
                 &mut mutable_call_options(&mut opts).prompt,
                 &mut tags_rendered_len,

@@ -3,6 +3,9 @@
 use super::*;
 use crate::compaction_provider::{lineage::MessageRef, notice::ViewReady, view::*};
 
+#[path = "media_resume_tests.rs"]
+mod media;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WaitViews {
     Off,
@@ -79,6 +82,12 @@ impl Windows {
                 ],
             );
         }
+        let mut continuation = text(Role::User, "continue");
+        continuation.content.extend(
+            super::super::media_refs(&state.prompt[2].content)
+                .cloned()
+                .map(ContentBlock::Media),
+        );
         CompactionView::new(
             session,
             version,
@@ -92,11 +101,8 @@ impl Windows {
                 ViewRange::replace(
                     1,
                     covered + 1,
-                    serde_json::to_string(&vec![
-                        text(Role::Assistant, "summary"),
-                        text(Role::User, "continue"),
-                    ])
-                    .unwrap(),
+                    serde_json::to_string(&vec![text(Role::Assistant, "summary"), continuation])
+                        .unwrap(),
                 ),
             ],
         )
@@ -271,6 +277,7 @@ struct EpisodeScenario {
     wait: WaitViews,
     budget: bool,
     later: Later,
+    media: bool,
     /// The WAL refuses to be read once a view applied, so released messages cannot be read
     /// back from it.
     history_unavailable: bool,
@@ -285,6 +292,7 @@ impl EpisodeScenario {
             wait: WaitViews::Off,
             budget: true,
             later,
+            media: false,
             history_unavailable: false,
             prompts: None,
         }
@@ -304,6 +312,7 @@ async fn run_configured(
         wait,
         budget,
         later,
+        media,
         history_unavailable,
         prompts,
     } = scenario;
@@ -312,6 +321,11 @@ async fn run_configured(
         text(Role::Assistant, "third answer"),
         text(Role::User, "third question"),
     ]);
+    if media {
+        request.input[2]
+            .content
+            .push(ContentBlock::Media(super::image()));
+    }
     request.input[3].content.insert(
         0,
         ContentBlock::Reasoning {
