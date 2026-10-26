@@ -27,7 +27,8 @@ def run_metadata(manifest, offline):
                "--manifest-path", str(manifest)]
     if offline:
         command.insert(2, "--offline")
-    return subprocess.run(command, capture_output=True, text=True, timeout=METADATA_TIMEOUT_SECS)
+    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
+                          timeout=METADATA_TIMEOUT_SECS)
 
 
 def check(manifest, root):

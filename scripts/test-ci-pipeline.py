@@ -254,7 +254,7 @@ class WorkflowGraph(unittest.TestCase):
         build = next(s for s in fixtures['steps'] if s.get('name') == 'Build fixtures once')
         self.assertIn('"subconscious/target/debug/ck$suffix"', build['run'])
         verify = next(s for s in fixtures['steps'] if s.get('name') == 'Verify and package fixtures')
-        self.assertIn('for name in ck-subc fake-aft-stub ck ck-claustrum ck-auth', verify['run'])
+        self.assertIn('for name in ck-subc fake-aft-stub ck ck-claustrum ck-auth fake-surface', verify['run'])
         nightly = next(s for s in fixtures['steps'] if s.get('name') == 'Resolve nightly sibling revisions')
         self.assertEqual(nightly['if'], "github.event_name == 'schedule'")
         self.assertEqual(nightly['run'].count('git ls-remote'), 2)
@@ -273,6 +273,32 @@ class WorkflowGraph(unittest.TestCase):
             self.assertIn('ckdev-mutate run --diff', script)
         linux = self.workflow('mutations.yml')['jobs']['mutations']
         self.assertIn('--broad', '\n'.join(s.get('run', '') for s in linux['steps']))
+
+    def test_private_content_standin_is_prebuilt_and_forwarded(self):
+        fixtures = self.workflow('fixtures.yml')['jobs']['fixtures']
+        build = next(s for s in fixtures['steps'] if s.get('name') == 'Build fixtures once')['run']
+        self.assertIn('cargo build --locked --manifest-path broca/crates/broca-module-serve/tests/support/fake-surface/Cargo.toml --target-dir fake-surface-target', build)
+        self.assertIn('cp "fake-surface-target/debug/fake-surface$suffix" fixtures/bin/', build)
+        cache = next(s for s in fixtures['steps'] if s.get('id') == 'binaries')['with']['key']
+        self.assertIn('fixtures-v3-', cache)
+        self.assertIn("hashFiles('broca/crates/broca-module-serve/tests/support/fake-surface/**')", cache)
+
+        def fixture_environments(node):
+            if isinstance(node, dict):
+                if 'FAKE_AFT_STUB_BIN' in node:
+                    yield node
+                for value in node.values():
+                    yield from fixture_environments(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from fixture_environments(value)
+
+        environments = [env for name in ('ci.yml', 'mutations.yml', 'mutations-windows.yml')
+                        for env in fixture_environments(self.workflow(name))]
+        self.assertEqual(len(environments), 5)
+        for env in environments:
+            self.assertEqual(env['FAKE_SURFACE_BIN'],
+                             env['FAKE_AFT_STUB_BIN'].replace('fake-aft-stub', 'fake-surface'))
 
     def test_linux_mutation_triggers_and_jobs_stay_release_required(self):
         workflow = self.workflow('mutations.yml')
