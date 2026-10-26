@@ -14,6 +14,7 @@ CLOCK_MARKER = "BROCA_TEST_CLOCK_RETENTION_CLOCK_OVERRIDE_V1"
 RETRY_MARKER = "BROCA_TEST_HARNESS_VIRTUAL_RETRY_WAITS_V1"
 ATTACHMENTS_MARKER = "broca-nonshipping-attachments-v1"
 HELD_REPLY_MARKER = "BROCA_TEST_DECLARE_HELD_REPLY_V1"
+FS_OVERRIDE_MARKER = "BROCA_TEST_FS_OVERRIDE_V1"
 
 spec = importlib.util.spec_from_file_location("placement_fixture", ROOT / "scripts/test-place-release-gate.py")
 placement = importlib.util.module_from_spec(spec)
@@ -58,6 +59,11 @@ class RetryMarkerStaging(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("artifact contains the test-attachments override marker", result.stderr)
 
+    def test_fs_override_marker_refuses_artifact(self):
+        result = self.probe(b"ordinary control\0" + FS_OVERRIDE_MARKER.encode() + b"\0")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("artifact contains the fs-override override marker", result.stderr)
+
     def test_normal_artifact_passes_both_marker_checks(self):
         result = self.probe(b"ordinary production artifact\0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -65,6 +71,7 @@ class RetryMarkerStaging(unittest.TestCase):
         self.assertIn("test-harness absent (planted strings control reads 1)", result.stdout)
         self.assertIn("test-attachments absent (planted strings control reads 1)", result.stdout)
         self.assertIn("held-reply-declaration absent (planted strings control reads 1)", result.stdout)
+        self.assertIn("fs-override absent (planted strings control reads 1)", result.stdout)
 
     def test_held_reply_declaration_marker_refuses_artifact(self):
         result = self.probe(b"ordinary control\0" + HELD_REPLY_MARKER.encode() + b"\0")
@@ -81,6 +88,16 @@ class RetryMarkerStaging(unittest.TestCase):
         source = (ROOT / "crates/broca-provider/src/transport.rs").read_text()
         sleep = source.split("async fn sleep(&self, delay: Duration) {", 1)[1].split("tokio::time::sleep(delay)", 1)[0]
         self.assertIn('#[cfg(feature = "test-harness")]\n        tracing::info!("' + RETRY_MARKER + '");', sleep)
+
+    def test_fs_override_path_carries_the_marker(self):
+        source = (ROOT / "crates/broca-wal/src/fs_ops.rs").read_text()
+        override = source.split('#[cfg(feature = "fs-override")]\nfn current()', 1)[1].split('\n}', 1)[0]
+        self.assertIn('std::hint::black_box("' + FS_OVERRIDE_MARKER + '");', override)
+        real = source.split('#[cfg(not(feature = "fs-override"))]\nfn current()', 1)[1].split('\n}', 1)[0]
+        self.assertIn('-> RealFs {\n    RealFs', real)
+        self.assertNotIn('CURRENT', real)
+        self.assertIn('#[cfg(feature = "fs-override")]\nthread_local!', source)
+        self.assertIn('#[cfg(feature = "fs-override")]\npub fn with_fs_ops', source)
 
 
 class ClientMarkerStaging(unittest.TestCase):
@@ -123,7 +140,7 @@ class ReleaseMarkerPlacement(placement.GateBase):
         self.assertFalse(any(".place." in p.name for p in self.bindir.iterdir()))
 
     def test_direct_placement_refuses_nonshipping_markers(self):
-        for marker in (CLOCK_MARKER, RETRY_MARKER, ATTACHMENTS_MARKER):
+        for marker in (CLOCK_MARKER, RETRY_MARKER, ATTACHMENTS_MARKER, FS_OVERRIDE_MARKER):
             with self.subTest(marker=marker):
                 placement.stub_binary(self.staged, features=[])
                 with self.staged.open("ab") as output:
@@ -154,6 +171,7 @@ class ReleaseMarkerPlacement(placement.GateBase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("test-harness absent (planted strings control reads 1)", result.stdout)
         self.assertIn("test-attachments absent (planted strings control reads 1)", result.stdout)
+        self.assertIn("fs-override absent (planted strings control reads 1)", result.stdout)
         self.assertNotEqual(self.dest.read_bytes(), self.before)
 
 

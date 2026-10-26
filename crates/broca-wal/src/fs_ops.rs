@@ -1,17 +1,20 @@
 //! Synchronous filesystem seam for durability tests. The default backend uses the same
 //! owner-only creation and platform-specific directory barriers as the WAL writer.
 //!
-//! An override is scoped to one thread, not the process. Keep the entire synchronous
-//! program (including recovery and directory barriers) inside [`with_fs_ops`]; file
-//! handles retain their backend, but path operations use the current thread's backend.
+//! With the non-shipping `fs-override` feature, an override is scoped to one thread,
+//! not the process. Keep the entire synchronous program (including recovery and
+//! directory barriers) inside `with_fs_ops`; handles retain their backend, but path
+//! operations use the current thread's backend. Without that feature, path operations
+//! call `RealFs` directly and there is no override API or thread-local backend.
 
 use std::{
-    cell::RefCell,
     fs::Metadata,
     io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::Arc,
 };
+
+#[cfg(feature = "fs-override")]
+use std::{cell::RefCell, sync::Arc};
 
 /// File-handle operations whose ordering matters to a power-loss model.
 pub trait FileOps: Read + Write + Seek + Send + Sync {
@@ -137,15 +140,26 @@ impl FsOps for RealFs {
     }
 }
 
+#[cfg(feature = "fs-override")]
 thread_local! {
     static CURRENT: RefCell<Arc<dyn FsOps>> = RefCell::new(Arc::new(RealFs));
 }
 
+#[cfg(feature = "fs-override")]
 fn current() -> Arc<dyn FsOps> {
+    // Keep the marker on the WAL I/O path so release staging and placement reject
+    // artifacts built with fs-override, even if they never call with_fs_ops.
+    std::hint::black_box("BROCA_TEST_FS_OVERRIDE_V1");
     CURRENT.with(|fs| fs.borrow().clone())
 }
 
+#[cfg(not(feature = "fs-override"))]
+fn current() -> RealFs {
+    RealFs
+}
+
 /// Override the backend for synchronous calls on this thread, restoring it on unwind.
+#[cfg(feature = "fs-override")]
 pub fn with_fs_ops<T>(fs: Arc<dyn FsOps>, action: impl FnOnce() -> T) -> T {
     struct Restore(Option<Arc<dyn FsOps>>);
     impl Drop for Restore {
