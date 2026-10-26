@@ -637,7 +637,7 @@ impl FileWal {
     ) -> Result<Self, WalError> {
         crate::migration::guard(&path, &session_ref, true)?;
         #[cfg(windows)]
-        broca_owner_only::validate_if_exists(&path).map_err(WalError::Io)?;
+        fs_ops::validate_if_exists(&path).map_err(WalError::Io)?;
         let mut newly_created_dirs = Vec::new();
         if let Some(parent) = path.parent() {
             let mut candidate = parent;

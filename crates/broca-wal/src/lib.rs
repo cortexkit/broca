@@ -6,6 +6,9 @@
 //! writer task, replay state machine, and materialized store build on top of this
 //! foundation.
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+// Test fixtures intentionally use direct I/O to prepare and inspect crash images.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod archive;
 mod directory_sync;
