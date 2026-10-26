@@ -1852,7 +1852,13 @@ impl RunnerRoute for BrocaRoute {
                             .map_err(|e| RouteFailure::new(e.to_string()))?;
                     }
                     self.subject
-                        .settle_compaction(&self.session.session)
+                        // Own live run: the actor synced this run's terminal before
+                        // replying, so it cannot be mistaken for a terminal left by
+                        // a crashed run.
+                        .settle_compaction(
+                            &self.session.session,
+                            compaction::file_terminal_is_enough(),
+                        )
                         .await
                         .map_err(|e| RouteFailure::new(e.to_string()))?;
                 }
@@ -2168,7 +2174,20 @@ impl LlmRunnerSubject for BrocaSubject {
         if self.shared.compaction.lock().unwrap().contains_key(session)
             && !self.records(handle, session).is_empty()
         {
-            self.settle_compaction(session).await?;
+            // After a restart the startup sealer appends the crash-orphan
+            // terminal before its fsync publishes the actor's durable head.
+            // A terminal that is only visible in the WAL file must not release
+            // this route: the kit reads `session.head` once and would see the
+            // previous `active` prefix and never send its continuation. Wait
+            // for the same run to report terminal through the public head.
+            let head_connection = connection.clone();
+            let head_route = route;
+            let mut probe = move || -> compaction::HeadFuture {
+                let head_connection = head_connection.clone();
+                let head_route = head_route;
+                Box::pin(async move { Self::public_head_run(&head_connection, &head_route).await })
+            };
+            self.settle_compaction(session, Some(&mut probe)).await?;
         }
         eprintln!(
             "route.open session={} channel={} epoch={} elapsed_us={}",
