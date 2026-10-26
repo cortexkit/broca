@@ -10,19 +10,6 @@
 //!
 //! `render_request` is pure (no network), so it is driven here with a dummy token.
 
-// A file-level `cfg` DELETES this file when the feature is off, and a deleted file reports
-// "running 0 tests ... test result: ok" -- indistinguishable at a glance from a suite that
-// ran and passed, and impossible to instrument because no code survives to carry a notice.
-// Gating a module instead leaves this shell compiled, so the absence can announce itself.
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP anthropic_render_golden: compiled without its feature, so none of its cases exist. \
-         This reports `ok` -- re-run with `-F broca-provider/live` to execute them."
-    );
-}
-
 #[cfg(feature = "live")]
 mod gated {
 

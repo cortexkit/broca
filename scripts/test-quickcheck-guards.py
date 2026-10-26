@@ -37,7 +37,7 @@ if args and args[0] == "metadata":
     else:
         targets += [{"name": "fixture", "kind": ["test"]}]
     print(json.dumps({"packages": [{"name": package, "targets": targets}]}))
-elif args and args[0] == "test" and "event_wait_guard" in args and os.environ.get("FAIL_GUARD"):
+elif args and args[0] == "test" and "open_failed_classes::" in args and os.environ.get("FAIL_GUARD"):
     print("fixture source-scan guard failed", file=sys.stderr)
     raise SystemExit(47)
 else:
@@ -97,7 +97,6 @@ class QuickcheckGuards(unittest.TestCase):
                     raise AssertionError(f"{GUARDS}:{line_number}: {symbol} is no longer a test")
             cls.entries.append((package, target, filter_name, features, source_name, symbol))
         required = {
-            ("broca-test-support", "event_wait_guard", "short_real_time_polls_are_classified"),
             ("broca-module", "it", "every_open_failed_site_chooses_a_class"),
             ("broca-module-serve", "it", "wal_known_features_prints_the_sorted_table_and_nothing_else"),
             ("broca-module-serve", "it", "broca_reads_stamp_identity_only_in_scope_adapters"),
@@ -191,7 +190,7 @@ class QuickcheckGuards(unittest.TestCase):
         result, events = self.run_quickcheck("broca-subc")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
-            ["test", "--locked", "-p", "broca-test-support", "--test", "event_wait_guard", "--quiet"],
+            ["test", "--locked", "-p", "broca-module", "--test", "it", "open_failed_classes::", "-F", "broca-module/test-clock", "--quiet"],
             events,
         )
         self.assertIn("quickcheck guards OK", result.stdout)
@@ -199,7 +198,7 @@ class QuickcheckGuards(unittest.TestCase):
     def test_a_failing_guard_fails_quickcheck(self):
         result, events = self.run_quickcheck("broca-subc", FAIL_GUARD="1")
         self.assertEqual(result.returncode, 47, result.stdout + result.stderr)
-        self.assertTrue(any("event_wait_guard" in call for call in events))
+        self.assertTrue(any("open_failed_classes::" in call for call in events))
         self.assertNotIn("quickcheck guards OK", result.stdout)
         self.assertNotIn("quickcheck OK:", result.stdout)
 

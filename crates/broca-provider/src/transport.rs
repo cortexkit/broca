@@ -8745,6 +8745,17 @@ mod tests {
         assert_eq!(server.request_bodies().len(), 1);
     }
 
+    fn mark_primary_client(provider: &mut LiveProvider<RetryTestFamily>) {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-test-primary-pool", "yes".parse().unwrap());
+        // The escape pool is rebuilt independently, so only primary-pool requests carry this.
+        provider.client = super::provider_client_builder()
+            .default_headers(headers)
+            .build()
+            .unwrap()
+            .into();
+    }
+
     #[tokio::test]
     async fn h1_escape_client_is_used_only_for_first_transport_retry() {
         let transport_server = ScriptedServer::start(vec![
@@ -8756,9 +8767,15 @@ mod tests {
             },
         ])
         .await;
-        let transport_provider = retry_test_provider(&transport_server, 0);
+        let mut transport_provider = retry_test_provider(&transport_server, 0);
+        use_virtual_retry_waits(&mut transport_provider);
+        mark_primary_client(&mut transport_provider);
         let events = collect_step_events(&transport_provider, CancellationToken::new(), None).await;
         assert!(terminal_error_if_any(&events).is_none());
+        assert_eq!(
+            transport_server.request_header("x-test-primary-pool"),
+            [Some("yes".into()), None]
+        );
         assert_eq!(
             transport_provider
                 .escape_client_builds
@@ -8779,9 +8796,15 @@ mod tests {
             },
         ])
         .await;
-        let http_provider = retry_test_provider(&http_server, 0);
+        let mut http_provider = retry_test_provider(&http_server, 0);
+        use_virtual_retry_waits(&mut http_provider);
+        mark_primary_client(&mut http_provider);
         let events = collect_step_events(&http_provider, CancellationToken::new(), None).await;
         assert!(terminal_error_if_any(&events).is_none());
+        assert_eq!(
+            http_server.request_header("x-test-primary-pool"),
+            [Some("yes".into()), Some("yes".into())]
+        );
         assert_eq!(http_provider.escape_client_builds.load(Ordering::SeqCst), 0);
     }
 
@@ -8801,11 +8824,17 @@ mod tests {
             },
         ])
         .await;
-        let provider = retry_test_provider(&server, 0);
+        let mut provider = retry_test_provider(&server, 0);
+        use_virtual_retry_waits(&mut provider);
+        mark_primary_client(&mut provider);
 
         let events = collect_step_events(&provider, CancellationToken::new(), None).await;
         assert!(terminal_error_if_any(&events).is_none());
         assert_eq!(server.request_bodies().len(), 3);
+        assert_eq!(
+            server.request_header("x-test-primary-pool"),
+            [Some("yes".into()), Some("yes".into()), None]
+        );
         assert_eq!(
             provider.escape_client_builds.load(Ordering::SeqCst),
             1,
@@ -10048,7 +10077,11 @@ mod output_ceiling_tests {
         });
         frozen.base_url = Some(format!("http://{address}"));
         frozen.max_output_tokens = CAP;
-        let provider = LiveProvider::new(family, frozen, AuthHandle::None);
+        let mut provider = LiveProvider::new(family, frozen, AuthHandle::None);
+        provider.retry_clock = super::RetryClock {
+            virtual_waits: Some(Arc::new(Mutex::new(Vec::new()))),
+            ..super::RetryClock::default()
+        };
         // The ceiling fixture is an HTTP body, not a socket upgrade; its assertions stay unchanged.
         broca_core::Provider::set_chatgpt_https_policy(&provider, Arc::new(|| true));
         let mut rx = provider.start_step(

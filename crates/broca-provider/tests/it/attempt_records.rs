@@ -5,17 +5,6 @@
 //! cutting the stream). The expected digests are computed from the server's own bytes, never
 //! from anything broca reports.
 
-// A file-level `cfg` would delete this file when the feature is off and report "0 tests ok";
-// gating a module keeps a visible notice instead.
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP attempt_records: compiled without its feature, so none of its cases exist. \
-         This reports `ok` -- re-run with `-F broca-provider/live` to execute them."
-    );
-}
-
 #[cfg(feature = "live")]
 mod gated {
     use std::{

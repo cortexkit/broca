@@ -591,7 +591,10 @@ mod tests {
     #[test]
     fn handles_crlf() {
         let raw = "data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r\n\r\n";
-        assert_eq!(parse_data_events(raw).unwrap().len(), 2);
+        assert_eq!(
+            parse_data_events(raw).unwrap(),
+            [r#"{"a":1}"#, r#"{"b":2}"#]
+        );
     }
 
     #[test]
@@ -755,19 +758,20 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_near_cap_record_is_scanned_incrementally() {
+    fn fragmented_record_is_scanned_incrementally() {
         let mut decoder = SseDecoder::default();
-        let record_len = MAX_SSE_RECORD_BYTES - 32;
-        let fragment = vec![b'x'; 1024];
-        for _ in 0..(record_len / fragment.len()) {
-            decoder.push(&fragment).unwrap();
+        let payload = "x".repeat(64 * 1024);
+        let record = format!("data: {payload}\n\n");
+        let mut events = Vec::new();
+        for fragment in record.as_bytes().chunks(64) {
+            events.extend(decoder.push(fragment).unwrap());
         }
-        let remainder = record_len % fragment.len();
-        decoder.push(&fragment[..remainder]).unwrap();
+        assert_eq!(events, [payload]);
         assert!(
-            decoder.scanned_positions <= record_len * 2,
-            "scan work must remain linear; scanned {} positions for {record_len} bytes",
-            decoder.scanned_positions
+            (1..=record.len() * 2).contains(&decoder.scanned_positions),
+            "scan work must be nonzero and linear; scanned {} positions for {} bytes",
+            decoder.scanned_positions,
+            record.len()
         );
     }
 
