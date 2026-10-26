@@ -45,6 +45,10 @@ read calls with only one bind flag use lookup and require that flag to match the
 recorded identity. Other daemon commands still accept their original bind flags.
 The connection file is
 only an argument; its path and contents are not printed on connection failures.
+Put the offline `trajectory` and `cache-dump` subcommands before their flags;
+prefixed global flags are refused by command name before any session lookup.
+These commands refuse `--subc` by command name,
+whether the daemon flag appears before or after the subcommand, without binding.
 
 ---
 

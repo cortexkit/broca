@@ -50,7 +50,7 @@ use sha2::{Digest, Sha256};
 struct Args {
     /// Path to the subc daemon's connection file (subc-connection.json).
     #[arg(long)]
-    subc: PathBuf,
+    subc: Option<PathBuf>,
     /// The broca module id to bind (the ManagementSurface).
     #[arg(long, default_value = "broca")]
     module_id: String,
@@ -92,6 +92,7 @@ struct Args {
 struct CacheDumpArgs {
     /// Bind session names to export. Repeat to select several sessions.
     #[arg(
+        id = "session",
         long = "session",
         required_unless_present = "since",
         conflicts_with = "since"
@@ -99,7 +100,7 @@ struct CacheDumpArgs {
     sessions: Vec<String>,
     /// Export only calls whose selected attempt ended at or after RFC3339 or epoch milliseconds.
     /// Earlier WAL history is replayed to reconstruct exact request bodies.
-    #[arg(long, required_unless_present = "sessions")]
+    #[arg(long, required_unless_present = "session")]
     since: Option<String>,
     #[arg(long)]
     out: PathBuf,
@@ -107,14 +108,17 @@ struct CacheDumpArgs {
     #[arg(long)]
     state_root: Option<PathBuf>,
     /// Address these sessions directly without consulting run-index.db.
-    #[arg(long, requires_all = ["sessions", "harness"], conflicts_with = "since")]
+    #[arg(long, requires_all = ["session", "harness"], conflicts_with = "since")]
     project_root: Option<PathBuf>,
-    #[arg(long, requires_all = ["sessions", "project_root"], conflicts_with = "since")]
+    #[arg(long, requires_all = ["session", "project_root"], conflicts_with = "since")]
     harness: Option<String>,
 }
 
 #[derive(Parser)]
 struct OfflineArgs {
+    /// Parse the daemon flag only to give the same refusal in either argument order.
+    #[arg(long, global = true, hide = true)]
+    subc: Option<PathBuf>,
     #[command(subcommand)]
     command: OfflineCommand,
 }
@@ -145,6 +149,18 @@ fn state_root(root: Option<&PathBuf>) -> Result<PathBuf, String> {
             .map(|resolved| resolved.path)
             .map_err(|_| "cannot resolve state root".into())
     })
+}
+
+fn offline_daemon_refusal(name: &str) -> String {
+    format!(
+        "{name} must be invoked without daemon arguments; put the subcommand first and omit --subc"
+    )
+}
+
+fn subc_path(args: &Args) -> Result<&std::path::Path, String> {
+    args.subc
+        .as_deref()
+        .ok_or_else(|| "--subc is required for daemon commands".into())
 }
 
 fn trajectory(args: TrajectoryArgs) -> Result<i32, String> {
@@ -651,9 +667,17 @@ async fn main() {
         .nth(1)
         .is_some_and(|a| a == "cache-dump" || a == "trajectory")
     {
-        let result = match OfflineArgs::parse().command {
-            OfflineCommand::CacheDump(args) => cache_dump(args),
-            OfflineCommand::Trajectory(args) => trajectory(args),
+        let args = OfflineArgs::parse();
+        let result = if args.subc.is_some() {
+            Err(offline_daemon_refusal(match &args.command {
+                OfflineCommand::CacheDump(_) => "cache-dump",
+                OfflineCommand::Trajectory(_) => "trajectory",
+            }))
+        } else {
+            match args.command {
+                OfflineCommand::CacheDump(args) => cache_dump(args),
+                OfflineCommand::Trajectory(args) => trajectory(args),
+            }
         };
         std::process::exit(match result {
             Ok(code) => code,
@@ -695,6 +719,12 @@ fn validate_max_output_tokens(cmd: &Cmd) -> Result<(), String> {
 }
 
 async fn run(args: Args) -> Result<i32, String> {
+    match &args.cmd {
+        Cmd::CacheDump(_) => return Err(offline_daemon_refusal("cache-dump")),
+        Cmd::Trajectory(_) => return Err(offline_daemon_refusal("trajectory")),
+        _ => {}
+    }
+    subc_path(&args)?;
     validate_max_output_tokens(&args.cmd)?;
     let plan = match &args.cmd {
         Cmd::Run { admission, .. } | Cmd::Send { admission, .. } => load_plan(&admission.plan)?,
@@ -714,7 +744,7 @@ async fn run(args: Args) -> Result<i32, String> {
     session
         .validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
-    let conn = SubcConnection::connect(&args.subc)
+    let conn = SubcConnection::connect(subc_path(&args)?)
         .await
         .map_err(|_| "cannot connect subc".to_string())?;
     let client = SessionClient::bind_with_timeout(
@@ -797,8 +827,9 @@ async fn run(args: Args) -> Result<i32, String> {
         Cmd::ComposePlan { .. } => {
             unreachable!("compose-plan is dispatched before the management-surface bind")
         }
-        Cmd::CacheDump(_) => Err("cache-dump must be invoked without daemon arguments".into()),
-        Cmd::Trajectory(_) => Err("trajectory must be invoked without daemon arguments".into()),
+        Cmd::CacheDump(_) | Cmd::Trajectory(_) => {
+            unreachable!("offline commands are refused before the management-surface bind")
+        }
         Cmd::Run {
             admission,
             prompt,
@@ -1178,7 +1209,7 @@ async fn compose_plan(args: &Args, path: &std::path::Path) -> Result<i32, String
     identity
         .validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
-    let conn = SubcConnection::connect(&args.subc)
+    let conn = SubcConnection::connect(subc_path(args)?)
         .await
         .map_err(|_| "cannot connect subc".to_string())?;
     let fetcher = broca_subc::SubcPlanFetcher::new(std::sync::Arc::new(conn), identity, None);
@@ -1342,7 +1373,7 @@ async fn request_vault_audit(args: &Args) -> Result<VaultAuditResponse, String> 
     session
         .validate_keyable()
         .map_err(|error| format!("invalid bind identity: {error}"))?;
-    let conn = SubcConnection::connect(&args.subc)
+    let conn = SubcConnection::connect(subc_path(args)?)
         .await
         .map_err(|_| "cannot connect subc".to_string())?;
     let client = SessionClient::bind_with_timeout(

@@ -64,6 +64,102 @@ fn root(tag: &str) -> PathBuf {
     broca_test_support::scratch_root().join(format!("session-trajectory-{tag}"))
 }
 
+fn rejects_offline_daemon_flags(global_first: bool) {
+    for name in ["trajectory", "cache-dump"] {
+        let root = root(&format!("daemon-flags-{name}-{global_first}"));
+        let connection = root.join("connection-path-must-not-be-printed.json");
+        let out = root.join("output");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_broca-session"));
+        if global_first {
+            command.arg("--subc").arg(&connection);
+        }
+        command.arg(name);
+        if name == "trajectory" {
+            command.arg("bg_unknown");
+        } else {
+            command.args(["--session", "bg_unknown"]);
+        }
+        command
+            .arg("--state-root")
+            .arg(&root)
+            .arg("--out")
+            .arg(&out);
+        if !global_first {
+            command.arg("--subc").arg(&connection);
+        }
+        let output = command.output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(1), "{text}");
+        assert!(
+            text.contains(&format!("{name} must be invoked without daemon arguments")),
+            "{text}"
+        );
+        assert!(!text.contains("connection-path-must-not-be-printed"));
+        assert!(!out.exists());
+    }
+}
+
+#[test]
+fn session_offline_commands_reject_daemon_flags_before_command() {
+    rejects_offline_daemon_flags(true);
+}
+
+#[test]
+fn session_offline_commands_reject_daemon_flags_after_command() {
+    rejects_offline_daemon_flags(false);
+}
+
+#[test]
+fn session_offline_commands_name_refusal_for_prefixed_state_root() {
+    for name in ["trajectory", "cache-dump"] {
+        let root = root(&format!("prefixed-state-{name}"));
+        let out = root.join("out");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_broca-session"));
+        command.arg("--state-root").arg(&root).arg(name);
+        if name == "trajectory" {
+            command.arg("bg_unknown");
+        } else {
+            command.args(["--session", "bg_unknown"]);
+        }
+        let output = command.arg("--out").arg(&out).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(1), "{text}");
+        assert!(text.contains(&format!("{name} must be invoked")), "{text}");
+        assert!(text.contains("put the subcommand first"), "{text}");
+        assert!(!out.exists());
+    }
+}
+
+#[test]
+fn session_daemon_commands_still_require_subc_before_lookup() {
+    let root = root("missing-daemon-flag");
+    let output = Command::new(env!("CARGO_BIN_EXE_broca-session"))
+        .arg("--state-root")
+        .arg(&root)
+        .args(["read", "bg_unknown"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        text.contains("--subc is required for daemon commands"),
+        "{text}"
+    );
+    assert!(!text.contains("inventory"));
+}
+
 #[test]
 fn session_trajectory_lookup_names_ambiguity_and_incomplete_inventory() {
     let root = root("lookup");
