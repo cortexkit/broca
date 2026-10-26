@@ -25,14 +25,6 @@
 //!   - `fireworks-ai/accounts/fireworks/models/kimi-k2-instruct`: the luna row's fast-mode
 //!     rates renamed to fireworks' mode name `priority`, so a priced tier meets a provider with
 //!     no broca mapping.
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP service_tier: compiled without the live feature, so none of its cases exist. \
-         Re-run with `-F broca-catalog/live` to execute them."
-    );
-}
 
 #[cfg(feature = "live")]
 mod gated {

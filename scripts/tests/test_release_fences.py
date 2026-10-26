@@ -4,7 +4,7 @@
 import importlib.util
 import os
 from pathlib import Path
-import re
+from compile_probe import api_probe, build
 import subprocess
 import tempfile
 import unittest
@@ -22,19 +22,34 @@ spec.loader.exec_module(placement)
 
 class CatalogApiFence(unittest.TestCase):
     def test_snapshot_installers_require_test_support(self):
-        source = (ROOT / "crates/broca-catalog/src/runtime.rs").read_text()
         for name in ("install_for_test", "install_parsed_for_test"):
+            source = f"pub fn probe() {{ let _ = broca_catalog::CatalogCache::{name}; }}"
             with self.subTest(api=name):
-                # Inspect the attributes on the API itself, not a feature mention elsewhere.
-                declaration = re.search(r"((?:\s*#\[[^\n]+\]\n)+)\s*pub fn " + name + r"\(", source)
-                self.assertIsNotNone(declaration, name)
-                self.assertIn('#[cfg(any(test, feature = "test-support"))]', declaration[1], name)
+                admitted = api_probe("broca-catalog", source, features=("live", "test-support"))
+                self.assertEqual(admitted.returncode, 0, admitted.stderr)
+                refused = api_probe("broca-catalog", source, features=("live",))
+                self.assertNotEqual(refused.returncode, 0, refused.stderr)
+                self.assertIn(name, refused.stderr)
+                self.assertIn("E0599", refused.stderr)
 
     def test_catalog_test_support_is_forbidden_without_debug_assertions(self):
-        source = (ROOT / "crates/broca-catalog/src/runtime.rs").read_text()
-        prohibition = ('#[cfg(all(feature = "test-support", not(debug_assertions)))]\n'
-                       'compile_error!("catalog test-support cannot be enabled in a release build");')
-        self.assertTrue(prohibition in source, "catalog test-support needs a release compile prohibition")
+        result, _ = build("broca-catalog", features=("live", "test-support"), release=True)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("catalog test-support cannot be enabled in a release build", result.stdout)
+
+
+class SubcApiFence(unittest.TestCase):
+    def test_release_builds_exclude_test_only_hooks(self):
+        for name in ("with_scope_sync_hold_for_test", "test_cached_route_is_open",
+                     "test_mint_lifecycle_token_uncancelled"):
+            source = f"pub fn probe() {{ let _ = broca_subc::SubcToolPlane::{name}; }}"
+            with self.subTest(api=name):
+                admitted = api_probe("broca-subc", source)
+                self.assertEqual(admitted.returncode, 0, admitted.stderr)
+                refused = api_probe("broca-subc", source, release=True)
+                self.assertNotEqual(refused.returncode, 0, refused.stderr)
+                self.assertIn("E0599", refused.stderr)
+                self.assertIn(name, refused.stderr)
 
 
 class RetryMarkerStaging(unittest.TestCase):
@@ -72,15 +87,26 @@ class RetryMarkerStaging(unittest.TestCase):
         self.assertIn("artifact contains the held-reply-declaration override marker", result.stderr)
 
     def test_held_reply_declaration_exists_only_in_debug_builds(self):
-        source = (ROOT / "crates/broca-module-serve/src/held_runtime.rs").read_text()
-        constant = re.search(r"((?:\s*(?:#\[[^\n]+\]|///[^\n]*)\n)+)\s*pub const DECLARE_HELD_REPLY_ENV: &str = \"" + HELD_REPLY_MARKER + "\";", source)
-        self.assertIsNotNone(constant, "the marker names the debug-only environment variable")
-        self.assertIn("#[cfg(debug_assertions)]", constant[1])
+        source = "pub const PROBE: &str = broca_module_serve::held_runtime::DECLARE_HELD_REPLY_ENV;"
+        admitted = api_probe("broca-module-serve", source)
+        self.assertEqual(admitted.returncode, 0, admitted.stderr)
+        refused = api_probe("broca-module-serve", source, release=True)
+        self.assertNotEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("E0425", refused.stderr)
+        self.assertIn("DECLARE_HELD_REPLY_ENV", refused.stderr)
 
     def test_retry_path_carries_the_marker(self):
-        source = (ROOT / "crates/broca-provider/src/transport.rs").read_text()
-        sleep = source.split("async fn sleep(&self, delay: Duration) {", 1)[1].split("tokio::time::sleep(delay)", 1)[0]
-        self.assertIn('#[cfg(feature = "test-harness")]\n        tracing::info!("' + RETRY_MARKER + '");', sleep)
+        for armed in (False, True):
+            features = ("live", "test-harness") if armed else ("live",)
+            result, artifacts = build("broca-provider", features=features, codegen=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(artifacts), 1, artifacts)
+            artifact = artifacts[0].read_bytes()
+            self.assertEqual(RETRY_MARKER.encode() in artifact, armed)
+            admission = self.probe(artifact)
+            self.assertEqual(admission.returncode, 2 if armed else 0, admission.stdout + admission.stderr)
+            if armed:
+                self.assertIn("artifact contains the test-harness override marker", admission.stderr)
 
 
 class ClientMarkerStaging(unittest.TestCase):

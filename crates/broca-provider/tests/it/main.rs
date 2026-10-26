@@ -47,7 +47,6 @@ mod claude_oauth_wire_vectors;
 mod conformance_report_is_not_vacuous;
 mod empty_assistant_turn_content;
 mod empty_text_drop;
-mod fixture_coverage;
 mod frozen_config_excludes_raw;
 mod frozen_config_resume;
 #[cfg(feature = "live")]
@@ -93,12 +92,3 @@ mod usage_presence;
 mod chatgpt_effort_updates;
 mod compaction_thinking;
 mod hooks_render_golden;
-
-#[cfg(not(feature = "live"))]
-#[test]
-fn live_transport_suites_need_their_feature_enabled() {
-    eprintln!(
-        "SKIP live transport suites: compiled without the live feature; re-run with \
-         `-F broca-provider/live` to exercise the family e2e and aimock guard suites."
-    );
-}

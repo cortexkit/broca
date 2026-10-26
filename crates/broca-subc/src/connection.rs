@@ -6627,16 +6627,31 @@ mod tests {
             let mut state = shared.current.lock().unwrap();
             assert!(deactivate_locked(&mut state));
         }
-        let supervisor = tokio::spawn(reconnect_supervisor(Arc::downgrade(&shared), reconnect_rx));
+        let supervisor = reconnect_supervisor(Arc::downgrade(&shared), reconnect_rx);
+        tokio::pin!(supervisor);
         shared.reconnect_tx.send(ConnToken(77)).unwrap();
-        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(futures::poll!(&mut supervisor).is_pending());
+        assert_eq!(shared.reconnect_attempts.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert!(futures::poll!(&mut supervisor).is_pending());
+        assert_eq!(shared.reconnect_attempts.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(futures::poll!(&mut supervisor).is_pending());
+        assert_eq!(shared.reconnect_attempts.load(Ordering::Relaxed), 2);
+        // After the first 100ms backoff, count subsequent attempts over another 450ms.
+        let observation = async {
+            tokio::time::sleep(Duration::from_millis(450)).await;
+        };
+        tokio::select! {
+            _ = &mut supervisor => panic!("reconnect supervisor exited"),
+            _ = observation => {}
+        };
 
         let attempts = shared.reconnect_attempts.load(Ordering::Relaxed);
         assert!(
             (2..=4).contains(&attempts),
             "exponential backoff should permit only a few attempts, got {attempts}"
         );
-        supervisor.abort();
     }
 
     #[test]
@@ -7522,13 +7537,16 @@ mod module_gate_tests {
         }))
         .await;
         let started_at = started_at.into_inner().unwrap();
-        let while_down = started_at.iter().filter(|at| **at < up_at).count();
+        let while_down: Vec<_> = started_at
+            .iter()
+            .filter(|at| **at < up_at)
+            .map(|at| *at - start)
+            .collect();
         let after_return = started_at.iter().filter(|at| **at >= up_at).count();
-        // The first open, then probes at 0.1, 0.3, 0.7, 1.5, 3.1 and 6.3 s.
-        assert!(
-            while_down <= 8,
-            "while the module is down the gate lets one probe through per tick in total, \
-             got {while_down} opens"
+        // Each failed open takes 5ms; the next shared probe starts after its backoff.
+        assert_eq!(
+            while_down,
+            [0, 105, 310, 715, 1520, 3125, 6330].map(Duration::from_millis)
         );
         assert_eq!(
             after_return, 50,
