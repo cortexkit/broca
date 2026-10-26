@@ -58,3 +58,4 @@ pub use broca_protocol::PauseReason;
 pub mod migration;
 
 pub mod size_limit;
+pub mod writer_tenure;
