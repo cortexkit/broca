@@ -126,7 +126,7 @@ enum ScopeReading {
     /// The scope or its parent is gone; the reason names which ([`drain_ends_run`] holds).
     Gone(&'static str),
     /// The scope is live; this is the stamp a route opened now would carry.
-    Live(ScopeStamp),
+    Live(Box<ScopeStamp>),
     /// The owner has not synced since the daemon started: wait, as for `scope_not_synced` on
     /// open.
     NotSynced,
@@ -158,7 +158,7 @@ fn read_describe(opened_epoch: u64, answer: &DescribedScope) -> ScopeReading {
             } else if stamp.parent_state == Some(ParentState::Ended) {
                 ScopeReading::Gone(SCOPE_PARENT_ENDED)
             } else {
-                ScopeReading::Live(stamp.clone())
+                ScopeReading::Live(Box::new(stamp.clone()))
             }
         }
     }
@@ -1915,7 +1915,7 @@ impl SubcToolPlane {
             })?;
             match self.read_scope(scope, lifecycle, true).await {
                 ScopeReading::Live(after) if may_resend_under(&before, &after) => {
-                    return Ok((handle, Some(after)));
+                    return Ok((handle, Some(*after)));
                 }
                 ScopeReading::Live(_) => {
                     // The scope's stamp changed while the route was opening, so the route may

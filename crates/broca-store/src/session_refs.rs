@@ -5,7 +5,7 @@ use broca_core::{agent_session_ref, session_addr, SessionRefIndex};
 use broca_protocol::BindIdentity;
 #[cfg(test)]
 use rusqlite::params;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::collections::BTreeMap;
 
 #[derive(Default, Debug)]
@@ -47,6 +47,10 @@ fn init_schema_measured(
             session_ref TEXT PRIMARY KEY CHECK(length(session_ref)=32 AND session_ref NOT GLOB '*[^0-9a-f]*'),
             address TEXT NOT NULL, project_root TEXT NOT NULL, harness TEXT NOT NULL, session TEXT NOT NULL
          ) WITHOUT ROWID",
+        "CREATE TABLE IF NOT EXISTS agent_data_session_ref_v2 (
+            session_ref TEXT NOT NULL, address TEXT NOT NULL,
+            PRIMARY KEY(session_ref,address)
+         ) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS agent_data_session_address ON agent_data_session_ref(address)",
         "CREATE TABLE IF NOT EXISTS agent_data_projection (id INTEGER PRIMARY KEY CHECK(id=1), backfilled INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS agent_data_census (address TEXT PRIMARY KEY, covered INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID",
@@ -74,7 +78,7 @@ fn init_schema_measured(
         for sql in schema {
             conn.execute_batch(sql)?;
         }
-        return Ok(());
+        return rekey_v2(conn);
     }
     let mut used = 0;
     while used < schema.len() {
@@ -89,6 +93,29 @@ fn init_schema_measured(
             },
             |_, _| Ok(()),
         )?;
+    }
+    rekey_v2(conn)
+}
+
+/// Rebuild external aliases at startup without changing stored WAL addresses.
+/// Multiple addresses deliberately survive under one alias so resolution can
+/// refuse a pair of harness/session names shared by different roots.
+fn rekey_v2(conn: &Connection) -> Result<(), StoreError> {
+    let rows = conn
+        .prepare("SELECT address,project_root,harness,session FROM agent_data_session_ref")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                BindIdentity::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (address, session) in rows {
+        write::insert_v2(conn, &address, &session)?;
     }
     Ok(())
 }
@@ -138,11 +165,13 @@ impl SqliteStore {
         let mut sessions = BTreeMap::new();
         {
             let mut statement = tx.prepare_cached(
-                "SELECT address,project_root,harness,session FROM agent_data_session_ref WHERE session_ref=?1",
+                "SELECT DISTINCT address,project_root,harness,session FROM agent_data_session_ref
+                 WHERE session_ref=?1 OR address IN
+                   (SELECT address FROM agent_data_session_ref_v2 WHERE session_ref=?1)",
             )?;
             for reference in refs {
-                let entry = statement
-                    .query_row([reference], |row| {
+                let entries = statement
+                    .query_map([reference], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             BindIdentity::new(
@@ -151,9 +180,12 @@ impl SqliteStore {
                                 row.get::<_, String>(3)?,
                             ),
                         ))
-                    })
-                    .optional()?;
-                if let Some(entry) = entry {
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if entries.len() > 1 {
+                    return Err(StoreError::InconsistentSnapshot("session_ref_ambiguous"));
+                }
+                if let Some(entry) = entries.into_iter().next() {
                     sessions.insert(reference.to_owned(), entry);
                 }
             }

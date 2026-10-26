@@ -472,10 +472,7 @@ pub fn catalog_request(
     let mut request = tool_catalog_request(tool_item).with_composition(plan.composition.clone());
     if let Some(item) = text_item {
         request = request.with_system_text(SystemTextItem {
-            preset: item
-                .preset
-                .clone()
-                .expect("system-text presets are checked before fetching"),
+            preset: item.preset.clone(),
             params: item.params.clone(),
         });
     }

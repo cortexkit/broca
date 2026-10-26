@@ -40,7 +40,7 @@ pub use projection_gap::{
     SESSION_PROJECTION_INCOMPLETE,
 };
 mod session_index;
-pub use session_index::{agent_session_ref, SessionRefIndex};
+pub use session_index::{agent_session_ref, legacy_session_ref, SessionRefIndex};
 
 /// A writer opened under a session lease, and the lease its caller keeps.
 pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
@@ -440,13 +440,14 @@ impl FileWalStore {
     pub fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
         broca_wal::migration::guard(
             &self.wal_path(session),
-            &cortexkit_role_llm_runner::session_ref(
+            &legacy_session_ref(
                 &session.harness,
                 &session.project_root.to_string_lossy(),
                 &session.session,
             ),
             write,
-        )
+        )?;
+        broca_wal::migration::guard(&self.wal_path(session), &agent_session_ref(session), write)
     }
 
     fn check_authorization_move(&self, session: &BindIdentity) -> Result<(), WalError> {
@@ -880,15 +881,11 @@ impl FileWalStore {
         );
         let retained = path == self.ephemeral_wal_path(session);
         let wal = FileWal::open_with_manifest_and_session_ref(
-            path,
+            path.clone(),
             self.manifest_path(),
             session_addr(session),
             identity,
-            cortexkit_role_llm_runner::session_ref(
-                &session.harness,
-                &session.project_root.to_string_lossy(),
-                &session.session,
-            ),
+            agent_session_ref(session),
         )?
         .with_recovery_cap(self.max_read_bytes)
         .with_feature_floor(self.feature_floor_path());
@@ -915,6 +912,14 @@ impl FileWalStore {
                 session_addr(session),
                 self.root.parent().unwrap_or(&self.root).to_path_buf(),
                 self.session_index.clone(),
+                (
+                    path,
+                    legacy_session_ref(
+                        &session.harness,
+                        &session.project_root.to_string_lossy(),
+                        &session.session,
+                    ),
+                ),
             )
             .with_placement(
                 self.wal_path(session),

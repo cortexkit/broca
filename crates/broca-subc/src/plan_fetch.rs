@@ -144,6 +144,7 @@ fn fetch_body(op: &str, arguments: Value) -> Result<Vec<u8>, FetchError> {
         schema_pin: None,
         origin: None,
         preset,
+        output_refs: None,
     })
     .map_err(|error| FetchError::Lost(error.to_string()))
 }
@@ -297,6 +298,7 @@ mod preset_tests {
                 build_lock_digest: None,
                 capability_requirements: vec![],
                 machine_id: None,
+                config_path: None,
             };
             assert!(module.reply(&request, serde_json::to_vec(&reply).unwrap()));
         });

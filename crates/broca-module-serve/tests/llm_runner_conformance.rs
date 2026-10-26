@@ -1917,6 +1917,9 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    fn runner_id(&self) -> &str {
+        "broca"
+    }
     async fn seed_untimed_tool_call(
         &self,
         handle: &Live,

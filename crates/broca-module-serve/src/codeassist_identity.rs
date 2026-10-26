@@ -19,7 +19,9 @@ pub fn for_episode(
             .map(serde_json::from_value)
             .transpose();
     }
-    let session_ref = broca_wire::agent_data::session_ref(
+    // Upstream conversation identity stays bound to the full triple, independently
+    // of the external session reference used by observers and move requests.
+    let session_ref = broca_core::wal_writer::legacy_session_ref(
         &session.harness,
         &session.project_root.to_string_lossy(),
         &session.session,

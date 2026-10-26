@@ -1189,9 +1189,11 @@ fn move_sidecars_and_pending_activation_cannot_leave_a_cache_dump() {
             }
             "activate" => {
                 let reference = cortexkit_role_llm_runner::session_ref(
-                    "runner",
-                    &key.project_root.to_string_lossy(),
-                    "moved",
+                    &cortexkit_role_llm_runner::SessionIdentity {
+                        runner: "broca",
+                        harness: "runner",
+                        session: "moved",
+                    },
                 );
                 broca_wal::migration::atomic_json(&root, &root.join("agent-data/cuts/cut.json"),&serde_json::json!({"refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
             }

@@ -639,11 +639,11 @@ mod provenance_tests {
         let hello = |manifest: &serde_json::Value| serde_json::json!({ "manifest": manifest });
         subc_protocol::manifest::validate_hello_event_declarations(&hello(&encoded))
             .expect("the daemon would refuse this HELLO");
-        // The control: the daemon's validator does refuse a dotted name, so the pass above
+        // The control: the daemon's validator refuses an empty name token, so the pass above
         // cannot come from a validator that accepts everything.
         let mut dotted = encoded.clone();
         dotted["events"] = serde_json::json!([
-            {"name": "compaction.advanced", "version": 1, "headers": ["session_ref"]}
+            {"name": "compaction..advanced", "version": 1, "headers": ["session_ref"]}
         ]);
         assert!(
             subc_protocol::manifest::validate_hello_event_declarations(&hello(&dotted)).is_err()

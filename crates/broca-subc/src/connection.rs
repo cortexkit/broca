@@ -1837,6 +1837,7 @@ impl SubcConnection {
             // relayed origin to attribute.
             origin: None,
             preset: preset.map(str::to_owned),
+            output_refs: None,
         })
         .map_err(|e| ConnError::Transport(e.to_string()))?;
         self.send_tool_call_body(route, deadline, name, body).await
@@ -1915,6 +1916,7 @@ impl SubcConnection {
             schema_pin: None,
             origin: None,
             preset: preset.map(str::to_owned),
+            output_refs: None,
         };
         let body = serde_json::to_string(&envelope)
             .map_err(|error| ConnError::Protocol(error.to_string()))?;
@@ -4151,7 +4153,7 @@ mod tests {
                             capabilities: capabilities.iter().map(|item| (*item).into()).collect(),
                             connected_clients: 1, counters: None,
                             build_git_sha: None, build_lock_digest: None,
-                            capability_requirements: vec![], machine_id: None,
+                            capability_requirements: vec![], machine_id: None, config_path: None,
                         };
                         assert!(module.reply(&request, serde_json::to_vec(&reply).unwrap()));
                     }
@@ -5073,6 +5075,7 @@ mod tests {
             schema_pin: None,
             origin: None,
             preset: None,
+            output_refs: None,
         })
         .unwrap();
         serde_json::from_slice(&bytes).unwrap()
