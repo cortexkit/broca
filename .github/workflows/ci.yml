@@ -206,6 +206,7 @@ jobs:
       BROCA_REQUIRE_VAULT: ${{ matrix.os == 'ubuntu' && '1' || '' }}
       SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc${{ matrix.os == 'windows' && '.exe' || '' }}
       FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub${{ matrix.os == 'windows' && '.exe' || '' }}
+      FAKE_SURFACE_BIN: ${{ github.workspace }}/fixtures/bin/fake-surface${{ matrix.os == 'windows' && '.exe' || '' }}
       CK_CLAUSTRUM_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-claustrum', github.workspace) || '' }}
       CK_AUTH_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-auth', github.workspace) || '' }}
       CK_CLAUSTRUM_CHECKOUT: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/claustrum', github.workspace) || '' }}
@@ -307,6 +308,7 @@ jobs:
       BROCA_REQUIRE_VAULT: '1'
       SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc
       FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub
+      FAKE_SURFACE_BIN: ${{ github.workspace }}/fixtures/bin/fake-surface
       CK_CLAUSTRUM_BIN: ${{ github.workspace }}/fixtures/bin/ck-claustrum
       CK_AUTH_BIN: ${{ github.workspace }}/fixtures/bin/ck-auth
       CK_CLAUSTRUM_CHECKOUT: ${{ github.workspace }}/fixtures/claustrum
@@ -444,6 +446,7 @@ jobs:
           BROCA_REQUIRE_VAULT: ${{ matrix.os == 'ubuntu' && '1' || '' }}
           SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc${{ runner.os == 'Windows' && '.exe' || '' }}
           FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub${{ runner.os == 'Windows' && '.exe' || '' }}
+          FAKE_SURFACE_BIN: ${{ github.workspace }}/fixtures/bin/fake-surface${{ runner.os == 'Windows' && '.exe' || '' }}
           CK_CLAUSTRUM_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-claustrum', github.workspace) || '' }}
           CK_AUTH_BIN: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/bin/ck-auth', github.workspace) || '' }}
           CK_CLAUSTRUM_CHECKOUT: ${{ matrix.os == 'ubuntu' && format('{0}/fixtures/claustrum', github.workspace) || '' }}

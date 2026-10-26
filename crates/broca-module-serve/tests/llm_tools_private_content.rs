@@ -9,6 +9,10 @@
 //! delivered. The `owner` and `cingulate` stand-ins are `fake-aft-stub`, which declares no
 //! management surface, so the daemon refuses a request aimed at either of them.
 
+// The handoff uses /bin/sh and records kernel process identities for cleanup.
+// Those identity helpers are implemented only on Linux and macOS.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -550,13 +554,19 @@ async fn served_route(
 ///
 /// That stand-in is another module, so it speaks the subc wire and the manifest shapes, and it
 /// is built as a separate package (`tests/support/fake-surface`) whose manifest pins exactly
-/// the releases broca links. Cargo does not build that package as part of this test target, so
-/// the helper builds it on demand with `CARGO`, which knows this crate's exact dependency
-/// revisions, into its own build directory, and reuses that build while the ready marker exists
-/// and the build is newer than its sources. The rig launches a published copy outside the build
-/// tree, never the build output: a supervising process must never execute a build-tree path,
-/// and macOS refuses to exec some removable build volumes.
+/// the releases broca links. CI runs prebuilt test archives without a complete Cargo registry,
+/// so it supplies `FAKE_SURFACE_BIN`. Runs with `BROCA_REQUIRE_SUBC=1` never compile fixtures;
+/// other local runs may build on demand. The rig always launches the `ckdev_binary` published
+/// copy, not the build output: on macOS a daemon-spawned module can block indefinitely in the
+/// loader on a removable build volume before it can register.
 fn fake_surface_bin() -> PathBuf {
+    if let Some(binary) = std::env::var_os("FAKE_SURFACE_BIN") {
+        return broca_test_support::ckdev_binary(binary, broca_test_support::scratch_root());
+    }
+    assert!(
+        std::env::var("BROCA_REQUIRE_SUBC").as_deref() != Ok("1"),
+        "required private-content stand-in missing: set FAKE_SURFACE_BIN to a prebuilt fake-surface binary; strict runs never compile fixtures"
+    );
     let stand_in = build_dir("fake-surface");
     let built = stand_in.join("debug/fake-surface");
     let ready = stand_in.join("fake-surface.ready");

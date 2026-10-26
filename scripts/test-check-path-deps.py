@@ -27,7 +27,7 @@ class PathDependencyGate(unittest.TestCase):
         self.repo.mkdir()
         self.environment = dict(os.environ, CARGO_NET_OFFLINE="true")
         self.manifest = self.repo / "Cargo.toml"
-        self.manifest.write_text('[package]\nname = "gate-fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+        self.manifest.write_text('[workspace]\n[package]\nname = "gate-fixture"\nversion = "0.1.0"\nedition = "2021"\n')
         (self.repo / "src").mkdir()
         (self.repo / "src/lib.rs").write_text("")
 
@@ -41,13 +41,38 @@ class PathDependencyGate(unittest.TestCase):
     def run_check(self):
         lock = subprocess.run(
             ["cargo", "generate-lockfile", "--manifest-path", str(self.manifest)],
-            env=self.environment, capture_output=True, text=True,
+            env=self.environment, capture_output=True, text=True, encoding="utf-8",
         )
         self.assertEqual(lock.returncode, 0, lock.stderr)
         return subprocess.run(
             [sys.executable, str(CHECK), "--repo-root", str(self.repo)],
-            env=self.environment, capture_output=True, text=True,
+            env=self.environment, capture_output=True, text=True, encoding="utf-8",
         )
+
+    def test_metadata_reader_decodes_utf8_under_windows_locale(self):
+        run_metadata = runpy.run_path(str(CHECK))["run_metadata"]
+        metadata = {"packages": [{"name": "fixture", "source": None,
+            "manifest_path": str(self.manifest), "dependencies": [],
+            "description": "Łódź café"}]}
+        stdout = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+        stderr = "metadata diagnostic: Łódź\n".encode("utf-8")
+        run = subprocess.run
+
+        def emit_metadata(command, **kwargs):
+            self.assertEqual(command[:2], ["cargo", "metadata"])
+            return run([sys.executable, "-c",
+                f"import sys; sys.stdout.buffer.write({stdout!r}); "
+                f"sys.stderr.buffer.write({stderr!r})"], **kwargs)
+
+        # Force the Windows default on every host; Ł includes a UTF-8 byte that
+        # cp1252 cannot decode, so omitting the reader's explicit encoding fails.
+        with patch("locale.getpreferredencoding", return_value="cp1252"), \
+                patch("locale.getencoding", return_value="cp1252", create=True), \
+                patch("subprocess.run", side_effect=emit_metadata):
+            result = run_metadata(self.manifest, offline=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), metadata)
+        self.assertEqual(result.stderr, "metadata diagnostic: Łódź\n")
 
     def test_metadata_stderr_does_not_contaminate_json(self):
         check = runpy.run_path(str(CHECK))["check"]

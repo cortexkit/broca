@@ -55,7 +55,7 @@ jobs:
         id: binaries
         with:
           path: fixtures
-          key: fixtures-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.rust }}-${{ env.SUBC_REV }}-${{ env.CLAUSTRUM_REV }}
+          key: fixtures-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.rust }}-${{ env.SUBC_REV }}-${{ env.CLAUSTRUM_REV }}-${{ hashFiles('broca/crates/broca-module-serve/tests/support/fake-surface/**') }}
       - name: Checkout subconscious
         if: steps.binaries.outputs.cache-hit != 'true'
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -78,18 +78,20 @@ jobs:
           set -euo pipefail
           cargo build --locked --manifest-path subconscious/Cargo.toml -p subc-core --bins
           cargo build --locked --manifest-path claustrum/Cargo.toml -p credentials-module --bins
+          cargo build --locked --manifest-path broca/crates/broca-module-serve/tests/support/fake-surface/Cargo.toml --target-dir fake-surface-target
           suffix=""
           if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
           mkdir -p fixtures/bin fixtures/claustrum/crates/credentials-module/tests/fixtures
           cp "subconscious/target/debug/ck-subc$suffix" "subconscious/target/debug/fake-aft-stub$suffix" "subconscious/target/debug/ck$suffix" fixtures/bin/
           cp "claustrum/target/debug/ck-claustrum$suffix" "claustrum/target/debug/ck-auth$suffix" fixtures/bin/
+          cp "fake-surface-target/debug/fake-surface$suffix" fixtures/bin/
           cp claustrum/crates/credentials-module/tests/fixtures/enrollment_wire_contract.json fixtures/claustrum/crates/credentials-module/tests/fixtures/
       - name: Verify and package fixtures
         run: |
           set -euo pipefail
           suffix=""
           if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
-          for name in ck-subc fake-aft-stub ck ck-claustrum ck-auth; do
+          for name in ck-subc fake-aft-stub ck ck-claustrum ck-auth fake-surface; do
             test -s "fixtures/bin/$name$suffix"
           done
           test -s fixtures/claustrum/crates/credentials-module/tests/fixtures/enrollment_wire_contract.json

@@ -75,6 +75,7 @@ jobs:
       CK_BUS_TESTKIT_REQUIRE: "1"
       SUBC_CORE_BIN: ${{ github.workspace }}/fixtures/bin/ck-subc.exe
       FAKE_AFT_STUB_BIN: ${{ github.workspace }}/fixtures/bin/fake-aft-stub.exe
+      FAKE_SURFACE_BIN: ${{ github.workspace }}/fixtures/bin/fake-surface.exe
       CK_CLAUSTRUM_BIN: ${{ github.workspace }}/fixtures/bin/ck-claustrum.exe
       CK_AUTH_BIN: ${{ github.workspace }}/fixtures/bin/ck-auth.exe
       CK_CLAUSTRUM_CHECKOUT: ${{ github.workspace }}/fixtures/claustrum
