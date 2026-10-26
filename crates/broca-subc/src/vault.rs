@@ -2906,8 +2906,11 @@ mod tests {
     /// about where the source is). Otherwise CI's layout is assumed: it checks claustrum out
     /// beside broca and names its binary in `CK_CLAUSTRUM_BIN`
     /// (`<checkout>/target/debug/ck-claustrum`), three directories below the checkout. When either
-    /// variable is set, the file must exist; with neither (a local run with no claustrum
-    /// checkout) there is nothing to compare.
+    /// variable is set, the file must exist; with neither there is nothing to compare, unless
+    /// the run requires the vault (`BROCA_REQUIRE_VAULT`), in which case the missing fixture
+    /// is a failure rather than a skip. The check is keyed solely on that flag: lanes without
+    /// a checkout (notably the Windows lib/bin/doc lane, which still runs with `CI=true`)
+    /// must skip here.
     #[test]
     fn list_scoped_strict_mirror_matches_claustrum_tip() {
         let non_empty = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
@@ -2921,8 +2924,7 @@ mod tests {
                 .to_path_buf()
         } else {
             assert!(
-                non_empty("BROCA_REQUIRE_VAULT").is_none()
-                    && std::env::var("CI").as_deref() != Ok("true"),
+                non_empty("BROCA_REQUIRE_VAULT").is_none(),
                 "claustrum source-tip comparison requires CK_CLAUSTRUM_CHECKOUT or CK_CLAUSTRUM_BIN in the required vault lane"
             );
             eprintln!("CK_CLAUSTRUM_CHECKOUT and CK_CLAUSTRUM_BIN unset: no claustrum checkout to compare against");
