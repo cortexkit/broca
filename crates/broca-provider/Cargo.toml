@@ -15,7 +15,7 @@ test-harness = []
 bench = ["dep:broca-replay", "dep:subc-protocol", "dep:subc-transport"]
 # The live Anthropic provider (LiveAnthropicProvider): a real HTTP/SSE front for
 # Provider::step. OFF by default so the pure normalize path stays reqwest-free.
-live = ["dep:reqwest", "dep:broca-core", "dep:futures", "dep:async-trait", "dep:httpdate", "dep:chrono", "dep:rand", "dep:tokio-util", "dep:tokio-tungstenite", "dep:tungstenite", "dep:flate2", "tokio/rt"]
+live = ["dep:reqwest", "dep:broca-core", "dep:broca-wal", "dep:futures", "dep:async-trait", "dep:httpdate", "dep:chrono", "dep:rand", "dep:tokio-util", "dep:tokio-tungstenite", "dep:tungstenite", "dep:flate2", "tokio/rt"]
 
 [dependencies]
 broca-owner-only.workspace = true
@@ -33,6 +33,7 @@ broca-ck = { path = "../broca-ck" }
 broca-replay = { path = "../broca-replay", optional = true }
 # broca-core for the Provider trait the live provider implements (feature `live`).
 broca-core = { path = "../broca-core", optional = true }
+broca-wal = { path = "../broca-wal", optional = true }
 # Only the bench-replay producer speaks the subc wire; the library codec paths are
 # transport-free so MITM consumers can depend on this crate with zero subc stacks.
 subc-protocol = { workspace = true, optional = true }
