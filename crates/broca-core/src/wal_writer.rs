@@ -3677,9 +3677,14 @@ mod tests {
             "unsynced append reached the tap"
         );
         handle.sync().await.unwrap();
-        let event = inbox
-            .try_recv()
-            .expect("sync publishes the durable tap before acknowledging");
+        // The writer acknowledges the sync first and publishes to the tap afterwards, so the
+        // run loop never waits on tap work; the event arrives shortly after the ack, not before.
+        let event =
+            broca_test_support::wait_for("the durable tap after sync", inbox.recv(), || {
+                "no tap event after a successful sync".into()
+            })
+            .await
+            .expect("tap channel open");
         let _ = handle.shutdown().await;
         assert_eq!(event, 1);
         assert!(
