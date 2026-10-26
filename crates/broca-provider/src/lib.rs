@@ -21,6 +21,7 @@ pub mod credential_refresh;
 pub mod families;
 pub mod hash;
 pub mod media_profile;
+pub mod media_render;
 #[cfg(feature = "live")]
 pub mod media_request;
 pub mod normalize;

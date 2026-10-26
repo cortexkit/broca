@@ -106,7 +106,8 @@ const GOLDEN_VERSION: &str = include_str!("../fixtures/openai_chat_render_golden
 #[test]
 fn openai_chat_render_matches_golden() {
     let frozen = openai_chat_frozen_config("gpt-4o");
-    let bytes = OpenAiChat.render(&frozen, &fixed_request());
+    let bytes =
+        render_golden_support::render_without_bundle(&OpenAiChat, &frozen, &fixed_request());
     let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
 
     if render_golden_support::update_if_requested(

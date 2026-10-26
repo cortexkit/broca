@@ -203,6 +203,10 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
         ))
         .expect("OpenAI Chat v4 pins are JSON"),
     );
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/pre_native_media.json"))
+            .expect("pre-native-media pins are JSON"),
+    );
     let legacy_opts = legacy_call_options();
     let chat_v4_opts = openai_chat_v4_call_options();
     let mut proven = BTreeSet::new();
