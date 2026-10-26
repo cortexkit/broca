@@ -106,6 +106,47 @@ impl SqliteStore {
         &self,
         refs: impl Iterator<Item = &'a str>,
     ) -> Result<SessionRefs, StoreError> {
+        self.read_session_refs(|tx| {
+            let mut sessions = BTreeMap::new();
+            let mut statement = tx.prepare_cached(
+                "SELECT address,project_root,harness,session FROM agent_data_session_ref WHERE session_ref=?1",
+            )?;
+            for reference in refs {
+                let entry = statement
+                    .query_row([reference], |row| {
+                        Ok((row.get::<_, String>(0)?, BindIdentity::new(
+                            row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?,
+                        )))
+                    })
+                    .optional()?;
+                if let Some(entry) = entry {
+                    sessions.insert(reference.to_owned(), entry);
+                }
+            }
+            Ok(sessions)
+        })
+    }
+
+    /// Scan only the compact bind inventory, never the much larger run history.
+    /// The limit bounds candidate decoding; callers must refuse a full result page.
+    pub fn session_refs_named(&self, name: &str, limit: u32) -> Result<SessionRefs, StoreError> {
+        self.read_session_refs(|tx| {
+            let mut statement = tx.prepare_cached(
+                "SELECT session_ref,address,project_root,harness,session FROM agent_data_session_ref WHERE session=?1 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(rusqlite::params![name, limit], |row| {
+                Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, BindIdentity::new(
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?,
+                ))))
+            })?;
+            rows.collect::<Result<BTreeMap<_, _>, _>>().map_err(StoreError::from)
+        })
+    }
+
+    fn read_session_refs(
+        &self,
+        select: impl FnOnce(&Connection) -> Result<BTreeMap<String, (String, BindIdentity)>, StoreError>,
+    ) -> Result<SessionRefs, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let root = conn
             .path()
@@ -135,29 +176,7 @@ impl SqliteStore {
             [],
             |row| row.get(0),
         )?;
-        let mut sessions = BTreeMap::new();
-        {
-            let mut statement = tx.prepare_cached(
-                "SELECT address,project_root,harness,session FROM agent_data_session_ref WHERE session_ref=?1",
-            )?;
-            for reference in refs {
-                let entry = statement
-                    .query_row([reference], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            BindIdentity::new(
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                            ),
-                        ))
-                    })
-                    .optional()?;
-                if let Some(entry) = entry {
-                    sessions.insert(reference.to_owned(), entry);
-                }
-            }
-        }
+        let sessions = select(&tx)?;
         tx.commit()?;
         Ok(SessionRefs {
             sessions,
