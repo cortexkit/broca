@@ -50,8 +50,3 @@ Windows tests use a deliberately broad parent, an ordinary inherited control fil
 and PowerShell ACL readback independent of the Rust validator. Temporary-file hooks
 inspect files while open, before publication or cleanup. WAL and SQLite refusal tests
 also observe entry into IO/initialisation, rather than relying only on unchanged bytes.
-
-The Windows guards are proven by rows in the root `mutations.toml` marked
-`platforms = ["windows"]`. Each row removes one guard or private creator and names the
-test that must then fail. The Windows CI mutation job replays them and publishes the
-observed report.

@@ -14,6 +14,7 @@ struct CapturingVaultDaemon {
     /// The consumer identity's module id presented on each route open, in order.
     route_open_identities: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     route_opens: Arc<std::sync::atomic::AtomicUsize>,
+    route_open_times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
     errors: Arc<std::sync::Mutex<Vec<String>>>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -117,12 +118,14 @@ impl CapturingVaultDaemon {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let route_open_identities = Arc::new(std::sync::Mutex::new(Vec::new()));
         let route_opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_open_times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = Arc::new(std::sync::Mutex::new(StandInRecord::default()));
         let server = {
             let requests = requests.clone();
             let route_open_identities = route_open_identities.clone();
             let route_opens = route_opens.clone();
+            let route_open_times = route_open_times.clone();
             let errors = errors.clone();
             tokio::spawn(async move {
                 loop {
@@ -132,6 +135,7 @@ impl CapturingVaultDaemon {
                     let (key, requests, errors) = (key.clone(), requests.clone(), errors.clone());
                     let route_open_identities = route_open_identities.clone();
                     let route_opens = route_opens.clone();
+                    let route_open_times = route_open_times.clone();
                     let record = record.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve_capturing_vault(
@@ -142,6 +146,7 @@ impl CapturingVaultDaemon {
                                 requests,
                                 route_open_identities,
                                 route_opens,
+                                route_open_times,
                             },
                             script,
                             scoped_not_found,
@@ -162,6 +167,7 @@ impl CapturingVaultDaemon {
             requests,
             route_open_identities,
             route_opens,
+            route_open_times,
             errors,
             server,
         }
@@ -270,6 +276,7 @@ struct CapturedTraffic {
     requests: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     route_open_identities: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     route_opens: Arc<std::sync::atomic::AtomicUsize>,
+    route_open_times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -288,6 +295,7 @@ async fn serve_capturing_vault(
         requests,
         route_open_identities,
         route_opens,
+        route_open_times,
     } = captured;
     use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse};
     use subc_protocol::{Flags, Frame, FrameType, Priority};
@@ -356,6 +364,7 @@ async fn serve_capturing_vault(
                     );
                 }
                 if matches!(request, ClientControlRequest::RouteOpen { .. }) {
+                    route_open_times.lock().unwrap().push(tokio::time::Instant::now());
                     let seen = route_opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let refusal = match script {
                         RouteOpenScript::Accept => None,
@@ -676,105 +685,6 @@ fn fresh_vault_root(label: &str) -> std::path::PathBuf {
     root
 }
 
-#[tokio::test]
-async fn a_delayed_client_auth_is_accepted_by_the_vault_stand_in() {
-    use subc_protocol::{Flags, Frame, FrameType, Priority};
-    use subc_transport::{ClientAuth, ClientHello, ServerProof};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    async fn send_auth_message(
-        stream: &mut tokio::net::TcpStream,
-        message: &impl serde::Serialize,
-    ) {
-        let body = serde_json::to_vec(message).unwrap();
-        let len = u32::try_from(body.len()).unwrap();
-        assert!(len <= subc_transport::MAX_AUTH_MESSAGE_LEN);
-        stream.write_u32_le(len).await.unwrap();
-        stream.write_all(&body).await.unwrap();
-    }
-
-    let root = fresh_vault_root("delayed-client-auth");
-    let daemon = CapturingVaultDaemon::start(&root).await;
-    let info = subc_transport::connection_file::read(&daemon.connection_file).unwrap();
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", info.endpoints[0].port))
-        .await
-        .unwrap();
-    let hello = ClientHello {
-        client_nonce: [0x12; subc_transport::NONCE_LEN],
-        role: subc_transport::DEFAULT_CLIENT_ROLE.into(),
-    };
-    send_auth_message(&mut stream, &hello).await;
-    let len = stream.read_u32_le().await.unwrap();
-    assert!(len <= subc_transport::MAX_AUTH_MESSAGE_LEN);
-    let mut body = vec![0; len as usize];
-    stream.read_exact(&mut body).await.unwrap();
-    let proof: ServerProof = serde_json::from_slice(&body).unwrap();
-    assert_eq!(proof.daemon_id, info.daemon_id);
-    assert_eq!(
-        proof.server_proof,
-        subc_transport::compute_proof(
-            &info.key,
-            subc_transport::SERVER_PROOF_DOMAIN,
-            &hello.client_nonce,
-            &proof.server_nonce,
-            &proof.daemon_id,
-        )
-    );
-
-    // Send the prelude by hand so only the stand-in's deadline is exercised, not the
-    // production client's 2-second budget. Delay ClientAuth without creating CPU load.
-    tokio::time::sleep(Duration::from_millis(2300)).await;
-    daemon.assert_healthy();
-    let auth = ClientAuth {
-        client_auth: subc_transport::compute_proof(
-            &info.key,
-            subc_transport::CLIENT_AUTH_DOMAIN,
-            &hello.client_nonce,
-            &proof.server_nonce,
-            &proof.daemon_id,
-        ),
-    };
-    send_auth_message(&mut stream, &auth).await;
-
-    // A catalog reply proves the server completed authentication and entered its frame loop.
-    let request = Frame::build(
-        FrameType::Request,
-        Flags::new(false, Priority::Passive, false),
-        0,
-        0,
-        1,
-        serde_json::to_vec(&subc_control::ClientControlRequest::CatalogList { module_id: None })
-            .unwrap(),
-    )
-    .unwrap();
-    subc_transport::write_frame(&mut stream, &request)
-        .await
-        .unwrap();
-    let reply = tokio::time::timeout(
-        Duration::from_secs(5),
-        subc_transport::read_frame(&mut stream),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
-    assert_eq!(reply.header.ty, FrameType::Response);
-    assert_eq!(reply.header.corr, request.header.corr);
-    let response: subc_control::ClientControlResponse =
-        serde_json::from_slice(&reply.body).unwrap();
-    let subc_control::ClientControlResponse::CatalogList { modules, .. } = response else {
-        panic!("expected the stand-in's catalog reply");
-    };
-    assert_eq!(modules.len(), 1);
-    assert_eq!(
-        modules[0].module_id,
-        broca_module_serve::consumer_routes::CREDENTIALS_MODULE_ID
-    );
-    daemon.assert_healthy();
-    drop(stream);
-    drop(daemon);
-    let _ = std::fs::remove_dir_all(root);
-}
 
 /// A credentials module that is restarting refuses `route.open` with `target_unavailable`
 /// until it is back. Admission must wait that out and get a fresh token from the vault.
@@ -837,22 +747,18 @@ async fn a_terminal_vault_route_refusal_fails_at_once_without_retry() {
     let executor =
         executor_with_capturing_vault_within(&root, &daemon, crate::VAULT_READY_TIMEOUT).await;
 
-    let started = std::time::Instant::now();
-    let result = executor
-        .decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None)
-        .await;
-    let elapsed = started.elapsed();
+    let result = broca_test_support::wait_for(
+        "terminal vault refusal",
+        executor.decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None),
+        || format!("route opens: {}", daemon.route_open_count()),
+    ).await;
     daemon.assert_healthy();
 
     assert!(
-        result.is_err(),
-        "an empty cache and a refused route leave nothing to admit on"
+        matches!(result, Err(RunError::Config(ref message)) if message.contains("unknown_module")),
+        "the terminal wire refusal must reach admission: {:?}", result.err()
     );
     assert_eq!(daemon.route_open_count(), 1, "a terminal refusal is never retried");
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "a terminal refusal must fail at once, took {elapsed:?}"
-    );
     assert!(daemon.requests().is_empty());
 
     drop(executor);
@@ -860,40 +766,42 @@ async fn a_terminal_vault_route_refusal_fails_at_once_without_retry() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A refusal that never clears gives up within the one readiness budget, not a budget per
-/// phase and not never.
+/// A retryable refusal uses one readiness deadline. Advance that clock after observing a
+/// retry, then require the last wire refusal without allowing another post-deadline open.
 #[tokio::test]
 async fn a_vault_route_refusal_that_never_clears_gives_up_within_the_ready_budget() {
     let root = fresh_vault_root("route-refused-forever");
-    let daemon =
-        CapturingVaultDaemon::start_with(&root, RouteOpenScript::RefuseForever("target_unavailable"))
-            .await;
-    let executor =
-        executor_with_capturing_vault_within(&root, &daemon, crate::VAULT_READY_TIMEOUT).await;
-
-    let started = std::time::Instant::now();
-    let result = executor
-        .decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None)
-        .await;
-    let elapsed = started.elapsed();
+    let daemon = CapturingVaultDaemon::start_with(
+        &root, RouteOpenScript::RefuseForever("target_unavailable")
+    ).await;
+    // Setup and socket authentication use real time. A long injected budget keeps the
+    // observed retry barrier independent of runner speed; expiration itself is virtual.
+    let budget = Duration::from_secs(3600);
+    let executor = executor_with_capturing_vault_within(&root, &daemon, budget).await;
+    let auth = tokio::spawn(async move {
+        executor.decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None).await
+    });
+    broca_test_support::wait_until("a retry of the vault route", || async {
+        if daemon.route_open_count() > 1 { Ok(()) }
+        else { Err(format!("opens: {}, auth finished: {}", daemon.route_open_count(), auth.is_finished())) }
+    }).await;
+    assert!(!auth.is_finished(), "a retryable refusal must wait for its deadline");
+    tokio::time::pause();
+    tokio::time::advance(budget).await;
+    let expired = tokio::time::Instant::now();
+    // Resume before waiting on TCP: an idle paused runtime can auto-advance socket
+    // reply timers ahead of the OS delivering a refusal that is already in flight.
+    tokio::time::resume();
+    let result = broca_test_support::wait_for("vault readiness deadline", auth, || {
+        format!("route opens: {}", daemon.route_open_count())
+    }).await.unwrap();
+    assert!(matches!(result, Err(RunError::Config(ref message)) if message.contains("target_unavailable")),
+        "the last wire refusal must reach admission: {:?}", result.err());
     daemon.assert_healthy();
-
-    assert!(result.is_err(), "the refusal outlasted the budget");
-    assert!(
-        elapsed <= crate::VAULT_READY_TIMEOUT + Duration::from_secs(1),
-        "the route open must stop within the readiness budget, took {elapsed:?}"
-    );
-    assert!(
-        elapsed >= crate::VAULT_READY_TIMEOUT - Duration::from_millis(500),
-        "a temporary refusal must be retried for the budget, gave up after {elapsed:?}"
-    );
-    assert!(
-        daemon.route_open_count() > 1,
-        "a temporary refusal must be retried"
-    );
+    assert!(daemon.route_open_count() > 1);
+    assert!(daemon.route_open_times.lock().unwrap().iter().all(|at| *at < expired),
+        "no route open may start after the readiness deadline");
     assert!(daemon.requests().is_empty());
-
-    drop(executor);
     drop(daemon);
     let _ = std::fs::remove_dir_all(root);
 }

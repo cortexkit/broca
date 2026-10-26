@@ -40,7 +40,3 @@ from commons commit `50093e9b09b6adadd57f74994f9aacbaa5145622`; the role's vecto
 are unchanged from `9abd24916a087162b7650ad7db71cf287be1330c`. Wire assertions
 compare JSON values against those independent fixtures: object member order is
 not pinned, and commons structs and JSON maps serialize in different orders.
-
-The route's guards are the `subc-hook-*` rows in the root `mutations.toml`.
-Replay them with the test prerequisite environment set (as `scripts/gate.sh`
-does), so none of their tests can skip.

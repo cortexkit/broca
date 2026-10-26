@@ -36,9 +36,7 @@ done
 [[ -n "$python_bin" ]] || refuse 'Python 3.11+ is required to read the workspace version'
 workspace_version="$("$python_bin" -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
 [[ "$workspace_version" == "$version" ]] || refuse "workspace version is $workspace_version, not $version; bump it before the train"
-# Only CI gates a release. Mutation replay proves the tests catch planted breaks, says nothing
-# new about whether this build is correct, and takes ~50 minutes; it runs on every master push
-# and nightly, and a failing row is a work item, not a reason to hold a release.
+# Only CI gates a release.
 # Only push runs are judged. The nightly scheduled CI run on the same commit builds against the
 # newest sibling revisions instead of the pinned ones, so it can fail or be cancelled for reasons
 # that say nothing about this commit; pull-request runs test a merge commit, not this one.

@@ -594,3 +594,60 @@ async fn codex_cross_run_connection_limit_retires_only_that_credentials_idle_soc
     );
     assert_eq!(mock.observed.lock().unwrap().handshakes, 5);
 }
+
+#[tokio::test]
+async fn codex_cross_run_connection_limit_uses_identical_codex_counts_for_retained_and_fresh() {
+    for reuse in [false, true] {
+        let failed = serde_json::json!({"type":"error","error":{"code":"websocket_connection_limit_reached"}});
+        let mut replies = vec![text_events()];
+        replies.extend((0..6).map(|_| vec![failed.clone()]));
+        replies.push(text_events());
+        let mock = Mock::start(replies, false, false).await;
+        let client = build_provider_http_client();
+        let first = run_provider(&mock, &client, "one");
+        first.bind_run_transport(&bind("session"));
+        let initial = step(&first, 1, &opts()).await;
+        first.complete_run_transport();
+        if !reuse {
+            client
+                .chatgpt_connections()
+                .retire_session(&bind("session"));
+        }
+        let mut second = run_provider(&mock, &client, "two");
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        second.retry_clock.virtual_waits = Some(waits.clone());
+        second.bind_run_transport(&bind("session"));
+        let options = follow_up(opts(), &initial, "Next");
+        let canonical = second.render_request(&options);
+        let events = step(&second, 1, &options).await;
+        let recorded = attempts(&events);
+        assert_eq!(
+            recorded.len(),
+            7,
+            "reuse={reuse}: six socket sends, then one successful HTTPS send"
+        );
+        assert_eq!(codex_trace(&events, 0).continuation, reuse);
+        for (index, attempt) in recorded.iter().enumerate() {
+            assert_canonical(attempt, &canonical);
+            if index < 6 {
+                assert_eq!(attempt.transport.as_deref(), Some("websocket"));
+                assert_eq!(attempt.outcome, AttemptOutcome::ChunkError);
+                assert_eq!(codex_trace(&events, index).physical_send_count, 1);
+                if index > 0 {
+                    assert!(!codex_trace(&events, index).continuation);
+                }
+            } else {
+                assert_eq!(attempt.transport.as_deref(), Some("https"));
+                assert_eq!(attempt.outcome, AttemptOutcome::Complete);
+            }
+        }
+        let waits = waits.lock().unwrap();
+        assert_eq!(waits.len(), 6);
+        assert_codex_stream_backoffs(&waits[..5]);
+        assert_eq!(waits[5], Duration::ZERO);
+        let seen = mock.observed.lock().unwrap();
+        assert_eq!(seen.requests.len(), 7);
+        assert_eq!(seen.http_bodies.len(), 1);
+        assert_eq!(seen.handshakes, if reuse { 6 } else { 7 });
+    }
+}

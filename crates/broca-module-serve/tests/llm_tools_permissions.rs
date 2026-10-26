@@ -314,15 +314,30 @@ impl Rig {
     async fn open(&self, connection: &SubcConnection, role: &str) -> broca_subc::RouteHandle {
         // Permissions do not create sessions, so empty harness and session names must work.
         let identity = BindIdentity::new(self.root.canonicalize().unwrap(), "", "");
-        connection
-            .route_open_management_roles_within(
-                "broca",
-                &identity,
-                std::collections::BTreeMap::from([(role.into(), "v1".into())]),
-                RouteOpenRetry::default_patience(),
-            )
-            .await
-            .unwrap()
+        // The daemon refuses opens with module_warming until broca registers, which can take
+        // longer than the default open patience on a loaded runner. Wait it out under the
+        // shared hang guard; any other refusal is the answer and fails the test.
+        broca_test_support::wait_until("broca's management route", || {
+            let identity = identity.clone();
+            async move {
+                match connection
+                    .route_open_management_roles_within(
+                        "broca",
+                        &identity,
+                        std::collections::BTreeMap::from([(role.into(), "v1".into())]),
+                        RouteOpenRetry::default_patience(),
+                    )
+                    .await
+                {
+                    Ok(route) => Ok(route),
+                    Err(error) if format!("{error:?}").contains("module_warming") => {
+                        Err(format!("broca is not live yet: {error:?}"))
+                    }
+                    Err(error) => panic!("broca's {role} route was refused: {error:?}"),
+                }
+            }
+        })
+        .await
     }
 }
 

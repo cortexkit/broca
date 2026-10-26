@@ -95,8 +95,7 @@ class RequiredModeTests(unittest.TestCase):
 
     @staticmethod
     def child_output(result: subprocess.CompletedProcess[str]) -> str:
-        """The child's output without its unittest summary line, which would otherwise be read
-        as this suite's own test count by the mutation runner."""
+        """Keep the child's unittest summary separate from this suite's test count."""
         lines = (result.stdout + result.stderr).splitlines()
         return "\n".join(line for line in lines if not line.startswith("Ran "))
 

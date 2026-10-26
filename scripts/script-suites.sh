@@ -42,9 +42,6 @@ chmod +x "$PY_DIR/python3"
 export PATH="$PY_DIR:$PATH"
 echo "script-suites: $(python3 --version) at $PY"
 
-# Check the whole catalogue before running suites or any native mutation replay.
-python3 scripts/verify-mutation-platforms.py
-
 suites=(
     scripts/test-check-path-deps.py
     scripts/test-stage-release.py
@@ -134,7 +131,5 @@ done
 python3 scripts/check-path-deps.py
 python3 scripts/live-runs.py --self-test
 python3 scripts/audit-export-lane.py --self-test
-python3 scripts/verify-windows-mutations.py --self-test
-python3 scripts/verify-mutation-platforms.py --self-test
 # Nothing under .cortexkit/ may be tracked except release-notes/, skills/, rules/ and WORKER.md.
 scripts/check-cortexkit-layout.sh

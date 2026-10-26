@@ -308,6 +308,9 @@ enum UpgradeFailure {
     /// The upgrade's own body already says the account's usage limit is reached, so an HTTPS
     /// round trip would only repeat the refusal.
     AccountLimit(u16, Box<ProviderError>),
+    /// The upgrade was refused with a 429, or with a server retry time. This refusal is the
+    /// attempt's answer, classified like an HTTPS answer.
+    Refused(u16, Box<ProviderError>),
     /// No socket for this attempt: send it over HTTPS instead.
     Transport,
 }
@@ -389,6 +392,28 @@ impl Session {
         if let Some(socket) = state.socket.take() {
             socket.shutdown.cancel();
         }
+    }
+
+    /// Codex's `try_switch_fallback_transport` (`core/src/client.rs:2454-2464`): send the rest of
+    /// the run over HTTPS, and answer whether this call made the switch. It did not when the run
+    /// was already switched, or when configuration already sends everything over HTTPS. Reaching
+    /// `FAILURE_LIMIT` socket failures also sends attempts over HTTPS (see `forced_https`), but
+    /// it does not count as this switch: Codex has no such threshold, so in its terms the
+    /// WebSocket is still enabled and the retry count may still fall back once.
+    pub(super) fn try_switch_to_https(&self) -> bool {
+        let policy = Arc::clone(&self.policy.read().unwrap());
+        if policy() {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.force_https {
+            return false;
+        }
+        state.force_https = true;
+        if let Some(socket) = state.socket.take() {
+            socket.shutdown.cancel();
+        }
+        true
     }
 
     fn now(&self) -> Instant {
@@ -487,6 +512,14 @@ impl Session {
                 {
                     warn_upgrade_refusal(status, response.headers(), "account_limit");
                     return Err(UpgradeFailure::AccountLimit(status, Box::new(error)));
+                }
+                if let Some(error) = upgrade_refusal_with_retry_time(
+                    status,
+                    response.headers(),
+                    response.body().as_deref(),
+                ) {
+                    warn_upgrade_refusal(status, response.headers(), "retry_decision");
+                    return Err(UpgradeFailure::Refused(status, Box::new(error)));
                 }
                 warn_upgrade_refusal(status, response.headers(), "https");
                 if status == 403 {
@@ -951,6 +984,10 @@ async fn drive_socket(
             // An exhausted account refills in hours or days: no retry within the step.
             return Err(AttemptFailure::http(*error, true));
         }
+        Err(UpgradeFailure::Refused(status, error)) => {
+            trace.http_status = Some(status);
+            return Err(AttemptFailure::http(*error, false));
+        }
         Err(UpgradeFailure::Transport) => {
             return drive_attempt(
                 client,
@@ -1242,14 +1279,7 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
         // Codex 0.163.0 treats this named cache miss as retryable before status mapping,
         // even for a wrapped 400. Failure guards retire the established socket; the normal
         // accounted attempt loop retries with full input, never a resend inside this attempt.
-        let retry = [value.pointer("/error/headers"), value.get("headers")]
-            .into_iter()
-            .flatten()
-            .find_map(|source| {
-                let mut headers = reqwest::header::HeaderMap::new();
-                extend_wrapped_headers(&mut headers, source);
-                parse_retry_after_header(&headers)
-            });
+        let retry = codex_frame_retry_after(&value);
         let mut error = transport_error("Previous response was not found; retrying full input");
         error.class = ErrorClass::Transient;
         error.provider_code = Some("previous_response_not_found".into());
@@ -1271,7 +1301,7 @@ pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<Atte
     {
         extend_wrapped_headers(&mut headers, source);
     }
-    let retry = parse_retry_after_header(&headers);
+    let retry = codex_frame_retry_after(&value);
     trace.account_observation.ratelimit_headers = ratelimit_unified_headers(&headers);
     let headers = response_headers(&headers);
     let text = String::from_utf8_lossy(raw);
@@ -1398,6 +1428,17 @@ fn safe_error_param(param: &str) -> bool {
         })
 }
 
+/// The server's retry time in a wrapped error frame, read as Codex reads it: the `Retry-After` in
+/// the nested `error.headers` first, then in the top-level `headers`, the first one that parses
+/// (`codex-api/src/endpoint/responses_websocket.rs:659-668`).
+fn codex_frame_retry_after(frame: &Value) -> Option<f64> {
+    let now = SystemTime::now();
+    [frame.pointer("/error/headers"), frame.get("headers")]
+        .into_iter()
+        .flatten()
+        .find_map(|headers| crate::codex_retry_after::json_headers_retry_after(headers, now))
+}
+
 fn extend_wrapped_headers(headers: &mut reqwest::header::HeaderMap, source: &Value) {
     if let Some(source) = source.as_object() {
         for (key, value) in source {
@@ -1472,6 +1513,40 @@ fn upgrade_account_limit(
         error,
     );
     error.is_account_limit_exhausted().then_some(error)
+}
+
+/// The error a refused upgrade states when the refusal is a 429 or carries a server retry time,
+/// classified the way an HTTPS answer is (status, the first [`UPGRADE_BODY_CLASSIFY_LIMIT`]
+/// bytes of the body, and the `Retry-After` header). Any other refusal returns `None`, and the
+/// caller sends the request over HTTPS within the same attempt.
+///
+/// Codex reads a refused upgrade as an ordinary HTTP answer and retries it by its own rules
+/// (`codex-api/src/endpoint/responses_websocket.rs:597-611`). A 429 without a retry time ends
+/// the step; with one, the next send waits until that time. Sending the request over HTTPS at
+/// once would re-send before the server's time, which is how a capacity refusal used to end
+/// runs early.
+fn upgrade_refusal_with_retry_time(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: Option<&[u8]>,
+) -> Option<ProviderError> {
+    let retry_after = codex_retry::retry_after_secs(headers);
+    if status != 429 && retry_after.is_none() {
+        return None;
+    }
+    let body = body.unwrap_or_default();
+    let text = String::from_utf8_lossy(&body[..body.len().min(UPGRADE_BODY_CLASSIFY_LIMIT)]);
+    let family = crate::spec::WireFamilyId::OpenAiResponsesChatgpt;
+    let error = classify_http_error(status, &text, retry_after, None);
+    let error = classify_chatgpt_upstream_key_rejection(family, status, &text, error);
+    Some(classify_account_limit_exhausted(
+        family,
+        status,
+        &response_headers(headers),
+        &text,
+        SystemTime::now(),
+        error,
+    ))
 }
 
 pub(super) fn frame_record(raw: &[u8]) -> Vec<u8> {

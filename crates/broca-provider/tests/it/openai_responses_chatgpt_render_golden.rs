@@ -102,7 +102,11 @@ pub(crate) fn golden_frozen() -> broca_provider::wire::FrozenRenderConfig {
 #[test]
 fn openai_responses_chatgpt_render_matches_golden() {
     let frozen = golden_frozen();
-    let bytes = OpenAiResponsesChatgpt.render(&frozen, &fixed_request());
+    let bytes = render_golden_support::render_without_bundle(
+        &OpenAiResponsesChatgpt,
+        &frozen,
+        &fixed_request(),
+    );
     let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
 
     if render_golden_support::update_if_requested(

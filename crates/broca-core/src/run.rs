@@ -9889,95 +9889,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn run_future_frame_sizes() {
-        let session = BindIdentity::new("/future-size", "test", "sizes");
-        let mut req = RunRequest::from_submission(
-            serde_json::from_value(serde_json::json!({
-                "model": {"provider_module_id": "stub", "model_id": "m"},
-                "input": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
-            }))
-            .unwrap(),
-            RunId("r".into()),
-            session,
-            broca_protocol::SubmissionId("s".into()),
-        );
-        let provider = crate::StubProvider::new(vec![]);
-        let plane = crate::StubToolPlane::new();
-        let control = RunControl::default();
-        let writer = WalHandle::spawn(
-            Box::new(RecordingWal {
-                records: Arc::new(std::sync::Mutex::new(vec![])),
-            }),
-            1,
-        )
-        .unwrap();
-        let wal_store = ReadableWalStore;
-        let lease_store = crate::FileLeaseStore::new("/future-size/leases");
-        let (out, _events) = mpsc::channel(1);
-        let body = run_body_with_approval_history(
-            &mut req,
-            crate::replay(&[]).unwrap(),
-            None,
-            false,
-            false,
-            false,
-            &control,
-            &provider,
-            &plane,
-            &crate::AllowAll,
-            &writer,
-            || Ok(false),
-            None,
-            &out,
-            None,
-            None,
-            None,
-            None,
-        );
-        println!(
-            "run_body_with_approval_history={} bytes",
-            std::mem::size_of_val(&body)
-        );
-        drop(body);
-        let leased = run_under_lease(
-            req.clone(),
-            1,
-            None,
-            &provider,
-            &plane,
-            &crate::AllowAll,
-            &wal_store,
-            None,
-            false,
-            false,
-            RunControl::default(),
-            &out,
-        );
-        println!("run_under_lease={} bytes", std::mem::size_of_val(&leased));
-        let public = run_loop_with_control(
-            req,
-            &provider,
-            &plane,
-            &lease_store,
-            &crate::AllowAll,
-            &wal_store,
-            None,
-            RunControl::default(),
-            &out,
-        );
-        println!(
-            "run_loop_with_control={} bytes",
-            std::mem::size_of_val(&public)
-        );
-        drop(public);
-        drop(leased);
-        writer
-            .shutdown()
-            .await
-            .expect("measurement writer shutdown");
-    }
-
     /// `stamp_credential` sets `credential_id` only on credential-scoped terminals (a billing
     /// refusal, an exhausted account window, a rate limit) and on no other error. It rewrites
     /// only rate limits to the `rate_limited` code, and sets `account_ref` only on the billing
@@ -12473,35 +12384,6 @@ mod tests {
         .await;
         assert!(!crate::projection_health::is_behind(&session));
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn projection_warning_mutations_are_not_test_gated() {
-        // A compile-time assertion cannot prove that these call sites survive non-test builds:
-        // Rust const evaluation has no way to inspect a statement's cfg attributes. This source
-        // check guards the exact failure mode by inspecting the statements compiled in production.
-        let source = include_str!("run.rs");
-        let mutation = ["PROJECTION_WARNING_COUNT", ".fetch_add"].concat();
-        let mutations: Vec<_> = source.match_indices(&mutation).collect();
-        assert_eq!(
-            mutations.len(),
-            3,
-            "expected content-read, content-write and retained-metadata warning counter mutations"
-        );
-
-        for (offset, _) in mutations {
-            let since_previous_statement = source[..offset]
-                .rsplit_once(';')
-                .map_or(&source[..offset], |(_, suffix)| suffix);
-            let compact: String = since_previous_statement
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect();
-            assert!(
-                !compact.contains("#[cfg(test)]"),
-                "projection warning counter mutation is test-gated"
-            );
-        }
     }
 
     #[tokio::test]

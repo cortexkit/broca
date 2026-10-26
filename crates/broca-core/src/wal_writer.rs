@@ -3677,9 +3677,11 @@ mod tests {
             "unsynced append reached the tap"
         );
         handle.sync().await.unwrap();
-        let event = tokio::time::timeout(std::time::Duration::from_millis(200), inbox.recv()).await;
+        let event = inbox
+            .try_recv()
+            .expect("sync publishes the durable tap before acknowledging");
         let _ = handle.shutdown().await;
-        assert_eq!(event.unwrap(), Some(1));
+        assert_eq!(event, 1);
         assert!(
             inbox.try_recv().is_err(),
             "tap published the same append more than once"

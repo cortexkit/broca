@@ -234,9 +234,17 @@ mod tests {
 
     #[test]
     fn clock_defaults_to_real_time() {
-        let before = Clock::default().now_ms();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         let clock = Clock::default();
-        assert!(clock.now_ms() >= before);
+        let measured = u128::from(clock.now_ms());
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        assert!((before..=after).contains(&measured));
         assert_eq!(*clock.subscribe().borrow(), 0);
         assert!(!clock.refresh().unwrap());
     }

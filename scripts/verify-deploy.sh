@@ -332,7 +332,7 @@ echo "        and provider-declarations/v1 (not inferred from the session reply)
 #
 # As of 2026-09-03 these have never shown a second value in production:
 #
-#     projection_failures                was the r126 defect; now mutation-guarded
+#     projection_failures                was the r126 defect; covered by regression tests
 #     frames_dropped_stale_epoch         0 since v0.3.33
 #     frames_dropped_unmatched_terminal  0 since v0.3.33
 #     catalog_refusals / _total          0 since v0.3.43

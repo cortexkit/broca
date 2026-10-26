@@ -540,6 +540,40 @@ pub fn fit_request(
     }
 }
 
+/// Render an explicit prepared bundle and enforce limits on the complete bytes the family
+/// would send, including envelopes, tags and signatures. The tag projection must be pure:
+/// it is reapplied after each limit marker so stored part identities never change.
+/// With no bundle, use the original renderer verbatim (including legacy carrier markers).
+pub fn render_prepared(
+    family: &dyn crate::wire::WireFamily,
+    frozen: &crate::wire::FrozenRenderConfig,
+    opts: &broca_protocol::CallOptions,
+    bundle: Option<&mut PreparedBundle>,
+    render_tags: &dyn Fn(&[Message]) -> Vec<Message>,
+) -> Result<Vec<u8>, PrepareError> {
+    let Some(bundle) = bundle else {
+        return Ok(family.render(frozen, opts));
+    };
+    let render = |candidate: &PreparedBundle| {
+        let mut options = opts.clone();
+        options.prompt = render_tags(&candidate.prompt);
+        let payloads: Vec<_> = candidate
+            .media
+            .iter()
+            .map(|media| crate::media_render::InlineMedia {
+                reference: &media.reference,
+                base64: &media.base64,
+                tool: media.tool,
+            })
+            .collect();
+        family.render_with_media(frozen, &options, &payloads)
+    };
+    if let Some(profile) = &frozen.media {
+        fit_request(profile, bundle, |candidate| render(candidate).len() as u64)?;
+    }
+    Ok(render(bundle))
+}
+
 fn breaks_counts(profile: &MediaProfile, bundle: &PreparedBundle) -> bool {
     let mut counts = [0u32; 4];
     for media in &bundle.media {

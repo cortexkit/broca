@@ -266,6 +266,46 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
     );
 }
 
+/// Preparing native media must not change existing runs before media admission is enabled.
+/// Their frozen configs omit the profile, so both the ordinary renderer and the explicit
+/// media hooks must retain the bytes pinned at Anthropic v2 and Bedrock v4.
+#[test]
+fn anthropic_and_bedrock_without_media_keep_their_pinned_old_version_bytes() {
+    let pins: Vec<Value> =
+        serde_json::from_str(include_str!("../fixtures/pre_native_media.json")).unwrap();
+    let opts = legacy_call_options();
+    let mut checked = Vec::new();
+    for case in pins {
+        let frozen: FrozenRenderConfig = serde_json::from_value(case["frozen"].clone()).unwrap();
+        assert!(frozen.media.is_none());
+        assert_eq!(serde_json::to_value(&frozen).unwrap(), case["frozen"]);
+        let expected = case["body"].as_str().unwrap().as_bytes();
+        let family = renderer(frozen.family_id);
+        assert_eq!(family.render(&frozen, &opts), expected);
+        assert_eq!(family.render_with_media(&frozen, &opts, &[]), expected);
+        #[cfg(feature = "live")]
+        assert_eq!(
+            broca_provider::media_request::render_prepared(
+                family,
+                &frozen,
+                &opts,
+                None,
+                &|_| panic!("an absent bundle must not project the prompt"),
+            )
+            .unwrap(),
+            expected,
+        );
+        checked.push((frozen.family_id, frozen.renderer_version));
+    }
+    assert_eq!(
+        checked,
+        vec![
+            (WireFamilyId::AnthropicMessages, 2),
+            (WireFamilyId::BedrockConverse, 4),
+        ],
+    );
+}
+
 /// The table answers only for what it declares: the current version and the declared earlier
 /// versions are reproduced; every other version, including a later one, is not.
 #[test]
@@ -282,6 +322,48 @@ fn only_declared_versions_are_reproduced() {
                 "{family:?} v{version}"
             );
         }
+    }
+}
+
+/// An explicit media bundle cannot change a run whose frozen config predates media admission.
+/// Use the existing no-media goldens as the byte oracle, not another rendering of the request.
+#[test]
+fn openai_without_media_keep_their_pinned_old_version_bytes() {
+    use crate::{
+        openai_chat_golden as chat, openai_responses_chatgpt_render_golden as chatgpt,
+        openai_responses_golden as responses,
+    };
+    for (family, mut frozen, opts, expected, version) in [
+        (
+            WireFamilyId::OpenAiChat,
+            broca_provider::families::openai_chat_frozen_config("gpt-4o"),
+            chat::fixed_request(),
+            chat::GOLDEN,
+            5,
+        ),
+        (
+            WireFamilyId::OpenAiResponses,
+            responses::golden_frozen(),
+            responses::fixed_request(),
+            responses::GOLDEN,
+            6,
+        ),
+        (
+            WireFamilyId::OpenAiResponsesChatgpt,
+            chatgpt::golden_frozen(),
+            chatgpt::fixed_request(),
+            chatgpt::GOLDEN,
+            8,
+        ),
+    ] {
+        frozen.renderer_version = version;
+        assert!(frozen.media.is_none());
+        let expected = expected.trim_end_matches('\n').as_bytes();
+        assert_eq!(renderer(family).render(&frozen, &opts), expected);
+        assert_eq!(
+            renderer(family).render_with_media(&frozen, &opts, &[]),
+            expected
+        );
     }
 }
 

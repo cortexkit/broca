@@ -1,11 +1,7 @@
 //! broca's state root at boot, and the isolation every test that spawns broca must keep from it.
 //!
-//! The default state root is the operator's REAL data home (`~/.local/share/cortexkit/broca`),
-//! where the production WAL and the run index astrocyte reads both live. A test that spawns
-//! `ck-broca` or `broca-run` -- directly, or through a subc daemon that passes its environment
-//! on to the module -- without pinning where that state goes would write into production. The
-//! guard at the bottom of this file reads every such spawn site in the workspace and fails on
-//! any that does not pin it.
+//! Spawn wrappers are exercised against hostile inherited roots. The child must create its
+//! state files only beneath the selected scratch root, never the operator's data home.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -147,178 +143,6 @@ fn boot_without_any_home_refuses_by_name() {
     );
 }
 
-// ------------------------------------------------------------------------------------------
-// The isolation guard: every test that spawns broca must pin where its state goes, so no test
-// run can write into the operator's real state root.
-
-/// Text that marks a source file as one that runs broca's binaries.
-const BROCA_BINARY_MARKERS: &[&str] = &[
-    "CARGO_BIN_EXE_ck-broca",
-    "CARGO_BIN_EXE_broca-run",
-    "\"ck-broca\"",
-    "\"broca-run\"",
-];
-
-/// Programs spawned from those files that are NOT broca and open no state root. Every entry is
-/// the program argument with whitespace removed. A new program in such a file is treated as a
-/// broca spawn until it is listed here, so the guard cannot be passed by a spawn nobody looked
-/// at.
-const NOT_BROCA: &[(&str, &str)] = &[
-    ("program", "the aimock provider server"),
-    (
-        "ck_import_bin()",
-        "the import CLI operating on the rig's isolated project and daemon",
-    ),
-    (
-        "ck_auth",
-        "the vault's credential CLI, pointed at a scratch --data-dir",
-    ),
-    (
-        "&ck_auth",
-        "the vault's credential CLI, pointed at a scratch --data-dir",
-    ),
-    (
-        "ck_auth_bin()",
-        "the vault's credential CLI, pointed at a scratch --data-dir",
-    ),
-    (
-        "broca_session_bin()",
-        "a subc client of an already-running module",
-    ),
-    (
-        "env!(\"CARGO_BIN_EXE_broca-session\")",
-        "a subc client of an already-running module",
-    ),
-    (
-        "env!(\"CARGO_BIN_EXE_ck-import\")",
-        "a subc client of an already-running module",
-    ),
-    (
-        "std::env::current_exe().expect(\"thetestbinary'sownpath\")",
-        "the test binary re-running one of its own tests",
-    ),
-];
-
-/// One `Command::new` site that the guard checked.
-#[derive(Debug)]
-struct Site {
-    file: PathBuf,
-    line: usize,
-    program: String,
-    isolated: bool,
-}
-
-fn strip_whitespace(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-/// The builder text from a spawn site to the call that runs it. `.env` calls made on a named
-/// command before it runs fall inside this window too.
-fn spawn_window(source: &str) -> &str {
-    let end = [".spawn()", ".output()", ".status()"]
-        .iter()
-        .filter_map(|call| source.find(call))
-        .min()
-        .unwrap_or(source.len());
-    &source[..end]
-}
-
-/// Whether a spawn window keeps broca off the operator's data home: an explicit state root, an
-/// emptied environment, or a pinned data home with any inherited state root removed. The last
-/// needs both halves, because an exported BROCA_STATE_ROOT overrides the data home.
-fn window_isolates(window: &str) -> bool {
-    let window = strip_whitespace(window);
-    window.contains(".env(\"BROCA_STATE_ROOT\",")
-        || window.contains(".env_clear()")
-        || (window.contains(".env(\"XDG_DATA_HOME\",")
-            && window.contains(".env_remove(\"BROCA_STATE_ROOT\")"))
-}
-
-/// The argument of the call whose opening parenthesis ends `source[..open]`.
-fn call_argument(source: &str, open: usize) -> &str {
-    let mut depth = 1usize;
-    for (offset, ch) in source[open..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &source[open..open + offset];
-                }
-            }
-            _ => {}
-        }
-    }
-    &source[open..]
-}
-
-/// The first argument of an argument list, cut at the first comma outside any brackets.
-fn first_argument(arguments: &str) -> &str {
-    let mut depth = 0usize;
-    for (offset, ch) in arguments.char_indices() {
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => return &arguments[..offset],
-            _ => {}
-        }
-    }
-    arguments
-}
-
-/// Every broca spawn site in `source`, checked. A site is a `Command` constructor, the
-/// test-support ckdev command builder, or the rig stdio builders (`rig_command` and
-/// `tokio_rig_command`, which real-daemon rigs use to launch their daemons). Missing a builder
-/// form would leave those spawns unchecked. Programs named by a string literal without
-/// "broca" in it (pgrep, kill, sleep) and the programs in [`NOT_BROCA`] are skipped.
-fn spawn_sites(file: &Path, source: &str) -> Vec<Site> {
-    if !BROCA_BINARY_MARKERS.iter().any(|m| source.contains(m)) {
-        return Vec::new();
-    }
-    // The rig needle also matches the tokio builder's name, and both end at the same opening
-    // parenthesis, so `dedup` below counts each site once.
-    let needles = [
-        ["Command", "::new("].concat(),
-        ["ckdev_", "command("].concat(),
-        ["rig_", "command("].concat(),
-    ];
-    let mut opens: Vec<usize> = needles
-        .iter()
-        .flat_map(|needle| {
-            source
-                .match_indices(needle.as_str())
-                .map(move |(at, _)| at + needle.len())
-        })
-        .collect();
-    opens.sort_unstable();
-    opens.dedup();
-    let mut sites = Vec::new();
-    for open in opens {
-        // A builder's own definition is not a spawn.
-        if needles.iter().any(|needle| {
-            source[..open]
-                .strip_suffix(needle.as_str())
-                .is_some_and(|before| before.ends_with("fn ") || before.ends_with("fn tokio_"))
-        }) {
-            continue;
-        }
-        let program = strip_whitespace(first_argument(call_argument(source, open)));
-        if program.starts_with('"') && !program.contains("broca") {
-            continue;
-        }
-        if NOT_BROCA.iter().any(|(name, _)| *name == program) {
-            continue;
-        }
-        sites.push(Site {
-            file: file.to_path_buf(),
-            line: source[..open].lines().count(),
-            isolated: window_isolates(spawn_window(&source[open..])),
-            program,
-        });
-    }
-    sites
-}
-
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -334,34 +158,6 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
-}
-
-/// The checker must be able to fail: an unpinned spawn, and one that pins the data home but
-/// lets an inherited BROCA_STATE_ROOT through, are both flagged, and the pinned forms pass.
-#[test]
-fn the_isolation_checker_flags_an_unpinned_spawn() {
-    let new = ["Command", "::new("].concat();
-    let case = |body: &str| {
-        let source = format!(
-            "// CARGO_BIN_EXE_ck-broca\nlet out = {new}env!(\"CARGO_BIN_EXE_ck-broca\"))\n{body}\n    .output();\n"
-        );
-        let sites = spawn_sites(Path::new("synthetic.rs"), &source);
-        assert_eq!(sites.len(), 1, "{sites:?}");
-        sites[0].isolated
-    };
-    assert!(
-        !case("    .arg(\"--subc\")"),
-        "an unpinned spawn must be flagged"
-    );
-    assert!(
-        !case("    .env(\"XDG_DATA_HOME\", &d)"),
-        "a pinned data home with an inheritable BROCA_STATE_ROOT must be flagged"
-    );
-    assert!(case("    .env(\"BROCA_STATE_ROOT\", &d)"));
-    assert!(case(
-        "    .env(\"XDG_DATA_HOME\", &d)\n    .env_remove(\"BROCA_STATE_ROOT\")"
-    ));
-    assert!(case("    .env_clear()"));
 }
 
 /// Only the shared resolver in `state_root.rs` may read BROCA_STATE_ROOT or spell the old
@@ -404,67 +200,163 @@ fn only_the_shared_resolver_names_the_state_root() {
     );
 }
 
-/// Every spawn of broca in the workspace keeps it off the operator's real data home.
-#[test]
-fn every_broca_spawn_site_pins_its_state_root() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut files = Vec::new();
-    rust_files(&workspace.join("crates"), &mut files);
-    let sites: Vec<Site> = files
-        .iter()
-        .flat_map(|file| {
-            let source = std::fs::read_to_string(file).unwrap_or_default();
-            let relative = file.strip_prefix(&workspace).unwrap_or(file).to_path_buf();
-            spawn_sites(&relative, &source)
-        })
-        .collect();
-
-    for site in &sites {
-        eprintln!(
-            "checked {}:{} spawns {}",
-            site.file.display(),
-            site.line,
-            site.program
-        );
-    }
-    let unpinned: Vec<String> = sites
-        .iter()
-        .filter(|site| !site.isolated)
-        .map(|site| {
-            format!(
-                "{}:{} spawns {}",
-                site.file.display(),
-                site.line,
-                site.program
+/// Boot a child through each command builder and observe its writes beneath the selected root.
+#[tokio::test]
+async fn every_broca_spawn_site_pins_its_state_root() {
+    let wrappers = [
+        "command",
+        "ckdev_command",
+        "rig_command",
+        "tokio_rig_command",
+    ];
+    let mut exercised = std::collections::BTreeSet::new();
+    for wrapper in wrappers {
+        for explicit in [false, true] {
+            let machine = Machine::new(&format!("{wrapper}-{explicit}"));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let key = vec![0x51; 32];
+            let daemon_id = [0x15; 16];
+            subc_transport::connection_file::write_atomic(
+                machine.connection_file(),
+                &subc_transport::connection_file::ConnectionInfo {
+                    schema: subc_transport::connection_file::SCHEMA_VERSION,
+                    wire_version: None,
+                    endpoints: vec![subc_transport::connection_file::Endpoint {
+                        host: "127.0.0.1".into(),
+                        port: listener.local_addr().unwrap().port(),
+                    }],
+                    key: key.clone(),
+                    daemon_id,
+                    pid: std::process::id(),
+                    daemon_ver: "isolation".into(),
+                },
             )
-        })
-        .collect();
-    assert!(
-        unpinned.is_empty(),
-        "these spawns of broca could write into the operator's real state root. Each must set \
-         BROCA_STATE_ROOT, or pin XDG_DATA_HOME AND env_remove(\"BROCA_STATE_ROOT\"), or \
-         env_clear(). If the program is not broca at all, add it to NOT_BROCA with the \
-         reason:\n  {}",
-        unpinned.join("\n  ")
-    );
-
-    // NON-VACUITY: the scan must actually have reached the rigs known to spawn broca, or a
-    // broken walk or marker list would pass this with nothing checked.
-    for expected in [
-        "crates/broca-module-serve/tests/it/provider_override_boot.rs",
-        "crates/broca-module-serve/tests/it/wal_known_features.rs",
-        "crates/broca-module-serve/tests/launch_nonce.rs",
-        "crates/broca-module-serve/tests/it/launch_nonce_e2e.rs",
-        "crates/broca-module-serve/tests/it/seal_line_is_filterable_e2e.rs",
-        "crates/broca-module-serve/tests/it/single_turn_module_e2e.rs",
-        "crates/broca-module-serve/tests/it/captured_replay_e2e.rs",
-        "crates/broca-module-serve/tests/it/state_root_isolation.rs",
-        "crates/ck-import/tests/it/real_module_e2e.rs",
-    ] {
-        assert!(
-            sites.iter().any(|site| site.file == Path::new(expected)),
-            "the guard checked no spawn site in {expected}; its scan has stopped reaching the \
-             rigs it exists for"
-        );
+            .unwrap();
+            // Authentication lets boot reach its storage initialization. The stand-in
+            // offers no modules or providers, so it cannot authorize any application work.
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                subc_transport::authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "isolation",
+                    broca_test_support::STAND_IN_AUTH_DEADLINE,
+                )
+                .await
+                .unwrap();
+                while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
+                    let (ty, body) = match frame.header.ty {
+                        subc_protocol::FrameType::Request => (subc_protocol::FrameType::Error,
+                            br#"{"code":"unknown_method","message":"no services in the isolation stand-in"}"#.to_vec()),
+                        subc_protocol::FrameType::Ping => (subc_protocol::FrameType::Pong, vec![]),
+                        _ => continue,
+                    };
+                    let reply = subc_protocol::Frame::build(
+                        ty,
+                        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        body,
+                    )
+                    .unwrap();
+                    if subc_transport::write_frame(&mut stream, &reply)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let binary =
+                broca_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-broca"), &machine.0);
+            let mut command: tokio::process::Command = match wrapper {
+                "command" => std::process::Command::new(&binary).into(),
+                "ckdev_command" => broca_test_support::ckdev_command(&binary, &machine.0).into(),
+                "rig_command" => broca_test_support::rig_command(&binary, &machine.0, "isolation")
+                    .unwrap()
+                    .into(),
+                "tokio_rig_command" => {
+                    broca_test_support::tokio_rig_command(&binary, &machine.0, "isolation").unwrap()
+                }
+                _ => unreachable!(),
+            };
+            let inherited = machine.0.join("inherited-state");
+            let home = machine.0.join("hostile-home");
+            command
+                .arg("--subc")
+                .arg(machine.connection_file())
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_DATA_HOME", machine.0.join("data"))
+                .env("LOCALAPPDATA", machine.0.join("data"))
+                .env("XDG_CONFIG_HOME", machine.0.join("config"))
+                .env("APPDATA", machine.0.join("config"))
+                .env_remove("BROCA_CONFIG_PATH")
+                .env_remove("SUBC_LAUNCH_NONCE")
+                .env_remove("SUBC_LAUNCH_NONCE_FD")
+                .env("SUBC_MODULE_ID", "broca")
+                .env("BROCA_STATE_ROOT", &inherited)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::fs::File::create(machine.0.join("boot.stdout.log")).unwrap())
+                .stderr(std::fs::File::create(machine.0.join("boot.stderr.log")).unwrap())
+                .kill_on_drop(true)
+                .current_dir(machine.0.join("cwd"));
+            if explicit {
+                command.env("BROCA_STATE_ROOT", machine.new_root());
+            } else {
+                command.env_remove("BROCA_STATE_ROOT");
+            }
+            let mut child = command.spawn().unwrap();
+            broca_test_support::wait_until("isolated child storage initialization", || async {
+                if machine
+                    .new_root()
+                    .join("media-uploads/uploads.lock")
+                    .is_file()
+                {
+                    Ok(())
+                } else {
+                    Err(std::fs::read_to_string(machine.0.join("boot.stderr.log"))
+                        .unwrap_or_default())
+                }
+            })
+            .await;
+            for directory in ["leases", "wal-durable", "wal-archive-durable"] {
+                assert!(
+                    machine.new_root().join(directory).is_dir(),
+                    "{wrapper}: missing {directory}"
+                );
+            }
+            let logs = machine.new_root().join("logs");
+            let names: Vec<_> = std::fs::read_dir(&logs)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name.to_string_lossy().starts_with("stall-")),
+                "{wrapper} did not write its state-root log: {names:?}"
+            );
+            assert!(
+                !inherited.exists(),
+                "{wrapper} used the inherited state root"
+            );
+            assert!(!home.exists(), "{wrapper} wrote under the default home");
+            assert!(
+                !machine.legacy_root().exists(),
+                "{wrapper} used the connection-relative root"
+            );
+            assert_eq!(std::fs::read_dir(machine.0.join("cwd")).unwrap().count(), 0);
+            child.kill().await.unwrap();
+            server.abort();
+            exercised.insert((wrapper, explicit));
+        }
     }
+    assert_eq!(
+        exercised.len(),
+        8,
+        "all four wrappers must run both root-selection policies"
+    );
 }

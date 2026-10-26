@@ -19,6 +19,7 @@ test-io-trace = []
 [dependencies]
 broca-owner-only.workspace = true
 broca-protocol = { path = "../broca-protocol" }
+broca-wal-reader = { path = "../broca-wal-reader", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

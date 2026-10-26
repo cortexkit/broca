@@ -19,11 +19,8 @@
 //! upstream passthrough. It cannot prove `raw` is unread elsewhere, and it is not trying to —
 //! reading `raw` during ingestion is fine, and the render path already cannot see a spec at all.
 //!
-//! On its non-vacuity, stated precisely because the obvious mutation does not work. Adding a
-//! `raw` field to `FrozenRenderConfig` does not compile: sixteen construction sites must name
-//! every field, so the change fails at the compiler before this test runs. That is a stronger
-//! guard than this file and it is worth knowing it exists — but a mutation that does not compile
-//! is not a caught mutation, so it does not demonstrate that this test discriminates.
+//! Adding a `raw` field to `FrozenRenderConfig` also requires updating every construction site;
+//! otherwise the compiler rejects the change before this test runs.
 //!
 //! What this test covers is the case the compiler does not: a widening that goes through, where
 //! every site is updated and the value flows in from a spec. The compiler is satisfied and the

@@ -2409,9 +2409,10 @@ fn joint_exchanges() -> Value {
     serde_json::from_slice(&std::fs::read(root.join("exchanges.json")).unwrap()).unwrap()
 }
 
-#[test]
-fn joint_fixture_has_seven_ordered_cases_and_extensible_unknown_refusal() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_mc_compaction_client_uses_isolated_daemon_and_joint_setup() {
     use broca_core::compaction_provider::setup::SetupAnswer;
+    use broca_core::CompactionPlane;
     let cases = joint_exchanges();
     let names: Vec<_> = cases
         .as_array()
@@ -2443,11 +2444,6 @@ fn joint_fixture_has_seven_ordered_cases_and_extensible_unknown_refusal() {
     assert_eq!(code.as_str(), "future_provider_reason");
     assert!(!code.retryable());
     assert_eq!(provider_code.as_deref(), Some("joint_unknown_control"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_mc_compaction_client_uses_isolated_daemon_and_joint_setup() {
-    use broca_core::CompactionPlane;
     // Magic Context is another module's build, which neither the gate nor CI provides, so it has
     // its own requirement switch: BROCA_REQUIRE_MC=1 makes a missing build fail instead of skip.
     let mc = std::env::var_os("MAGIC_CONTEXT_BIN").map(std::path::PathBuf::from);
@@ -2496,7 +2492,6 @@ async fn real_mc_compaction_client_uses_isolated_daemon_and_joint_setup() {
             .await
             .unwrap(),
     );
-    let cases = joint_exchanges();
     let bind = broca_protocol::BindIdentity::new(&rig.dir, "broca", "alfonso:joint");
     // A published daemon connection does not mean its supervised MC module is live.
     // The shared route-open policy retries only typed readiness refusals and preserves

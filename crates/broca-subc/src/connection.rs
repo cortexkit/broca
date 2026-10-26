@@ -59,7 +59,7 @@ const PROBE_EGRESS_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// Pinned by `bind_relay_grace_covers_the_daemon_relay_window` because the behavioural tests
 /// INJECT their own grace to compress timeouts, so they prove the mechanism and cannot see this
-/// number drift. Verified by mutation: setting this to zero leaves every behavioural arm green.
+/// number drift.
 const ROUTE_OPEN_BIND_RELAY_GRACE: Duration = Duration::from_secs(12);
 /// How long past the daemon's bind-relay bound a route.open reply may still take to reach us: the
 /// daemon's own bookkeeping after the module answers `route.bind`, the reply's trip through its
@@ -4192,9 +4192,7 @@ mod tests {
     }
 
     /// The behavioural grace tests inject their own window to compress timeouts, so they prove
-    /// the MECHANISM and are blind to the shipped VALUE. Found by mutation: setting the constant
-    /// to zero left all four probe arms green, which is the shape where a guard stays intact
-    /// while the number that arms it drifts.
+    /// the mechanism and are blind to the shipped value.
     ///
     /// The relations, not the literals, are what matter. The grace must cover the daemon's
     /// relay window, so a caller that abandons a route.open early cannot get a healthy socket

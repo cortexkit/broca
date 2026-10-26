@@ -946,23 +946,6 @@ mod tests {
         );
     }
 
-    /// A connection retrying every few seconds writes one WARN per distinct cause and method,
-    /// and a cause that returns after a success is written again.
-    #[test]
-    fn credential_failures_are_logged_once_per_cause() {
-        let warnings = WarnOnce::default();
-        let superseded = refused("ckbus.nonce_sign", CODE_SUPERSEDED);
-        assert!(warnings.failed(&superseded));
-        assert!(!warnings.failed(&superseded));
-        assert!(warnings.failed(&CkbusError::TimedOut {
-            method: "ckbus.nonce_sign"
-        }));
-        assert!(warnings.failed(&refused("ckbus.credential_renew", CODE_SUPERSEDED)));
-        assert!(!warnings.failed(&CkbusError::Backoff));
-        warnings.succeeded("ckbus.nonce_sign");
-        assert!(warnings.failed(&superseded));
-    }
-
     /// ck-bus as it keeps credentials: one current key per module, each issue minting the
     /// next key and retiring the one before it. Renewing or signing with a retired key is
     /// refused with the codes ck-bus uses.

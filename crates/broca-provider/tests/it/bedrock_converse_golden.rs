@@ -122,7 +122,8 @@ const GOLDEN_VERSION: &str =
 fn bedrock_converse_render_matches_golden_unsigned_body() {
     let frozen =
         bedrock_frozen_config_with_region("anthropic.claude-3-5-sonnet-20240620-v1:0", "us-west-2");
-    let bytes = BedrockConverse.render(&frozen, &fixed_request());
+    let bytes =
+        render_golden_support::render_without_bundle(&BedrockConverse, &frozen, &fixed_request());
     let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
 
     if render_golden_support::update_if_requested(
