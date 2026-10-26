@@ -29394,8 +29394,8 @@ select = "expected"
 test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
 expect_red = ["memory_private_unknown_provider_is_not_dispatched"]
 file = "crates/broca-module-serve/src/llm_tools/route.rs"
-old = "        if stored.is_none() {\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
-new = "        if stored.is_none() && admission.provider == \"never-a-provider\" { // NON-VACUITY BREAK: skip the policy for a fresh call.\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
+old = "        if stored.is_none() && held.is_none() {\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
+new = "        if stored.is_none() && held.is_none() && admission.provider == \"never-a-provider\" { // NON-VACUITY BREAK: skip the policy for a fresh call.\n            self.private_content\n                .admit(scope, &admission.provider)\n                .await?;"
 
 [[control]]
 id = "llm-tool-single-flight-joins-waiters"
@@ -29471,9 +29471,9 @@ target = "--test llm_tools_route"
 select = "expected"
 test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
 expect_red = ["memory_late_results_refuse_foreign_and_future_cursors"]
-file = "crates/broca-module-serve/src/llm_tools/route.rs"
-old = "if !since.is_null()"
-new = "if false && !since.is_null() // NON-VACUITY BREAK: accept an invalid late-read cursor."
+file = "crates/broca-module-serve/src/llm_tools/held.rs"
+old = "if let Some(cursor) = &request.since {"
+new = "if let Some(cursor) = request.since.as_ref().filter(|_| false) { // NON-VACUITY BREAK: accept an invalid late-read cursor."
 
 [[control]]
 id = "llm-tool-late-ack-cursor-fence"
@@ -29484,9 +29484,9 @@ target = "--test llm_tools_route"
 select = "expected"
 test_file = "crates/broca-module-serve/tests/llm_tools_route.rs"
 expect_red = ["memory_late_results_refuse_foreign_and_future_cursors"]
-file = "crates/broca-module-serve/src/llm_tools/route.rs"
-old = "if through[\"provider_incarnation\"] != crate::serve::process_launch_id()"
-new = "if false && through[\"provider_incarnation\"] != crate::serve::process_launch_id() // NON-VACUITY BREAK: accept foreign acknowledgement cursors."
+file = "crates/broca-module-serve/src/llm_tools/held.rs"
+old = "        self.check_cursor(\n            &request.through,\n            self.store.late_head(&principal).map_err(internal)?,\n            &principal,\n        )?;"
+new = "        let _ = &request.through; // NON-VACUITY BREAK: accept foreign acknowledgement cursors."
 
 [[control]]
 id = "llm-tool-requires-daemon-stamp"
@@ -31026,3 +31026,315 @@ expect_message = "rig processes survived unwinding drop"
 file = "crates/broca-module-serve/tests/llm_tools_private_content.rs"
 old = "            let cleanup = cleanup_recorded_processes(&self.root);"
 new = "            let cleanup: std::io::Result<()> = Ok(()); // NON-VACUITY BREAK: leave recorded rig descendants running."
+
+[[control]]
+id = "llm-held-admission-deadline"
+guards = "Each held call has a ten-minute deadline fixed at its own admission"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["joining_replacement_and_restart_never_extend_individual_deadlines"]
+file = "crates/broca-store/src/grants.rs"
+old = "request.admitted_at_ms.saturating_add(HOLD_MS)"
+new = "request.admitted_at_ms.saturating_add(HOLD_MS + 60_000) /* NON-VACUITY BREAK: extend the first deadline. */"
+
+[[control]]
+id = "llm-held-replacement-preserves-deadline"
+guards = "Replacing a consent card never resets any joined call's deadline"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["joining_replacement_and_restart_never_extend_individual_deadlines"]
+file = "crates/broca-store/src/grants.rs"
+old = "row.card_id = card.card_id.clone();"
+new = "row.card_id = card.card_id.clone(); row.deadline_at_ms += HOLD_MS; // NON-VACUITY BREAK: refile extends the deadline."
+
+[[control]]
+id = "llm-held-authorization-source-cas"
+guards = "Only held calls can win authorization, and only once"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["authorization_cas_survives_restart_and_late_deadline"]
+file = "crates/broca-store/src/grants.rs"
+old = "if row.state != HeldState::Held || now_ms >= row.deadline_at_ms {"
+new = "if now_ms >= row.deadline_at_ms { // NON-VACUITY BREAK: authorize an already authorized call."
+
+[[control]]
+id = "llm-held-authorization-deadline-cas"
+guards = "An unstarted call cannot gain authorization at or after its deadline"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["deadline_cas_prevents_late_authorization_and_double_settlement"]
+file = "crates/broca-store/src/grants.rs"
+old = "if row.state != HeldState::Held || now_ms >= row.deadline_at_ms {"
+new = "if row.state != HeldState::Held { // NON-VACUITY BREAK: authorize after the deadline."
+
+[[control]]
+id = "llm-held-authorized-never-unstarted"
+guards = "A denied or unavailable consent outcome cannot overwrite an authorized attempt"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["authorization_cas_survives_restart_and_late_deadline"]
+file = "crates/broca-store/src/grants.rs"
+old = "HeldState::Filing | HeldState::Held)"
+new = "HeldState::Filing | HeldState::Held | HeldState::Authorized) /* NON-VACUITY BREAK: consent can cancel dispatched work. */"
+
+[[control]]
+id = "llm-held-authorized-never-times-out"
+guards = "A stored deadline can settle only held calls, never authorized work after restart"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["authorization_cas_survives_restart_and_late_deadline"]
+file = "crates/broca-store/src/grants.rs"
+old = "if row.state != HeldState::Held || now_ms < row.deadline_at_ms {"
+new = "if now_ms < row.deadline_at_ms { // NON-VACUITY BREAK: expire authorized work."
+
+[[control]]
+id = "llm-held-final-request-purge"
+guards = "Final held-call rows clear request content while keeping the replay digest"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["retention_clears_request_keeps_digest_and_ack_does_not_shorten_replay"]
+file = "crates/broca-store/src/grants.rs"
+old = "row.request = None;"
+new = "row.request = row.request.take(); // NON-VACUITY BREAK: retain private request content."
+
+[[control]]
+id = "llm-held-args-digest-reuse"
+guards = "A held key with changed arguments cannot join the original admission"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["hold_replay_checks_identity_and_digest_without_changing_first_admission"]
+file = "crates/broca-store/src/grants.rs"
+old = "} else if row.args_digest != request.args_digest {"
+new = "} else if false && row.args_digest != request.args_digest { // NON-VACUITY BREAK: join changed arguments."
+
+[[control]]
+id = "llm-held-late-feed-principal"
+guards = "A caller reads only its own held-call results, even under a shared raw call key"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["two_principals_restart_authorize_and_deliver_under_raw_keys"]
+file = "crates/broca-store/src/grants.rs"
+old = "WHERE l.principal=?1 AND l.seq>?2"
+new = "WHERE ?1 IS NOT NULL /* NON-VACUITY BREAK: expose another caller's results. */ AND l.seq>?2"
+
+[[control]]
+id = "llm-held-late-ack-principal"
+guards = "Acknowledging one caller's feed never removes another caller's delivery"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["two_principals_restart_authorize_and_deliver_under_raw_keys"]
+file = "crates/broca-store/src/grants.rs"
+old = "DELETE FROM late_results WHERE principal=?1 AND seq<=?2"
+new = "DELETE FROM late_results WHERE ?1 IS NOT NULL /* NON-VACUITY BREAK: acknowledge all callers. */ AND seq<=?2"
+
+[[control]]
+id = "llm-held-late-retention-anchor"
+guards = "Unacknowledged late delivery expires seven days after admission, not settlement"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["unacknowledged_delivery_expires_at_admission_not_settlement"]
+file = "crates/broca-store/src/grants.rs"
+old = "row.admitted_at_ms.saturating_add(RETENTION_MS)"
+new = "now_ms.saturating_add(RETENTION_MS) /* NON-VACUITY BREAK: restart retention at settlement. */"
+
+[[control]]
+id = "llm-held-physical-retention-anchor"
+guards = "Held-call replay rows are physically deleted at seven days from admission"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["retention_clears_request_keeps_digest_and_ack_does_not_shorten_replay"]
+file = "crates/broca-store/src/grants.rs"
+old = "DELETE FROM held_calls WHERE admitted_at_ms<=?1"
+new = "DELETE FROM held_calls WHERE deadline_at_ms<=?1 /* NON-VACUITY BREAK: retain replay past admission expiry. */"
+
+[[control]]
+id = "llm-held-recovery-admission-anchor"
+guards = "Execution of authorized held work keeps the original admission for batch retention"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["authorized_recovery_executes_frozen_request_after_deadline_and_preserves_retention_anchor"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "let admitted_at = held.as_ref().map(|row| row.admitted_at_ms);"
+new = "let admitted_at = held.as_ref().map(|_| service.system.tool_now()); // NON-VACUITY BREAK: reanchor delayed execution."
+
+[[control]]
+id = "llm-held-answer-first-decision"
+guards = "Replaying a settled card cannot recreate a revoked grant or apply a conflicting deny"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["answer_page_is_atomic_first_decision_wins_and_revoke_survives_replay"]
+file = "crates/broca-store/src/grants.rs"
+old = "if matches!(card.state, CardState::Allowed | CardState::Denied) {"
+new = "if false && matches!(card.state, CardState::Allowed | CardState::Denied) { /* NON-VACUITY BREAK: reapply settled cards. */"
+
+[[control]]
+id = "llm-held-late-run-allow"
+guards = "An ended or unknown run never gains a late run-only grant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["run_answers_are_epoch_scoped_and_late_run_allow_cannot_mint"]
+file = "crates/broca-store/src/grants.rs"
+old = "if !run || answer.run_live {"
+new = "if true || !run || answer.run_live { // NON-VACUITY BREAK: mint a grant for an ended run."
+
+[[control]]
+id = "llm-held-cursor-incarnation"
+guards = "A restarted provider refuses cursors from the previous incarnation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["late_cursor_validation_pagination_and_restart_event_identity"]
+file = "crates/broca-module-serve/src/llm_tools/held.rs"
+old = "if cursor.provider_incarnation != self.caller_incarnation(principal) || cursor.seq > head {"
+new = "if cursor.seq > head { // NON-VACUITY BREAK: accept another incarnation's cursor."
+
+[[control]]
+id = "llm-held-scope-reuse"
+guards = "A held key cannot move to another scope epoch"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["hold_replay_checks_identity_and_digest_without_changing_first_admission"]
+file = "crates/broca-store/src/grants.rs"
+old = "if row.scope != request.scope"
+new = "if false && row.scope != request.scope /* NON-VACUITY BREAK: join another scope epoch. */"
+
+[[control]]
+id = "llm-held-late-raw-key"
+guards = "Late results correlate by the consumer's raw key, never the derived storage key"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["two_principals_restart_authorize_and_deliver_under_raw_keys"]
+file = "crates/broca-module-serve/src/llm_tools/held.rs"
+old = '"custodian":row.principal, "call_key":row.call_key,'
+new = '"custodian":row.principal, "call_key":row.batch_id, /* NON-VACUITY BREAK: deliver the storage key. */'
+
+[[control]]
+id = "llm-held-route-replay-digest"
+guards = "Held and denied replays reject changed arguments before catalog or policy lookup"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["held_and_final_replay_precede_catalog_and_keep_original_bytes"]
+file = "crates/broca-module-serve/src/llm_tools/held.rs"
+old = "if digest != row.args_digest {"
+new = "if false && digest != row.args_digest { // NON-VACUITY BREAK: replay changed arguments."
+
+[[control]]
+id = "llm-held-permanent-error-settlement"
+guards = "An authorized permanent model failure is retained as a final result, not left authorized"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["authorized_permanent_failure_is_final_replayed_and_delivered_as_result"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = 'if value["detail"]["class"] == "permanent" {'
+new = 'if false && value["detail"]["class"] == "permanent" { // NON-VACUITY BREAK: leave a terminal model failure authorized.'
+
+[[control]]
+id = "llm-held-route-replay-batch-scope"
+guards = "Held and final replay also preserve the run or flow attribution within a stamped identity"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["held_and_final_replay_precede_catalog_and_keep_original_bytes"]
+file = "crates/broca-module-serve/src/llm_tools/held.rs"
+old = "|| row.batch_scope != admission.scope"
+new = "|| false && row.batch_scope != admission.scope /* NON-VACUITY BREAK: replay another run's held call. */"
+
+[[control]]
+id = "llm-held-reused-key-event-identity"
+guards = "A key reused after retention is new work, not a duplicate of its old late result"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["expired_key_reuse_gets_a_new_late_event_identity"]
+file = "crates/broca-module-serve/src/llm_tools/held.rs"
+old = '"event_id":format!("llm.classify:{}:{}",row.batch_id,row.admitted_at_ms),'
+new = '"event_id":format!("llm.classify:{}",row.batch_id), /* NON-VACUITY BREAK: deduplicate new work as an old result. */'
+
+[[control]]
+id = "llm-held-retention-is-seven-days"
+guards = "Held-call retention is independently checked against seven days, not the implementation constant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["retention_clears_request_keeps_digest_and_ack_does_not_shorten_replay"]
+file = "crates/broca-store/src/grants.rs"
+old = "pub const RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;"
+new = "pub const RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000; // NON-VACUITY BREAK: keep private rows for eight days."
+
+[[control]]
+id = "llm-held-frozen-request-bytes"
+guards = "An authorized retry executes the stored validated request, not a canonically equal re-encoding"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_held"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_held.rs"
+expect_red = ["authorized_replay_uses_first_admitted_request_bytes"]
+file = "crates/broca-module-serve/src/llm_tools/route.rs"
+old = "admission.params.clone_from(params);"
+new = "let _ = params; // NON-VACUITY BREAK: execute the retry's re-encoded request."

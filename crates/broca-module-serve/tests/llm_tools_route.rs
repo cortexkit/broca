@@ -512,19 +512,27 @@ async fn reported_overrun_is_returned_and_missing_input_cost_is_a_durable_failur
     assert!(unknown.get("cost_usd").is_none());
 }
 
+/// SIGKILL the broca module the rig daemon supervises, found through the daemon's live-child
+/// roster in this rig's own data home. The late-results cursor can't name the process: its
+/// incarnation is a hash of the process's launch nonce and the caller's principal.
 #[cfg(unix)]
-async fn kill_broca(route: &Route) {
-    let late: Value = serde_json::from_slice(
-        &route
-            .request("late_results", json!({"since":null}), None)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let incarnation = late["cursor"]["provider_incarnation"].as_str().unwrap();
-    let pid = incarnation.split('-').next().unwrap();
+async fn kill_broca(rig: &Rig) {
+    let roster = rig.root.join("data/cortexkit/run/live-children.json");
+    let record: Value = serde_json::from_slice(&std::fs::read(&roster).unwrap()).unwrap();
+    let pid = record["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["module_id"] == "broca")
+        .and_then(|child| child["pid"].as_u64())
+        .expect("the rig daemon supervises a live broca");
+    sigkill(u32::try_from(pid).unwrap());
+}
+
+#[cfg(unix)]
+fn sigkill(pid: u32) {
     assert!(std::process::Command::new("kill")
-        .args(["-KILL", pid])
+        .args(["-KILL", &pid.to_string()])
         .status()
         .unwrap()
         .success());
@@ -551,7 +559,7 @@ async fn replay_precedes_catalog_and_pricing_across_real_process_restarts() {
                 .remove("rate.input");
         }
         std::fs::write(path, catalog.to_string()).unwrap();
-        kill_broca(&route).await;
+        kill_broca(&rig).await;
         route = rig.open(true, false).await;
         assert_eq!(route.call(args(), Some("frozen")).await.unwrap(), first);
         assert_eq!(rig.calls(), 1);
@@ -581,7 +589,7 @@ async fn provider_answer_crash_cut_retries_once_and_stores_one_outcome_and_fact(
     assert_eq!(rig.calls(), 1);
     assert!(rows(&rig.state.join("system-one.db"), "item_outcome").is_empty());
     assert!(rows(&rig.state.join("run-index.db"), "export_facts").is_empty());
-    kill_broca(&route).await;
+    kill_broca(&rig).await;
     caller.abort();
     let restarted = rig.open(true, false).await;
     let answer = restarted.call(args(), Some("cut")).await.unwrap();
@@ -592,7 +600,7 @@ async fn provider_answer_crash_cut_retries_once_and_stores_one_outcome_and_fact(
     );
     let facts = rows(&rig.state.join("run-index.db"), "export_facts");
     assert_eq!(facts.len(), 1);
-    kill_broca(&restarted).await;
+    kill_broca(&rig).await;
     let again = rig.open(true, false).await;
     assert_eq!(again.call(args(), Some("cut")).await.unwrap(), answer);
     assert_eq!(rig.calls(), 2);
@@ -640,7 +648,7 @@ async fn another_process_claim_returns_transient_without_writes() {
     else {
         return;
     };
-    let _owner_process = rig.spawn_peer("broca-owner-process");
+    let owner_process = rig.spawn_peer("broca-owner-process");
     let first = Arc::new(rig.open_to("broca-owner-process", true, false).await);
     rig.provider
         .blocked
@@ -669,7 +677,8 @@ async fn another_process_claim_returns_transient_without_writes() {
     assert_eq!(error["detail"]["retry_after_ms"], 1000);
     assert_eq!(artifacts(&rig), before);
     executing.abort();
-    kill_broca(&first).await;
+    // The claim belongs to the peer broca the first route reached, not the daemon's own module.
+    sigkill(owner_process.id().expect("the owner peer is running"));
     let recovery = broca_store::SystemOneStore::open(rig.state.join("system-one.db")).unwrap();
     broca_test_support::wait_until("dead owner lifetime lock release", || async {
         match recovery.release_abandoned().unwrap() {
@@ -706,12 +715,13 @@ async fn effective_subscription_override_is_unpriceable() {
     let Some(rig) = Rig::start("subscription", true, true, Some(42_000_000), 0, false).await else {
         return;
     };
-    let route = rig.open(true, false).await;
+    // Open a route first so broca is serving before it is killed and restarted.
+    let _serving = rig.open(true, false).await;
     let path = rig.root.join("config/cortexkit/broca.jsonc");
     let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     config["charge_basis"] = json!({"typesafe:apikey":"subscription_included"});
     std::fs::write(path, config.to_string()).unwrap();
-    kill_broca(&route).await;
+    kill_broca(&rig).await;
     let restarted = rig.open(true, false).await;
     refused_without_writes(&rig, &restarted, args(), "subscription", "cost_unpriceable").await;
 }
