@@ -151,11 +151,13 @@ fn replay_for_attach(
     records: Vec<broca_wal::FramedRecord>,
     h: u64,
     from: AttachFrom,
+    lineage: Option<broca_wal::WalLineageId>,
 ) -> Result<AttachReplay, String> {
     let durable_prefix: Vec<broca_wal::FramedRecord> =
         records.into_iter().filter(|f| f.seq <= h).collect();
     let seeded_h = durable_prefix.last().map_or(0, |record| record.seq);
     let mut state = ControlProjectionState::default();
+    state.set_wal_lineage_id(lineage);
     Ok(match from {
         // Live uses the existing strictly-after comparison once the barrier has projected H.
         // An empty lineage has no cursor to resume after, but Start is equivalent because its
@@ -768,6 +770,7 @@ async fn projector_loop(
                 deferred_gate_seed = None;
                 covered_head = covered_head.max(seed.head);
                 for framed in std::mem::take(&mut buffered).into_iter().filter(|record| record.seq > seed.head) {
+                    projection_state.set_wal_lineage_id(framed.lineage_id());
                     let events = match project_events(
                         std::slice::from_ref(&*framed),
                         &mut projection_state,
@@ -803,6 +806,7 @@ async fn projector_loop(
                         if framed.seq <= covered_head {
                             continue;
                         }
+                        projection_state.set_wal_lineage_id(framed.lineage_id());
                         let events = match project_events(
                             std::slice::from_ref(&*framed),
                             &mut projection_state,
@@ -883,6 +887,7 @@ async fn try_live_projection_seed<W: WalStore + 'static>(
             .read_records_range_from_valid_anchor(&session, seed.watermark_seq, Some(h), anchor)
             .ok()
             .flatten()?;
+        state.set_wal_lineage_id(range.lineage_id);
         let records = match range.records() {
             broca_wal::WalRangeRecords::Complete(records)
             | broca_wal::WalRangeRecords::Partial(records)
@@ -959,10 +964,10 @@ async fn subscriber_task<W: WalStore + 'static>(
         // returns committed (fsynced) records; HARD-FILTER seq <= H so a concurrent append of
         // seq > H during the read is excluded, keeping the read prefix-consistent at H.
         // Advisory display replay is snapshotted separately after durable control replay.
-        let records = match spawn_blocking(JobKind::WalRead, {
+        let (records, lineage) = match spawn_blocking(JobKind::WalRead, {
             let wal_store = wal_store.clone();
             let session = session.clone();
-            move || wal_store.read_records(&session)
+            move || wal_store.read_records_with_lineage(&session)
         })
         .await
         {
@@ -1001,7 +1006,7 @@ async fn subscriber_task<W: WalStore + 'static>(
             units: replay,
             ..
         } = match spawn_blocking(JobKind::Projection, move || {
-            replay_for_attach(records, h, from)
+            replay_for_attach(records, h, from, lineage)
         })
         .await
         {
@@ -1484,6 +1489,7 @@ mod tests {
             records.clone(),
             h,
             AttachFrom::Cursor(FromCursor::After(cursor)),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1502,7 +1508,7 @@ mod tests {
             full.len()
         );
 
-        let live = replay_for_attach(records.clone(), h, AttachFrom::Live).unwrap();
+        let live = replay_for_attach(records.clone(), h, AttachFrom::Live, None).unwrap();
         assert_eq!(
             live.built, 0,
             "a live attach delivers no replay and builds none"
@@ -1512,12 +1518,20 @@ mod tests {
         assert!(matches!(live.from, FromCursor::After(last) if last == full.last().unwrap().0));
 
         let from_start =
-            replay_for_attach(records, h, AttachFrom::Cursor(FromCursor::Start)).unwrap();
+            replay_for_attach(records, h, AttachFrom::Cursor(FromCursor::Start), None).unwrap();
         assert_eq!(from_start.units, full);
     }
 
     fn state_through(records: &[FramedRecord]) -> ControlProjectionState {
+        state_through_with_lineage(records, None)
+    }
+
+    fn state_through_with_lineage(
+        records: &[FramedRecord],
+        lineage: Option<broca_wal::WalLineageId>,
+    ) -> ControlProjectionState {
         let mut state = ControlProjectionState::default();
+        state.set_wal_lineage_id(lineage);
         let _ = project_control_with_state(records, &mut state);
         state
     }
@@ -1745,8 +1759,10 @@ mod tests {
         )
         .await
         .expect("valid seed and suffix use the fast path");
-        let full_records = wal_store.read_records(&session).expect("read full oracle");
-        let full_state = state_through(&full_records);
+        let (full_records, lineage) = wal_store
+            .read_records_with_lineage(&session)
+            .expect("read full oracle");
+        let full_state = state_through_with_lineage(&full_records, lineage);
         assert_eq!(
             fast_state, full_state,
             "seed plus suffix must equal full replay at H"
@@ -1896,12 +1912,15 @@ mod tests {
                 .expect("real store seed uses the fast path");
         assert_eq!(
             recovered,
-            state_through(match full_range.records() {
-                broca_wal::WalRangeRecords::Complete(records)
-                | broca_wal::WalRangeRecords::Partial(records)
-                | broca_wal::WalRangeRecords::Unknown(records) => records,
-                broca_wal::WalRangeRecords::Absent => &[],
-            })
+            state_through_with_lineage(
+                match full_range.records() {
+                    broca_wal::WalRangeRecords::Complete(records)
+                    | broca_wal::WalRangeRecords::Partial(records)
+                    | broca_wal::WalRangeRecords::Unknown(records) => records,
+                    broca_wal::WalRangeRecords::Absent => &[],
+                },
+                full_range.lineage_id
+            )
         );
 
         let _ = writer.shutdown().await;

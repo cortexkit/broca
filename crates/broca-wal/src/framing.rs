@@ -173,6 +173,10 @@ pub const MEDIA_CONTENT_FEATURE: &str = "media-content/v1";
 /// requires it unless a provider declared something.
 pub const PROVIDER_DECLARATIONS_FEATURE: &str = "provider-declarations/v1";
 
+/// Catalog schema identities frozen in a plan. Readers that drop the map could
+/// dispatch a resumed run without its admitted tool definition's schema pin.
+pub const TOOL_SCHEMA_PINS_FEATURE: &str = "tool-schema-pins/v1";
+
 /// The feature names this build understands in a gated frame's `requires` list.
 ///
 /// THIS IS THE ONLY TABLE. Every reader path (replay, the anchored range read behind
@@ -207,6 +211,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     PLAN_MANIFEST_FEATURE,
     PLAN_REFERENCE_SLOTS_FEATURE,
     PROVIDER_DECLARATIONS_FEATURE,
+    TOOL_SCHEMA_PINS_FEATURE,
     PROVIDER_HELD_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
     RESTART_PAUSE_FEATURE,
@@ -1081,6 +1086,7 @@ mod tests {
                 PLAN_MANIFEST_FEATURE,
                 PLAN_REFERENCE_SLOTS_FEATURE,
                 PROVIDER_DECLARATIONS_FEATURE,
+                TOOL_SCHEMA_PINS_FEATURE,
                 PROVIDER_HELD_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,
                 RESTART_PAUSE_FEATURE,
@@ -1112,6 +1118,7 @@ mod tests {
         assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
         assert_eq!(PLAN_REFERENCE_SLOTS_FEATURE, "plan-reference-slots/v1");
         assert_eq!(PROVIDER_DECLARATIONS_FEATURE, "provider-declarations/v1");
+        assert_eq!(TOOL_SCHEMA_PINS_FEATURE, "tool-schema-pins/v1");
         assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
         assert_eq!(CHATGPT_CODEX_WIRE_FEATURE, "chatgpt-codex-wire/v1");
         assert_eq!(OPENROUTER_REASONING_FEATURE, "openrouter-reasoning/v1");

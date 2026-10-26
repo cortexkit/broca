@@ -159,6 +159,8 @@ impl Step {
 /// What the provider and tool plane of the rig do, shared with the test.
 #[derive(Default)]
 pub struct Script {
+    /// A synthetic tool's catalog schema and semantics pin; absent for legacy direct tools.
+    pub schema_pin: Mutex<Option<broca_wal::DispatchSchemaPin>>,
     pub attempt_time: Mutex<Option<u64>>,
     pub hold_stream: Mutex<bool>,
     pub stream_gate: Notify,
@@ -346,6 +348,14 @@ impl ToolPlane for ScriptedTools {
     fn dispatch_target(&self, _ctx: &BatchCtx, _tool_call_id: &ToolCallId) -> Option<String> {
         Some(WORK_MODULE.into())
     }
+    fn dispatch_schema_pin(
+        &self,
+        _ctx: &BatchCtx,
+        _id: &ToolCallId,
+        _tool: &str,
+    ) -> Option<broca_wal::DispatchSchemaPin> {
+        self.0.schema_pin.lock().unwrap().clone()
+    }
 
     async fn dispatch(&self, _ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         loop {
@@ -531,6 +541,7 @@ impl RunExecutor for CoreExec {
 }
 
 pub struct Rig {
+    pub store: Arc<broca_store::SqliteStore>,
     pub dir: PathBuf,
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
@@ -648,7 +659,7 @@ impl Rig {
         let registry = Arc::new(LineageRegistry::new_with_reader(
             opener,
             wal.clone(),
-            Some(store),
+            Some(store.clone()),
         ));
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(client);
@@ -690,6 +701,7 @@ impl Rig {
         let session = BindIdentity::new(dir.join("proj"), harness, "delivery");
         let wal_path = wal.wal_path(&session);
         let mut rig = Self {
+            store,
             dir,
             reader,
             writer,
@@ -743,6 +755,29 @@ impl Rig {
     ) -> Vec<Frame> {
         self.subscribe_collect_inner(channel, params, quiet, None::<fn()>, |_| true)
             .await
+    }
+
+    /// Subscribe on a route the test already bound with its caller and scope.
+    pub async fn subscribe_collect_bound(
+        &mut self,
+        channel: u16,
+        params: serde_json::Value,
+        quiet: Duration,
+    ) -> Vec<Frame> {
+        self.corr += 1;
+        let corr = self.corr;
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&serde_json::json!({"method":"session.subscribe","params":params}))
+                .unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut self.writer, &frame).await.unwrap();
+        collect_subscription_frames_at(&mut self.reader, corr, quiet, None::<fn()>, |_| true).await
     }
 
     /// `subscribe_collect`, calling `on_attach` once the subscription's first frame arrives.

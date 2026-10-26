@@ -115,6 +115,7 @@ impl ToolPlaneConnection for Rig {
         _: Duration,
         _: Option<&str>,
         key: Option<&str>,
+        _schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.sent
             .lock()
@@ -129,6 +130,7 @@ impl ToolPlaneConnection for Rig {
         _: Duration,
         _: Option<&str>,
         args: &ApprovedArgs,
+        _schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.sent
             .lock()
@@ -213,6 +215,7 @@ fn manifest_declaring(opt_in: bool, late_results: bool) -> ToolManifest {
             )])
         }),
         late_results: late_results.then_some(true),
+        schema_pins: None,
     };
     let plan = PlanManifest {
         declarations: Vec::new(),
@@ -677,6 +680,7 @@ async fn staged_plain_key_reaches_the_real_guarded_wire_envelope() {
         Duration::from_secs(2),
         Some("preset"),
         Some("lineage:1"),
+        None,
     );
     tokio::pin!(dispatch);
     let request = tokio::select! {

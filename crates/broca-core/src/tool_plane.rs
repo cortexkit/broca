@@ -19,6 +19,7 @@
 use async_trait::async_trait;
 use broca_protocol::{BindIdentity, RunId, SessionScope};
 use broca_protocol::{ToolCall, ToolCallId, ToolResult};
+pub use broca_wal::DispatchSchemaPin;
 
 use crate::capability::ToolManifest;
 
@@ -338,6 +339,17 @@ pub trait ToolPlane: Send + Sync {
     /// reports as the call's `dispatched_to`. Asked after `batch_started` and before the intent
     /// is written, so it must answer from state `batch_started` already settled.
     fn dispatch_target(&self, _ctx: &BatchCtx, _tool_call_id: &ToolCallId) -> Option<String> {
+        None
+    }
+
+    /// The provider definition frozen for this call. In-process and legacy
+    /// non-plan tools have no catalog semantics to report, so their pin is unknown.
+    fn dispatch_schema_pin(
+        &self,
+        _ctx: &BatchCtx,
+        _tool_call_id: &ToolCallId,
+        _tool: &str,
+    ) -> Option<broca_wal::DispatchSchemaPin> {
         None
     }
 

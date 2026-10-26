@@ -1423,6 +1423,15 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if matches!(self, WalRecord::RunStarted { manifest: Some(manifest), .. }
+            if manifest.fetches.iter().any(|fetch| matches!(&fetch.outcome,
+                FetchOutcome::Answered { declarations_frozen: Some(declarations), .. }
+                    if declarations.schema_pins.is_some())))
+        {
+            with_feature(base, crate::framing::TOOL_SCHEMA_PINS_FEATURE)
+        } else {
+            base
+        };
         let identity_digest = match self {
             WalRecord::RunStarted {
                 request_identity_digest,

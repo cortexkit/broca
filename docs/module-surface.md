@@ -249,11 +249,11 @@ permission the next send actually has. This does not tighten or otherwise change
 
 Tool, step-transform and compaction plan items may omit `preset`. Broca preserves the omission
 on catalog, declaration and compaction calls; it never substitutes an empty string. An explicit
-`"worker"` tool preset still requires scope. **System-text items still require a preset**:
-tool-provider 0.10.4 defines `system_text: {preset, params}` and has no default selector. A
-preset-less system-text item is refused before fetching or writing as `invalid_params`, naming
-`plan.system_text_items[index].preset`, rather than sending a shape the provider contract cannot
-express. A preset-less step declaration refused by its provider keeps the provider's code,
+`"worker"` tool preset still requires scope. A runner declaring `system_text_default` also accepts
+a preset-less system-text item, but forwards it only when that provider's daemon catalog entry
+declares `system-text-default/v1`. Otherwise admission refuses `system_text_preset_required`
+with the provider named, before forwarding or writing. The resolved text is frozen at admission,
+just like preset-selected text. A preset-less step declaration refused by its provider keeps the provider's code,
 message and field; it does not invent a `preset_missing` difference for a nonexistent name.
 
 ### Health counters and per-request diagnostics
@@ -1539,3 +1539,39 @@ Classed records require the must-understand WAL feature `session-class/v1`.
 A `v0.3.205` reader refuses those records by feature name; unclassed records retain
 their old bytes and remain readable. The reader, writer and capability ship
 together, with no writer switch or second rollout release.
+
+## External session and call identities
+
+New external session references use the llm-runner v2 derivation over
+`{runner: "broca", harness, session}`. Folder spelling is not part of that reference.
+The WAL address, lease and store identity remain the full
+`(project_root, harness, session)` triple. At startup, broca maps v2 references to
+their sessions and continues to accept the older folder-based v1 references. A v2
+reference shared by multiple roots is ambiguous and does not resolve to an arbitrary
+session. Queued events keep the reference from their body; their publication headers
+carry that same reference. Provider conversation IDs remain scoped
+to the full triple and are not the external session references described above.
+
+With `call_identity`, display-history tool-call parts and live `tool_started` and
+`tool_finished` frames carry the durable call's `call_key` and its recorded
+`schema_pin`. Ordinary keys are `<WAL lineage id>:<dispatch-intent sequence>`;
+approved calls preserve the preparation key recorded on their dispatch intent. Plan sessions
+freeze actual provider catalog pins at admission, protected by the must-understand
+`tool-schema-pins/v1` WAL feature. A later catalog cannot change a recorded pin.
+Legacy non-plan tools and older manifests have no recorded provider semantics, so
+their pins remain absent rather than being invented from the argument schema.
+Default `session.read` and `run.status` gain no call-identity members.
+For approved calls only, existing `session.read` attribution and tool-result delivery
+keys now preserve that recorded preparation key instead of incorrectly naming the later
+dispatch intent. `run.tool_calls` already preserved it. Ordinary keys and all `run.status`
+bytes remain unchanged.
+
+An error `session.head` can carry `last_run_error: {class, retry_after_secs?,
+resets_at_ms?}`. Its values come from the same named run's terminal reconciliation
+as `run.status`, with the same caller-facing class mapping. Fractional retry delays
+are preserved; a missing delay remains absent. Paused, interrupted, successful and
+never-written sessions carry no error summary.
+
+Compaction Setup continues to omit `ride_wait_max_ms`, `view_apply` and child-run
+`session_retention`: broca does not promise provider-chosen ride waits, marked
+next-step view application, or the per-session retention policy group.

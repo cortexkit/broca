@@ -1325,23 +1325,46 @@ async fn session_ref_vectors_are_resolved_by_the_serve_participant() {
         .clone();
     cases.push(json!({"harness":"broca","project_root":"/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/c0c39eea197fcc68/pool-952","session":"alfonso:bg_de298dcca128a1e1","sessionRef":"cc8f376395c1f915b357326b6741ddcb"}));
     for case in cases {
-        let rig = Rig::new("ref-vector", Arc::new(FakeDoor::default()));
         let session = BindIdentity::new(
             case["project_root"].as_str().unwrap(),
             case["harness"].as_str().unwrap(),
             case["session"].as_str().unwrap(),
         );
-        rig.seed(&session, "vector", true);
-        let mut wire = Wire::new(&rig, entorhinal(), true).await;
-        let reply = wire
-            .call(
-                "prepare",
-                json!({"cutId":CUT,"refs":[{"ref_kind":"broca-session","ref":case["sessionRef"]}]}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(reply["items"][0]["sessionRef"], case["sessionRef"]);
+        for reference in [
+            case["sessionRef"].as_str().unwrap().to_owned(),
+            broca_core::agent_session_ref(&session),
+        ] {
+            let rig = Rig::new("ref-vector", Arc::new(FakeDoor::default()));
+            rig.seed(&session, "vector", true);
+            let mut wire = Wire::new(&rig, entorhinal(), true).await;
+            let reply = wire
+                .call(
+                    "prepare",
+                    json!({"cutId":CUT,"refs":[{"ref_kind":"broca-session","ref":reference}]}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply["items"][0]["sessionRef"], reference);
+        }
     }
+}
+
+#[tokio::test]
+async fn session_ref_v2_ambiguous_roots_refuse_through_serve() {
+    let rig = Rig::new("ref-ambiguous", Arc::new(FakeDoor::default()));
+    let one = BindIdentity::new("/synthetic/one", "runner", "shared");
+    let two = BindIdentity::new("/synthetic/two", "runner", "shared");
+    rig.seed(&one, "first", true);
+    rig.seed(&two, "second", true);
+    let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    let error = wire.call("prepare", json!({"cutId":CUT,"refs":[{"ref_kind":"broca-session","ref":broca_core::agent_session_ref(&one)}]})).await.unwrap_err();
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("session_ref_ambiguous"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]

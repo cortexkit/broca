@@ -1829,9 +1829,8 @@ impl SubcConnection {
             // This unkeyed API has no intake registration or provider-declaration context.
             // Eligible dispatch keys go through the tool plane's guarded staged path instead.
             call_key: None,
-            // Not sent yet, for the same reason: the pin's content is defined by the
-            // tool-provider role, and broca sends one only after it freezes each tool's pin at
-            // admission and the receiving provider checks it.
+            // This unkeyed API has no admitted provider definition. Agent dispatch
+            // carries its frozen pin through the guarded staged path instead.
             schema_pin: None,
             // broca dispatches its own model's calls; it relays nobody else's, so there is no
             // relayed origin to attribute.
@@ -1855,7 +1854,7 @@ impl SubcConnection {
         preset: Option<&str>,
         call_key: Option<&str>,
     ) -> ConnResult<serde_json::Value> {
-        let body = Self::raw_tool_call_body(name, args_jcs, tool_call_id, preset, call_key)?;
+        let body = Self::raw_tool_call_body(name, args_jcs, tool_call_id, preset, call_key, None)?;
         self.send_tool_call_body(route, deadline, name, body).await
     }
 
@@ -1869,12 +1868,20 @@ impl SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         call_key: Option<&str>,
+        schema_pin: Option<&str>,
         signals: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, ApprovedCallError> {
         // All fallible setup belongs to one pre-push stage. There is no fallible
         // work after enqueue inside this block, so its errors can never mean sent.
         let before_push = async {
-            let body = Self::raw_tool_call_body(name, args_jcs, tool_call_id, preset, call_key)?;
+            let body = Self::raw_tool_call_body(
+                name,
+                args_jcs,
+                tool_call_id,
+                preset,
+                call_key,
+                schema_pin,
+            )?;
             let corr = self.next_corr();
             let (runtime, registration, rx) =
                 self.register_route(route, (route.channel, route.epoch, corr))?;
@@ -1904,6 +1911,7 @@ impl SubcConnection {
         tool_call_id: Option<&str>,
         preset: Option<&str>,
         call_key: Option<&str>,
+        schema_pin: Option<&str>,
     ) -> ConnResult<Vec<u8>> {
         serde_json::from_str::<&serde_json::value::RawValue>(args_jcs)
             .map_err(|error| ConnError::Protocol(format!("invalid approved arguments: {error}")))?;
@@ -1913,7 +1921,7 @@ impl SubcConnection {
             tool_call_id: tool_call_id.map(str::to_owned),
             progress_token: None,
             call_key: call_key.map(str::to_owned),
-            schema_pin: None,
+            schema_pin: schema_pin.map(str::to_owned),
             origin: None,
             preset: preset.map(str::to_owned),
             output_refs: None,
@@ -4170,6 +4178,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_guarded_dispatch_preserves_pin_and_exact_argument_bytes() {
+        let (conn, route, mut provider) = SubcConnection::in_process_for_test(5, 3);
+        let signals = broca_core::tool_plane::DispatchSignals::default();
+        let pin = format!("tp1:work:{}:7", "0".repeat(64));
+        let arguments = r#"{ "value" : 1 }"#;
+        let dispatch = conn.tool_call_raw_guarded(
+            &route,
+            "work",
+            arguments,
+            Some("call"),
+            Duration::from_secs(1),
+            None,
+            Some("lineage:7"),
+            Some(&pin),
+            &signals,
+        );
+        let receive = async {
+            let request = provider.next_request().await;
+            let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(value["schema_pin"], pin);
+            assert_eq!(value["call_key"], "lineage:7");
+            assert!(String::from_utf8_lossy(&request.body)
+                .contains(&format!("\"arguments\":{arguments}")));
+            assert!(provider.reply(&request, br#"{"content":[]}"#.to_vec()));
+        };
+        let (result, ()) = tokio::join!(dispatch, receive);
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn capabilities_are_single_flight_and_reset_on_reconnect() {
         let (conn, _, mut module) = SubcConnection::in_process_for_test(1, 1);
         read_capabilities_concurrently(&conn, &mut module, &["scopes/v1"]).await;
@@ -5207,6 +5245,7 @@ mod tests {
             r#"{"secret":"argument content"}"#,
             Some("provider-call"),
             Duration::from_secs(1),
+            None,
             None,
             None,
             &signals,

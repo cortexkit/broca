@@ -96,27 +96,29 @@ fn media(media: &MediaRef) -> Reference {
 }
 
 #[derive(Clone, Default)]
-struct SendMetadata {
+struct RowMetadata {
     client_message_id: Option<String>,
     sender: Option<String>,
+    tool_pins: BTreeMap<String, broca_wal::DispatchSchemaPin>,
 }
 
 fn send_metadata(
     digest: Option<&str>,
     principal: Option<&broca_protocol::BindPrincipal>,
-) -> SendMetadata {
-    SendMetadata {
+) -> RowMetadata {
+    RowMetadata {
         client_message_id: digest.and_then(broca_core::digest_client_message_id),
         sender: match principal {
             Some(broca_protocol::BindPrincipal::Reserved { module_id }) => Some(module_id.clone()),
             _ => None,
         },
+        tool_pins: Default::default(),
     }
 }
 
-/// Send metadata is already durable beside message bodies. Reuse the replay placement kernel
-/// so a held steer receives its row ordinal at the same boundary as transcript assembly.
-fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, SendMetadata>, ServeError> {
+/// Sender metadata and tool schema pins are durable beside message bodies. Reuse
+/// replay placement so held messages and their dispatch facts keep the same ordinals.
+fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, RowMetadata>, ServeError> {
     use broca_core::placement::{AppendKind, Placement, PlacementAction};
     use broca_wal::WalRecord;
     let mut placement = Placement::default();
@@ -124,8 +126,11 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, SendMetada
     let mut senders = BTreeMap::new();
     let mut pending = VecDeque::new();
     let mut rows = BTreeMap::new();
+    let mut assistant = None;
+    let mut tool_pins: BTreeMap<u64, BTreeMap<String, broca_wal::DispatchSchemaPin>> =
+        BTreeMap::new();
     for record in records {
-        let mut current = SendMetadata::default();
+        let mut current = RowMetadata::default();
         match record {
             WalRecord::DeliveryOrdered {
                 submission_id,
@@ -157,6 +162,7 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, SendMetada
                 ..
             } => {
                 pending.clear();
+                assistant = None;
                 if matches!(origin, broca_wal::RunOrigin::Fresh) {
                     current = submission_id
                         .as_ref()
@@ -188,6 +194,19 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, SendMetada
                     input.len(),
                 ));
             }
+            WalRecord::ToolDispatchIntent {
+                tool_call_id,
+                schema_pin: Some(pin),
+                ..
+            } => {
+                if let Some(ordinal) = assistant {
+                    tool_pins
+                        .entry(ordinal)
+                        .or_default()
+                        .entry(tool_call_id.0.clone())
+                        .or_insert_with(|| pin.clone());
+                }
+            }
             _ => {}
         }
         let actions = placement.observe(record).map_err(|message| {
@@ -196,6 +215,19 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, SendMetada
                 Some(broca_protocol::ErrorClass::Transient),
             )
         })?;
+        if matches!(record, WalRecord::ModelStepFinished { .. }) {
+            assistant = actions
+                .iter()
+                .find_map(|action| match action {
+                    PlacementAction::Append {
+                        first,
+                        kind: AppendKind::Assistant | AppendKind::Finalize,
+                        ..
+                    } => Some(*first),
+                    _ => None,
+                })
+                .or_else(|| placement.held_assistant_ordinal());
+        }
         for action in actions {
             match action {
                 PlacementAction::Append {
@@ -212,10 +244,16 @@ fn metadata(records: &[broca_wal::WalRecord]) -> Result<BTreeMap<u64, SendMetada
                         rows.insert(ordinal, pending.pop_front().unwrap_or_default());
                     }
                 }
-                PlacementAction::Truncate { to } => rows.retain(|ordinal, _| *ordinal < to),
+                PlacementAction::Truncate { to } => {
+                    rows.retain(|ordinal, _| *ordinal < to);
+                    tool_pins.retain(|ordinal, _| *ordinal < to);
+                }
                 _ => {}
             }
         }
+    }
+    for (ordinal, pins) in tool_pins {
+        rows.entry(ordinal).or_default().tool_pins = pins;
     }
     Ok(rows)
 }
@@ -241,13 +279,21 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
                     DisplayPart::Other(OtherPart::new(key, "redacted_reasoning"))
                 }
                 ContentBlock::Media(value) => DisplayPart::File(FilePart::media(key, media(value))),
-                ContentBlock::ToolCall(call) => DisplayPart::ToolCall(ToolCallPart::new(
-                    key,
-                    &call.tool_call_id.0,
-                    &call.tool_name,
-                    &call.input,
-                    limits,
-                )),
+                ContentBlock::ToolCall(call) => {
+                    let mut part = ToolCallPart::new(
+                        key,
+                        &call.tool_call_id.0,
+                        &call.tool_name,
+                        &call.input,
+                        limits,
+                    );
+                    part.call_key = entry
+                        .tool_calls
+                        .iter()
+                        .find(|fact| fact.tool_call_id == call.tool_call_id.0)
+                        .and_then(|fact| fact.call_key.clone());
+                    DisplayPart::ToolCall(part)
+                }
                 ContentBlock::ToolResult(result) => {
                     let (text, files) = match &result.output {
                         ToolOutput::Text { text } => (text.clone(), vec![]),
@@ -441,6 +487,19 @@ pub async fn read<H: ServeHandler + ?Sized>(
     for (entry, written_at) in entries.iter().zip(creation_times) {
         let value = if request.form() == HistoryForm::Display {
             let mut row = project(entry, request.limits.as_ref());
+            if let Some(metadata) = metadata.get(&entry.ordinal) {
+                for call in row.tool_calls_mut() {
+                    call.schema_pin = metadata.tool_pins.get(&call.tool_call_id).and_then(|pin| {
+                        cortexkit_role_tool_provider::call::SchemaPin::new(
+                            &call.name,
+                            &pin.schema_digest,
+                            pin.semantics,
+                        )
+                        .encode()
+                        .ok()
+                    });
+                }
+            }
             if entry.message.role == Role::User {
                 if let Some(metadata) = metadata.get(&entry.ordinal) {
                     row.client_message_id = metadata.client_message_id.clone();

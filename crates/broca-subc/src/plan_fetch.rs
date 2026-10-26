@@ -236,6 +236,22 @@ impl broca_fetch_plan::PlanAdmitter for SubcPlanAdmitter {
 
 #[async_trait]
 impl Fetcher for SubcPlanFetcher {
+    async fn system_text_default_supported(&self, provider: &str) -> Result<bool, FetchError> {
+        let entries = self
+            .conn
+            .catalog_list()
+            .await
+            .map_err(|error| FetchError::Lost(error.to_string()))?;
+        Ok(entries
+            .iter()
+            .find(|entry| entry.module_id == provider)
+            .and_then(|entry| entry.capabilities.as_ref())
+            .is_some_and(|caps| {
+                caps.provides.iter().any(|capability| {
+                    capability == cortexkit_role_tool_provider::SYSTEM_TEXT_DEFAULT
+                })
+            }))
+    }
     async fn catalog(&self, provider: &str, request: &CatalogRequest) -> Result<Value, FetchError> {
         let arguments =
             serde_json::to_value(request).map_err(|error| FetchError::Lost(error.to_string()))?;
@@ -396,6 +412,61 @@ mod preset_tests {
             assert_eq!(
                 serde_json::to_vec(&request["arguments"]["composition"]).unwrap(),
                 serde_json::to_vec(&composition).unwrap()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod default_text_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn system_text_default_uses_matching_daemon_catalog_declaration() {
+        for (module, provides, expected) in [
+            (
+                "persona",
+                vec![cortexkit_role_tool_provider::SYSTEM_TEXT_DEFAULT],
+                true,
+            ),
+            ("persona", vec![], false),
+            (
+                "another-provider",
+                vec![cortexkit_role_tool_provider::SYSTEM_TEXT_DEFAULT],
+                false,
+            ),
+        ] {
+            let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+            let fetcher = SubcPlanFetcher::new(
+                Arc::new(conn),
+                BindIdentity::new("/synthetic/default-text", "runner", "catalog-guard"),
+                None,
+            );
+            let read = fetcher.system_text_default_supported("persona");
+            let reply = async {
+                let request = daemon.next_request().await;
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["op"], "catalog.list");
+                let mut entry =
+                    serde_json::to_value(subc_control::CatalogEntry::new(module, vec![], vec![]))
+                        .unwrap();
+                entry["capabilities"] = json!({"provides":provides});
+                let entry = serde_json::from_value(entry).unwrap();
+                let response = subc_control::ClientControlResponse::CatalogList {
+                    generation: 1,
+                    modules: vec![entry],
+                    subc_ops: vec![],
+                };
+                assert!(daemon.reply(&request, serde_json::to_vec(&response).unwrap()));
+            };
+            let (supported, ()) = tokio::join!(read, reply);
+            assert_eq!(supported.unwrap(), expected);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), daemon.next_request())
+                    .await
+                    .is_err(),
+                "checking a capability must not forward a provider request"
             );
         }
     }

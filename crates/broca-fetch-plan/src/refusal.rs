@@ -97,6 +97,8 @@ pub enum Refusal {
     /// Tool providers require a per-call preset on scoped routes, and broca takes presets
     /// only from a plan.
     ScopedToolsRequirePlan,
+    /// A preset-less system-text item names a provider that has not declared a default.
+    SystemTextPresetRequired { provider: String },
     /// The send or its plan is malformed. `detail` names the offending `field`, and for a
     /// malformed subscription also its `item`, `subscription` and `problem`.
     InvalidParams { detail: Value },
@@ -151,6 +153,7 @@ impl Refusal {
     pub fn code(&self) -> &'static str {
         match self {
             Self::ScopedToolsRequirePlan => "scoped_tools_require_plan",
+            Self::SystemTextPresetRequired { .. } => "system_text_preset_required",
             Self::InvalidParams { .. } | Self::CompactionRoleNotServed { .. } => {
                 errors::INVALID_PARAMS
             }
@@ -166,6 +169,7 @@ impl Refusal {
     pub fn detail(&self) -> Value {
         match self {
             Self::ScopedToolsRequirePlan => json!({"class": "permanent"}),
+            Self::SystemTextPresetRequired { provider } => json!({"provider": provider}),
             Self::InvalidParams { detail } => detail.clone(),
             Self::CompactionRoleNotServed { provider, problems } => json!({
                 "field": "plan.compaction_item", "provider": provider, "problems": problems,
@@ -212,6 +216,7 @@ impl Refusal {
     pub fn retryable(&self) -> bool {
         match self {
             Self::ScopedToolsRequirePlan | Self::PlanModelMismatch { .. } => false,
+            Self::SystemTextPresetRequired { .. } => false,
             _ => errors::is_retryable(self.code()),
         }
     }
@@ -220,6 +225,7 @@ impl Refusal {
     pub fn message(&self) -> String {
         match self {
             Self::ScopedToolsRequirePlan => "tools on a scoped session must come from a fetch plan, because tool providers require a per-call preset on scoped routes".into(),
+            Self::SystemTextPresetRequired { provider } => format!("system-text provider {provider} requires a preset because it does not declare system-text-default/v1"),
             Self::PlanModelMismatch { provider, .. } => {
                 format!("provider {provider} has a plan model different from the send model")
             }

@@ -395,10 +395,10 @@ async fn absent_system_text_preset_refuses_before_fetch_or_wal_write() {
         json!({}),
     )
     .await;
-    assert_eq!(error_body(&frame)["code"], "invalid_params");
+    assert_eq!(error_body(&frame)["code"], "system_text_preset_required");
     assert_eq!(
         error_body(&frame)["detail"],
-        json!({"field":"plan.system_text_items[0].preset"})
+        json!({"provider":plan["system_text_items"][0]["provider"]})
     );
     assert!(admitter.calls().is_empty());
     assert!(rig.wal_bytes().is_empty());

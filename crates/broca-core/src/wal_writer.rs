@@ -225,6 +225,22 @@ pub trait WalStore: Send + Sync {
         session: &BindIdentity,
     ) -> Result<Vec<broca_wal::FramedRecord>, WalError>;
 
+    /// Read records with their log-header identity from the same snapshot.
+    /// Stores without a header retain their existing full-read behavior and
+    /// report an unknown identity rather than inventing one from the bind key.
+    fn read_records_with_lineage(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<
+        (
+            Vec<broca_wal::FramedRecord>,
+            Option<broca_wal::WalLineageId>,
+        ),
+        WalError,
+    > {
+        self.read_records(session).map(|records| (records, None))
+    }
+
     /// Read records after a sequence watermark, optionally bounded by the caller's
     /// last fsynced safe head. Implementations may use `anchor` as a validated byte-offset
     /// hint; correctness must not depend on it.
@@ -1596,6 +1612,20 @@ impl WalStore for FileWalStore {
         &self,
         session: &BindIdentity,
     ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+        self.read_records_with_lineage(session)
+            .map(|(records, _)| records)
+    }
+
+    fn read_records_with_lineage(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<
+        (
+            Vec<broca_wal::FramedRecord>,
+            Option<broca_wal::WalLineageId>,
+        ),
+        WalError,
+    > {
         // READ-ONLY: decode the committed records, discarding a torn final record in
         // memory. This must NOT go through `FileWal::open` — open truncates a torn tail
         // (writer-recovery), and a reader runs CONCURRENTLY with the live writer, so
@@ -1605,11 +1635,10 @@ impl WalStore for FileWalStore {
         // The range reader distinguishes an absent log from a present empty log and retries
         // archive lookup if the live file moved into an archive during the read. replay_file
         // deliberately collapses NotFound to empty, so it cannot supply that distinction.
-        match self
-            .read_records_range(session, 0, None, None)?
-            .into_records()
-        {
-            broca_wal::WalRangeRecords::Complete(records) => Ok(records),
+        let range = self.read_records_range(session, 0, None, None)?;
+        let lineage = range.lineage_id;
+        match range.into_records() {
+            broca_wal::WalRangeRecords::Complete(records) => Ok((records, lineage)),
             broca_wal::WalRangeRecords::Absent => Err(WalError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 "session WAL is absent after live and archive lookup",
@@ -1946,11 +1975,14 @@ pub type DurableRecordTap =
 /// pointer keeps each slot small and independent of the record's size; the record itself is
 /// still cloned once per publish, exactly as before.
 #[derive(Clone, Debug)]
-pub struct ObservedRecord(Arc<broca_wal::FramedRecord>);
+pub struct ObservedRecord(Arc<(broca_wal::FramedRecord, Option<broca_wal::WalLineageId>)>);
 
 impl ObservedRecord {
     pub fn new(framed: broca_wal::FramedRecord) -> Self {
-        Self(Arc::new(framed))
+        Self(Arc::new((framed, None)))
+    }
+    pub fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
+        self.0 .1
     }
 }
 
@@ -1964,7 +1996,7 @@ impl std::ops::Deref for ObservedRecord {
     type Target = broca_wal::FramedRecord;
 
     fn deref(&self) -> &broca_wal::FramedRecord {
-        &self.0
+        &self.0 .0
     }
 }
 
@@ -1988,18 +2020,27 @@ impl RecordObserver {
         self
     }
 
-    fn observe(&self, seq: u64, fence: u64, record: &WalRecord) {
+    fn observe(
+        &self,
+        seq: u64,
+        fence: u64,
+        record: &WalRecord,
+        lineage: Option<broca_wal::WalLineageId>,
+    ) {
         if self.subscribers.load(Ordering::Acquire) == 0 {
             return;
         }
         // `broadcast` is bounded and non-blocking: when the projector falls behind it drops
         // the oldest queued records and reports `Lagged`, which makes every live subscriber
         // detach and recover from the WAL rather than allowing this writer-side queue to grow.
-        let _ = self.tx.send(ObservedRecord::new(broca_wal::FramedRecord {
-            seq,
-            fence,
-            record: record.clone(),
-        }));
+        let _ = self.tx.send(ObservedRecord(Arc::new((
+            broca_wal::FramedRecord {
+                seq,
+                fence,
+                record: record.clone(),
+            },
+            lineage,
+        ))));
     }
 
     fn observe_tap(
@@ -3068,11 +3109,11 @@ fn writer_loop(
                         if let Some(obs) = &observer {
                             if has_tap {
                                 for (seq, record) in &pending_observed {
-                                    obs.observe(*seq, fence, record);
+                                    obs.observe(*seq, fence, record, wal.lineage_id());
                                 }
                             } else {
                                 for (seq, record) in pending_observed.drain(..) {
-                                    obs.observe(seq, fence, &record);
+                                    obs.observe(seq, fence, &record, wal.lineage_id());
                                 }
                             }
                         }
@@ -3106,7 +3147,7 @@ fn writer_loop(
                     durable_head.store(last_appended_seq, Ordering::Release);
                     if let Some(obs) = &observer {
                         for (seq, record) in pending_observed.drain(..) {
-                            obs.observe(seq, fence, &record);
+                            obs.observe(seq, fence, &record, wal.lineage_id());
                             if has_tap {
                                 obs.observe_tap(seq, fence, wal.lineage_id(), &record);
                             }
@@ -4100,7 +4141,7 @@ mod tests {
         let subscribers = Arc::new(AtomicUsize::new(0));
         let observer = RecordObserver::new(tx, subscribers.clone());
 
-        observer.observe(1, 7, &WalRecord::StepStarted { step_id: StepId(1) });
+        observer.observe(1, 7, &WalRecord::StepStarted { step_id: StepId(1) }, None);
         assert!(
             matches!(
                 rx.try_recv(),
@@ -4110,7 +4151,7 @@ mod tests {
         );
 
         subscribers.fetch_add(1, Ordering::AcqRel);
-        observer.observe(2, 7, &WalRecord::StepStarted { step_id: StepId(2) });
+        observer.observe(2, 7, &WalRecord::StepStarted { step_id: StepId(2) }, None);
         let framed = rx
             .try_recv()
             .expect("once a subscriber enables the gate, records must publish live");
@@ -4135,6 +4176,7 @@ mod tests {
                 &WalRecord::StepStarted {
                     step_id: StepId(seq),
                 },
+                None,
             );
         }
 

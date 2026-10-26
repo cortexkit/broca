@@ -409,6 +409,7 @@ trait ToolPlaneConnection: Send + Sync {
         _deadline: Duration,
         _preset: Option<&str>,
         _args: &ApprovedArgs,
+        _schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         Err(crate::connection::ApprovedCallError::BeforePush(
             ConnError::Protocol("approved_dispatch_unavailable".into()).into(),
@@ -422,7 +423,13 @@ trait ToolPlaneConnection: Send + Sync {
         deadline: Duration,
         preset: Option<&str>,
         _call_key: Option<&str>,
+        schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+        if schema_pin.is_some() {
+            return Err(crate::connection::ApprovedCallError::BeforePush(
+                ConnError::Protocol("pinned_dispatch_unavailable".into()).into(),
+            ));
+        }
         self.tool_call(
             route,
             &call.tool_name,
@@ -472,6 +479,7 @@ impl ToolPlaneConnection for SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         call_key: Option<&str>,
+        schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         let args = serde_json::to_string(&call.input).map_err(|error| {
             crate::connection::ApprovedCallError::BeforePush(
@@ -486,6 +494,7 @@ impl ToolPlaneConnection for SubcConnection {
             deadline,
             preset,
             call_key,
+            schema_pin,
             &broca_core::tool_plane::DispatchSignals::default(),
         )
         .await
@@ -513,6 +522,7 @@ impl ToolPlaneConnection for SubcConnection {
         deadline: Duration,
         preset: Option<&str>,
         args: &ApprovedArgs,
+        schema_pin: Option<&str>,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
         self.tool_call_raw_guarded(
             route,
@@ -522,6 +532,7 @@ impl ToolPlaneConnection for SubcConnection {
             deadline,
             preset,
             Some(&args.key),
+            schema_pin,
             &args.signals,
         )
         .await
@@ -776,6 +787,17 @@ impl SubcToolPlane {
             .and_then(|calls| calls.get(&call.tool_call_id))
             .cloned();
         let preset = self.frozen_preset(ctx, module);
+        let schema_pin = self
+            .dispatch_schema_pin(ctx, &call.tool_call_id, &call.tool_name)
+            .and_then(|pin| {
+                cortexkit_role_tool_provider::call::SchemaPin::new(
+                    &call.tool_name,
+                    pin.schema_digest,
+                    pin.semantics,
+                )
+                .encode()
+                .ok()
+            });
         let late_results = self.frozen_contract(ctx, module).late_results;
         let plain_key = key.filter(|_| {
             self.held_reply_declared() && late_results && self.conn.consumer_module_id().is_some()
@@ -811,7 +833,14 @@ impl SubcToolPlane {
             }
             SendAttempt::approved_reply(
                 self.conn
-                    .tool_call_approved(route, call, deadline, preset.as_deref(), &args)
+                    .tool_call_approved(
+                        route,
+                        call,
+                        deadline,
+                        preset.as_deref(),
+                        &args,
+                        schema_pin.as_deref(),
+                    )
                     .await,
             )
         } else {
@@ -823,6 +852,7 @@ impl SubcToolPlane {
                         deadline,
                         preset.as_deref(),
                         plain_key.map(|key| key.call_key),
+                        schema_pin.as_deref(),
                     )
                     .await,
             )
@@ -2727,6 +2757,26 @@ impl ToolPlane for SubcToolPlane {
     fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
         self.dispatch_target_inner(ctx, id)
     }
+    fn dispatch_schema_pin(
+        &self,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
+    ) -> Option<broca_core::tool_plane::DispatchSchemaPin> {
+        let module = self.dispatch_target_inner(ctx, id)?;
+        // Only an admitted plan supplies the provider's schema digest and semantics.
+        // Legacy direct tools and old manifests keep an unknown pin; consulting a
+        // later catalog would invent history and add a new refusing RPC to dispatch.
+        self.batch_manifests
+            .lock()
+            .unwrap()
+            .get(&Self::batch_route_key(ctx))?
+            .provider_declarations(&module)?
+            .schema_pins
+            .as_ref()?
+            .get(tool)
+            .cloned()
+    }
     async fn dispatch(&self, ctx: &BatchCtx, call: &ToolCall) -> DispatchResult {
         self.dispatch_inner(ctx, call, None).await
     }
@@ -3490,6 +3540,7 @@ mod tests {
             deadline: Duration,
             preset: Option<&str>,
             args: &ApprovedArgs,
+            _schema_pin: Option<&str>,
         ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
             if let Some(error) = self.approved_setup_error.lock().unwrap().take() {
                 return Err(crate::connection::ApprovedCallError::BeforePush(
@@ -6937,7 +6988,8 @@ mod approval_digest_contract_tests {
                 &call,
                 Duration::from_secs(1),
                 Some("head"),
-                &args
+                &args,
+                None
             ),
             async {
                 let request = module.next_request().await;
@@ -7043,6 +7095,7 @@ mod approved_queue_contract_tests {
                     Duration::from_millis(20),
                     None,
                     Some("call-key"),
+                    None,
                     &Default::default(),
                 )
                 .await;

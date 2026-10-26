@@ -8229,10 +8229,11 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                             // requires `dispatch-module/v1`, and the WAL raises its feature floor
                             // to that name before the first such frame.
                             module_id: tool_plane.dispatch_target(&ctx, &c.tool_call_id),
-                            // A session's frozen tools carry no schema digest yet (a fetched
-                            // catalog's `schema_digest` and `semantics` are not part of the
-                            // frozen `Tool`), so there is no pin to record.
-                            schema_pin: None,
+                            schema_pin: tool_plane.dispatch_schema_pin(
+                                &ctx,
+                                &c.tool_call_id,
+                                &c.tool_name,
+                            ),
                             approval_digest: None,
                             call_key: None,
                         })
@@ -9047,6 +9048,14 @@ impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
     }
     fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
         self.inner.dispatch_target(ctx, id)
+    }
+    fn dispatch_schema_pin(
+        &self,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
+    ) -> Option<broca_wal::DispatchSchemaPin> {
+        self.inner.dispatch_schema_pin(ctx, id, tool)
     }
     async fn register_dispatch_group(
         &self,
@@ -13599,7 +13608,11 @@ mod approval_gate {
                         tool_name: Some(call.tool_name.clone()),
                         args: Arc::clone(&call.input),
                         module_id: plane.dispatch_target(ctx, &call.tool_call_id),
-                        schema_pin: None,
+                        schema_pin: plane.dispatch_schema_pin(
+                            ctx,
+                            &call.tool_call_id,
+                            &call.tool_name,
+                        ),
                         approval_digest: None,
                         call_key: None,
                         hooks: call.hooks.clone(),
@@ -14447,7 +14460,7 @@ mod approval_gate {
                                 let held = held.clone(); let call = held.call();
                                 let WalRecord::ToolCallDeferred { module, schema_pin, args_jcs, .. } = &*held.prepared else { unreachable!() };
                                 history.record(writer, WalRecord::ToolDispatchIntent { dispatched_at_ms: None, batch_id: ctx.batch_id.clone(), tool_call_id: call.tool_call_id.clone(), tool_name: Some(call.tool_name.clone()),
-                                    args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone(), hooks: None,
+                                    args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone().or_else(|| plane.dispatch_schema_pin(ctx, &call.tool_call_id, &call.tool_name)), hooks: None,
                                     approval_digest: None, call_key: Some(held.key.clone()) });
                                 writer.sync().await?;
                                 let before_send_cancel = control.cancel.as_ref();
