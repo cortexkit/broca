@@ -274,6 +274,9 @@ pub struct SystemOne {
     /// fallback, since a release still pending after the reply refuses an immediate re-send.
     #[cfg(test)]
     fallback_release_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Tests hold publication after the outcome/outbox commit to expose premature replay.
+    #[cfg(test)]
+    pub(crate) fact_publish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Pricing accepted before private-content admission. Keeping this snapshot with a delayed
@@ -329,6 +332,8 @@ impl SystemOne {
             charge_basis: Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
             #[cfg(test)]
             fallback_release_gate: Mutex::new(None),
+            #[cfg(test)]
+            fact_publish_hook: Mutex::new(None),
         }
     }
 
@@ -348,6 +353,13 @@ impl SystemOne {
             return Ok(());
         };
         for pending in self.store.pending_facts().map_err(|e| e.to_string())? {
+            #[cfg(test)]
+            {
+                let hook = self.fact_publish_hook.lock().unwrap().clone();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             if export
                 .emit_system_one_fact(&pending.fact)
                 .map_err(|e| e.to_string())?
@@ -364,6 +376,14 @@ impl SystemOne {
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    async fn publish_facts(self: &Arc<Self>) -> Result<(), Refusal> {
+        let service = Arc::clone(self);
+        tokio::task::spawn_blocking(move || service.flush_facts())
+            .await
+            .map_err(|_| internal_refusal("usage export task failed"))?
+            .map_err(|_| internal_refusal("usage export is unavailable; re-send the batch"))
     }
 
     pub fn health(&self) -> serde_json::Value {
@@ -421,11 +441,14 @@ impl SystemOne {
         self.catalog.row(model)
     }
 
-    pub(crate) fn replay_tool(
-        &self,
+    pub(crate) async fn replay_tool(
+        self: &Arc<Self>,
         params: &str,
         stored: &broca_store::system_one::StoredBatch,
     ) -> Result<Box<RawValue>, Refusal> {
+        // The outcome and outbox commit together, but publication is a separate transaction.
+        // A replay can see that outcome while its original execution is still exporting it.
+        self.publish_facts().await?;
         classify::replay_tool(params, stored)
     }
 

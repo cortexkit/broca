@@ -29632,6 +29632,34 @@ old = "let scope = if let Some(flow_id) = &stamped.flow_id {"
 new = "let scope = if let Some(flow_id) = stamped.flow_id.as_ref().filter(|_| false) { // NON-VACUITY BREAK: refuse flow-only scope attribution."
 
 [[control]]
+id = "llm-tool-replay-publishes-spend-before-answer"
+guards = "A stored tool answer cannot bypass pending spend publication even after its first waiter disconnects"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/llm_tools/route_tests.rs"
+expect_red = ["llm_tools::route::tests::stored_replay_waits_for_spend_publication_after_leader_disconnects"]
+expect_message = "stored replay released an answer before its spend fact"
+file = "crates/broca-module-serve/src/system_one/mod.rs"
+old = "        self.publish_facts().await?;"
+new = "        // NON-VACUITY BREAK: replay a committed outcome before publishing its spend fact."
+
+[[control]]
+id = "llm-tool-shared-execution-publishes-spend-before-answer"
+guards = "A detached tool execution publishes its paid fact before waking shared-result waiters"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/llm_tools/route_tests.rs"
+expect_red = ["llm_tools::route::tests::shared_execution_publishes_spend_before_waking_waiters"]
+expect_message = "shared answer must have a published spend fact"
+file = "crates/broca-module-serve/src/system_one/classify.rs"
+old = "        service.publish_facts().await?;"
+new = "        // NON-VACUITY BREAK: wake shared-result waiters without publishing paid spend."
+
+[[control]]
 id = "llm-tool-bare-response-is-call-local"
 guards = "An oversized bare tool-provider response refuses only that call and preserves its sibling response"
 runner = "cargo"
