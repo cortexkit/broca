@@ -579,6 +579,7 @@ version = "0.3.267"
 dependencies = [
  "async-trait",
  "broca-core",
+ "broca-crash-harness",
  "broca-owner-only",
  "broca-protocol",
  "broca-test-support",
