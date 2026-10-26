@@ -19,13 +19,20 @@ use serde_json::{json, Value};
 
 use super::held::not_started;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunLiveness {
+    Live,
+    Ended,
+    Unknown,
+}
+
 #[async_trait::async_trait]
 pub trait ConsentIo: Send + Sync {
     async fn request(&self, scope: &SessionScope, body: &Value) -> Result<String, ConsentError>;
     async fn answers(&self, scope: &SessionScope, since: u64) -> Result<AnswersPage, ConsentError>;
     async fn wait(&self, scope: &SessionScope, id: &str) -> Result<ConsentRecord, ConsentError>;
     async fn withdraw(&self, scope: &SessionScope, id: &str);
-    async fn run_live(&self, scope: &SessionScope) -> bool;
+    async fn run_live(&self, scope: &SessionScope) -> RunLiveness;
 }
 
 pub struct SubcConsentIo {
@@ -92,17 +99,28 @@ impl ConsentIo for SubcConsentIo {
         }
     }
 
-    async fn run_live(&self, scope: &SessionScope) -> bool {
-        self.describer
+    async fn run_live(&self, scope: &SessionScope) -> RunLiveness {
+        let answer = self
+            .describer
             .describe(
                 &super::private_content::owner_principal(&scope.owner.as_owner_string()),
                 &scope.scope_ref,
             )
-            .await
-            .is_ok_and(|answer| {
-                answer.status == subc_protocol::scope::ScopeStatus::Live
-                    && answer.scope_epoch == Some(scope.scope_epoch)
-            })
+            .await;
+        use subc_protocol::scope::ScopeStatus;
+        match answer {
+            Ok(answer) => match answer.status {
+                ScopeStatus::Ended => RunLiveness::Ended,
+                ScopeStatus::NotLive if answer.owner_synced => RunLiveness::Ended,
+                ScopeStatus::Live => match answer.scope_epoch {
+                    Some(epoch) if epoch == scope.scope_epoch => RunLiveness::Live,
+                    Some(_) => RunLiveness::Ended,
+                    None => RunLiveness::Unknown,
+                },
+                ScopeStatus::NotLive => RunLiveness::Unknown,
+            },
+            Err(_) => RunLiveness::Unknown,
+        }
     }
 }
 
@@ -181,7 +199,8 @@ impl Consent {
                     return Ok(true)
                 }
                 GrantKind::Run
-                    if grant.scope.as_ref() == Some(&identity) && self.io.run_live(scope).await =>
+                    if grant.scope.as_ref() == Some(&identity)
+                        && self.io.run_live(scope).await == RunLiveness::Live =>
                 {
                     return Ok(true)
                 }
@@ -478,7 +497,8 @@ impl Consent {
             "deny" => Decision::Deny,
             _ => return None,
         };
-        let run_live = !matches!(decision, Decision::AllowRun) || self.io.run_live(scope).await;
+        let run_live = !matches!(decision, Decision::AllowRun)
+            || self.io.run_live(scope).await == RunLiveness::Live;
         Some(CardAnswer {
             dedup_key: card.dedup_key.clone(),
             card_id: record.elicitation_id.clone(),

@@ -50,6 +50,8 @@ const MANAGEMENT_OPERATIONS: &[&str] = &[
     "session.history",
     "session.output_refs",
     "session.output_ref_read",
+    "permissions.list",
+    "permissions.revoke",
 ];
 
 #[derive(Clone, Debug)]

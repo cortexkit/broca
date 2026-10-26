@@ -1396,15 +1396,20 @@ where
                 return Ok(true);
             }
             if matches!(bind.role, RouteRole::ToolProvider | RouteRole::Permissions) {
-                if bind.role == RouteRole::ToolProvider {
-                    let service = routes.llm_tools.clone();
-                    let writer = writer.clone();
-                    request_tasks.spawn(reply_on_panic(
-                        writer.clone(),
-                        (ver, channel, epoch, corr),
-                        async move {
-                            let answer = match service {
-                                Some(service) => tokio::spawn(async move {
+                let service = routes.llm_tools.clone();
+                let writer = writer.clone();
+                request_tasks.spawn(reply_on_panic(
+                    writer.clone(),
+                    (ver, channel, epoch, corr),
+                    async move {
+                        let answer = match service {
+                            Some(service) => tokio::spawn(async move {
+                                if bind.role == RouteRole::Permissions {
+                                    service
+                                        .permissions()
+                                        .answer(&frame.body, bind.principal.as_ref())
+                                        .await
+                                } else {
                                     service
                                         .answer_with_capabilities(
                                             &frame.body,
@@ -1413,51 +1418,40 @@ where
                                             bind.reads_held_reply,
                                         )
                                         .await
-                                })
-                                .await
-                                .unwrap_or_else(|_| {
-                                    Err(crate::system_one::refusal_body(
-                                        &crate::system_one::internal_refusal(
-                                            "model tool request failed",
-                                        ),
-                                    ))
-                                }),
-                                None => Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
-                                    "unknown_method",
-                                    "model tools are not configured",
+                                }
+                            })
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(crate::system_one::refusal_body(
+                                    &crate::system_one::internal_refusal(
+                                        "model tool request failed",
+                                    ),
                                 ))
-                                .expect("error encodes")),
-                            };
-                            match answer {
-                                Ok(body) => {
-                                    send_response_bytes(
-                                        &writer,
-                                        ver,
-                                        channel,
-                                        epoch,
-                                        corr,
-                                        body.get().as_bytes().to_vec(),
-                                    )
-                                    .await
-                                }
-                                Err(body) => {
-                                    send_error_bytes(&writer, ver, channel, epoch, corr, body).await
-                                }
+                            }),
+                            None => Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                                "unknown_method",
+                                "model tools are not configured",
+                            ))
+                            .expect("error encodes")),
+                        };
+                        match answer {
+                            Ok(body) => {
+                                send_response_bytes(
+                                    &writer,
+                                    ver,
+                                    channel,
+                                    epoch,
+                                    corr,
+                                    body.get().as_bytes().to_vec(),
+                                )
+                                .await
                             }
-                        },
-                    ));
-                    return Ok(true);
-                }
-                send_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "unknown_method",
-                    "this role's operations are not implemented in this build",
-                )
-                .await?;
+                            Err(body) => {
+                                send_error_bytes(&writer, ver, channel, epoch, corr, body).await
+                            }
+                        }
+                    },
+                ));
                 return Ok(true);
             }
             let req: RouteRequest = match serde_json::from_slice(&frame.body) {

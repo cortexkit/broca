@@ -31598,7 +31598,7 @@ select = "expected"
 test_file = "crates/broca-module-serve/tests/llm_tools_consent.rs"
 expect_red = ["late_answers_keep_24h_grants_but_ended_run_allow_records_nothing"]
 file = "crates/broca-module-serve/src/llm_tools/consent.rs"
-old = "let run_live = !matches!(decision, Decision::AllowRun) || self.io.run_live(scope).await;"
+old = "let run_live = !matches!(decision, Decision::AllowRun)\n            || self.io.run_live(scope).await == RunLiveness::Live;"
 new = "let run_live = true; let _ = scope; // NON-VACUITY BREAK: mint a late grant for an ended run."
 
 [[control]]
@@ -31922,3 +31922,172 @@ old = '''broca_wal::WalRecord::ModelStepFinished { .. } => {
 new = '''broca_wal::WalRecord::ModelStepFinished { .. } => {
                     // NON-VACUITY BREAK: forget each historical step's aging boundary.
                     step_open = false;'''
+
+[[control]]
+id = "llm-permissions-stamped-operator-only"
+guards = "Only direct and reserved:cingulate may read grants or revoke operator authority"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["only_stamped_operator_principals_can_read_or_revoke"]
+file = "crates/broca-module-serve/src/llm_tools/permissions.rs"
+old = "if !matches!(principal, Some(BindPrincipal::Direct))"
+new = "if false && !matches!(principal, Some(BindPrincipal::Direct)) // NON-VACUITY BREAK: bypass operator admission."
+
+[[control]]
+id = "llm-permissions-agent-filter"
+guards = "A permissions list filtered to one agent does not disclose another agent's grants"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["list_filters_agent_expiry_and_run_liveness_and_projects_labels"]
+file = "crates/broca-module-serve/src/llm_tools/permissions.rs"
+old = ".is_some_and(|id| id != &grant.holder)"
+new = ".is_some_and(|_| false) // NON-VACUITY BREAK: ignore the agent filter."
+
+[[control]]
+id = "llm-permissions-list-live-only"
+guards = "Permissions list excludes expired and ended-run grants"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["list_filters_agent_expiry_and_run_liveness_and_projects_labels"]
+file = "crates/broca-module-serve/src/llm_tools/permissions.rs"
+old = "|| !self.visible(&grant, now).await"
+new = "|| false && !self.visible(&grant, now).await // NON-VACUITY BREAK: list dead grants."
+
+[[control]]
+id = "llm-permissions-expired-revoke-not-found"
+guards = "Revoking an expired grant answers not_found without advancing its generation"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["revoke_unknown_expired_and_repeated_ids_returns_not_found_without_generation_change"]
+file = "crates/broca-module-serve/src/llm_tools/permissions.rs"
+old = "let revoked = live && self.store.revoke(&params.id).map_err(store_error)?;"
+new = "let revoked = (live || true) && self.store.revoke(&params.id).map_err(store_error)?; // NON-VACUITY BREAK: revoke expired authority."
+
+[[control]]
+id = "llm-permissions-revoke-one-overlapping-grant"
+guards = "Revocation removes only the named grant, preserving overlapping authority"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["overlapping_grants_revoke_only_the_named_grant"]
+file = "crates/broca-store/src/grants.rs"
+old = 'tx.execute("DELETE FROM grants WHERE id=?1", [id])?;'
+new = 'tx.execute("DELETE FROM grants WHERE holder=(SELECT holder FROM grants WHERE id=?1)", [id])?; // NON-VACUITY BREAK: remove overlapping grants too.'
+
+[[control]]
+id = "llm-permissions-revoke-generation-survives-restart"
+guards = "Revocation durably advances the next consent card key, including in the same run"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["revoke_restart_changes_the_next_card_key_and_leaves_held_calls_waiting"]
+file = "crates/broca-store/src/grants.rs"
+old = 'tx.execute("INSERT INTO generations VALUES (?1,?2,1) ON CONFLICT(agent_id,provider) DO UPDATE SET generation=generation+1", params![holder, provider])?;'
+new = 'tx.execute("INSERT INTO generations VALUES (?1,?2,0) ON CONFLICT(agent_id,provider) DO UPDATE SET generation=generation", params![holder, provider])?; // NON-VACUITY BREAK: keep the old card generation.'
+
+[[control]]
+id = "llm-permissions-unknown-run-remains-visible"
+guards = "An unknown run-liveness answer cannot hide revocable authority from the operator"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["unknown_run_liveness_keeps_operator_visibility"]
+file = "crates/broca-module-serve/src/llm_tools/permissions.rs"
+old = ".await\n                    != RunLiveness::Ended"
+new = ".await == RunLiveness::Live // NON-VACUITY BREAK: hide a grant when liveness is unknown."
+
+[[control]]
+id = "llm-permissions-unknown-run-can-be-revoked"
+guards = "A stored run grant can be revoked even when scope liveness is unknown"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["unknown_run_liveness_cannot_prevent_durable_revocation"]
+file = "crates/broca-module-serve/src/llm_tools/permissions.rs"
+old = "Some(grant) => grant.kind == GrantKind::Run || self.visible(&grant, now).await,"
+new = "Some(grant) => grant.kind != GrantKind::Run && self.visible(&grant, now).await, // NON-VACUITY BREAK: refuse durable run-grant deletion."
+
+[[control]]
+id = "llm-permissions-unknown-run-cannot-authorize"
+guards = "Unknown liveness remains fail-closed when a run grant would authorize a call"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["unknown_liveness_cannot_mint_or_use_run_grants"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "&& self.io.run_live(scope).await == RunLiveness::Live =>"
+new = "&& self.io.run_live(scope).await != RunLiveness::Ended => // NON-VACUITY BREAK: authorize an unknown run."
+
+[[control]]
+id = "llm-permissions-unknown-run-cannot-mint"
+guards = "Unknown liveness remains fail-closed when an allow_run answer would mint a grant"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test llm_tools_permissions"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/llm_tools_permissions.rs"
+expect_red = ["unknown_liveness_cannot_mint_or_use_run_grants"]
+file = "crates/broca-module-serve/src/llm_tools/consent.rs"
+old = "|| self.io.run_live(scope).await == RunLiveness::Live;"
+new = "|| self.io.run_live(scope).await != RunLiveness::Ended; // NON-VACUITY BREAK: mint a grant for an unknown run."
+
+[[control]]
+id = "llm-permissions-manifest-capability"
+guards = "The served permissions role is discoverable by its declared capability"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test role_binding"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/role_binding.rs"
+expect_red = ["manifest_does_not_advertise_unimplemented_roles_or_operations"]
+file = "crates/broca-module-serve/src/manifest.rs"
+old = '"permissions/v1".to_string(),'
+new = '"permissions-disabled/v1".to_string(), // NON-VACUITY BREAK: hide the served permissions capability.'
+
+[[control]]
+id = "llm-permissions-manifest-list"
+guards = "The served permissions.list query is declared in the management operation inventory"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test role_binding"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/role_binding.rs"
+expect_red = ["manifest_does_not_advertise_unimplemented_roles_or_operations"]
+file = "crates/broca-module-serve/src/manifest.rs"
+old = 'name: "permissions.list".into(),'
+new = 'name: "unserved.permissions.list".into(), // NON-VACUITY BREAK: hide the served list operation.'
+
+[[control]]
+id = "llm-permissions-manifest-revoke"
+guards = "The served permissions.revoke mutation is declared in the management operation inventory"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--test role_binding"
+select = "expected"
+test_file = "crates/broca-module-serve/tests/role_binding.rs"
+expect_red = ["manifest_does_not_advertise_unimplemented_roles_or_operations"]
+file = "crates/broca-module-serve/src/manifest.rs"
+old = 'name: "permissions.revoke".into(),'
+new = 'name: "unserved.permissions.revoke".into(), // NON-VACUITY BREAK: hide the served revoke operation.'

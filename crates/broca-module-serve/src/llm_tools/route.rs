@@ -99,6 +99,13 @@ impl LlmTools {
         self
     }
 
+    pub(crate) fn permissions(&self) -> super::permissions::Permissions {
+        super::permissions::Permissions::new(
+            self.held.store.clone(),
+            self.consent.as_ref().map(|consent| consent.io.clone()),
+        )
+    }
+
     pub fn with_consent(
         mut self,
         consent: Arc<super::consent::Consent>,

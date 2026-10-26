@@ -4,6 +4,7 @@
 mod admission;
 pub mod consent;
 pub mod held;
+pub mod permissions;
 mod private_content;
 mod route;
 
