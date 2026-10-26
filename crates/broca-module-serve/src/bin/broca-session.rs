@@ -175,6 +175,15 @@ impl From<CliCacheRole> for CacheRole {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Replay a unary management op. Stdout is the exact response or refusal body;
+    /// stderr reports its byte count, SHA-256 and elapsed milliseconds. Refusals exit 1.
+    Raw {
+        #[arg(long)]
+        op: String,
+        /// JSON params, for example '{"from":0,"limit":10}'.
+        #[arg(long, default_value = "{}")]
+        params: String,
+    },
     /// Export digest-verified request bodies directly from live or archived WALs (no daemon).
     CacheDump(CacheDumpArgs),
     /// Compose a tool-only fetch plan from live provider catalogs, without sending a turn.
@@ -658,6 +667,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let raw_output = matches!(
         &args.cmd,
         Cmd::Status { raw: true, .. }
+            | Cmd::Raw { .. }
             | Cmd::Result { raw: true, .. }
             | Cmd::Describe
             | Cmd::EventGet { .. }
@@ -840,6 +850,32 @@ async fn run(args: Args) -> Result<i32, String> {
                 || format!("IMPORT {response:?}"),
             );
             Ok(0)
+        }
+        Cmd::Raw { op, params } => {
+            if op == "session.subscribe" {
+                return Err(
+                    "raw accepts unary operations, not session.subscribe; use subscribe".into(),
+                );
+            }
+            let params: serde_json::Value =
+                serde_json::from_str(&params).map_err(|error| format!("raw params: {error}"))?;
+            let started = std::time::Instant::now();
+            let reply = client
+                .management_raw(&op, &params)
+                .await
+                .map_err(|error| format!("raw transport: {error}"))?;
+            let elapsed_ms = started.elapsed().as_millis();
+            let (body, exit) = match reply {
+                Ok(body) => (body, 0),
+                Err(body) => (body, 1),
+            };
+            write_raw_reply_to(
+                &body,
+                Some(elapsed_ms),
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )?;
+            Ok(exit)
         }
         Cmd::Status { run_id, raw } => {
             match run_id {
@@ -2087,12 +2123,35 @@ fn emit_run_final_text_to(json: bool, text: &str, output: &mut impl FnMut(String
 }
 
 fn write_raw_reply(body: &[u8]) -> Result<(), String> {
-    let mut stdout = std::io::stdout().lock();
+    write_raw_reply_to(
+        body,
+        None,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+fn write_raw_reply_to(
+    body: &[u8],
+    elapsed_ms: Option<u128>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<(), String> {
     stdout
         .write_all(body)
         .and_then(|()| stdout.flush())
         .map_err(|error| format!("write raw daemon reply to stdout: {error}"))?;
-    eprintln!("RAW bytes={} sha256={:x}", body.len(), Sha256::digest(body));
+    writeln!(
+        stderr,
+        "RAW bytes={} sha256={:x}",
+        body.len(),
+        Sha256::digest(body)
+    )
+    .map_err(|error| format!("write raw reply metadata: {error}"))?;
+    if let Some(elapsed_ms) = elapsed_ms {
+        writeln!(stderr, "RAW elapsed_ms={elapsed_ms}")
+            .map_err(|error| format!("write raw reply elapsed time: {error}"))?;
+    }
     Ok(())
 }
 
@@ -2115,6 +2174,40 @@ mod tests {
     use std::sync::Arc;
 
     use super::{cache_params, load_plan, read_page_event, run, Args, Cmd, PathBuf};
+
+    #[test]
+    fn generic_raw_command_preserves_json_params() {
+        use clap::Parser;
+        let params = r#"{"from":12,"limit":3}"#;
+        let args = Args::try_parse_from([
+            "broca-session",
+            "--subc",
+            "unused",
+            "--project-root",
+            ".",
+            "--session",
+            "s",
+            "raw",
+            "--op",
+            "session.history",
+            "--params",
+            params,
+        ])
+        .unwrap();
+        assert!(
+            matches!(args.cmd, Cmd::Raw { op, params: parsed } if op == "session.history" && parsed == params)
+        );
+    }
+
+    #[test]
+    fn raw_reply_bytes_and_digest_are_exact_with_elapsed_metadata() {
+        let body = b"abc";
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        super::write_raw_reply_to(body, Some(2001), &mut stdout, &mut stderr).unwrap();
+        assert_eq!(stdout, body);
+        assert_eq!(String::from_utf8(stderr).unwrap(), "RAW bytes=3 sha256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\nRAW elapsed_ms=2001\n");
+    }
 
     #[test]
     fn cache_dump_reads_all_compaction_records_live_and_archived() {

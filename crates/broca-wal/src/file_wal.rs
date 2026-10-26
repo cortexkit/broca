@@ -1477,6 +1477,15 @@ pub fn read_records_tail_bounded(
         Err(error) => return Err(WalError::Io(error)),
     };
     let metadata = file.metadata().map_err(WalError::Io)?;
+    read_records_tail_snapshot(&mut file, &metadata, max_bytes, tail_bytes)
+}
+
+fn read_records_tail_snapshot(
+    file: &mut File,
+    metadata: &std::fs::Metadata,
+    max_bytes: u64,
+    tail_bytes: u64,
+) -> Result<Option<WalRangeRead>, WalError> {
     let file_size = metadata.len();
     if file_size > max_bytes {
         return Err(WalError::TooLarge {
@@ -1485,9 +1494,16 @@ pub fn read_records_tail_bounded(
         });
     }
     let start = file_size.saturating_sub(tail_bytes);
-    let suffix = read_open_file_capped(&mut file, start, file_size, file_size)?;
-    let lineage = read_first_frame_lineage(&mut file, max_bytes)?;
-    let file_id = metadata_file_id(&metadata);
+    // The observed length bounds a snapshot, not the safety cap. A capped EOF
+    // probe would mistake a concurrent append for an over-cap file. Read only
+    // the already size-checked window, keeping both the cap and tail bound intact.
+    file.seek(SeekFrom::Start(start)).map_err(WalError::Io)?;
+    let mut suffix = Vec::new();
+    file.take(file_size - start)
+        .read_to_end(&mut suffix)
+        .map_err(WalError::Io)?;
+    let lineage = read_first_frame_lineage(file, max_bytes)?;
+    let file_id = metadata_file_id(metadata);
     if start == 0 {
         let decoded = decode_bytes(&suffix, 0, 1)?;
         return select_decoded_range(decoded, &suffix, 0, file_id, 0, None).map(Some);
@@ -2905,6 +2921,39 @@ mod tests {
         assert_eq!(reread.lineage_id, Some(first));
         assert_eq!(reread.records.len(), 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bounded_tail_snapshot_ignores_append_after_stat_without_loosening_cap() {
+        let path = tmp("bounded-tail-append-after-stat");
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append(1, &run_started(1), true).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        // Model a writer starting its next frame after the reader captured the length.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+        let result =
+            read_records_tail_snapshot(&mut file, &metadata, metadata.len() + 4096, metadata.len());
+        assert!(
+            result.is_ok(),
+            "concurrent append must not become a safety cap: {result:?}"
+        );
+        let read = result.unwrap().unwrap();
+        assert!(matches!(read.records(), WalRangeRecords::Complete(records) if records.len() == 1));
+        assert!(matches!(
+            read_records_tail_snapshot(&mut file, &metadata, metadata.len() - 1, metadata.len()),
+            Err(WalError::TooLarge { max_bytes, file_size })
+                if max_bytes == metadata.len() - 1 && file_size == metadata.len()
+        ));
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(&after[..before.len()], before.as_slice());
+        assert_eq!(after.len(), before.len() + 1);
     }
 
     #[test]

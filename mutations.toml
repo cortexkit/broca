@@ -9,6 +9,36 @@
 # Add it only after a broad replay shows those targets, with that property as its reason.
 
 [[control]]
+id = "management-request-slow-warn-threshold"
+guards = "Management replies above two seconds are visible at WARN even with default INFO filtering"
+runner = "cargo"
+package = "broca-module-serve"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-module-serve/src/serve.rs"
+expect_red = ["serve::tests::slow_management_request_warns_at_default_level"]
+file = "crates/broca-module-serve/src/serve.rs"
+old = "if elapsed_us > 2_000_000 {"
+new = "if elapsed_us > 3_000_000 { // NON-VACUITY BREAK: hide replies between two and three seconds."
+
+[[control]]
+id = "wal-bounded-tail-snapshot-not-safety-cap"
+guards = "A concurrent append after stat cannot turn the snapshot length into a one-byte-short safety cap"
+runner = "cargo"
+package = "broca-wal"
+target = "--lib"
+select = "expected"
+test_file = "crates/broca-wal/src/file_wal.rs"
+expect_red = ["file_wal::tests::bounded_tail_snapshot_ignores_append_after_stat_without_loosening_cap"]
+file = "crates/broca-wal/src/file_wal.rs"
+old = """    file.seek(SeekFrom::Start(start)).map_err(WalError::Io)?;
+    let mut suffix = Vec::new();
+    file.take(file_size - start)
+        .read_to_end(&mut suffix)
+        .map_err(WalError::Io)?;"""
+new = "let suffix = read_open_file_capped(file, start, file_size, file_size)?; // NON-VACUITY BREAK: treat the observed length as a safety cap."
+
+[[control]]
 id = "store-nonadvancing-projection-preserves-wal-anchor"
 platforms = ["linux", "macos"]
 guards = "A terminal-only projection preserves the byte anchor at the unchanged watermark so the next admission reads only the WAL tail"
