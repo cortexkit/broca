@@ -103,6 +103,13 @@ pub struct ProviderHttpClient {
     decoding: reqwest::Client,
     request_gzip: request_gzip::RequestGzipPolicy,
     chatgpt_connections: ChatgptConnections,
+    /// Tests only: when set, every send fails at once with a refused connection, without
+    /// opening a socket. A refused localhost connect takes seconds on some platforms, so a
+    /// test that needs many connect failures in a bounded window cannot dial a real closed
+    /// port; this keeps the failure and its `ConnectFailed` outcome while removing the
+    /// operating system from the timing.
+    #[cfg(test)]
+    fail_connects: bool,
 }
 
 impl ProviderHttpClient {
@@ -124,6 +131,8 @@ impl ProviderHttpClient {
             decoding: build(true),
             request_gzip,
             chatgpt_connections: ChatgptConnections::default(),
+            #[cfg(test)]
+            fail_connects: false,
         }
     }
 
@@ -138,7 +147,22 @@ impl ProviderHttpClient {
 
     /// The one-attempt HTTP/1.1 pool-escape client, with this client's request-gzip policy.
     fn http1_escape(&self) -> Self {
-        Self::build(|| provider_client_builder().http1_only(), self.request_gzip)
+        let escaped = Self::build(|| provider_client_builder().http1_only(), self.request_gzip);
+        escaped.with_test_hooks_from(self)
+    }
+
+    /// Tests only: carry the test-only send hooks across the escape-client rebuild, so the
+    /// step's one escape attempt fails the same way the primary pool does.
+    #[cfg(test)]
+    fn with_test_hooks_from(mut self, source: &Self) -> Self {
+        self.fail_connects = source.fail_connects;
+        self
+    }
+
+    /// Production builds have no test-only send hooks, so the rebuilt client is already whole.
+    #[cfg(not(test))]
+    fn with_test_hooks_from(self, _source: &Self) -> Self {
+        self
     }
 
     /// The client that never decodes responses, for diagnostic tools that record a response
@@ -172,6 +196,8 @@ impl From<reqwest::Client> for ProviderHttpClient {
             decoding: client,
             request_gzip: request_gzip::RequestGzipPolicy::isolated(false),
             chatgpt_connections: ChatgptConnections::default(),
+            #[cfg(test)]
+            fail_connects: false,
         }
     }
 }
@@ -3017,6 +3043,16 @@ async fn send_attempt(
     header_timeout: Duration,
     trace: &mut AttemptTrace,
 ) -> Result<reqwest::Response, AttemptFailure> {
+    // Tests only: fail the connect before any socket opens, so a test that needs many
+    // connect failures is not timed by the operating system's refusal speed. The outcome
+    // and error are the production refusal's: `ConnectFailed` with a retryable class.
+    #[cfg(test)]
+    if client.fail_connects {
+        return Err(AttemptFailure::transport(
+            transport_error("refused test connection (no socket opened)"),
+            AttemptOutcome::ConnectFailed,
+        ));
+    }
     let builder = attempt_request_builder(
         client,
         &request.url,
@@ -9017,6 +9053,11 @@ mod tests {
     /// re-sends at Codex's backoff, then a connect wait of 5 s doubling to 60 s. Every send
     /// leaves its attempt record. Only the caller's cancel ends it, promptly and without an
     /// error.
+    ///
+    /// The refusal is injected, not dialed: a refused localhost connect takes seconds on
+    /// some platforms, so forty real refusals cannot fit the bounded wait below. The seam
+    /// fails the connect before any socket opens, and the `ConnectFailed` outcome it feeds
+    /// the retry decision is the production refusal's.
     #[tokio::test]
     async fn codex_unreachable_endpoint_retries_until_cancelled() {
         let address = {
@@ -9025,8 +9066,10 @@ mod tests {
         };
         let mut frozen = openai_chat_frozen_config("retry-test");
         frozen.family_id = WireFamilyId::OpenAiResponses;
+        // Never dialed: the test client refuses the connect before any socket opens.
         frozen.base_url = Some(format!("http://{address}"));
         let mut provider = LiveProvider::new(RetryTestFamily::new(0), frozen, AuthHandle::None);
+        provider.client.fail_connects = true;
         let waits = use_virtual_retry_waits(&mut provider);
         let cancel = CancellationToken::new();
         let mut rx = provider.start_step(
