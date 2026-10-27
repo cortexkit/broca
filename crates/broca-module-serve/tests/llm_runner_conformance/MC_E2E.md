@@ -72,7 +72,12 @@ The run checks, in order:
   dropped part is gone from the newest applied view, the stamped outputs are
   no longer sent, and the next model request is smaller than the one before
   it;
-- a real process kill mid-step is followed by identical request bytes on resume.
+- a real process kill mid-step seals the run `interrupted` at boot (the
+  crash-orphan seal): resending its send_id reads that terminal back without
+  reaching the model, the held step's unfinished reply is nowhere in the
+  transcript, and a new send_id starts a new episode whose first request
+  renders the held compaction-applied history plus the new user message, with
+  the applied view intact and the dropped reads still not sent.
 
 Not checked: views Magic Context hands over during a ride (a rewrite broca asks
 for when the request prefix changes anyway), its reminder text, and the context

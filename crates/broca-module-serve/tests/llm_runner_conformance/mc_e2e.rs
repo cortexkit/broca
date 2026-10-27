@@ -1017,8 +1017,12 @@ async fn real_mc_async_compaction_end_to_end() {
         "view v{applied_version} must precede its consuming step"
     );
 
-    // A real kill mid-step, then a resume with byte-identical request bytes. The held run is
-    // answered with text only, and after the restart the scripted model serves its next turn.
+    // A real kill mid-step, then a new episode after the restart. Broca's boot
+    // crash-orphan seal ends the SIGKilled run `interrupted` (documented behaviour,
+    // unchanged since the public release): resending its send_id only reads that
+    // terminal back and can never resume the held model step. The held run is
+    // answered with text only, and after the restart the scripted model serves its
+    // next turn, so the new episode answers "Resumed answer.".
     turns.extend([
         ScriptedTurn::new(vec![ScriptedPart::Text("Held answer.".into())]),
         ScriptedTurn::new(vec![ScriptedPart::Text("Resumed answer.".into())]),
@@ -1050,32 +1054,233 @@ async fn real_mc_async_compaction_end_to_end() {
         &root,
         "SIGKILL delivered to broca; restarting private stack on the same WAL",
     );
+    // The hold below captures the new episode's first request. The resend of the
+    // killed send_id must not reach the model, so the request count proves it.
     subject.hold_next_model_step(SESSION).await.unwrap();
     let synced = scope_sync_lines(&root);
     live = subject.start(&root).await.unwrap();
     wait_scope_synced(&root, synced).await;
     let route = scoped_session_route(&subject, &live).await;
-    send(&route, resume_fields, &root).await;
-    subject.await_model_step(SESSION).await.unwrap();
-    let resumed = requests(&subject).last().unwrap().clone();
-    std::fs::write(root.join("request-after-restart.json"), &resumed).unwrap();
+    let killed_send_id = resume_fields["send_id"].as_str().unwrap().to_owned();
+    // The killed run's id, from the WAL it started: the resend below must name it.
+    let killed_run_id = subject
+        .records(&live, SESSION)
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            WalRecord::RunStarted {
+                run_id, send_id, ..
+            } if send_id.as_deref() == Some(killed_send_id.as_str()) => Some(run_id.0.clone()),
+            _ => None,
+        })
+        .expect("the killed run recorded no start");
+    let sent_before_resend = requests(&subject).len();
+    let resend = route
+        .request("session.send", resume_fields.clone())
+        .await
+        .expect("session.send transport");
+    note(
+        &root,
+        format!("resend of the killed send_id replied: {resend:?}"),
+    );
+    // The resend answers the sealed terminal instead of resuming: a resumed run
+    // would answer `active` and reach the model, neither of which may happen.
+    let Reply::Response(resend) = &resend else {
+        panic!("the killed send_id was refused after the restart");
+    };
     assert_eq!(
-        before_kill, resumed,
-        "resume changed rendered request bytes"
+        resend["run_id"].as_str(),
+        Some(killed_run_id.as_str()),
+        "the resend named a different run than the killed one"
+    );
+    assert_eq!(
+        resend["state"].as_str(),
+        Some("finished"),
+        "the killed run resumed instead of reading back its terminal: {resend}"
+    );
+    assert_eq!(
+        resend["reason"].as_str(),
+        Some("interrupted"),
+        "the killed run did not read back interrupted: {resend}"
+    );
+    assert_eq!(
+        requests(&subject).len(),
+        sent_before_resend,
+        "the resend of a sealed run reached the model"
+    );
+    // The terminal is `interrupted`, never `cancelled`: the seal ends a run the
+    // daemon never cancelled. The boot pass may still be sealing it, so a
+    // transient refusal means poll again, as the retention lane does.
+    let status =
+        broca_test_support::wait_until("the killed run reads back interrupted", || async {
+            let reply = route
+                .request("run.status", json!({ "run_id": killed_run_id }))
+                .await
+                .expect("run.status transport");
+            match reply {
+                Reply::Error(error)
+                    if error
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail["class"] == "transient") =>
+                {
+                    Err(format!(
+                        "run.status not ready: {} {}",
+                        error.code, error.message
+                    ))
+                }
+                Reply::Error(error) => panic!(
+                    "run.status refused the killed run: {} {}",
+                    error.code, error.message
+                ),
+                Reply::Response(status) if status["state"] == "active" => {
+                    Err(format!("the killed run is still active: {status}"))
+                }
+                Reply::Response(status) => Ok(status),
+            }
+        })
+        .await;
+    assert_eq!(
+        status["state"].as_str(),
+        Some("interrupted"),
+        "the killed run did not read back interrupted: {status}"
+    );
+    let records = subject.records(&live, SESSION);
+    let start_at = records
+        .iter()
+        .position(|record| {
+            matches!(record, WalRecord::RunStarted { run_id, .. } if run_id.0 == killed_run_id)
+        })
+        .expect("the killed run recorded no start");
+    // The WAL agrees with the API above: the killed episode's terminal is
+    // `interrupted`, so it was sealed, never cancelled.
+    let terminal = records[start_at..]
+        .iter()
+        .find_map(|record| match record {
+            WalRecord::RunFinished { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("the killed run recorded no terminal");
+    assert!(
+        matches!(terminal, broca_protocol::RunFinishReason::Interrupted),
+        "the killed run was not sealed interrupted: {terminal:?}"
+    );
+    // The held model step never answered: its step started, no step finished, so
+    // there is no unfinished reply that could leak into the transcript.
+    assert!(
+        records[start_at..]
+            .iter()
+            .any(|record| matches!(record, WalRecord::StepStarted { .. })),
+        "the killed run recorded no step"
     );
     assert!(
-        subject.records(&live, SESSION).contains(&view),
-        "resume lost the applied view"
+        !records[start_at..]
+            .iter()
+            .any(|record| matches!(record, WalRecord::ModelStepFinished { .. })),
+        "the held model step finished after the kill"
     );
+    let page = route
+        .request("session.read", json!({}))
+        .await
+        .expect("session.read transport");
+    let Reply::Response(page) = &page else {
+        panic!("session.read refused after the restart");
+    };
+    // The killed run's user message stays, but its held reply never existed: the
+    // model was held before answering and the seal finished the run without it.
+    assert!(
+        !page.to_string().contains("Held answer."),
+        "the held step's unfinished reply is in the transcript: {page}"
+    );
+    // A NEW send_id starts a new episode: it must answer `active` under a fresh
+    // run id rather than joining the sealed run.
+    previous_notice_published(&subject, &live, &events).await;
+    let next_fields = fields(&subject, false, runs + 1);
+    assert_ne!(
+        next_fields["send_id"].as_str(),
+        Some(killed_send_id.as_str()),
+        "the new send reused the killed send_id"
+    );
+    let next_send = route
+        .request("session.send", next_fields)
+        .await
+        .expect("session.send transport");
+    note(&root, format!("new send replied: {next_send:?}"));
+    let Reply::Response(next_send) = &next_send else {
+        panic!("the new send was refused after the restart");
+    };
+    assert_eq!(
+        next_send["state"].as_str(),
+        Some("active"),
+        "the new send_id did not start a new episode: {next_send}"
+    );
+    let next_run_id = next_send["run_id"]
+        .as_str()
+        .expect("the new send names its run");
+    assert_ne!(
+        next_run_id, killed_run_id,
+        "the new send joined the killed run instead of starting an episode"
+    );
+    subject.await_model_step(SESSION).await.unwrap();
+    let after_restart = requests(&subject).last().unwrap().clone();
+    std::fs::write(root.join("request-after-restart.json"), &after_restart).unwrap();
+    // The new episode renders exactly the compaction-applied history the held
+    // request had. Rendering is deterministic, so parsed-JSON equality is the
+    // byte-exact check: everything but `messages` is unchanged (system text and
+    // tools included), the held messages are the new one's prefix, and the only
+    // addition is the new user message.
+    let before: Value = serde_json::from_slice(&before_kill).unwrap();
+    let after: Value = serde_json::from_slice(&after_restart).unwrap();
+    let mut before_head = before.as_object().unwrap().clone();
+    let mut after_head = after.as_object().unwrap().clone();
+    let before_messages = before_head.remove("messages").unwrap();
+    let after_messages = after_head.remove("messages").unwrap();
+    assert_eq!(
+        after_head, before_head,
+        "the new episode changed the held request outside its messages"
+    );
+    assert_eq!(
+        after_messages[0], before_messages[0],
+        "the new episode changed the held system message"
+    );
+    let before_messages = before_messages.as_array().unwrap();
+    let after_messages = after_messages.as_array().unwrap();
+    assert_eq!(
+        after_messages.len(),
+        before_messages.len() + 1,
+        "the new request is not the held request plus one message"
+    );
+    assert_eq!(
+        &after_messages[..before_messages.len()],
+        before_messages,
+        "the held request's messages are not the new request's prefix"
+    );
+    let new_message = after_messages.last().unwrap();
+    assert_eq!(
+        new_message["role"].as_str(),
+        Some("user"),
+        "the new request does not end in the new user message: {new_message}"
+    );
+    assert!(
+        new_message
+            .to_string()
+            .contains(&format!("Turn {}:", runs + 1)),
+        "the new request does not end in the new user message: {new_message}"
+    );
+    let records = subject.records(&live, SESSION);
+    assert!(records.contains(&view), "the restart lost the applied view");
+    // The applied view still holds: the new episode renders its edits and the
+    // dropped reads are still not sent.
+    assert_worker_view(&root, &after_restart, &decoded, &dropped);
     note(
         &root,
         format!(
-            "Resume request byte-identical: {} bytes; applied view intact",
-            resumed.len()
+            "New episode {next_run_id} renders the held {}-byte history plus one user message; applied view v{applied_version} intact",
+            before_kill.len(),
         ),
     );
     subject.release_model_step(SESSION).await.unwrap();
-    finished(&subject, &live, runs + 1).await;
+    finished(&subject, &live, runs + 2).await;
     note(&root, mc.assert_private_databases(&live));
     note(&root, "Not checked: ride views, reminder text, and the ceiling beyond Setup recording one. No historian is configured, so no summarizer child run can be made.");
 }
