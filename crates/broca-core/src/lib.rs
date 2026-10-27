@@ -22,6 +22,7 @@ pub mod compaction;
 pub mod consent;
 pub mod context;
 pub mod delivery_order;
+pub mod durability_counters;
 pub mod head;
 pub mod hooks;
 pub mod import;

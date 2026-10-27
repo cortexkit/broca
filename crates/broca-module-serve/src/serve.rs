@@ -363,6 +363,27 @@ fn projection_health_report(failures: u64, behind_sessions: u64) -> ProjectionHe
     }
 }
 
+/// Per-cause fsync totals for the writer sync deadline, reported under
+/// `wal_fsyncs`: barriers the owner asked for, deadline syncs the loop issued
+/// on its own, and the final sync of each close path. A healthy writer that
+/// appends without barriers shows deadline syncs and little else.
+fn wal_fsync_health_metrics() -> serde_json::Value {
+    wal_fsync_health_json(broca_core::durability_counters::snapshot())
+}
+
+/// Render one durability snapshot as the `wal_fsyncs` health object. Pure so
+/// tests can pin the exact shape and values.
+fn wal_fsync_health_json(
+    snapshot: broca_core::durability_counters::DurabilitySnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "barrier": snapshot.barrier,
+        "deadline": snapshot.deadline,
+        "shutdown": snapshot.shutdown,
+        "disconnect": snapshot.disconnect,
+    })
+}
+
 fn health_status(details: &[String]) -> subc_protocol::session::HealthStatus {
     if details.is_empty() {
         subc_protocol::session::HealthStatus::Ok
@@ -2004,6 +2025,8 @@ async fn handle_control_request(
                     // behind-session gauge, never this historical counter.
                     "projection_failures": projection_health.failures,
                     "projection_behind_sessions": projection_health.behind_sessions,
+                    // Fsyncs the writer loop issued, by the path that issued them.
+                    "wal_fsyncs": wal_fsync_health_metrics(),
                     // Lifetime operation counts for THIS process. They reset on restart and are not
                     // fleet totals; consumers derive rates by diffing two readings from one launch.
                     // Always emit zero so a quiet process cannot be confused with an unwired counter.
@@ -5608,6 +5631,26 @@ mod tests {
         assert!(
             !detail.contains("  "),
             "health detail contains an accidental run of spaces: {detail:?}"
+        );
+    }
+
+    #[test]
+    fn wal_fsync_health_metrics_reports_named_causes() {
+        let metrics = wal_fsync_health_json(broca_core::durability_counters::DurabilitySnapshot {
+            barrier: 2,
+            deadline: 3,
+            shutdown: 1,
+            disconnect: 4,
+        });
+        assert_eq!(
+            metrics,
+            serde_json::json!({
+                "barrier": 2,
+                "deadline": 3,
+                "shutdown": 1,
+                "disconnect": 4,
+            }),
+            "health reports each fsync cause with its exact total"
         );
     }
 
