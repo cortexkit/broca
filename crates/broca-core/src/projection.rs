@@ -253,6 +253,22 @@ impl ControlProjectionState {
         Some(state)
     }
 
+    /// The state a projection holds just before an episode's `RunStarted`, given the
+    /// transcript ordinal where that episode's input starts.
+    ///
+    /// A `RunStarted` resets every episode-local field, and placement keeps only the absolute
+    /// next ordinal across episodes (its batch, held steers and budget facts reset at the run
+    /// start too). So projecting an episode from its `RunStarted` with this state yields the
+    /// same units and the same final state as projecting the whole log, as long as the
+    /// ordinal is the episode's own first ordinal. Use it only immediately before a
+    /// `RunStarted` record; anywhere else the episode-local fields would be missing.
+    pub fn at_episode_start(first_ord: u64) -> Self {
+        Self {
+            placement: crate::placement::Placement::new(first_ord),
+            ..Self::default()
+        }
+    }
+
     pub fn placement(&self) -> &crate::placement::Placement {
         &self.placement
     }
@@ -1156,6 +1172,247 @@ fn message_shape_finish_reason(
     } else {
         FinishReason::Stop
     }
+}
+
+// Episode-bounded reads from the offset index.
+//
+// On overhaul state roots the offset index records where each run episode starts. The model
+// view and a live attach then decode only the frames of the episodes they show, folding at
+// most one episode's records to rebuild state, instead of replaying the whole log. These
+// helpers check everything they take from the index against the log before relying on it, and
+// a read that fails any check replays the whole log instead.
+
+/// One run episode as the offset index's `episode` row locates it.
+///
+/// Each field mirrors a column the indexer wrote, so episode-bounded reads never depend on the
+/// store crate. None is trusted on its own: [`replay_from_episode_start`] re-reads the episode's
+/// `RunStarted` frame and checks the ordinal where its input starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedEpisode {
+    /// WAL sequence of the episode's `RunStarted`; `None` for records written before the first run.
+    pub run_started_seq: Option<u64>,
+    /// Byte offset where that `RunStarted` frame starts.
+    pub run_started_off: Option<u64>,
+    /// Transcript ordinal where the episode's input starts.
+    pub first_ord: u64,
+    /// Transcript ordinal just past the episode's last placed message.
+    pub end_ord: u64,
+}
+
+/// The index's tail seed at the committed projection boundary an episode read starts from.
+///
+/// The boundary is the last qualified `projection_boundary` row before the episode's
+/// `RunStarted`; the other fields are the tail seed the index holds at that boundary: exactly
+/// the inputs [`crate::replay::replay_seeded_at_validated_boundary`] takes, which validates the
+/// boundary frame before anything is replayed.
+#[derive(Debug, Clone)]
+pub struct EpisodeSeed {
+    pub boundary: crate::replay::SeedBoundary,
+    /// Transcript length the boundary covers.
+    pub ordinal_base: u64,
+    /// Steers recorded before the boundary that no step boundary has placed yet.
+    pub held_steers: Vec<broca_protocol::Message>,
+    pub tag_seed: crate::tags::TagSeed,
+    /// Model, run id and budget of the episode open at the boundary.
+    pub seed_origin: Option<broca_protocol::request::ModelHandle>,
+    pub seed_run_id: Option<RunId>,
+    pub seed_budget: Option<broca_protocol::request::BudgetConfig>,
+}
+
+/// A replay that starts at a validated position and reaches an episode's `RunStarted`.
+#[derive(Debug, Clone)]
+pub struct EpisodeReplay {
+    /// Replay of every frame given, seeded at the boundary or from the log's first record.
+    pub state: crate::replay::ReplayState,
+    /// Transcript ordinal of `state.prompt[0]`.
+    pub ordinal_base: u64,
+    /// Index, among the frames given, of the episode's `RunStarted`.
+    pub run_started: usize,
+}
+
+/// Byte offset of the log's first record: past the header frame when the log has one.
+pub fn first_record_offset(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<u64> {
+    let header = read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64)?;
+    Ok(match broca_wal::framing::decode_next(&header) {
+        broca_wal::framing::DecodeStep::Lineage { consumed, .. } => consumed as u64,
+        _ => 0,
+    })
+}
+
+/// Decode the frames in the byte range `from..to`, which must start and end on frame
+/// boundaries, counting each decoded frame when `decode_counter` is given.
+///
+/// The range is read once through `read_at`. A log shorter than the range, a torn or corrupt
+/// frame, or a frame from a newer writer is an error: the index named a range the log does not
+/// hold, and the caller replays the whole log instead. With counting on, tests assert that a
+/// read decodes only the frames of the range it asked for, never the whole log.
+pub fn decode_positioned_frames(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    from: u64,
+    to: u64,
+    decode_counter: Option<&std::cell::Cell<u64>>,
+) -> Result<Vec<crate::replay::PositionedFrame>, String> {
+    use broca_wal::framing::{decode_next, DecodeStep};
+    let len = to
+        .checked_sub(from)
+        .ok_or_else(|| format!("WAL range {from}..{to} is reversed"))?;
+    let bytes = read_at(from, len).map_err(|error| format!("WAL read at {from}: {error}"))?;
+    if (bytes.len() as u64) < len {
+        return Err(format!(
+            "WAL ends at {} before the range end {to}",
+            from + bytes.len() as u64
+        ));
+    }
+    let mut frames = Vec::new();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let at = from + off as u64;
+        match decode_next(&bytes[off..]) {
+            DecodeStep::Record { framed, consumed } => {
+                if let Some(counter) = decode_counter {
+                    counter.set(counter.get() + 1);
+                }
+                frames.push(crate::replay::PositionedFrame {
+                    off: at,
+                    framed: *framed,
+                });
+                off += consumed;
+            }
+            DecodeStep::Lineage { consumed, .. } => {
+                if let Some(counter) = decode_counter {
+                    counter.set(counter.get() + 1);
+                }
+                off += consumed;
+            }
+            DecodeStep::TornTail => return Err(format!("torn WAL frame at {at}")),
+            DecodeStep::Corrupt(error) => return Err(format!("corrupt WAL at {at}: {error}")),
+            DecodeStep::NewerWriter { ver, .. } => {
+                return Err(format!("newer WAL writer version {ver} at {at}"))
+            }
+        }
+    }
+    Ok(frames)
+}
+
+/// The episode whose records hold WAL sequence `seq`: the last one started at or before it.
+///
+/// `episodes` are the session's `episode` rows in episode order. `None` when `seq` precedes
+/// every run start.
+pub fn episode_holding_seq(episodes: &[IndexedEpisode], seq: u64) -> Option<usize> {
+    episodes
+        .iter()
+        .rposition(|episode| episode.run_started_seq.is_some_and(|start| start <= seq))
+}
+
+/// Where the episode's `RunStarted` sits among `frames`, if the frame at its recorded sequence
+/// is a `RunStarted` at its recorded byte offset.
+pub fn episode_start_index(
+    episode: &IndexedEpisode,
+    frames: &[crate::replay::PositionedFrame],
+) -> Option<usize> {
+    let seq = episode.run_started_seq?;
+    let index = frames
+        .iter()
+        .position(|positioned| positioned.framed.seq == seq)?;
+    let frame = &frames[index];
+    (matches!(frame.framed.record, WalRecord::RunStarted { .. })
+        && episode.run_started_off == Some(frame.off))
+    .then_some(index)
+}
+
+/// Replay `frames` from a validated position through an episode's `RunStarted` and beyond.
+///
+/// With a seed, `frames` must continue its boundary, and the replay goes through
+/// [`crate::replay::replay_seeded_at_validated_boundary`], which re-reads the boundary frame and
+/// checks its sequence, hash, lineage and qualification and the frames' contiguity. Without a
+/// seed, `frames` must begin at the log's first record, so nothing stored is relied on. Either
+/// way the frames must hold the episode's `RunStarted` at its recorded sequence and offset, and
+/// the replay must place that episode's input at the episode's recorded first ordinal. Any
+/// mismatch returns the [`crate::replay::SeedFallback`] reason, and the caller replays the whole
+/// log instead.
+pub fn replay_from_episode_start(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    seed: Option<&EpisodeSeed>,
+    episode: &IndexedEpisode,
+    frames: &[crate::replay::PositionedFrame],
+) -> Result<EpisodeReplay, crate::replay::SeedFallback> {
+    use crate::replay::SeedFallback;
+    let run_started = episode_start_index(episode, frames).ok_or(SeedFallback {
+        reason: "episode start not in the frames read",
+    })?;
+    let (state, ordinal_base) = match seed {
+        Some(seed) => (
+            crate::replay::replay_seeded_at_validated_boundary(
+                read_at,
+                &seed.boundary,
+                frames,
+                seed.seed_origin.clone(),
+                seed.seed_run_id.clone(),
+                seed.seed_budget.clone(),
+                None,
+                seed.ordinal_base,
+                false,
+                seed.tag_seed,
+                seed.held_steers.clone(),
+            )?,
+            seed.ordinal_base,
+        ),
+        None => {
+            let start = first_record_offset(read_at).map_err(|_| SeedFallback {
+                reason: "log unreadable",
+            })?;
+            // `run_started` was found, so `frames` is not empty.
+            if frames[0].framed.seq != 1 || frames[0].off != start {
+                return Err(SeedFallback {
+                    reason: "frames do not start at the log's first record",
+                });
+            }
+            if frames
+                .windows(2)
+                .any(|pair| pair[0].framed.seq + 1 != pair[1].framed.seq)
+            {
+                return Err(SeedFallback {
+                    reason: "frames have a sequence gap",
+                });
+            }
+            let state = crate::replay::replay_seeded(
+                frames.iter().map(|positioned| &positioned.framed.record),
+                None,
+                None,
+                None,
+                None,
+                0,
+                false,
+                crate::tags::TagSeed::default(),
+            )
+            .map_err(|_| SeedFallback {
+                reason: "replay refused the frames",
+            })?;
+            (state, 0)
+        }
+    };
+    // Replay records one render episode per `RunStarted`, at the ordinal where its input starts.
+    let starts_before = frames[..run_started]
+        .iter()
+        .filter(|positioned| matches!(positioned.framed.record, WalRecord::RunStarted { .. }))
+        .count();
+    let prompt_start = state
+        .render_episodes
+        .as_deref()
+        .and_then(|episodes| episodes.get(starts_before))
+        .map(|rendered| rendered.prompt_start as u64);
+    if prompt_start != Some(episode.first_ord) {
+        return Err(SeedFallback {
+            reason: "episode first ordinal mismatch",
+        });
+    }
+    Ok(EpisodeReplay {
+        state,
+        ordinal_base,
+        run_started,
+    })
 }
 
 #[cfg(test)]

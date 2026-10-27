@@ -154,14 +154,26 @@ fn replay_for_attach(
 ) -> Result<AttachReplay, String> {
     let durable_prefix: Vec<broca_wal::FramedRecord> =
         records.into_iter().filter(|f| f.seq <= h).collect();
+    project_attach(&durable_prefix, ControlProjectionState::default(), from)
+}
+
+/// Project a durable prefix for one attach, starting from `state`.
+///
+/// `durable_prefix` ends at the barrier head. `state` must be the projection state just before
+/// its first record: the default for a prefix starting at the log's first record, or
+/// [`ControlProjectionState::at_episode_start`] for one starting at an episode's `RunStarted`.
+fn project_attach(
+    durable_prefix: &[broca_wal::FramedRecord],
+    mut state: ControlProjectionState,
+    from: AttachFrom,
+) -> Result<AttachReplay, String> {
     let seeded_h = durable_prefix.last().map_or(0, |record| record.seq);
-    let mut state = ControlProjectionState::default();
     Ok(match from {
         // Live uses the existing strictly-after comparison once the barrier has projected H.
         // An empty lineage has no cursor to resume after, but Start is equivalent because its
         // replay is empty.
         AttachFrom::Live => {
-            let last = advance_control_projection_state(&durable_prefix, &mut state);
+            let last = advance_control_projection_state(durable_prefix, &mut state);
             if let Some(error) = state.placement_error() {
                 return Err(error.to_owned());
             }
@@ -195,6 +207,131 @@ fn replay_for_attach(
             }
         }
     })
+}
+
+/// Where an attach by episode starts its fold, from the offset index.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+pub(crate) struct AttachEpisodeStart {
+    /// The episode holding the attach cursor, or, for a live attach, the barrier head (see
+    /// [`broca_core::projection::episode_holding_seq`]).
+    pub episode: broca_core::projection::IndexedEpisode,
+    /// The last qualified projection boundary before that episode's `RunStarted`, with the
+    /// index's tail seed there; `None` to read from the log's first record.
+    pub seed: Option<broca_core::projection::EpisodeSeed>,
+}
+
+/// Replay an attach from the episode holding its attach point instead of the whole log.
+///
+/// Only the frames from the episode's seed boundary to the barrier head are decoded (through
+/// `read_at`, counting each when `decode_counter` is given), where `durable_end` is the byte
+/// offset just past the barrier head's frame. The fold that rebuilds projection state before
+/// the attach point covers that one episode from its `RunStarted`, which resets every
+/// episode-local field; placement carries only the episode's first ordinal across episodes. The
+/// ordinal and the episode start are validated against the log by
+/// [`broca_core::projection::replay_from_episode_start`] before they are used.
+///
+/// An attach from the lineage start, or without an episode start, decodes from the log's first
+/// record: everything it decodes is delivered. Any failed check, an unreadable range, or a
+/// projection error falls back to `complete_read` and a full replay, so the delivered units and
+/// the state handed to the live projector are the same either way; the second value names the
+/// fallback reason, `None` when the attach was served by episode.
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+fn replay_for_attach_by_episode(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    durable_end: u64,
+    h: u64,
+    from: AttachFrom,
+    start: Option<&AttachEpisodeStart>,
+    decode_counter: Option<&std::cell::Cell<u64>>,
+    complete_read: impl FnOnce() -> Result<Vec<broca_wal::FramedRecord>, String>,
+) -> Result<(AttachReplay, Option<&'static str>), String> {
+    match attach_by_episode(read_at, durable_end, h, from, start, decode_counter) {
+        Ok(replay) => Ok((replay, None)),
+        Err(reason) => Ok((replay_for_attach(complete_read()?, h, from)?, Some(reason))),
+    }
+}
+
+#[allow(dead_code, reason = "used once broca.db opens on overhaul state roots")]
+fn attach_by_episode(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+    durable_end: u64,
+    h: u64,
+    from: AttachFrom,
+    start: Option<&AttachEpisodeStart>,
+    decode_counter: Option<&std::cell::Cell<u64>>,
+) -> Result<AttachReplay, &'static str> {
+    let records_start =
+        broca_core::projection::first_record_offset(read_at).map_err(|_| "log unreadable")?;
+    let start = match from {
+        AttachFrom::Cursor(FromCursor::Start) => None,
+        _ => start,
+    };
+    let frames_from = start
+        .and_then(|start| start.seed.as_ref())
+        .map_or(records_start, |seed| seed.boundary.frame_end);
+    let frames = broca_core::projection::decode_positioned_frames(
+        read_at,
+        frames_from,
+        durable_end,
+        decode_counter,
+    )
+    .map_err(|_| "attach frames unreadable")?;
+    if frames
+        .windows(2)
+        .any(|pair| pair[0].framed.seq + 1 != pair[1].framed.seq)
+    {
+        return Err("attach frames have a sequence gap");
+    }
+    if frames.last().map_or(0, |last| last.framed.seq) < h {
+        return Err("attach frames end before the barrier head");
+    }
+    let Some(start) = start else {
+        // Everything from the log's first record: nothing stored is relied on.
+        if frames
+            .first()
+            .is_some_and(|first| first.framed.seq != 1 || first.off != records_start)
+        {
+            return Err("frames do not start at the log's first record");
+        }
+        let prefix: Vec<_> = frames
+            .into_iter()
+            .map(|positioned| positioned.framed)
+            .filter(|framed| framed.seq <= h)
+            .collect();
+        return project_attach(&prefix, ControlProjectionState::default(), from)
+            .map_err(|_| "attach projection refused");
+    };
+    let run_started = broca_core::projection::episode_start_index(&start.episode, &frames)
+        .ok_or("episode start not in the frames read")?;
+    // Validate the seed and the episode's first ordinal on the frames up to its start only:
+    // the frames after it are projected below, not replayed.
+    broca_core::projection::replay_from_episode_start(
+        read_at,
+        start.seed.as_ref(),
+        &start.episode,
+        &frames[..=run_started],
+    )
+    .map_err(|fallback| fallback.reason)?;
+    let episode_seq = frames[run_started].framed.seq;
+    match from {
+        AttachFrom::Cursor(FromCursor::After(cursor)) if cursor.wal_seq < episode_seq => {
+            return Err("attach point precedes the episode");
+        }
+        AttachFrom::Live if h < episode_seq => return Err("barrier head precedes the episode"),
+        _ => {}
+    }
+    let prefix: Vec<_> = frames
+        .into_iter()
+        .skip(run_started)
+        .map(|positioned| positioned.framed)
+        .filter(|framed| framed.seq <= h)
+        .collect();
+    project_attach(
+        &prefix,
+        ControlProjectionState::at_episode_start(start.episode.first_ord),
+        from,
+    )
+    .map_err(|_| "attach projection refused")
 }
 
 /// The attach-barrier decision for a unit arriving on the LIVE ring (step 2 of the
@@ -3229,5 +3366,549 @@ mod tests {
         .expect("a unit published after the lazy ring exists reaches the subscriber");
         assert_eq!(delivered.0, Cursor::new(2, 0));
         fanout.teardown().await;
+    }
+}
+
+/// Attach by episode: the delivered units and the state handed to the live projector equal a
+/// full replay's at every cut and every attach point, while decoding only the frames from the
+/// attach point's episode boundary to the barrier head.
+#[cfg(test)]
+mod episode_attach_tests {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use broca_core::projection::{
+        decode_positioned_frames, episode_holding_seq, EpisodeSeed, IndexedEpisode,
+    };
+    use broca_core::projection_plan::{OffsetEpisode, OffsetSeed};
+    use broca_core::replay::SeedBoundary;
+    use broca_protocol::caller::RunFinishReason;
+    use broca_protocol::content::{
+        AssistantMessage, ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult,
+    };
+    use broca_protocol::{BatchId, Delivery, MessageId, RunId, StepId, ToolCallId, Usage};
+    use broca_wal::{CompactionMessageKind, FramedRecord, RunConfig, RunOrigin, WalRecord};
+    use sha2::Digest;
+
+    use super::{
+        replay_for_attach, replay_for_attach_by_episode, AttachEpisodeStart, AttachFrom,
+        AttachReplay, FromCursor,
+    };
+
+    fn user(text: &str) -> Message {
+        Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    fn run_started(run_id: &str, input: Vec<Message>) -> WalRecord {
+        WalRecord::RunStarted {
+            written_at_ms: None,
+            tags: None,
+            session_class: None,
+            retention: None,
+            hooks: None,
+            title: None,
+            on_restart: None,
+            keep_warm: None,
+            marker_order_version: None,
+            manifest: None,
+            scope: None,
+            send_id: None,
+            request_identity_digest: None,
+            project_id: None,
+            principal: None,
+            ts_ms: None,
+            run_id: RunId(run_id.into()),
+            session: broca_protocol::BindIdentity::new("/tmp/project", "runner", "attach"),
+            config: Box::new(RunConfig {
+                turn_directives_v1: None,
+                render_tags: false,
+                computed_tags: None,
+                model: broca_protocol::request::ModelHandle::new("fake", "fake"),
+                tools: vec![].into(),
+                tool_choice: Default::default(),
+                generation: Default::default(),
+                response_format: Default::default(),
+                provider_options: serde_json::Value::Null,
+                cache_tiers: serde_json::Value::Null,
+                context_epoch: 0,
+                renderer_version: 1,
+                frozen_render_config: serde_json::Value::Null,
+                auth_selection: None,
+                tools_were_omitted: false,
+                budget: None,
+                context_limit: None,
+                work_class: None,
+                variant: None,
+                service_tier: None,
+                stop_when: Vec::new(),
+                context_management: None,
+            }),
+            input: input.into(),
+            origin: RunOrigin::Fresh,
+            submission_id: None,
+        }
+    }
+
+    fn step(step: u64, content: Vec<ContentBlock>) -> Vec<WalRecord> {
+        vec![
+            WalRecord::StepStarted {
+                step_id: StepId(step),
+            },
+            WalRecord::ModelStepFinished {
+                written_at_ms: None,
+                tags: None,
+                hooks: None,
+                step_id: StepId(step),
+                assistant_message: Arc::new(AssistantMessage {
+                    message_id: MessageId(format!("m{step}")),
+                    content,
+                }),
+                usage: Usage::default(),
+                finish_reason: None,
+                retries_used: 0,
+                service_tier_used: None,
+                speed_used: None,
+            },
+        ]
+    }
+
+    /// A model step calling `calls`, then its committed tool turn with the results arriving in
+    /// reverse plan order.
+    fn tool_step(step_id: u64, batch: &str, calls: &[&str]) -> Vec<WalRecord> {
+        let mut records = step(
+            step_id,
+            calls
+                .iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId((*id).into()),
+                        tool_name: "lookup".into(),
+                        input: serde_json::json!({ "id": id }),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+        );
+        let batch_id = BatchId(batch.into());
+        records.push(WalRecord::ToolBatchStarted {
+            batch_id: batch_id.clone(),
+            step_id: StepId(step_id),
+            planned_calls: calls.iter().map(|id| ToolCallId((*id).into())).collect(),
+        });
+        for id in calls {
+            records.push(WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                tool_call_id: ToolCallId((*id).into()),
+                tool_name: Some("lookup".into()),
+                args: Arc::new(serde_json::json!({ "id": id })),
+                module_id: None,
+                schema_pin: None,
+                approval_digest: None,
+                call_key: None,
+            });
+        }
+        for id in calls.iter().rev() {
+            records.push(WalRecord::ToolResult {
+                finished_at_ms: None,
+                tags: None,
+                hooks: None,
+                batch_id: batch_id.clone(),
+                result: Arc::new(ToolResult {
+                    tool_call_id: ToolCallId((*id).into()),
+                    output: ToolOutput::Text {
+                        text: format!("out-{id}"),
+                    },
+                    is_error: false,
+                }),
+                outcome: broca_wal::DispatchOutcome::Completed,
+                reason: None,
+                withdraw_elicitation: None,
+                provider_held: None,
+            });
+        }
+        records.push(WalRecord::ToolBatchFinished { batch_id });
+        records.push(WalRecord::TurnFinished {
+            step_id: StepId(step_id),
+        });
+        records
+    }
+
+    fn text(text: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text { text: text.into() }]
+    }
+
+    fn run_finished() -> WalRecord {
+        WalRecord::RunFinished {
+            interrupt_reason: None,
+            ts_ms: None,
+            reason: RunFinishReason::Completed,
+            usage: Usage::default(),
+            error: None,
+            retries_used: 0,
+        }
+    }
+
+    /// Four episodes: tool turns with reverse-order results and a steer placed at the first
+    /// episode's close; a non-attributable import; a third episode recording a compaction
+    /// Setup whose cuts fall inside the first episode; and a fourth after it.
+    fn corpus() -> Vec<WalRecord> {
+        let mut records = vec![run_started("r1", vec![user("task")])];
+        records.extend(tool_step(1, "r1-b1", &["a", "b"]));
+        records.extend(step(2, text("done")));
+        records.push(WalRecord::Steered {
+            written_at_ms: None,
+            tags: None,
+            retention: None,
+            ts_ms: None,
+            title: None,
+            send_id: Some("steer-late".into()),
+            request_identity_digest: None,
+            delivery: Some(Delivery::Steer),
+            input: Arc::new(vec![user("late")]),
+            hooks: None,
+        });
+        records.push(run_finished());
+        let mut import = run_started("seed", vec![user("imported")]);
+        if let WalRecord::RunStarted { origin, .. } = &mut import {
+            *origin = RunOrigin::SeededFrom {
+                origin_kind: broca_wal::SeedOriginKind::Import,
+                source_ref: "fixture:import".into(),
+                origin_device_pseudonym: None,
+                base_seq: None,
+            };
+        }
+        records.extend([import, run_finished()]);
+        records.push(run_started("r3", vec![user("next")]));
+        records.extend(step(1, text("answer")));
+        records.push(WalRecord::CompactionMessage {
+            provider: "test".into(),
+            kind: CompactionMessageKind::Setup,
+            compaction_id: "cmp-1".into(),
+            version: 1,
+            range: broca_wal::CompactionRange { from: 0, to: 2 },
+            replacement: Arc::new(vec![Message::new(
+                Role::Assistant,
+                vec![ContentBlock::Text {
+                    text: "summary".into(),
+                }],
+            )]),
+            sha256: "0".repeat(64),
+            request_id: None,
+            cursor: None,
+            call_when: None,
+            stability: None,
+            ceiling: None,
+            tag_checkpoint: Some(broca_wal::SetupTagCheckpoint {
+                tag_checkpoint: 50,
+                cut: "m3".into(),
+            }),
+            ride_wait_ms: None,
+        });
+        records.push(run_finished());
+        records.push(run_started("r4", vec![user("after")]));
+        records.extend(tool_step(1, "r4-b1", &["c"]));
+        records.extend(step(2, text("last")));
+        records.push(run_finished());
+        records
+    }
+
+    /// Each record's frame and its byte range in the encoded log.
+    fn encode(records: &[WalRecord]) -> (Vec<u8>, Vec<(u64, u64)>) {
+        let mut bytes = Vec::new();
+        let mut ranges = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            let start = bytes.len() as u64;
+            bytes.extend(broca_wal::framing::encode(index as u64 + 1, 1, record).unwrap());
+            ranges.push((start, bytes.len() as u64));
+        }
+        (bytes, ranges)
+    }
+
+    fn framed(records: &[WalRecord]) -> Vec<FramedRecord> {
+        records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| FramedRecord {
+                seq: index as u64 + 1,
+                fence: 1,
+                record: record.clone(),
+            })
+            .collect()
+    }
+
+    /// The episode rows and committed projection boundaries the offset index holds for a log,
+    /// from the same fold the indexer runs.
+    fn index_log(bytes: &[u8], ranges: &[(u64, u64)]) -> (Vec<IndexedEpisode>, Vec<SeedBoundary>) {
+        let mut seed = OffsetSeed::default();
+        let mut episodes: BTreeMap<u64, OffsetEpisode> = BTreeMap::new();
+        let mut boundaries: Vec<SeedBoundary> = Vec::new();
+        for (frame, (off, end)) in framed_from(bytes).iter().zip(ranges) {
+            let delta = seed.observe(frame, *off, *end).unwrap();
+            if let Some(closed) = delta.closed_episode {
+                episodes.insert(closed.n, closed);
+            }
+            if let Some(open) = &seed.episode {
+                episodes.insert(open.n, open.clone());
+            }
+            for fact in delta.boundaries {
+                if fact.terminal_seq.is_some() {
+                    boundaries
+                        .iter_mut()
+                        .find(|boundary| boundary.seq == fact.seq)
+                        .expect("a qualifier names an earlier candidate")
+                        .qualified = true;
+                } else {
+                    boundaries.push(SeedBoundary {
+                        lineage_id: None,
+                        seq: fact.seq,
+                        frame_off: *off,
+                        frame_end: *end,
+                        frame_identity: sha2::Sha256::digest(&bytes[*off as usize..*end as usize])
+                            .to_vec(),
+                        qualified: fact.qualified,
+                    });
+                }
+            }
+        }
+        let episodes = episodes
+            .into_values()
+            .map(|episode| IndexedEpisode {
+                run_started_seq: episode.run_started_seq,
+                run_started_off: episode.run_started_off,
+                first_ord: episode.first_ord,
+                end_ord: episode.end_ord,
+            })
+            .collect();
+        (episodes, boundaries)
+    }
+
+    fn framed_from(bytes: &[u8]) -> Vec<FramedRecord> {
+        let read_at = reader(bytes);
+        decode_positioned_frames(&read_at, 0, bytes.len() as u64, None)
+            .unwrap()
+            .into_iter()
+            .map(|positioned| positioned.framed)
+            .collect()
+    }
+
+    fn reader(bytes: &[u8]) -> impl Fn(u64, u64) -> std::io::Result<Vec<u8>> + '_ {
+        move |off, len| {
+            let start = (off as usize).min(bytes.len());
+            let end = (off.saturating_add(len) as usize).min(bytes.len());
+            Ok(bytes[start..end].to_vec())
+        }
+    }
+
+    /// The attach start the index gives for WAL sequence `seq`: the episode holding it and the
+    /// tail seed at the last qualified boundary before that episode's `RunStarted`.
+    fn start_for(
+        records: &[WalRecord],
+        episodes: &[IndexedEpisode],
+        boundaries: &[SeedBoundary],
+        seq: u64,
+    ) -> Option<AttachEpisodeStart> {
+        let episode = episodes[episode_holding_seq(episodes, seq)?];
+        let run_started = episode.run_started_seq?;
+        let seed = boundaries
+            .iter()
+            .filter(|boundary| boundary.qualified && boundary.seq < run_started)
+            .max_by_key(|boundary| boundary.seq)
+            .map(|boundary| {
+                let prefix = broca_core::replay::replay(&records[..boundary.seq as usize]).unwrap();
+                EpisodeSeed {
+                    boundary: boundary.clone(),
+                    ordinal_base: prefix.prompt.len() as u64,
+                    held_steers: prefix.pending_steers.clone(),
+                    tag_seed: broca_core::tags::TagSeed::from_prefix(&prefix.prompt),
+                    seed_origin: prefix
+                        .run_config
+                        .as_ref()
+                        .map(|config| config.model.clone()),
+                    seed_run_id: prefix.run_id.clone(),
+                    seed_budget: None,
+                }
+            });
+        Some(AttachEpisodeStart { episode, seed })
+    }
+
+    fn assert_same(by_episode: &AttachReplay, full: &AttachReplay, context: &str) {
+        assert_eq!(by_episode.units, full.units, "{context}");
+        assert_eq!(by_episode.state, full.state, "{context}");
+        assert_eq!(by_episode.seeded_h, full.seeded_h, "{context}");
+        assert_eq!(
+            format!("{:?}", by_episode.from),
+            format!("{:?}", full.from),
+            "{context}"
+        );
+    }
+
+    /// One attach by episode over the log `records` (barrier head at its last record),
+    /// returning the replay and how many frames it decoded.
+    fn attach(
+        records: &[WalRecord],
+        from: AttachFrom,
+        start: Option<&AttachEpisodeStart>,
+    ) -> (AttachReplay, Option<&'static str>, u64) {
+        let (bytes, _) = encode(records);
+        let read_at = reader(&bytes);
+        let decoded = Cell::new(0);
+        let (replay, fallback) = replay_for_attach_by_episode(
+            &read_at,
+            bytes.len() as u64,
+            records.len() as u64,
+            from,
+            start,
+            Some(&decoded),
+            || Ok(framed(records)),
+        )
+        .unwrap();
+        (replay, fallback, decoded.get())
+    }
+
+    #[test]
+    fn attach_by_episode_equals_full_replay_at_every_cut() {
+        let records = corpus();
+        let mut checked = 0;
+        for cut in 1..=records.len() {
+            let log = &records[..cut];
+            let (bytes, ranges) = encode(log);
+            let (episodes, boundaries) = index_log(&bytes, &ranges);
+            let h = cut as u64;
+            let full_units = super::project_control(&framed(log));
+            let mut points: Vec<AttachFrom> =
+                vec![AttachFrom::Live, AttachFrom::Cursor(FromCursor::Start)];
+            points.extend(
+                full_units
+                    .iter()
+                    .map(|(cursor, ..)| AttachFrom::Cursor(FromCursor::After(*cursor))),
+            );
+            for from in points {
+                let point_seq = match from {
+                    AttachFrom::Live => h,
+                    AttachFrom::Cursor(FromCursor::After(cursor)) => cursor.wal_seq,
+                    AttachFrom::Cursor(FromCursor::Start) => 1,
+                };
+                let start = start_for(log, &episodes, &boundaries, point_seq);
+                let (by_episode, fallback, decoded) = attach(log, from, start.as_ref());
+                let context = format!("cut {cut} from {from:?}");
+                assert_eq!(fallback, None, "{context}");
+                assert_same(
+                    &by_episode,
+                    &replay_for_attach(framed(log), h, from).unwrap(),
+                    &context,
+                );
+                // Only the frames from the episode's seed boundary to the head are decoded,
+                // and the frames before the episode's start are the end of a single earlier
+                // episode: the fold never crosses a second run start.
+                let frames_from_seq = match (&from, &start) {
+                    (AttachFrom::Cursor(FromCursor::Start), _) | (_, None) => 1,
+                    (_, Some(start)) => start.seed.as_ref().map_or(1, |seed| seed.boundary.seq + 1),
+                };
+                assert_eq!(decoded, h + 1 - frames_from_seq, "{context}");
+                if let (AttachFrom::Cursor(FromCursor::After(_)) | AttachFrom::Live, Some(start)) =
+                    (&from, &start)
+                {
+                    let run_started = start.episode.run_started_seq.unwrap();
+                    let before_start = &log[frames_from_seq as usize - 1..run_started as usize - 1];
+                    assert!(
+                        !before_start
+                            .iter()
+                            .any(|record| matches!(record, WalRecord::RunStarted { .. })),
+                        "{context}"
+                    );
+                    let fold = log
+                        .get(run_started as usize..(point_seq as usize).saturating_sub(1))
+                        .unwrap_or_default();
+                    assert!(
+                        !fold
+                            .iter()
+                            .any(|record| matches!(record, WalRecord::RunStarted { .. })),
+                        "{context}: the fold covers one episode"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 300, "{checked} attaches checked");
+    }
+
+    #[test]
+    fn an_attach_near_the_head_decodes_only_the_last_episode() {
+        let records = corpus();
+        let (bytes, ranges) = encode(&records);
+        let (episodes, boundaries) = index_log(&bytes, &ranges);
+        let h = records.len() as u64;
+        let last_start = episodes.last().unwrap().run_started_seq.unwrap();
+
+        let start = start_for(&records, &episodes, &boundaries, h).unwrap();
+        let boundary = start.seed.as_ref().unwrap().boundary.seq;
+        assert!(
+            boundary < last_start,
+            "the seed sits in the previous episode"
+        );
+        let (live, fallback, decoded) = attach(&records, AttachFrom::Live, Some(&start));
+        assert_eq!(fallback, None);
+        assert_same(
+            &live,
+            &replay_for_attach(framed(&records), h, AttachFrom::Live).unwrap(),
+            "live",
+        );
+        assert_eq!(decoded, h - boundary, "of {h} frames");
+        assert!(decoded < h / 2);
+
+        // A resume from the last episode's tool call decodes the same frames.
+        let cursor = super::project_control(&framed(&records))
+            .into_iter()
+            .map(|(cursor, ..)| cursor)
+            .find(|cursor| cursor.wal_seq > last_start)
+            .unwrap();
+        let start = start_for(&records, &episodes, &boundaries, cursor.wal_seq).unwrap();
+        let from = AttachFrom::Cursor(FromCursor::After(cursor));
+        let (resumed, fallback, decoded) = attach(&records, from, Some(&start));
+        assert_eq!(fallback, None);
+        assert_same(
+            &resumed,
+            &replay_for_attach(framed(&records), h, from).unwrap(),
+            "resume",
+        );
+        assert_eq!(decoded, h - boundary);
+    }
+
+    #[test]
+    fn stale_episode_facts_fall_back_to_a_full_replay() {
+        let records = corpus();
+        let (bytes, ranges) = encode(&records);
+        let (episodes, boundaries) = index_log(&bytes, &ranges);
+        let h = records.len() as u64;
+        let full = replay_for_attach(framed(&records), h, AttachFrom::Live).unwrap();
+
+        let mut start = start_for(&records, &episodes, &boundaries, h).unwrap();
+        start.episode.first_ord += 1;
+        let (live, fallback, _) = attach(&records, AttachFrom::Live, Some(&start));
+        assert_eq!(fallback, Some("episode first ordinal mismatch"));
+        assert_same(&live, &full, "shifted ordinal");
+
+        let mut start = start_for(&records, &episodes, &boundaries, h).unwrap();
+        if let Some(seed) = &mut start.seed {
+            seed.boundary.frame_identity[0] ^= 1;
+        }
+        let (live, fallback, _) = attach(&records, AttachFrom::Live, Some(&start));
+        assert_eq!(fallback, Some("boundary frame identity mismatch"));
+        assert_same(&live, &full, "forged boundary");
+
+        // A cursor before the episode the index named would lose the units between them.
+        let cursor = super::project_control(&framed(&records))[0].0;
+        let start = start_for(&records, &episodes, &boundaries, h).unwrap();
+        let from = AttachFrom::Cursor(FromCursor::After(cursor));
+        let (resumed, fallback, _) = attach(&records, from, Some(&start));
+        assert_eq!(fallback, Some("attach point precedes the episode"));
+        assert_same(
+            &resumed,
+            &replay_for_attach(framed(&records), h, from).unwrap(),
+            "early cursor",
+        );
     }
 }
