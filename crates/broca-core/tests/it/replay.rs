@@ -1389,6 +1389,10 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
             );
             turn.1 = plain_turn.1;
         }
+        // The output reservation is the one reader of attempt records: it takes an attempt's
+        // rendered body length as the measurement its next estimate scales from. It is asserted
+        // on its own below; everything else replay reads must not change.
+        state.output_reservation = plain_state.output_reservation.clone();
         assert_eq!(
             format!("{state:?}"),
             format!("{plain_state:?}"),
@@ -1428,6 +1432,19 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
     }
     assert!(inserted >= 6, "both model steps carry attempt records");
     compare("live-shaped attempt records", &live_shaped, inserted);
+    // With an attempt record before each finished step, as the live loop writes them, the
+    // output reservation has a measurement for the run's model; without them it has none.
+    let model = records
+        .iter()
+        .find_map(|r| match r {
+            WalRecord::RunStarted { config, .. } => Some(config.model.clone()),
+            _ => None,
+        })
+        .expect("the run's RunStarted");
+    assert!(replay(&live_shaped)
+        .output_reservation
+        .has_measurement(&model));
+    assert!(!plain_state.output_reservation.has_measurement(&model));
 
     for insert_at in 1..records.len() {
         let label = format!("attempt record before record {insert_at}/{}", records.len());
@@ -1438,14 +1455,17 @@ async fn provider_attempt_records_change_nothing_replay_reads() {
         );
         compare(&label, &with_records, 1);
 
-        // A crash right after the attempt record: the WAL ends on it.
-        let cut = replay(&with_records[..=insert_at]);
+        // A crash right after the attempt record: the WAL ends on it. The output reservation
+        // holds that attempt's body length for the step it belongs to, which is the one
+        // difference allowed.
+        let mut cut = replay(&with_records[..=insert_at]);
         let cut_plain = replay(&records[..insert_at]);
         assert_eq!(
             render_prompt(&cut.prompt),
             render_prompt(&cut_plain.prompt),
             "{label}: rendered prompt of the cut WAL"
         );
+        cut.output_reservation = cut_plain.output_reservation.clone();
         assert_eq!(
             format!("{cut:?}"),
             format!("{cut_plain:?}"),

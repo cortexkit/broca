@@ -301,6 +301,10 @@ impl FrozenRenderConfig {
     ///
     /// Anthropic requires `max_tokens` above the thinking budget, so with thinking enabled the
     /// floor is one token above the budget the request sends.
+    ///
+    /// Only builds with broca-core linked (the `live` provider, or this crate's tests) have the
+    /// type it returns.
+    #[cfg(any(feature = "live", test))]
     pub fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
         let renders_cap = match self.family_id {
             WireFamilyId::OpenAiResponsesChatgpt => false,

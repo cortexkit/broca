@@ -2226,6 +2226,10 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // here because this rig serves no model-tool route; the counters themselves are
         // asserted through the route in llm_tools_consent.
         "llm_tools_consent",
+        // Scoped sessions counted by whether the daemon-stamped workdir matches the bind's
+        // project_root. Asserted below: its four counters exist, nothing here binds under a
+        // stamp, and no session ever overflows the per-process dedupe set.
+        "scoped_session_workdirs",
         // This process's WAL fsyncs by cause. Asserted below: its four counters exist, and a
         // writer that lost its channel without a shutdown (`disconnect`) never happens here.
         "wal_fsyncs",
@@ -2271,6 +2275,30 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     // Every writer here is shut down through its handle. A disconnect sync would mean one was
     // dropped without that, which a healthy daemon never does.
     assert_eq!(fsyncs["disconnect"], serde_json::json!(0));
+    let workdirs = metrics["scoped_session_workdirs"]
+        .as_object()
+        .expect("scoped_session_workdirs is an object");
+    assert_eq!(
+        workdirs.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "sessions_differ",
+            "sessions_same",
+            "sessions_untracked",
+            "sessions_without_workdir"
+        ],
+        "scoped_session_workdirs carries one counter per outcome"
+    );
+    // This rig binds without a daemon stamp, so no session was compared. A non-zero
+    // `sessions_untracked` on any daemon means the dedupe set overflowed and counts are lost.
+    assert_eq!(
+        metrics["scoped_session_workdirs"],
+        serde_json::json!({
+            "sessions_differ": 0,
+            "sessions_same": 0,
+            "sessions_untracked": 0,
+            "sessions_without_workdir": 0,
+        })
+    );
     assert_eq!(metrics["active_sessions"], serde_json::json!(1));
     assert_eq!(metrics["opening"], serde_json::json!(0));
     assert_eq!(metrics["closing"], serde_json::json!(0));
