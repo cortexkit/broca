@@ -846,17 +846,23 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             frozen_account_ref: self.frozen_account_ref.clone(),
         });
 
+        let route = if self.routed_fallback().is_some() {
+            broca_core::refusal_fallback::StepRoute::Fallback
+        } else {
+            broca_core::refusal_fallback::StepRoute::Source
+        };
         spawn_transport_task(
             self.client.clone(),
             self.clock.clone(),
             Arc::clone(&self.family),
             // The route's config: a fallback step's response is normalized, and its retries
             // re-addressed, for the model that answers it.
-            if self.routed_fallback().is_some() {
+            if route == broca_core::refusal_fallback::StepRoute::Fallback {
                 step_frozen
             } else {
                 Arc::clone(&self.frozen)
             },
+            route,
             render_job,
             served.account_ref,
             recovery,
@@ -1953,6 +1959,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
     clock: Clock,
     family: Arc<F>,
     frozen: Arc<FrozenRenderConfig>,
+    route: broca_core::refusal_fallback::StepRoute,
     render_job: RenderJob<F>,
     served_account_ref: Option<String>,
     recovery: Option<AuthRecovery>,
@@ -2129,6 +2136,7 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                     step_id,
                     cache_ttl_ms: crate::cache_warm::marker_ttl_ms(&frozen),
                     first_attempt,
+                    route,
                 },
                 &retry_clock,
                 Some(websocket.as_ref()),
@@ -2753,6 +2761,8 @@ struct StepSeal<'a> {
     cache_ttl_ms: Option<u64>,
     /// The ordinal this call's first attempt is recorded with; see `StepRuntime::first_attempt`.
     first_attempt: u32,
+    /// The model the step is sent to, which a warm of its bytes must address too.
+    route: broca_core::refusal_fallback::StepRoute,
 }
 
 impl StepSeal<'_> {
@@ -2770,6 +2780,7 @@ impl StepSeal<'_> {
                     body: Arc::new(body.clone()),
                     sha256: digest.sha256.clone(),
                     sent_at_ms: now_millis(),
+                    route: self.route,
                 },
                 self.cache_ttl_ms,
             );

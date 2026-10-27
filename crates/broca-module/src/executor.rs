@@ -277,7 +277,15 @@ pub async fn send_warm(
     base: WarmBase,
 ) -> Result<broca_core::WarmSent, WarmError> {
     let bytes = match base {
-        WarmBase::InFlight(sent) => sent.bytes().to_vec(),
+        WarmBase::InFlight(sent) => {
+            // The in-flight bytes are already the ones the transport sent, for whichever model
+            // it sent them to; the warm must be shaped and addressed for that same model, so
+            // the provider follows the route the transport recorded with them. Without this a
+            // run on its refusal-fallback model would have its warm addressed as the episode's
+            // own model.
+            provider.set_step_route(sent.route);
+            sent.bytes().to_vec()
+        }
         WarmBase::Recorded(recorded) => {
             // A step the refusal-fallback model answered was rendered and sent for that model,
             // so the warm must render it, and address the warm, the same way: on the source

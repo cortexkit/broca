@@ -1834,6 +1834,140 @@ async fn a_warm_of_a_recorded_source_step_is_unchanged_by_the_refusal_fallback()
     }
 }
 
+/// Two servers, one per model, so a test can tell which model's config addressed a request:
+/// the source config points at `source_url`, its frozen fallback at `fallback_url`.
+fn source_and_fallback_on(
+    source_url: &str,
+    fallback_url: &str,
+) -> (FrozenRenderConfig, FrozenRenderConfig) {
+    let (mut source, mut fallback) = source_with_refusal_fallback(source_url);
+    fallback.base_url = Some(fallback_url.to_owned());
+    source.refusal_fallback.as_mut().unwrap().frozen = fallback.clone();
+    (source, fallback)
+}
+
+/// Run one step of [`hello_options`] through `provider` on `route`, as the run loop does under
+/// the module's shutdown seal, and return what the transport handed the seal: the in-flight
+/// request an in-run warm re-sends.
+async fn in_flight_after_one_step(
+    provider: &LiveProvider<AnthropicMessages>,
+    route: broca_core::refusal_fallback::StepRoute,
+) -> broca_core::SentRequest {
+    use broca_core::Provider as _;
+    provider.set_step_route(route);
+    let seal = broca_core::ShutdownSeal::new();
+    let mut events = provider
+        .step_with_shutdown_seal(
+            StepId(1),
+            Arc::new(hello_options()),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            seal.clone(),
+        )
+        .await;
+    while events.recv().await.is_some() {}
+    seal.last_sent().expect("the step's request was sent")
+}
+
+/// A run whose refusal round sends its steps to the fallback model is warmed, mid-run, on that
+/// model: the in-flight request carries the fallback route the transport sent it on, and the
+/// warm, sent through a fresh provider built from the source episode's config, re-sends the
+/// fallback's bytes to the fallback's address. Nothing reaches the source model, whose cache
+/// the run is not using. The step's bytes are checked against the Anthropic renderer applied
+/// to the fallback's own config.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_flight_warm_of_a_fallback_step_is_sent_to_the_fallback() {
+    use broca_provider::wire::WireFamily;
+    let source_server = Server::start(vec![Reply::WarmOrText]).await;
+    let fallback_server = Server::start(vec![text_turn("hello"), Reply::WarmOrText]).await;
+    let (source, fallback) = source_and_fallback_on(&source_server.url, &fallback_server.url);
+    let fallback_base = AnthropicMessages.render(&fallback, &hello_options());
+
+    let sent = in_flight_after_one_step(
+        &provider_for(source.clone()),
+        broca_core::refusal_fallback::StepRoute::Fallback,
+    )
+    .await;
+    assert_eq!(
+        sent.route,
+        broca_core::refusal_fallback::StepRoute::Fallback
+    );
+    assert_eq!(sent.bytes(), fallback_base.as_slice());
+
+    let warmed = crate::executor::send_warm(
+        &provider_for(source),
+        crate::executor::WarmBase::InFlight(sent),
+    )
+    .await
+    .expect("the in-flight fallback request is warmed");
+
+    let bodies = fallback_server.bodies();
+    assert_eq!(bodies.len(), 2, "the fallback step and its warm");
+    assert_eq!(bodies[1], expected_warm_body(&fallback_base));
+    let body: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+    assert_eq!(body["model"], REFUSAL_FALLBACK);
+    assert_eq!(warmed.warm_body_sha256, sha256_hex(&bodies[1]));
+    assert!(
+        source_server.bodies().is_empty(),
+        "nothing is sent to the source model"
+    );
+}
+
+/// A run on the episode's own model is warmed mid-run exactly as before the fallback existed:
+/// the source's bytes, sent to the source model, whether the warm provider is fresh or an
+/// earlier fallback warm left it on the fallback route.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_flight_warm_of_a_source_step_is_unchanged_by_the_refusal_fallback() {
+    use broca_provider::wire::WireFamily;
+    for left_on_fallback in [false, true] {
+        let source_server = Server::start(vec![text_turn("hello"), Reply::WarmOrText]).await;
+        let fallback_server = Server::start(vec![Reply::WarmOrText]).await;
+        let (source, _) = source_and_fallback_on(&source_server.url, &fallback_server.url);
+        let source_base = AnthropicMessages.render(&source, &hello_options());
+
+        let sent = in_flight_after_one_step(
+            &provider_for(source.clone()),
+            broca_core::refusal_fallback::StepRoute::Source,
+        )
+        .await;
+        assert_eq!(sent.route, broca_core::refusal_fallback::StepRoute::Source);
+        let warm_provider = provider_for(source);
+        if left_on_fallback {
+            broca_core::Provider::set_step_route(
+                &warm_provider,
+                broca_core::refusal_fallback::StepRoute::Fallback,
+            );
+        }
+
+        crate::executor::send_warm(&warm_provider, crate::executor::WarmBase::InFlight(sent))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("left_on_fallback={left_on_fallback}: the source warm failed: {error:?}")
+            });
+
+        let bodies = source_server.bodies();
+        assert_eq!(bodies.len(), 2, "left_on_fallback={left_on_fallback}");
+        assert_eq!(
+            bodies[0], source_base,
+            "left_on_fallback={left_on_fallback}"
+        );
+        assert_eq!(
+            bodies[1],
+            expected_warm_body(&source_base),
+            "left_on_fallback={left_on_fallback}"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bodies[1]).unwrap();
+        assert_eq!(
+            body["model"], REFUSING_SOURCE,
+            "left_on_fallback={left_on_fallback}"
+        );
+        assert!(
+            fallback_server.bodies().is_empty(),
+            "left_on_fallback={left_on_fallback}: nothing is sent to the fallback model"
+        );
+    }
+}
+
 /// A warm the provider refuses is reported with the provider's error and recorded nowhere.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_warm_the_provider_refuses_is_reported_and_not_recorded() {
