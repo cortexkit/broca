@@ -189,6 +189,17 @@ pub struct ModelPin {
 /// answer, and be billed, as 1.13.0.
 const JEV_1_13_0_WIRE: &str = cortexkit_role_classifier::provider::models::JEV_1_13_0;
 
+/// A catalog key's provider id and model id. Catalog keys are `<provider>/<model>` and only
+/// the provider id is free of slashes, so the key splits once, at its first slash: Clef's
+/// `cloudflare-workers-ai/@cf/cloudflare/clef` is provider `cloudflare-workers-ai`, model
+/// `@cf/cloudflare/clef`. Usage facts carry the two ids apart, as session facts do, so a
+/// consumer prices them by the provider's own model id. `None` for a key that does not name
+/// both.
+pub(crate) fn catalog_key_parts(key: &str) -> Option<(&str, &str)> {
+    key.split_once('/')
+        .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
+}
+
 /// Consent uses only the catalog's human labels. A missing display fact is not permission
 /// to show a provider or model identifier on the person's approval card.
 pub(crate) fn consent_model_labels(row: &ModelBatchRow) -> Option<(&str, &str)> {
@@ -365,10 +376,16 @@ impl SystemOne {
                 .map_err(|e| e.to_string())?
             {
                 let mut metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
-                let spend = metrics
-                    .spend_nanos_by_model
-                    .entry(pending.fact.model.clone())
-                    .or_default();
+                // Health keys spend by catalog key, which the fact's bare model id alone does
+                // not name. A fact written by an older build already carries the whole key as
+                // its model and is counted under it unchanged.
+                let fact = &pending.fact;
+                let catalog_key = if fact.model.starts_with(&format!("{}/", fact.provider)) {
+                    fact.model.clone()
+                } else {
+                    format!("{}/{}", fact.provider, fact.model)
+                };
+                let spend = metrics.spend_nanos_by_model.entry(catalog_key).or_default();
                 *spend = spend.saturating_add(pending.spend_nanos);
             }
             self.store
