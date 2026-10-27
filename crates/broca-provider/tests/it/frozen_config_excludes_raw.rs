@@ -70,6 +70,7 @@ fn model_with_marked_raw() -> ModelSpec {
         limits: Limits::default(),
         cost: Default::default(),
         reasoning_options: Default::default(),
+        server_side_fallback: None,
         input_modalities: Default::default(),
         release_date: None,
         status: None,
