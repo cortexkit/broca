@@ -9,6 +9,7 @@ use std::{
     cell::{Cell, RefCell},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use crate::fs_ops::{self, File, OpenOptions};
@@ -430,6 +431,20 @@ pub trait Wal {
         None
     }
 
+    /// The state root this log lives in, beside its `wal/` directory. A writer raises that
+    /// root's feature floor before the first version 4 frame, whose header names
+    /// `frame-stamps/v1`.
+    fn state_root_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// True when the log lives on a state root marked `broca-state/2`. Its writer appends
+    /// version 4 frames, whose headers carry `appended_ms` and `writer_id`; every other root
+    /// keeps the frames its current readers already understand.
+    fn on_overhaul_root(&self) -> bool {
+        false
+    }
+
     fn recovery_byte_cap(&self) -> Option<u64> {
         None
     }
@@ -473,6 +488,9 @@ struct SyncProbe {
 
 pub struct FileWal {
     path: PathBuf,
+    /// The state root holding this log: `path`'s parent's parent. A version 4 frame names
+    /// `frame-stamps/v1`, and that root's floor must list it before such a frame is written.
+    state_root: PathBuf,
     file: File,
     next_seq: u64,
     /// The file size this writer last left the file at (the byte offset after its last
@@ -495,6 +513,9 @@ pub struct FileWal {
     /// upward. The first directory-sync pass drains this list after syncing every directory
     /// whose direct child was newly created.
     newly_created_dirs: RefCell<Vec<PathBuf>>,
+    /// True on a `broca-state/2` root, where appends are version 4 frames. A root does not
+    /// change format under a live writer.
+    overhaul_root: bool,
     lineage_id: Option<WalLineageId>,
     /// The machine's WAL feature floor (see [`crate::floor`]). A record that requires any WAL
     /// feature is appended only after this file lists it; with no floor configured such a
@@ -535,6 +556,76 @@ fn mint_lineage_id() -> Result<WalLineageId, WalError> {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(WalLineageId::from_bytes(bytes))
+}
+
+/// One state root's format marker, read the first time this process opens a log inside it.
+struct RootMarker {
+    /// The root path, as given by the logged path's grandparent.
+    root: PathBuf,
+    overhaul: bool,
+}
+
+/// Every marker this process has read. A state root's file count, file kinds and marker are fixed
+/// by its format, so the answer is read once: a per-open read would change a root's identity on
+/// every writer open, which the power-loss harness compares.
+static ROOT_MARKERS: OnceLock<std::sync::Mutex<Vec<RootMarker>>> = OnceLock::new();
+
+/// Report whether the state root holding `wal_path` is an overhaul root, reading its marker the
+/// first time this process asks about that root.
+///
+/// A missing or unreadable marker means a legacy root: reading one as overhaul would put frames
+/// on disk that its readers cannot open. A root this open created is not marked overhaul either:
+/// the overlay that creates a root writes its marker, so a root born without one holds legacy
+/// logs.
+fn overhaul_root_cached(wal_path: &Path, created_root: bool) -> (PathBuf, bool) {
+    let root = wal_path
+        .parent()
+        .and_then(Path::parent)
+        .map_or_else(PathBuf::new, Path::to_path_buf);
+    let markers = ROOT_MARKERS.get_or_init(Default::default);
+    let mut markers = markers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(known) = markers.iter().find(|marker| marker.root == root) {
+        return (root, known.overhaul);
+    }
+    let overhaul = if created_root {
+        false
+    } else {
+        match File::open(root.join(crate::state_format::MARKER_FILENAME)) {
+            Ok(mut file) => {
+                let mut marker = Vec::new();
+                match file.read_to_end(&mut marker) {
+                    Ok(_) => {
+                        marker == crate::state_format::OVERHAUL_MARKER
+                            || marker == b"broca-state/2\n"
+                    }
+                    Err(error) => {
+                        report_unreadable_marker(&root, &error);
+                        false
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                report_unreadable_marker(&root, &error);
+                false
+            }
+        }
+    };
+    markers.push(RootMarker {
+        root: root.clone(),
+        overhaul,
+    });
+    (root, overhaul)
+}
+
+fn report_unreadable_marker(root: &Path, error: &std::io::Error) {
+    tracing::warn!(
+        target: "wal",
+        "cannot read the state-format marker in {}: {error}; keeping legacy frames",
+        root.display()
+    );
 }
 
 struct ManifestAppend {
@@ -836,6 +927,8 @@ impl FileWal {
             ),
             Err(e) => return Err(WalError::Io(e)),
         };
+        let (state_root, overhaul_root) =
+            overhaul_root_cached(&path, !newly_created_dirs.is_empty());
         let mut lineage_id = recovered_lineage_id;
         // Creation is the identity boundary. Legacy files deliberately remain unidentified on
         // open and receive their first metadata frame only when append performs the next write.
@@ -862,11 +955,13 @@ impl FileWal {
         };
         Ok(Self {
             path,
+            state_root,
             file,
             next_seq,
             last_write_end,
             dir_needs_sync: Cell::new(true),
             newly_created_dirs: RefCell::new(newly_created_dirs),
+            overhaul_root,
             lineage_id,
             recovery_cap: DEFAULT_MAX_READ_BYTES,
             append_budget: DEFAULT_MAX_READ_BYTES,
@@ -1051,7 +1146,10 @@ impl FileWal {
                 file_size: required,
             });
         }
-        if preencoded {
+        // A version 4 writer stamps its header and writes here directly, so it has nothing to
+        // validate against the legacy bytes; every other pre-encoded frame is checked to be
+        // exactly the one its sequence, fence and record require.
+        if preencoded && !self.overhaul_root {
             crate::framing::validate_preencoded(&record_bytes, seq, fence, record)
                 .map_err(WalError::Frame)?;
         }
@@ -1122,6 +1220,14 @@ impl Wal for FileWal {
         frame: Vec<u8>,
     ) -> Result<u64, WalError> {
         self.append_frame(fence, record, sync, Some(frame))
+    }
+
+    fn on_overhaul_root(&self) -> bool {
+        self.overhaul_root
+    }
+
+    fn state_root_path(&self) -> Option<PathBuf> {
+        Some(self.state_root.clone())
     }
 
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
@@ -1598,15 +1704,38 @@ fn scan_prefix<T>(
         let mut frame = header[..n].to_vec();
         if n == header.len() {
             let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+            // A version 4 header is longer than the legacy one: its requirements array comes
+            // before the CRC and the payload. Read that array before sizing the frame from
+            // `len`, or the reader would assemble a frame short of its own header and never
+            // reach the payload, which a crash leaves unwritten, so recovery discards it.
+            let header_len = if header[4] == crate::framing::V4_FRAMING_VERSION {
+                match crate::framing::v4_header_len(&header) {
+                    Some(header_len) => header_len,
+                    None => return Ok(scan),
+                }
+            } else {
+                header.len()
+            };
+            if header_len > header.len() {
+                let extra = header_len - header.len();
+                let extra_budget = max_bytes.saturating_sub(offset + header.len() as u64);
+                let read = extra.min(usize::try_from(extra_budget).unwrap_or(usize::MAX));
+                let mut rest = vec![0u8; read];
+                let n = read_up_to(&mut file, &mut rest)?;
+                scan.bytes_read += n as u64;
+                rest.truncate(n);
+                frame.extend_from_slice(&rest);
+            }
             if len <= crate::framing::MAX_PAYLOAD_LEN {
-                let size = header.len() + len as usize;
+                let size = header_len + len as usize;
                 // The declared payload may be a torn tail's damaged length. Read
                 // only within budget; exceptional classification below probes one
                 // more byte to distinguish EOF from an actually oversized source.
                 let bounded_size = size.min(usize::try_from(available).unwrap_or(usize::MAX));
-                frame.resize(bounded_size, 0);
-                let n = read_up_to(&mut file, &mut frame[header.len()..])?;
-                frame.truncate(header.len() + n);
+                let already = frame.len();
+                frame.resize(bounded_size.max(already), 0);
+                let n = read_up_to(&mut file, &mut frame[already..])?;
+                frame.truncate(already + n);
                 scan.bytes_read += n as u64;
             }
         }

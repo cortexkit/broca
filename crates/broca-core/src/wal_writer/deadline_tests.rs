@@ -512,12 +512,14 @@ fn raw_disconnect_without_shutdown_syncs_dirty_writer() {
             poisoned,
             durable_head,
             lineage,
+            None,
         );
     });
     tx.send(WalCommand::Append {
         seq: 1,
         record: Box::new(WalRecord::Unknown),
         frame: None,
+        v4: None,
     })
     .expect("writer loop is running");
     // Wait until the append is on the writer: the point is a dirty disconnect,
@@ -569,12 +571,14 @@ fn failed_disconnect_sync_poisons_without_publishing() {
             poisoned,
             durable_head,
             lineage,
+            None,
         );
     });
     tx.send(WalCommand::Append {
         seq: 1,
         record: Box::new(WalRecord::Unknown),
         frame: None,
+        v4: None,
     })
     .expect("writer loop is running");
     let give_up = std::time::Instant::now() + Duration::from_secs(10);

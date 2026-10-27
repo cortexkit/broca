@@ -161,6 +161,11 @@ const LINEAGE_PAYLOAD_LEN: u32 = 16;
 pub const GATED_FRAMING_VERSION: u8 = 3;
 pub const V4_FRAMING_VERSION: u8 = broca_wal_reader::frame::VERSION;
 pub const INTERRUPT_REASON_FEATURE: &str = "interrupt-reason/v1";
+/// Every version 4 frame names this: its header carries the `appended_ms` written immediately
+/// before the write and the `writer_id` of the writer that appended it. A reader that knows the
+/// version 4 layout but not this name refuses the log, so no build reads those fields as
+/// anything other than what they are.
+pub const FRAME_STAMPS_FEATURE: &str = "frame-stamps/v1";
 pub const TURN_DIRECTIVES_FEATURE: &str = "turn-directives/v1";
 /// A `RunStarted`, `Queued` or `Steered` record whose `request_identity_digest` carries the
 /// send's `client_message_id` (llm-runner 0.5.1 §9.11). Part of the send's identity: a build
@@ -213,6 +218,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     DELIVERY_ORDER_FEATURE,
     DISPATCH_MODULE_FEATURE,
     FLOW_SCOPE_FEATURE,
+    FRAME_STAMPS_FEATURE,
     GOOGLE_RPC_ERROR_DETAILS_FEATURE,
     INPUT_TOKEN_CAP_FEATURE,
     MEDIA_CONTENT_FEATURE,
@@ -632,6 +638,20 @@ pub fn encode_with_requires(
     .map_err(FrameError::Serialize)?;
     frame(GATED_FRAMING_VERSION, seq, fence, &payload)
 }
+
+/// Size the version 4 header would occupy, from the header alone.
+pub fn v4_header_len(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 45 {
+        return None;
+    }
+    let requires_len = u16::from_le_bytes([buf[45], buf[46]]) as usize;
+    Some(broca_wal_reader::frame::FIXED_HEADER_LEN + requires_len)
+}
+
+/// The shared version 4 codec. broca's own writer builds version 4 headers with it rather than
+/// with a second copy of the layout, so a frame broca writes and a frame the published reader
+/// decodes can only agree.
+pub use broca_wal_reader::frame as v4;
 
 /// Encode an overhaul-root record with caller-supplied writer metadata. This is
 /// deliberately separate from legacy encoding: adding the codec must not turn
@@ -1296,6 +1316,7 @@ mod tests {
                 DELIVERY_ORDER_FEATURE,
                 DISPATCH_MODULE_FEATURE,
                 FLOW_SCOPE_FEATURE,
+                FRAME_STAMPS_FEATURE,
                 GOOGLE_RPC_ERROR_DETAILS_FEATURE,
                 INPUT_TOKEN_CAP_FEATURE,
                 MEDIA_CONTENT_FEATURE,

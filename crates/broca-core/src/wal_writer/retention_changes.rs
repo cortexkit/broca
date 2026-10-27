@@ -178,6 +178,12 @@ impl Wal for ObservedWal {
     fn lineage_id(&self) -> Option<broca_wal::WalLineageId> {
         self.inner.lineage_id()
     }
+    fn on_overhaul_root(&self) -> bool {
+        self.inner.on_overhaul_root()
+    }
+    fn state_root_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.state_root_path()
+    }
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
         self.inner.append_budget()
     }
