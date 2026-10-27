@@ -1003,7 +1003,7 @@ async fn real_mc_async_compaction_end_to_end() {
     .await;
     assert_bus_notices(&root, &bus, &events, &records, &ready).await;
     note(&root, format!("Setup recorded once; view v{applied_version} at WAL index {view_at}: {view:?}; request bytes before={before}, next={}", next.len()));
-    assert_dropped_parts_gone(&root, &records, &decoded, &dropped, &drop_tags);
+    assert_mc_worker_drops(&root, &records, &dropped, &drop_tags);
     assert!(
         next.len() < before,
         "the worker view v{applied_version} must shrink the next model request: {before} -> {}",
@@ -1833,19 +1833,308 @@ fn assert_worker_view(
     );
 }
 
-/// Checks the view itself, not only the request it shaped: the history broca assembles under
-/// `view` no longer holds the tool outputs of `dropped`, the reads whose tags (`drop_tags`) the
-/// model's ctx_reduce call named. The transcript is the one the WAL replays, with ordinals
-/// stamped as broca stamps them, and the assembly is broca's own, so a part the view drops or
-/// replaces by its key (`m<ordinal>#<index>`), or covers with a Replace range, is gone, and a
-/// part it keeps as written is still there. The raw transcript is checked to hold every one of
-/// those outputs first, so the check can fail.
-fn assert_dropped_parts_gone(
-    root: &Path,
-    records: &[WalRecord],
+/// Magic Context worker-preset (mode 3) drop contract.
+///
+/// MC's investigation `mode3-v1-partial-drops.md` ("What BROCA's test should check
+/// instead") found the old check wrong: the first gated view (v1) not holding every
+/// stamped drop is by design. A stamped drop stays queued while its tool output sits
+/// inside the persisted tool-tag protection window, and the worker preset applies it
+/// on an execute pass once newer tool output pushes it out. This checker asserts
+/// MC's four rules over every view broca applied, in WAL order:
+///
+/// 1. A drop outside the window lands on the first view after its stamp.
+/// 2. A drop inside the window lands on the first execute pass after newer tool
+///    output pushes it out (so it may be absent from early views).
+/// 3. No view ever brings a dropped part back: once an edit or removal of a part
+///    appears in view N, every later view carries it with identical bytes.
+/// 4. Either legal drop shape counts: a removed arc (`replace` with `"[]"`) or a
+///    skeleton (`keep` plus a `[dropped]` part edit). The engine picks the shape,
+///    so the check never requires one shape for every tag.
+///
+/// The timing half (rules 1-2) replays MC's window from the test's own known
+/// output sizes: every read output costs MC_READ_OUTPUT_TOKENS and the
+/// ctx_reduce result MC_REDUCE_RESULT_TOKENS (both MC-measured in the report's
+/// timeline table), and a drop is out once newer covered outputs reach
+/// MC_PROTECTED_TOKENS across at least MC_PROTECTED_NEWEST_GROUPS groups. A view
+/// covering below the stamp result was built before the stamp and is exempt from
+/// the timing half (rules 1-2) while still bound by no-resurrection (rule 3).
+/// That coverage set matches the tag rows the build's window walked: both
+/// derive from the same notice stream (validated against the preserved run
+/// replayed by `mc_drops_replay_run_1115b`).
+///
+/// The window's group leg (three newest tool-tag groups) and token leg
+/// (newer output reaching `protected_tokens`) come from the MC report section
+/// cited on each constant. A drop counts as released only when both legs agree
+/// it is out, matching the report's `min` cutoff.
+/// The context window the rig configures (the test-compaction `config` file
+/// writes 128000; the MC report calls it the 128k window). Only the floor
+/// below enters the window math; the debug assertion at the checker's entry
+/// pins the reclaim.md:38 relation between the two, so a future window change
+/// updates the floor instead of silently aging it.
+const MC_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
+/// `protected_tokens_effective` in the MC report: the documented default for a
+/// 128k window, `round(0.08 * window)` clamped as in reclaim.md:38
+/// (`clamp(6400, min(16000, 10240), 64000)` is 10240).
+const MC_PROTECTED_TOKENS: u64 = 10_240;
+/// Each read output's cost in the MC report timeline table: every read output
+/// row carries `token_count` 3505. The rig's outputs all share one shape
+/// (`tool_output` repeats one line 700 times), so one measured size fits all.
+const MC_READ_OUTPUT_TOKENS: u64 = 3_505;
+/// The ctx_reduce result's cost in the same table (tag 11, `token_count` 5).
+const MC_REDUCE_RESULT_TOKENS: u64 = 5;
+/// The window's group leg: the three newest tool-tag groups (MC report,
+/// `ProtectionWindow::from_persisted_rows_calibrated`).
+const MC_PROTECTED_NEWEST_GROUPS: usize = 3;
+
+/// One stamped drop: the read whose tool output the model's `ctx_reduce` call
+/// named, and where the replayed transcript holds it.
+struct StampedDrop {
+    read: usize,
+    part: String,
+    ordinal: u64,
+    marker: String,
+}
+
+/// One tool output for the window walk, in transcript order (the prompt is
+/// append-only, so transcript order is mint order).
+struct WindowOutput {
+    ordinal: u64,
+    tokens: u64,
+}
+
+/// How far a stamped drop is from leaving the window under a view covering
+/// through `covers_through`.
+struct ReleaseState {
+    newer_tokens: u64,
+    newer_groups: usize,
+    released: bool,
+}
+
+/// Whether `drop` had left the protection window by the time a view covering
+/// through `covers_through` was built: newer covered outputs reach
+/// MC_PROTECTED_TOKENS across at least MC_PROTECTED_NEWEST_GROUPS groups.
+fn mc_release_state(
+    covers_through: u64,
+    drop: &StampedDrop,
+    outputs: &[WindowOutput],
+) -> ReleaseState {
+    let mut newer_tokens = 0u64;
+    let mut newer_groups = 0usize;
+    for output in outputs {
+        if output.ordinal > drop.ordinal && output.ordinal <= covers_through {
+            newer_tokens += output.tokens;
+            newer_groups += 1;
+        }
+    }
+    ReleaseState {
+        newer_tokens,
+        newer_groups,
+        released: newer_tokens >= MC_PROTECTED_TOKENS && newer_groups >= MC_PROTECTED_NEWEST_GROUPS,
+    }
+}
+
+/// How one applied view drops one stamped part: either legal shape from MC's
+/// report. A part that is gone without either shape still counts as gone, but
+/// carries no evidence for the identical-bytes half of rule 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DropEvidence {
+    /// A keep-range edit of the part: `drop: true` removes it outright, and
+    /// `bytes` replaces it (the worker skeleton writes `[dropped]`).
+    PartEdit { drop: bool, bytes: Option<String> },
+    /// A replace range over the part's message holding no messages: the arc
+    /// removed whole (`"[]"`).
+    ArcRemoved { from: u64, to: u64, bytes: String },
+}
+
+/// The evidence with which `view` drops `drop`, when it carries either legal
+/// shape over the part.
+fn drop_evidence(
     view: &broca_core::compaction_provider::view::CompactionView,
+    drop: &StampedDrop,
+) -> Option<DropEvidence> {
+    use broca_core::compaction_provider::view::ViewRange;
+    for range in &view.ranges {
+        match range {
+            ViewRange::Keep { from, to, edits } if *from <= drop.ordinal && drop.ordinal < *to => {
+                if let Some(edit) = edits.iter().find(|edit| edit.part == drop.part) {
+                    return Some(DropEvidence::PartEdit {
+                        drop: edit.drop,
+                        bytes: edit.bytes.clone(),
+                    });
+                }
+            }
+            ViewRange::Replace { from, to, bytes }
+                if *from <= drop.ordinal && drop.ordinal < *to =>
+            {
+                let empty = serde_json::from_str::<Vec<serde_json::Value>>(bytes)
+                    .is_ok_and(|messages| messages.is_empty());
+                if empty {
+                    return Some(DropEvidence::ArcRemoved {
+                        from: *from,
+                        to: *to,
+                        bytes: bytes.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Rules 1-4 over applied views in WAL order. Returns a one-line summary for
+/// the run report. `views` holds `(view_version, view)` in the order broca
+/// applied them; `stamp_ordinal` is the ordinal of the `ctx_reduce` result.
+fn check_mc_worker_drops(
+    prompt: &[broca_protocol::Message],
+    drops: &[StampedDrop],
+    outputs: &[WindowOutput],
+    stamp_ordinal: u64,
+    views: &[(u64, broca_core::compaction_provider::view::CompactionView)],
+) -> Result<String, String> {
+    debug_assert_eq!(
+        MC_PROTECTED_TOKENS,
+        (MC_CONTEXT_WINDOW_TOKENS * 8 / 100)
+            .clamp(6_400, 64_000)
+            .min(16_000),
+        "the protected floor follows reclaim.md:38 for this rig's window"
+    );
+    if views.is_empty() {
+        return Err("no applied views to check the stamped drops against".to_owned());
+    }
+    if drops.is_empty() {
+        return Err("no stamped drops to check the applied views against".to_owned());
+    }
+    for pair in views.windows(2) {
+        if pair[0].0 >= pair[1].0 {
+            return Err(format!(
+                "applied view versions out of order: v{} then v{}",
+                pair[0].0, pair[1].0
+            ));
+        }
+    }
+    let holds = |messages: &[broca_protocol::Message], marker: &str| {
+        messages
+            .iter()
+            .any(|m| serde_json::to_string(m).unwrap().contains(marker))
+    };
+    let mut assembled: Vec<Vec<broca_protocol::Message>> = Vec::with_capacity(views.len());
+    for (version, view) in views {
+        match broca_core::compaction::view::assemble(view, prompt) {
+            Ok(history) => assembled.push(history),
+            Err(problem) => {
+                return Err(format!(
+                    "broca cannot assemble Magic Context's view v{version} over the replayed transcript: {problem:?}"
+                ));
+            }
+        }
+    }
+    let gone = |index: usize, drop: &StampedDrop| !holds(&assembled[index], &drop.marker);
+    // Rule 3: no view ever brings a dropped part back, with identical bytes.
+    for drop in drops {
+        let mut first_gone: Option<u64> = None;
+        let mut first_evidence: Option<(u64, DropEvidence)> = None;
+        for (index, (version, view)) in views.iter().enumerate() {
+            if gone(index, drop) {
+                if first_gone.is_none() {
+                    first_gone = Some(*version);
+                }
+                if let Some(evidence) = drop_evidence(view, drop) {
+                    match &first_evidence {
+                        Some((first_version, first)) if *first != evidence => {
+                            return Err(format!(
+                                "view v{version} changes how stamped part {} (read {}) drops: v{first_version} carried {first:?}, now {evidence:?}; no view ever brings a dropped part back, and every later view carries it with identical bytes",
+                                drop.part, drop.read
+                            ));
+                        }
+                        Some(_) => {}
+                        None => first_evidence = Some((*version, evidence)),
+                    }
+                } else if let Some((first_version, first)) = &first_evidence {
+                    return Err(format!(
+                        "view v{version} drops the evidence v{first_version} carried for stamped part {} (read {}): {first:?}; every later view carries it with identical bytes",
+                        drop.part, drop.read
+                    ));
+                }
+            } else if let Some(first_version) = first_gone {
+                return Err(format!(
+                    "view v{version} still carries stamped part {} (read {}), gone since v{first_version}; no view ever brings a dropped part back",
+                    drop.part, drop.read
+                ));
+            }
+        }
+    }
+    // Rules 1-2: a drop the view's build had already pushed out of the window
+    // is gone from it. A drop still inside the window may be held, so no
+    // presence is required there: that hold is the late-inside case the old
+    // check mistook for a defect.
+    for (index, (version, view)) in views.iter().enumerate() {
+        let covers = view.covers_through.ordinal;
+        if covers < stamp_ordinal {
+            continue;
+        }
+        for drop in drops {
+            let state = mc_release_state(covers, drop, outputs);
+            if state.released && !gone(index, drop) {
+                return Err(format!(
+                    "view v{version} (covers {covers}) still carries stamped part {} (read {}): {} newer tool-output tokens in {} groups reach the window ({MC_PROTECTED_TOKENS} tokens, {} newest groups), so the drop had left the window before this build; an outside drop lands on the first view after its stamp",
+                    drop.part,
+                    drop.read,
+                    state.newer_tokens,
+                    state.newer_groups,
+                    MC_PROTECTED_NEWEST_GROUPS
+                ));
+            }
+        }
+    }
+    // Every dropped part gone from the newest applied view.
+    let (newest, _) = views.last().unwrap();
+    let last = assembled.len() - 1;
+    for drop in drops {
+        if !gone(last, drop) {
+            return Err(format!(
+                "newest applied view v{newest} still carries stamped part {} (read {}); every dropped part is gone from the newest applied view",
+                drop.part, drop.read
+            ));
+        }
+    }
+    let mut summary = format!(
+        "checked {} applied views against {} stamped drops",
+        views.len(),
+        drops.len()
+    );
+    for drop in drops {
+        let first = views
+            .iter()
+            .enumerate()
+            .find(|(index, _)| gone(*index, drop))
+            .map(|(_, (version, _))| version.to_string())
+            .unwrap_or_else(|| "never".to_owned());
+        summary.push_str(&format!(
+            " read {} ({}): first gone v{first};",
+            drop.read, drop.part
+        ));
+    }
+    Ok(summary)
+}
+
+/// Replay the WAL into the checker's inputs: the stamped drops with their part
+/// keys, the tool outputs for the window walk in transcript (mint) order, the
+/// ordinal of the `ctx_reduce` result, and every applied view in WAL order.
+/// The transcript is the one the WAL replays, with ordinals stamped as broca
+/// stamps them; the raw transcript must hold every stamped output first, so the
+/// check can fail.
+#[allow(clippy::type_complexity)]
+fn mc_worker_drop_inputs(
+    records: &[WalRecord],
     dropped: &[usize],
     drop_tags: &str,
+) -> (
+    Vec<broca_protocol::Message>,
+    Vec<StampedDrop>,
+    Vec<WindowOutput>,
+    u64,
+    Vec<(u64, broca_core::compaction_provider::view::CompactionView)>,
 ) {
     use broca_protocol::ContentBlock;
     let mut prompt = broca_core::replay::replay(records)
@@ -1859,54 +2148,440 @@ fn assert_dropped_parts_gone(
             .any(|m| serde_json::to_string(m).unwrap().contains(&marker))
     };
     // Each dropped read's part key in the transcript, to name it in a failure.
-    let parts: Vec<(usize, String)> = dropped
+    let drops: Vec<StampedDrop> = dropped
         .iter()
         .map(|&read| {
             let call = format!("read_{read}");
-            let part = prompt.iter().find_map(|message| {
+            let found = prompt.iter().find_map(|message| {
                 let index = message.content.iter().position(|block| {
                     matches!(block, ContentBlock::ToolResult(result) if result.tool_call_id.0 == call)
                 })?;
-                Some(broca_protocol::tags::part_key(message.ordinal?, index))
+                let ordinal = message.ordinal?;
+                Some((ordinal, broca_protocol::tags::part_key(ordinal, index)))
             });
-            let part = part.unwrap_or_else(|| {
+            let (ordinal, part) = found.unwrap_or_else(|| {
                 panic!("the replayed transcript holds no tool result for call {call}")
             });
             assert!(
                 holds(&prompt, read),
                 "the replayed transcript does not hold tool output {read} at part {part}"
             );
-            (read, part)
+            StampedDrop {
+                read,
+                part,
+                ordinal,
+                marker: format!("Tool output {read}:"),
+            }
         })
         .collect();
-    let assembled = broca_core::compaction::view::assemble(view, &prompt).unwrap_or_else(|problem| {
-        panic!(
-            "broca cannot assemble Magic Context's view v{} over the replayed transcript: {problem:?}",
-            view.view_version
-        )
+    let mut outputs = Vec::new();
+    let mut stamp_ordinal = None;
+    for message in &prompt {
+        for block in &message.content {
+            if let ContentBlock::ToolResult(result) = block {
+                let ordinal = message.ordinal.expect("stamped prompt");
+                let id = result.tool_call_id.0.as_str();
+                if id == "reduce_old_outputs" {
+                    stamp_ordinal = Some(ordinal);
+                    outputs.push(WindowOutput {
+                        ordinal,
+                        tokens: MC_REDUCE_RESULT_TOKENS,
+                    });
+                } else if id.starts_with("read_") && id["read_".len()..].parse::<usize>().is_ok() {
+                    outputs.push(WindowOutput {
+                        ordinal,
+                        tokens: MC_READ_OUTPUT_TOKENS,
+                    });
+                } else {
+                    panic!(
+                        "the window walk meets an unexpected tool result {id}; it only knows the rig's reads and the ctx_reduce result"
+                    );
+                }
+            }
+        }
+    }
+    let stamp_ordinal = stamp_ordinal.unwrap_or_else(|| {
+        panic!("the replayed transcript holds no ctx_reduce result for tags {drop_tags}")
     });
-    let kept: Vec<&(usize, String)> = parts
+    let views: Vec<(u64, broca_core::compaction_provider::view::CompactionView)> = records
         .iter()
-        .filter(|(read, _)| holds(&assembled, *read))
+        .filter_map(|record| match record {
+            WalRecord::CompactionViewApplied {
+                provider,
+                view_version,
+                view: raw,
+                ..
+            } => {
+                assert_eq!(
+                    provider, "magic-context",
+                    "the session compacts only through Magic Context: {record:?}"
+                );
+                let decoded: broca_core::compaction_provider::view::CompactionView =
+                    serde_json::from_str(raw.as_json_text()).unwrap_or_else(|error| {
+                        panic!("broca recorded an undecodable view v{view_version}: {error}")
+                    });
+                Some((*view_version, decoded))
+            }
+            _ => None,
+        })
         .collect();
-    let edits: Vec<_> = view
-        .edits()
-        .filter(|edit| parts.iter().any(|(_, part)| *part == edit.part))
-        .collect();
-    assert!(
-        kept.is_empty(),
-        "Magic Context's view v{} still carries the parts of the dropped tags {drop_tags}: (read, part) {kept:?}; the view's edits of those parts: {edits:?}; its ranges cover {:?}",
-        view.view_version,
-        view.ranges
-            .iter()
-            .map(|r| (r.from(), r.to()))
-            .collect::<Vec<_>>()
-    );
-    note(
-        root,
-        format!(
-            "View v{} drops the parts of tags {drop_tags}: (read, part) {parts:?}; edits of those parts: {edits:?}",
-            view.view_version
+    (prompt, drops, outputs, stamp_ordinal, views)
+}
+
+/// The worker-preset drop check for the real-MC lane: MC's mode-3 rules over
+/// every view broca applied, in WAL order.
+fn assert_mc_worker_drops(root: &Path, records: &[WalRecord], dropped: &[usize], drop_tags: &str) {
+    let (prompt, drops, outputs, stamp_ordinal, views) =
+        mc_worker_drop_inputs(records, dropped, drop_tags);
+    match check_mc_worker_drops(&prompt, &drops, &outputs, stamp_ordinal, &views) {
+        Ok(summary) => note(root, format!("Worker drops {drop_tags}: {summary}")),
+        Err(problem) => panic!(
+            "Magic Context's worker view breaks the mode-3 drop contract for tags {drop_tags}: {problem}"
         ),
+    }
+}
+
+/// A synthetic transcript for the checker unit tests: a user message, three
+/// read outputs, the ctx_reduce result, then two more reads, so one early drop
+/// needs three newer reads to leave the window, exactly like the real lane.
+fn synth_prompt() -> Vec<broca_protocol::Message> {
+    use broca_protocol::ids::ToolCallId;
+    use broca_protocol::{ContentBlock, Message, Role, ToolOutput, ToolResult};
+    let mut prompt = vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "synthetic start".into(),
+        }],
+    )];
+    let read_output = |read: usize| {
+        Message::new(
+            Role::Tool,
+            vec![ContentBlock::ToolResult(ToolResult {
+                tool_call_id: ToolCallId(format!("read_{read}")),
+                output: ToolOutput::Text {
+                    text: format!("Synth output {read}: {}", "evidence line. ".repeat(10)),
+                },
+                is_error: false,
+            })],
+        )
+    };
+    for read in 0..3 {
+        prompt.push(read_output(read));
+    }
+    prompt.push(Message::new(
+        Role::Tool,
+        vec![ContentBlock::ToolResult(ToolResult {
+            tool_call_id: ToolCallId("reduce_old_outputs".into()),
+            output: ToolOutput::Text {
+                text: "2 tags stamped. ".into(),
+            },
+            is_error: false,
+        })],
+    ));
+    for read in 3..5 {
+        prompt.push(read_output(read));
+    }
+    broca_protocol::content::stamp_ordinals(&mut prompt);
+    prompt
+}
+
+/// The checker's inputs over [`synth_prompt`] for `dropped` reads: part keys
+/// and ordinals scanned from the stamped prompt, the window walk, and the
+/// stamp ordinal of the ctx_reduce result.
+fn synth_inputs(
+    dropped: &[usize],
+) -> (
+    Vec<broca_protocol::Message>,
+    Vec<StampedDrop>,
+    Vec<WindowOutput>,
+    u64,
+) {
+    use broca_protocol::ContentBlock;
+    let prompt = synth_prompt();
+    let drops: Vec<StampedDrop> = dropped
+        .iter()
+        .map(|&read| {
+            let call = format!("read_{read}");
+            let (ordinal, part) = prompt
+                .iter()
+                .find_map(|message| {
+                    let index = message.content.iter().position(|block| {
+                        matches!(block, ContentBlock::ToolResult(result) if result.tool_call_id.0 == call)
+                    })?;
+                    let ordinal = message.ordinal?;
+                    Some((ordinal, broca_protocol::tags::part_key(ordinal, index)))
+                })
+                .expect("synthetic prompt holds every read");
+            StampedDrop {
+                read,
+                part,
+                ordinal,
+                marker: format!("Synth output {read}:"),
+            }
+        })
+        .collect();
+    let mut outputs = Vec::new();
+    let mut stamp_ordinal = None;
+    for message in &prompt {
+        for block in &message.content {
+            if let ContentBlock::ToolResult(result) = block {
+                let ordinal = message.ordinal.expect("stamped prompt");
+                if result.tool_call_id.0 == "reduce_old_outputs" {
+                    stamp_ordinal = Some(ordinal);
+                    outputs.push(WindowOutput {
+                        ordinal,
+                        tokens: MC_REDUCE_RESULT_TOKENS,
+                    });
+                } else {
+                    outputs.push(WindowOutput {
+                        ordinal,
+                        tokens: MC_READ_OUTPUT_TOKENS,
+                    });
+                }
+            }
+        }
+    }
+    (
+        prompt,
+        drops,
+        outputs,
+        stamp_ordinal.expect("synthetic prompt holds the stamp"),
+    )
+}
+
+/// A synthetic applied view: `ranges` must tile `[0, covers_through + 1)`.
+fn synth_view(
+    version: u64,
+    covers_through: u64,
+    ranges: Vec<broca_core::compaction_provider::view::ViewRange>,
+) -> (u64, broca_core::compaction_provider::view::CompactionView) {
+    use broca_core::compaction_provider::lineage::MessageRef;
+    use broca_core::compaction_provider::view::CompactionView;
+    (
+        version,
+        CompactionView::new(
+            "synth",
+            version,
+            "synth-lineage",
+            MessageRef {
+                ordinal: covers_through,
+                mid: format!("m{covers_through}"),
+            },
+            ranges,
+        ),
+    )
+}
+
+/// The skeleton bytes for `call_id`: the tool-result part with its output
+/// replaced by `[dropped]`, the shape the worker serves for a recent output.
+fn synth_skeleton_bytes(call_id: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "is_error": false,
+        "output": {"kind": "text", "text": "[dropped]"},
+        "tool_call_id": call_id,
+        "type": "tool_result",
+    }))
+    .unwrap()
+}
+
+/// A drop that lands late inside the window passes: v1 still holds the part
+/// (only two newer reads plus the tiny stamp result are covered, 7,015 tokens
+/// under the 10,240 floor), and v2 carries the drop once four newer reads are
+/// covered.
+#[test]
+fn mc_drops_late_inside_window_passes() {
+    use broca_core::compaction_provider::view::{PartEdit, ViewRange};
+    let (prompt, drops, outputs, stamp_ordinal) = synth_inputs(&[0]);
+    let views = vec![
+        synth_view(1, 4, vec![ViewRange::keep(0, 5)]),
+        synth_view(
+            2,
+            6,
+            vec![ViewRange::keep_with_edits(
+                0,
+                7,
+                vec![PartEdit::replace(
+                    1,
+                    "m1",
+                    drops[0].part.clone(),
+                    synth_skeleton_bytes("read_0"),
+                )],
+            )],
+        ),
+    ];
+    let summary = check_mc_worker_drops(&prompt, &drops, &outputs, stamp_ordinal, &views)
+        .expect("a late drop inside the window must pass");
+    assert!(
+        summary.contains("read 0"),
+        "summary names the drop: {summary}"
+    );
+}
+
+/// A drop that lands late outside the window fails: v1 already covers four
+/// newer reads, so the part must be gone from it.
+#[test]
+fn mc_drops_late_outside_window_fails() {
+    use broca_core::compaction_provider::view::ViewRange;
+    let (prompt, drops, outputs, stamp_ordinal) = synth_inputs(&[0]);
+    let views = vec![synth_view(1, 6, vec![ViewRange::keep(0, 7)])];
+    let problem = check_mc_worker_drops(&prompt, &drops, &outputs, stamp_ordinal, &views)
+        .expect_err("a late drop outside the window must fail");
+    assert!(
+        problem.contains("had left the window"),
+        "the failure names the missed timing: {problem}"
+    );
+}
+
+/// A part that is dropped and then reappears fails, even though the newest
+/// view is the one that carries it again.
+#[test]
+fn mc_drops_reappearing_part_fails() {
+    use broca_core::compaction_provider::view::{PartEdit, ViewRange};
+    let (prompt, drops, outputs, stamp_ordinal) = synth_inputs(&[0]);
+    let views = vec![
+        synth_view(
+            1,
+            6,
+            vec![ViewRange::keep_with_edits(
+                0,
+                7,
+                vec![PartEdit::replace(
+                    1,
+                    "m1",
+                    drops[0].part.clone(),
+                    synth_skeleton_bytes("read_0"),
+                )],
+            )],
+        ),
+        synth_view(2, 6, vec![ViewRange::keep(0, 7)]),
+    ];
+    let problem = check_mc_worker_drops(&prompt, &drops, &outputs, stamp_ordinal, &views)
+        .expect_err("a reappearing part must fail");
+    assert!(
+        problem.contains("brings a dropped part back"),
+        "the failure names rule 3: {problem}"
+    );
+}
+
+/// Both legal shapes pass together: a removed arc for one part and a skeleton
+/// edit for the other, both released by the same coverage.
+#[test]
+fn mc_drops_accepts_both_shapes() {
+    use broca_core::compaction_provider::view::{PartEdit, ViewRange};
+    let (prompt, drops, outputs, stamp_ordinal) = synth_inputs(&[0, 1]);
+    let views = vec![synth_view(
+        1,
+        6,
+        vec![
+            ViewRange::keep(0, 1),
+            ViewRange::replace(1, 2, "[]"),
+            ViewRange::keep_with_edits(
+                2,
+                3,
+                vec![PartEdit::replace(
+                    2,
+                    "m2",
+                    drops[1].part.clone(),
+                    synth_skeleton_bytes("read_1"),
+                )],
+            ),
+            ViewRange::keep(3, 7),
+        ],
+    )];
+    check_mc_worker_drops(&prompt, &drops, &outputs, stamp_ordinal, &views)
+        .expect("both legal drop shapes must pass");
+}
+
+/// The identical-bytes half of rule 3: the same part dropped two ways across
+/// views fails, even though it never reappears.
+#[test]
+fn mc_drops_changed_bytes_fail() {
+    use broca_core::compaction_provider::view::{PartEdit, ViewRange};
+    let (prompt, drops, outputs, stamp_ordinal) = synth_inputs(&[0]);
+    let views = vec![
+        synth_view(
+            1,
+            6,
+            vec![ViewRange::keep_with_edits(
+                0,
+                7,
+                vec![PartEdit::replace(
+                    1,
+                    "m1",
+                    drops[0].part.clone(),
+                    synth_skeleton_bytes("read_0"),
+                )],
+            )],
+        ),
+        synth_view(
+            2,
+            6,
+            vec![ViewRange::keep_with_edits(
+                0,
+                7,
+                vec![PartEdit::replace(
+                    1,
+                    "m1",
+                    drops[0].part.clone(),
+                    synth_skeleton_bytes("read_0").replace("[dropped]", "[dropped again]"),
+                )],
+            )],
+        ),
+    ];
+    let problem = check_mc_worker_drops(&prompt, &drops, &outputs, stamp_ordinal, &views)
+        .expect_err("changed drop bytes must fail");
+    assert!(
+        problem.contains("identical bytes"),
+        "the failure names the identical-bytes rule: {problem}"
+    );
+}
+
+/// Offline replay of a preserved Magic Context end-to-end WAL through the new
+/// checker: run 1115b is the failed lane run whose first view carried only one
+/// of the two stamped drops, failing the old check. Point
+/// `BROCA_MC_E2E_REPLAY_ROOT` at the preserved run directory (which holds
+/// `wal-records.json`, written by the lane's evidence hook) and run
+/// `mc_e2e::mc_drops_replay_run_1115b`. The run's three applied views must
+/// satisfy the contract, and removing the newest view's skeleton edit must
+/// fail the check, proving the timing half can fail. Skipped without the
+/// directory: the 467 KB WAL carries operator-local paths, so it is not a
+/// committed fixture.
+#[test]
+fn mc_drops_replay_run_1115b() {
+    use broca_core::compaction_provider::view::ViewRange;
+    let Some(root) = std::env::var_os("BROCA_MC_E2E_REPLAY_ROOT") else {
+        println!("SKIP mc_drops_replay_run_1115b: BROCA_MC_E2E_REPLAY_ROOT is unset");
+        return;
+    };
+    let bytes = std::fs::read(PathBuf::from(root).join("wal-records.json"))
+        .expect("the replay root must hold wal-records.json");
+    let values: Vec<Value> = serde_json::from_slice(&bytes).expect("wal-records.json must be JSON");
+    let records: Vec<WalRecord> = values
+        .into_iter()
+        .map(|value| serde_json::from_value(value).expect("wal-records.json must hold WAL records"))
+        .collect();
+    let (prompt, drops, outputs, stamp_ordinal, views) =
+        mc_worker_drop_inputs(&records, &[0, 1], "2,5");
+    check_mc_worker_drops(&prompt, &drops, &outputs, stamp_ordinal, &views)
+        .expect("run 1115b satisfies the mode-3 drop contract");
+    let mut mutated = views.clone();
+    let (_newest_version, newest) = mutated.last_mut().expect("run 1115b applied views");
+    let mut removed = 0;
+    for range in &mut newest.ranges {
+        if let ViewRange::Keep { edits, .. } = range {
+            let before = edits.len();
+            edits.retain(|edit| !drops.iter().any(|drop| edit.part == drop.part));
+            removed += before - edits.len();
+        }
+    }
+    assert!(
+        removed > 0,
+        "the mutation must remove the newest view's drop edits"
+    );
+    let problem = check_mc_worker_drops(&prompt, &drops, &outputs, stamp_ordinal, &mutated)
+        .expect_err("removing the newest view's drop edit must fail");
+    assert!(
+        problem.contains("still carries"),
+        "the failure names the carried part: {problem}"
     );
 }
