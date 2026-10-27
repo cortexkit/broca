@@ -5,7 +5,10 @@ use broca_core::CompactionViews;
 use broca_diagnostics::{spawn_blocking, JobKind};
 use broca_module::LineageRegistry;
 use broca_store::compaction_facts::CompactionFacts;
-use broca_store::{compaction_receipts::ViewReceipt, SqliteStore};
+use broca_store::{
+    compaction_receipts::{ReceiptWrite, ViewReceipt},
+    SqliteStore,
+};
 use cortexkit_bus_trait::{Message, StreamCursor};
 use std::{
     sync::{
@@ -154,12 +157,26 @@ impl Service {
         // A redelivery after receipt commit must still refill an inbox lost in a restart.
         #[cfg(feature = "test-clock")]
         receipt_barrier("ViewReceiptRecorded").await?;
+        // A receipt replaces the stored one when the lineage changes or, within the same
+        // lineage, its view version increases. The store keeps only one receipt per session,
+        // so the replaced version is no longer stored; log it here as cleared.
+        if let ReceiptWrite::Recorded {
+            replaced: Some(old),
+        } = &recorded
+        {
+            let reason = if old.lineage_id == receipt.lineage_id {
+                "superseded"
+            } else {
+                "lineage_changed"
+            };
+            tracing::info!(target: LOG, session_ref = %ready.session_ref,
+                view_version = %old.view_version, reason, "compaction view receipt cleared");
+        }
         // `receipt_held`: a receipt for this view or a newer one was already durable, as on a
         // redelivery; the inbox is refilled all the same.
-        handled(if recorded {
-            "receipted"
-        } else {
-            "receipt_held"
+        handled(match recorded {
+            ReceiptWrite::Recorded { .. } => "receipted",
+            ReceiptWrite::Held => "receipt_held",
         });
         self.inbox.announce(ready);
         Ok(())
