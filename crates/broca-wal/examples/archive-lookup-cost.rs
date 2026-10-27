@@ -12,7 +12,7 @@ fn main() {
 #[cfg(feature = "test-io-trace")]
 fn main() -> io::Result<()> {
     let root = PathBuf::from(std::env::args_os().nth(1).expect("archive directory"));
-    let mut paths = std::fs::read_dir(root)?
+    let mut paths = broca_wal::fs_ops::read_dir(root)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<io::Result<Vec<_>>>()?;
     paths.retain(|path| path.extension().is_some_and(|ext| ext == "ark"));
