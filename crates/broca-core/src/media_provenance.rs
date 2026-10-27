@@ -89,6 +89,7 @@ fn supplied_media_in_block(block: &ContentBlock) -> Option<Option<usize>> {
         | ContentBlock::TextWithState { .. }
         | ContentBlock::Reasoning { .. }
         | ContentBlock::RedactedReasoning { .. }
+        | ContentBlock::ProviderFallback { .. }
         | ContentBlock::ToolCall(_) => None,
     }
 }

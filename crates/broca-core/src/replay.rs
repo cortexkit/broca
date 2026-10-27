@@ -2996,6 +2996,9 @@ fn replay_seeded_with_compaction<'a>(
             // same contract, so replay skips it exactly as it skips `Unknown`. The step's retry
             // count still comes from `ModelStepFinished.retries_used`.
             WalRecord::ModelAttemptFinished { .. } => {}
+            // A refused step: decoded so the WAL stays readable, with nothing folded from it
+            // yet. No build writes one yet.
+            WalRecord::ModelStepRefused { .. } => {}
             // A resume's own account of what it found. Informational under the same contract:
             // it never enters the prompt, and replay is identical to the same WAL without it.
             WalRecord::ResumeStarted { .. } => {}
@@ -4071,6 +4074,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -4693,6 +4697,7 @@ pub(crate) mod deferred_tests {
         vec![
             super::projection_boundary_tests::run_started(1, "r").record,
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -5489,6 +5494,7 @@ mod offset_tail_tests {
 
     fn text_step(step: u64, text: &str) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -5558,6 +5564,7 @@ mod offset_tail_tests {
         // One model step with two tool calls, planned as [a, b] but arriving as [b, a].
         // The tools message orders results by plan, not by arrival.
         records.push(WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -6150,6 +6157,7 @@ mod offset_tail_tests {
     fn invalid_states_fall_back_to_full_replay() {
         let batch_id = BatchId("r1-b9".into());
         let tool_step = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -6294,6 +6302,7 @@ mod offset_tail_tests {
         ];
         for i in 0..9996u64 {
             small.push(WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,

@@ -1121,6 +1121,10 @@ fn convert_content(
             // A tool_result inside a non-Tool message is unusual; the Tool-role path
             // above handles results.
             ContentBlock::ToolResult(_) => None,
+            // Anthropic's server-side fallback handoff may be echoed only to a request whose
+            // frozen config opted into server-side fallback, and no config can opt in yet, so
+            // it is always dropped.
+            ContentBlock::ProviderFallback { .. } => None,
         })
         .collect()
 }

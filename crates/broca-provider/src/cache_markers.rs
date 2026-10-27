@@ -246,6 +246,9 @@ fn is_cacheable_block(block: &ContentBlock) -> bool {
         ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => !text.is_empty(),
         ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_) => true,
         ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => false,
+        // Every renderer drops a server-side fallback handoff today, so a marker placed on it
+        // would be lost with it.
+        ContentBlock::ProviderFallback { .. } => false,
     }
 }
 

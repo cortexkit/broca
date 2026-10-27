@@ -5596,6 +5596,7 @@ where
                                     false,
                                 );
                                 let mut records = vec![WalRecord::ModelStepFinished {
+                                    fallback: Default::default(),
                                     written_at_ms: step_written_at_ms,
                                     tags: None,
                                     hooks: metadata,
@@ -5702,6 +5703,7 @@ where
                         hooks.is_some(),
                         writer,
                         WalRecord::ModelStepFinished {
+                            fallback: Default::default(),
                             written_at_ms: step_written_at_ms,
                             tags: None,
                             hooks: message_hooks,
@@ -5736,6 +5738,7 @@ where
                 // extraction. The prompt reclaims ownership only after the turn is durable.
                 let message = Arc::new(message);
                 let model_record = WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: step_written_at_ms,
                     tags: None,
                     hooks: message_hooks,

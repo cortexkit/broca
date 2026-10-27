@@ -120,6 +120,7 @@ fn assistant_tool_call(id: &str, name: &str) -> AssistantMessage {
 
 fn step_with_call(step: u64, id: &str) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -152,6 +153,7 @@ fn usage_with_cache(input_tokens: u64, cached_input_tokens: u64, output_tokens: 
 
 fn step_text_with_usage(step: u64, text: &str, usage: Usage) -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,
@@ -845,6 +847,7 @@ async fn resume_completes_partial_batch_redispatching_only_missing_call() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2508,6 +2511,7 @@ async fn cross_episode_resume_is_exactly_once() {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -3182,6 +3186,7 @@ fn budget_fired_semantic_validation_rejects_wrong_early_reordered_and_duplicate_
     let mut reordered = vec![
         budgeted_start("r"),
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

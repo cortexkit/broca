@@ -2229,6 +2229,7 @@ pub(crate) fn text_step(seq: u64, step: u64, text: &str) -> FramedRecord {
     framed(
         seq,
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -2270,6 +2271,7 @@ fn tool_turn(seq_base: u64, step: u64) -> Vec<FramedRecord> {
         framed(
             seq_base,
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,

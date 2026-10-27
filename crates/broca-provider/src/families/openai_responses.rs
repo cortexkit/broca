@@ -475,6 +475,8 @@ fn user_text_content(
                     | ContentBlock::RedactedReasoning { .. }
                     | ContentBlock::ToolCall(_)
                     | ContentBlock::ToolResult(_) => None,
+                    // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
+                    ContentBlock::ProviderFallback { .. } => None,
                 })
                 .collect(),
         );
@@ -603,6 +605,8 @@ fn convert_assistant_items(
             ContentBlock::Reasoning { .. }
             | ContentBlock::RedactedReasoning { .. }
             | ContentBlock::ToolResult(_) => {}
+            // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
+            ContentBlock::ProviderFallback { .. } => {}
         }
     }
     flush_text(&mut out, &mut text);

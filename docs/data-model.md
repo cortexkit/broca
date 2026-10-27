@@ -330,6 +330,29 @@ no time.
 | `retries_used` | u32 | defaulted 0 | Retries within this step. |
 | `service_tier_used` | string | absent | Tier the provider **reported** serving, verbatim. Never filled from the requested tier. |
 | `speed_used` | string | absent | Anthropic `usage.speed`, verbatim. |
+| `served_model` | string | absent | **Must-understand, feature `provider-fallback-block/v1`.** The wire model id an Anthropic server-side fallback served the answer with, present only when it differs from the requested model. |
+| `usage_iterations` | array | absent | **Must-understand, feature `provider-fallback-block/v1`.** The response's `usage.iterations`, verbatim: entries with `type` (`message`, `fallback_message`), `model`, token counts and any other members. `usage` stays the top-level usage. |
+| `route` | `{model, reason}` | absent | **Must-understand, feature `refusal-fallback/v1`.** Present only when the step was sent to the client-side fallback model `model` (`{provider_module_id, model_id}`); `reason` is `refusal` (the source refused this step) or `schedule` (an earlier refusal's schedule routed it). |
+| `refusal_fallback` | object | absent | **Must-understand, feature `refusal-fallback/v1`.** The session's refusal-fallback schedule after this step: `source`, `fallback` (model handles), `phase` (`{kind: "fallback", remaining}` or `{kind: "probe", clean}`), `re_refusals` (u8), `updated_at_ms` (absent). |
+| `refusal_after_tool_use` | bool | absent | **Must-understand, feature `refusal-fallback/v1`.** The source model refused after completing a tool call; the step committed as a tool step. |
+
+An assistant message may hold a `provider_fallback` part, `{"type": "provider_fallback",
+"from_model": str, "to_model": str}`: Anthropic's server-side fallback handoff, at the position
+the response placed it. Any record carrying one requires `provider-fallback-block/v1`.
+
+**`model_step_refused`**: **must-understand, feature `refusal-fallback/v1`.** The source model
+refused the step and it is re-sent to the client-side fallback model under the same `step_id`,
+with no new `step_started`. Synced before the re-send. The refused content is never stored. At
+most one per step.
+
+| Field | Type | Rule | Meaning |
+|---|---|---|---|
+| `step_id` | u64 | required | The step being re-sent. |
+| `usage` | `Usage` | required | The refused response's billed usage. |
+| `served_model` | string | absent | As on `model_step_finished`. |
+| `discarded_blocks` | u32 | required | How many content blocks the refused response held. |
+| `schedule` | object | required | The schedule after the refusal, shaped like `model_step_finished.refusal_fallback`. |
+| `ts_ms` | u64 | absent | Wall-clock Unix ms of the refusal. |
 
 **`turn_finished`**: `step_id` (u64). The turn (step plus its tool batch) is committed.
 Synced.
@@ -485,6 +508,7 @@ reported it, the sum covers those steps only, a lower bound.
 **Which records carry usage:**
 
 - `model_step_finished.usage`: one step, one provider call.
+- `model_step_refused.usage`: one refused provider call; it counts toward the run total.
 - `run_finished.usage`: the run's accumulated usage.
 - `model_attempt_finished` carries **none**. Nothing else in the WAL does.
 

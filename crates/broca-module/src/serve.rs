@@ -3971,6 +3971,7 @@ mod offset_head_tests {
 
     fn text_step() -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
