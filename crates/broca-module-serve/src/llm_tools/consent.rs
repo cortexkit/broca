@@ -315,7 +315,22 @@ impl Consent {
                     self.io.withdraw(scope, &id).await;
                 }
             }
-            Err(ConsentError::Refused { .. }) => {
+            Err(ConsentError::Refused {
+                code,
+                message,
+                detail,
+            }) => {
+                // The caller only sees `consent_unavailable`, so Cingulate's own reason is
+                // logged here; without it an operator cannot tell a card shape the consent
+                // module rejects from one it was never asked about.
+                tracing::warn!(
+                    target: "llm_tools.consent",
+                    %code,
+                    %message,
+                    detail = %detail.map(|d| d.to_string()).unwrap_or_default(),
+                    dedup_key = %card.dedup_key,
+                    "consent module refused the approval card; the held call ends consent_unavailable"
+                );
                 // A refusal is proof that no card was filed. Transport and unreadable replies
                 // are different: they retain filing authority until the recovery feed is read.
                 self.store.refuse_card(
