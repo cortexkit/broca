@@ -141,6 +141,7 @@ fn chatgpt_test_options<'a>(account_id: Option<&'a str>) -> ResolveOptions<'a> {
         structured_output: None,
         frozen_account_ref: None,
         clock: None,
+        refusal_fallback_model: None,
     }
 }
 

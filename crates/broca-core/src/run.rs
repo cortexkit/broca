@@ -3008,6 +3008,19 @@ where
     A: ApprovalPolicy,
 {
     held_prompt::release_read_metadata(&mut prior);
+    // The session's client-side refusal-fallback schedule as replay left it (see
+    // `crate::refusal_fallback`). A fresh episode applies the admission rules to it once its
+    // `RunStarted` is durable; a resumed one already has them applied by replay.
+    let mut refusal_schedule = prior.refusal_fallback.clone();
+    // A resumed episode's steps that a durable `ModelStepRefused` already re-sent to the
+    // fallback model: they go there again, and are never refused a second time.
+    let refused_steps = if is_resume && !append_episode {
+        prior.refused_steps.clone()
+    } else {
+        Default::default()
+    };
+    // The last committed step's usage, for the fallback's context guard.
+    let mut last_step_usage = prior.last_step_usage;
     if !is_resume && req.retention.is_some() && writer.is_retention_lineage() == Some(false) {
         return Err(RunError::Config(
             "retention disagrees with the lineage's frozen policy".into(),
@@ -4389,6 +4402,9 @@ where
         // synced, reclaim the vector when no observer retained the record; otherwise the mutable
         // prompt takes its own copy only after the record is durable.
         let episode_input = Arc::new(episode_input);
+        // Read once: the record carries it, and the refusal-fallback admission rules below
+        // compare the schedule against the same value replay will.
+        let admitted_at_ms = control.now_ms();
         output_history.start_run(&cfg.model);
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
             written_at_ms: req
@@ -4423,7 +4439,7 @@ where
             title: req.title.clone(),
             project_id: req.project_id.clone(),
             principal: req.principal.clone(),
-            ts_ms: control.now_ms(),
+            ts_ms: admitted_at_ms,
             run_id: resolved_run_id.clone(),
             session: req.session.clone(),
             config: remember_warm_config(
@@ -4483,6 +4499,11 @@ where
         if let Some(reporter) = &control.account_reporter {
             reporter.run_started(writer.lineage_id(), run_started_seq);
         }
+        refusal_schedule = crate::refusal_fallback::on_episode_admitted(
+            refusal_schedule.take(),
+            &cfg.model,
+            admitted_at_ms,
+        );
 
         // The run is now durably ADMITTED — RunStarted+config+input are fsynced. Signal the
         // coordinator so it can reply `active{run_id}` + commit the durable run-index row
@@ -4928,7 +4949,7 @@ where
             }
         }};
     }
-    let reason = loop {
+    let reason = 'steps: loop {
         input_budget.limit = writer.input_token_limit().or(input_budget.limit);
         // A session budget is independent of episode counters and reminder inheritance.
         if let Some(detail) = input_budget.exhausted() {
@@ -5391,87 +5412,6 @@ where
                     .map_or(0, |history| history.retained_base_len()),
             );
         }
-        // Keep the step's output reservation inside the context limit: lower its cap when the
-        // estimated input plus the frozen cap would pass the limit, or end the run
-        // `context_overflow` without sending when not even the provider's floor fits.
-        //
-        // A cap this step already recorded is what an earlier attempt of it sent, so a resume
-        // renders it again even when it cannot estimate the request itself.
-        let recorded_cap = output_history.recorded_for(step_id);
-        let mut fresh_clamp = None;
-        if let (Some(limits), Some(context_limit)) = (provider.output_limits(), context_limit) {
-            // The estimate costs a render of the whole request, so it is made only when a
-            // measured earlier step on this model makes one possible. A compaction boundary
-            // already rendered the request it sends.
-            let estimate = output_history
-                .has_measurement(&cfg.model)
-                .then(|| {
-                    let bytes = match &model_opts {
-                        Some(_) => notice_request_bytes,
-                        None => provider.render_request(&opts).len(),
-                    };
-                    output_history.estimate(bytes, &cfg.model)
-                })
-                .flatten();
-            match estimate.map(|estimate| {
-                (
-                    estimate,
-                    crate::output_reservation::decide(limits, context_limit, estimate),
-                )
-            }) {
-                Some((
-                    estimate,
-                    crate::output_reservation::Reservation::Overflow { available, floor },
-                )) => {
-                    let error =
-                        output_reservation_overflow(estimate, available, floor, context_limit);
-                    let _ = send(
-                        out,
-                        OutputEvent::Control(ControlUnit::Error {
-                            error: error.clone().into(),
-                        }),
-                    )
-                    .await;
-                    terminal_error = Some(error);
-                    break RunFinishReason::Error;
-                }
-                Some((
-                    estimate,
-                    crate::output_reservation::Reservation::Clamped { max_output_tokens },
-                )) => fresh_clamp = Some((max_output_tokens, estimate, context_limit)),
-                Some((_, crate::output_reservation::Reservation::Unchanged)) | None => {}
-            }
-        }
-        // Only a request that now needs less than the recorded cap lowers it further.
-        let step_cap = match (recorded_cap, fresh_clamp) {
-            (Some(recorded), Some((fresh, ..))) => Some(recorded.min(fresh)),
-            (Some(recorded), None) => Some(recorded),
-            (None, Some((fresh, ..))) => Some(fresh),
-            (None, None) => None,
-        };
-        if let Some(cap) = step_cap {
-            if recorded_cap != Some(cap) {
-                let (_, estimated_input_tokens, context_limit) =
-                    fresh_clamp.expect("a cap below the recorded one comes from a fresh clamp");
-                writer.record(WalRecord::OutputReservationClamped {
-                    step_id,
-                    max_output_tokens: cap,
-                    estimated_input_tokens,
-                    context_limit,
-                });
-                // Durable before the request is sent, so a resume and any rebuild of this
-                // step's request render the cap the provider saw.
-                writer.sync().await?;
-                output_history.note_recorded(step_id, cap);
-            }
-            let sent = match model_opts.as_mut() {
-                Some(model_opts) => Arc::make_mut(model_opts),
-                None => mutable_call_options(&mut opts),
-            };
-            if let Some(step_context) = sent.step_context.as_mut() {
-                step_context.max_output_tokens = Some(cap);
-            }
-        }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
             break RunFinishReason::Cancelled;
@@ -5491,10 +5431,17 @@ where
         let session = &req.session;
         let attempt_run_id = &resolved_run_id;
         let completed_attempt_time = std::sync::Mutex::new(None);
+        // Attempts this step has recorded, so a re-send after a refusal numbers its attempts
+        // after them.
+        let step_attempts = std::sync::atomic::AtomicU32::new(0);
+        // How many `thinking_dropped` input transformations the step's completed attempt
+        // reported, when it reported its transformations at all.
+        let thinking_dropped = std::sync::Mutex::new(None::<usize>);
         // The body length of this step's latest attempt, for the output reservation's next
         // estimate (replay reads it from the same `ModelAttemptFinished` records).
         let last_attempt_bytes = std::sync::Mutex::new(None);
         let record_attempt = |attempt: broca_protocol::ModelAttempt| -> AttemptFuture<'_> {
+            step_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *last_attempt_bytes.lock().unwrap() = Some(attempt.request_body_len);
             if matches!(
                 attempt.outcome,
@@ -5502,6 +5449,13 @@ where
                     | broca_protocol::AttemptOutcome::ToolArgsTrailingGarbage
             ) {
                 *completed_attempt_time.lock().unwrap() = Some(attempt.ts_ms);
+                *thinking_dropped.lock().unwrap() =
+                    attempt.input_transformations.as_ref().map(|entries| {
+                        entries
+                            .iter()
+                            .filter(|entry| entry.kind.as_deref() == Some("thinking_dropped"))
+                            .count()
+                    });
             }
             Box::pin(async move {
                 if let Some(warm) = &control.keep_warm {
@@ -5531,11 +5485,151 @@ where
         // before either await arm so the wrapper cannot duplicate its large inline frame.
         let mut schema_resent = false;
         let mut schema_prior_retries = 0;
+        // Client-side refusal fallback (see `crate::refusal_fallback`). Only an episode that
+        // froze a fallback at admission has a `fallback_model`; every other run skips all of
+        // this, and its steps, records and bytes are exactly what they were without it.
+        let fallback_model = provider.refusal_fallback_model();
+        // A prompt that already fills the fallback model's window would only overflow it.
+        let fallback_fits = match (
+            provider.refusal_fallback_context_limit(),
+            last_step_usage.and_then(|usage| usage.fill_tokens()),
+        ) {
+            (Some(limit), Some(fill)) => fill < limit,
+            _ => true,
+        };
+        // Set once this step has been refused and re-sent, live or before a crash: a step is
+        // re-sent at most once, and a refusal on the re-send passes through.
+        let mut fallback_resent = refused_steps.contains(&step_id);
+        let mut step_route = crate::refusal_fallback::StepRoute::Source;
+        let mut route_reason = broca_wal::StepRouteReason::Schedule;
+        if let Some(fallback) = &fallback_model {
+            let scheduled = fallback_resent
+                || crate::refusal_fallback::route(refusal_schedule.as_ref(), true)
+                    == crate::refusal_fallback::StepRoute::Fallback;
+            if scheduled && fallback_fits {
+                step_route = crate::refusal_fallback::StepRoute::Fallback;
+                if fallback_resent {
+                    route_reason = broca_wal::StepRouteReason::Refusal;
+                }
+            } else if scheduled {
+                tracing::warn!(
+                    target: "broca::refusal_fallback",
+                    session = %req.session.session,
+                    run_id = %resolved_run_id.0,
+                    step_id = step_id.0,
+                    source = %cfg.model.model_id,
+                    fallback = %fallback.model_id,
+                    "refusal fallback skipped: prompt exceeds {} context",
+                    fallback.model_id
+                );
+            }
+            provider.set_step_route(step_route);
+        }
+        let mut refusal_prior_retries = 0u32;
+        let mut first_attempt = 0u32;
         let step = loop {
+            // A fallback step tells the renderer which model it is rendering for, as the
+            // recorded request a cache warm rebuilds does.
+            let (step_model, step_context_limit) = match (&fallback_model, step_route) {
+                (Some(fallback), crate::refusal_fallback::StepRoute::Fallback) => {
+                    (fallback, provider.refusal_fallback_context_limit())
+                }
+                _ => (&cfg.model, context_limit),
+            };
+            let mut step_opts = match (&fallback_model, step_route) {
+                (Some(fallback), crate::refusal_fallback::StepRoute::Fallback) => {
+                    Arc::new(CallOptions {
+                        target_model: Some(fallback.clone()),
+                        ..(**sent_opts).clone()
+                    })
+                }
+                _ => Arc::clone(sent_opts),
+            };
+            // Keep the step's output reservation inside the context limit: lower its cap when the
+            // estimated input plus the frozen cap would pass the limit, or end the run
+            // `context_overflow` without sending when not even the provider's floor fits.
+            //
+            // A cap this step already recorded is what an earlier attempt of it sent, so a resume
+            // renders it again even when it cannot estimate the request itself.
+            let recorded_cap = output_history.recorded_for(step_id);
+            let mut fresh_clamp = None;
+            if let (Some(limits), Some(context_limit)) =
+                (provider.output_limits(), step_context_limit)
+            {
+                // The estimate costs a render of the whole request, so it is made only when a
+                // measured earlier step on this model makes one possible. A compaction boundary
+                // already rendered the request, unless refusal fallback changed its route.
+                let estimate = output_history
+                    .has_measurement(step_model)
+                    .then(|| {
+                        let bytes = match &model_opts {
+                            Some(_) if fallback_model.is_none() => notice_request_bytes,
+                            _ => provider.render_request(&step_opts).len(),
+                        };
+                        output_history.estimate(bytes, step_model)
+                    })
+                    .flatten();
+                match estimate.map(|estimate| {
+                    (
+                        estimate,
+                        crate::output_reservation::decide(limits, context_limit, estimate),
+                    )
+                }) {
+                    Some((
+                        estimate,
+                        crate::output_reservation::Reservation::Overflow { available, floor },
+                    )) => {
+                        let error =
+                            output_reservation_overflow(estimate, available, floor, context_limit);
+                        let _ = send(
+                            out,
+                            OutputEvent::Control(ControlUnit::Error {
+                                error: error.clone().into(),
+                            }),
+                        )
+                        .await;
+                        terminal_error = Some(error);
+                        break 'steps RunFinishReason::Error;
+                    }
+                    Some((
+                        estimate,
+                        crate::output_reservation::Reservation::Clamped { max_output_tokens },
+                    )) => fresh_clamp = Some((max_output_tokens, estimate, context_limit)),
+                    Some((_, crate::output_reservation::Reservation::Unchanged)) | None => {}
+                }
+            }
+            // Only a request that now needs less than the recorded cap lowers it further.
+            let step_cap = match (recorded_cap, fresh_clamp) {
+                (Some(recorded), Some((fresh, ..))) => Some(recorded.min(fresh)),
+                (Some(recorded), None) => Some(recorded),
+                (None, Some((fresh, ..))) => Some(fresh),
+                (None, None) => None,
+            };
+            if let Some(cap) = step_cap {
+                if recorded_cap != Some(cap) {
+                    let (_, estimated_input_tokens, context_limit) =
+                        fresh_clamp.expect("a cap below the recorded one comes from a fresh clamp");
+                    writer.record(WalRecord::OutputReservationClamped {
+                        step_id,
+                        max_output_tokens: cap,
+                        estimated_input_tokens,
+                        context_limit,
+                    });
+                    // Durable before the request is sent, so a resume and any rebuild of this
+                    // step's request render the cap the provider saw.
+                    writer.sync().await?;
+                    output_history.note_recorded(step_id, cap);
+                }
+                let sent = Arc::make_mut(&mut step_opts);
+                if let Some(step_context) = sent.step_context.as_mut() {
+                    step_context.max_output_tokens = Some(cap);
+                }
+            }
             let model_step = Box::pin(run_step_watched(
                 provider,
                 step_id,
-                sent_opts,
+                &step_opts,
+                first_attempt,
                 control,
                 out,
                 &record_attempt,
@@ -5568,10 +5662,98 @@ where
                     continue;
                 }
             }
+            // A plain refusal on the source model: re-send this same step to the fallback
+            // model. The refused content is not committed or stored; only its billed usage and
+            // the schedule it arms are, in a record synced before the re-send. A run resumed
+            // after a crash that followed that sync sends the step to the fallback model; one
+            // resumed after a crash before it sends the step to the source model again.
+            // A refusal after a completed tool call commits as a tool step instead (below), and
+            // one on the fallback model commits as today. This runs before post-assistant
+            // hooks, so a hook never sees the refused message, only the fallback's answer.
+            if let (
+                Some(fallback),
+                StepOutcome::Completed {
+                    message,
+                    usage,
+                    retries_used,
+                    finish_reason: Some(FinishReason::ContentFilter),
+                    ..
+                },
+            ) = (&fallback_model, &step)
+            {
+                let no_tool_calls = message.tool_calls().next().is_none();
+                if step_route == crate::refusal_fallback::StepRoute::Source
+                    && no_tool_calls
+                    && !fallback_resent
+                    && !fallback_fits
+                {
+                    tracing::warn!(
+                        target: "broca::refusal_fallback",
+                        session = %req.session.session,
+                        run_id = %resolved_run_id.0,
+                        step_id = step_id.0,
+                        source = %cfg.model.model_id,
+                        fallback = %fallback.model_id,
+                        "refusal fallback skipped: prompt exceeds {} context",
+                        fallback.model_id
+                    );
+                }
+                if step_route == crate::refusal_fallback::StepRoute::Source
+                    && no_tool_calls
+                    && !fallback_resent
+                    && fallback_fits
+                {
+                    let now = control.now_ms().filter(|at| *at != 0);
+                    let schedule = crate::refusal_fallback::on_source_refusal(
+                        refusal_schedule.as_ref(),
+                        &cfg.model,
+                        fallback,
+                        now,
+                    );
+                    writer.record(WalRecord::ModelStepRefused {
+                        step_id,
+                        usage: *usage,
+                        served_model: None,
+                        discarded_blocks: message.content.len() as u32,
+                        schedule: schedule.clone(),
+                        ts_ms: now,
+                    });
+                    // Barrier: the re-send is authorized only by the durable refusal.
+                    writer.sync().await?;
+                    // The refused attempt's deltas already reached display subscribers.
+                    let _ = send(out, OutputEvent::Display(DisplayEvent::DisplayReset)).await;
+                    log_schedule(
+                        format!(
+                            "content filter on {}; re-sending step on {}",
+                            cfg.model.model_id, fallback.model_id
+                        ),
+                        &req.session,
+                        &resolved_run_id,
+                        step_id,
+                        &schedule,
+                        None,
+                    );
+                    // The refused call was billed: it counts toward the run's totals and its
+                    // input budget, as replay counts the record.
+                    total_usage += *usage;
+                    input_budget.observe(*usage);
+                    refusal_prior_retries = *retries_used;
+                    refusal_schedule = Some(schedule);
+                    fallback_resent = true;
+                    step_route = crate::refusal_fallback::StepRoute::Fallback;
+                    route_reason = broca_wal::StepRouteReason::Refusal;
+                    provider.set_step_route(step_route);
+                    first_attempt = step_attempts.load(std::sync::atomic::Ordering::Relaxed);
+                    *thinking_dropped.lock().unwrap() = None;
+                    continue;
+                }
+            }
             match &mut step {
                 StepOutcome::Completed { retries_used, .. }
                 | StepOutcome::Failed { retries_used, .. } => {
-                    *retries_used = retries_used.saturating_add(schema_prior_retries);
+                    *retries_used = retries_used
+                        .saturating_add(schema_prior_retries)
+                        .saturating_add(refusal_prior_retries);
                 }
             }
             break Ok(step);
@@ -5579,6 +5761,11 @@ where
         let step = match step {
             Ok(step) => step,
             Err(reason) => break reason,
+        };
+        // The model that produces this step's answer: the fallback model on a fallback step.
+        let step_origin = match (&fallback_model, step_route) {
+            (Some(fallback), crate::refusal_fallback::StepRoute::Fallback) => fallback.clone(),
+            _ => cfg.model.clone(),
         };
         let step_written_at_ms = completed_attempt_time
             .lock()
@@ -5614,21 +5801,27 @@ where
                     });
                 }
                 total_retries_used = total_retries_used.saturating_add(retries_used);
+                last_step_usage = Some(usage);
                 // Each step is a separate billed call → ACCUMULATE, never overwrite,
                 // or a multi-step run under-reports its own total spend.
                 total_usage += usage;
                 input_budget.observe(usage);
                 input_budget.limit = writer.input_token_limit().or(input_budget.limit);
-                if let Some(bytes) = last_attempt_bytes.lock().unwrap().take() {
+                let attempt_bytes = last_attempt_bytes.lock().unwrap().take();
+                if let Some(bytes) = attempt_bytes {
                     output_history.note_attempt(bytes);
                 }
-                output_history.note_step(usage);
+                output_history.note_step(usage, Some(&step_origin));
                 if let Some(bytes) = sent_bytes {
                     compaction_history.previous_native_usage = Some(usage);
                     compaction_history.previous_provider_code = None;
                     compaction_history.previous_error = false;
-                    compaction_history.previous_request_bytes = Some(bytes);
-                    compaction_history.previous_model = Some(cfg.model.clone());
+                    compaction_history.previous_request_bytes = if fallback_model.is_some() {
+                        attempt_bytes.and_then(|bytes| usize::try_from(bytes).ok())
+                    } else {
+                        Some(bytes)
+                    };
+                    compaction_history.previous_model = Some(step_origin.clone());
                 }
                 if let Some(seal) = &control.shutdown_seal {
                     seal.note_usage(step_id, usage);
@@ -5649,6 +5842,83 @@ where
                         finish_reason = Some(FinishReason::Stop);
                     }
                 }
+                // The refusal-fallback facts this step's record carries, and the schedule after
+                // it. A source refusal that came after a completed tool call commits as a tool
+                // step (its tool calls are dispatched once, as for any tool step) and arms the
+                // schedule, so the next step goes to the fallback model. Absent on every run
+                // without a fallback, which keeps its records' bytes.
+                let step_fallback: Box<broca_wal::StepFallback> = match &fallback_model {
+                    None => Default::default(),
+                    Some(fallback) => {
+                        let now = control.now_ms().filter(|at| *at != 0);
+                        let refusal_after_tool_use = step_route
+                            == crate::refusal_fallback::StepRoute::Source
+                            && finish_reason == Some(FinishReason::ContentFilter)
+                            && message.tool_calls().next().is_some();
+                        let schedule = if refusal_after_tool_use {
+                            finish_reason = Some(FinishReason::ToolCalls);
+                            let armed = crate::refusal_fallback::on_source_refusal(
+                                refusal_schedule.as_ref(),
+                                &cfg.model,
+                                fallback,
+                                now,
+                            );
+                            let next = match armed.phase {
+                                broca_wal::RefusalFallbackPhase::Fallback { remaining } => {
+                                    remaining
+                                }
+                                broca_wal::RefusalFallbackPhase::Probe { .. } => 0,
+                            };
+                            log_schedule(
+                                format!(
+                                    "content filter after tool_use on {}; next {next} responses \
+                                     on {}",
+                                    cfg.model.model_id, fallback.model_id
+                                ),
+                                &req.session,
+                                &resolved_run_id,
+                                step_id,
+                                &armed,
+                                None,
+                            );
+                            Some(armed)
+                        } else {
+                            let committed = crate::refusal_fallback::on_step_committed(
+                                refusal_schedule.as_ref(),
+                                crate::refusal_fallback::CommittedStep {
+                                    route: step_route,
+                                    refused: finish_reason == Some(FinishReason::ContentFilter),
+                                    served_by_server_side_fallback: false,
+                                },
+                                now,
+                            );
+                            log_step_transition(
+                                refusal_schedule.as_ref(),
+                                committed.as_ref(),
+                                step_route,
+                                finish_reason,
+                                *thinking_dropped.lock().unwrap(),
+                                &req.session,
+                                &resolved_run_id,
+                                step_id,
+                            );
+                            committed
+                        };
+                        if let Some(schedule) = &schedule {
+                            refusal_schedule = Some(schedule.clone());
+                        }
+                        Box::new(broca_wal::StepFallback {
+                            route: (step_route == crate::refusal_fallback::StepRoute::Fallback)
+                                .then(|| broca_wal::StepRoute {
+                                    model: fallback.clone(),
+                                    reason: route_reason,
+                                }),
+                            refusal_fallback: schedule,
+                            refusal_after_tool_use,
+                            ..Default::default()
+                        })
+                    }
+                };
                 let original_message = hooks.as_ref().map(|_| message.clone());
                 let hook_output = if let Some(hooks) = &hooks {
                     let original_message = original_message
@@ -5691,7 +5961,7 @@ where
                                     false,
                                 );
                                 let mut records = vec![WalRecord::ModelStepFinished {
-                                    fallback: Default::default(),
+                                    fallback: step_fallback.clone(),
                                     written_at_ms: step_written_at_ms,
                                     tags: None,
                                     hooks: metadata,
@@ -5789,7 +6059,7 @@ where
                         // The run's last message, announced before the run ends.
                         closing_tail.push(Message::assistant_from(
                             message.content.clone(),
-                            cfg.model.clone(),
+                            step_origin.clone(),
                         ));
                     }
                     let message = Arc::new(message);
@@ -5798,7 +6068,7 @@ where
                         hooks.is_some(),
                         writer,
                         WalRecord::ModelStepFinished {
-                            fallback: Default::default(),
+                            fallback: step_fallback,
                             written_at_ms: step_written_at_ms,
                             tags: None,
                             hooks: message_hooks,
@@ -5833,7 +6103,7 @@ where
                 // extraction. The prompt reclaims ownership only after the turn is durable.
                 let message = Arc::new(message);
                 let model_record = WalRecord::ModelStepFinished {
-                    fallback: Default::default(),
+                    fallback: step_fallback,
                     written_at_ms: step_written_at_ms,
                     tags: None,
                     hooks: message_hooks,
@@ -6215,7 +6485,7 @@ where
                     cache_prefix_blocks: None,
                     role: Role::Assistant,
                     content: assembled.content.clone(),
-                    origin: Some(cfg.model.clone()),
+                    origin: Some(step_origin.clone()),
                     ordinal: None,
                     tags: Default::default(),
                 };
@@ -6326,9 +6596,10 @@ where
             role: Role::Assistant,
             content: assembled.content,
             // Stamp the producing model so a later cross-model continuation can strip a
-            // signature this model minted. Same `cfg.model` replay stamps from the frozen
-            // config → byte-identical live-vs-resume.
-            origin: Some(cfg.model.clone()),
+            // signature this model minted. Same model replay stamps (the episode's frozen
+            // model, or the fallback model a step was routed to) → byte-identical
+            // live-vs-resume.
+            origin: Some(step_origin),
             ordinal: None,
             tags: Default::default(),
         };
@@ -7003,6 +7274,113 @@ impl TransformationReading {
     }
 }
 
+/// One INFO line about the client-side refusal fallback, with the schedule's fields.
+/// `thinking_dropped` is how many earlier thinking blocks the provider dropped from the
+/// request, when the response reported its input transformations: a fallback model does not
+/// read the source model's signed thinking, and this is where that loss shows up.
+fn log_schedule(
+    message: String,
+    session: &BindIdentity,
+    run_id: &RunId,
+    step_id: StepId,
+    schedule: &broca_wal::RefusalFallbackSchedule,
+    thinking_dropped: Option<usize>,
+) {
+    let (phase, remaining, clean) = match schedule.phase {
+        broca_wal::RefusalFallbackPhase::Fallback { remaining } => {
+            ("fallback", Some(remaining), None)
+        }
+        broca_wal::RefusalFallbackPhase::Probe { clean } => ("probe", None, Some(clean)),
+    };
+    tracing::info!(
+        target: "broca::refusal_fallback",
+        session = %session.session,
+        run_id = %run_id.0,
+        step_id = step_id.0,
+        source = %schedule.source.model_id,
+        fallback = %schedule.fallback.model_id,
+        phase,
+        remaining = ?remaining,
+        clean = ?clean,
+        re_refusals = schedule.re_refusals,
+        thinking_dropped = ?thinking_dropped,
+        "{message}"
+    );
+}
+
+/// Log what a committed step did to the refusal-fallback schedule: a step answered by the
+/// fallback model (with any thinking the provider dropped from its request), a refusal on the
+/// fallback passing through, the end of a round, and the reset after enough clean source
+/// responses.
+// Each value is a separate fact of the committed step; grouping them would only rename them.
+#[allow(clippy::too_many_arguments)]
+fn log_step_transition(
+    before: Option<&broca_wal::RefusalFallbackSchedule>,
+    after: Option<&broca_wal::RefusalFallbackSchedule>,
+    route: crate::refusal_fallback::StepRoute,
+    finish_reason: Option<FinishReason>,
+    thinking_dropped: Option<usize>,
+    session: &BindIdentity,
+    run_id: &RunId,
+    step_id: StepId,
+) {
+    use broca_wal::RefusalFallbackPhase::{Fallback, Probe};
+    let Some(after) = after else {
+        return;
+    };
+    let source = &after.source.model_id;
+    let fallback = &after.fallback.model_id;
+    if route == crate::refusal_fallback::StepRoute::Fallback {
+        if finish_reason == Some(FinishReason::ContentFilter) {
+            tracing::warn!(
+                target: "broca::refusal_fallback",
+                session = %session.session,
+                run_id = %run_id.0,
+                step_id = step_id.0,
+                source = %source,
+                fallback = %fallback,
+                "refusal on {fallback} passed through (no chain)"
+            );
+        } else {
+            log_schedule(
+                format!("step answered by {fallback} for {source}"),
+                session,
+                run_id,
+                step_id,
+                after,
+                thinking_dropped,
+            );
+        }
+    }
+    match (before.map(|before| before.phase), after.phase) {
+        (Some(Fallback { .. }), Probe { .. }) => log_schedule(
+            format!("fallback round complete; returning to {source}"),
+            session,
+            run_id,
+            step_id,
+            after,
+            None,
+        ),
+        (Some(Probe { clean }), Probe { clean: now })
+            if clean < crate::refusal_fallback::CLEAN_TO_RESET
+                && now == crate::refusal_fallback::CLEAN_TO_RESET =>
+        {
+            log_schedule(
+                format!(
+                    "refusal fallback reset after {} clean {source} responses",
+                    crate::refusal_fallback::CLEAN_TO_RESET
+                ),
+                session,
+                run_id,
+                step_id,
+                after,
+                None,
+            )
+        }
+        _ => {}
+    }
+}
+
 /// Count and warn about every entry of an attempt's `input_transformations`, whatever its reason:
 /// on an account that is not enforced, a mismatched thinking block is dropped silently, so this
 /// log line and the counter are the only place the loss shows up.
@@ -7502,6 +7880,7 @@ async fn run_step_watched<P: Provider>(
     provider: &P,
     step_id: StepId,
     opts: &Arc<CallOptions>,
+    first_attempt: u32,
     control: &RunControl,
     out: &mpsc::Sender<OutputEvent>,
     on_attempt: &AttemptSink<'_>,
@@ -7551,6 +7930,7 @@ async fn run_step_watched<P: Provider>(
             provider,
             step_id,
             render_opts,
+            first_attempt,
             &step_cancel,
             watchdog_deadline,
             out,
@@ -7653,6 +8033,7 @@ async fn run_step<P: Provider>(
     provider: &P,
     step_id: StepId,
     opts: Arc<CallOptions>,
+    first_attempt: u32,
     cancel: &CancellationToken,
     deadline: Option<tokio::time::Instant>,
     out: &mpsc::Sender<OutputEvent>,
@@ -7675,6 +8056,7 @@ async fn run_step<P: Provider>(
                 deadline,
                 seal: shutdown_seal.cloned(),
                 progress,
+                first_attempt,
             },
         )
         .await;
@@ -12708,6 +13090,7 @@ mod tests {
             &provider,
             StepId(1),
             &Arc::new(CallOptions::new(Vec::new())),
+            0,
             &control,
             &out,
             &|_| Box::pin(async { Ok(()) }),
@@ -12733,7 +13116,7 @@ mod tests {
         };
         let (out, _output_rx) = mpsc::channel(1);
         let opts = Arc::new(CallOptions::new(Vec::new()));
-        let run = run_step_watched(&provider, StepId(1), &opts, &control, &out, &|_| {
+        let run = run_step_watched(&provider, StepId(1), &opts, 0, &control, &out, &|_| {
             Box::pin(async { Ok(()) })
         });
         let cancel_parent = async {
@@ -12785,6 +13168,7 @@ mod tests {
             &MessageWithoutFinishedProvider,
             StepId(1),
             Arc::new(CallOptions::new(Vec::new())),
+            0,
             &CancellationToken::new(),
             None,
             &out,

@@ -130,7 +130,23 @@ impl OutputReservationHistory {
             WalRecord::ModelAttemptFinished {
                 request_body_len, ..
             } => self.note_attempt(*request_body_len),
-            WalRecord::ModelStepFinished { usage, .. } => self.note_step(*usage),
+            WalRecord::ModelStepFinished {
+                usage, fallback, ..
+            } => {
+                // A routed step was counted by the fallback's tokenizer, not the run's.
+                // Server-side mixed-model usage has no single tokenizer, so leave it unmeasured.
+                let model = if fallback.carries_server_side_fallback() {
+                    None
+                } else {
+                    fallback
+                        .route
+                        .as_ref()
+                        .map(|route| &route.model)
+                        .or(self.current_model.as_ref())
+                }
+                .cloned();
+                self.note_step(*usage, model.as_ref());
+            }
             WalRecord::OutputReservationClamped {
                 step_id,
                 max_output_tokens,
@@ -153,15 +169,14 @@ impl OutputReservationHistory {
         self.attempt_bytes = Some(request_body_len);
     }
 
-    /// A `ModelStepFinished` record with this usage.
-    pub fn note_step(&mut self, usage: broca_protocol::Usage) {
+    /// A `ModelStepFinished` record with usage measured on `model`, or `None` when the
+    /// serving model is unknown. A different model's tokenizer cannot supply an estimate.
+    pub fn note_step(&mut self, usage: broca_protocol::Usage, model: Option<&ModelHandle>) {
         // A step without measured input (or without an attempt record) leaves the older
         // measurement in place: its input plus the growth since is still an estimate.
-        if let (Some(input_tokens), Some(request_bytes), Some(model)) = (
-            usage.fill_tokens(),
-            self.attempt_bytes,
-            self.current_model.clone(),
-        ) {
+        if let (Some(input_tokens), Some(request_bytes), Some(model)) =
+            (usage.fill_tokens(), self.attempt_bytes, model.cloned())
+        {
             self.measured = Some(Measured {
                 input_tokens,
                 request_bytes,
@@ -348,6 +363,68 @@ mod tests {
             history.fold(&record);
         }
         assert_eq!(history.estimate(1_000, &model("m")), Some(100 + 300));
+    }
+
+    #[test]
+    fn fallback_usage_never_becomes_a_source_model_measurement() {
+        let mut routed = step(2, Some(900_000));
+        routed["route"] = serde_json::json!({
+            "model": {"provider_module_id": "p", "model_id": "fallback"},
+            "reason": "schedule"
+        });
+        let wal = records(&[
+            run_started("source"),
+            attempt(1, 400),
+            step(1, Some(100)),
+            attempt(2, 800),
+            routed,
+        ]);
+        let mut replayed = OutputReservationHistory::default();
+        for record in &wal[..3] {
+            replayed.fold(record);
+        }
+        assert_eq!(replayed.estimate(1_000, &model("source")), Some(400));
+        let mut live = replayed.clone();
+        live.note_attempt(800);
+        live.note_step(
+            broca_protocol::Usage {
+                input_tokens: Some(900_000),
+                ..Default::default()
+            },
+            Some(&model("fallback")),
+        );
+        for record in &wal[3..] {
+            replayed.fold(record);
+        }
+        assert_eq!(live, replayed);
+        assert_eq!(replayed.estimate(1_000, &model("source")), None);
+        assert_eq!(replayed.estimate(1_000, &model("fallback")), Some(900_100));
+        // A new run on the source model must not treat the fallback's tokens as its own.
+        replayed.start_run(&model("source"));
+        assert_eq!(replayed.estimate(1_000, &model("source")), None);
+        let mut checkpoint = crate::compaction::CompactionHistory::default();
+        for record in &wal {
+            checkpoint.fold(record);
+        }
+        let mut seeded = OutputReservationHistory::default();
+        seeded.seed_from_compaction(&checkpoint);
+        assert_eq!(seeded.estimate(1_000, &model("source")), None);
+        assert_eq!(seeded.estimate(1_000, &model("fallback")), Some(900_100));
+    }
+
+    #[test]
+    fn unknown_or_mixed_model_usage_cannot_seed_an_estimate() {
+        let mut history = OutputReservationHistory::default();
+        for record in records(&[attempt(1, 400), step(1, Some(100))]) {
+            history.fold(&record);
+        }
+        assert_eq!(history.estimate(1_000, &model("source")), None);
+        let mut mixed = step(1, Some(900_000));
+        mixed["served_model"] = serde_json::json!("another-model");
+        for record in records(&[run_started("source"), attempt(1, 400), mixed]) {
+            history.fold(&record);
+        }
+        assert_eq!(history.estimate(1_000, &model("source")), None);
     }
 
     #[test]

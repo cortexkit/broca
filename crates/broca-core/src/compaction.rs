@@ -441,9 +441,22 @@ impl CompactionHistory {
                 self.completed_at = *ts_ms;
                 self.current_request_bytes = usize::try_from(*request_body_len).ok();
             }
-            WalRecord::ModelStepFinished { usage, .. } => {
+            WalRecord::ModelStepFinished {
+                usage, fallback, ..
+            } => {
                 self.previous_native_usage = Some(*usage);
-                self.previous_model.clone_from(&self.current_model);
+                // Checkpoints must keep the tokenizer that measured the step, including a
+                // client-side fallback. Mixed server-side usage has no single tokenizer.
+                self.previous_model = if fallback.carries_server_side_fallback() {
+                    None
+                } else {
+                    fallback
+                        .route
+                        .as_ref()
+                        .map(|route| &route.model)
+                        .or(self.current_model.as_ref())
+                        .cloned()
+                };
                 self.previous_provider_code = None;
                 self.previous_error = false;
                 self.previous_request_bytes = self.current_request_bytes;

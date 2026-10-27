@@ -226,9 +226,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let refusal_fallback =
         broca_module_serve::refusal_fallback_config::RefusalFallbackConfig::load_default_path()
             .map_err(ServeIoError)?;
-    // Loaded and validated above; no run reads it yet, and this line keeps the loaded value
-    // alive until the run loop's refusal path takes it.
-    let _ = &refusal_fallback;
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
@@ -428,6 +425,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_subc::RouteOpenRetry::default_patience(),
     )))
     .with_provider_overrides(provider_overrides)
+    .with_refusal_fallback(refusal_fallback)
     .with_claude_code_install_id(
         match broca_module_serve::claude_code_identity::load_or_create_install_id(&state_root) {
             Ok(install_id) => Some(install_id),
@@ -2745,6 +2743,10 @@ mod executor {
         /// Configured hosts change only the endpoint. Keeping them out of provider_base_url
         /// prevents them from disabling credentials and cache planning like the mock path.
         provider_overrides: broca_module_serve::provider_overrides::ProviderOverrides,
+        /// The operator's client-side refusal fallback: the `anthropic_refusal_fallback` switch
+        /// and the model each source model's refused steps are re-sent to. Consulted only when a
+        /// fresh episode is admitted; a resume keeps what its recorded config froze.
+        refusal_fallback: broca_module_serve::refusal_fallback_config::RefusalFallbackConfig,
         /// Vault access shared with the provider transport's in-step token refresher.
         /// Absent only for mock providers and executors not yet configured for real calls.
         vault: Option<Arc<VaultAuth>>,
@@ -2811,6 +2813,8 @@ mod executor {
                 clock: broca_core::clock::Clock::default(),
                 provider_base_url,
                 provider_overrides: Default::default(),
+                // Off unless the boot config switches it on.
+                refusal_fallback: Default::default(),
                 vault: None,
                 context_management: Default::default(),
                 cache_table: CacheTtlTable::shipped_defaults(),
@@ -3078,6 +3082,15 @@ mod executor {
             overrides: broca_module_serve::provider_overrides::ProviderOverrides,
         ) -> Self {
             self.provider_overrides = overrides;
+            self
+        }
+
+        /// Install the refusal-fallback switch and mapping loaded at boot.
+        pub fn with_refusal_fallback(
+            mut self,
+            config: broca_module_serve::refusal_fallback_config::RefusalFallbackConfig,
+        ) -> Self {
+            self.refusal_fallback = config;
             self
         }
 
@@ -4016,6 +4029,15 @@ mod executor {
                     .as_ref()
                     .map(|refresh| refresh.refresher.clone()),
                 structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
+                // Offered only to a fresh episode, and only with the operator switch on; the
+                // catalog then decides whether the episode is eligible and freezes it.
+                refusal_fallback_model: self
+                    .refusal_fallback
+                    .offer_for(
+                        job.req.model.provider_module_id.as_str(),
+                        job.req.model.model_id.as_str(),
+                    )
+                    .filter(|_| fresh_episode),
             };
             let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
                 family_override.filter(|_| fresh_episode),
@@ -4877,6 +4899,7 @@ mod executor {
                     structured_output: None,
                     frozen_account_ref: None,
                     clock: None,
+                    refusal_fallback_model: None,
                 },
             );
             match result {
@@ -4905,6 +4928,7 @@ mod executor {
                 structured_output: None,
                 frozen_account_ref: None,
                 clock: None,
+                refusal_fallback_model: None,
             };
             let paused = AuthResolution {
                 mode: AuthMode::None,

@@ -123,6 +123,9 @@ pub struct AnthropicNormalizer {
     /// `message.input_transformations` from `message_start`, verbatim; `None` when the
     /// response did not carry the field (it is present only under the thinking-binding beta).
     input_transformations: Option<Vec<broca_protocol::InputTransformation>>,
+    /// Drop blocks the stream never finished when the response is a refusal that came after
+    /// at least one completed tool call; see [`Self::with_refusal_tool_use_trim`].
+    trim_refusal_after_tool_use: bool,
 }
 
 impl AnthropicNormalizer {
@@ -142,7 +145,19 @@ impl AnthropicNormalizer {
             service_tier_used: None,
             speed_used: None,
             input_transformations: None,
+            trim_refusal_after_tool_use: false,
         }
+    }
+
+    /// For a request whose episode froze a client-side refusal fallback: when the response
+    /// ends `stop_reason: "refusal"` after at least one tool call completed (got its
+    /// `content_block_stop`) and none is still open, keep only the blocks that completed. The
+    /// run commits such a step as a tool step, and a block the refusal cut off mid-stream (a
+    /// partial trailing text) must not enter the transcript. Off by default, which assembles
+    /// every refusal exactly as before.
+    pub fn with_refusal_tool_use_trim(mut self, trim: bool) -> Self {
+        self.trim_refusal_after_tool_use = trim;
+        self
     }
 
     /// The provider's report of how it altered the request, as read from `message_start`.
@@ -561,11 +576,22 @@ impl AnthropicNormalizer {
                 max_output_tokens: self.max_output_tokens,
                 output_tokens: self.usage.output_tokens,
             });
+        let is_tool = |buf: &BlockBuf| matches!(buf, BlockBuf::ToolUse { .. });
+        let refusal_after_tool_use = self.trim_refusal_after_tool_use
+            && self.finish_reason == FinishReason::ContentFilter
+            && self
+                .blocks
+                .iter()
+                .any(|(idx, buf)| is_tool(buf) && self.completed_blocks.contains(idx))
+            && self
+                .blocks
+                .iter()
+                .all(|(idx, buf)| !is_tool(buf) || self.completed_blocks.contains(idx));
         let mut content = Vec::new();
         for (idx, buf) in std::mem::take(&mut self.blocks) {
-            if self.arguments_guard.fired()
+            if (self.arguments_guard.fired() || refusal_after_tool_use)
                 && !self.completed_blocks.contains(&idx)
-                && !matches!(buf, BlockBuf::ToolUse { .. })
+                && !is_tool(&buf)
             {
                 continue;
             }
@@ -917,6 +943,62 @@ mod tests {
             } => assert_eq!(data, blob),
             other => panic!("expected RedactedReasoning, got {other:?}"),
         }
+    }
+
+    /// A refusal after a completed tool call: text block 0 and tool block 1 completed, text
+    /// block 2 was cut off by the refusal.
+    fn refusal_after_tool_use(trim: bool) -> (Vec<ContentBlock>, FinishReason) {
+        let events = [
+            r#"{"type":"message_start","message":{"id":"msg_t","usage":{"input_tokens":5}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"looking"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"f\":\"a\"}"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"half a sen"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let mut n = AnthropicNormalizer::new(StepId(1)).with_refusal_tool_use_trim(trim);
+        let mut all = Vec::new();
+        for e in events {
+            all.extend(n.push_json(e).expect("push"));
+        }
+        let message = all
+            .iter()
+            .find_map(|e| match e {
+                NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                    Some(message.content.clone())
+                }
+                _ => None,
+            })
+            .expect("assembled message");
+        let reason = all
+            .iter()
+            .find_map(|e| match e {
+                NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) => {
+                    Some(*finish_reason)
+                }
+                _ => None,
+            })
+            .expect("finished");
+        (message, reason)
+    }
+
+    #[test]
+    fn a_refusal_after_a_completed_tool_call_keeps_only_completed_blocks_when_asked() {
+        let (trimmed, reason) = refusal_after_tool_use(true);
+        assert_eq!(reason, FinishReason::ContentFilter);
+        assert_eq!(trimmed.len(), 2, "{trimmed:?}");
+        assert!(matches!(&trimmed[0], ContentBlock::Text { text } if text == "looking"));
+        assert!(matches!(&trimmed[1], ContentBlock::ToolCall(call) if call.tool_call_id.0 == "t1"));
+        // Without the episode's fallback the refusal assembles as it always did.
+        let (untouched, reason) = refusal_after_tool_use(false);
+        assert_eq!(reason, FinishReason::ContentFilter);
+        assert_eq!(untouched.len(), 3, "{untouched:?}");
+        assert!(matches!(&untouched[2], ContentBlock::Text { text } if text == "half a sen"));
     }
 
     #[test]
