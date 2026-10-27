@@ -93,6 +93,7 @@ fn opts(tools: bool) -> CallOptions {
         account_ref: None,
         run_id: "run-so".into(),
         step_index: 1,
+        max_output_tokens: None,
     });
     opts
 }

@@ -868,7 +868,9 @@ fn project_control_record<S: ControlProjectionSink>(
                 });
             }
         }
-        WalRecord::ContextCeilingWait { .. } | WalRecord::ContextCeilingDecided { .. } => {}
+        WalRecord::ContextCeilingWait { .. }
+        | WalRecord::ContextCeilingDecided { .. }
+        | WalRecord::OutputReservationClamped { .. } => {}
         WalRecord::CompactionRideWait { deadline_ms, .. } => {
             if let Some(run_id) = &state.run_id {
                 push!(ControlUnit::CompactionWait {

@@ -520,6 +520,7 @@ mod tests {
             account_ref: None,
             run_id: run_id.to_string(),
             step_index: idx,
+            max_output_tokens: None,
         }
     }
 

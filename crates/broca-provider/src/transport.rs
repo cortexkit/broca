@@ -604,6 +604,15 @@ impl StreamNormalizer for ToolNameRestoringNormalizer {
     }
 }
 
+/// `frozen` with the step's lowered output cap applied (see [`FrozenRenderConfig::for_step`]);
+/// the same allocation when the step keeps the frozen cap.
+fn step_frozen(frozen: Arc<FrozenRenderConfig>, opts: &CallOptions) -> Arc<FrozenRenderConfig> {
+    match frozen.for_step(opts) {
+        std::borrow::Cow::Borrowed(_) => frozen,
+        std::borrow::Cow::Owned(lowered) => Arc::new(lowered),
+    }
+}
+
 fn build_retry_normalizer<F: WireFamily>(
     family: &F,
     frozen: &FrozenRenderConfig,
@@ -781,7 +790,7 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         let render_job = RenderJob {
             auth_revision: served.revision,
             family: Arc::clone(&self.family),
-            frozen: self.effective_frozen(),
+            frozen: step_frozen(self.effective_frozen(), &opts),
             auth: served.auth,
             opts,
             step_id,
@@ -800,7 +809,8 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             self.client.clone(),
             self.clock.clone(),
             Arc::clone(&self.family),
-            Arc::clone(&self.frozen),
+            // The normalizer reports an output-ceiling cut with the cap this step was sent with.
+            step_frozen(Arc::clone(&self.frozen), &render_job.opts),
             render_job,
             served.account_ref,
             recovery,
@@ -935,7 +945,8 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     }
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
-        self.family.render(&self.effective_frozen(), opts)
+        self.family
+            .render(&self.effective_frozen().for_step(opts), opts)
     }
 
     fn renderer_version(&self) -> u32 {
@@ -4967,6 +4978,7 @@ mod tests {
             account_ref: None,
             run_id: "render-job-run".into(),
             step_index: 7,
+            max_output_tokens: None,
         });
         opts.target_model = Some(ModelHandle::new("target-provider", "target-model"));
         opts
@@ -5038,6 +5050,7 @@ mod tests {
             account_ref: None,
             run_id: "panic-translation".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         let mut rx = provider.start_step(StepId(1), Arc::new(opts), CancellationToken::new(), None);
         let event = rx
@@ -10232,6 +10245,7 @@ mod tests {
                 account_ref: None,
                 run_id: "run-abc".into(),
                 step_index: 7,
+                max_output_tokens: None,
             }),
             "ignored",
             1,

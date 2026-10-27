@@ -34,6 +34,7 @@ pub mod media_store;
 pub mod media_uploads;
 pub mod media_validation;
 pub mod message_times;
+pub mod output_reservation;
 pub mod placement;
 pub mod projection;
 mod projection_health;
