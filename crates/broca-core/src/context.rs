@@ -1885,6 +1885,9 @@ pub(crate) fn merge_prefix_and_tail(
         // `latest_projection_boundary`), so every unplaced steer is in the tail.
         pending_steers: tail_state.pending_steers,
         resolution: tail_state.resolution,
+        // Only what the tail recorded: the materialized prefix keeps no schedule.
+        refusal_fallback: tail_state.refusal_fallback,
+        refused_steps: tail_state.refused_steps,
         committed_tool_turns: Vec::new(),
         held: None,
     };

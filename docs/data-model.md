@@ -760,6 +760,14 @@ separate-reasoning normalizer), `usage` (`Usage`, section 2.5), `usage_by_servic
 `pricing_at_ms`, `pricing_at_precision`, `occurred_at_ms`, `occurred_at_precision`,
 `terminal_reason` (final slice only). New fields are only ever added.
 
+A slice ends at a refreeze, and also where a model call is answered by another model than the
+slice's: a step routed to the refusal-fallback model (`route`) or served by an Anthropic
+server-side fallback (`served_model`). The next slice's `model` is the model that answered, so a
+run can carry a row for a fallback model. A `model_step_refused` call belongs to the slice of
+the model that refused it, and a `cache_warmed` re-send of a routed step's request is billed
+under that step's model. When every call is answered by the run's own model, only refreezes
+open additional slices.
+
 Session facts have no `kind` member and retain the shape above. Sessionless classifier
 facts dispatch on `kind: "system_one"` before decoding. They contain `fact_id`,
 `batch_id`, `item_index`, `provider`, `model`, optional `auth_selection` (the resolved

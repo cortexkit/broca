@@ -81,16 +81,29 @@ impl HeadProjection {
                 model.variant = config.variant.clone().filter(|value| !value.is_empty());
                 self.model = Some(model);
             }
-            WalRecord::ModelStepFinished { usage, .. } => {
+            // A refused call was billed, so it counts as a call of the model that refused; a
+            // step another model answered counts under that model.
+            WalRecord::ModelStepFinished { usage, .. }
+            | WalRecord::ModelStepRefused { usage, .. } => {
                 if let (Some(run_id), Some(model)) = (&self.run_id, &self.model) {
-                    self.usage
-                        .get_or_insert_with(|| SessionUsage::new(&run_id.0))
-                        .record_step(
-                            &model.provider,
-                            &model.model,
-                            model.variant.as_deref(),
-                            crate::replay::reported_step_usage(usage),
-                        );
+                    let episode = broca_protocol::request::ModelHandle::new(
+                        model.provider.as_str(),
+                        model.model.as_str(),
+                    );
+                    if let Some((provider, model, variant)) = crate::refusal_fallback::usage_model(
+                        &episode,
+                        model.variant.as_deref(),
+                        record,
+                    ) {
+                        self.usage
+                            .get_or_insert_with(|| SessionUsage::new(&run_id.0))
+                            .record_step(
+                                provider,
+                                model,
+                                variant,
+                                crate::replay::reported_step_usage(usage),
+                            );
+                    }
                 }
             }
             WalRecord::Queued {
@@ -182,6 +195,44 @@ mod tests {
         serde_json::from_value(json!({"type":"model_step_finished", "step_id":1,
             "assistant_message":{"message_id":"m","content":[]},"usage":usage,"retries_used":0}))
         .unwrap()
+    }
+
+    /// A refused call counts under the model that refused it, and a step routed to the
+    /// refusal-fallback model, or served by a server-side fallback, under the model that
+    /// answered it, without the caller's variant.
+    #[test]
+    fn session_spend_counts_refused_and_fallback_calls_under_the_model_that_answered() {
+        let mut head = HeadProjection::default();
+        head.observe(&start("run", Some("deep")));
+        head.observe(&step(json!({"input_tokens":2,"output_tokens":1})));
+        head.observe(
+            &serde_json::from_value(json!({"type":"model_step_refused","step_id":2,
+                "usage":{"input_tokens":4,"output_tokens":1},"discarded_blocks":0,
+                "schedule":{"source":{"provider_module_id":"p","model_id":"m"},
+                "fallback":{"provider_module_id":"p","model_id":"m-fallback"},
+                "phase":{"kind":"fallback","remaining":10},"re_refusals":0}}))
+            .unwrap(),
+        );
+        let mut routed =
+            serde_json::to_value(step(json!({"input_tokens":8,"output_tokens":2}))).unwrap();
+        routed["route"] =
+            json!({"model":{"provider_module_id":"p","model_id":"m-fallback"},"reason":"refusal"});
+        head.observe(&serde_json::from_value(routed).unwrap());
+        let mut served =
+            serde_json::to_value(step(json!({"input_tokens":16,"output_tokens":4}))).unwrap();
+        served["served_model"] = json!("m-served");
+        head.observe(&serde_json::from_value(served).unwrap());
+        let usage = serde_json::to_value(head.usage.unwrap()).unwrap();
+        assert_eq!(usage["steps"], 4);
+        assert_eq!(usage["input_tokens"], 30);
+        assert_eq!(
+            usage["by_model"],
+            json!([
+                {"provider":"p","model":"m","variant":"deep","steps":2,"unreported_steps":0,"input_tokens":6,"output_tokens":2},
+                {"provider":"p","model":"m-fallback","steps":1,"unreported_steps":0,"input_tokens":8,"output_tokens":2},
+                {"provider":"p","model":"m-served","steps":1,"unreported_steps":0,"input_tokens":16,"output_tokens":4}
+            ])
+        );
     }
 
     #[test]
