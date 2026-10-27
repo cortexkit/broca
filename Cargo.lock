@@ -621,6 +621,7 @@ dependencies = [
  "broca-provider",
  "broca-test-support",
  "broca-wal",
+ "cortexkit-model-batch",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
@@ -1032,9 +1033,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-model-batch"
-version = "0.3.0"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c566ae8de589e7be4deccb1fa677a2afca9e731d090057830a38fa184fcca0b6"
+checksum = "b03d631c6b45c0e5c00fd5a7e36d038f62c3dbe88ca7dd4498d45918ad8d486e"
 dependencies = [
  "base64",
  "serde",

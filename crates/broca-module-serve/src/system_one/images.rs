@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine};
 use broca_protocol::SendScope;
 use cortexkit_model_batch::image::{
     DecodedImage, Image, InlineImage, ResolveFailure, IMAGE_MAX_PIXELS,
@@ -14,7 +13,6 @@ use cortexkit_role_classifier::{
         check_request, check_request_with_references, check_resolved_item_images, parse_request,
     },
 };
-use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use super::SystemOne;
@@ -174,13 +172,7 @@ impl SystemOne {
                                 )
                             }
                         })?;
-                    let bytes = STANDARD
-                        .decode(&reply.bytes)
-                        .map_err(|_| invalid_reply(&field))?;
-                    if bytes.is_empty() || format!("{:x}", Sha256::digest(&bytes)) != reply.sha256 {
-                        return Err(invalid_reply(&field));
-                    }
-                    DecodedImage::new(reply.mime, bytes)
+                    DecodedImage::new(reply.content_type, reply.bytes)
                 } else {
                     image
                         .decode()
