@@ -382,7 +382,9 @@ async fn start_rig_with_references(
             .map(|byte| format!("{byte:02x}")).collect::<String>();
         config["modules"]["cerebellum"] = json!({
             "program":broca_test_support::ckdev_binary(surface, broca_test_support::scratch_root()),
-            "args":[format!("--SURFACE_FIXTURES={}",hex(&fixtures)),format!("--SURFACE_REQUESTS={}",hex(&root.join("images.requests")))],
+            // The daemon names neither the module id nor a FAKE_AFT_MODULE_ID for a supervised
+            // module, so the stand-in is told it is `cerebellum` here; without it, it exits at once.
+            "args":["--module-id","cerebellum",format!("--SURFACE_FIXTURES={}",hex(&fixtures)),format!("--SURFACE_REQUESTS={}",hex(&root.join("images.requests")))],
             "reserved":true,"enabled":true,"env":{"SUBC_CONNECTION":connection_file}
         });
         fixtures
