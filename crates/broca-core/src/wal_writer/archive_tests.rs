@@ -76,6 +76,29 @@ fn admission_existence_counts_archived_members_and_keeps_them_portable() {
     assert!(!f.store.ephemeral_wal_path(&f.session).exists());
 }
 
+#[test]
+fn restored_live_log_wins_after_member_index_was_warmed() {
+    let f = Fixture::new();
+    let records = f.live();
+    let live = f.store.wal_path(&f.session);
+    f.archive(1000, &std::fs::read(&live).unwrap());
+    std::fs::remove_file(&live).unwrap();
+    assert_eq!(f.store.read_records(&f.session).unwrap(), records);
+    #[cfg(unix)]
+    assert!(broca_wal::archive::cached_member_index_stats(&f.root.join("wal-archive")).is_some());
+    let mut wal = f.store.open(&f.session).unwrap();
+    #[cfg(unix)]
+    assert!(
+        broca_wal::archive::cached_member_index_stats(&f.root.join("wal-archive")).is_some(),
+        "restore must retain the index for other archived addresses"
+    );
+    wal.append(1, &WalRecord::StepStarted { step_id: StepId(4) }, true)
+        .unwrap();
+    let restored = wal.replay().unwrap();
+    assert_eq!(restored.len(), records.len() + 1);
+    assert_eq!(f.store.read_records(&f.session).unwrap(), restored);
+}
+
 /// The boot prewarm only fills the membership cache; it must not change any answer. With no
 /// archive it consults nothing. With one it consults every container, then an archived
 /// session still reads its archived transcript and a new session still reads as absent --

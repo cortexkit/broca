@@ -692,7 +692,10 @@ fn run_tree(
             // have run, so an already-absent file is the SUCCESS case, not an error.
             if options.write {
                 match fs::remove_file(&ark) {
-                    Ok(()) => sync_dir(&dir)?,
+                    Ok(()) => {
+                        broca_wal::archive::invalidate_member_index(&dir);
+                        sync_dir(&dir)?;
+                    }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => {
                         return Err(invalid(format!(
@@ -790,6 +793,7 @@ fn run_tree(
         }
         journal.append(Event::Restarted, boundary)?;
         fs::remove_file(&ark)?;
+        broca_wal::archive::invalidate_member_index(&dir);
         sync_dir(&dir)?;
     }
     if !options.write {
@@ -1209,6 +1213,7 @@ fn unfold(root: &Path, journal: &Journal, ark: &Path, write: bool) -> io::Result
         file.write_all(&member.payload)?;
         file.sync_all()?;
         fs::rename(&temp, &path)?;
+        broca_wal::archive::invalidate_restored_member(ark.parent().unwrap(), &session_addr);
         sync_dir(&Tree::for_journal(journal).live(root))?;
         report.restored += 1;
     }
