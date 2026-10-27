@@ -166,6 +166,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let state_root = broca_module_serve::state_root::resolve_for_launch(&conn_path)
         .map_err(|e| ServeIoError(e.to_string()))?
         .path;
+    // ONE BROCA PER STATE ROOT, decided before anything below touches the root: the state-format
+    // decision, the stall log, store opens and every boot recovery step (fence-index rebuild, cut
+    // reconcile, crash-orphan seal, System One release) assume no other process is doing the
+    // same work on the same files. A held lock exits at once, non-zero, so the daemon counts a
+    // failed start and backs off; see `state_root_lock`.
+    match broca_module_serve::state_root_lock::acquire(&state_root) {
+        Ok(lock) => lock.hold_until_exit(),
+        Err(error) => {
+            tracing::error!(target: "lifecycle", root = %state_root.display(), "{error}");
+            return Err(ServeIoError(error.to_string()).into());
+        }
+    }
     // DECIDE THE STATE FORMAT BEFORE ANY OTHER STARTUP WORK TOUCHES THE ROOT, the stall log
     // just below included. A new root that is to become a `broca-state/2` root gets its marker first, so a
     // power loss can never leave other files on it without one (which would read as a legacy

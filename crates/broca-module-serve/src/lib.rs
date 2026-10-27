@@ -46,6 +46,7 @@ pub mod session_class;
 pub mod session_lookup;
 pub mod stall;
 pub mod state_root;
+pub mod state_root_lock;
 pub mod system_one;
 pub mod trajectory;
 pub mod transport_config;
