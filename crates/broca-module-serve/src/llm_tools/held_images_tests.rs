@@ -12,7 +12,6 @@ use broca_subc::{
     AnswersPage, ConsentError, ConsentRecord, ConsentState, ImageResolveError, ResolvedImage,
 };
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::consent::{Consent, ConsentIo, RunLiveness};
@@ -50,10 +49,10 @@ impl ImageResolver for Source {
             return Err(ImageResolveError::Unavailable);
         }
         let bytes = STANDARD.decode(PIXEL).expect("fixture base64");
+        // The test fake stands in for the wire decoder: bytes here are already verified.
         Ok(ResolvedImage {
-            mime: "image/png".into(),
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
-            bytes: PIXEL.into(),
+            content_type: "image/png".into(),
+            bytes,
         })
     }
 }

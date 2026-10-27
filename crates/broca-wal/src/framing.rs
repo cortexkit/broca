@@ -223,6 +223,7 @@ pub const KNOWN_FEATURES: &[&str] = &[
     INPUT_TOKEN_CAP_FEATURE,
     MEDIA_CONTENT_FEATURE,
     OPENROUTER_REASONING_FEATURE,
+    OUTPUT_RESERVATION_FEATURE,
     PLAN_MANIFEST_FEATURE,
     PLAN_REFERENCE_SLOTS_FEATURE,
     PROVIDER_DECLARATIONS_FEATURE,
@@ -266,6 +267,14 @@ pub const CHATGPT_CODEX_WIRE_FEATURE: &str = "chatgpt-codex-wire/v1";
 /// OpenRouter-tagged reasoning and its frozen echo policy cannot be read faithfully by older
 /// builds. This is distinct from text-part phase/signature state in provider-text-state/v1.
 pub const OPENROUTER_REASONING_FEATURE: &str = "openrouter-reasoning/v1";
+
+/// A step's output-token cap lowered below the run's frozen cap so that the request stays
+/// inside the run's context limit (`WalRecord::OutputReservationClamped`). The cap is part of
+/// the request the step sent, and a resume or a rebuild of that request (cache warm, cache
+/// dump) renders it again. A reader without the feature would skip the record and render the
+/// frozen cap instead: a different request from the recorded one, which the provider may refuse
+/// for crossing the context window. So it must refuse the WAL.
+pub const OUTPUT_RESERVATION_FEATURE: &str = "output-reservation/v1";
 
 /// Compaction's issued fence, applied view and other answers. Missing it must refuse the
 /// WAL rather than lose an applied view or allow a superseded request to apply on replay.
@@ -1321,6 +1330,7 @@ mod tests {
                 INPUT_TOKEN_CAP_FEATURE,
                 MEDIA_CONTENT_FEATURE,
                 OPENROUTER_REASONING_FEATURE,
+                OUTPUT_RESERVATION_FEATURE,
                 PLAN_MANIFEST_FEATURE,
                 PLAN_REFERENCE_SLOTS_FEATURE,
                 PROVIDER_DECLARATIONS_FEATURE,
@@ -1348,6 +1358,7 @@ mod tests {
         );
         assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
         assert_eq!(MESSAGE_TIMES_FEATURE, "message-times/v1");
+        assert_eq!(OUTPUT_RESERVATION_FEATURE, "output-reservation/v1");
         assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");
         assert_eq!(RUNNER_TAGS_V2_FEATURE, "runner-tags/v2");
         assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
@@ -1517,6 +1528,33 @@ mod tests {
             decode_next_with(&bytes, &old),
             DecodeStep::NewerWriter { .. }
         ));
+    }
+
+    /// A lowered output cap is part of the request its step sent, so it is written in a gated
+    /// frame requiring `output-reservation/v1`: a build without the feature refuses the WAL
+    /// rather than skip the record and resume the step with the frozen cap.
+    #[test]
+    fn a_lowered_output_cap_requires_its_own_feature() {
+        let record = WalRecord::OutputReservationClamped {
+            step_id: broca_protocol::StepId(175),
+            max_output_tokens: 124_990,
+            estimated_input_tokens: 919_490,
+            context_limit: 1_048_576,
+        };
+        assert_eq!(record.required_features(), &[OUTPUT_RESERVATION_FEATURE]);
+        let bytes = encode(1, 1, &record).unwrap();
+        assert_eq!(bytes[4], GATED_FRAMING_VERSION);
+        assert!(
+            matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
+        );
+        let older: Vec<_> = KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|name| *name != OUTPUT_RESERVATION_FEATURE)
+            .collect();
+        assert!(
+            matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [OUTPUT_RESERVATION_FEATURE])
+        );
     }
 
     #[test]

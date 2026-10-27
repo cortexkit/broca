@@ -186,6 +186,13 @@ struct Armed {
 
 #[derive(Default)]
 struct Shared {
+    fixture_connection: Mutex<Option<PathBuf>>,
+    default_text_module: Mutex<Option<String>>,
+    default_text_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    default_text_seen:
+        Mutex<HashMap<String, cortexkit_role_llm_runner_conformance::SystemTextDefaultObservation>>,
+    failure_turns: Mutex<HashMap<String, usize>>,
+    dispatched_pins: Mutex<HashMap<String, Option<String>>>,
     /// Turns served so far for each session whose scripted model counts its own turns. The
     /// real Magic Context rig needs this: an applied view can drop messages, so the number of
     /// assistant messages in a request no longer says which turn comes next.
@@ -584,15 +591,20 @@ async fn serve_model_request(
     let counted: Option<usize> = None;
     let turn_index = session
         .as_ref()
-        .and_then(|session| {
-            shared
-                .compaction
-                .lock()
-                .unwrap()
-                .get(session)
-                .map(|state| state.emitted)
+        .and_then(|session| shared.failure_turns.lock().unwrap().get(session).copied())
+        .or_else(|| {
+            session
+                .as_ref()
+                .and_then(|session| {
+                    shared
+                        .compaction
+                        .lock()
+                        .unwrap()
+                        .get(session)
+                        .map(|state| state.emitted)
+                })
+                .or(counted)
         })
-        .or(counted)
         .unwrap_or_else(|| {
             messages
                 .iter()
@@ -632,6 +644,9 @@ async fn serve_model_request(
         return Ok(());
     };
     let session = session.expect("a turn was found for it");
+    if let Some(served) = shared.failure_turns.lock().unwrap().get_mut(&session) {
+        *served += 1;
+    }
     #[cfg(feature = "test-clock")]
     if let Some(served) = shared.counted_turns.lock().unwrap().get_mut(&session) {
         *served += 1;
@@ -650,6 +665,24 @@ async fn serve_model_request(
         .entry(session.clone())
         .or_default()
         .push(request.clone());
+    if let Some(failure) = &turn.model_failure {
+        let (status, code) = match failure.class.as_str() {
+            "auth_required" | "auth" => (401, "authentication_error"),
+            "context_overflow" => (400, "context_length_exceeded"),
+            "permanent" => (400, "invalid_request_error"),
+            _ => (429, "rate_limit_error"),
+        };
+        let body = json!({"error":{"code":code,"message":failure.message}}).to_string();
+        let retry = failure
+            .retry_after_secs
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map_or_else(String::new, |value| format!("retry-after: {value}\r\n"));
+        // A scripted terminal occupies one turn. Retrying this HTTP failure
+        // would consume the recovery turn and turn a failure fixture into success.
+        let response = format!("HTTP/1.1 {status} Scripted failure\r\ncontent-type: application/json\r\nx-should-retry: false\r\n{retry}content-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(());
+    }
     let model_gate = shared.model_holds.lock().unwrap().get(&session).cloned();
     let stream_parts = shared.stream_holds.lock().unwrap().remove(&session);
     if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_none()) {
@@ -825,6 +858,10 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
             .unwrap()
             .entry(arguments.clone())
             .or_default() += 1;
+        self.shared.dispatched_pins.lock().unwrap().insert(
+            arguments.clone(),
+            request["schema_pin"].as_str().map(str::to_owned),
+        );
         // The call is sent only once its dispatch intent is durable.
         if self.shared.reach(points::DISPATCH_INTENT, &session) {
             self.shared.released.notified().await;
@@ -912,6 +949,48 @@ fn tool_manifest() -> subc_protocol::manifest::ModuleManifest {
             sub_supervises: false,
         }])
         .build()
+}
+
+struct DefaultTextProvider {
+    shared: Arc<Shared>,
+    session: String,
+}
+
+#[async_trait]
+impl subc_client_rs::ModuleHandler for DefaultTextProvider {
+    async fn handle(
+        &self,
+        _: subc_client_rs::RequestCtx,
+        body: Vec<u8>,
+    ) -> subc_client_rs::HandlerOutcome {
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            arguments: Box<serde_json::value::RawValue>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Arguments {
+            system_text: Option<Box<serde_json::value::RawValue>>,
+        }
+        let envelope: Envelope = serde_json::from_slice(&body).unwrap();
+        let arguments: Arguments = serde_json::from_str(envelope.arguments.get()).unwrap();
+        {
+            let mut all = self.shared.default_text_seen.lock().unwrap();
+            let seen = all.entry(self.session.clone()).or_default();
+            seen.provider_calls += 1;
+            if let Some(item) = arguments.system_text {
+                seen.provider_items.push(item.get().as_bytes().to_vec());
+            }
+        }
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        let composition = &request["arguments"]["composition"];
+        let digest =
+            cortexkit_role_tool_provider::catalog::composition_digest(composition).unwrap();
+        let text = "synthetic provider default system text";
+        let answer = json!({"generation":"1","catalog_digest":"default-text","composition_digest":digest,"tools":[],
+            "system_text":{"text":text,"item_digest":cortexkit_role_tool_provider::catalog::system_text_digest(text),
+                "preflight_digest":"default-text","composition_digest":digest,"tool_names":[]}});
+        subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap())
+    }
 }
 
 // ---- the harness ----------------------------------------------------------------------------------
@@ -1252,6 +1331,7 @@ impl BrocaSubject {
             Some(bus) => Some(bus.register(&connection_file).await),
             None => None,
         };
+        *self.shared.fixture_connection.lock().unwrap() = Some(connection_file.clone());
         Ok(Live {
             daemon: Some(daemon),
             connection_file,
@@ -1923,6 +2003,12 @@ impl RunnerRoute for BrocaRoute {
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    fn supports_model_failure_fixture(&self) -> bool {
+        true
+    }
+    fn runner_id(&self) -> &str {
+        "broca"
+    }
     async fn seed_untimed_tool_call(
         &self,
         handle: &Live,
@@ -2104,6 +2190,9 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::Compaction,
             Capability::ModelView,
             Capability::ClientMessageId,
+            // role.describe declares system_text_default (tool-provider 0.12), and the
+            // adapter implements both of its hooks, so the kit runs those cases.
+            Capability::SystemTextDefault,
         ]
         .into_iter()
         .collect();
@@ -2207,6 +2296,15 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        // The pin fixture uses an admitted provider catalog. Caller-declared
+        // legacy tools intentionally have no provider semantics to pin.
+        if session.starts_with("cf-call-identity-pin-")
+            && !self.shared.plan_sessions.lock().unwrap().contains(session)
+        {
+            return self
+                .send_fields_with_plan(session, first, &Map::new())
+                .unwrap();
+        }
         if self
             .shared
             .output_refs_sessions
@@ -2303,7 +2401,125 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn tool_provider_module(&self) -> String {
-        TOOL_MODULE.into()
+        self.shared
+            .default_text_module
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| TOOL_MODULE.into())
+    }
+
+    async fn prepare_system_text_default(
+        &self,
+        session: &str,
+        provides: &[String],
+        item: &Value,
+    ) -> Result<Map<String, Value>, HarnessError> {
+        let connection = self
+            .shared
+            .fixture_connection
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| HarnessError::new("no private daemon is running"))?;
+        let module = format!(
+            "conformance-default-text-{}",
+            self.shared.default_text_tasks.lock().unwrap().len()
+        );
+        let mut manifest = tool_manifest();
+        manifest.module_id = module.clone();
+        manifest.capabilities = Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: provides.to_vec(),
+            requires: vec![],
+            must_never_reach: vec![],
+        });
+        let (_, serve) = subc_client_rs::serve_with_handle(
+            &connection,
+            manifest,
+            DefaultTextProvider {
+                shared: self.shared.clone(),
+                session: session.into(),
+            },
+        )
+        .await
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+        self.shared
+            .default_text_tasks
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(async move {
+                let _ = serve.await;
+            }));
+        *self.shared.default_text_module.lock().unwrap() = Some(module.clone());
+        self.shared
+            .default_text_seen
+            .lock()
+            .unwrap()
+            .insert(session.into(), Default::default());
+        self.shared
+            .plan_sessions
+            .lock()
+            .unwrap()
+            .insert(session.into());
+        let composition =
+            json!({"providers":[{"provider":module,"tools":[]}],"step_transform_items":[]});
+        let mut plan_item = item.clone();
+        plan_item["provider"] = json!(module);
+        Ok(json!({"model":{"provider":"mock","model":format!("{PLAN_MODEL_PREFIX}{session}")},"tools":null,"system":null,
+            "plan":{"tool_items":[],"system_text_items":[plan_item],"step_transform_items":[],"composition":composition,
+                "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap()}}).as_object().unwrap().clone())
+    }
+
+    async fn system_text_default_observation(
+        &self,
+        handle: &Live,
+        session: &str,
+    ) -> Result<cortexkit_role_llm_runner_conformance::SystemTextDefaultObservation, HarnessError>
+    {
+        let mut observation = self
+            .shared
+            .default_text_seen
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+            .unwrap_or_default();
+        let bind = self.bind_identity(session);
+        // Observe the authoritative log and its session-scoped SQL projections;
+        // unrelated sessions may still be draining their own background writes.
+        let wal = broca_core::FileWalStore::new(handle.state_root.join("wal"))
+            .bytes_for_move(&self.bind_identity(session))
+            .map_err(|error| HarnessError::new(error.to_string()))?
+            .unwrap_or_default();
+        let store =
+            broca_store::SqliteStore::open_read_only(handle.state_root.join("run-index.db"))
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+        let checkpoint = broca_core::MaterializedStore::read_admission_snapshot(&store, &bind)
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let connection = rusqlite::Connection::open_with_flags(
+            handle.state_root.join("run-index.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|error| HarnessError::new(error.to_string()))?;
+        let key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            bind.project_root.display(),
+            bind.harness,
+            bind.session
+        );
+        let runs = connection.prepare("SELECT run_id,state,request_identity_digest,submission_id FROM run_index WHERE session=?1 ORDER BY run_id")
+            .and_then(|mut query| query.query_map([key], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,Option<String>>(3)?)))?.collect::<Result<Vec<_>,_>>())
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let refs = connection.prepare("SELECT session_ref,address FROM agent_data_session_ref WHERE project_root=?1 AND harness=?2 AND session=?3 ORDER BY session_ref")
+            .and_then(|mut query| query.query_map(rusqlite::params![bind.project_root.to_string_lossy(),bind.harness,bind.session], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>())
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        let aliases = connection.prepare("SELECT session_ref,address FROM agent_data_session_ref_v2 WHERE address=?1 ORDER BY session_ref")
+            .and_then(|mut query| query.query_map([broca_core::session_addr(&bind)], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>())
+            .map_err(|error| HarnessError::new(error.to_string()))?;
+        observation.durable_state =
+            serde_json::to_vec(&(wal, format!("{checkpoint:?}"), runs, refs, aliases))
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+        Ok(observation)
     }
 
     fn output_refs_fields(&self, session: &str) -> Result<Map<String, Value>, HarnessError> {
@@ -2431,6 +2647,14 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     async fn install_script(&self, session: &str, script: Script) -> Result<(), HarnessError> {
+        *self.shared.default_text_module.lock().unwrap() = None;
+        if script.turns.iter().any(|turn| turn.model_failure.is_some()) {
+            self.shared
+                .failure_turns
+                .lock()
+                .unwrap()
+                .insert(session.to_owned(), 0);
+        }
         if history_display_kit_session(session) {
             self.shared
                 .model_id_marker_sessions
@@ -2464,6 +2688,19 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(&arguments.to_string())
             .copied()
             .unwrap_or(0)
+    }
+
+    async fn dispatched_schema_pin(
+        &self,
+        arguments: &Value,
+    ) -> Result<Option<String>, HarnessError> {
+        self.shared
+            .dispatched_pins
+            .lock()
+            .unwrap()
+            .get(&arguments.to_string())
+            .cloned()
+            .ok_or_else(|| HarnessError::new("the tool provider did not observe these arguments"))
     }
 
     /// A read message's top-level parts, keyed as broca keys them: `<mid>#<index>`, the `mid`
@@ -2999,7 +3236,10 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         .join(format!("broca-llm-conformance-{}", std::process::id()));
     broca_test_support::remove_rig_dir(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
-    let subject = BrocaSubject::new(&scratch).await;
+    #[cfg_attr(not(feature = "test-clock"), allow(unused_mut))]
+    let mut subject = BrocaSubject::new(&scratch).await;
+    #[cfg(feature = "test-clock")]
+    attach_notice_bus(&mut subject, &scratch).await;
     let work_dir = scratch.join("suite");
     std::fs::create_dir_all(&work_dir).unwrap();
     let report = run_suite(&subject, &work_dir)
@@ -3199,6 +3439,19 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     broca_test_support::remove_rig_dir(&scratch);
 }
 
+/// Attach one private NATS bus to every daemon the kit starts, as production runs with a bus.
+/// The kit reads compaction advance notices captured at the bus, never rebuilt from the WAL,
+/// so without a bus its notice cases could only fail. A missing `nats-server` therefore fails
+/// the suite here, naming the cause, instead of failing those cases with a misleading reason.
+#[cfg(feature = "test-clock")]
+async fn attach_notice_bus(subject: &mut BrocaSubject, root: &Path) {
+    let bus = bus::BusRig::new(root).await.expect(
+        "the llm-runner conformance suite needs a private NATS bus (nats-server, through \
+         cortexkit-bus-testkit) to capture the compaction advance notices the kit checks",
+    );
+    subject.bus = Some(Arc::new(bus));
+}
+
 /// Sandboxed runs can exercise every non-kill case without claiming crash conformance.
 fn skip_crash_kills() -> bool {
     std::env::var("BROCA_CONFORMANCE_SKIP_CRASH_KILLS").as_deref() == Ok("1")
@@ -3272,6 +3525,8 @@ async fn kit_compaction_cases_without_process_kills() {
     let root = broca_test_support::scratch_root().join("kit-compaction-without-kills");
     std::fs::create_dir_all(&root).unwrap();
     let mut subject = BrocaSubject::new(&root).await;
+    #[cfg(feature = "test-clock")]
+    attach_notice_bus(&mut subject, &root).await;
     let advertised = subject.capabilities();
     subject.process_kills_disabled = true;
     assert_eq!(
@@ -4826,4 +5081,54 @@ mod held_call_tests {
             .unwrap_err();
         assert!(error.to_string().contains("the call is not held"));
     }
+}
+
+#[tokio::test]
+async fn scripted_model_failure_ends_one_turn_and_preserves_fractional_retry_hint() {
+    use cortexkit_role_llm_runner_conformance::ScriptedTurn;
+    let shared = Arc::new(Shared::default());
+    let session = "scripted-failure-fixture";
+    shared
+        .failure_turns
+        .lock()
+        .unwrap()
+        .insert(session.into(), 0);
+    shared.scripts.lock().unwrap().insert(
+        session.into(),
+        Script {
+            turns: vec![
+                ScriptedTurn::new(vec![]).with_model_failure(
+                    cortexkit_role_llm_runner::run::RunError::new(
+                        "transient",
+                        "synthetic failure",
+                        "rate_limited",
+                    )
+                    .with_retry_after_secs(1.5),
+                ),
+                ScriptedTurn::new(vec![ScriptedPart::Text("recovered".into())]),
+            ],
+        },
+    );
+    let base = start_model(shared.clone()).await;
+    async fn post(base: &str, session: &str) -> String {
+        let address = base
+            .strip_prefix("http://")
+            .unwrap()
+            .strip_suffix("/v1")
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let body = json!({"model":"mock-model","messages":[{"role":"system","content":format!("{SESSION_MARKER}{session}")},{"role":"user","content":"synthetic prompt"}]}).to_string();
+        stream.write_all(format!("POST /v1/chat/completions HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.unwrap();
+        String::from_utf8(reply).unwrap()
+    }
+    let failure = post(&base, session).await;
+    assert!(failure.starts_with("HTTP/1.1 429"), "{failure}");
+    assert!(failure.contains("retry-after: 1.5\r\n"));
+    assert!(failure.contains("x-should-retry: false\r\n"));
+    let recovered = post(&base, session).await;
+    assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
+    assert!(recovered.contains("recovered"));
+    assert_eq!(shared.failure_turns.lock().unwrap()[session], 2);
 }

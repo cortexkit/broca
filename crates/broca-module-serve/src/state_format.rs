@@ -7,16 +7,19 @@
 //! - A root whose `state-format` reads `broca-state/2` runs the overhaul code. Any other value
 //!   refuses to serve and names the runbook.
 //! - A root with no `state-format`:
-//!   - holding any entry other than `state-format.tmp` is a LEGACY root. Before the cutover
-//!     build it runs today's code; from the cutover build on it refuses and names the runbook.
-//!   - missing, empty, or holding only `state-format.tmp` is a NEW root. Before the cutover build
+//!   - holding any entry other than `state-format.tmp` and the state-root lock file
+//!     (`broca.lock`) is a LEGACY root. Before the cutover build it runs today's code; from the
+//!     cutover build on it refuses and names the runbook.
+//!   - missing, empty, or holding only `state-format.tmp` and `broca.lock` is a NEW root. The lock
+//!     file holds no state and is created before the marker rules run. Before the cutover build
 //!     it is started as a legacy root unless `broca.jsonc` sets `"state_format": 2` (tests and
 //!     staging only); from the cutover build on it becomes an overhaul root.
 //!
 //! CREATING AN OVERHAUL ROOT WRITES THE MARKER FIRST: `state-format.tmp`, fsync, rename to
 //! `state-format`, fsync the root directory, and only then anything else (logs, leases, WAL,
-//! databases). A power loss anywhere in that sequence leaves either a root that is still new
-//! (empty, or holding only the temporary file) or a complete overhaul root. It can never leave a
+//! databases). Only the empty state-root lock file comes earlier. A power loss anywhere in that
+//! sequence leaves either a root that is still new (empty, or holding only the temporary file and
+//! the lock file) or a complete overhaul root. It can never leave a
 //! root that holds other files but no marker, which would be read as a legacy root on the next
 //! start, and it can never leave an empty or partial `state-format`, which would be refused.
 //!
@@ -31,6 +34,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use broca_module_serve::state_root_lock::LOCK_FILE;
 
 /// The marker file at the top of a state root.
 pub(crate) const MARKER_FILE: &str = "state-format";
@@ -76,7 +81,7 @@ pub(crate) enum StateFormat {
 /// What a state root holds, read before anything is written to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RootContents {
-    /// Missing, empty, or holding only `state-format.tmp`.
+    /// Missing, empty, or holding only `state-format.tmp` and the state-root lock file.
     New,
     /// Holding `state-format`, with these bytes.
     Marked(Vec<u8>),
@@ -248,7 +253,12 @@ pub(crate) fn inspect_root(
             .map_err(io_error("read the state-format marker", &marker))?;
         return Ok(RootContents::Marked(bytes));
     }
-    if names.iter().all(|name| name == MARKER_TMP_FILE) {
+    // The state-root lock file holds no state, and `ck-broca` creates it before this check runs
+    // (see `state_root_lock`), so a root holding only it is still new.
+    if names
+        .iter()
+        .all(|name| name == MARKER_TMP_FILE || name == LOCK_FILE)
+    {
         Ok(RootContents::New)
     } else {
         Ok(RootContents::Legacy)
@@ -857,9 +867,19 @@ mod tests {
         }
     }
 
-    /// Startup on an opted-in root as `ck-broca` runs it: decide the format, then (standing in
-    /// for the lease store, `broca.db` and the logs) write and sync one more file.
+    /// Startup on an opted-in root as `ck-broca` runs it: take the state-root lock (create a
+    /// missing root, sync its parent, create the empty lock file, as `state_root_lock::acquire`
+    /// does), decide the format, then (standing in for the lease store, `broca.db` and the logs)
+    /// write and sync one more file.
     fn start_opted_in(shim: &Shim) {
+        if shim.list(&shim.root).unwrap().is_none() {
+            shim.create_dir_all(&shim.root).unwrap();
+            shim.sync_dir(&shim.parent).unwrap();
+        }
+        let lock = shim.root.join(LOCK_FILE);
+        if shim.inode(&lock).is_err() {
+            shim.create_new(&lock, b"").unwrap();
+        }
         let format = prepare_with(shim, &shim.root, true, CutPhase::BeforeCut)
             .expect("an opted-in start never refuses a new or overhaul root");
         assert_eq!(format, StateFormat::Overhaul);
@@ -947,7 +967,7 @@ mod tests {
         for (index, op) in ops.iter().enumerate() {
             if let Op::Link { name, .. } = op {
                 assert!(
-                    name == MARKER_TMP_FILE || index > root_synced,
+                    name == MARKER_TMP_FILE || name == LOCK_FILE || index > root_synced,
                     "{name} created before the marker was durable: {ops:?}"
                 );
             }
@@ -1017,11 +1037,21 @@ mod tests {
     #[test]
     fn empty_root_is_legacy_without_opt_in() {
         type Setup = fn(&Path);
-        let setups: [(&str, Setup); 3] = [
+        let setups: [(&str, Setup); 5] = [
             ("missing", |_| {}),
             ("empty", |root| std::fs::create_dir_all(root).unwrap()),
             ("only a temporary marker", |root| {
                 std::fs::create_dir_all(root).unwrap();
+                std::fs::write(root.join(MARKER_TMP_FILE), b"broca-").unwrap();
+            }),
+            // `ck-broca` creates the lock file before the marker rules run.
+            ("only the state-root lock", |root| {
+                std::fs::create_dir_all(root).unwrap();
+                std::fs::write(root.join(LOCK_FILE), b"").unwrap();
+            }),
+            ("the lock and a temporary marker", |root| {
+                std::fs::create_dir_all(root).unwrap();
+                std::fs::write(root.join(LOCK_FILE), b"").unwrap();
                 std::fs::write(root.join(MARKER_TMP_FILE), b"broca-").unwrap();
             }),
         ];
@@ -1156,23 +1186,28 @@ mod tests {
 
     #[test]
     fn power_loss_while_creating_an_overhaul_root_leaves_new_or_complete() {
-        let complete = Snapshot::with(&[(MARKER_FILE, MARKER_BYTES)]);
         let mut seen = BTreeSet::new();
         for start in [
             Snapshot::missing(),
             Snapshot::with(&[]),
             Snapshot::with(&[(MARKER_TMP_FILE, b"broca")]),
+            // An overhaul root created before the lock file existed.
+            Snapshot::with(&[(MARKER_FILE, MARKER_BYTES)]),
         ] {
             seen.extend(cut_everywhere(start));
         }
         // The enumeration reached every kind of state the invariant allows, so it was exercised.
-        let started = Snapshot::with(&[(MARKER_FILE, MARKER_BYTES), ("broca.db", b"index")]);
+        // The lock file is created before the marker, so every state after that point contains
+        // the lock file.
+        let lock: (&str, &[u8]) = (LOCK_FILE, b"");
+        let started = Snapshot::with(&[(MARKER_FILE, MARKER_BYTES), ("broca.db", b"index"), lock]);
         for expected in [
             Snapshot::missing(),
             Snapshot::with(&[]),
-            Snapshot::with(&[(MARKER_TMP_FILE, b"")]),
-            Snapshot::with(&[(MARKER_TMP_FILE, b"broca-st")]),
-            complete.clone(),
+            Snapshot::with(&[lock]),
+            Snapshot::with(&[(MARKER_TMP_FILE, b""), lock]),
+            Snapshot::with(&[(MARKER_TMP_FILE, b"broca-st"), lock]),
+            Snapshot::with(&[(MARKER_FILE, MARKER_BYTES), lock]),
             started,
         ] {
             assert!(seen.contains(&expected), "never produced {expected:?}");

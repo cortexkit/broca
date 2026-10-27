@@ -269,6 +269,85 @@ pub struct FrozenRenderConfig {
     pub media: Option<crate::media_profile::MediaProfile>,
 }
 
+impl FrozenRenderConfig {
+    /// The config one step renders with: this config, with `max_output_tokens` lowered to the
+    /// step's own cap (`StepContext::max_output_tokens`) when the run loop lowered it to keep the
+    /// request inside the context limit. Every renderer reads the cap from the config, so this is
+    /// the one place a step's cap enters the bytes. A step without a lower cap borrows the config
+    /// unchanged and renders exactly as before.
+    pub fn for_step(&self, opts: &CallOptions) -> std::borrow::Cow<'_, Self> {
+        match opts
+            .step_context
+            .as_ref()
+            .and_then(|step| step.max_output_tokens)
+        {
+            Some(cap) if cap < self.max_output_tokens => {
+                let mut lowered = self.clone();
+                lowered.max_output_tokens = cap;
+                std::borrow::Cow::Owned(lowered)
+            }
+            _ => std::borrow::Cow::Borrowed(self),
+        }
+    }
+
+    /// The output cap this config's requests carry and the smallest cap a step may lower it to,
+    /// or `None` when the rendered body does not carry `max_output_tokens` as its cap, so lowering
+    /// it would change nothing:
+    ///
+    /// - the ChatGPT codex backend omits the field (the backend rejects it);
+    /// - an Antigravity tier model renders its tier ceiling unless the caller set a cap and the
+    ///   renderer is version 7 or later;
+    /// - Bedrock before renderer version 3 renders the caller's cap without bounding it.
+    ///
+    /// Anthropic requires `max_tokens` above the thinking budget, so with thinking enabled the
+    /// floor is one token above the budget the request sends.
+    pub fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
+        let renders_cap = match self.family_id {
+            WireFamilyId::OpenAiResponsesChatgpt => false,
+            WireFamilyId::GoogleCodeAssist => {
+                crate::families::google_codeassist::renders_frozen_output_cap(self)
+            }
+            WireFamilyId::BedrockConverse => {
+                self.renderer_version >= 3 || self.caller_max_output_tokens.is_none()
+            }
+            WireFamilyId::OpenAiChat
+            | WireFamilyId::OpenAiResponses
+            | WireFamilyId::AnthropicMessages
+            | WireFamilyId::Gemini => true,
+        };
+        if !renders_cap {
+            return None;
+        }
+        let variant_budget = match &self.variant {
+            Some(crate::variant::FrozenVariant {
+                request: crate::variant::VariantRequest::Anthropic { thinking, .. },
+                ..
+            }) => Some(
+                thinking
+                    .as_ref()
+                    .and_then(|thinking| thinking.get("budget_tokens"))
+                    .and_then(Value::as_u64)
+                    .and_then(|budget| u32::try_from(budget).ok())
+                    .unwrap_or(0),
+            ),
+            _ => None,
+        };
+        let thinking_budget = variant_budget.unwrap_or(match self.reasoning {
+            ReasoningPolicy::AnthropicInterleaved { budget_tokens, .. } => budget_tokens,
+            _ => 0,
+        });
+        let required = if thinking_budget > 0 {
+            thinking_budget.saturating_add(1)
+        } else {
+            0
+        };
+        Some(broca_core::output_reservation::OutputLimits::new(
+            self.max_output_tokens,
+            required,
+        ))
+    }
+}
+
 /// Conversation identity and episode-local request numbering for the Antigravity envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeAssistIdentity {
@@ -1010,5 +1089,104 @@ mod tests {
         let restored: FrozenRenderConfig =
             serde_json::from_str(&serialized).expect("old-shaped frozen config deserializes");
         assert_eq!(restored.cache, None);
+    }
+}
+
+#[cfg(test)]
+mod output_cap_tests {
+    use super::*;
+    use crate::families::frozen_config_for_family;
+    use broca_protocol::{ContentBlock, Message, Role, StepContext};
+
+    fn opts(cap: Option<u32>) -> CallOptions {
+        let mut opts = CallOptions::new(vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: "hi".into() }],
+        )]);
+        opts.step_context = Some(StepContext {
+            run_id: "r".into(),
+            step_index: 1,
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
+            max_output_tokens: cap,
+        });
+        opts
+    }
+
+    /// The families whose body carries the frozen cap: a step without a lower cap renders the
+    /// frozen config byte for byte, and a step with one renders that cap in place of it.
+    #[test]
+    fn a_step_cap_replaces_the_frozen_cap_and_its_absence_changes_nothing() {
+        for family_id in [
+            WireFamilyId::AnthropicMessages,
+            WireFamilyId::OpenAiResponses,
+            WireFamilyId::OpenAiChat,
+            WireFamilyId::Gemini,
+            WireFamilyId::BedrockConverse,
+        ] {
+            let frozen = frozen_config_for_family(family_id, "m");
+            let family = crate::registry::wire_family(family_id).unwrap();
+            let unchanged = opts(None);
+            assert!(matches!(
+                frozen.for_step(&unchanged),
+                std::borrow::Cow::Borrowed(_)
+            ));
+            assert_eq!(
+                family.render(&frozen.for_step(&unchanged), &unchanged),
+                family.render(&frozen, &unchanged),
+                "{family_id:?}"
+            );
+            // A cap at or above the frozen one is not a lowering.
+            let higher = opts(Some(frozen.max_output_tokens + 1));
+            assert!(matches!(
+                frozen.for_step(&higher),
+                std::borrow::Cow::Borrowed(_)
+            ));
+
+            let cap = frozen.max_output_tokens - 7;
+            let lowered = opts(Some(cap));
+            let body =
+                String::from_utf8(family.render(&frozen.for_step(&lowered), &lowered)).unwrap();
+            assert!(body.contains(&format!(":{cap}")), "{family_id:?}: {body}");
+            assert!(
+                !body.contains(&format!(":{}", frozen.max_output_tokens)),
+                "{family_id:?}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_limits_follow_what_each_family_renders() {
+        // The ChatGPT codex backend omits the field, so there is nothing to lower.
+        assert_eq!(
+            frozen_config_for_family(WireFamilyId::OpenAiResponsesChatgpt, "m").output_limits(),
+            None
+        );
+        // An Antigravity tier model without a caller cap renders its tier ceiling.
+        let tier = frozen_config_for_family(WireFamilyId::GoogleCodeAssist, "gemini-3-flash-agent");
+        assert_eq!(tier.output_limits(), None);
+        let mut capped = tier.clone();
+        capped.caller_max_output_tokens = Some(10_000);
+        assert!(capped.output_limits().is_some());
+
+        let responses = frozen_config_for_family(WireFamilyId::OpenAiResponses, "m");
+        let limits = responses.output_limits().unwrap();
+        assert_eq!(limits.max, responses.max_output_tokens);
+        assert_eq!(
+            limits.floor,
+            broca_core::output_reservation::MIN_USEFUL_OUTPUT_TOKENS.min(limits.max)
+        );
+
+        // Anthropic needs `max_tokens` above the thinking budget.
+        let mut anthropic = frozen_config_for_family(WireFamilyId::AnthropicMessages, "m");
+        anthropic.max_output_tokens = 64_000;
+        anthropic.reasoning = ReasoningPolicy::AnthropicInterleaved {
+            budget_tokens: 31_999,
+            last_turn_only: true,
+            echo_scope: crate::policy::ThinkingEchoScope::AllAssistantMessages,
+            cross_model: crate::policy::CrossModelThinking::AnyAnthropicModel,
+        };
+        assert_eq!(anthropic.output_limits().unwrap().floor, 32_000);
     }
 }

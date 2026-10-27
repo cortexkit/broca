@@ -395,10 +395,10 @@ async fn absent_system_text_preset_refuses_before_fetch_or_wal_write() {
         json!({}),
     )
     .await;
-    assert_eq!(error_body(&frame)["code"], "invalid_params");
+    assert_eq!(error_body(&frame)["code"], "system_text_preset_required");
     assert_eq!(
         error_body(&frame)["detail"],
-        json!({"field":"plan.system_text_items[0].preset"})
+        json!({"provider":plan["system_text_items"][0]["provider"]})
     );
     assert!(admitter.calls().is_empty());
     assert!(rig.wal_bytes().is_empty());
@@ -1090,6 +1090,8 @@ async fn a_resent_paused_first_send_fetches_nothing_and_redrives_its_episode() {
 /// The first `RunStarted` carrying a manifest is a gated frame requiring `plan-manifest/v1`, and
 /// the WAL raised its feature floor to that name before writing it, so placement never lets a
 /// build that cannot read the frame run on this machine. Before it, the floor names nothing.
+/// The manifest also freezes the catalog's tool schema pins inside its provider declarations,
+/// so the frame requires `provider-declarations/v1` and `tool-schema-pins/v1` as well.
 #[tokio::test]
 async fn the_first_planned_episode_raises_the_feature_floor() {
     let (mut rig, _admitter) = plan_rig("plan-floor").await;
@@ -1105,7 +1107,9 @@ async fn the_first_planned_episode_raises_the_feature_floor() {
         [
             broca_wal::MESSAGE_TIMES_FEATURE,
             broca_wal::PLAN_MANIFEST_FEATURE,
-            broca_wal::RUNNER_TAGS_V2_FEATURE
+            broca_wal::PROVIDER_DECLARATIONS_FEATURE,
+            broca_wal::RUNNER_TAGS_V2_FEATURE,
+            broca_wal::framing::TOOL_SCHEMA_PINS_FEATURE,
         ]
     );
     let floor = broca_wal::read_floor(&floor_path).unwrap();

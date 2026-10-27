@@ -16,6 +16,7 @@ mod graceful_stop;
 mod input_token_cap;
 mod lineage_replay;
 mod non_compaction_request_bytes;
+mod output_reservation;
 mod pause_continue;
 mod projection;
 mod queue_crash;

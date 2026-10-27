@@ -38,6 +38,8 @@ sha2.workspace = true
 
 [dev-dependencies]
 broca-module-serve = { path = "../broca-module-serve" }
+# The image-resolve fixture test pins the issuer's mint limit it relies on.
+cortexkit-model-batch = { workspace = true }
 cortexkit-role-tool-provider-conformance.workspace = true
 subc-client-rs = { workspace = true }
 broca-wal = { path = "../broca-wal" }

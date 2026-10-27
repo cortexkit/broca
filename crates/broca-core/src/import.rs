@@ -483,6 +483,7 @@ fn repairable_import_prefix(
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::OutputReservationClamped { .. }
             | WalRecord::CompactionRideWait { .. }
             | WalRecord::CompactionRideWaitEnded { .. }
             | WalRecord::CompactionNotice { .. } => {}

@@ -85,6 +85,7 @@ fn prompt(with_handoff: bool) -> CallOptions {
         account_ref: None,
         run_id: "run-handoff".into(),
         step_index: 3,
+        max_output_tokens: None,
     });
     opts
 }

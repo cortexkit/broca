@@ -669,8 +669,22 @@ impl ClassifierSubject for Subject<'_> {
         let mut fixtures: Vec<Value> =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         let handle = format!("ih{:032x}", fixtures.len());
-        fixtures.push(json!({"match":{"method":"image.resolve","scope_ref":"classifier-run","handle":handle},
-            "stdout":serde_json::to_string(&json!({"mime":content_type,"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":STANDARD.encode(bytes)})).unwrap()}));
+        // The stand-in answers `image.resolve` with the binary reply body (a `u32`
+        // big-endian head length, the head as JSON, then the image bytes), so the fixture
+        // carries those exact body bytes base64-encoded; the stand-in only pipes them.
+        let head = serde_json::to_vec(&json!({
+            "content_type": content_type,
+            "length": bytes.len(),
+            "sha256": format!("{:x}", Sha256::digest(&bytes)),
+        }))
+        .unwrap();
+        let mut body = (head.len() as u32).to_be_bytes().to_vec();
+        body.extend_from_slice(&head);
+        body.extend_from_slice(&bytes);
+        fixtures.push(
+            json!({"match":{"method":"image.resolve","scope_ref":"classifier-run","handle":handle},
+            "stdout":STANDARD.encode(body)}),
+        );
         let temporary = path.with_extension("new");
         std::fs::write(&temporary, serde_json::to_vec(&fixtures).unwrap()).unwrap();
         std::fs::rename(temporary, path).unwrap();
@@ -693,6 +707,10 @@ impl ClassifierSubject for Subject<'_> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(unix),
+    ignore = "the stand-in Cerebellum (fake-surface) uses Unix-only APIs and is not built on Windows"
+)]
 async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
     let Some(surface) = std::env::var_os("FAKE_SURFACE_BIN")
         .map(PathBuf::from)

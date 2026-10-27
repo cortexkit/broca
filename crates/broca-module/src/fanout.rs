@@ -151,10 +151,13 @@ fn replay_for_attach(
     records: Vec<broca_wal::FramedRecord>,
     h: u64,
     from: AttachFrom,
+    lineage: Option<broca_wal::WalLineageId>,
 ) -> Result<AttachReplay, String> {
     let durable_prefix: Vec<broca_wal::FramedRecord> =
         records.into_iter().filter(|f| f.seq <= h).collect();
-    project_attach(&durable_prefix, ControlProjectionState::default(), from)
+    let mut state = ControlProjectionState::default();
+    state.set_wal_lineage_id(lineage);
+    project_attach(&durable_prefix, state, from)
 }
 
 /// Project a durable prefix for one attach, starting from `state`.
@@ -247,7 +250,15 @@ fn replay_for_attach_by_episode(
 ) -> Result<(AttachReplay, Option<&'static str>), String> {
     match attach_by_episode(read_at, durable_end, h, from, start, decode_counter) {
         Ok(replay) => Ok((replay, None)),
-        Err(reason) => Ok((replay_for_attach(complete_read()?, h, from)?, Some(reason))),
+        Err(reason) => {
+            let lineage = broca_core::projection::log_header_info(read_at)
+                .ok()
+                .and_then(|(_, lineage)| lineage);
+            Ok((
+                replay_for_attach(complete_read()?, h, from, lineage)?,
+                Some(reason),
+            ))
+        }
     }
 }
 
@@ -260,8 +271,8 @@ fn attach_by_episode(
     start: Option<&AttachEpisodeStart>,
     decode_counter: Option<&std::cell::Cell<u64>>,
 ) -> Result<AttachReplay, &'static str> {
-    let records_start =
-        broca_core::projection::first_record_offset(read_at).map_err(|_| "log unreadable")?;
+    let (records_start, lineage) =
+        broca_core::projection::log_header_info(read_at).map_err(|_| "log unreadable")?;
     let start = match from {
         AttachFrom::Cursor(FromCursor::Start) => None,
         _ => start,
@@ -298,8 +309,9 @@ fn attach_by_episode(
             .map(|positioned| positioned.framed)
             .filter(|framed| framed.seq <= h)
             .collect();
-        return project_attach(&prefix, ControlProjectionState::default(), from)
-            .map_err(|_| "attach projection refused");
+        let mut state = ControlProjectionState::default();
+        state.set_wal_lineage_id(lineage);
+        return project_attach(&prefix, state, from).map_err(|_| "attach projection refused");
     };
     let run_started = broca_core::projection::episode_start_index(&start.episode, &frames)
         .ok_or("episode start not in the frames read")?;
@@ -326,12 +338,9 @@ fn attach_by_episode(
         .map(|positioned| positioned.framed)
         .filter(|framed| framed.seq <= h)
         .collect();
-    project_attach(
-        &prefix,
-        ControlProjectionState::at_episode_start(start.episode.first_ord),
-        from,
-    )
-    .map_err(|_| "attach projection refused")
+    let mut state = ControlProjectionState::at_episode_start(start.episode.first_ord);
+    state.set_wal_lineage_id(lineage);
+    project_attach(&prefix, state, from).map_err(|_| "attach projection refused")
 }
 
 /// The attach-barrier decision for a unit arriving on the LIVE ring (step 2 of the
@@ -905,6 +914,7 @@ async fn projector_loop(
                 deferred_gate_seed = None;
                 covered_head = covered_head.max(seed.head);
                 for framed in std::mem::take(&mut buffered).into_iter().filter(|record| record.seq > seed.head) {
+                    projection_state.set_wal_lineage_id(framed.lineage_id());
                     let events = match project_events(
                         std::slice::from_ref(&*framed),
                         &mut projection_state,
@@ -940,6 +950,7 @@ async fn projector_loop(
                         if framed.seq <= covered_head {
                             continue;
                         }
+                        projection_state.set_wal_lineage_id(framed.lineage_id());
                         let events = match project_events(
                             std::slice::from_ref(&*framed),
                             &mut projection_state,
@@ -1020,6 +1031,7 @@ async fn try_live_projection_seed<W: WalStore + 'static>(
             .read_records_range_from_valid_anchor(&session, seed.watermark_seq, Some(h), anchor)
             .ok()
             .flatten()?;
+        state.set_wal_lineage_id(range.lineage_id);
         let records = match range.records() {
             broca_wal::WalRangeRecords::Complete(records)
             | broca_wal::WalRangeRecords::Partial(records)
@@ -1096,10 +1108,10 @@ async fn subscriber_task<W: WalStore + 'static>(
         // returns committed (fsynced) records; HARD-FILTER seq <= H so a concurrent append of
         // seq > H during the read is excluded, keeping the read prefix-consistent at H.
         // Advisory display replay is snapshotted separately after durable control replay.
-        let records = match spawn_blocking(JobKind::WalRead, {
+        let (records, lineage) = match spawn_blocking(JobKind::WalRead, {
             let wal_store = wal_store.clone();
             let session = session.clone();
-            move || wal_store.read_records(&session)
+            move || wal_store.read_records_with_lineage(&session)
         })
         .await
         {
@@ -1138,7 +1150,7 @@ async fn subscriber_task<W: WalStore + 'static>(
             units: replay,
             ..
         } = match spawn_blocking(JobKind::Projection, move || {
-            replay_for_attach(records, h, from)
+            replay_for_attach(records, h, from, lineage)
         })
         .await
         {
@@ -1622,6 +1634,7 @@ mod tests {
             records.clone(),
             h,
             AttachFrom::Cursor(FromCursor::After(cursor)),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1640,7 +1653,7 @@ mod tests {
             full.len()
         );
 
-        let live = replay_for_attach(records.clone(), h, AttachFrom::Live).unwrap();
+        let live = replay_for_attach(records.clone(), h, AttachFrom::Live, None).unwrap();
         assert_eq!(
             live.built, 0,
             "a live attach delivers no replay and builds none"
@@ -1650,12 +1663,20 @@ mod tests {
         assert!(matches!(live.from, FromCursor::After(last) if last == full.last().unwrap().0));
 
         let from_start =
-            replay_for_attach(records, h, AttachFrom::Cursor(FromCursor::Start)).unwrap();
+            replay_for_attach(records, h, AttachFrom::Cursor(FromCursor::Start), None).unwrap();
         assert_eq!(from_start.units, full);
     }
 
     fn state_through(records: &[FramedRecord]) -> ControlProjectionState {
+        state_through_with_lineage(records, None)
+    }
+
+    fn state_through_with_lineage(
+        records: &[FramedRecord],
+        lineage: Option<broca_wal::WalLineageId>,
+    ) -> ControlProjectionState {
         let mut state = ControlProjectionState::default();
+        state.set_wal_lineage_id(lineage);
         let _ = project_control_with_state(records, &mut state);
         state
     }
@@ -1884,8 +1905,10 @@ mod tests {
         )
         .await
         .expect("valid seed and suffix use the fast path");
-        let full_records = wal_store.read_records(&session).expect("read full oracle");
-        let full_state = state_through(&full_records);
+        let (full_records, lineage) = wal_store
+            .read_records_with_lineage(&session)
+            .expect("read full oracle");
+        let full_state = state_through_with_lineage(&full_records, lineage);
         assert_eq!(
             fast_state, full_state,
             "seed plus suffix must equal full replay at H"
@@ -2035,12 +2058,15 @@ mod tests {
                 .expect("real store seed uses the fast path");
         assert_eq!(
             recovered,
-            state_through(match full_range.records() {
-                broca_wal::WalRangeRecords::Complete(records)
-                | broca_wal::WalRangeRecords::Partial(records)
-                | broca_wal::WalRangeRecords::Unknown(records) => records,
-                broca_wal::WalRangeRecords::Absent => &[],
-            })
+            state_through_with_lineage(
+                match full_range.records() {
+                    broca_wal::WalRangeRecords::Complete(records)
+                    | broca_wal::WalRangeRecords::Partial(records)
+                    | broca_wal::WalRangeRecords::Unknown(records) => records,
+                    broca_wal::WalRangeRecords::Absent => &[],
+                },
+                full_range.lineage_id
+            )
         );
 
         let _ = writer.shutdown().await;
@@ -3801,7 +3827,7 @@ mod episode_attach_tests {
                 assert_eq!(fallback, None, "{context}");
                 assert_same(
                     &by_episode,
-                    &replay_for_attach(framed(log), h, from).unwrap(),
+                    &replay_for_attach(framed(log), h, from, None).unwrap(),
                     &context,
                 );
                 // Only the frames from the episode's seed boundary to the head are decoded,
@@ -3857,7 +3883,7 @@ mod episode_attach_tests {
         assert_eq!(fallback, None);
         assert_same(
             &live,
-            &replay_for_attach(framed(&records), h, AttachFrom::Live).unwrap(),
+            &replay_for_attach(framed(&records), h, AttachFrom::Live, None).unwrap(),
             "live",
         );
         assert_eq!(decoded, h - boundary, "of {h} frames");
@@ -3875,10 +3901,97 @@ mod episode_attach_tests {
         assert_eq!(fallback, None);
         assert_same(
             &resumed,
-            &replay_for_attach(framed(&records), h, from).unwrap(),
+            &replay_for_attach(framed(&records), h, from, None).unwrap(),
             "resume",
         );
         assert_eq!(decoded, h - boundary);
+    }
+
+    #[test]
+    fn episode_attach_preserves_recorded_log_identity_for_call_keys() {
+        use broca_wal::{FileWal, Wal};
+        let root = broca_test_support::scratch_root().join(format!(
+            "episode-call-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.wal");
+        let records = corpus();
+        let mut wal = FileWal::open(&path)
+            .unwrap()
+            .with_feature_floor(root.join("wal-feature-floor.json"));
+        for record in &records {
+            wal.append(1, record, true).unwrap();
+        }
+        let lineage = wal.lineage_id().unwrap();
+        drop(wal);
+        let written = std::fs::read(&path).unwrap();
+        let first = broca_core::projection::first_record_offset(&reader(&written)).unwrap();
+        // Use the same contiguous corpus frames as the episode index fixtures,
+        // with a real writer's header rather than a fabricated log identity.
+        let (encoded, ranges) = encode(&records);
+        let mut bytes = written[..first as usize].to_vec();
+        bytes.extend(encoded);
+        let ranges: Vec<_> = ranges
+            .into_iter()
+            .map(|(off, end)| (off + first, end + first))
+            .collect();
+        let read_at = reader(&bytes);
+        let frames = framed(&records);
+        let intent = frames
+            .iter()
+            .rev()
+            .find(|frame| matches!(frame.record, WalRecord::ToolDispatchIntent { .. }))
+            .unwrap();
+        let intent_seq = intent.seq;
+        let WalRecord::ToolDispatchIntent { tool_call_id, .. } = &intent.record else {
+            unreachable!()
+        };
+        let call_id = tool_call_id.0.clone();
+        let from = AttachFrom::Cursor(FromCursor::After(broca_core::Cursor {
+            wal_seq: intent_seq - 1,
+            sub_index: u32::MAX,
+        }));
+        let h = frames.last().unwrap().seq;
+        let (episodes, mut boundaries) = index_log(&bytes, &ranges);
+        for boundary in &mut boundaries {
+            boundary.lineage_id = Some(lineage.to_string());
+        }
+        let start = start_for(&records, &episodes, &boundaries, intent_seq - 1);
+        let (by_episode, fallback) = replay_for_attach_by_episode(
+            &read_at,
+            bytes.len() as u64,
+            h,
+            from,
+            start.as_ref(),
+            None,
+            || Ok(frames.clone()),
+        )
+        .unwrap();
+        assert!(fallback.is_none(), "{fallback:?}");
+        let full = replay_for_attach(frames, h, from, Some(lineage)).unwrap();
+        assert_same(&by_episode, &full, "recorded header identity");
+        let event = by_episode
+            .units
+            .iter()
+            .find_map(|(_, _, event)| match event {
+                cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event)
+                    if event.tool_call_id == call_id =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .expect("attach includes the dispatch start");
+        assert_eq!(
+            event.call_key.as_deref(),
+            Some(format!("{lineage}:{intent_seq}").as_str())
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3887,7 +4000,7 @@ mod episode_attach_tests {
         let (bytes, ranges) = encode(&records);
         let (episodes, boundaries) = index_log(&bytes, &ranges);
         let h = records.len() as u64;
-        let full = replay_for_attach(framed(&records), h, AttachFrom::Live).unwrap();
+        let full = replay_for_attach(framed(&records), h, AttachFrom::Live, None).unwrap();
 
         let mut start = start_for(&records, &episodes, &boundaries, h).unwrap();
         start.episode.first_ord += 1;
@@ -3911,7 +4024,7 @@ mod episode_attach_tests {
         assert_eq!(fallback, Some("attach point precedes the episode"));
         assert_same(
             &resumed,
-            &replay_for_attach(framed(&records), h, from).unwrap(),
+            &replay_for_attach(framed(&records), h, from, None).unwrap(),
             "early cursor",
         );
     }

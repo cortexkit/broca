@@ -380,8 +380,16 @@ fn export_records_since(
         let mut attempts = BTreeMap::new();
         let mut completed = BTreeMap::new();
         let mut usages = BTreeMap::new();
+        let mut output_caps = BTreeMap::new();
         for (index, record) in records[start..end].iter().enumerate() {
             match record {
+                WalRecord::OutputReservationClamped {
+                    step_id,
+                    max_output_tokens,
+                    ..
+                } => {
+                    output_caps.insert(step_id.0, *max_output_tokens);
+                }
                 WalRecord::StepStarted { step_id } => {
                     boundaries.insert(step_id.0, start + index);
                 }
@@ -445,7 +453,16 @@ fn export_records_since(
                 meta["input_transformations"] = report;
             }
             let rendered = boundaries.get(&step).and_then(|boundary| {
-                crate::wal_render::render_step(&records[..=*boundary], config, &run_id.0, step).ok()
+                // The prefix ends at the step's `step_started`; a cap the step lowered before
+                // sending follows it, so it is passed in.
+                crate::wal_render::render_step_with_output_cap(
+                    &records[..=*boundary],
+                    config,
+                    &run_id.0,
+                    step,
+                    output_caps.get(&step).copied(),
+                )
+                .ok()
             });
             if let Some((frozen, _, body)) = rendered {
                 meta["wire_family"] = json!(frozen.family_id);

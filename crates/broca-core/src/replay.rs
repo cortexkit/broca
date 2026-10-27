@@ -118,6 +118,8 @@ pub struct ReplayState {
     pub run_finals: std::collections::BTreeMap<u64, RunAttribution>,
     pub compaction: crate::compaction::CompactionCheckpoint,
     pub compaction_history: crate::compaction::CompactionHistory,
+    /// The measured step and recorded output cap the run loop's output reservation reads.
+    pub output_reservation: crate::output_reservation::OutputReservationHistory,
     /// The lowest sequence number this lineage's next compaction notice may take: 1, or, for a
     /// lineage at an address whose earlier lineages retention deleted, the number their
     /// tombstones recorded. Replay alone cannot know it; admission sets it from the WAL store.
@@ -2313,7 +2315,9 @@ fn replay_seeded_with_compaction<'a>(
     let mut committed_tool_turns: Vec<(usize, usize)> = Vec::new();
 
     let mut input_budget = crate::input_budget::InputTokenBudget::default();
+    let mut output_reservation = crate::output_reservation::OutputReservationHistory::default();
     for (record_index, rec) in records.into_iter().enumerate() {
+        output_reservation.fold(rec);
         input_budget
             .fold(rec)
             .map_err(|reason| ReplayError::CorruptLineage {
@@ -3022,6 +3026,7 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::OutputReservationClamped { .. }
             | WalRecord::CompactionRideWait { .. }
             | WalRecord::CompactionRideWaitEnded { .. }
             | WalRecord::CompactionNotice { .. } => {}
@@ -3326,6 +3331,7 @@ fn replay_seeded_with_compaction<'a>(
         run_finals,
         compaction,
         compaction_history,
+        output_reservation,
         compaction_notice_floor: 1,
         manifest: None,
         committed_tool_turns,

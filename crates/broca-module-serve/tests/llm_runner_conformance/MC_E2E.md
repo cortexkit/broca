@@ -64,11 +64,20 @@ The run checks, in order:
   it (applied, refused, or passed over for a newer view), since a decision
   clears the receipt; then the broker ACK, the applied view, and that broca
   applied the newest announced version;
-- the history broca assembles under the applied view (as `view.get` returned
-  it, recorded in the WAL) no longer holds the parts of the dropped tags, the
-  stamped outputs are no longer sent, and the next model request is smaller
-  than the one before it;
-- a real process kill mid-step is followed by identical request bytes on resume.
+- every view broca applied satisfies Magic Context's worker mode-3 drop rules:
+  a drop outside the protection window lands on the first view after its
+  stamp, a drop inside it may stay held until newer tool output pushes it
+  out, no view ever
+  brings a dropped part back, and either legal drop shape counts; every
+  dropped part is gone from the newest applied view, the stamped outputs are
+  no longer sent, and the next model request is smaller than the one before
+  it;
+- a real process kill mid-step seals the run `interrupted` at boot (the
+  crash-orphan seal): resending its send_id reads that terminal back without
+  reaching the model, the held step's unfinished reply is nowhere in the
+  transcript, and a new send_id starts a new episode whose first request
+  renders the held compaction-applied history plus the new user message, with
+  the applied view intact and the dropped reads still not sent.
 
 Not checked: views Magic Context hands over during a ride (a rewrite broca asks
 for when the request prefix changes anyway), its reminder text, and the context

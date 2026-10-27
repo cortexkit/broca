@@ -15,18 +15,23 @@ fn ref_index_write_finds_gaps_missed_by_default_backoff() {
         let session = BindIdentity::new("/project", "broca", "new-session");
         let result = store.record_session(&session_addr(&session), &session);
         let conn = store.conn.lock().unwrap();
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT session_ref FROM agent_data_session_ref",
-                [],
-                |row| row.get(0),
-            )
+        // Both references a session is found by: the folder-based legacy reference and the
+        // external (v2) reference.
+        let stored = ["agent_data_session_ref", "agent_data_session_ref_v2"].map(|table| {
+            conn.query_row(&format!("SELECT session_ref FROM {table}"), [], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()
-            .unwrap();
-        (result, stored, agent_session_ref(&session))
+            .unwrap()
+        });
+        let expected = [
+            broca_core::wal_writer::legacy_session_ref("broca", "/project", "new-session"),
+            agent_session_ref(&session),
+        ];
+        (result, stored, expected)
     });
     result.expect("ref-index short polls must find an unlocked gap");
-    assert_eq!(stored.as_deref(), Some(expected.as_str()));
+    assert_eq!(stored, expected.map(Some));
 }
 
 #[test]
@@ -70,9 +75,16 @@ fn with_regrabbing_writer<T>(tag: &str, write: impl FnOnce(Connection) -> T) -> 
         .execute_batch(
             "PRAGMA journal_mode=WAL;
          CREATE TABLE sample(id INTEGER PRIMARY KEY);
-         CREATE TABLE agent_data_session_ref(
-             session_ref TEXT NOT NULL, address TEXT NOT NULL, project_root TEXT NOT NULL,
-             harness TEXT NOT NULL, session TEXT NOT NULL, PRIMARY KEY(session_ref,address));
+         -- The two session-reference tables as broca-store's session_refs::init_schema
+         -- creates them. Its full schema can't be used here: its triggers name run_index.
+         CREATE TABLE agent_data_session_ref (
+             session_ref TEXT PRIMARY KEY CHECK(length(session_ref)=32 AND session_ref NOT GLOB '*[^0-9a-f]*'),
+             address TEXT NOT NULL, project_root TEXT NOT NULL, harness TEXT NOT NULL, session TEXT NOT NULL
+         ) WITHOUT ROWID;
+         CREATE TABLE agent_data_session_ref_v2 (
+             session_ref TEXT NOT NULL, address TEXT NOT NULL,
+             PRIMARY KEY(session_ref,address)
+         ) WITHOUT ROWID;
          BEGIN IMMEDIATE;",
         )
         .unwrap();

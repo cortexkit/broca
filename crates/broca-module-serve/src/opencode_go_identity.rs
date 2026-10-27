@@ -1,9 +1,9 @@
 use broca_protocol::BindIdentity;
 use broca_provider::wire::ClaudeCodePersona;
 
-/// Derive the Go routing id from the same opaque bind reference used by Claude Code identities.
+/// Keep upstream routing scoped to the full bind triple, as Claude Code identities are.
 pub fn for_session(session: &BindIdentity) -> String {
-    let reference = broca_wire::agent_data::session_ref(
+    let reference = broca_core::wal_writer::legacy_session_ref(
         &session.harness,
         &session.project_root.to_string_lossy(),
         &session.session,

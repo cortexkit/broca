@@ -568,6 +568,11 @@ pub fn last_recorded_request(
             account_ref: None,
             run_id: run_id.0.clone(),
             step_index: step_id.0,
+            // A cap the step lowered to fit its context limit is part of the bytes it sent.
+            max_output_tokens: crate::output_reservation::recorded_cap(
+                &records[..attempt_at],
+                *step_id,
+            ),
         }),
         target_model: Some(
             route

@@ -116,6 +116,7 @@ fn facts_drive_admission_and_recorded_bytes_survive_refresh() {
         account_ref: None,
         run_id: "routing-run".into(),
         step_index: 0,
+        max_output_tokens: None,
     });
     let bytes = routed.provider.render_request(&prompt);
     assert_eq!(

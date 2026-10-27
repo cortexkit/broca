@@ -221,7 +221,8 @@ pub fn fresh_persona(
     let account = account_id
         .filter(|id| !id.is_empty())
         .unwrap_or(credential_id);
-    let session_ref = broca_wire::agent_data::session_ref(
+    // Provider conversation ids must not change when the observer reference changes.
+    let session_ref = broca_core::wal_writer::legacy_session_ref(
         &session.harness,
         &session.project_root.to_string_lossy(),
         &session.session,

@@ -926,7 +926,8 @@ fn indexed_run_tool_calls(
                             && !call.terminal
                     }),
                 ) {
-                    call.call.call_key = Some(format!("{lineage_id}:{}", framed.seq));
+                    call.call.call_key =
+                        broca_core::tool_call_key(Some(lineage_id), framed.seq, None);
                 }
             }
             WalRecord::ToolDispatchIntent {
@@ -943,9 +944,8 @@ fn indexed_run_tool_calls(
                     call.has_intent = true;
                     call.call.args = (**args).clone();
                     call.call.dispatched_to = module_id.clone();
-                    call.call.call_key = call_key.clone().or_else(|| {
-                        lineage_id.map(|lineage_id| format!("{lineage_id}:{}", framed.seq))
-                    });
+                    call.call.call_key =
+                        broca_core::tool_call_key(lineage_id, framed.seq, call_key.as_deref());
                 }
             }
             WalRecord::ToolNoDispatch {
@@ -1495,6 +1495,9 @@ pub enum ServeError {
     /// The routing module refused to choose a provider account for the send; nothing was
     /// written.
     AccountSelectionRefused(broca_core::AccountSelectionRefusal),
+    /// The routing module gave no usable account decision for the send (unreachable, no
+    /// decision in time, or a pick broca did not offer); nothing was written. Transient.
+    RoutingUnavailable(broca_core::RoutingUnavailable),
     /// `session.warm` was refused; the body is sent exactly as the broca-wire type serializes.
     WarmRefused(Box<broca_wire::WarmRefusal>),
     /// A steer or queued send was refused before writing or interrupting a run.
@@ -1603,6 +1606,11 @@ impl std::fmt::Display for ServeError {
                 f,
                 "routing refused to choose a provider account ({})",
                 refusal.routing_code
+            ),
+            ServeError::RoutingUnavailable(unavailable) => write!(
+                f,
+                "the routing module gave no usable account decision ({})",
+                unavailable.reason.as_str()
             ),
             ServeError::WarmRefused(refusal) => f.write_str(&refusal.message),
         }
@@ -2127,8 +2135,13 @@ impl crate::LineageRegistry {
                     .and_then(|calls| calls.iter().find(|call| &call.tool_call_id == carrier))
                 {
                     if let Some(receipt) = &mut message.delivered_as {
-                        receipt.call_key =
-                            dispatch.intent_seq.map(|seq| format!("{lineage_id}:{seq}"));
+                        receipt.call_key = dispatch.intent_seq.and_then(|seq| {
+                            broca_core::tool_call_key(
+                                Some(&lineage_id),
+                                seq,
+                                dispatch.recorded_call_key.as_deref(),
+                            )
+                        });
                     }
                 }
             }
@@ -2142,7 +2155,13 @@ impl crate::LineageRegistry {
                     .iter()
                     .map(|dispatch| broca_wire::SessionReadToolCall {
                         tool_call_id: dispatch.tool_call_id.clone(),
-                        call_key: dispatch.intent_seq.map(|seq| format!("{lineage_id}:{seq}")),
+                        call_key: dispatch.intent_seq.and_then(|seq| {
+                            broca_core::tool_call_key(
+                                Some(&lineage_id),
+                                seq,
+                                dispatch.recorded_call_key.as_deref(),
+                            )
+                        }),
                         dispatched_to: dispatch.dispatched_to.clone(),
                         indeterminate: dispatch.indeterminate,
                     })
@@ -2504,6 +2523,9 @@ impl ServeHandler for crate::LineageRegistry {
             SendOutcome::Transient(e) => Err(ServeError::Transient(e)),
             SendOutcome::AccountSelectionRefused(refusal) => {
                 Err(ServeError::AccountSelectionRefused(refusal))
+            }
+            SendOutcome::RoutingUnavailable(unavailable) => {
+                Err(ServeError::RoutingUnavailable(unavailable))
             }
             SendOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
             SendOutcome::ScopeFreezeBusy { reason, run_id } => Err(ServeError::ScopeFreezeBusy {
@@ -3023,7 +3045,32 @@ impl ServeHandler for crate::LineageRegistry {
             None
         };
         let sender = head_facts.sender(principal, scope, broca_wire::DELIVERY_MODES);
+        let last_run_error = if page.lineage_state.state.as_str() == "error" {
+            if let Some(run_id) = page.lineage_state.last_run_id.clone() {
+                // Query the named run through the same terminal-record reconciliation as
+                // run.status, rather than classifying provider diagnostics a second time.
+                match self.run_status(session, run_id).await? {
+                    RunStatusResponse::Error {
+                        error: Some(error), ..
+                    } => {
+                        let mut summary =
+                            cortexkit_role_llm_runner::read::LastRunError::new(error.class_wire());
+                        summary.retry_after_secs = error
+                            .retry_after_secs
+                            .and_then(cortexkit_role_llm_runner::read::RetryAfterSecs::new);
+                        summary.resets_at_ms = error.resets_at_ms;
+                        Some(summary)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(broca_wire::HeadResponse {
+            last_run_error,
             model: head_facts.model,
             usage: head_facts.usage.filter(|usage| usage.consistent()),
             sender,
