@@ -959,6 +959,15 @@ impl RetentionService {
         {
             return Ok(None);
         }
+        // Deletion writes its tombstone before moving the WAL aside. When this call saw a live
+        // WAL, the tombstones above were read before that WAL vanished, so a deletion that ran
+        // in between is missing from them. Re-read: a send that finds the lease held waits
+        // only while this reports expiry, and would otherwise refuse with LeaseHeld.
+        let stones = if path.is_some() {
+            self.tombstones(key)?
+        } else {
+            stones
+        };
         Ok(stones
             .into_iter()
             .max_by_key(|stone| stone.seq)
