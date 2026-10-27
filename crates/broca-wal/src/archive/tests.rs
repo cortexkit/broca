@@ -602,10 +602,10 @@ fn newer_absent_session_still_returns_older_transcript() {
 }
 
 /// Fill the process-wide membership cache for `paths` with an address no fixture uses,
-/// the same way the daemon's boot prewarm does. The answer itself is not the point.
+/// through the fallback scan, as the daemon's boot prewarm does. The answer is incidental.
 #[cfg(unix)]
 fn prewarm(paths: &[PathBuf]) -> io::Result<Option<ArchiveMember>> {
-    read_newest_member(paths, "ffffffffffffffff", 100)
+    scan_newest_member(paths, "ffffffffffffffff", 100)
 }
 
 /// The index names member 2 under another valid address, which `load_index` cannot

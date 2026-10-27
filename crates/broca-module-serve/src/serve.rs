@@ -514,7 +514,9 @@ struct BindObservation {
     /// The daemon's scope stamp on the bind, or why there is none. Every send over the route
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
-    reads_held_reply: bool,
+    /// What the consumer declared about reading tool replies, under either version's name for
+    /// the reply format.
+    consumer_format: crate::llm_tools::ConsumerFormat,
 }
 
 /// Preserve the scope identity, including the agent and run identifiers of an agent-run scope
@@ -1501,11 +1503,11 @@ where
                                                 .await
                                         } else {
                                             service
-                                                .answer_with_capabilities(
+                                                .answer_for_consumer(
                                                     &frame.body,
                                                     bind.principal.as_ref(),
                                                     &bind.scope,
-                                                    bind.reads_held_reply,
+                                                    bind.consumer_format,
                                                 )
                                                 .await
                                         }
@@ -1745,7 +1747,7 @@ async fn handle_control_request(
                 project_id: identity.project_id.clone(),
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
-                reads_held_reply: cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
+                consumer_format: crate::llm_tools::ConsumerFormat::from_capabilities(
                     consumer_capabilities.as_deref(),
                 ),
             };
@@ -7736,7 +7738,7 @@ mod tests {
                     project_id: None,
                     principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
-                    reads_held_reply: false,
+                    consumer_format: Default::default(),
                 },
                 cancel,
                 refusal: Ok(None),

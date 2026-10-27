@@ -168,6 +168,7 @@ pub enum ContainerState {
 /// name, so the name must be the canonical `fold-<stamp>.ark`.
 pub struct ArchiveWriter {
     file: File,
+    path: PathBuf,
     stamp: u64,
     entries: Vec<MemberInfo>,
     failed: bool,
@@ -202,6 +203,7 @@ impl ArchiveWriter {
         options.write(true).create_new(true);
         Ok(Self {
             file: options.open(path)?,
+            path: path.to_owned(),
             stamp,
             entries: Vec::new(),
             failed: false,
@@ -332,7 +334,9 @@ impl ArchiveWriter {
         index.extend_from_slice(&index_len.to_le_bytes());
         index.extend_from_slice(&MAGIC.to_le_bytes());
         self.file.write_all(&index)?;
-        self.file.sync_all()
+        self.file.sync_all()?;
+        invalidate_member_index(self.path.parent().unwrap_or_else(|| Path::new("")));
+        Ok(())
     }
 }
 
@@ -842,6 +846,18 @@ pub fn read_newest_member(
     session_addr: &str,
     max_member_bytes: u64,
 ) -> io::Result<Option<ArchiveMember>> {
+    #[cfg(unix)]
+    if let Some(answer) = member_index::lookup(paths, session_addr, max_member_bytes)? {
+        return Ok(answer);
+    }
+    scan_newest_member(paths, session_addr, max_member_bytes)
+}
+
+fn scan_newest_member(
+    paths: &[PathBuf],
+    session_addr: &str,
+    max_member_bytes: u64,
+) -> io::Result<Option<ArchiveMember>> {
     let addr = address(session_addr)?;
     let mut ordered = paths
         .iter()
@@ -898,6 +914,49 @@ pub fn read_newest_member(
         }
     }
     Ok(None)
+}
+
+/// Warm the per-container fallback cache without replacing a directory-wide index with
+/// a single-container snapshot. The caller may warm independent containers concurrently.
+pub fn prewarm_container_membership(path: &Path, max_member_bytes: u64) -> io::Result<()> {
+    scan_newest_member(
+        std::slice::from_ref(&path.to_owned()),
+        "0000000000000000",
+        max_member_bytes,
+    )?;
+    Ok(())
+}
+
+/// Discard cached locations in an archive directory after a fold, removal or restore.
+/// External changes are also detected by comparing file identities on every lookup.
+pub fn invalidate_member_index(directory: &Path) {
+    #[cfg(unix)]
+    member_index::invalidate(directory);
+    #[cfg(not(unix))]
+    let _ = directory;
+}
+
+/// Mark a restored address uncertain without discarding other unchanged locations.
+/// Archive reads of this address use the scan until the directory index is rebuilt;
+/// ordinary store reads prefer the restored live log before consulting the archive.
+pub fn invalidate_restored_member(directory: &Path, session_addr: &str) {
+    #[cfg(unix)]
+    member_index::restored(directory, session_addr);
+    #[cfg(not(unix))]
+    let _ = (directory, session_addr);
+}
+
+#[cfg(unix)]
+mod member_index;
+
+/// Diagnostic (container count, address count, estimated allocation bytes) for a directory.
+#[cfg(all(
+    unix,
+    any(test, feature = "test-io-trace", feature = "test-known-feature")
+))]
+#[doc(hidden)]
+pub fn cached_member_index_stats(directory: &Path) -> Option<(usize, usize, usize)> {
+    member_index::stats(directory)
 }
 
 /// How the process-wide membership cache answered for one container, for tests and

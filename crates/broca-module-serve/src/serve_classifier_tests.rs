@@ -344,6 +344,19 @@ impl Rig {
     }
 }
 
+/// Compare a fact the real producer exported with its golden file, which the downstream
+/// decoder pins. `BROCA_UPDATE_GOLDEN=1` rewrites the file from these bytes first.
+fn assert_fact_golden(actual: &str, file: &str) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(file);
+    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&path, format!("{actual}\n")).unwrap();
+    }
+    let pinned = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(actual, pinned.trim_end(), "{file}");
+}
+
 fn run_stamp(run: &str) -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
         "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
@@ -397,9 +410,9 @@ async fn scoped_classifier_exports_one_measurement_per_paid_item_and_none_on_res
         assert_eq!(rig.reply().await.header.ty, FrameType::Response);
         let page = rig.export.read_export_page(None, 100).unwrap();
         assert_eq!(page.facts.len(), 2);
-        assert_eq!(
-            serde_json::to_string(&page.facts[0].segment).unwrap(),
-            include_str!("../tests/golden/system_one_run_fact.json").trim()
+        assert_fact_golden(
+            &serde_json::to_string(&page.facts[0].segment).unwrap(),
+            "system_one_run_fact.json",
         );
         for (index, fact) in page.facts.iter().enumerate() {
             let broca_core::system_one_fact::UsageExportSegment::SystemOne(fact) = &fact.segment
@@ -417,7 +430,8 @@ async fn scoped_classifier_exports_one_measurement_per_paid_item_and_none_on_res
             assert_eq!(fact.usage.input_tokens, Some(100));
             assert_eq!(fact.usage.output_tokens, None);
             assert_eq!(fact.charge_basis, broca_core::ChargeBasis::MeteredApi);
-            assert_eq!(fact.model, JEV_1_13_0);
+            assert_eq!(fact.provider, "typesafe");
+            assert_eq!(fact.model, "jev-1.13.0");
         }
     }
     assert_eq!(rig.provider.held.load(Ordering::SeqCst), 2);
@@ -454,9 +468,9 @@ async fn flow_classifier_measurement_never_inherits_its_owner_agent_or_run() {
     let page = rig.export.read_export_page(None, 100).unwrap();
     assert_eq!(page.facts.len(), 1);
     let value = serde_json::to_value(&page.facts[0].segment).unwrap();
-    assert_eq!(
-        serde_json::to_string(&page.facts[0].segment).unwrap(),
-        include_str!("../tests/golden/system_one_flow_fact.json").trim()
+    assert_fact_golden(
+        &serde_json::to_string(&page.facts[0].segment).unwrap(),
+        "system_one_flow_fact.json",
     );
     assert_eq!(value["flow_id"], "flow-1");
     for absent in [
@@ -741,7 +755,7 @@ async fn startup_replays_committed_measurement_intents_before_serving() {
     let context = FactContext {
         source_instance_id: rig.export.source_instance_id().into(),
         provider: "typesafe".into(),
-        model: JEV_1_13_0.into(),
+        model: "jev-1.13.0".into(),
         auth_selection: Some("apikey:typesafe:primary".into()),
         account_ref: Some("primary".into()),
         charge_basis: broca_core::ChargeBasis::MeteredApi,
@@ -816,4 +830,130 @@ async fn classifier_fact_resolves_charge_basis_from_its_configured_table() {
     let value = serde_json::to_value(&page.facts[0].segment).unwrap();
     assert_eq!(value["charge_basis"], "unknown");
     rig.finish().await;
+}
+
+/// A Workers AI provider that answers at once, as Cloudflare does for Clef.
+struct ClefAnswers;
+
+#[async_trait::async_trait]
+impl ClassifierProvider for ClefAnswers {
+    fn egress_host(&self) -> String {
+        "stand-in.invalid".into()
+    }
+    fn credential_id(&self) -> Option<String> {
+        None
+    }
+    async fn call(&self, _body: String) -> ProviderReply {
+        ProviderReply::AttributedAnswer {
+            body: br#"{"answers":{"q":{"type":"noul","noul":0.5}},"usage":{"input_tokens":100}}"#
+                .to_vec(),
+            auth_selection: Some("apikey:cloudflare-workers-ai:primary".into()),
+            account_ref: Some("primary".into()),
+        }
+    }
+}
+
+struct ClefOnly;
+
+impl BatchCatalog for ClefOnly {
+    fn row(&self, catalog_id: &str) -> Option<broca_catalog::ModelBatchRow> {
+        (catalog_id == crate::system_one::CLEF).then(|| broca_catalog::ModelBatchRow {
+            model_name: None,
+            provider_name: None,
+            kind: Some("decision".into()),
+            context_tokens: None,
+            attachment: false,
+            input_rate_nanos: Some(240_000_000),
+            output_rate_nanos: Some(0),
+        })
+    }
+}
+
+/// Clef's model id carries slashes of its own, so the catalog key splits only at its first
+/// slash: the fact names provider `cloudflare-workers-ai` and model `@cf/cloudflare/clef`.
+#[tokio::test]
+async fn a_clef_fact_names_the_provider_and_its_slashed_model_id_apart() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("classifier-export-clef-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let export = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
+    let system_one = Arc::new(
+        SystemOne::new(
+            Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+            "test",
+            Arc::new(ClefOnly),
+            vec![ModelPin::clef(Arc::new(ClefAnswers))],
+            Config::default(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_export(
+            export.clone(),
+            Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
+        ),
+    );
+    let mut params = classify_params("clef");
+    params["model"] = json!("cloudflare-workers-ai/@cf/cloudflare/clef");
+    system_one
+        .clone()
+        .spawn_call(
+            params.to_string(),
+            broca_store::system_one::BatchScope::Run {
+                agent_id: "agent".into(),
+                run_id: "run".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let page = export.read_export_page(None, 100).unwrap();
+    assert_eq!(page.facts.len(), 1);
+    let broca_core::system_one_fact::UsageExportSegment::SystemOne(fact) = &page.facts[0].segment
+    else {
+        panic!("not a System One fact")
+    };
+    assert_eq!(fact.provider, "cloudflare-workers-ai");
+    assert_eq!(fact.model, "@cf/cloudflare/clef");
+    assert_eq!(
+        system_one.health()["spend_nanos_by_model"]["cloudflare-workers-ai/@cf/cloudflare/clef"],
+        24_000,
+        "health still keys spend by the whole catalog key"
+    );
+}
+
+/// A routed key with no provider/model split could not be attributed in a usage fact, so the
+/// call is refused before its provider is called or anything is stored.
+#[tokio::test]
+async fn a_routed_key_without_a_provider_split_is_refused_before_any_call() {
+    struct AnyRow;
+    impl BatchCatalog for AnyRow {
+        fn row(&self, _catalog_id: &str) -> Option<broca_catalog::ModelBatchRow> {
+            ClefOnly.row(crate::system_one::CLEF)
+        }
+    }
+    let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
+    let mut pin = ModelPin::clef(Arc::new(ClefAnswers));
+    pin.catalog_id = "clef".into();
+    let system_one = Arc::new(SystemOne::new(
+        store.clone(),
+        "test",
+        Arc::new(AnyRow),
+        vec![pin],
+        Config::default(),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let mut params = classify_params("bare");
+    params["model"] = json!("clef");
+    let refused = system_one
+        .clone()
+        .spawn_call(
+            params.to_string(),
+            broca_store::system_one::BatchScope::Run {
+                agent_id: "agent".into(),
+                run_id: "run".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    let refused: Value = serde_json::from_slice(&refused).unwrap();
+    assert_eq!(refused["code"], "model_unavailable", "{refused}");
+    assert_eq!(store.ledger(system_one.store_role(), "bare").unwrap(), None);
 }

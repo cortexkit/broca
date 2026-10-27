@@ -11,7 +11,10 @@ pub struct SystemOneFact {
     pub fact_id: String,
     pub batch_id: String,
     pub item_index: u64,
+    /// The provider id, such as `typesafe`.
     pub provider: String,
+    /// The provider's own model id, never prefixed with the provider: `jev-1.13.0`, or
+    /// `@cf/cloudflare/clef`, whose id carries slashes of its own.
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_selection: Option<String>,

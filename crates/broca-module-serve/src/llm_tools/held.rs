@@ -236,6 +236,10 @@ fn late_entry(row: &HeldCall) -> Result<Value, Vec<u8>> {
             body
         } else if result.is_error {
             json!({"content":[{"type":"text","text":result.body}],"isError":true,"errorCode":body["code"]})
+        } else if body.is_object() {
+            // Consumers hand `structuredContent` to the caller, so a late answer reaches it as
+            // the same object an immediate answer would.
+            json!({"content":[{"type":"text","text":result.body}],"structuredContent":body})
         } else {
             json!({"content":[{"type":"text","text":result.body}]})
         };

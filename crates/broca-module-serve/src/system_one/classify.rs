@@ -633,6 +633,12 @@ pub(super) async fn run_inner(
         .pin(&request.model)
         .ok_or_else(|| Refusal::model_unavailable(&request.model))?
         .clone();
+    // Every usage fact names the provider id and the model id apart. A routed key that does
+    // not split into both could not be attributed, so it is refused here, before anything is
+    // written or sent, rather than answered and billed without a fact.
+    if super::catalog_key_parts(&request.model).is_none() {
+        return Err(Refusal::model_unavailable(&request.model));
+    }
     let entry = service.model_entry(&pin, &row);
     if tool.is_none() {
         check_request(&request, &entry)?;
@@ -944,31 +950,31 @@ async fn serve_claimed(
                     input_tokens: usage.and_then(|u| u.input_tokens),
                     output_tokens: usage.and_then(|u| u.output_tokens),
                 };
-                let fact = service.export.as_ref().map(|export| {
-                    use broca_core::ChargeBasisResolver;
-                    let provider = request
-                        .model
-                        .split('/')
-                        .next()
-                        .unwrap_or_default()
-                        .to_owned();
-                    let method = auth_selection
-                        .as_deref()
-                        .and_then(|id| id.split(':').next())
-                        .unwrap_or("apikey");
-                    let (charge_basis, charge_basis_mapping_version) =
-                        service.charge_basis.resolve_charge_basis(&provider, method);
-                    broca_store::system_one::FactContext {
-                        source_instance_id: export.source_instance_id().into(),
-                        provider,
-                        model: request.model.clone(),
-                        auth_selection,
-                        account_ref,
-                        charge_basis,
-                        charge_basis_mapping_version,
-                        charge_basis_overrides: service.charge_basis.charge_basis_overrides(),
-                    }
-                });
+                // `run_inner` refused a key without both ids before the call, so the split
+                // always succeeds here.
+                let fact = service
+                    .export
+                    .as_ref()
+                    .zip(super::catalog_key_parts(&request.model))
+                    .map(|(export, (provider, model))| {
+                        use broca_core::ChargeBasisResolver;
+                        let method = auth_selection
+                            .as_deref()
+                            .and_then(|id| id.split(':').next())
+                            .unwrap_or("apikey");
+                        let (charge_basis, charge_basis_mapping_version) =
+                            service.charge_basis.resolve_charge_basis(provider, method);
+                        broca_store::system_one::FactContext {
+                            source_instance_id: export.source_instance_id().into(),
+                            provider: provider.to_owned(),
+                            model: model.to_owned(),
+                            auth_selection,
+                            account_ref,
+                            charge_basis,
+                            charge_basis_mapping_version,
+                            charge_basis_overrides: service.charge_basis.charge_basis_overrides(),
+                        }
+                    });
                 record_paid(service, &request.batch_id, &outcome, cost, fact).await?;
                 spent = spent.saturating_add(cost);
                 slots[index] = Some(Slot::Stored(outcome));

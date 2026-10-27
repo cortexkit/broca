@@ -40,6 +40,41 @@ impl super::Asks for NoPrivateContent {
 
 type Answer = Result<Box<RawValue>, Vec<u8>>;
 
+/// tool-provider 0.13's name for the opt-in reply format that 0.10 called `content/v1`. The
+/// rename changed nothing else: the reply shapes, held replies and late results are identical,
+/// so a consumer built against either version reads the same bodies.
+pub const TOOL_RESULT_V1: &str = "tool-result/v1";
+
+/// What a route's consumer declared at bind about reading replies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConsumerFormat {
+    /// The reply-format name the consumer declared, if any. The catalog echoes it, because a
+    /// 0.13 consumer decodes replies only for a tool whose `result_format` it recognises.
+    /// `None` keeps the legacy body: the bare tool result.
+    pub result_format: Option<&'static str>,
+    /// The consumer can hold a call for a later result (`held-reply/v1` with a result format).
+    pub held_reply: bool,
+}
+
+impl ConsumerFormat {
+    /// Read the bind's consumer capabilities, accepting either name of the reply format.
+    pub fn from_capabilities(capabilities: Option<&[String]>) -> Self {
+        let declares = |name: &str| capabilities.is_some_and(|caps| caps.iter().any(|c| c == name));
+        let result_format = if declares(TOOL_RESULT_V1) {
+            Some(TOOL_RESULT_V1)
+        } else if declares(cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY) {
+            Some(cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY)
+        } else {
+            None
+        };
+        Self {
+            result_format,
+            held_reply: result_format.is_some()
+                && declares(cortexkit_role_tool_provider::HELD_REPLY_V1),
+        }
+    }
+}
+
 /// The classify tool's catalog name. Codemode programs call tools as `tools.<name>`, so a name
 /// must be a plain identifier; the contract's tag `llm.classify/v1` goes in `capabilities`.
 pub const CLASSIFY_TOOL_NAME: &str = "llm_classify";
@@ -266,6 +301,25 @@ impl LlmTools {
         scope: &SendScope,
         reads_held_reply: bool,
     ) -> Answer {
+        let consumer = ConsumerFormat {
+            result_format: None,
+            held_reply: reads_held_reply,
+        };
+        self.answer_for_consumer(body, principal, scope, consumer)
+            .await
+    }
+
+    /// Answer one tool-provider request for a consumer whose bind declared `consumer`. A
+    /// consumer that declared a reply format gets the catalog in that name and successes as
+    /// tool results whose `structuredContent` is the tool's result object.
+    pub async fn answer_for_consumer(
+        self: &Arc<Self>,
+        body: &[u8],
+        principal: Option<&BindPrincipal>,
+        scope: &SendScope,
+        consumer: ConsumerFormat,
+    ) -> Answer {
+        let reads_held_reply = consumer.held_reply;
         let call: ToolCallRequest = serde_json::from_slice(body)
             .map_err(|e| error(Refusal::invalid_params("request", e.to_string())))?;
         match call.name.as_str() {
@@ -273,7 +327,7 @@ impl LlmTools {
                 "majors": [{"version":"tool-provider/v1", "ops":["role.describe", "tool.catalog", "late_results", "late_results.ack"], "stability":"alpha"}],
                 "implementation_version": env!("CARGO_PKG_VERSION"),
             })),
-            "tool.catalog" => self.catalog(&call.arguments),
+            "tool.catalog" => self.catalog(&call.arguments, consumer.result_format),
             "late_results" => self
                 .held
                 .read(&call.arguments, principal, self.system.tool_now()),
@@ -319,8 +373,13 @@ impl LlmTools {
                 } else {
                     None
                 };
-                self.call(admission, call.call_key.is_some(), scope, held, hold_caller)
-                    .await
+                let answer = self
+                    .call(admission, call.call_key.is_some(), scope, held, hold_caller)
+                    .await;
+                match consumer.result_format {
+                    Some(_) => answer.and_then(as_tool_result),
+                    None => answer,
+                }
             }
             _ => Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
                 "unknown_method",
@@ -330,7 +389,7 @@ impl LlmTools {
         }
     }
 
-    fn catalog(&self, arguments: &Value) -> Answer {
+    fn catalog(&self, arguments: &Value, result_format: Option<&'static str>) -> Answer {
         let request: cortexkit_role_tool_provider::catalog::CatalogRequest =
             serde_json::from_value(arguments.clone())
                 .map_err(|e| catalog_error("arguments", e.to_string()))?;
@@ -358,7 +417,7 @@ impl LlmTools {
             "semantics":1, "capabilities":[], "description":"Classify one item with a decision model.",
             "input_schema":schema,
             "modes":cortexkit_llm_tools::MODES,
-            "result_format":cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY,
+            "result_format":result_format.unwrap_or(cortexkit_role_tool_provider::CONTENT_V1_CAPABILITY),
         });
         if self.config.advertise_tags {
             tool["capabilities"] = json!([classify::TAG]);
@@ -721,6 +780,21 @@ fn catalog_error(field: &str, message: String) -> Vec<u8> {
     let mut body = subc_protocol::ErrorBody::new("invalid_request", message);
     body.detail = Some(json!({"field":field}));
     serde_json::to_vec(&body).expect("catalog refusal encodes")
+}
+
+/// Wrap a bare tool result as a tool-result reply: the JSON text for display, and the same object
+/// as `structuredContent`, which consumers hand to the caller. Held replies already carry
+/// `content` and pass through unchanged.
+fn as_tool_result(body: Box<RawValue>) -> Answer {
+    let value: Value = serde_json::from_str(body.get()).map_err(|_| {
+        error(crate::system_one::internal_refusal(
+            "model tool reply cannot decode",
+        ))
+    })?;
+    if !value.is_object() || value.get("content").is_some() {
+        return Ok(body);
+    }
+    raw(json!({"content":[{"type":"text","text":body.get()}],"structuredContent":value}))
 }
 
 fn raw(value: Value) -> Answer {
