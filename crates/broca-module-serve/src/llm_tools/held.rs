@@ -8,6 +8,8 @@ use broca_store::grants::{FinalKind, GrantsStore, HeldCall, HeldState, ScopeIden
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
 
+use super::spend::Spend;
+
 type Answer = Result<Box<RawValue>, Vec<u8>>;
 
 pub struct HeldCalls {
@@ -92,12 +94,14 @@ impl HeldCalls {
             return Err(refusal(
                 "batch_scope_mismatch",
                 "held call belongs to another stamped scope or caller",
+                Spend::Nothing,
             ));
         }
         if digest != row.args_digest {
             return Err(refusal(
                 "batch_id_reuse",
                 "held call arguments differ from first admission",
+                Spend::Nothing,
             ));
         }
         if row.state == HeldState::Held && now_ms >= row.deadline_at_ms {
@@ -120,11 +124,12 @@ impl HeldCalls {
         let result = row
             .final_result
             .as_ref()
-            .ok_or_else(|| refusal("internal", "final held call has no result"))?;
+            .ok_or_else(|| refusal("internal", "final held call has no result", Spend::Unknown))?;
+        // A stored error is answered as stored, with the spend mark its first answer carried.
         if result.is_error {
             return Err(result.body.as_bytes().to_vec());
         }
-        RawValue::from_string(result.body.clone()).map_err(internal)
+        RawValue::from_string(result.body.clone()).map_err(lost)
     }
 
     /// Re-arm from persisted deadlines, including on startup. Authorized calls deliberately
@@ -192,6 +197,7 @@ impl HeldCalls {
                 refusal(
                     "scope_required",
                     "late results require a daemon-stamped caller principal",
+                    Spend::Nothing,
                 )
             })?
             .as_owner_string();
@@ -224,6 +230,7 @@ impl HeldCalls {
                 refusal(
                     "scope_required",
                     "late-result acknowledgements require a daemon-stamped caller principal",
+                    Spend::Nothing,
                 )
             })?
             .as_owner_string();
@@ -241,7 +248,7 @@ impl HeldCalls {
 
     fn check_cursor(&self, cursor: &Cursor, head: u64, principal: &str) -> Result<(), Vec<u8>> {
         if cursor.provider_incarnation != self.caller_incarnation(principal) || cursor.seq > head {
-            return Err(refusal("cursor_incarnation_changed", "late-results cursor is not from this caller's provider incarnation or is past its entries"));
+            return Err(refusal("cursor_incarnation_changed", "late-results cursor is not from this caller's provider incarnation or is past its entries", Spend::Nothing));
         }
         Ok(())
     }
@@ -254,20 +261,23 @@ impl HeldCalls {
 }
 
 pub fn not_started(consent: &str) -> String {
-    let mut body = serde_json::to_value(super::admission::refusal(
+    let mut body = serde_json::to_value(Spend::Nothing.mark(super::admission::refusal(
         "not_started",
         format!("private-content consent ended the call without dispatch: {consent}"),
-    ))
+    )))
     .expect("a consent refusal encodes");
     body["detail"]["consent"] = json!(consent);
     body.to_string()
 }
 
 fn late_entry(row: &HeldCall) -> Result<Value, Vec<u8>> {
-    let result = row
-        .final_result
-        .as_ref()
-        .ok_or_else(|| refusal("internal", "late result has no stored final outcome"))?;
+    let result = row.final_result.as_ref().ok_or_else(|| {
+        refusal(
+            "internal",
+            "late result has no stored final outcome",
+            Spend::Unknown,
+        )
+    })?;
     let mut entry = json!({
         "kind":if result.kind == FinalKind::Result {"result"} else {"not_started"},
         "owner":row.scope.owner, "ref":row.scope.scope_ref, "scope_epoch":row.scope.scope_epoch,
@@ -275,7 +285,7 @@ fn late_entry(row: &HeldCall) -> Result<Value, Vec<u8>> {
         "event_id":format!("llm.classify:{}:{}",row.batch_id,row.admitted_at_ms),
         "settled_at":result.settled_at_ms, "reduced":false,
     });
-    let body: Value = serde_json::from_str(&result.body).map_err(internal)?;
+    let body: Value = serde_json::from_str(&result.body).map_err(lost)?;
     if result.kind == FinalKind::Result {
         entry["result"] = if body.get("content").is_some() {
             body
@@ -308,19 +318,29 @@ fn raw(value: Value) -> Answer {
     serde_json::value::to_raw_value(&value).map_err(internal)
 }
 
-fn refusal(code: &str, message: &str) -> Vec<u8> {
-    crate::system_one::refusal_body(&super::admission::refusal(code, message))
+fn refusal(code: &str, message: &str, spend: Spend) -> Vec<u8> {
+    crate::system_one::refusal_body(&spend.mark(super::admission::refusal(code, message)))
 }
 
 fn invalid(error: impl std::fmt::Display) -> Vec<u8> {
     refusal(
         "invalid_params",
         &format!("invalid late-results arguments: {error}"),
+        Spend::Nothing,
     )
 }
 
+/// A held-call store failure that ends a request before anything is sent to a provider.
 fn internal(error: impl std::fmt::Display) -> Vec<u8> {
-    crate::system_one::refusal_body(&crate::system_one::internal_refusal(&format!(
-        "held-call store: {error}"
+    crate::system_one::refusal_body(&Spend::Nothing.mark(crate::system_one::internal_refusal(
+        &format!("held-call store: {error}"),
+    )))
+}
+
+/// A held call's stored result that cannot be read back. The call may have been executed and
+/// billed before its result was lost, so its spend is unknown.
+fn lost(error: impl std::fmt::Display) -> Vec<u8> {
+    crate::system_one::refusal_body(&Spend::Unknown.mark(crate::system_one::internal_refusal(
+        &format!("held-call result: {error}"),
     )))
 }

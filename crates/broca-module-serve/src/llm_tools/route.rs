@@ -12,6 +12,7 @@ use tokio::sync::watch;
 
 use super::admission::{admit, hash, refusal, Admission};
 use super::private_content::PrivateContent;
+use super::spend::Spend;
 
 /// The private-content answer for a route with no cerebellum or Basal behind it, which is what
 /// a test that drives this route directly gets: the scope counts as marked and its sources are
@@ -331,12 +332,15 @@ impl LlmTools {
     ) -> Answer {
         let reads_held_reply = consumer.held_reply;
         let call: ToolCallRequest = serde_json::from_slice(body)
-            .map_err(|e| error(Refusal::invalid_params("request", e.to_string())))?;
+            .map_err(|e| unspent(Refusal::invalid_params("request", e.to_string())))?;
         match call.name.as_str() {
-            "role.describe" => raw(json!({
-                "majors": [{"version":"tool-provider/v1", "ops":["role.describe", "tool.catalog", "late_results", "late_results.ack"], "stability":"alpha"}],
-                "implementation_version": env!("CARGO_PKG_VERSION"),
-            })),
+            "role.describe" => raw(
+                Spend::Nothing,
+                json!({
+                    "majors": [{"version":"tool-provider/v1", "ops":["role.describe", "tool.catalog", "late_results", "late_results.ack"], "stability":"alpha"}],
+                    "implementation_version": env!("CARGO_PKG_VERSION"),
+                }),
+            ),
             "tool.catalog" => self.catalog(&call.arguments, consumer.result_format),
             "late_results" => self
                 .held
@@ -344,7 +348,7 @@ impl LlmTools {
             "late_results.ack" => self.held.acknowledge(&call.arguments, principal),
             CLASSIFY_TOOL_NAME => {
                 let envelope: RawEnvelope<'_> = serde_json::from_slice(body)
-                    .map_err(|e| error(Refusal::invalid_params("arguments", e.to_string())))?;
+                    .map_err(|e| unspent(Refusal::invalid_params("arguments", e.to_string())))?;
                 let admission = admit(
                     principal,
                     scope,
@@ -352,18 +356,21 @@ impl LlmTools {
                     call.call_key.as_deref(),
                     self.system.image_references(),
                 )
-                .map_err(error)?;
-                let pin = cortexkit_role_tool_provider::call::check_call(&call)
-                    .map_err(|error| serde_json::to_vec(&error).expect("call refusal encodes"))?;
+                .map_err(unspent)?;
+                let pin =
+                    cortexkit_role_tool_provider::call::check_call(&call).map_err(|error| {
+                        Spend::Nothing
+                            .mark_body(serde_json::to_vec(&error).expect("call refusal encodes"))
+                    })?;
                 if let Some(pin) = pin {
                     let digest =
                         cortexkit_role_tool_provider::catalog::schema_digest(&self.input_schema())
                             .expect("contract schema has a digest");
                     if pin.schema_digest != digest {
-                        return Err(serde_json::to_vec(&json!({"code":"tool_schema_changed", "message":"the pinned tool schema is no longer served", "detail":{"tool":call.name, "expected":pin.schema_digest, "current":digest}})).expect("refusal encodes"));
+                        return Err(serde_json::to_vec(&json!({"code":"tool_schema_changed", "message":"the pinned tool schema is no longer served", "detail":{"tool":call.name, "expected":pin.schema_digest, "current":digest, "no_spend":true}})).expect("refusal encodes"));
                     }
                     if pin.semantics != 1 {
-                        return Err(serde_json::to_vec(&json!({"code":"tool_semantics_changed", "message":"the pinned tool semantics are no longer served", "detail":{"tool":call.name, "expected":pin.semantics, "current":1}})).expect("refusal encodes"));
+                        return Err(serde_json::to_vec(&json!({"code":"tool_semantics_changed", "message":"the pinned tool semantics are no longer served", "detail":{"tool":call.name, "expected":pin.semantics, "current":1, "no_spend":true}})).expect("refusal encodes"));
                     }
                 }
                 let held = if let Some(call_key) = &call.call_key {
@@ -391,11 +398,13 @@ impl LlmTools {
                     None => answer,
                 }
             }
-            _ => Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
-                "unknown_method",
-                format!("tool-provider does not serve {}", call.name),
-            ))
-            .expect("error encodes")),
+            _ => Err(Spend::Nothing.mark_body(
+                serde_json::to_vec(&subc_protocol::ErrorBody::new(
+                    "unknown_method",
+                    format!("tool-provider does not serve {}", call.name),
+                ))
+                .expect("error encodes"),
+            )),
         }
     }
 
@@ -442,10 +451,13 @@ impl LlmTools {
         }
         let digest = hash(&answer);
         if request.digest_only == Some(true) {
-            return raw(json!({"generation":generation,"catalog_digest":digest}));
+            return raw(
+                Spend::Nothing,
+                json!({"generation":generation,"catalog_digest":digest}),
+            );
         }
         answer["catalog_digest"] = json!(digest);
-        raw(answer)
+        raw(Spend::Nothing, answer)
     }
 
     fn input_schema(&self) -> Value {
@@ -475,7 +487,7 @@ impl LlmTools {
                 }
                 HeldState::Authorized => {
                     let Some(params) = &row.request else {
-                        return Err(error(crate::system_one::internal_refusal(
+                        return Err(unspent(crate::system_one::internal_refusal(
                             "authorized held call has no validated request",
                         )));
                     };
@@ -490,7 +502,7 @@ impl LlmTools {
                 .stored_batch(&admission.batch_id)
                 .await
                 .map_err(|_| {
-                    error(crate::system_one::internal_refusal(
+                    unspent(crate::system_one::internal_refusal(
                         "batch replay is unavailable",
                     ))
                 })?
@@ -502,17 +514,22 @@ impl LlmTools {
             None
         };
         if let Some(stored) = &stored {
-            check_replay(stored, &admission).map_err(error)?;
+            // A refusal about the recorded batch reports this invocation's spend, which is
+            // nothing: it sent no request. The recorded call's own cost reaches the caller
+            // through its replayed answer, so it is never charged twice.
+            check_replay(stored, &admission).map_err(unspent)?;
             if has_final_outcome(stored) {
+                // Replaying sends nothing, so a failure to read the record spent nothing; the
+                // replayed answer itself carries the spend its first answer carried.
                 let answer = convert(
                     &self
                         .system
                         .replay_tool(&admission.params, stored)
                         .await
-                        .map_err(error)?,
+                        .map_err(unspent)?,
                 );
                 if held.is_some() {
-                    self.persist_held_answer(&admission.batch_id, &answer)?;
+                    self.persist_held_answer(&admission.batch_id, &answer, Spend::Nothing)?;
                 }
                 return answer;
             }
@@ -521,13 +538,13 @@ impl LlmTools {
             let flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(flight) = flights.get(&admission.batch_id) {
                 if flight.scope != admission.scope {
-                    return Err(error(refusal(
+                    return Err(unspent(refusal(
                         "batch_scope_mismatch",
                         "batch_id is executing under another scope",
                     )));
                 }
                 if flight.digest != admission.args_digest {
-                    return Err(error(Refusal::batch_id_reuse("arguments")));
+                    return Err(unspent(Refusal::batch_id_reuse("arguments")));
                 }
                 Some(flight.result.clone())
             } else {
@@ -542,7 +559,7 @@ impl LlmTools {
                 .held
                 .images
                 .get(row, scope, &admission)
-                .map_err(error)?,
+                .map_err(unspent)?,
             None => None,
         };
         let image_scope = match &kept {
@@ -561,9 +578,9 @@ impl LlmTools {
             {
                 Ok(images) => Arc::new(images),
                 Err(refusal) => {
-                    let answer = Err(error(refusal));
+                    let answer = Err(unspent(refusal));
                     if held.is_some() {
-                        self.persist_held_answer(&admission.batch_id, &answer)?;
+                        self.persist_held_answer(&admission.batch_id, &answer, Spend::Nothing)?;
                     }
                     return answer;
                 }
@@ -571,14 +588,14 @@ impl LlmTools {
         };
         let pricing = if let Some(row) = &held {
             serde_json::from_value(json!({"frozen_row":row.frozen_row})).map_err(|_| {
-                error(crate::system_one::internal_refusal(
+                unspent(crate::system_one::internal_refusal(
                     "held pricing snapshot is unreadable",
                 ))
             })?
         } else {
             self.system
                 .admit_tool(&admission.params, stored.as_ref())
-                .map_err(error)?
+                .map_err(unspent)?
         };
         // Private-content admission runs on every call that is not replaying a stored answer:
         // a repeat must return the bytes it already paid for even after the operator's list
@@ -685,13 +702,13 @@ impl LlmTools {
             let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(flight) = flights.get(&admission.batch_id) {
                 if flight.scope != admission.scope {
-                    return Err(error(refusal(
+                    return Err(unspent(refusal(
                         "batch_scope_mismatch",
                         "batch_id is executing under another scope",
                     )));
                 }
                 if flight.digest != admission.args_digest {
-                    return Err(error(Refusal::batch_id_reuse("arguments")));
+                    return Err(unspent(Refusal::batch_id_reuse("arguments")));
                 }
                 flight.result.clone()
             } else {
@@ -724,13 +741,20 @@ impl LlmTools {
                     .await;
                     let answer = match execution {
                         Ok(Ok(reply)) => convert(&reply),
-                        Ok(Err(refusal)) => Err(error(refusal)),
-                        Err(_) => Err(error(crate::system_one::internal_refusal(
-                            "model tool execution failed; retry the call",
-                        ))),
+                        // `execute_tool` marks every refusal it returns with its spend.
+                        Ok(Err(refusal)) => Err(error(refusal, None)),
+                        // The task may have ended after its provider request was sent.
+                        Err(_) => Err(error(
+                            crate::system_one::internal_refusal(
+                                "model tool execution failed; retry the call",
+                            ),
+                            Some(Spend::Unknown),
+                        )),
                     };
                     let answer = if held.is_some() {
-                        service.persist_held_answer(&batch_id, &answer).and(answer)
+                        service
+                            .persist_held_answer(&batch_id, &answer, Spend::Unknown)
+                            .and(answer)
                     } else {
                         answer
                     };
@@ -747,7 +771,15 @@ impl LlmTools {
         await_flight(receiver).await
     }
 
-    fn persist_held_answer(&self, batch_id: &str, answer: &Answer) -> Result<(), Vec<u8>> {
+    /// Record a held call's outcome. `lost` is the spend a failure to record states: unknown
+    /// after an execution that may have reached the provider, nothing when no request was sent.
+    fn persist_held_answer(
+        &self,
+        batch_id: &str,
+        answer: &Answer,
+        lost: Spend,
+    ) -> Result<(), Vec<u8>> {
+        let error = |refusal| error(refusal, Some(lost));
         // Transient execution refusals stay authorized so recovery can retry them. They must
         // not be converted into a not-started consent outcome after dispatch.
         if let Ok(body) = answer {
@@ -798,10 +830,12 @@ async fn await_flight(mut receiver: watch::Receiver<Option<Answer>>) -> Answer {
         if let Some(answer) = receiver.borrow_and_update().clone() {
             return answer;
         }
+        // The shared execution ended without an answer, possibly after its provider request.
         receiver.changed().await.map_err(|_| {
-            error(crate::system_one::internal_refusal(
-                "model tool execution stopped",
-            ))
+            error(
+                crate::system_one::internal_refusal("model tool execution stopped"),
+                Some(Spend::Unknown),
+            )
         })?;
     }
 }
@@ -832,13 +866,25 @@ fn has_final_outcome(stored: &StoredBatch) -> bool {
         })
 }
 
-fn error(refusal: Refusal) -> Vec<u8> {
+/// Encode a model-tool refusal with its spend mark. `None` is for a refusal an earlier step
+/// already marked (a refusal `execute_tool` returns, or an item error that carries its stored
+/// mark); every other caller states the spend.
+fn error(refusal: Refusal, spend: Option<Spend>) -> Vec<u8> {
+    let refusal = match spend {
+        Some(spend) => spend.mark(refusal),
+        None => refusal,
+    };
     crate::system_one::refusal_body(&refusal)
+}
+
+/// A refusal returned before this invocation sent anything to a provider.
+fn unspent(refusal: Refusal) -> Vec<u8> {
+    error(refusal, Some(Spend::Nothing))
 }
 
 fn catalog_error(field: &str, message: String) -> Vec<u8> {
     let mut body = subc_protocol::ErrorBody::new("invalid_request", message);
-    body.detail = Some(json!({"field":field}));
+    body.detail = Some(json!({"field":field, "no_spend":true}));
     serde_json::to_vec(&body).expect("catalog refusal encodes")
 }
 
@@ -846,22 +892,29 @@ fn catalog_error(field: &str, message: String) -> Vec<u8> {
 /// as `structuredContent`, which consumers hand to the caller. Held replies already carry
 /// `content` and pass through unchanged.
 fn as_tool_result(body: Box<RawValue>) -> Answer {
+    // The body is an answer that may already have been paid for, so losing it is unknown spend.
     let value: Value = serde_json::from_str(body.get()).map_err(|_| {
-        error(crate::system_one::internal_refusal(
-            "model tool reply cannot decode",
-        ))
+        error(
+            crate::system_one::internal_refusal("model tool reply cannot decode"),
+            Some(Spend::Unknown),
+        )
     })?;
     if !value.is_object() || value.get("content").is_some() {
         return Ok(body);
     }
-    raw(json!({"content":[{"type":"text","text":body.get()}],"structuredContent":value}))
+    raw(
+        Spend::Unknown,
+        json!({"content":[{"type":"text","text":body.get()}],"structuredContent":value}),
+    )
 }
 
-fn raw(value: Value) -> Answer {
+/// Encode a reply. `lost` is the spend a failure to encode it states.
+fn raw(lost: Spend, value: Value) -> Answer {
     serde_json::value::to_raw_value(&value).map_err(|_| {
-        error(crate::system_one::internal_refusal(
-            "model tool reply cannot encode",
-        ))
+        error(
+            crate::system_one::internal_refusal("model tool reply cannot encode"),
+            Some(lost),
+        )
     })
 }
 
@@ -876,7 +929,7 @@ fn convert(reply: &RawValue) -> Answer {
     struct ItemReply<'a> {
         #[serde(borrow)]
         answers: Option<&'a RawValue>,
-        error: Option<cortexkit_role_classifier::errors::ItemError>,
+        error: Option<super::spend::MarkedItemError>,
         usage: Option<cortexkit_llm_tools::Usage>,
     }
     #[derive(serde::Serialize)]
@@ -885,29 +938,35 @@ fn convert(reply: &RawValue) -> Answer {
         usage: cortexkit_llm_tools::Usage,
         cost_usd: serde_json::Number,
     }
+    // Before the reply's cost is read, a reply that cannot be read may hide a paid answer.
     let batch: BatchReply<'_> = serde_json::from_str(reply.get()).map_err(|_| {
-        error(crate::system_one::internal_refusal(
-            "stored model reply cannot decode",
-        ))
+        error(
+            crate::system_one::internal_refusal("stored model reply cannot decode"),
+            Some(Spend::Unknown),
+        )
     })?;
     let item = batch.items.into_iter().next().ok_or_else(|| {
-        error(crate::system_one::internal_refusal(
-            "stored model reply has no item",
-        ))
+        error(
+            crate::system_one::internal_refusal("stored model reply has no item"),
+            Some(Spend::Unknown),
+        )
     })?;
     if let Some(failure) = item.error {
-        let mut refusal = Refusal::new(failure.code, failure.message);
-        refusal.detail.class = failure.class;
-        refusal.detail.retry_after_ms = failure.retry_after_ms;
-        return Err(error(refusal));
+        // The item error carries the spend mark it was stored with. One stored before model
+        // tools marked refusals has none and replays unmarked, as its first answer was.
+        return Err(error(failure.into_refusal(), None));
     }
     let Some(cost_usd) = batch.cost_usd else {
-        return Err(error(super::unmeasured_cost_refusal()));
+        // `cost_unmeasured` is its own spend mark.
+        return Err(error(super::unmeasured_cost_refusal(), None));
     };
+    // From here the call's billed cost is known, so every refusal charges exactly that.
+    let measured = Some(cost_usd.as_f64().map_or(Spend::Unknown, Spend::Measured));
     let answers = item.answers.ok_or_else(|| {
-        error(crate::system_one::internal_refusal(
-            "stored model reply has no answers",
-        ))
+        error(
+            crate::system_one::internal_refusal("stored model reply has no answers"),
+            measured,
+        )
     })?;
     // Validate the shared result type without re-serializing provider answers. Unknown fields,
     // object order and JSON number spellings remain exactly as the provider returned them.
@@ -917,9 +976,10 @@ fn convert(reply: &RawValue) -> Answer {
         cost_usd,
     })
     .map_err(|_| {
-        error(crate::system_one::internal_refusal(
-            "model tool reply cannot encode",
-        ))
+        error(
+            crate::system_one::internal_refusal("model tool reply cannot encode"),
+            measured,
+        )
     })?;
     let parsed: classify::Result = serde_json::from_str(result.get()).map_err(|_| {
         error(
@@ -928,6 +988,7 @@ fn convert(reply: &RawValue) -> Answer {
                 "the provider returned a malformed classification result",
             )
             .expect("the contract classifies provider_error"),
+            measured,
         )
     })?;
     classify::validate_result(&parsed).map_err(|_| {
@@ -937,6 +998,7 @@ fn convert(reply: &RawValue) -> Answer {
                 "the provider's classification result failed validation",
             )
             .expect("the contract classifies provider_error"),
+            measured,
         )
     })?;
     Ok(result)
@@ -945,3 +1007,7 @@ fn convert(reply: &RawValue) -> Answer {
 #[cfg(test)]
 #[path = "route_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "spend_route_tests.rs"]
+mod spend_tests;

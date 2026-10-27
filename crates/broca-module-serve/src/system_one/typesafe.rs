@@ -107,10 +107,13 @@ impl ClassifierProvider for TypeSafe {
             )),
             // The URL is the public endpoint and carries no secret, but the error text is
             // reduced to its kind anyway so nothing request-specific reaches a reply.
+            // A connect error comes from the connector, before any request byte is written.
+            // A connect that timed out stays a transport failure, like every timeout.
+            Ok(Err(error)) if error.is_connect() && !error.is_timeout() => {
+                ProviderReply::Unconnected("the connection failed".to_owned())
+            }
             Ok(Err(error)) => ProviderReply::Transport(if error.is_timeout() {
                 "the request timed out".to_owned()
-            } else if error.is_connect() {
-                "the connection failed".to_owned()
             } else {
                 "the request failed in transport".to_owned()
             }),
