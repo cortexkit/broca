@@ -66,18 +66,33 @@ fn outage_result(tool_call_id: &str) -> ToolResult {
     }
 }
 
-/// Drive one `work` call that ends as an attributed module outage, and wait for the run.
-async fn outage_session(tag: &str) -> Rig {
+/// Drive one `work` call that ends as `result`, and wait for the run.
+async fn finished_session(tag: &str, call_id: &'static str, result: ToolResult) -> Rig {
     let mut rig = Rig::start(tag).await;
-    rig.script.push(&[Step::Call("call-1"), Step::Text("done")]);
-    rig.script.tool_results.lock().unwrap().insert(
-        "call-1".into(),
-        DispatchResult::Completed(outage_result("call-1")),
-    );
+    rig.script.push(&[Step::Call(call_id), Step::Text("done")]);
+    rig.script
+        .tool_results
+        .lock()
+        .unwrap()
+        .insert(call_id.into(), DispatchResult::Completed(result));
     rig.send("send-1", "hi", None).await;
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
     rig
+}
+
+/// Drive one `work` call that ends as an attributed module outage, and wait for the run.
+async fn outage_session(tag: &str) -> Rig {
+    finished_session(tag, "call-1", outage_result("call-1")).await
+}
+
+/// A plain, unattributed tool error, as it was before attribution existed.
+fn plain_error_result(tool_call_id: &str) -> ToolResult {
+    ToolResult {
+        tool_call_id: ToolCallId(tool_call_id.into()),
+        output: ToolOutput::error("plain failure"),
+        is_error: true,
+    }
 }
 
 /// `method` with `params` on `channel`, returning the reply frame.
@@ -215,7 +230,7 @@ async fn capture_module_outage_tool_result_bytes() {
     assert_attributed(&record_output);
 
     // The captured bytes, for a strict reader out of band.
-    let files: Vec<(&str, Vec<u8>)> = vec![
+    write_samples(&[
         ("session_read.reply.json", read.body.clone()),
         (
             "session_history.row.json",
@@ -227,18 +242,130 @@ async fn capture_module_outage_tool_result_bytes() {
         ),
         ("tool_finished.frame.json", finished_frame.body.clone()),
         ("tool_result.record.json", record_payload.clone()),
-    ];
-    if let Some(dir) = samples_dir() {
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut sums = String::new();
-        for (name, bytes) in &files {
-            std::fs::write(dir.join(name), bytes).unwrap();
-            sums.push_str(&format!("{}  {name}\n", sha256_hex(bytes)));
-        }
-        std::fs::write(dir.join("SHA256SUMS"), &sums).unwrap();
-        println!("wrote outage samples to {}", dir.display());
-    }
+    ]);
     rig.finish().await;
+}
+
+/// Write sample files, then regenerate SHA256SUMS over every sample file present, so
+/// tests that each add files all leave consistent sums.
+fn write_samples(files: &[(&str, Vec<u8>)]) {
+    let Some(dir) = samples_dir() else {
+        return;
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, bytes) in files {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != "SHA256SUMS")
+        .collect();
+    names.sort();
+    let mut sums = String::new();
+    for name in &names {
+        let bytes = std::fs::read(dir.join(name)).unwrap();
+        sums.push_str(&format!("{}  {name}\n", sha256_hex(&bytes)));
+    }
+    std::fs::write(dir.join("SHA256SUMS"), &sums).unwrap();
+    println!("wrote outage samples to {}", dir.display());
+}
+
+/// The `session.history` display row (`form: "display"`) for the outage, and for a
+/// plain unattributed error through the same path.
+///
+/// What changed for an error tool result is new TEXT lines only, never the shape: the
+/// display text for an attributed outage is the stable message plus one line each for
+/// the module, the code, the detail, the never-sent marker and the retry guidance,
+/// while a plain error renders as its message alone — byte-identical to the old
+/// `message.clone()` rendering (see the base `history.rs` error arm and the protocol
+/// unit test pinning `error_model_text` with no attribution to the message itself).
+#[tokio::test]
+async fn capture_display_rows_for_outage_and_plain_error() {
+    let mut outage =
+        finished_session("tool-outage-display", "call-1", outage_result("call-1")).await;
+    let mut plain = finished_session(
+        "tool-plain-error-display",
+        "call-2",
+        plain_error_result("call-2"),
+    )
+    .await;
+
+    let outage_row = display_row(&mut outage, "call-1").await;
+    let outage_rendered = outage_row.to_string();
+    // The rendered display text (as opposed to the JSON output object beside it) carries
+    // the attribution on its own lines.
+    for line in [
+        "tool plane unavailable\\nmodule: aft",
+        "module: aft",
+        "code: target_unavailable",
+        "detail: supervised_not_registered",
+        "nothing was sent",
+        "retry: the module is restarting or unavailable",
+    ] {
+        assert!(
+            outage_rendered.contains(line),
+            "the display row renders {line:?}: {outage_row}"
+        );
+    }
+
+    let plain_row = display_row(&mut plain, "call-2").await;
+    let plain_rendered = plain_row.to_string();
+    assert!(
+        plain_rendered.contains("plain failure"),
+        "the display row renders the message: {plain_row}"
+    );
+    // No attribution leaks into a plain error's row: its display text IS its message,
+    // byte-identical to what `message.clone()` produced before attribution existed.
+    for leaked in [
+        "module: ",
+        "code: ",
+        "detail: ",
+        "nothing was sent",
+        "retry: ",
+    ] {
+        assert!(
+            !plain_rendered.contains(leaked),
+            "a plain error must render as its message alone: {plain_row}"
+        );
+    }
+
+    write_samples(&[
+        (
+            "session_history.display.row.json",
+            serde_json::to_vec_pretty(&outage_row).unwrap(),
+        ),
+        (
+            "session_history.display.plain-error.row.json",
+            serde_json::to_vec_pretty(&plain_row).unwrap(),
+        ),
+    ]);
+    outage.finish().await;
+    plain.finish().await;
+}
+
+/// The `session.history` display row (`form: "display"`) for the call's tool result: the
+/// entry whose row holds a `tool_result` part for that call, not the assistant entry
+/// whose tool-call block merely names the same id.
+async fn display_row(rig: &mut Rig, call_id: &str) -> Value {
+    let reply = call(
+        rig,
+        7,
+        "session.history",
+        json!({"form": "display", "limit": 100}),
+    )
+    .await;
+    let history = result(&reply);
+    history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            let rendered = entry.to_string();
+            rendered.contains(call_id) && rendered.contains("\"type\":\"tool_result\"")
+        })
+        .unwrap_or_else(|| panic!("display history shows no tool result for {call_id}: {history}"))
+        .clone()
 }
 
 /// The output shape a build at the base commit knew: `Error` carries only `message`, and
