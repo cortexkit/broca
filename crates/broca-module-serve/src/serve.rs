@@ -535,6 +535,10 @@ struct BindObservation {
     /// The daemon's scope stamp on the bind, or why there is none. Every send over the route
     /// carries it to admission, which decides the owner check and the scope to freeze.
     scope: broca_protocol::SendScope,
+    /// The session folder and project id on the bind's scope stamp, `None` on an unstamped
+    /// bind. Measured against the bind's `project_root` on each scoped send; never part of
+    /// the session key.
+    stamped_project: Option<crate::scope_workdir::StampedProject>,
     /// What the consumer declared about reading tool replies, under either version's name for
     /// the reply format.
     consumer_format: crate::llm_tools::ConsumerFormat,
@@ -1777,6 +1781,9 @@ async fn handle_control_request(
                 project_id: identity.project_id.clone(),
                 principal: principal.as_ref().map(to_bind_principal),
                 scope: bind_send_scope(scope.as_ref(), routes.daemon_scopes, principal.as_ref()),
+                stamped_project: scope
+                    .as_ref()
+                    .map(crate::scope_workdir::StampedProject::from_stamp),
                 consumer_format: crate::llm_tools::ConsumerFormat::from_capabilities(
                     consumer_capabilities.as_deref(),
                 ),
@@ -2017,6 +2024,11 @@ async fn handle_control_request(
                     // Serve-side inbound daemon frames rejected by this process's binding guard.
                     "serve_frames_dropped_unbound_channel": SERVE_FRAMES_DROPPED_UNBOUND_CHANNEL.load(Ordering::Relaxed),
                     "serve_frames_dropped_stale_epoch": SERVE_FRAMES_DROPPED_STALE_EPOCH.load(Ordering::Relaxed),
+                    // Distinct scoped sessions whose send's stamped folder matched, differed
+                    // from, or was missing beside the bind's project_root. Sessions stay keyed
+                    // by project_root either way; `sessions_differ` is how many would move if
+                    // they were keyed by the stamped folder instead.
+                    "scoped_session_workdirs": crate::scope_workdir::health(),
                     // Requests a module sent toward broca on a route, each answered with
                     // reverse_request_unhandled because broca fronts no person who could answer.
                     // Non-zero means some module is asking and not getting what it wants.
@@ -3010,6 +3022,15 @@ where
             send_req.request.principal = bind.principal.clone();
             send_req.request.scope = bind.scope.clone();
             send_req.plan = plan;
+            // Measured here, after every serve-side refusal, so only sends that reach the
+            // session are counted. The session key above stays the bind triple.
+            if matches!(&bind.scope, broca_protocol::SendScope::Stamped(_)) {
+                crate::scope_workdir::observe_scoped_send(
+                    session,
+                    bind.stamped_project.as_ref(),
+                    bind.project_id.as_deref(),
+                );
+            }
             let refusal_session_ref = send_req.session.session.clone();
             let refusal_send_id = send_req.send_id.clone();
             let refusal_delivery_mode = send_req.delivery.as_str();
@@ -7804,6 +7825,7 @@ mod tests {
                     project_id: None,
                     principal: None,
                     scope: broca_protocol::SendScope::Unstamped,
+                    stamped_project: None,
                     consumer_format: Default::default(),
                 },
                 cancel,
@@ -8941,6 +8963,19 @@ mod tests {
                 .is_some(),
             "health.check includes the stale-epoch counter, zero included"
         );
+        for counter in [
+            "sessions_same",
+            "sessions_differ",
+            "sessions_without_workdir",
+            "sessions_untracked",
+        ] {
+            assert!(
+                health["metrics"]["scoped_session_workdirs"][counter]
+                    .as_u64()
+                    .is_some(),
+                "health.check includes the scoped-session workdir counter {counter}, zero included"
+            );
+        }
 
         let bind = ModuleControlRequest::RouteBind {
             route_channel: 7,
