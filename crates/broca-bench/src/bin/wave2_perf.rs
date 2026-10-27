@@ -451,6 +451,7 @@ async fn append_projection_episode(fixture: &Fixture, episodes: usize, iteration
     });
     writer.record(WalRecord::StepStarted { step_id: StepId(1) });
     writer.record(WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,

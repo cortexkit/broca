@@ -3531,6 +3531,9 @@ where
     // between boundaries estimates the next one.
     let mut notice_request_bytes = 0usize;
     let mut compaction_history = prior.compaction_history.clone();
+    // The output cap this run recorded for a step it may now resume; kept current below from
+    // the run and step records this run writes, exactly as replay folds them.
+    let mut output_history = prior.output_reservation.clone();
     let compaction_item = frozen_hooks
         .map(|manifest| crate::compaction::item(manifest))
         .transpose()
@@ -4452,6 +4455,7 @@ where
         // synced, reclaim the vector when no observer retained the record; otherwise the mutable
         // prompt takes its own copy only after the record is durable.
         let episode_input = Arc::new(episode_input);
+        output_history.start_run();
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
             written_at_ms: req
                 .input_written_at_ms
@@ -5173,6 +5177,7 @@ where
         opts_mut.step_context = Some(broca_protocol::StepContext {
             run_id: resolved_run_id.0.clone(),
             step_index: step_id.0,
+            max_output_tokens: None,
             session_address: Some(session_addr(&req.session)),
             credential_id: run_credential_id.clone(),
             account_ref: run_account_ref.clone(),
@@ -5452,6 +5457,17 @@ where
                     .map_or(0, |history| history.retained_base_len()),
             );
         }
+        // A cap this step already recorded is what an earlier attempt of it sent, so a resume
+        // renders it again.
+        if let Some(cap) = output_history.recorded_for(step_id) {
+            let sent = match model_opts.as_mut() {
+                Some(model_opts) => Arc::make_mut(model_opts),
+                None => mutable_call_options(&mut opts),
+            };
+            if let Some(step_context) = sent.step_context.as_mut() {
+                step_context.max_output_tokens = Some(cap);
+            }
+        }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
             break RunFinishReason::Cancelled;
@@ -5595,6 +5611,7 @@ where
                 total_usage += usage;
                 input_budget.observe(usage);
                 input_budget.limit = writer.input_token_limit().or(input_budget.limit);
+                output_history.note_step();
                 if let Some(bytes) = sent_bytes {
                     compaction_history.previous_native_usage = Some(usage);
                     compaction_history.previous_provider_code = None;
@@ -5663,6 +5680,7 @@ where
                                     false,
                                 );
                                 let mut records = vec![WalRecord::ModelStepFinished {
+                                    fallback: Default::default(),
                                     written_at_ms: step_written_at_ms,
                                     tags: None,
                                     hooks: metadata,
@@ -5769,6 +5787,7 @@ where
                         hooks.is_some(),
                         writer,
                         WalRecord::ModelStepFinished {
+                            fallback: Default::default(),
                             written_at_ms: step_written_at_ms,
                             tags: None,
                             hooks: message_hooks,
@@ -5803,6 +5822,7 @@ where
                 // extraction. The prompt reclaims ownership only after the turn is durable.
                 let message = Arc::new(message);
                 let model_record = WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: step_written_at_ms,
                     tags: None,
                     hooks: message_hooks,
@@ -8311,10 +8331,11 @@ async fn dispatch_batch<T: ToolPlane, A: ApprovalPolicy>(
                             // requires `dispatch-module/v1`, and the WAL raises its feature floor
                             // to that name before the first such frame.
                             module_id: tool_plane.dispatch_target(&ctx, &c.tool_call_id),
-                            // A session's frozen tools carry no schema digest yet (a fetched
-                            // catalog's `schema_digest` and `semantics` are not part of the
-                            // frozen `Tool`), so there is no pin to record.
-                            schema_pin: None,
+                            schema_pin: tool_plane.dispatch_schema_pin(
+                                &ctx,
+                                &c.tool_call_id,
+                                &c.tool_name,
+                            ),
                             approval_digest: None,
                             call_key: None,
                         })
@@ -9129,6 +9150,14 @@ impl<T: ToolPlane> ToolPlane for ProviderHeldPlane<'_, T> {
     }
     fn dispatch_target(&self, ctx: &BatchCtx, id: &ToolCallId) -> Option<String> {
         self.inner.dispatch_target(ctx, id)
+    }
+    fn dispatch_schema_pin(
+        &self,
+        ctx: &BatchCtx,
+        id: &ToolCallId,
+        tool: &str,
+    ) -> Option<broca_wal::DispatchSchemaPin> {
+        self.inner.dispatch_schema_pin(ctx, id, tool)
     }
     async fn register_dispatch_group(
         &self,
@@ -13563,7 +13592,11 @@ mod approval_gate {
                         tool_name: Some(call.tool_name.clone()),
                         args: Arc::clone(&call.input),
                         module_id: plane.dispatch_target(ctx, &call.tool_call_id),
-                        schema_pin: None,
+                        schema_pin: plane.dispatch_schema_pin(
+                            ctx,
+                            &call.tool_call_id,
+                            &call.tool_name,
+                        ),
                         approval_digest: None,
                         call_key: None,
                         hooks: call.hooks.clone(),
@@ -14411,7 +14444,7 @@ mod approval_gate {
                                 let held = held.clone(); let call = held.call();
                                 let WalRecord::ToolCallDeferred { module, schema_pin, args_jcs, .. } = &*held.prepared else { unreachable!() };
                                 history.record(writer, WalRecord::ToolDispatchIntent { dispatched_at_ms: None, batch_id: ctx.batch_id.clone(), tool_call_id: call.tool_call_id.clone(), tool_name: Some(call.tool_name.clone()),
-                                    args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone(), hooks: None,
+                                    args: Arc::new(call.input.clone()), module_id: module.clone(), schema_pin: schema_pin.clone().or_else(|| plane.dispatch_schema_pin(ctx, &call.tool_call_id, &call.tool_name)), hooks: None,
                                     approval_digest: None, call_key: Some(held.key.clone()) });
                                 writer.sync().await?;
                                 let before_send_cancel = control.cancel.as_ref();

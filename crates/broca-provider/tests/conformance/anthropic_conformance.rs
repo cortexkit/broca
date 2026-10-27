@@ -124,6 +124,7 @@ fn anthropic_spec() -> (ProviderSpec, ModelSpec) {
         limits: Limits::default(),
         cost: CostSchedule::default(),
         reasoning_options: Default::default(),
+        server_side_fallback: None,
         input_modalities: Default::default(),
         release_date: None,
         status: None,

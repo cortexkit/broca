@@ -176,6 +176,7 @@ mod gated {
             account_ref: None,
             run_id: "run-variant-01".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         opts
     }

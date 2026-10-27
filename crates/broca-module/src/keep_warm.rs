@@ -342,6 +342,7 @@ mod retention_tests {
                 config: *config.clone(),
                 opts: broca_protocol::CallOptions::new(vec![]),
                 request_body_sha256: "digest".into(),
+                route: None,
             })),
         };
         let WarmTick::Stop {
@@ -421,6 +422,7 @@ mod retention_tests {
                     config: *config.clone(),
                     opts: broca_protocol::CallOptions::new(vec![]),
                     request_body_sha256: "digest".into(),
+                    route: None,
                 })),
             };
             let WarmTick::Stop {

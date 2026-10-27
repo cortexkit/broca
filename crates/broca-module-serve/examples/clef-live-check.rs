@@ -335,7 +335,7 @@ async fn main() -> Result<(), String> {
             ProviderReply::Status { status, .. } => format!(
                 "{name} ({at}): HTTP {status} in {elapsed} ms as a plain status, which this client never returns"
             ),
-            ProviderReply::Transport(message) => format!(
+            ProviderReply::Transport(message) | ProviderReply::Unconnected(message) => format!(
                 "{name} ({at}): no reply in {elapsed} ms ({message}), so broca would record provider_error"
             ),
             ProviderReply::Credential(message) => {

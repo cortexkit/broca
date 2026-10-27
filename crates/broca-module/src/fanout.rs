@@ -1532,6 +1532,7 @@ mod tests {
 
     fn tool_step() -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -1662,6 +1663,7 @@ mod tests {
     #[cfg(unix)]
     fn text_step(step_id: u64) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3122,6 +3124,7 @@ mod tests {
                 seq: 2,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -3456,6 +3459,7 @@ mod episode_attach_tests {
                 step_id: StepId(step),
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,

@@ -91,6 +91,7 @@ impl Rig {
             Arc::new(system),
             crate::config::LlmToolsConfig {
                 advertise_tags: true,
+                image_references: false,
                 private_content_providers: vec!["typesafe".into()],
             },
             Arc::new(NoPrivateContent),

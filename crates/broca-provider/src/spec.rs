@@ -162,6 +162,12 @@ pub struct ModelSpec {
     /// valid only if these options define it; see `crate::variant`.
     #[serde(default, skip_serializing_if = "ReasoningOptions::is_unstated")]
     pub reasoning_options: ReasoningOptions,
+    /// `capability.server_side_fallback`: the runtime accepts a request that asks it to hand a
+    /// refusal to another model itself. `None` when the catalog states nothing, which callers
+    /// read as "do not ask" — the fact is served on current reads only, so absence is not a
+    /// claim that the model lacks it. A value the catalog states badly also reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_side_fallback: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

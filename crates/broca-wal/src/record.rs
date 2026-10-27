@@ -32,6 +32,11 @@ pub use compaction::{
     CompactionRange, CompactionStabilityRank, CompactionStrip, CompactionViewChoice,
     CompactionWait, CompactionWaitExit, RejectedCompaction, MAX_REPLACEMENT_BYTES,
 };
+mod fallback;
+pub use fallback::{
+    RefusalFallbackPhase, RefusalFallbackSchedule, StepFallback, StepRoute, StepRouteReason,
+    UsageIteration,
+};
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -331,6 +336,38 @@ pub enum WalRecord {
         /// One tag per block of `assistant_message`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tags: Option<Box<MessageTags>>,
+        /// Server-side and client-side fallback facts about this step, flattened into the
+        /// record as top-level keys. All absent on an ordinary step, which then keeps its
+        /// exact bytes. Each present member is must-understand (see [`StepFallback`]). Boxed
+        /// so the common step pays one small allocation, not the record's size.
+        #[serde(flatten)]
+        fallback: Box<StepFallback>,
+    },
+    /// The source model refused a step (`stop_reason: "refusal"`) and the step is being re-sent
+    /// to the client-side fallback model under the same step id, with no new `StepStarted`.
+    /// Synced before the re-send, so a crash after it re-sends the step on the fallback model
+    /// and a crash before it re-sends the step on the source.
+    ///
+    /// The refused content is deliberately not stored: it must never reach a prompt or a
+    /// reader. The refused attempt's `ModelAttemptFinished` digests remain the forensic link.
+    /// Contributes nothing to the prompt; its `usage` counts toward the run's totals because the
+    /// call was billed. At most one per step. Requires `refusal-fallback/v1`.
+    ModelStepRefused {
+        /// The step being re-sent.
+        step_id: StepId,
+        /// The refused response's billed usage.
+        usage: Usage,
+        /// As on `ModelStepFinished`: the wire model a server-side fallback served the refused
+        /// response with, when it was not the requested one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
+        /// How many content blocks the refused response carried; only the count is kept.
+        discarded_blocks: u32,
+        /// The schedule after this refusal.
+        schedule: RefusalFallbackSchedule,
+        /// Wall-clock time the refusal was recorded, Unix milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ts_ms: Option<u64>,
     },
     /// Evidence for ONE provider HTTP attempt of a model step: what was sent and received, as
     /// byte lengths and SHA-256 digests, and how the attempt ended. One per attempt, failed
@@ -589,6 +626,23 @@ pub enum WalRecord {
     ContextCeilingDecided {
         step_id: StepId,
         detail: Option<broca_protocol::ContextCeilingDetail>,
+    },
+    /// A step's output-token cap, lowered below the run's frozen cap before any model I/O so
+    /// that the estimated input plus the output reservation stays inside the run's context
+    /// limit. Written (and synced) only for a step whose cap was lowered; a step sent with the
+    /// frozen cap writes nothing, so its WAL bytes are as before. The step's request, and every
+    /// re-render of it (a resume, a cache warm, a cache dump), renders `max_output_tokens`
+    /// instead of the frozen cap. Must-understand: `output-reservation/v1`, because a build that
+    /// skipped the record would resume the step with the frozen cap, a different request from
+    /// the one recorded.
+    OutputReservationClamped {
+        step_id: StepId,
+        /// The cap the step's request carries.
+        max_output_tokens: u32,
+        /// The input-token estimate the cap was derived from, kept for diagnosis only.
+        estimated_input_tokens: u64,
+        /// The run's frozen context limit the estimate was checked against.
+        context_limit: u64,
     },
     /// A rewrite ride (compaction-provider 0.5.1 §8) whose answer has been pending for
     /// `COMPACTION_WAIT_REPORT_AFTER_MS` (llm-runner 0.5.2 §6): the step waits for it until
@@ -1423,6 +1477,15 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if matches!(self, WalRecord::RunStarted { manifest: Some(manifest), .. }
+            if manifest.fetches.iter().any(|fetch| matches!(&fetch.outcome,
+                FetchOutcome::Answered { declarations_frozen: Some(declarations), .. }
+                    if declarations.schema_pins.is_some())))
+        {
+            with_feature(base, crate::framing::TOOL_SCHEMA_PINS_FEATURE)
+        } else {
+            base
+        };
         let identity_digest = match self {
             WalRecord::RunStarted {
                 request_identity_digest,
@@ -1459,6 +1522,16 @@ impl WalRecord {
         };
         let base = if self.carries_provider_text_state() {
             with_feature(base, crate::framing::PROVIDER_TEXT_STATE_FEATURE)
+        } else {
+            base
+        };
+        let base = if self.carries_provider_fallback() {
+            with_feature(base, crate::framing::PROVIDER_FALLBACK_BLOCK_FEATURE)
+        } else {
+            base
+        };
+        let base = if self.carries_refusal_fallback() {
+            with_feature(base, crate::framing::REFUSAL_FALLBACK_FEATURE)
         } else {
             base
         };
@@ -1627,6 +1700,7 @@ impl WalRecord {
                 | ContentBlock::TextWithState { .. }
                 | ContentBlock::Reasoning { .. }
                 | ContentBlock::RedactedReasoning { .. }
+                | ContentBlock::ProviderFallback { .. }
                 | ContentBlock::ToolCall(_) => false,
             })
         };
@@ -1704,6 +1778,7 @@ impl WalRecord {
             Self::CompactionMessage { replacement, .. } => messages(replacement),
             Self::CompactionViewApplied { view, .. } => view_carries_media_content(view),
             Self::ModelAttemptFinished { .. }
+            | Self::ModelStepRefused { .. }
             | Self::StepStarted { .. }
             | Self::ToolBatchStarted { .. }
             | Self::ToolBatchFinished { .. }
@@ -1713,6 +1788,7 @@ impl WalRecord {
             | Self::InputTokenBudgetExhausted { .. }
             | Self::ContextCeilingWait { .. }
             | Self::ContextCeilingDecided { .. }
+            | Self::OutputReservationClamped { .. }
             | Self::StructuredOutputDowngraded { .. }
             | Self::StructuredOutputResult { .. }
             | Self::RunFinished { .. }
@@ -1851,6 +1927,45 @@ impl WalRecord {
         }
     }
 
+    /// Whether this record carries Anthropic's server-side fallback: the `provider_fallback`
+    /// content part in any message it holds, or a step's `served_model` or `usage_iterations`.
+    fn carries_provider_fallback(&self) -> bool {
+        let blocks = |content: &[broca_protocol::content::ContentBlock]| {
+            content.iter().any(|block| {
+                matches!(
+                    block,
+                    broca_protocol::content::ContentBlock::ProviderFallback { .. }
+                )
+            })
+        };
+        let messages = |input: &[Message]| input.iter().any(|message| blocks(&message.content));
+        match self {
+            Self::RunStarted { input, .. } => messages(input),
+            Self::ModelStepFinished {
+                assistant_message,
+                fallback,
+                ..
+            } => blocks(&assistant_message.content) || fallback.carries_server_side_fallback(),
+            Self::Queued { request, .. } => messages(&request.input),
+            Self::Steered { input, .. } => messages(input),
+            Self::SendDelivered { input, .. } => {
+                input.as_deref().is_some_and(|input| messages(input))
+            }
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            _ => false,
+        }
+    }
+
+    /// Whether this record carries client-side refusal-fallback state: a refused step, or a
+    /// step's route, schedule or refusal-after-tool-use flag.
+    fn carries_refusal_fallback(&self) -> bool {
+        match self {
+            Self::ModelStepRefused { .. } => true,
+            Self::ModelStepFinished { fallback, .. } => fallback.carries_refusal_fallback(),
+            _ => false,
+        }
+    }
+
     fn carries_provider_text_state(&self) -> bool {
         let blocks = |content: &[broca_protocol::content::ContentBlock]| {
             content.iter().any(|block| {
@@ -1943,6 +2058,9 @@ impl WalRecord {
             } => &[crate::framing::CONTEXT_CEILING_FEATURE],
             WalRecord::StructuredOutputDowngraded { .. } => {
                 &[crate::framing::STRUCTURED_OUTPUT_DOWNGRADE_FEATURE]
+            }
+            WalRecord::OutputReservationClamped { .. } => {
+                &[crate::framing::OUTPUT_RESERVATION_FEATURE]
             }
             WalRecord::RunCancelRequested { .. } => &[crate::framing::RUN_CANCEL_AT_FEATURE],
             WalRecord::CompactionRequest { .. }
@@ -3189,6 +3307,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3547,6 +3666,7 @@ mod schema_tests {
         // reported. A step whose response reported no tier must keep exactly these bytes, and
         // these bytes must keep decoding to the same record.
         let full = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3569,6 +3689,7 @@ mod schema_tests {
             speed_used: None,
         };
         let bare = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3600,6 +3721,7 @@ mod schema_tests {
     #[test]
     fn old_records_default_retries_used_to_zero() {
         let model = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4148,6 +4270,7 @@ mod schema_tests {
                 submission_id: Some(SubmissionId("sub1".into())),
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -4776,6 +4899,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_preserves_signed_tool_call() {
         let rec = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4820,6 +4944,7 @@ mod schema_tests {
         assert_eq!(decoded_call, call);
 
         let rec = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

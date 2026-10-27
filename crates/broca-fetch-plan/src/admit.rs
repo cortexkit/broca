@@ -885,6 +885,9 @@ fn frozen_provider_declarations(
         late_results: answer
             .declares(cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS)
             .then_some(true),
+        // Catalog schema pins are left unset: this build reads pins a later build froze into a
+        // manifest, but never freezes them itself.
+        ..Default::default()
     };
     (!declarations.is_empty()).then_some(declarations)
 }
@@ -2373,5 +2376,24 @@ mod tests {
             !lines[0].contains(&format!("refusal_field=Some(\"{field}\")")),
             "the full refusal field reached the warning"
         );
+    }
+
+    /// This build reads catalog schema pins from a manifest but never freezes one: a catalog
+    /// answer whose tools carry a schema digest and semantics version admits with no pin, so a
+    /// fresh admission here writes no `schema_pins` and its frame needs no pin feature.
+    #[test]
+    fn admission_on_this_build_freezes_no_schema_pin() {
+        let answer: cortexkit_role_tool_provider::catalog::CatalogAnswer =
+            serde_json::from_value(json!({
+                "generation":"one", "catalog_digest":"one", "tools":[{
+                    "name":"work", "input_schema":{"type":"object"},
+                    "schema_digest":"634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335",
+                    "semantics":7, "capabilities":[]
+                }]
+            }))
+            .unwrap();
+        assert_eq!(answer.tools.len(), 1, "the answer offers a pinnable tool");
+        // Nothing else was declared, so no declaration is frozen at all.
+        assert_eq!(frozen_provider_declarations(&answer), None);
     }
 }

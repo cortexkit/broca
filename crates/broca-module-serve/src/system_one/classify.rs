@@ -24,8 +24,8 @@ use cortexkit_role_classifier::{
     provider::{item_code_for_status, workers_ai_item_code},
     reply::Usage,
     request::{
-        check_catalog_row, check_request, check_request_bytes, parse_request, CatalogRow,
-        ClassifyRequest, CLASSIFIER_KIND,
+        check_catalog_row, check_request_bytes, parse_request, CatalogRow, ClassifyRequest,
+        CLASSIFIER_KIND,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,7 @@ use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
 use super::{internal_refusal, ModelPin, ProviderReply, SystemOne, ToolAdmission};
+use crate::llm_tools::spend::{ItemSpend, MarkedItemError, Spend};
 
 /// The catalog kind fusiform gives a decision model. `classifier/v1` calls the same kind
 /// `classifier`; a row stating either is a classifier.
@@ -52,7 +53,7 @@ pub(crate) fn is_classifier_row(row: &ModelBatchRow) -> bool {
 
 /// The catalog row as the role's check reads it: fusiform's `decision` is the role's
 /// `classifier`; any other stated kind is passed on as stated, so a refusal names it.
-fn catalog_row(row: Option<&ModelBatchRow>) -> CatalogRow<'_> {
+pub(super) fn catalog_row(row: Option<&ModelBatchRow>) -> CatalogRow<'_> {
     match row {
         None => CatalogRow::Absent,
         Some(row) => match row.kind.as_deref() {
@@ -130,7 +131,7 @@ struct ReplyItem<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     answers: Option<&'a RawValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'a ItemError>,
+    error: Option<&'a MarkedItemError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<Usage>,
 }
@@ -149,8 +150,9 @@ struct Reply<'a> {
 enum Slot {
     /// A stored outcome: from an earlier call, or recorded by this one.
     Stored(StoredOutcome),
-    /// Not answered and not stored: a code that stopped the call, or one never stored.
-    Unsent(ItemError),
+    /// Not answered and not stored: a code that stopped the call, or one never stored. A
+    /// model-tool call keeps the error's spend mark with it.
+    Unsent(MarkedItemError),
 }
 
 /// This call's hold on a batch: the in-process claim, and the store's `running` row once it
@@ -268,6 +270,16 @@ fn sha256_hex(text: &str) -> String {
 
 fn item_error_json(error: &ItemError) -> String {
     serde_json::to_string(error).expect("an item error encodes")
+}
+
+/// An item error as it is stored: with its spend mark for a model-tool call, so a replay
+/// answers the same mark, and exactly as before for a `classifier/v1` call (`spend` is `None`).
+fn stored_error_json(error: &ItemError, spend: Option<ItemSpend>) -> String {
+    match spend {
+        None => item_error_json(error),
+        Some(_) => serde_json::to_string(&MarkedItemError::new(error.clone(), spend))
+            .expect("an item error encodes"),
+    }
 }
 
 /// One item's estimate, at `rate` (zero for an unpriced input).
@@ -400,14 +412,37 @@ fn map_reply(reply: ProviderReply, pin: &ModelPin) -> Result<(String, Option<Usa
             }
             Err(error)
         }
-        ProviderReply::Transport(message) => Err(ItemError::for_code(
-            errors::PROVIDER_ERROR,
-            format!("the provider could not be reached: {message}"),
-        )),
+        ProviderReply::Transport(message) | ProviderReply::Unconnected(message) => {
+            Err(ItemError::for_code(
+                errors::PROVIDER_ERROR,
+                format!("the provider could not be reached: {message}"),
+            ))
+        }
         ProviderReply::Credential(message) => Err(ItemError::for_code(
             errors::AUTH_FAILED,
             format!("the provider credential could not be read: {message}"),
         )),
+    }
+}
+
+/// What a final attempt that failed may have cost, under the model tools' refusal-spend rule.
+/// An error the provider answered with a status or code it does not bill (authentication, a
+/// missing model, a rate limit, an item it rejected, the account's limits) and a failure before
+/// anything was sent (no credential, no connection) spent nothing. Every other failure may have
+/// reached a billed model: a `provider_error` status (408 or 5xx), a timeout, a connection lost
+/// mid-request, or a 200 whose body did not decode.
+fn reply_spend(reply: &ProviderReply) -> ItemSpend {
+    let code = match reply {
+        ProviderReply::Credential(_) | ProviderReply::Unconnected(_) => return ItemSpend::Nothing,
+        ProviderReply::Answered(_)
+        | ProviderReply::AttributedAnswer { .. }
+        | ProviderReply::Transport(_) => return ItemSpend::Unknown,
+        ProviderReply::Status { status, .. } => item_code_for_status(*status),
+        ProviderReply::WorkersAiError { status, code, .. } => workers_ai_item_code(*status, *code),
+    };
+    match code.unwrap_or(errors::PROVIDER_ERROR) {
+        errors::PROVIDER_ERROR => ItemSpend::Unknown,
+        _ => ItemSpend::Nothing,
     }
 }
 
@@ -440,12 +475,12 @@ fn retry_wait(reply: &ProviderReply, service: &SystemOne) -> Option<std::time::D
 
 /// One item's provider call, retried only where the provider marked its refusal retryable.
 /// The item's spend check ran once before this; a refused attempt bills nothing, so retries
-/// stay inside it.
+/// stay inside it. A failure comes with what its final attempt may have cost.
 async fn call_provider(
     service: &SystemOne,
     pin: &ModelPin,
     body: String,
-) -> Result<PaidAnswer, ItemError> {
+) -> Result<PaidAnswer, (ItemError, ItemSpend)> {
     let slot = service.model_slot(&pin.catalog_id);
     let mut attempt = 0;
     loop {
@@ -460,7 +495,9 @@ async fn call_provider(
             ProviderReply::WorkersAiError { status, code, .. } => {
                 Some(code.map_or_else(|| status.to_string(), |code| code.to_string()))
             }
-            ProviderReply::Transport(_) => Some("transport_error".into()),
+            ProviderReply::Transport(_) | ProviderReply::Unconnected(_) => {
+                Some("transport_error".into())
+            }
             ProviderReply::Credential(_) => Some("auth_failed".into()),
         };
         if let Some(code) = code {
@@ -487,12 +524,15 @@ async fn call_provider(
                     } => (auth_selection.clone(), account_ref.clone()),
                     _ => (pin.provider.credential_id(), None),
                 };
-                return map_reply(reply, pin).map(|(answers, usage)| PaidAnswer {
-                    answers,
-                    usage,
-                    auth_selection,
-                    account_ref,
-                });
+                let spend = reply_spend(&reply);
+                return map_reply(reply, pin)
+                    .map(|(answers, usage)| PaidAnswer {
+                        answers,
+                        usage,
+                        auth_selection,
+                        account_ref,
+                    })
+                    .map_err(|error| (error, spend));
             }
         }
     }
@@ -513,7 +553,16 @@ pub(crate) async fn run(
     scope: &broca_store::system_one::BatchScope,
     admitted_at_ms: Option<i64>,
 ) -> Result<Box<RawValue>, Refusal> {
-    run_inner(service, params, scope, admitted_at_ms, None).await
+    run_inner(
+        service,
+        params,
+        scope,
+        admitted_at_ms,
+        None,
+        None,
+        &mut false,
+    )
+    .await
 }
 
 pub(super) fn admit_tool(
@@ -539,7 +588,7 @@ pub(super) fn admit_tool(
         let pin = service
             .pin(&request.model)
             .ok_or_else(|| Refusal::model_unavailable(&request.model))?;
-        check_request(&request, &service.model_entry(pin, &row))?;
+        service.check_images_request(&request, &service.model_entry(pin, &row))?;
         use broca_core::ChargeBasisResolver;
         FrozenRow {
             input_rate_nanos: row.input_rate_nanos,
@@ -585,17 +634,23 @@ pub(super) fn replay_tool(
             .cloned()
             .map(|outcome| Some(Slot::Stored(outcome)))
             .collect(),
+        true,
     )
 }
 
 /// The tool supplies its argument digest and a read-only replay snapshot. Classifier callers
 /// retain their identity digest and live-catalog admission, including their original bytes.
+/// `dispatched` turns true before this call starts its first provider attempt (before it even
+/// waits for a provider slot), so a refusal returned while it is still false provably spent
+/// nothing.
 pub(super) async fn run_inner(
     service: &Arc<SystemOne>,
     params: &str,
     scope: &broca_store::system_one::BatchScope,
     admitted_at_ms: Option<i64>,
     tool: Option<(&str, &ToolAdmission)>,
+    images: Option<&super::images::PreparedImages>,
+    dispatched: &mut bool,
 ) -> Result<Box<RawValue>, Refusal> {
     let flush = Arc::clone(service);
     tokio::task::spawn_blocking(move || flush.flush_facts())
@@ -633,9 +688,28 @@ pub(super) async fn run_inner(
         .pin(&request.model)
         .ok_or_else(|| Refusal::model_unavailable(&request.model))?
         .clone();
+    // Every usage fact names the provider id and the model id apart. A routed key that does
+    // not split into both could not be attributed, so it is refused here, before anything is
+    // written or sent, rather than answered and billed without a fact.
+    if super::catalog_key_parts(&request.model).is_none() {
+        return Err(Refusal::model_unavailable(&request.model));
+    }
     let entry = service.model_entry(&pin, &row);
     if tool.is_none() {
-        check_request(&request, &entry)?;
+        service.check_images_request(&request, &entry)?;
+    }
+    for (i, item) in request.items.iter().enumerate() {
+        if let Some(j) = item
+            .images
+            .iter()
+            .flatten()
+            .position(|image| image.reference().is_some())
+        {
+            if images.is_none_or(|prepared| prepared.0.len() != request.items.len()) {
+                return Err(cortexkit_model_batch::image::ResolveFailure::Unavailable
+                    .refusal(format!("items[{i}].images[{j}]")));
+            }
+        }
     }
 
     let identity =
@@ -690,6 +764,8 @@ pub(super) async fn run_inner(
         sent_ceiling,
         admitted_at_ms,
         tool.map(|(_, admission)| admission.frozen_row.as_str()),
+        images,
+        dispatched,
     )
     .await;
     hold.release().await;
@@ -716,8 +792,13 @@ async fn serve_claimed(
     sent_ceiling: Option<u64>,
     admitted_at_ms: Option<i64>,
     tool_frozen: Option<&str>,
+    prepared: Option<&super::images::PreparedImages>,
+    dispatched: &mut bool,
 ) -> Result<Box<RawValue>, Refusal> {
     let is_tool = tool_frozen.is_some();
+    // Only a model-tool call marks its item errors with their spend; `classifier/v1` replies
+    // stay as they were.
+    let mark = |spend: ItemSpend| is_tool.then_some(spend);
     let live_frozen = if let Some(frozen) = tool_frozen {
         serde_json::from_str(frozen)
             .map_err(|_| internal_refusal("the admitted tool price does not decode"))?
@@ -855,7 +936,10 @@ async fn serve_claimed(
                 ),
             );
             error.retry_after_ms = stopped.retry_after_ms;
-            slots[index] = Some(Slot::Unsent(error));
+            slots[index] = Some(Slot::Unsent(MarkedItemError::new(
+                error,
+                mark(ItemSpend::Nothing),
+            )));
             continue;
         }
         // §5: recorded spend plus this item's estimate, before its provider call.
@@ -870,7 +954,7 @@ async fn serve_claimed(
                 );
                 let outcome = StoredOutcome {
                     index: index as u64,
-                    outcome: Outcome::Failed(item_error_json(&error)),
+                    outcome: Outcome::Failed(stored_error_json(&error, mark(ItemSpend::Nothing))),
                     input_tokens: None,
                     output_tokens: None,
                 };
@@ -883,21 +967,29 @@ async fn serve_claimed(
                 continue;
             }
         }
-        let images = raw.items[index]
-            .images
-            .filter(|images| images.get().trim() != "null")
-            .map_or(String::new(), |images| {
-                format!(",\"images\":{}", images.get())
+        let replacement = prepared
+            .and_then(|images| images.0.get(index))
+            .and_then(Option::as_deref);
+        let images = replacement
+            .map(|images| format!(",\"images\":{images}"))
+            .unwrap_or_else(|| {
+                raw.items[index]
+                    .images
+                    .filter(|images| images.get().trim() != "null")
+                    .map_or(String::new(), |images| {
+                        format!(",\"images\":{}", images.get())
+                    })
             });
         let body = format!(
             "{{\"model\":{},\"state\":{},\"questions\":{questions}{images}}}",
             serde_json::to_string(&pin.provider_model).expect("a string encodes"),
             raw.items[index].state.get(),
         );
+        *dispatched = true;
         let answer = call_provider(service, pin, body).await;
         if first_provider_call {
             first_provider_call = false;
-            if let Err(error) = &answer {
+            if let Err((error, _)) = &answer {
                 if errors::is_batch_level(&error.code) {
                     // §14: a batch-level code on the call's first provider call is an
                     // admission refusal. A batch this call created is removed; a recorded one
@@ -906,7 +998,14 @@ async fn serve_claimed(
                         discard_fresh(service, &request.batch_id).await;
                         hold.stored = false;
                     }
-                    return Err(first_call_refusal(error, &request.model, pin));
+                    let refusal = first_call_refusal(error, &request.model, pin);
+                    // Every batch-level code is an answer the provider does not bill (or a
+                    // credential that was never sent), so the call spent nothing.
+                    return Err(if is_tool {
+                        Spend::Nothing.mark(refusal)
+                    } else {
+                        refusal
+                    });
                 }
             }
             for outcome in std::mem::take(&mut pending) {
@@ -944,47 +1043,50 @@ async fn serve_claimed(
                     input_tokens: usage.and_then(|u| u.input_tokens),
                     output_tokens: usage.and_then(|u| u.output_tokens),
                 };
-                let fact = service.export.as_ref().map(|export| {
-                    use broca_core::ChargeBasisResolver;
-                    let provider = request
-                        .model
-                        .split('/')
-                        .next()
-                        .unwrap_or_default()
-                        .to_owned();
-                    let method = auth_selection
-                        .as_deref()
-                        .and_then(|id| id.split(':').next())
-                        .unwrap_or("apikey");
-                    let (charge_basis, charge_basis_mapping_version) =
-                        service.charge_basis.resolve_charge_basis(&provider, method);
-                    broca_store::system_one::FactContext {
-                        source_instance_id: export.source_instance_id().into(),
-                        provider,
-                        model: request.model.clone(),
-                        auth_selection,
-                        account_ref,
-                        charge_basis,
-                        charge_basis_mapping_version,
-                        charge_basis_overrides: service.charge_basis.charge_basis_overrides(),
-                    }
-                });
+                // `run_inner` refused a key without both ids before the call, so the split
+                // always succeeds here.
+                let fact = service
+                    .export
+                    .as_ref()
+                    .zip(super::catalog_key_parts(&request.model))
+                    .map(|(export, (provider, model))| {
+                        use broca_core::ChargeBasisResolver;
+                        let method = auth_selection
+                            .as_deref()
+                            .and_then(|id| id.split(':').next())
+                            .unwrap_or("apikey");
+                        let (charge_basis, charge_basis_mapping_version) =
+                            service.charge_basis.resolve_charge_basis(provider, method);
+                        broca_store::system_one::FactContext {
+                            source_instance_id: export.source_instance_id().into(),
+                            provider: provider.to_owned(),
+                            model: model.to_owned(),
+                            auth_selection,
+                            account_ref,
+                            charge_basis,
+                            charge_basis_mapping_version,
+                            charge_basis_overrides: service.charge_basis.charge_basis_overrides(),
+                        }
+                    });
                 record_paid(service, &request.batch_id, &outcome, cost, fact).await?;
                 spent = spent.saturating_add(cost);
                 slots[index] = Some(Slot::Stored(outcome));
             }
-            Err(error) => {
+            Err((error, spend)) => {
                 if error.is_stored() {
                     let outcome = StoredOutcome {
                         index: index as u64,
-                        outcome: Outcome::Failed(item_error_json(&error)),
+                        outcome: Outcome::Failed(stored_error_json(&error, mark(spend))),
                         input_tokens: None,
                         output_tokens: None,
                     };
                     record(service, &request.batch_id, &outcome, 0).await?;
                     slots[index] = Some(Slot::Stored(outcome));
                 } else {
-                    slots[index] = Some(Slot::Unsent(error.clone()));
+                    slots[index] = Some(Slot::Unsent(MarkedItemError::new(
+                        error.clone(),
+                        mark(spend),
+                    )));
                 }
                 if error.stops_the_call() {
                     stop = Some(error);
@@ -995,7 +1097,7 @@ async fn serve_claimed(
     for outcome in pending {
         record(service, &request.batch_id, &outcome, 0).await?;
     }
-    reply(request, &frozen, slots)
+    reply(request, &frozen, slots, is_tool)
 }
 
 /// The debug test hook can stop after a provider answer, before the atomic outcome/fact write.
@@ -1087,13 +1189,16 @@ async fn discard_fresh(service: &Arc<SystemOne>, batch_id: &str) {
     }
 }
 
+/// The batch reply. `tool` keeps each item error's spend mark for a model-tool call; a
+/// `classifier/v1` reply carries none.
 fn reply(
     request: &ClassifyRequest,
     frozen: &FrozenRow,
     slots: Vec<Option<Slot>>,
+    tool: bool,
 ) -> Result<Box<RawValue>, Refusal> {
     let mut answers_raw: Vec<Option<Box<RawValue>>> = Vec::with_capacity(slots.len());
-    let mut errors_parsed: Vec<Option<ItemError>> = Vec::with_capacity(slots.len());
+    let mut errors_parsed: Vec<Option<MarkedItemError>> = Vec::with_capacity(slots.len());
     let mut usages: Vec<Option<Usage>> = Vec::with_capacity(slots.len());
     let mut answered_tokens = Vec::new();
     let mut total = Usage::default();
@@ -1119,21 +1224,27 @@ fn reply(
                         (Some(raw), None, usage)
                     }
                     Outcome::Failed(text) => {
-                        let error: ItemError = serde_json::from_str(text)
+                        let error: MarkedItemError = serde_json::from_str(text)
                             .map_err(|_| internal_refusal("a stored item error does not decode"))?;
                         (None, Some(error), None)
                     }
                 }
             }
             Some(Slot::Unsent(error)) => (None, Some(error.clone()), None),
+            // Never sent, so it spent nothing.
             None => (
                 None,
-                Some(ItemError::for_code(
-                    errors::PROVIDER_ERROR,
-                    "the item was not reached",
+                Some(MarkedItemError::new(
+                    ItemError::for_code(errors::PROVIDER_ERROR, "the item was not reached"),
+                    tool.then_some(ItemSpend::Nothing),
                 )),
                 None,
             ),
+        };
+        let error = if tool {
+            error
+        } else {
+            error.map(MarkedItemError::unmarked)
         };
         answers_raw.push(answer);
         errors_parsed.push(error);

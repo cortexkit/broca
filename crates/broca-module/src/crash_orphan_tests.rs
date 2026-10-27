@@ -436,6 +436,7 @@ fn run_started(key: &BindIdentity) -> WalRecord {
 /// has not ended. Replay resumes such a run by dispatching the call.
 fn model_step_with_tool_call() -> WalRecord {
     WalRecord::ModelStepFinished {
+        fallback: Default::default(),
         written_at_ms: None,
         tags: None,
         hooks: None,

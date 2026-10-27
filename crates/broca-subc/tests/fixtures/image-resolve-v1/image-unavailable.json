@@ -1,0 +1,26 @@
+{
+  "case": "image-unavailable",
+  "contract": "image-resolve-v1",
+  "handle": "ih0123456789abcdef0123456789abcdef",
+  "principal": "reserved:broca",
+  "reply": {
+    "body_length": 89,
+    "body_utf8": "{\"context\":null,\"detail\":{\"field\":\"handle\"},\"outcome\":\"image_unavailable\",\"session\":null}",
+    "channel": 9,
+    "corr": 13,
+    "epoch": 1,
+    "flags": 2,
+    "type": "Response",
+    "wire_hex": "590000000201020900010000000d000000000000007b22636f6e74657874223a6e756c6c2c2264657461696c223a7b226669656c64223a2268616e646c65227d2c226f7574636f6d65223a22696d6167655f756e617661696c61626c65222c2273657373696f6e223a6e756c6c7d"
+  },
+  "request": {
+    "body_length": 118,
+    "body_utf8": "{\"method\":\"image.resolve\",\"params\":{\"handle\":\"ih0123456789abcdef0123456789abcdef\",\"scope_ref\":\"another-conversation\"}}",
+    "channel": 9,
+    "corr": 13,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "760000000200020900010000000d000000000000007b226d6574686f64223a22696d6167652e7265736f6c7665222c22706172616d73223a7b2268616e646c65223a2269683031323334353637383961626364656630313233343536373839616263646566222c2273636f70655f726566223a22616e6f746865722d636f6e766572736174696f6e227d7d"
+  },
+  "state": "a handle outside the caller's scope is refused as if it did not exist"
+}

@@ -792,6 +792,9 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
             .get("reasoning_options")
             .and_then(ReasoningOptions::from_value)
             .unwrap_or_default(),
+        // The vendored models.dev snapshot states no server-side fallback; the fact is served by
+        // fusiform alone.
+        server_side_fallback: None,
         release_date: entry
             .get("release_date")
             .and_then(Value::as_str)
@@ -2154,6 +2157,7 @@ mod tests {
                 account_ref: None,
                 run_id: "fixed-run".into(),
                 step_index: 1,
+                max_output_tokens: None,
             });
             opts
         };

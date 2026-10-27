@@ -817,6 +817,7 @@ mod tests {
                 seq: records.len() as u64 + 1,
                 fence: 1,
                 record: WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,

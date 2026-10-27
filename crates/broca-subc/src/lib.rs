@@ -51,6 +51,7 @@ pub use flow_providers::{
 pub use hook_plane::SubcHookPlane;
 pub use late_results::{late_entry_tool_result, LateResultsError, LateResultsFeed};
 pub use plan_fetch::{SubcPlanAdmitter, SubcPlanFetcher};
+pub use private_content::{ImageResolveError, ResolvedImage};
 pub use private_content::{PrivateContent, PrivateContentClient, PrivateContentError, SourceKind};
 pub use scope_describe::{DescribedScope, ModuleScopeDescriber, ScopeDescriber};
 pub use session_door::{DoorCoverage, DoorRead, SessionDoorClient, SessionDoorError};

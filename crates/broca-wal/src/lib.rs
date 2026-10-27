@@ -31,9 +31,9 @@ pub use framing::{
     COMPACTION_VIEW_FEATURE, COMPACTION_WAIT_FEATURE, DEFERRED_CALL_FEATURE,
     DISPATCH_MODULE_FEATURE, FRAMING_VERSION, GATED_FRAMING_VERSION, HEADER_LEN, KNOWN_FEATURES,
     MAX_PAYLOAD_LEN, MESSAGE_TIMES_FEATURE, PLAN_MANIFEST_FEATURE, PLAN_REFERENCE_SLOTS_FEATURE,
-    PROVIDER_DECLARATIONS_FEATURE, PROVIDER_HELD_FEATURE, RUNNER_TAGS_FEATURE,
-    RUNNER_TAGS_V2_FEATURE, SCOPE_FEATURE, STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE,
-    TOOL_REPLY_FEATURE, TOOL_TIMES_FEATURE,
+    PROVIDER_DECLARATIONS_FEATURE, PROVIDER_FALLBACK_BLOCK_FEATURE, PROVIDER_HELD_FEATURE,
+    REFUSAL_FALLBACK_FEATURE, RUNNER_TAGS_FEATURE, RUNNER_TAGS_V2_FEATURE, SCOPE_FEATURE,
+    STEER_QUEUE_FEATURE, STEP_TRANSFORMS_FEATURE, TOOL_REPLY_FEATURE, TOOL_TIMES_FEATURE,
 };
 pub use record::{
     compaction_replacement_sha256, AccountDecision, ApprovalDecision, AuthSelection,
@@ -44,12 +44,13 @@ pub use record::{
     FrozenDeclaration, FrozenHoldArgument, FrozenProviderDeclarations, FrozenReferenceSlot,
     FrozenReply, FrozenResultFormat, HookOp, Hooks, LateDecision, LateExecution, LateOutcome,
     NoDispatchReason, OnExpiry, OpaqueJson, PlanManifest, ProviderFetch, ProviderHeld,
-    QueuedAdmissionFailure, RejectedCompaction, ResumeRedo, ResumeReplayed, RunConfig, RunOrigin,
-    SeedOriginKind, SetupTagCheckpoint, VaultReadOp, VaultRequest, WalRecord, WithdrawElicitation,
-    WithdrawalAnswer, ACCOUNT_DECISION_AUTH_REQUIRED, ACCOUNT_DECISION_CANDIDATES_UNKNOWN,
-    ACCOUNT_DECISION_DISABLED, ACCOUNT_DECISION_LEGACY_STATIC, ACCOUNT_DECISION_PINNED,
-    ACCOUNT_DECISION_ROUTED, ACCOUNT_DECISION_SINGLE_CANDIDATE, ACCOUNT_DECISION_UNREACHABLE,
-    ACCOUNT_DECISION_UNSUPPORTED, MAX_REPLACEMENT_BYTES,
+    QueuedAdmissionFailure, RefusalFallbackPhase, RefusalFallbackSchedule, RejectedCompaction,
+    ResumeRedo, ResumeReplayed, RunConfig, RunOrigin, SeedOriginKind, SetupTagCheckpoint,
+    StepFallback, StepRoute, StepRouteReason, UsageIteration, VaultReadOp, VaultRequest, WalRecord,
+    WithdrawElicitation, WithdrawalAnswer, ACCOUNT_DECISION_AUTH_REQUIRED,
+    ACCOUNT_DECISION_CANDIDATES_UNKNOWN, ACCOUNT_DECISION_DISABLED, ACCOUNT_DECISION_LEGACY_STATIC,
+    ACCOUNT_DECISION_PINNED, ACCOUNT_DECISION_ROUTED, ACCOUNT_DECISION_SINGLE_CANDIDATE,
+    ACCOUNT_DECISION_UNREACHABLE, ACCOUNT_DECISION_UNSUPPORTED, MAX_REPLACEMENT_BYTES,
 };
 // `PauseReason` is shared caller/WAL vocabulary; it lives in `broca-protocol` (like
 // `RunFinishReason`) and is re-exported here so existing `broca_wal::PauseReason` paths

@@ -60,6 +60,7 @@ mod gated {
             account_ref: None,
             run_id: "run-ovr".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         o
     }

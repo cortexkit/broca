@@ -1496,6 +1496,11 @@ pub struct LineageActor<W: WalStore> {
     /// Set while recovery runs because a late result was deposited for one of this session's
     /// held calls, so a run paused on them resumes instead of staying parked.
     resuming_for_late_result: bool,
+    /// A late result was deposited for a held call while a run was still active. If that run
+    /// ends paused on held calls, it resumes at once so its batch takes the deposit. Without
+    /// this, a request that lands between the batch's pause and the run's terminal reaching
+    /// this actor would be lost, and the result would wait for the delivery to time out.
+    held_resume_owed: bool,
     /// A command dispatched inside a suspended restart admission asked this generation to
     /// exit. The admission ends early, and the enclosing command returns the exit request.
     nested_exit_requested: bool,
@@ -1748,6 +1753,7 @@ impl<W: WalStore + 'static> LineageActor<W> {
             restart_waiters: Vec::new(),
             restart_recovery_owns_waiters: false,
             resuming_for_late_result: false,
+            held_resume_owed: false,
             nested_exit_requested: false,
             warm_in_flight: Default::default(),
         };
@@ -2186,14 +2192,13 @@ impl<W: WalStore + 'static> LineageActor<W> {
                 false
             }
             LineageCmd::ResumeHeld { reply } => {
-                // A live run needs nothing: its batch waits in the held call's slot, or, if it
-                // is about to pause, the delivery times out and a later pull resumes it.
                 let result = if matches!(self.state, RunState::Idle) {
-                    self.resuming_for_late_result = true;
-                    let result = self.recover_durable_work().await;
-                    self.resuming_for_late_result = false;
-                    result
+                    self.resume_for_late_result().await
                 } else {
+                    // A live run's batch normally waits in the held call's slot already. It may
+                    // instead have just paused, with its terminal not yet handled here; the
+                    // owed resume runs once that terminal shows the pause.
+                    self.held_resume_owed = true;
                     Ok(())
                 };
                 let _ = reply.send(result);
@@ -2543,6 +2548,15 @@ impl<W: WalStore + 'static> LineageActor<W> {
         for reply in std::mem::take(&mut self.restart_waiters) {
             let _ = reply.send(result.clone());
         }
+    }
+
+    /// Recover with a late result just deposited for one of this session's held calls, so a run
+    /// paused on held calls resumes into its batch instead of staying parked.
+    async fn resume_for_late_result(&mut self) -> Result<(), String> {
+        self.resuming_for_late_result = true;
+        let result = self.recover_durable_work().await;
+        self.resuming_for_late_result = false;
+        result
     }
 
     async fn recover_durable_work(&mut self) -> Result<(), String> {
@@ -6756,6 +6770,9 @@ impl<W: WalStore + 'static> LineageActor<W> {
             // Stale terminal (backstop already fired, or a different/older run) — ignore.
             _ => return false,
         };
+        // A resume owed to this run is due only if it ends paused on held calls; any other
+        // terminal discharges it.
+        let held_resume_owed = std::mem::take(&mut self.held_resume_owed);
         let run_id = durable_run_id; // index the DURABLE id's terminal below
                                      // The run task has ended, so its conversation, rendered requests and step state are
                                      // freed. Let the idle memory hook hand those pages back to the system.
@@ -6844,14 +6861,27 @@ impl<W: WalStore + 'static> LineageActor<W> {
             self.approvals.finished(&run_id);
         }
 
-        match self.refresh_admission_view().await {
-            Ok(()) => {
-                if let Err(error) = self.drain_queue_one().await {
-                    tracing::warn!(target: "admission", "queued-run drain deferred: {error}");
-                }
+        if held_resume_owed && summary.paused == Some(broca_protocol::PauseReason::ToolHeld) {
+            // A late result was deposited while this run was pausing. Resume now so its batch
+            // takes the deposit, instead of waiting for the delivery to time out and retry.
+            // Recovery refreshes the admission view itself. A resume with no deposit to take
+            // pauses again on its first look at the held calls.
+            if let Err(error) = self.resume_for_late_result().await {
+                tracing::warn!(
+                    target: "admission",
+                    "owed held-call resume deferred to the next delivery: {error}"
+                );
             }
-            Err(error) => {
-                tracing::warn!(target: "admission", "post-run admission refresh deferred: {error}");
+        } else {
+            match self.refresh_admission_view().await {
+                Ok(()) => {
+                    if let Err(error) = self.drain_queue_one().await {
+                        tracing::warn!(target: "admission", "queued-run drain deferred: {error}");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "admission", "post-run admission refresh deferred: {error}");
+                }
             }
         }
         if should_emit_usage {
@@ -8855,6 +8885,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -9017,6 +9048,7 @@ mod tests {
                     submission_id: None,
                 },
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -9222,6 +9254,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -9567,6 +9600,440 @@ mod tests {
                 let _ = std::fs::remove_dir_all(root);
             }
         }).await.expect("cancel of a closed held actor must not wait for delivery");
+    }
+
+    /// A run paused on one held call `a` (key `lineage:4`, held by `tools`) whose WAL ends in
+    /// its `RunPaused`, as a session looks while it waits for the call's late result.
+    fn single_held_paused_seed(key: &BindIdentity) -> Vec<WalRecord> {
+        use broca_protocol::content::{AssistantMessage, ContentBlock, ToolCall};
+        use broca_protocol::{BatchId, MessageId, StepId, ToolCallId};
+        let request = text_req(key, "held");
+        // A resume verifies the recorded render identity against the provider's, so the seed
+        // records the stub provider's.
+        let mut config = min_config();
+        {
+            use broca_core::Provider as _;
+            let provider = broca_core::StubProvider::new(vec![]);
+            config.renderer_version = provider.renderer_version();
+            config.frozen_render_config = provider.render_config_blob();
+        }
+        let call = ToolCall {
+            tool_call_id: ToolCallId("a".into()),
+            tool_name: "ask".into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        };
+        vec![
+            WalRecord::RunStarted {
+                written_at_ms: None,
+                tags: None,
+                session_class: None,
+                retention: None,
+                hooks: None,
+                title: None,
+                on_restart: None,
+                keep_warm: None,
+                marker_order_version: None,
+                manifest: None,
+                scope: None,
+                send_id: None,
+                request_identity_digest: Some(broca_core::submission_identity_digest(
+                    &request.to_submission(),
+                )),
+                project_id: None,
+                principal: None,
+                ts_ms: Some(1),
+                run_id: RunId("held".into()),
+                session: key.clone(),
+                config: Box::new(config),
+                input: request.input.into(),
+                origin: broca_wal::RunOrigin::Fresh,
+                submission_id: None,
+            },
+            WalRecord::ModelStepFinished {
+                fallback: Default::default(),
+                written_at_ms: None,
+                tags: None,
+                hooks: None,
+                step_id: StepId(1),
+                assistant_message: Arc::new(AssistantMessage {
+                    message_id: MessageId("m".into()),
+                    content: vec![ContentBlock::ToolCall(call.clone())],
+                }),
+                usage: Usage::default(),
+                retries_used: 0,
+                finish_reason: None,
+                service_tier_used: None,
+                speed_used: None,
+            },
+            WalRecord::ToolBatchStarted {
+                batch_id: BatchId("held-b1".into()),
+                step_id: StepId(1),
+                planned_calls: vec![call.tool_call_id.clone()],
+            },
+            WalRecord::ToolDispatchIntent {
+                dispatched_at_ms: None,
+                batch_id: BatchId("held-b1".into()),
+                tool_call_id: call.tool_call_id.clone(),
+                tool_name: Some(call.tool_name.clone()),
+                args: Arc::new(call.input.clone()),
+                module_id: Some("tools".into()),
+                schema_pin: None,
+                hooks: None,
+                approval_digest: None,
+                call_key: None,
+            },
+            WalRecord::ToolCallProviderHeld {
+                batch_id: BatchId("held-b1".into()),
+                tool_call_id: call.tool_call_id,
+                call_key: "lineage:4".into(),
+                module: "tools".into(),
+                reason: "running".into(),
+                detail_digest: None,
+                held_at_ms: 42,
+                sequential: false,
+            },
+            WalRecord::RunPaused {
+                run_id: RunId("held".into()),
+                reason: broca_protocol::PauseReason::ToolHeld,
+                error: None,
+                ts_ms: Some(43),
+            },
+        ]
+    }
+
+    /// Runs the real loop with `HeldSlots` as the held-call lifecycle. A run that ends paused on
+    /// held calls stops before returning until the test releases it: its pause is durable, but
+    /// the actor has not yet handled its terminal and still holds the run as active.
+    struct PausingHeldExecutor {
+        wal_store: Arc<FileWalStore>,
+        provider: broca_core::StubProvider,
+        plane: StubToolPlane,
+        slots: Arc<crate::held_slots::HeldSlots>,
+        /// How many runs the actor has started.
+        runs: AtomicUsize,
+        /// One message per run that paused and now waits for its release.
+        paused: mpsc::UnboundedSender<()>,
+        release: tokio::sync::Semaphore,
+        /// How each run ended, sent as it returns to the actor.
+        ended: mpsc::UnboundedSender<Option<broca_protocol::PauseReason>>,
+    }
+
+    #[async_trait]
+    impl RunExecutor for PausingHeldExecutor {
+        fn provider_held_lifecycle(
+            &self,
+        ) -> Option<Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>> {
+            Some(self.slots.clone() as Arc<dyn broca_core::tool_plane::ProviderHeldLifecycle>)
+        }
+
+        async fn execute(
+            &self,
+            job: RunJob,
+            out: mpsc::Sender<OutputEvent>,
+        ) -> Result<RunSummary, RunError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let result = run_loop_on_writer_admitted_with_prior_snapshot(
+                job.req,
+                job.writer.as_ref(),
+                StartMode::FreshOrResume,
+                &self.provider,
+                &self.plane,
+                &AllowAll,
+                self.wal_store.as_ref(),
+                None,
+                job.control,
+                &out,
+                job.on_admitted,
+                Some(&job.prior_snapshot),
+            )
+            .await;
+            let paused = result.as_ref().ok().and_then(|summary| summary.paused);
+            if paused == Some(broca_protocol::PauseReason::ToolHeld) {
+                let _ = self.paused.send(());
+                self.release.acquire().await.unwrap().forget();
+            }
+            let _ = self.ended.send(paused);
+            result
+        }
+    }
+
+    struct PausingHeldRig {
+        root: std::path::PathBuf,
+        key: BindIdentity,
+        store: Arc<FileWalStore>,
+        slots: Arc<crate::held_slots::HeldSlots>,
+        executor: Arc<PausingHeldExecutor>,
+        registry: LineageRegistry,
+        paused: mpsc::UnboundedReceiver<()>,
+        ended: mpsc::UnboundedReceiver<Option<broca_protocol::PauseReason>>,
+    }
+
+    impl PausingHeldRig {
+        /// A session paused on held call `a`, opened and parked. A resume with nothing
+        /// deposited then drives it into a live run, which pauses again and is held by the
+        /// executor before it returns.
+        async fn paused_and_held(name: &str) -> Self {
+            let root =
+                broca_test_support::scratch_root().join(format!("{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("project")).unwrap();
+            let key = BindIdentity::new(root.join("project"), "broca", "held");
+            let store = Arc::new(FileWalStore::new(root.join("wal")));
+            seed_held_wal(&store, &key, &single_held_paused_seed(&key));
+            let slots = crate::held_slots::HeldSlots::new();
+            let (paused_tx, paused) = mpsc::unbounded_channel();
+            let (ended_tx, ended) = mpsc::unbounded_channel();
+            let answer = vec![
+                broca_protocol::NormalizedEvent::Control(
+                    broca_protocol::ProviderControl::AssistantMessage {
+                        message: broca_protocol::content::AssistantMessage {
+                            message_id: broca_protocol::MessageId("m2".into()),
+                            content: vec![broca_protocol::content::ContentBlock::Text {
+                                text: "done".into(),
+                            }],
+                        },
+                    },
+                ),
+                broca_protocol::NormalizedEvent::Control(
+                    broca_protocol::ProviderControl::Finished {
+                        usage: Default::default(),
+                        finish_reason: broca_protocol::FinishReason::Stop,
+                        retries_used: 0,
+                    },
+                ),
+            ];
+            let executor = Arc::new(PausingHeldExecutor {
+                wal_store: store.clone(),
+                provider: broca_core::StubProvider::new(vec![answer]),
+                plane: StubToolPlane::new(),
+                slots: slots.clone(),
+                runs: AtomicUsize::new(0),
+                paused: paused_tx,
+                release: tokio::sync::Semaphore::new(0),
+                ended: ended_tx,
+            });
+            let registry = LineageRegistry::new(Arc::new(SeamOpener {
+                lease_store: Arc::new(FileLeaseStore::new(root.join("leases"))),
+                wal_store: store.clone(),
+                idle_ttl: Duration::from_secs(60),
+                executor: executor.clone(),
+            }));
+            registry.route_status(&key).await.unwrap();
+            let mut rig = Self {
+                root,
+                key,
+                store,
+                slots,
+                executor,
+                registry,
+                paused,
+                ended,
+            };
+            rig.registry.resume_held_run(&rig.key).await.unwrap();
+            if tokio::time::timeout(Duration::from_secs(3), rig.paused.recv())
+                .await
+                .is_err()
+            {
+                panic!(
+                    "the resumed run did not pause again; runs={} WAL={:#?}",
+                    rig.executor.runs.load(Ordering::SeqCst),
+                    rig.records()
+                );
+            }
+            rig
+        }
+
+        fn records(&self) -> Vec<WalRecord> {
+            self.store
+                .read_records(&self.key)
+                .unwrap()
+                .into_iter()
+                .map(|frame| frame.record)
+                .collect()
+        }
+
+        /// Let the run the executor holds return to the actor.
+        fn release(&self) {
+            self.executor.release.add_permits(1);
+        }
+
+        fn deposit(&self) -> tokio::sync::oneshot::Receiver<()> {
+            self.slots.deposit(
+                &self.key,
+                &broca_protocol::ToolCallId("a".into()),
+                "lineage:4",
+                broca_protocol::ToolResult {
+                    tool_call_id: broca_protocol::ToolCallId("a".into()),
+                    output: broca_protocol::ToolOutput::Text {
+                        text: "late".into(),
+                    },
+                    is_error: false,
+                },
+            )
+        }
+
+        /// The deposit is taken and synced as the held call's terminal, and the run completes.
+        /// `runs` counts every run the actor started, the completing one included.
+        async fn assert_completes(
+            mut self,
+            delivered: tokio::sync::oneshot::Receiver<()>,
+            runs: usize,
+        ) {
+            delivered
+                .await
+                .expect("the run syncs the deposited result as the held call's terminal");
+            assert_eq!(
+                self.ended.recv().await,
+                Some(None),
+                "the resumed run completes"
+            );
+            let raw = self.records();
+            let terminals: Vec<_> = raw
+                .iter()
+                .filter_map(|record| match record {
+                    WalRecord::ToolResult { result, .. } => Some(result.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(terminals.len(), 1, "{terminals:?}");
+            assert_eq!(terminals[0].tool_call_id.0, "a");
+            assert_eq!(
+                terminals[0].output,
+                broca_protocol::ToolOutput::Text {
+                    text: "late".into()
+                }
+            );
+            assert!(raw.iter().any(|record| matches!(
+                record,
+                WalRecord::RunFinished {
+                    reason: RunFinishReason::Completed,
+                    ..
+                }
+            )));
+            broca_core::replay(&raw).expect("the WAL replays");
+            assert_eq!(
+                self.executor.provider.calls().len(),
+                1,
+                "only the run that took the result asks the model again"
+            );
+            assert_eq!(self.executor.runs.load(Ordering::SeqCst), runs);
+            assert!(self.registry.stop_and_seal().await);
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A late result deposited while the run is pausing (its `RunPaused` is durable, but the
+    /// actor has not yet handled the run's terminal) resumes the run as soon as the terminal
+    /// is handled, so the deposit is taken at once instead of after the delivery times out.
+    #[tokio::test]
+    async fn a_late_result_that_lands_while_the_run_is_pausing_resumes_it_at_once() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut rig = PausingHeldRig::paused_and_held("held-resume-while-pausing").await;
+            let delivered = rig.deposit();
+            rig.registry
+                .resume_held_run(&rig.key)
+                .await
+                .expect("a resume asked of an active run is answered");
+            rig.release();
+            assert_eq!(
+                rig.ended.recv().await,
+                Some(Some(broca_protocol::PauseReason::ToolHeld)),
+                "the run that was pausing still ends paused"
+            );
+            rig.assert_completes(delivered, 2).await;
+        })
+        .await
+        .expect("the deposit is taken once the pausing run's terminal is handled");
+    }
+
+    /// A resume owed to a pausing run whose held call has nothing deposited (a spurious one)
+    /// pauses the resumed run again on its first look. It appends exactly what any resume that
+    /// finds no deposit appends, writes no terminal for the held call, leaves a WAL that still
+    /// replays as paused on that call, and does not owe another resume after it.
+    #[tokio::test]
+    async fn an_owed_resume_with_nothing_deposited_pauses_again_and_writes_nothing_wrong() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut rig = PausingHeldRig::paused_and_held("held-owed-spurious").await;
+            let seeded = single_held_paused_seed(&rig.key).len();
+            let after_first = rig.records();
+            rig.registry
+                .resume_held_run(&rig.key)
+                .await
+                .expect("a resume asked of an active run is answered");
+            rig.release();
+            assert_eq!(
+                rig.ended.recv().await,
+                Some(Some(broca_protocol::PauseReason::ToolHeld))
+            );
+            rig.paused
+                .recv()
+                .await
+                .expect("the owed resume runs once the pausing run's terminal is handled");
+            let after_second = rig.records();
+            let kinds = |records: &[WalRecord]| -> Vec<_> {
+                records.iter().map(std::mem::discriminant).collect()
+            };
+            assert!(
+                after_first.len() > seeded,
+                "the first resume appended its records"
+            );
+            assert!(
+                matches!(
+                    after_second.last(),
+                    Some(WalRecord::RunPaused {
+                        reason: broca_protocol::PauseReason::ToolHeld,
+                        ..
+                    })
+                ),
+                "the owed resume ends in a held pause: {:#?}",
+                &after_second[after_first.len()..]
+            );
+            assert_eq!(
+                kinds(&after_second[after_first.len()..]),
+                kinds(&after_first[seeded..]),
+                "the owed resume appends what the first resume appended, and nothing else: {:#?}",
+                &after_second[after_first.len()..]
+            );
+            assert!(!after_second.iter().any(|record| matches!(
+                record,
+                WalRecord::ToolResult { .. } | WalRecord::RunFinished { .. }
+            )));
+            let count = |matches: fn(&WalRecord) -> bool| {
+                after_second.iter().filter(|record| matches(record)).count()
+            };
+            assert_eq!(
+                count(|record| matches!(record, WalRecord::ToolDispatchIntent { .. })),
+                1,
+                "a resume never repeats the held call's dispatch intent"
+            );
+            assert_eq!(
+                count(|record| matches!(record, WalRecord::ToolCallProviderHeld { .. })),
+                1,
+                "a resume never repeats the held call's held record"
+            );
+            let prior = broca_core::replay(&after_second).expect("the WAL replays");
+            let broca_core::ReplayResolution::ProviderHeld { open_held, .. } = &prior.resolution
+            else {
+                panic!("still paused on the held call: {:?}", prior.resolution)
+            };
+            assert_eq!(open_held.len(), 1);
+
+            rig.release();
+            assert_eq!(
+                rig.ended.recv().await,
+                Some(Some(broca_protocol::PauseReason::ToolHeld))
+            );
+
+            // The run is still resumable: a real deposit completes it. Three runs in all (the
+            // first resume, the owed one and this one) show the spurious resume owed nothing
+            // more: a fourth would pause and hold this test until its timeout.
+            let delivered = rig.deposit();
+            rig.registry.resume_held_run(&rig.key).await.unwrap();
+            rig.assert_completes(delivered, 3).await;
+        })
+        .await
+        .expect("a spurious owed resume settles without waiting on any timeout");
     }
 
     #[tokio::test]
@@ -12791,6 +13258,7 @@ mod import_idempotency_tests {
             submission_id: None,
         });
         writer.record(broca_wal::WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

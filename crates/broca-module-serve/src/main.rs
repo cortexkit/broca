@@ -166,6 +166,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let state_root = broca_module_serve::state_root::resolve_for_launch(&conn_path)
         .map_err(|e| ServeIoError(e.to_string()))?
         .path;
+    // ONE BROCA PER STATE ROOT, decided before anything below touches the root: the state-format
+    // decision, the stall log, store opens and every boot recovery step (fence-index rebuild, cut
+    // reconcile, crash-orphan seal, System One release) assume no other process is doing the
+    // same work on the same files. A held lock exits at once, non-zero, so the daemon counts a
+    // failed start and backs off; see `state_root_lock`.
+    match broca_module_serve::state_root_lock::acquire(&state_root) {
+        Ok(lock) => lock.hold_until_exit(),
+        Err(error) => {
+            tracing::error!(target: "lifecycle", root = %state_root.display(), "{error}");
+            return Err(ServeIoError(error.to_string()).into());
+        }
+    }
     // DECIDE THE STATE FORMAT BEFORE ANY OTHER STARTUP WORK TOUCHES THE ROOT, the stall log
     // just below included. A new root that is to become a `broca-state/2` root gets its marker first, so a
     // power loss can never leave other files on it without one (which would read as a legacy
@@ -208,6 +220,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let account_selection =
         broca_module_serve::account_routing::AccountSelectionConfig::load_default_path()
             .map_err(ServeIoError)?;
+    // The `refusal_fallback` section: which model a refused step is re-sent to. A malformed
+    // section refuses boot by name, like the defaults above: a mapping that was silently
+    // dropped would only be noticed when a refusal happened and nothing switched.
+    let refusal_fallback =
+        broca_module_serve::refusal_fallback_config::RefusalFallbackConfig::load_default_path()
+            .map_err(ServeIoError)?;
+    // Loaded and validated above; no run reads it yet, and this line keeps the loaded value
+    // alive until the run loop's refusal path takes it.
+    let _ = &refusal_fallback;
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
@@ -682,6 +703,17 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record
     // is its own file; `run-index.db` is a rebuildable projection and cannot hold an authority.
+    let llm_tools_config =
+        broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?;
+    let llm_tools_identity = broca_protocol::BindIdentity::new(
+        state_root.to_string_lossy().to_string(),
+        "broca",
+        "llm-tools",
+    );
+    let cerebellum = Arc::new(broca_subc::PrivateContentClient::new(
+        plan_conn.clone(),
+        llm_tools_identity.clone(),
+    ));
     let system_one = {
         let store = Arc::new(
             broca_store::SystemOneStore::open(state_root.join("system-one.db"))
@@ -719,6 +751,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             registry.batches_in_flight_gauge(),
         );
+        let service = if llm_tools_config.image_references {
+            service.with_image_resolver(cerebellum.clone())
+        } else {
+            service
+        };
         // System One's export bridge into the usage export. An overhaul root exports nothing.
         let service = Arc::new(if state_format.runs(BackgroundTask::UsageExport) {
             service.with_export(run_index.clone(), charge_basis_table)
@@ -743,16 +780,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // content and Basal which providers a flow's approved version allows. Both questions ride
     // the module connection `plan_conn` presents under broca's own principal; cerebellum and
     // Basal admit only `reserved:broca`.
-    let llm_tools_identity = broca_protocol::BindIdentity::new(
-        state_root.to_string_lossy().to_string(),
-        "broca",
-        "llm-tools",
-    );
     let llm_tools_asks = Arc::new(broca_module_serve::llm_tools::SubcAsks::new(
-        Arc::new(broca_subc::PrivateContentClient::new(
-            plan_conn.clone(),
-            llm_tools_identity.clone(),
-        )),
+        cerebellum,
         Arc::new(broca_subc::FlowProvidersClient::new(
             plan_conn.clone(),
             llm_tools_identity.clone(),
@@ -772,7 +801,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let llm_tools = Arc::new(
         broca_module_serve::llm_tools::LlmTools::new(
             Arc::new(system_one.fork_for_tools()),
-            broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?,
+            llm_tools_config,
             llm_tools_asks,
         )
         .with_held(held_calls.clone())
@@ -4350,6 +4379,7 @@ mod executor {
         include!("role_plane_tests.rs");
         include!("admission_wal_read_budget_tests.rs");
         include!("credential_source_guard_tests.rs");
+        include!("frozen_auth_method_resume_tests.rs");
 
         /// A new episode whose request has `inherit_frozen_cache` set (a steer or interrupt
         /// that omitted `cache`) takes the cache policy and caller cache key frozen in the

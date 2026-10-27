@@ -118,6 +118,8 @@ pub struct ReplayState {
     pub run_finals: std::collections::BTreeMap<u64, RunAttribution>,
     pub compaction: crate::compaction::CompactionCheckpoint,
     pub compaction_history: crate::compaction::CompactionHistory,
+    /// The output cap the current run recorded for a step, which a resume of that step renders.
+    pub output_reservation: crate::output_reservation::OutputReservationHistory,
     /// The lowest sequence number this lineage's next compaction notice may take: 1, or, for a
     /// lineage at an address whose earlier lineages retention deleted, the number their
     /// tombstones recorded. Replay alone cannot know it; admission sets it from the WAL store.
@@ -199,6 +201,14 @@ pub struct ReplayState {
     pub pending_steers: Vec<Message>,
     /// What to do next.
     pub resolution: ReplayResolution,
+    /// The session's client-side refusal-fallback schedule: the last one a `model_step_refused`
+    /// or `model_step_finished` recorded, cleared when an episode is admitted with another model
+    /// or a day after the schedule last changed. `None` when no refusal armed one. A replay
+    /// that starts from a materialized prefix sees only what its tail recorded: the prefix
+    /// keeps no schedule.
+    pub refusal_fallback: Option<broca_wal::RefusalFallbackSchedule>,
+    /// The last episode's steps a `model_step_refused` re-sent to the fallback model.
+    pub refused_steps: std::collections::BTreeSet<StepId>,
     /// Set only by a resume that loaded the held set of an applied compaction view instead of
     /// the whole transcript: `prompt` then holds only those messages, already in prompt form,
     /// and this carries what the run loop would otherwise derive from the whole prompt.
@@ -1345,6 +1355,11 @@ struct Episode {
     open_assistant: Option<Arc<AssistantMessage>>,
     /// The runner tags of `open_assistant`, from its `ModelStepFinished`.
     open_assistant_tags: Option<broca_protocol::tags::MessageTags>,
+    /// The model that answered `open_assistant` when it was not the episode's own (a step
+    /// routed to the refusal-fallback model).
+    open_assistant_origin: Option<broca_protocol::request::ModelHandle>,
+    /// Steps of THIS episode a `model_step_refused` re-sent; a second refusal of one is corrupt.
+    refused_steps: std::collections::BTreeSet<StepId>,
     open_batch: Option<OpenBatch>,
     open_step: Option<StepId>,
     open_batch_id: Option<BatchId>,
@@ -2280,6 +2295,9 @@ fn replay_seeded_with_compaction<'a>(
     // A tail can begin after the current episode's RunStarted. Only a RunStarted observed in
     // this walk may require a durable terminal before another episode opens.
     let mut saw_run_started = false;
+    // Session-scoped, unlike the episode state below: a schedule carries across episodes of
+    // the same source model.
+    let mut refusal_fallback: Option<broca_wal::RefusalFallbackSchedule> = None;
     // The current episode's transient state — reset on each new `RunStarted`. Seed the origin
     // and durable budget facts for a tail whose RunStarted is in the materialized prefix.
     let mut seeded_nudge_indices = seed_budget_state
@@ -2297,7 +2315,9 @@ fn replay_seeded_with_compaction<'a>(
     let mut committed_tool_turns: Vec<(usize, usize)> = Vec::new();
 
     let mut input_budget = crate::input_budget::InputTokenBudget::default();
+    let mut output_reservation = crate::output_reservation::OutputReservationHistory::default();
     for (record_index, rec) in records.into_iter().enumerate() {
+        output_reservation.fold(rec);
         input_budget
             .fold(rec)
             .map_err(|reason| ReplayError::CorruptLineage {
@@ -2354,6 +2374,7 @@ fn replay_seeded_with_compaction<'a>(
                 input,
                 origin,
                 submission_id,
+                ts_ms: admitted_at_ms,
                 // `..` deliberately covers `manifest`: replay decodes a frozen plan manifest but
                 // does not act on it, and renders from the episode's own frozen config and input,
                 // the same as for an episode without one.
@@ -2401,6 +2422,11 @@ fn replay_seeded_with_compaction<'a>(
                 // signature at render. From the durable per-episode config → reproduces on
                 // resume.
                 ep.origin = Some(config.model.clone());
+                refusal_fallback = crate::refusal_fallback::on_episode_admitted(
+                    refusal_fallback.take(),
+                    &config.model,
+                    *admitted_at_ms,
+                );
                 marker_order_version = *version;
                 keep_warm = *policy;
                 on_restart = *on_restart_policy;
@@ -2454,9 +2480,17 @@ fn replay_seeded_with_compaction<'a>(
                 finish_reason,
                 retries_used,
                 tags: step_tags,
+                fallback,
                 ..
             } => {
                 let step_tags = step_tags.as_deref();
+                // A step routed to the refusal-fallback model is that model's message.
+                let step_origin = crate::refusal_fallback::step_origin(fallback)
+                    .cloned()
+                    .or_else(|| ep.origin.clone());
+                if let Some(schedule) = &fallback.refusal_fallback {
+                    refusal_fallback = Some(schedule.clone());
+                }
                 ep.usage.accumulate(u);
                 ep.retries_used = ep.retries_used.saturating_add(*retries_used);
                 ep.last_step_usage = Some(*u);
@@ -2503,7 +2537,7 @@ fn replay_seeded_with_compaction<'a>(
                                 .filter(|block| !matches!(block, ContentBlock::ToolCall(_)))
                                 .cloned()
                                 .collect(),
-                            origin: ep.origin.clone(),
+                            origin: step_origin.clone(),
                             ordinal: None,
                             tags: Default::default(),
                         },
@@ -2536,6 +2570,7 @@ fn replay_seeded_with_compaction<'a>(
                     ep.open_batch = None;
                     ep.open_assistant = Some(assistant_message.clone()); // tool turn — held
                     ep.open_assistant_tags = step_tags.cloned();
+                    ep.open_assistant_origin = step_origin.clone();
                     ep.open_step = Some(*step_id);
                     ep.open_step_record = Some(record_index);
                     ep.open_batch_id = None; // a new tool turn; its batch hasn't opened yet
@@ -2557,7 +2592,7 @@ fn replay_seeded_with_compaction<'a>(
                             cache_prefix_blocks: None,
                             role: Role::Assistant,
                             content: assistant_message.content.clone(),
-                            origin: ep.origin.clone(),
+                            origin: step_origin.clone(),
                             ordinal: None,
                             tags: Default::default(),
                         },
@@ -2729,7 +2764,9 @@ fn replay_seeded_with_compaction<'a>(
                                 &assistant,
                                 ep.open_assistant_tags.take().as_ref(),
                                 b,
-                                ep.origin.clone(),
+                                ep.open_assistant_origin
+                                    .take()
+                                    .or_else(|| ep.origin.clone()),
                             );
                         }
                         ep.open_batch = None;
@@ -2989,6 +3026,7 @@ fn replay_seeded_with_compaction<'a>(
             | WalRecord::CompactionViewApplied { .. }
             | WalRecord::ContextCeilingWait { .. }
             | WalRecord::ContextCeilingDecided { .. }
+            | WalRecord::OutputReservationClamped { .. }
             | WalRecord::CompactionRideWait { .. }
             | WalRecord::CompactionRideWaitEnded { .. }
             | WalRecord::CompactionNotice { .. } => {}
@@ -2996,6 +3034,28 @@ fn replay_seeded_with_compaction<'a>(
             // same contract, so replay skips it exactly as it skips `Unknown`. The step's retry
             // count still comes from `ModelStepFinished.retries_used`.
             WalRecord::ModelAttemptFinished { .. } => {}
+            // A refused step contributes nothing to the prompt: its content was never stored,
+            // and the same step id commits the fallback model's answer. Its usage was billed, so
+            // it counts toward the episode's totals, and it records the schedule it armed.
+            WalRecord::ModelStepRefused {
+                step_id,
+                usage: refused_usage,
+                schedule,
+                ..
+            } => {
+                if !ep.refused_steps.insert(*step_id) {
+                    return Err(ReplayError::CorruptLineage {
+                        episode_run_id: run_id.clone().unwrap_or_else(|| RunId(String::new())),
+                        reason: format!(
+                            "a second model_step_refused for step {}: a refused step is re-sent \
+                             once, to the fallback model",
+                            step_id.0
+                        ),
+                    });
+                }
+                ep.usage.accumulate(refused_usage);
+                refusal_fallback = Some(schedule.clone());
+            }
             // A resume's own account of what it found. Informational under the same contract:
             // it never enters the prompt, and replay is identical to the same WAL without it.
             WalRecord::ResumeStarted { .. } => {}
@@ -3192,7 +3252,10 @@ fn replay_seeded_with_compaction<'a>(
                         cache_prefix_blocks: None,
                         role: Role::Assistant,
                         content: assistant.content.clone(),
-                        origin: ep.origin.clone(),
+                        origin: ep
+                            .open_assistant_origin
+                            .clone()
+                            .or_else(|| ep.origin.clone()),
                         ordinal: None,
                         tags: Default::default(),
                     },
@@ -3226,6 +3289,7 @@ fn replay_seeded_with_compaction<'a>(
             ep.hard_stopped = Some(RunFinishReason::BudgetExhausted);
         }
     }
+    let refused_steps = std::mem::take(&mut ep.refused_steps);
     let mut resolution = classify(ep, run_id.as_ref(), cancel_at.is_some());
     if input_budget.exhausted().is_some() {
         match &mut resolution {
@@ -3267,6 +3331,7 @@ fn replay_seeded_with_compaction<'a>(
         run_finals,
         compaction,
         compaction_history,
+        output_reservation,
         compaction_notice_floor: 1,
         manifest: None,
         committed_tool_turns,
@@ -3294,6 +3359,8 @@ fn replay_seeded_with_compaction<'a>(
         open_tool_batch,
         pending_steers,
         resolution,
+        refusal_fallback,
+        refused_steps,
         held: None,
     })
 }
@@ -3350,14 +3417,23 @@ impl RunUsageProjection {
                     self.model = Some((config.model.clone(), config.variant.clone()));
                 }
             }
-            WalRecord::ModelStepFinished { usage, .. } if self.active => {
+            WalRecord::ModelStepFinished { usage, .. }
+            | WalRecord::ModelStepRefused { usage, .. }
+                if self.active =>
+            {
+                // A refused call was billed, so it counts as a call of the model that refused.
                 if let Some((model, variant)) = &self.model {
-                    self.usage.record_step(
-                        &model.provider_module_id,
-                        &model.model_id,
-                        variant.as_deref().filter(|value| !value.is_empty()),
-                        reported_step_usage(usage),
-                    );
+                    let variant = variant.as_deref().filter(|value| !value.is_empty());
+                    if let Some((provider, model, variant)) =
+                        crate::refusal_fallback::usage_model(model, variant, record)
+                    {
+                        self.usage.record_step(
+                            provider,
+                            model,
+                            variant,
+                            reported_step_usage(usage),
+                        );
+                    }
                 }
             }
             _ => {}
@@ -4071,6 +4147,7 @@ pub(crate) mod projection_boundary_tests {
         framed(
             seq,
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -4694,6 +4771,7 @@ pub(crate) mod deferred_tests {
         vec![
             super::projection_boundary_tests::run_started(1, "r").record,
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -5490,6 +5568,7 @@ mod offset_tail_tests {
 
     fn text_step(step: u64, text: &str) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -5559,6 +5638,7 @@ mod offset_tail_tests {
         // One model step with two tool calls, planned as [a, b] but arriving as [b, a].
         // The tools message orders results by plan, not by arrival.
         records.push(WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -6151,6 +6231,7 @@ mod offset_tail_tests {
     fn invalid_states_fall_back_to_full_replay() {
         let batch_id = BatchId("r1-b9".into());
         let tool_step = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -6295,6 +6376,7 @@ mod offset_tail_tests {
         ];
         for i in 0..9996u64 {
             small.push(WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,

@@ -259,7 +259,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "broca-bench"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "broca-catalog"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "base64",
  "broca-catalog",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "broca-ck"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-protocol",
  "serde",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "broca-core"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "async-trait",
  "broca-diagnostics",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "broca-crash-harness"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "broca-diagnostics"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "serde",
  "tokio",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "broca-fetch-plan"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "async-trait",
  "broca-protocol",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "broca-heap-profile"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "serde",
  "serde_json",
@@ -387,11 +387,11 @@ dependencies = [
 
 [[package]]
 name = "broca-memory-relief"
-version = "0.3.268"
+version = "0.3.271"
 
 [[package]]
 name = "broca-module"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "async-trait",
  "base64",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "broca-module-serve"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -482,18 +482,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "zeroize",
 ]
 
 [[package]]
 name = "broca-owner-only"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "broca-protocol"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "cortexkit-anthropic-policy",
  "cortexkit-bus-naming",
@@ -507,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "broca-provider"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "async-trait",
  "base64",
@@ -547,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "broca-replay"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-protocol",
  "rustix",
@@ -559,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "broca-run"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-catalog",
  "broca-core",
@@ -575,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "broca-store"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -597,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "broca-store-contention-tests"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -608,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "broca-subc"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "async-trait",
  "base64",
@@ -620,6 +621,7 @@ dependencies = [
  "broca-provider",
  "broca-test-support",
  "broca-wal",
+ "cortexkit-model-batch",
  "cortexkit-role-step-transform-provider",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
@@ -639,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "broca-test-support"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-owner-only",
  "libproc",
@@ -652,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "broca-wal"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-owner-only",
  "broca-protocol",
@@ -677,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "broca-wire"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -788,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "ck-import"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-core",
  "broca-module",
@@ -807,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "ck-session-import"
-version = "0.3.268"
+version = "0.3.271"
 dependencies = [
  "broca-module-serve",
  "broca-protocol",
@@ -1003,9 +1005,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-llm-tools"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "233083985c55934bba91982bc4650719895ae236e00ebe48e4db8e52e0dd2d32"
+checksum = "8681854859b3571b38e1f353df55fbb714e97ee670d1152201c47b9139e23c25"
 dependencies = [
  "cortexkit-model-batch",
  "cortexkit-role-classifier",
@@ -1031,9 +1033,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-model-batch"
-version = "0.2.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ba8a82cd36445c06658fc3383334fc9cdc45c936bf68b7b6d0f13b07b154571"
+checksum = "b03d631c6b45c0e5c00fd5a7e36d038f62c3dbe88ca7dd4498d45918ad8d486e"
 dependencies = [
  "base64",
  "serde",
@@ -1063,9 +1065,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95b013902af700747a64b9da9d529643bbe320095deb5fc4ae0c5e071fdae264"
+checksum = "3a432f735acd51eb8c537fab43d76cde6dcc1276d9206ffdb622276186119ec7"
 dependencies = [
  "cortexkit-model-batch",
  "indexmap",
@@ -1075,9 +1077,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier-conformance"
-version = "0.4.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea68d608cb119118be7b83205b8f107248dd6defb2c5644c1fa974d1737a7d2a"
+checksum = "d4ad45935958f8388ffaeb6e9c80030555cf718f54f97ccec22d5230bfe145d9"
 dependencies = [
  "async-trait",
  "cortexkit-role-classifier",
@@ -1085,7 +1087,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "subc-protocol 0.32.4",
+ "subc-protocol 0.33.0",
 ]
 
 [[package]]
@@ -1103,9 +1105,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-extractor"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62372f03db4c981cd47da7530ec28e0a55a3a11a022ddb3a1526e0774f1d04a7"
+checksum = "0edf6c7d961829fc58395bb8011ec0c6381c362bbb1940a2d056b9f524866866"
 dependencies = [
  "cortexkit-model-batch",
  "indexmap",

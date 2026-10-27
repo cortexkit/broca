@@ -2212,6 +2212,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // would wait out its drain ceiling.
         "system_one_batches_in_flight",
         "system_one",
+        // This process's WAL fsyncs by cause. Asserted below: its four counters exist, and a
+        // writer that lost its channel without a shutdown (`disconnect`) never happens here.
+        "wal_fsyncs",
     ]
     .into_iter()
     .collect();
@@ -2239,6 +2242,21 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         launch.contains('-') && !launch.starts_with('-') && !launch.ends_with('-'),
         "launch_id must carry both nonce components, got {launch:?}"
     );
+    let fsyncs = metrics["wal_fsyncs"]
+        .as_object()
+        .expect("wal_fsyncs is an object");
+    assert_eq!(
+        fsyncs.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["barrier", "deadline", "disconnect", "shutdown"],
+        "wal_fsyncs carries one counter per sync cause"
+    );
+    assert!(
+        fsyncs.values().all(serde_json::Value::is_u64),
+        "every wal_fsyncs counter is a count, got {fsyncs:?}"
+    );
+    // Every writer here is shut down through its handle. A disconnect sync would mean one was
+    // dropped without that, which a healthy daemon never does.
+    assert_eq!(fsyncs["disconnect"], serde_json::json!(0));
     assert_eq!(metrics["active_sessions"], serde_json::json!(1));
     assert_eq!(metrics["opening"], serde_json::json!(0));
     assert_eq!(metrics["closing"], serde_json::json!(0));
@@ -6342,6 +6360,7 @@ async fn history_unreachable_refusal_golden_from_real_serve() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,

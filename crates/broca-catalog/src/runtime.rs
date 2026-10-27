@@ -44,6 +44,12 @@ compile_error!("catalog test-support cannot be enabled in a release build");
 /// extraction model such as Cloudflare's System One rows). `session.send` serves chat only, so
 /// it refuses a model whose stated kind is anything else; an absent kind is not stated, never a
 /// claim of chat, and admits as before.
+///
+/// `capability.server_side_fallback` is the one capability fusiform serves for a routing
+/// feature rather than a model property: the runtime may hand a refused request to another
+/// model itself. It sits under `capability.` because fusiform publishes it as a model
+/// capability, and it is requested by its full name because broca requests exact capability
+/// keys.
 pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "existence",
     "model.kind",
@@ -55,6 +61,7 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "capability.input_modalities",
     "capability.reasoning",
     "capability.reasoning_options",
+    "capability.server_side_fallback",
     "capability.tool_call",
     "capability.structured_output",
     "rate.input",
@@ -75,6 +82,11 @@ const MODE_RATE_INPUT_PREFIX: &str = "rate.input.mode.";
 const MODE_RATE_OUTPUT_PREFIX: &str = "rate.output.mode.";
 /// The `model.kind` value of a chat model, the only kind `session.send` admits.
 pub(crate) const MODEL_KIND_CHAT: &str = "chat";
+
+/// The catalog fact saying the runtime accepts a request that asks it to hand a refusal to
+/// another model itself. A named constant because the rest of the work keys on it: the prefix
+/// list above, the row reader, the `carries_…` scan and the tests.
+pub(crate) const SERVER_SIDE_FALLBACK_FACT: &str = "capability.server_side_fallback";
 
 /// The successful `catalog.get` response persisted as the last-known-good document.
 ///
@@ -144,6 +156,12 @@ struct LoadedCatalog {
     carries_input_modalities: bool,
     /// A same-version poll can add names omitted by the previous prefix list.
     carries_display_names: bool,
+    /// Whether any row of the source document carried `capability.server_side_fallback`. Same
+    /// reason as `carries_output_limits`: fusiform serves the fact on current reads, so a
+    /// last-known-good catalog written before broca requested it has the same version as the
+    /// next poll and none of the fact. Reusing its index would leave every row reading "no
+    /// server-side fallback" until fusiform happened to mint a new version.
+    carries_server_side_fallback: bool,
     /// Present rows this catalog left out or kept from the catalog it replaced, because their
     /// facts could not be used. Shared with an equal-version republish, which reuses the index
     /// these describe.
@@ -170,6 +188,13 @@ fn response_carries_display_names(response: &FusiformCatalogResponse) -> bool {
         .models
         .values()
         .any(|facts| facts.contains_key("model.name") || facts.contains_key("provider.name"))
+}
+
+fn response_carries_server_side_fallback(response: &FusiformCatalogResponse) -> bool {
+    response
+        .models
+        .values()
+        .any(|facts| facts.contains_key(SERVER_SIDE_FALLBACK_FACT))
 }
 
 fn response_carries_routing_facts(response: &FusiformCatalogResponse) -> bool {
@@ -249,6 +274,13 @@ struct ServingModel {
     /// `capability.reasoning_options`: null, `[]` and a populated array stay distinct. A catalog
     /// from before fusiform served the fact reads as unstated, which defines no variant.
     reasoning_options: ReasoningOptions,
+    /// `capability.server_side_fallback`: whether the runtime accepts a request that asks it to
+    /// hand a refusal to another model itself. Absent and null both read as `None`, which callers
+    /// treat as false: the fact is served on current reads only, so an older catalog or a
+    /// point-in-time read carries no answer, never a claim. A value that is not a boolean is
+    /// malformed; it is reported and reads as `None`, because an optional routing feature must
+    /// not take a model offline.
+    server_side_fallback: Option<bool>,
     /// Upstream mode names (`fast`, `priority`, ...) for which fusiform serves BOTH a priced
     /// input and a priced output rate, sorted. A mode missing either side is unpriced and is
     /// not listed; see `priced_modes_fact`.
@@ -273,6 +305,7 @@ impl Default for ServingModel {
             tool_call: CapabilityFlag::Absent,
             structured_output: CapabilityFlag::Absent,
             reasoning_options: ReasoningOptions::Unstated,
+            server_side_fallback: None,
             priced_modes: Vec::new(),
             wire_family: None,
             kind: None,
@@ -300,6 +333,7 @@ impl ServingModel {
             tool_call: model.capabilities.tool_call,
             structured_output: model.capabilities.structured_output,
             reasoning_options: model.reasoning_options.clone(),
+            server_side_fallback: None,
             // The legacy snapshot path carries no fusiform mode rates, so it offers no tier
             // that needs one.
             priced_modes: Vec::new(),
@@ -330,6 +364,7 @@ impl ServingModel {
             },
             cost: self.cost.clone(),
             reasoning_options: self.reasoning_options.clone(),
+            server_side_fallback: self.server_side_fallback,
             release_date: None,
             status: None,
             overlay: Overlay::default(),
@@ -680,6 +715,17 @@ impl CatalogSnapshot {
         self.0
             .catalog
             .model_for_serving_with_family(provider_id, model_id, family)
+    }
+
+    /// `capability.server_side_fallback` for this model on its resolved row: `Some(true)` or
+    /// `Some(false)` when the catalog states it, `None` when it states nothing (an older
+    /// catalog, a point-in-time read, or a value that was malformed). A caller reads `None` as
+    /// false: the request field it gates is never sent without a stated `true`.
+    pub fn server_side_fallback(&self, provider_id: &str, model_id: &str) -> Option<bool> {
+        self.0
+            .catalog
+            .provider_and_model(provider_id, model_id)
+            .and_then(|(_, model)| model.server_side_fallback)
     }
 
     /// The model's `model.kind`: `Some(kind)` when the catalog states one, `None` when it does
@@ -1408,6 +1454,7 @@ fn serving_model_from_facts(
             "capability.structured_output",
         )?,
         reasoning_options: reasoning_options_fact(identity, facts)?,
+        server_side_fallback: server_side_fallback_fact(identity, facts),
         priced_modes: priced_modes_fact(identity, facts)?,
         wire_family: None,
         kind: model_kind_fact(identity, facts)?,
@@ -1466,6 +1513,34 @@ fn optional_capability_fact(
         capability_fact(identity, facts, fact)
     } else {
         Ok(CapabilityFlag::Absent)
+    }
+}
+
+/// `capability.server_side_fallback`: `Some(true)` or `Some(false)` when fusiform states one,
+/// `None` when it is absent or null. A value of any other type is malformed, and this reader is
+/// deliberately the one place a malformed row fact does not exclude its row.
+///
+/// Every other reader here fails closed: a fact it cannot read means the row's route or spec
+/// cannot be trusted. This fact is different because nothing about the row depends on it. It
+/// only asks for an extra request field that the runtime may answer with a handoff, so a value
+/// broca cannot read means "do not ask", which is the same as false. Excluding the row instead
+/// would take a model offline over one optional feature; the WARN names the row so the producer
+/// of the bad value can find it.
+fn server_side_fallback_fact(identity: &str, facts: &BTreeMap<String, Value>) -> Option<bool> {
+    match facts.get(SERVER_SIDE_FALLBACK_FACT) {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::Null) | None => None,
+        Some(value) => {
+            tracing::warn!(
+                target: "catalog",
+                model = identity,
+                fact = SERVER_SIDE_FALLBACK_FACT,
+                value = %value,
+                "a catalog fact has an unexpected value; it is read as unstated and the row \
+                 still serves"
+            );
+            None
+        }
     }
 }
 
@@ -2066,6 +2141,8 @@ impl CatalogCache {
                         != current.carries_input_modalities
                     || response_carries_routing_facts(&response) != current.carries_routing_facts
                     || response_carries_display_names(&response) != current.carries_display_names
+                    || response_carries_server_side_fallback(&response)
+                        != current.carries_server_side_fallback
                 {
                     let rebuilt = Arc::new(loaded(
                         &response,
@@ -2097,6 +2174,7 @@ impl CatalogCache {
                     carries_model_kinds: current.carries_model_kinds,
                     carries_input_modalities: current.carries_input_modalities,
                     carries_display_names: current.carries_display_names,
+                    carries_server_side_fallback: current.carries_server_side_fallback,
                     excluded_rows: Arc::clone(&current.excluded_rows),
                 });
                 self.install(refreshed);
@@ -2189,6 +2267,8 @@ impl CatalogCache {
             carries_model_kinds: false,
             carries_input_modalities: false,
             carries_display_names: false,
+            // The vendored snapshot serves no `capability.server_side_fallback`.
+            carries_server_side_fallback: false,
             excluded_rows: Arc::from([]),
         });
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
@@ -2260,6 +2340,7 @@ fn loaded(
         carries_model_kinds: response_carries_model_kinds(response),
         carries_input_modalities: response_carries_input_modalities(response),
         carries_display_names: response_carries_display_names(response),
+        carries_server_side_fallback: response_carries_server_side_fallback(response),
         excluded_rows: assembled.excluded_rows.into(),
     })
 }
@@ -3443,6 +3524,195 @@ mod tests {
                 .unwrap()
                 .1,
             "https://served.example"
+        );
+    }
+
+    /// An equal-version poll that is the first to carry `capability.server_side_fallback`
+    /// rebuilds the index.
+    ///
+    /// Fusiform serves the fact on current reads only, so the last-known-good catalog on disk
+    /// was written before broca requested it and carries none, at the same version as the next
+    /// poll. Reusing that index would keep every row reading "no server-side fallback" until
+    /// fusiform happened to mint a new version.
+    #[test]
+    fn an_equal_version_poll_that_newly_carries_server_side_fallback_rebuilds_the_index() {
+        let cache = CatalogCache::empty();
+        let first = response(100);
+        let version = first.catalog_version;
+        cache.refresh(first).expect("install");
+        let before = cache.snapshot().expect("installed");
+        assert_eq!(
+            before.server_side_fallback("anthropic", "claude-sonnet-4-5"),
+            None
+        );
+
+        let mut upgraded = response(200);
+        upgraded.catalog_version = version;
+        upgraded
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .expect("fixture row")
+            .insert(SERVER_SIDE_FALLBACK_FACT.into(), serde_json::json!(true));
+        cache.refresh(upgraded).expect("same-version refresh");
+        let after = cache.snapshot().expect("installed");
+        assert!(
+            !before.shares_index_with(&after),
+            "a newly carried fact requires a new serving index"
+        );
+        assert_eq!(
+            after.server_side_fallback("anthropic", "claude-sonnet-4-5"),
+            Some(true)
+        );
+    }
+
+    /// The fact reaches the resolved row as a plain yes, no or nothing, and a malformed value
+    /// leaves the row serving with its route unchanged, reported by one WARN.
+    #[test]
+    fn server_side_fallback_reaches_the_resolved_row() {
+        let mut page = response(100);
+        let facts = page
+            .models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .expect("fixture row");
+        facts.insert(
+            "wire.npm".into(),
+            serde_json::json!({"value":"@ai-sdk/anthropic", "from":"provider"}),
+        );
+        facts.insert(
+            "wire.api".into(),
+            serde_json::json!({"value":"https://api.anthropic.com/v1", "from":"curated"}),
+        );
+        facts.insert(SERVER_SIDE_FALLBACK_FACT.into(), serde_json::json!(true));
+        page.models.insert("anthropic/claude-opus-5-5".into(), {
+            let mut row = chat_row(200_000);
+            row.insert(SERVER_SIDE_FALLBACK_FACT.into(), serde_json::json!(false));
+            row
+        });
+        let cache = CatalogCache::empty();
+        cache.refresh(page).expect("install");
+        let snapshot = cache.snapshot().unwrap();
+        assert_eq!(
+            snapshot.server_side_fallback("anthropic", "claude-sonnet-4-5"),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.server_side_fallback("anthropic", "claude-opus-5-5"),
+            Some(false)
+        );
+        assert_eq!(
+            snapshot.server_side_fallback("anthropic", "not-a-row"),
+            None
+        );
+        assert_eq!(
+            snapshot
+                .model_for_serving("anthropic", "claude-sonnet-4-5")
+                .unwrap()
+                .1
+                .server_side_fallback,
+            Some(true),
+            "the fact is on the spec admission freezes from"
+        );
+    }
+
+    /// A malformed value must not change what the row's route resolves to. The control install
+    /// carries the same row with no such fact, and the two resolutions must match.
+    #[test]
+    fn a_malformed_server_side_fallback_still_serves_the_same_route() {
+        fn page(flag: Option<serde_json::Value>) -> FusiformCatalogResponse {
+            let mut page = response(100);
+            let facts = page
+                .models
+                .get_mut("anthropic/claude-sonnet-4-5")
+                .expect("fixture row");
+            facts.insert(
+                "wire.npm".into(),
+                serde_json::json!({"value":"@ai-sdk/anthropic", "from":"provider"}),
+            );
+            facts.insert(
+                "wire.api".into(),
+                serde_json::json!({"value":"https://api.anthropic.com/v1", "from":"curated"}),
+            );
+            if let Some(flag) = flag {
+                facts.insert(SERVER_SIDE_FALLBACK_FACT.into(), flag);
+            }
+            page
+        }
+
+        let control = CatalogCache::empty();
+        control.refresh(page(None)).unwrap();
+        let control_route = control
+            .snapshot()
+            .unwrap()
+            .resolve_route("anthropic", "claude-sonnet-4-5")
+            .expect("the row routes");
+
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!([true]),
+            serde_json::json!({"value": true}),
+        ] {
+            let cache = CatalogCache::empty();
+            let capture = broca_test_support::LogCapture::new();
+            capture
+                .in_scope(|| cache.refresh(page(Some(value.clone()))))
+                .expect("a malformed optional fact must not refuse the refresh");
+            let snapshot = cache.snapshot().unwrap();
+            assert_eq!(
+                snapshot.resolve_route("anthropic", "claude-sonnet-4-5"),
+                Ok(control_route.clone()),
+                "{value}: the row must resolve the same route"
+            );
+            assert_eq!(
+                snapshot.server_side_fallback("anthropic", "claude-sonnet-4-5"),
+                None,
+                "{value}: an unreadable value states nothing"
+            );
+            assert_eq!(
+                cache.health(100).unwrap().rows_excluded,
+                0,
+                "{value}: the row is not excluded over an optional fact"
+            );
+            let warns: Vec<_> = capture
+                .events()
+                .into_iter()
+                .filter(|event| {
+                    event.level == tracing::Level::WARN
+                        && event.target == "catalog"
+                        && event.fields.get("fact").map(String::as_str)
+                            == Some(SERVER_SIDE_FALLBACK_FACT)
+                })
+                .collect();
+            assert_eq!(warns.len(), 1, "{value}: exactly one WARN: {warns:?}");
+            assert_eq!(warns[0].fields["model"], "anthropic/claude-sonnet-4-5");
+        }
+    }
+
+    /// An explicit `null` is the producer saying it does not state the fact, not a defect, so
+    /// it is silent.
+    #[test]
+    fn a_null_server_side_fallback_is_unstated_without_a_warning() {
+        let mut page = response(100);
+        page.models
+            .get_mut("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .insert(SERVER_SIDE_FALLBACK_FACT.into(), serde_json::Value::Null);
+        let cache = CatalogCache::empty();
+        let capture = broca_test_support::LogCapture::new();
+        capture.in_scope(|| cache.refresh(page)).unwrap();
+        assert_eq!(
+            cache
+                .snapshot()
+                .unwrap()
+                .server_side_fallback("anthropic", "claude-sonnet-4-5"),
+            None
+        );
+        assert!(
+            capture
+                .events()
+                .iter()
+                .all(|event| event.level != tracing::Level::WARN),
+            "null is an answer, not a malformed value"
         );
     }
 

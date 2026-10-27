@@ -1004,6 +1004,8 @@ fn a_sealed_unfinished_pass_serves_members_through_the_verified_index() {
             assert!(read_newest_member(&paths, "ffffffffffffffff", MAX_BYTES)
                 .unwrap()
                 .is_none());
+            // Directory lookups need not populate the separate fallback membership cache.
+            broca_wal::archive::prewarm_container_membership(&paths[0], MAX_BYTES).unwrap();
             assert_eq!(
                 cached_membership(&paths[0]),
                 Some(CachedMembership::Verified)

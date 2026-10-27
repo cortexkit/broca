@@ -868,7 +868,9 @@ fn project_control_record<S: ControlProjectionSink>(
                 });
             }
         }
-        WalRecord::ContextCeilingWait { .. } | WalRecord::ContextCeilingDecided { .. } => {}
+        WalRecord::ContextCeilingWait { .. }
+        | WalRecord::ContextCeilingDecided { .. }
+        | WalRecord::OutputReservationClamped { .. } => {}
         WalRecord::CompactionRideWait { deadline_ms, .. } => {
             if let Some(run_id) = &state.run_id {
                 push!(ControlUnit::CompactionWait {
@@ -890,6 +892,10 @@ fn project_control_record<S: ControlProjectionSink>(
         // Provider attempt evidence is known to this build but carries no session semantics:
         // it is skipped exactly like `Unknown`, so the control stream is identical without it.
         WalRecord::ModelAttemptFinished { .. } => {}
+        // A refused step is re-sent under the same step id and its refused content is never
+        // stored, so a subscriber replaying the WAL sees only the step's `StepStarted` and the
+        // answer that committed it.
+        WalRecord::ModelStepRefused { .. } => {}
         // A resume's own account of what it found: informational, so the control stream is
         // identical without it. The results a resume writes are ordinary `ToolResult` records.
         WalRecord::ResumeStarted { .. } => {}

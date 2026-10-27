@@ -4,7 +4,7 @@
 //! (`flow.private_content_providers`) before it may call a provider, so a test needs both to
 //! answer. `fake-aft-stub` declares only the tool-provider role, so the daemon refuses a
 //! `route.open` aimed at its management surface before any operation is dispatched. This binary
-//! is a module that does declare a management surface, and serves those two operations.
+//! is a module that declares a management surface, including screenshot resolution.
 //!
 //! Configuration, from the environment and the command line:
 //!
@@ -25,6 +25,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use subc_protocol::manifest::{
     Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
     ProviderRole,
@@ -32,7 +33,7 @@ use subc_protocol::manifest::{
 use subc_protocol::{ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Priority, PROTOCOL_VERSION};
 use subc_transport::{authenticate_client, read_frame, write_frame};
 
-const SURFACED_OPS: [&str; 2] = ["private_content.query", "flow.private_content_providers"];
+const SURFACED_OPS: [&str; 3] = ["private_content.query", "flow.private_content_providers", "image.resolve"];
 
 fn main() {
     if let Some(()) = relaunch() {
@@ -219,7 +220,7 @@ async fn serve() -> Result<(), String> {
             append(&requests, &format!("route.bind {}\n", String::from_utf8_lossy(&frame.body)))?;
             let accepted = serde_json::to_vec(&serde_json::json!({"op":"route.bind"}))
                 .unwrap_or_default();
-            write(&mut stream, reply_frame(&frame, FrameType::Response, accepted)).await?;
+            write(&mut stream, reply_frame(&frame, FrameType::Response, accepted, false)).await?;
             continue;
         }
         if frame.header.channel == 0 && frame.header.ty == FrameType::Request {
@@ -236,7 +237,7 @@ async fn serve() -> Result<(), String> {
                 "the stand-in surface serves no module control operation",
             );
             let body = serde_json::to_vec(&refused).unwrap_or_default();
-            write(&mut stream, reply_frame(&frame, FrameType::Error, body)).await?;
+            write(&mut stream, reply_frame(&frame, FrameType::Error, body, false)).await?;
             continue;
         }
         let request: serde_json::Value =
@@ -246,11 +247,16 @@ async fn serve() -> Result<(), String> {
             &requests,
             &format!("{} {}\n", method, request["params"]),
         )?;
-        let (ty, body) = match answer(&fixtures, &method, &request["params"]) {
-            Ok(result) => (FrameType::Response, result),
-            Err(refused) => (FrameType::Error, refused),
+        // Leave the image request unanswered to exercise the caller's source timeout.
+        // Other operations remain available while the image source is down.
+        if method == "image.resolve" && fixtures.with_extension("down").exists() {
+            continue;
+        }
+        let (ty, body, binary) = match answer(&fixtures, &method, &request["params"]) {
+            Ok(result) => (FrameType::Response, result.body, result.binary),
+            Err(refused) => (FrameType::Error, refused, false),
         };
-        write(&mut stream, reply_frame(&frame, ty, body)).await?;
+        write(&mut stream, reply_frame(&frame, ty, body, binary)).await?;
     }
 }
 
@@ -272,10 +278,10 @@ fn control(ty: FrameType, corr: u64, body: Vec<u8>) -> Frame {
     .expect("a control frame fits the wire limit")
 }
 
-fn reply_frame(request: &Frame, ty: FrameType, body: Vec<u8>) -> Frame {
+fn reply_frame(request: &Frame, ty: FrameType, body: Vec<u8>, binary: bool) -> Frame {
     Frame::build(
         ty,
-        Flags::new(false, Priority::Interactive, false),
+        Flags::new(binary, Priority::Interactive, false),
         request.header.channel,
         request.header.epoch,
         request.header.corr,
@@ -311,7 +317,7 @@ fn manifest(module_id: &str) -> ModuleManifest {
     .build()
 }
 
-fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Result<Vec<u8>, Vec<u8>> {
+fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Result<Surfaced, Vec<u8>> {
     if method == "flow.private_content_providers"
         && (params["flow_id"].as_str().is_none()
             || params.as_object().is_none_or(|params| params.keys().any(|key| key != "flow_id")))
@@ -324,11 +330,13 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
                 .keys()
                 .find(|key| !matches!(key.as_str(), "scope_ref" | "parent_scope_ref"))
         }) {
-            return Ok(serde_json::to_vec(&serde_json::json!({
-                "outcome": "invalid_request", "context": null, "session": null,
-                "detail": {"field": field, "reason_code": "unknown_field"}
-            }))
-            .unwrap());
+            return Ok(Surfaced::plain(
+                serde_json::to_vec(&serde_json::json!({
+                    "outcome": "invalid_request", "context": null, "session": null,
+                    "detail": {"field": field, "reason_code": "unknown_field"}
+                }))
+                .unwrap(),
+            ));
         }
     }
     let refused = |code: &str, message: String| {
@@ -358,36 +366,68 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
         {
             continue;
         }
+        if fixture["match"]["handle"].as_str()
+            .is_some_and(|handle| params["handle"].as_str() != Some(handle)) {
+            continue;
+        }
         let raw = fixture["stdout"].as_str().unwrap_or_default();
+        // Cerebellum sends both answers and refusals as bare response bodies. Preserve the
+        // fixture bytes so the rig cannot hide a client that expects a result envelope.
+        // A resolve success is a binary body (`u32` big-endian head length, head JSON, image
+        // bytes): the fixture carries those exact body bytes base64-encoded, and the reply
+        // frame carries the binary flag. Every `image.resolve` fixture is a success; an
+        // unmatched handle gets the JSON refusal from the default below.
+        if method == "image.resolve" {
+            let body = STANDARD.decode(raw).map_err(|error| {
+                refused("internal_error", format!("bad fixture: {error}"))
+            })?;
+            return Ok(Surfaced { body, binary: true });
+        }
+        if method == "private_content.query" {
+            return Ok(Surfaced::plain(raw.as_bytes().to_vec()));
+        }
         let value: serde_json::Value = match serde_json::from_str(raw) {
             Ok(value) => value,
             Err(error) => return Err(refused("internal_error", format!("bad fixture: {error}"))),
         };
-        // Cerebellum sends both answers and refusals as bare response bodies. Preserve the
-        // fixture bytes so the rig cannot hide a client that expects a result envelope.
-        if method == "private_content.query" {
-            return Ok(raw.as_bytes().to_vec());
-        }
         // Basal refuses with an error frame, while its successful fixture includes result.
         if value.get("code").is_some() {
             return Err(raw.as_bytes().to_vec());
         }
-        return Ok(raw.as_bytes().to_vec());
+        return Ok(Surfaced::plain(raw.as_bytes().to_vec()));
     }
     // An unmatched private-content query returns marked=true if the fixture file names any
     // recognized source. This lets a test model Cerebellum continuing to find private content.
     if method == "private_content.query" {
         let marked = ["person_browser", "desktop_app", "signed_in_site"]
             .iter().any(|source| text.contains(source));
-        return Ok(serde_json::to_vec(&serde_json::json!({
-            "private_content": marked, "sources": []
-        }))
-        .unwrap_or_default());
+        return Ok(Surfaced::plain(
+            serde_json::to_vec(&serde_json::json!({
+                "private_content": marked, "sources": []
+            }))
+            .unwrap_or_default(),
+        ));
+    }
+    if method == "image.resolve" {
+        return Ok(Surfaced::plain(br#"{"outcome":"image_unavailable"}"#.to_vec()));
     }
     Err(refused(
         "unknown_method",
         format!("the stand-in surface does not serve {method}"),
     ))
+}
+
+/// A fixture's answer: the reply body, and whether it is a binary body rather than JSON.
+#[derive(Debug)]
+struct Surfaced {
+    body: Vec<u8>,
+    binary: bool,
+}
+
+impl Surfaced {
+    fn plain(body: Vec<u8>) -> Self {
+        Self { body, binary: false }
+    }
 }
 fn append(path: &PathBuf, line: &str) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
@@ -404,6 +444,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_resolution_fixtures_are_scoped_by_handle_and_answer_binary() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/scratch/image-fixtures-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixtures.json");
+        let image = b"abc";
+        // SHA-256 of `abc`, so the test needs no hash dependency for three fixture bytes.
+        let head = br#"{"content_type":"image/png","length":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}"#;
+        let mut body = (head.len() as u32).to_be_bytes().to_vec();
+        body.extend_from_slice(head);
+        body.extend_from_slice(image);
+        let stdout = STANDARD.encode(&body);
+        std::fs::write(&path, serde_json::json!([{
+            "match":{"method":"image.resolve","scope_ref":"run","handle":"ih123"},"stdout":stdout
+        }]).to_string()).unwrap();
+        let answered = answer(&path, "image.resolve", &serde_json::json!({"handle":"ih123","scope_ref":"run"})).unwrap();
+        assert!(answered.binary);
+        assert_eq!(answered.body, body);
+        for params in [serde_json::json!({"handle":"foreign","scope_ref":"run"}), serde_json::json!({"handle":"ih123","scope_ref":"foreign"})] {
+            let refused = answer(&path, "image.resolve", &params).unwrap();
+            assert!(!refused.binary);
+            assert_eq!(refused.body, br#"{"outcome":"image_unavailable"}"#);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn private_content_rejects_unknown_params_with_a_normal_refusal_body() {
         let response = answer(
             &PathBuf::new(),
@@ -412,7 +479,8 @@ mod tests {
                 "scope_ref": "run", "owner": {"kind": "reserved", "module_id": "broca"}
             }),
         )
-        .unwrap();
+        .unwrap()
+        .body;
         // Cerebellum fbcc6766, crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json.
         // Whole-file SHA-256 (provenance only, not body bytes):
         // 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc.
@@ -428,7 +496,8 @@ mod tests {
                 "scope_ref": "run", "parent_scope_ref": "head"
             }),
         )
-        .unwrap();
+        .unwrap()
+        .body;
         // Cerebellum fbcc6766, crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json.
         // Whole-file SHA-256 (provenance only, not body bytes):
         // e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2.
@@ -457,10 +526,10 @@ mod tests {
             std::fs::write(&fixture, serde_json::json!([{
                 "match": {"method": "private_content.query", "scope_ref": "test-session"}, "stdout": body
             }]).to_string()).unwrap();
-            let bytes = answer(&fixture, "private_content.query", &serde_json::json!({"scope_ref": "test-session"})).unwrap();
+            let bytes = answer(&fixture, "private_content.query", &serde_json::json!({"scope_ref": "test-session"})).unwrap().body;
             assert_eq!(bytes, body.as_bytes());
             if body.contains("signed_in_site") {
-                let fallback = answer(&fixture, "private_content.query", &serde_json::json!({"scope_ref": "other-scope"})).unwrap();
+                let fallback = answer(&fixture, "private_content.query", &serde_json::json!({"scope_ref": "other-scope"})).unwrap().body;
                 assert_eq!(fallback, br#"{"private_content":true,"sources":[]}"#);
             }
         }
@@ -494,7 +563,7 @@ mod tests {
                 "match": {"method": "flow.private_content_providers"}, "stdout": body
             }]).to_string()).unwrap();
             let response = answer(&fixture, "flow.private_content_providers", &serde_json::json!({"flow_id": "flow"}));
-            let bytes = if refused { response.unwrap_err() } else { response.unwrap() };
+            let bytes = if refused { response.unwrap_err() } else { response.unwrap().body };
             assert_eq!(bytes, body.as_bytes());
         }
         std::fs::remove_dir_all(root).unwrap();

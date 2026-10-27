@@ -218,6 +218,7 @@ fn publish_json_bytes(
         .open(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    publication_ready(path)?;
     fs::rename(&temp, path)?;
     sync_dir(parent)?;
     if let Some(publication) = publication {

@@ -21,14 +21,14 @@ use std::time::Duration;
 use broca_protocol::BindIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::connection::{ConnError, RouteOpenRetry, SubcConnection};
 
 /// The module whose management surface answers `private_content.query`.
 pub const CEREBELLUM_MODULE: &str = "cerebellum";
 
-/// The one operation broca calls on cerebellum's management surface. Cerebellum refuses every
-/// other operation on a route bound as `reserved:broca`; broca never asks for one.
+/// The private-content operation on cerebellum's `reserved:broca` management surface.
 pub const PRIVATE_CONTENT_QUERY: &str = "private_content.query";
 
 /// How long one query waits for its reply. The daemon and cerebellum answer from their own
@@ -151,15 +151,77 @@ struct Answer {
     sources: Vec<String>,
 }
 
-/// Asks cerebellum one `private_content.query`.
+/// Cerebellum management client for privacy marks and screenshot resolution.
 pub struct PrivateContentClient {
     conn: Arc<SubcConnection>,
     identity: BindIdentity,
 }
 
+/// A resolved screenshot: the content type the capture declared, and the image's own encoded
+/// bytes, exactly as the capture reply carried them.
+///
+/// The bytes are checked against the reply's head (length and SHA-256) before this is built,
+/// so a caller receives only bytes Cerebellum sent intact. Image bytes stay in memory until
+/// the provider request completes; never persist or log them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedImage {
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageResolveError {
+    Unavailable,
+    SourceUnavailable,
+    InvalidReply,
+    /// The daemon refused to deliver Cerebellum's reply because it was larger than a
+    /// module-to-client frame may be (`MAX_DELIVERED_FRAME_LEN`, 4 MiB with the header). The
+    /// reply carries the image bytes raw, so the image itself is nearly 4 MiB: this is
+    /// a property of the image, not a missing or expired handle.
+    TooLarge,
+}
+
 impl PrivateContentClient {
     pub fn new(conn: Arc<SubcConnection>, identity: BindIdentity) -> Self {
         Self { conn, identity }
+    }
+
+    /// Resolve only refs from the daemon stamp, never scope names supplied by tool arguments.
+    pub async fn resolve_image(
+        &self,
+        handle: &str,
+        scope_ref: &str,
+        parent_scope_ref: Option<&str>,
+    ) -> Result<ResolvedImage, ImageResolveError> {
+        let route = self
+            .conn
+            .route_open_management_within(
+                CEREBELLUM_MODULE,
+                &self.identity,
+                RouteOpenRetry::within(Duration::ZERO, Duration::ZERO),
+            )
+            .await
+            .map_err(|_| ImageResolveError::SourceUnavailable)?;
+        let mut params = json!({"handle":handle,"scope_ref":scope_ref});
+        if let Some(parent) = parent_scope_ref {
+            params["parent_scope_ref"] = json!(parent);
+        }
+        let body = serde_json::to_vec(&json!({"method":"image.resolve","params":params}))
+            .expect("image resolution request encodes");
+        let reply = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            self.conn.route_unary_reply(&route, body, QUERY_TIMEOUT),
+        )
+        .await;
+        let _ = self.conn.route_close(&route).await;
+        match reply {
+            Ok(Ok(Ok(bytes))) => decode_image(&bytes),
+            Ok(Ok(Err(error))) if error.code == subc_protocol::error_codes::FRAME_TOO_LARGE => {
+                Err(ImageResolveError::TooLarge)
+            }
+            Ok(Ok(Err(_))) => Err(ImageResolveError::Unavailable),
+            _ => Err(ImageResolveError::SourceUnavailable),
+        }
     }
 
     /// Ask whether `scope_ref` read the person's private content.
@@ -204,6 +266,45 @@ impl PrivateContentClient {
         let _ = self.conn.route_close(&route).await;
         reply
     }
+}
+
+/// Longest head a successful `image.resolve` reply may carry. The head is three small members
+/// (`content_type`, `sha256`, `length`); anything larger is not the published shape.
+const MAX_RESOLVE_HEAD_LEN: usize = 4 * 1024;
+
+/// The closed head of a successful binary `image.resolve` reply: the content type, the lowercase
+/// hex SHA-256 of the bytes after the head, and their count in bytes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveHead {
+    content_type: String,
+    sha256: String,
+    length: u64,
+}
+
+/// Decode a binary `image.resolve` reply body: a `u32` big-endian head length, the head as
+/// JSON, then the image's own encoded bytes. Length and digest are checked first: only bytes
+/// that match the head reach the inline image checks. A JSON refusal body is Cerebellum's
+/// refusal, and anything else that is not a well-formed success frame is malformed; both
+/// refuse the same way, so no reply tells a caller which handle state it hit.
+fn decode_image(bytes: &[u8]) -> Result<ResolvedImage, ImageResolveError> {
+    let unavailable = ImageResolveError::Unavailable;
+    let head_len = bytes
+        .get(..4)
+        .and_then(|prefix| <[u8; 4]>::try_from(prefix).ok())
+        .map(u32::from_be_bytes)
+        .filter(|len| (*len as usize) <= MAX_RESOLVE_HEAD_LEN)
+        .ok_or(unavailable)? as usize;
+    let rest = bytes.get(4..).ok_or(unavailable)?;
+    let (head, image) = rest.split_at_checked(head_len).ok_or(unavailable)?;
+    let head: ResolveHead = serde_json::from_slice(head).map_err(|_| unavailable)?;
+    if head.length != image.len() as u64 || format!("{:x}", Sha256::digest(image)) != head.sha256 {
+        return Err(unavailable);
+    }
+    Ok(ResolvedImage {
+        content_type: head.content_type,
+        bytes: image.to_vec(),
+    })
 }
 
 fn request_body(
@@ -288,6 +389,271 @@ fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One binary `image.resolve` success body: the head JSON, then the image bytes.
+    fn success_body(content_type: &str, image: &[u8]) -> Vec<u8> {
+        let head = serde_json::to_vec(&serde_json::json!({
+            "content_type": content_type,
+            "length": image.len(),
+            "sha256": format!("{:x}", Sha256::digest(image)),
+        }))
+        .unwrap();
+        let mut body = (head.len() as u32).to_be_bytes().to_vec();
+        body.extend_from_slice(&head);
+        body.extend_from_slice(image);
+        body
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn image_resolve_uses_cerebellum_management_and_omits_absent_parent() {
+        for parent in [Some("stamped-parent"), None] {
+            let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+            let client = PrivateContentClient::new(
+                Arc::new(conn),
+                BindIdentity::new("project", "test", "images"),
+            );
+            let (reply, ()) = tokio::join!(
+                client.resolve_image(
+                    "ih0123456789abcdef0123456789abcdef",
+                    "stamped-scope",
+                    parent
+                ),
+                async {
+                    let open = module.next_request().await;
+                    let control: subc_control::ClientControlRequest =
+                        serde_json::from_slice(&open.body).unwrap();
+                    let subc_control::ClientControlRequest::RouteOpen { target, .. } = control
+                    else {
+                        panic!("not a route open")
+                    };
+                    assert_eq!(
+                        target,
+                        subc_protocol::RouteTarget::ManagementSurface {
+                            module_id: "cerebellum".into()
+                        }
+                    );
+                    assert!(module.reply(
+                        &open,
+                        serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
+                            route_channel: route.channel,
+                            route_epoch: route.epoch
+                        })
+                        .unwrap()
+                    ));
+                    let request = module.next_request().await;
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["method"], "image.resolve");
+                    assert_eq!(
+                        body["params"]["handle"],
+                        "ih0123456789abcdef0123456789abcdef"
+                    );
+                    assert_eq!(body["params"]["scope_ref"], "stamped-scope");
+                    if let Some(parent) = parent {
+                        assert_eq!(body["params"]["parent_scope_ref"], parent);
+                    } else {
+                        assert!(body["params"].get("parent_scope_ref").is_none());
+                    }
+                    assert!(module.reply(&request, success_body("image/png", b"abc")));
+                }
+            );
+            let reply = reply.unwrap();
+            assert_eq!(reply.content_type, "image/png");
+            assert_eq!(reply.bytes, b"abc");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn image_resolve_refusal_timeout_and_malformed_shape_are_distinct() {
+        for case in [
+            "refused",
+            "outcome",
+            "invalid",
+            "too_large",
+            "timeout",
+            "route",
+        ] {
+            let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+            let client = PrivateContentClient::new(
+                Arc::new(conn),
+                BindIdentity::new("project", "test", "images"),
+            );
+            let (reply, ()) = tokio::join!(client.resolve_image("handle", "scope", None), async {
+                let open = module.next_request().await;
+                if case == "route" {
+                    assert!(module.refuse(&open, "module_unavailable"));
+                    return;
+                }
+                assert!(module.reply(
+                    &open,
+                    serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
+                        route_channel: route.channel,
+                        route_epoch: route.epoch
+                    })
+                    .unwrap()
+                ));
+                let request = module.next_request().await;
+                match case {
+                    "refused" => {
+                        assert!(module.refuse(&request, "image_unavailable"));
+                    }
+                    "outcome" => {
+                        assert!(module.reply(&request, br#"{"outcome":"unavailable"}"#.to_vec()));
+                    }
+                    // A truncated frame, a wrong length or digest, an oversized head and an
+                    // unknown head field are all malformed success frames, refused as an
+                    // unavailable handle rather than retried as the same image.
+                    "invalid" => {
+                        assert!(
+                            module.reply(&request, success_body("image/png", b"abc")[..8].to_vec())
+                        );
+                    }
+                    // What the daemon sends in place of a reply too large to deliver.
+                    "too_large" => {
+                        assert!(module.refuse(&request, "frame_too_large"));
+                    }
+                    "timeout" => tokio::time::advance(QUERY_TIMEOUT + Duration::from_secs(1)).await,
+                    _ => unreachable!(),
+                }
+            });
+            let expected = match case {
+                "refused" | "outcome" | "invalid" => ImageResolveError::Unavailable,
+                "too_large" => ImageResolveError::TooLarge,
+                _ => ImageResolveError::SourceUnavailable,
+            };
+            assert!(matches!(reply, Err(error) if error == expected), "{case}");
+        }
+    }
+
+    // Cerebellum image-resolve-v1 vectors, copied as fixtures beside this crate
+    // (tests/fixtures/image-resolve-v1). The copies are byte-exact: the pins test below checks
+    // every file against SHA256SUMS before decoding anything.
+    fn image_vector(name: &str) -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/tests/fixtures/image-resolve-v1/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    fn image_vector_body(name: &str) -> Vec<u8> {
+        // Each JSON case pins the reply body as `body_utf8`; `success.bin` is the body itself.
+        if name.ends_with(".bin") {
+            return image_vector(name);
+        }
+        let case: Value = serde_json::from_slice(&image_vector(name)).unwrap();
+        case["reply"]["body_utf8"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    }
+
+    #[test]
+    fn image_resolve_fixtures_match_their_shasums() {
+        let pins = String::from_utf8(image_vector("SHA256SUMS")).unwrap();
+        let mut checked = 0;
+        for line in pins.lines() {
+            let (digest, name) = line.split_once("  ").unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(image_vector(name))),
+                digest,
+                "{name}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 5);
+    }
+
+    #[test]
+    fn image_resolve_success_vector_decodes_with_matching_digest() {
+        // The issuer hands out a handle only for an image of at most this many bytes, so the
+        // resolve reply fits in one daemon frame; pin the published value here.
+        assert_eq!(
+            cortexkit_model_batch::image::MAX_REFERENCE_IMAGE_BYTES,
+            4_128_768
+        );
+        let case: Value = serde_json::from_slice(&image_vector("success.json")).unwrap();
+        let body = image_vector("success.bin");
+        assert_eq!(
+            body.len(),
+            case["reply"]["body_length"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&body)),
+            case["reply"]["body_sha256"].as_str().unwrap()
+        );
+        let image = decode_image(&body).unwrap();
+        assert_eq!(image.content_type, "image/png");
+        assert!(
+            (image.bytes.len() as u64)
+                <= cortexkit_model_batch::image::MAX_REFERENCE_IMAGE_BYTES as u64
+        );
+        let head: Value = serde_json::from_slice(
+            &body[4..4 + u32::from_be_bytes(body[..4].try_into().unwrap()) as usize],
+        )
+        .unwrap();
+        assert_eq!(head["content_type"].as_str().unwrap(), image.content_type);
+        assert_eq!(head["length"].as_u64().unwrap(), image.bytes.len() as u64);
+        assert_eq!(
+            head["sha256"].as_str().unwrap(),
+            format!("{:x}", Sha256::digest(&image.bytes))
+        );
+    }
+
+    #[test]
+    fn image_resolve_corruptions_are_unavailable() {
+        let body = image_vector("success.bin");
+        let head_len = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+        let head: Value = serde_json::from_slice(&body[4..4 + head_len]).unwrap();
+        let image = &body[4 + head_len..];
+        let head_with = |head: Value| {
+            let head = serde_json::to_vec(&head).unwrap();
+            let mut framed = (head.len() as u32).to_be_bytes().to_vec();
+            framed.extend_from_slice(&head);
+            framed.extend_from_slice(image);
+            framed
+        };
+        let mut wrong_length = head.clone();
+        wrong_length["length"] = ((image.len() + 1) as u64).into();
+        let mut wrong_digest = head.clone();
+        wrong_digest["sha256"] = "0".repeat(64).into();
+        let mut unknown_field = head.clone();
+        unknown_field["unknown"] = "field".into();
+        let mut oversized = vec![0x00, 0x00, 0x10, 0x01];
+        oversized.extend_from_slice(&body[4..]);
+        for (what, framed) in [
+            ("truncated", body[..body.len() - 1].to_vec()),
+            ("cut head", body[..10].to_vec()),
+            ("wrong length", head_with(wrong_length)),
+            ("wrong digest", head_with(wrong_digest)),
+            ("unknown head field", head_with(unknown_field)),
+            ("oversized head", oversized),
+            ("not a frame", b"not a frame".to_vec()),
+        ] {
+            assert!(
+                matches!(decode_image(&framed), Err(ImageResolveError::Unavailable)),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_resolve_refusal_vector_is_unavailable() {
+        assert!(matches!(
+            decode_image(&image_vector_body("image-unavailable.json")),
+            Err(ImageResolveError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn image_resolve_unknown_field_vector_is_refused() {
+        // A malformed request is refused with `invalid_request`; from the host's side that is
+        // Cerebellum's refusal, answered `image_unavailable` like any other.
+        assert!(matches!(
+            decode_image(&image_vector_body("unknown-field.json")),
+            Err(ImageResolveError::Unavailable)
+        ));
+    }
 
     // Cerebellum fbcc6766, docs/contracts/private-content-query-v1.md.
     // These are reply bodies from the vectors below. Hashes identify the whole golden-file

@@ -72,7 +72,9 @@ impl InputTokenBudget {
                         .and_then(|budget| budget.max_input_tokens),
                 )?;
             }
-            WalRecord::ModelStepFinished { usage, .. } => self.observe(*usage),
+            // A refused call's input was sent and billed, so it is spent like any step's.
+            WalRecord::ModelStepFinished { usage, .. }
+            | WalRecord::ModelStepRefused { usage, .. } => self.observe(*usage),
             _ => {}
         }
         Ok(())

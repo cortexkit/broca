@@ -913,6 +913,19 @@ impl FileWalStore {
             // Extraction preserves the logical address and payload; session-ref
             // candidates need no location update.
             extraction::restore(&path, &member.payload, authority).map_err(WalError::Io)?;
+            let archive = if lookup.durable {
+                "wal-archive-durable"
+            } else {
+                "wal-archive"
+            };
+            broca_wal::archive::invalidate_restored_member(
+                &self
+                    .root
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .join(archive),
+                &session_addr(session),
+            );
             path
         } else if let Some(path) = self.resolve_live_path(session)? {
             path
@@ -1160,11 +1173,9 @@ impl FileWalStore {
             while let Some(path) =
                 paths.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
             {
-                if let Err(error) = broca_wal::archive::read_newest_member(
-                    std::slice::from_ref(path),
-                    "0000000000000000",
-                    self.max_read_bytes,
-                ) {
+                if let Err(error) =
+                    broca_wal::archive::prewarm_container_membership(path, self.max_read_bytes)
+                {
                     first_error
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -3376,6 +3387,10 @@ fn writer_loop(
     durable_head: Arc<AtomicU64>,
     lineage_id: Arc<Mutex<Option<broca_wal::WalLineageId>>>,
 ) {
+    use crate::durability_counters::{
+        deadline_ms_for, monotonic_now_ms_for, record_fsync, FsyncCause,
+    };
+
     // The seq of the last record APPENDED (coalesced, maybe not yet fsynced) and the
     // last record made DURABLE by a successful fsync. A control-stream cursor may only
     // advance to `last_fsynced_seq` — `last_appended_seq` includes records past the
@@ -3385,11 +3400,135 @@ fn writer_loop(
     let mut last_appended_seq = wal.last_seq();
     let mut last_fsynced_seq = wal.last_seq();
     let mut dirty = false;
-    let mut pending_observed = Vec::new();
+    // The sync deadline: the monotonic instant (in ms) by which dirty data must be
+    // synced. Set when an append makes a clean writer dirty, and never slid while
+    // dirty, so a queue that never empties cannot postpone the sync past it. Cleared
+    // whenever the writer goes clean, and also when a sync fails: the writer is then
+    // poisoned and must idle until close, not spin on a deadline that can never succeed.
+    let mut deadline_at_ms: Option<u64> = None;
+    let mut pending_observed: Vec<(u64, Box<WalRecord>)> = Vec::new();
     let has_tap = observer
         .as_ref()
         .is_some_and(|observer| observer.tap.is_some());
-    while let Ok(cmd) = rx.recv() {
+
+    // What the blocking wait below returned: a command, a bare timeout that
+    // carried no command, or proof the handle is gone.
+    enum Wait {
+        Command(WalCommand),
+        Empty,
+        Gone,
+    }
+
+    loop {
+        // One clock sample per dirty iteration; clean writers read no clock.
+        // The deadline is checked before every command on that sample: at most
+        // one command is handled past the deadline, so a queue that never
+        // empties still syncs on time. The same sample bounds the wait, so a
+        // dirty writer wakes at its deadline even when nothing arrives. A dirty
+        // writer with no deadline is poisoned (its sync already failed), so it
+        // idles like a clean one until close.
+        let wait = if dirty {
+            let now = monotonic_now_ms_for(fence);
+            if deadline_at_ms.is_some_and(|deadline| now >= deadline) {
+                let poison = current_poison(&poisoned);
+                if poison.is_none() {
+                    // Every fsync is counted by the path that issued it, for health.
+                    record_fsync(FsyncCause::Deadline, fence);
+                }
+                match sync_result(&*wal, &poison) {
+                    Ok(()) => {
+                        last_fsynced_seq = last_appended_seq;
+                        durable_head.store(last_fsynced_seq, Ordering::Release);
+                        dirty = false;
+                        deadline_at_ms = None;
+                        if let Some(obs) = &observer {
+                            if has_tap {
+                                for (seq, record) in &pending_observed {
+                                    obs.observe(*seq, fence, record);
+                                }
+                            } else {
+                                for (seq, record) in pending_observed.drain(..) {
+                                    obs.observe(seq, fence, &record);
+                                }
+                            }
+                        }
+                        if has_tap {
+                            if let Some(obs) = &observer {
+                                for (seq, record) in pending_observed.drain(..) {
+                                    obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        set_poison(&poisoned, error);
+                        deadline_at_ms = None;
+                    }
+                }
+            }
+            // Wait for the next command. The bound reuses the sample above: a
+            // still-installed deadline postdates it by definition (a due one
+            // just synced). A writer that just went clean or poisoned has no
+            // deadline, so it blocks in `recv()` until a command arrives.
+            if dirty {
+                match deadline_at_ms {
+                    Some(deadline) => {
+                        match rx.recv_timeout(std::time::Duration::from_millis(
+                            deadline.saturating_sub(now),
+                        )) {
+                            Ok(command) => Wait::Command(command),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Wait::Empty,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Wait::Gone,
+                        }
+                    }
+                    None => match rx.recv() {
+                        Ok(command) => Wait::Command(command),
+                        Err(_) => Wait::Gone,
+                    },
+                }
+            } else {
+                match rx.recv() {
+                    Ok(command) => Wait::Command(command),
+                    Err(_) => Wait::Gone,
+                }
+            }
+        } else {
+            match rx.recv() {
+                Ok(command) => Wait::Command(command),
+                Err(_) => Wait::Gone,
+            }
+        };
+        if matches!(wait, Wait::Gone) {
+            // A dropped handle closes like Shutdown: sync dirty data before exit.
+            if dirty {
+                let poison = current_poison(&poisoned);
+                if poison.is_none() {
+                    // Every fsync is counted by the path that issued it, for health.
+                    record_fsync(FsyncCause::Disconnect, fence);
+                }
+                match sync_result(&*wal, &poison) {
+                    Ok(()) => {
+                        last_fsynced_seq = last_appended_seq;
+                        durable_head.store(last_fsynced_seq, Ordering::Release);
+                        if let Some(obs) = &observer {
+                            for (seq, record) in pending_observed.drain(..) {
+                                obs.observe(seq, fence, &record);
+                                if has_tap {
+                                    obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => set_poison(&poisoned, error),
+                }
+            }
+            break;
+        }
+        // Group commit is unchanged: one sync still covers every append that
+        // preceded it.
+        let Wait::Command(cmd) = wait else {
+            continue;
+        };
         match cmd {
             #[cfg(test)]
             WalCommand::AppendDrained(ack) => {
@@ -3408,8 +3547,17 @@ fn writer_loop(
                         // handle's counter and the WAL drifted — a bug, not a runtime
                         // condition — so poison rather than write a wrong-cursor record.
                         Ok(assigned) if assigned == seq => {
+                            let became_dirty = !dirty;
                             last_appended_seq = assigned;
                             dirty = true;
+                            if became_dirty {
+                                // The deadline starts when the writer goes dirty and
+                                // never slides: later appends cannot postpone it.
+                                deadline_at_ms = Some(
+                                    monotonic_now_ms_for(fence)
+                                        .saturating_add(deadline_ms_for(fence)),
+                                );
+                            }
                             // A legacy file mints its identity on this first append.
                             *lineage_id.lock().unwrap() = wal.lineage_id();
                             // Keep observer delivery behind the same durability barrier as the
@@ -3436,10 +3584,14 @@ fn writer_loop(
                 // error even though the seqs happen to match.
                 let poison = current_poison(&poisoned);
                 let res = if dirty {
+                    if poison.is_none() {
+                        record_fsync(FsyncCause::Barrier, fence);
+                    }
                     sync_result(&*wal, &poison).map(|()| {
                         last_fsynced_seq = last_appended_seq;
                         durable_head.store(last_fsynced_seq, Ordering::Release);
                         dirty = false;
+                        deadline_at_ms = None;
                         if let Some(obs) = &observer {
                             if has_tap {
                                 for (seq, record) in &pending_observed {
@@ -3458,6 +3610,9 @@ fn writer_loop(
                 };
                 let res = res.map_err(|e| {
                     set_poison(&poisoned, e.clone());
+                    // The writer is poisoned now: drop the deadline with it, so
+                    // the loop idles instead of retrying a sync that cannot succeed.
+                    deadline_at_ms = None;
                     WalWriteError::Failed(e)
                 });
                 let durable = res.is_ok();
@@ -3473,6 +3628,9 @@ fn writer_loop(
             WalCommand::Shutdown(ack) => {
                 let poison = current_poison(&poisoned);
                 let result = if dirty {
+                    if poison.is_none() {
+                        record_fsync(FsyncCause::Shutdown, fence);
+                    }
                     sync_result(&*wal, &poison)
                 } else {
                     poison.map_or(Ok(()), Err)
@@ -4531,6 +4689,9 @@ mod tests {
 
 #[cfg(test)]
 mod archive_tests;
+
+#[cfg(test)]
+mod deadline_tests;
 
 #[cfg(test)]
 mod shutdown_tests;
