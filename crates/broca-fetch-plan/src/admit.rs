@@ -411,6 +411,11 @@ impl FetchError {
 /// them.
 #[async_trait]
 pub trait Fetcher: Send + Sync {
+    /// A declaration from the provider's daemon catalog entry, never guessed from
+    /// a version or learned by forwarding a request an older provider cannot read.
+    async fn system_text_default_supported(&self, _provider: &str) -> Result<bool, FetchError> {
+        Ok(false)
+    }
     /// One `tool.catalog` call to `provider`.
     async fn catalog(&self, provider: &str, request: &CatalogRequest) -> Result<Value, FetchError>;
     /// One `transform.declare` call to `provider`.
@@ -472,10 +477,7 @@ pub fn catalog_request(
     let mut request = tool_catalog_request(tool_item).with_composition(plan.composition.clone());
     if let Some(item) = text_item {
         request = request.with_system_text(SystemTextItem {
-            preset: item
-                .preset
-                .clone()
-                .expect("system-text presets are checked before fetching"),
+            preset: item.preset.clone(),
             params: item.params.clone(),
         });
     }
@@ -862,9 +864,8 @@ fn freeze_reply(reply: &cortexkit_role_tool_provider::catalog::Reply) -> broca_w
     }
 }
 
-/// The provider declarations a fetched answer carries, frozen so a later step reads a reply by
-/// what the provider declared at admission. `None` when it declared nothing, which keeps the
-/// manifest bytes of every provider that never opted in or never serves late results.
+/// Freeze catalog identities and reply declarations at admission so dispatch and
+/// display never depend on a provider's later catalog.
 fn frozen_provider_declarations(
     answer: &cortexkit_role_tool_provider::catalog::CatalogAnswer,
 ) -> Option<FrozenProviderDeclarations> {
@@ -881,13 +882,25 @@ fn frozen_provider_declarations(
         })
         .collect();
     let declarations = FrozenProviderDeclarations {
+        schema_pins: (!answer.tools.is_empty()).then(|| {
+            answer
+                .tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.name.clone(),
+                        broca_wal::DispatchSchemaPin {
+                            schema_digest: tool.schema_digest.clone(),
+                            semantics: tool.semantics,
+                        },
+                    )
+                })
+                .collect()
+        }),
         result_formats: (!result_formats.is_empty()).then_some(result_formats),
         late_results: answer
             .declares(cortexkit_role_tool_provider::catalog::session_capabilities::LATE_RESULTS)
             .then_some(true),
-        // Catalog schema pins are left unset: this build reads pins a later build froze into a
-        // manifest, but never freezes them itself.
-        ..Default::default()
     };
     (!declarations.is_empty()).then_some(declarations)
 }
@@ -1107,6 +1120,29 @@ pub async fn admit(
 ) -> Result<Admitted, Refusal> {
     let started = Instant::now();
     let deadline = started + deadline;
+    for item in plan
+        .system_text_items
+        .iter()
+        .filter(|item| item.preset.is_none())
+    {
+        let supported = within_deadline(deadline, || {
+            fetcher.system_text_default_supported(&item.provider)
+        })
+        .await
+        .map_err(|error| {
+            let missed = FetchMiss::from_error(error);
+            Refusal::FetchUnavailable {
+                provider: item.provider.clone(),
+                unanswered: missed.unanswered.clone(),
+                provider_detail: missed.provider_detail("catalog.list"),
+            }
+        })?;
+        if !supported {
+            return Err(Refusal::SystemTextPresetRequired {
+                provider: item.provider.clone(),
+            });
+        }
+    }
     let mut catalog_fetches: Vec<CatalogFetch<'_>> = Vec::new();
     for item in plan.tool_items.iter().chain(&plan.system_text_items) {
         if catalog_fetches.iter().all(|f| f.provider != item.provider) {
@@ -1443,7 +1479,7 @@ pub async fn admit(
             Err(ItemRefusal::InvalidParams(detail)) => {
                 return Err(Refusal::InvalidParams {
                     detail: serde_json::to_value(detail).expect("JSON"),
-                })
+                });
             }
         }
     }
@@ -1611,7 +1647,7 @@ fn check_default_item(
             Err(problem) => {
                 return Err(ItemRefusal::InvalidParams(InvalidSubscriptionDetail::new(
                     item, index, problem,
-                )))
+                )));
             }
         }
     }
@@ -1911,6 +1947,103 @@ mod tests {
             "tools": [],
             "system_text": system_text
         })
+    }
+
+    #[test]
+    fn catalog_schema_pin_is_frozen_instead_of_recomputed_from_a_later_catalog() {
+        let digest = "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335";
+        let mut answer: cortexkit_role_tool_provider::catalog::CatalogAnswer = serde_json::from_value(json!({
+            "generation":"one", "catalog_digest":"one", "tools":[{
+                "name":"work", "input_schema":{"type":"object"}, "schema_digest":digest, "semantics":7, "capabilities":[]
+            }]
+        })).unwrap();
+        let frozen = frozen_provider_declarations(&answer).unwrap();
+        answer.tools[0].schema_digest = "0".repeat(64);
+        answer.tools[0].semantics = 99;
+        let round_trip: FrozenProviderDeclarations =
+            serde_json::from_slice(&serde_json::to_vec(&frozen).unwrap()).unwrap();
+        let pin = &round_trip.schema_pins.as_ref().unwrap()["work"];
+        assert_eq!(pin.schema_digest, digest);
+        assert_eq!(pin.semantics, 7);
+        assert_eq!(
+            cortexkit_role_tool_provider::call::SchemaPin::new(
+                "work",
+                &pin.schema_digest,
+                pin.semantics
+            )
+            .encode()
+            .unwrap(),
+            format!("tp1:work:{digest}:7")
+        );
+        assert!(FrozenProviderDeclarations::default().schema_pins.is_none());
+    }
+
+    struct DefaultTextFetcher {
+        supported: bool,
+        answer: Value,
+        requests: std::sync::Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl Fetcher for DefaultTextFetcher {
+        async fn system_text_default_supported(&self, _: &str) -> Result<bool, FetchError> {
+            Ok(self.supported)
+        }
+        async fn catalog(&self, _: &str, request: &CatalogRequest) -> Result<Value, FetchError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(request).unwrap());
+            Ok(self.answer.clone())
+        }
+        async fn declare(&self, _: &str, _: &DeclareRequest) -> Result<Value, FetchError> {
+            unreachable!()
+        }
+        async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn presetless_system_text_is_catalog_gated_and_frozen() {
+        let composition =
+            json!({"providers":[{"provider":"persona","tools":[]}],"step_transform_items":[]});
+        let raw = json!({"tool_items":[],"system_text_items":[{"provider":"persona","params":{}}],"step_transform_items":[],
+            "composition_digest":cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap(),"composition":composition});
+        let plan = crate::parse_plan(&raw, crate::CompactionSupport::Unsupported).unwrap();
+        let text = "frozen provider default";
+        let session =
+            broca_protocol::BindIdentity::new("/synthetic/default-text", "runner", "default-text");
+        for supported in [false, true] {
+            let mut fetcher = DefaultTextFetcher {
+                supported,
+                answer: catalog_answer(
+                    &plan,
+                    Some(text),
+                    &cortexkit_role_tool_provider::catalog::system_text_digest(text),
+                ),
+                requests: Default::default(),
+            };
+            let result = admit(&plan, &fetcher, &session, Duration::from_secs(1)).await;
+            if !supported {
+                let refusal = result.unwrap_err();
+                assert_eq!(refusal.code(), "system_text_preset_required");
+                assert_eq!(refusal.detail(), json!({"provider":"persona"}));
+                assert!(!refusal.retryable());
+                assert!(fetcher.requests.lock().unwrap().is_empty());
+            } else {
+                let admitted = result.unwrap();
+                let requests = fetcher.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(requests[0]["system_text"].get("preset").is_none());
+                assert_eq!(admitted.manifest.system_text, text);
+                fetcher.answer["system_text"]["text"] = json!("later catalog text");
+                let stored = serde_json::to_vec(&admitted.manifest).unwrap();
+                let restored: broca_wal::PlanManifest = serde_json::from_slice(&stored).unwrap();
+                assert_eq!(restored.system_text, text);
+                assert_eq!(requests.len(), 1);
+            }
+        }
     }
 
     async fn run_fetch(plan: &Plan, answer: Result<Value, FetchError>, session: &str) {
@@ -2376,24 +2509,5 @@ mod tests {
             !lines[0].contains(&format!("refusal_field=Some(\"{field}\")")),
             "the full refusal field reached the warning"
         );
-    }
-
-    /// This build reads catalog schema pins from a manifest but never freezes one: a catalog
-    /// answer whose tools carry a schema digest and semantics version admits with no pin, so a
-    /// fresh admission here writes no `schema_pins` and its frame needs no pin feature.
-    #[test]
-    fn admission_on_this_build_freezes_no_schema_pin() {
-        let answer: cortexkit_role_tool_provider::catalog::CatalogAnswer =
-            serde_json::from_value(json!({
-                "generation":"one", "catalog_digest":"one", "tools":[{
-                    "name":"work", "input_schema":{"type":"object"},
-                    "schema_digest":"634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335",
-                    "semantics":7, "capabilities":[]
-                }]
-            }))
-            .unwrap();
-        assert_eq!(answer.tools.len(), 1, "the answer offers a pinnable tool");
-        // Nothing else was declared, so no declaration is frozen at all.
-        assert_eq!(frozen_provider_declarations(&answer), None);
     }
 }

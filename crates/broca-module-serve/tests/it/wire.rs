@@ -6732,11 +6732,12 @@ async fn moved_tombstone_refuses_every_read_and_send_with_the_real_wire_golden()
 #[tokio::test]
 async fn reader_release_refuses_first_time_activation_fence_without_any_sidecar() {
     let mut route = PreparedWalRoute::start("activation-fence-wire", |_| {}).await;
-    let reference = cortexkit_role_llm_runner::session_ref(
-        "runner",
-        &route.dir.join("proj").to_string_lossy(),
-        "s1",
-    );
+    let reference =
+        cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+            runner: "broca",
+            harness: "runner",
+            session: "s1",
+        });
     let authority = route.dir.join("agent-data/cuts/cut-a.json");
     broca_wal::migration::atomic_json(&route.dir, &authority, &serde_json::json!({"step":"imported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"activate","request":{}}})).unwrap();
     let before = std::fs::read(&route.wal_path).unwrap();
@@ -6754,11 +6755,12 @@ async fn reader_release_refuses_first_time_activation_fence_without_any_sidecar(
 #[tokio::test]
 async fn pending_release_fence_outranks_a_tombstone_for_mutations_but_not_reads() {
     let mut route = PreparedWalRoute::start("pending-release-wire", |_| {}).await;
-    let reference = cortexkit_role_llm_runner::session_ref(
-        "runner",
-        &route.dir.join("proj").to_string_lossy(),
-        "s1",
-    );
+    let reference =
+        cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+            runner: "broca",
+            harness: "runner",
+            session: "s1",
+        });
     broca_wal::migration::atomic_json(&route.dir, &route.dir.join("agent-data/cuts/cut-a.json"),&serde_json::json!({"step":"exported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"release","request":{}}})).unwrap();
     broca_wal::migration::atomic_json(
         &route.dir,
@@ -6958,11 +6960,12 @@ async fn protected_moved_route(first: &str, pending_release: bool) -> PreparedWa
     )
     .await;
     if pending_release {
-        let reference = cortexkit_role_llm_runner::session_ref(
-            "runner",
-            &route.dir.join("proj").to_string_lossy(),
-            "s1",
-        );
+        let reference =
+            cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+                runner: "broca",
+                harness: "runner",
+                session: "s1",
+            });
         broca_wal::migration::atomic_json(&route.dir, &route.dir.join("agent-data/cuts/cut-a.json"),
             &serde_json::json!({"step":"exported","refs":[{"ref_kind":"broca-session","ref":reference}],"intent":{"op":"release","request":{}}})).unwrap();
     }

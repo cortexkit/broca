@@ -204,6 +204,7 @@ async fn placed_aft_requires_a_scoped_preset_and_worker_read_bash_watch_succeed(
         schema_pin: None,
         origin: None,
         preset: None,
+        output_refs: None,
     })
     .unwrap();
     let refusal = conn

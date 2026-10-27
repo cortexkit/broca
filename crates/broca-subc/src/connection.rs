@@ -1829,14 +1829,14 @@ impl SubcConnection {
             // This unkeyed API has no intake registration or provider-declaration context.
             // Eligible dispatch keys go through the tool plane's guarded staged path instead.
             call_key: None,
-            // Not sent yet, for the same reason: the pin's content is defined by the
-            // tool-provider role, and broca sends one only after it freezes each tool's pin at
-            // admission and the receiving provider checks it.
+            // This unkeyed API has no admitted provider definition. Agent dispatch
+            // carries its frozen pin through the guarded staged path instead.
             schema_pin: None,
             // broca dispatches its own model's calls; it relays nobody else's, so there is no
             // relayed origin to attribute.
             origin: None,
             preset: preset.map(str::to_owned),
+            output_refs: None,
         })
         .map_err(|e| ConnError::Transport(e.to_string()))?;
         self.send_tool_call_body(route, deadline, name, body).await
@@ -1924,6 +1924,7 @@ impl SubcConnection {
             schema_pin: schema_pin.map(str::to_owned),
             origin: None,
             preset: preset.map(str::to_owned),
+            output_refs: None,
         };
         let body = serde_json::to_string(&envelope)
             .map_err(|error| ConnError::Protocol(error.to_string()))?;
@@ -4160,7 +4161,7 @@ mod tests {
                             capabilities: capabilities.iter().map(|item| (*item).into()).collect(),
                             connected_clients: 1, counters: None,
                             build_git_sha: None, build_lock_digest: None,
-                            capability_requirements: vec![], machine_id: None,
+                            capability_requirements: vec![], machine_id: None, config_path: None,
                         };
                         assert!(module.reply(&request, serde_json::to_vec(&reply).unwrap()));
                     }
@@ -5112,6 +5113,7 @@ mod tests {
             schema_pin: None,
             origin: None,
             preset: None,
+            output_refs: None,
         })
         .unwrap();
         serde_json::from_slice(&bytes).unwrap()

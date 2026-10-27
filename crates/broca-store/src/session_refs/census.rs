@@ -176,7 +176,14 @@ pub(super) fn run(
                     for frame in records {
                         if let broca_wal::WalRecord::RunStarted { session, .. } = frame.record {
                             if broca_core::session_addr(&session) == address {
-                                candidates.insert(broca_core::agent_session_ref(&session), session);
+                                candidates.insert(
+                                    broca_core::wal_writer::legacy_session_ref(
+                                        &session.harness,
+                                        &session.project_root.to_string_lossy(),
+                                        &session.session,
+                                    ),
+                                    session,
+                                );
                             }
                         }
                     }

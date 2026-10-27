@@ -11,13 +11,29 @@ pub use cortexkit_role_agent_data::{
     import, ops, prepare, refs, release, request, status, step, EmptyReply, Op, ADMITTED_CALLER,
     MAX_REFS, PROVIDES, REQUIRED_OPS, ROLE, SERVICE_ID, VERSION,
 };
-pub use cortexkit_role_llm_runner::session_ref;
+pub fn session_ref(harness: &str, _project_root: &str, session: &str) -> String {
+    cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+        runner: "broca",
+        harness,
+        session,
+    })
+}
+
+/// Accept old folder-based handles as well as the current external identity.
+pub fn matches_session_ref(
+    reference: &str,
+    harness: &str,
+    project_root: &str,
+    session: &str,
+) -> bool {
+    reference == session_ref(harness, project_root, session)
+        || reference == broca_core::wal_writer::legacy_session_ref(harness, project_root, session)
+}
 
 /// The kind entorhinal uses to route a registered broca session to this participant.
 pub const BROCA_SESSION_REF_KIND: &str = "broca-session";
 
-/// A session's agent-data ref, over the bind triple exactly as carried.
-/// Paths are not normalised: even a trailing slash changes the shared handle.
+/// A session's external reference, independent of its folder spelling.
 pub fn session_reference(harness: &str, project_root: &str, session: &str) -> refs::Ref {
     refs::Ref::new(
         BROCA_SESSION_REF_KIND,
