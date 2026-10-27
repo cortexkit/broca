@@ -456,9 +456,17 @@ impl LateResultsIntake {
                 provider_incarnation: reply.cursor.provider_incarnation.clone(),
                 seq: reply.cursor.seq,
             });
-            // Settling the pinned reply never acks it: any ack covering it would pass the pin.
+            // While anything in the pinned reply is unsettled it is never acked: any ack
+            // covering it would pass the pin.
             let (settled, still) = self.settle(module, &reply.entries).await?;
             if still.is_empty() {
+                // Every entry of the reply settled, so nothing pins the ack any more. The reply
+                // was read from the acked position, so its cursor covers only settled entries.
+                // Without this ack the feed would stay unacked for as long as the puller lives.
+                puller.set_pinned(Vec::new());
+                if !reply.entries.is_empty() {
+                    self.ack(module, &reply.cursor, &reply.entries).await?;
+                }
                 if !reply.more {
                     return Ok(());
                 }
@@ -559,10 +567,19 @@ impl LateResultsIntake {
                 // A delivery is this module's only settlement that needs the run, so it is
                 // handed over before anything can ack the entry's position. A delivery that
                 // could not be made leaves the entry exactly where it was.
-                if let Err(_reason) = self
+                if let Err(reason) = self
                     .deliver_settled(module, std::slice::from_ref(entry), &rows)
                     .await
                 {
+                    // The entry is retried from its pin on a later pull. The reason names the
+                    // failure only, never the entry's result, so it is safe at INFO.
+                    tracing::info!(
+                        target: "late_results",
+                        module,
+                        call_key = entry.call_key,
+                        event_id = entry.event_id,
+                        "late-results delivery not made; the entry stays pinned: {reason}"
+                    );
                     pinned.push(key);
                     continue;
                 }
@@ -2243,5 +2260,284 @@ mod tests {
         assert_eq!(rig.feed.pulls().len(), 1);
         assert!(rig.feed.acks().is_empty(), "{:?}", rig.feed.acks());
         assert!(!rig.store.feed("tools").unwrap().unwrap().ack_owed);
+    }
+
+    /// An entry whose first delivery failed is pinned. Once a later round settles it, the pin
+    /// is cleared and the entry is acked, so the feed does not stay unacked for good.
+    #[tokio::test]
+    async fn a_pinned_entry_that_later_settles_is_acked_and_unpinned() {
+        let call_key = "lineage:4";
+        let bind = session("held");
+        let rig = Rig::new(
+            "pin-settles",
+            Some((call_key, "tools", bind.clone())),
+            vec![registration(call_key, "tools", &bind)],
+        )
+        .await;
+        let puller = rig.puller("tools");
+        let page = || reply(vec![entry(kinds::RESULT, call_key, "ev-1")], 1, false);
+        rig.feed.replies(vec![page(), page()]);
+        // The first delivery fails the way a delivery that waited too long for the run fails.
+        *rig.delivery.refuse.lock().unwrap() =
+            Some("the run did not sync the held call's terminal in time".into());
+        rig.intake.tick("tools").await.unwrap();
+        assert!(rig.feed.acks().is_empty());
+        assert_eq!(
+            puller.pinned(),
+            vec![entry(kinds::RESULT, call_key, "ev-1").intake_key("tools")]
+        );
+
+        *rig.delivery.refuse.lock().unwrap() = None;
+        rig.intake.tick("tools").await.unwrap();
+        assert_eq!(
+            rig.delivery.delivered.lock().unwrap().clone(),
+            vec![(call_key.to_owned(), "ev-1".to_owned())]
+        );
+        assert_eq!(
+            rig.feed.acks(),
+            vec![cursor(1)],
+            "the pinned entry settled, so its page is acked; pinned={:?}",
+            puller.pinned()
+        );
+        assert!(puller.pinned().is_empty(), "{:?}", puller.pinned());
+        let feed = rig.store.feed("tools").unwrap().unwrap();
+        assert_eq!(feed.position.map(|position| position.seq), Some(1));
+        assert!(!feed.ack_owed);
+    }
+
+    /// A provider feed that keeps what it publishes: a pull answers every entry after `since`
+    /// (or after the acked position, whichever is later), and the cursor is the entry count.
+    #[derive(Default)]
+    struct KeepingFeed {
+        entries: Mutex<Vec<LateEntry>>,
+        acked: Mutex<u64>,
+        acks: Mutex<Vec<(u64, tokio::time::Instant)>>,
+        pulls: Mutex<Vec<(Option<u64>, tokio::time::Instant)>>,
+        changed: tokio::sync::Notify,
+    }
+
+    impl KeepingFeed {
+        /// Wait, on the test's clock, until `done` holds for this feed.
+        async fn wait_until(&self, done: impl Fn(&Self) -> bool) {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if done(self) {
+                    return;
+                }
+                changed.await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LateResultsFeed for KeepingFeed {
+        async fn pull(
+            &self,
+            _module: &str,
+            since: Option<&Cursor>,
+            _limit: Option<u32>,
+        ) -> Result<FeedReply, FeedError> {
+            self.pulls
+                .lock()
+                .unwrap()
+                .push((since.map(|cursor| cursor.seq), tokio::time::Instant::now()));
+            let entries = self.entries.lock().unwrap().clone();
+            let from = since.map_or(0, |cursor| cursor.seq);
+            let start = from.max(*self.acked.lock().unwrap()) as usize;
+            self.changed.notify_waiters();
+            Ok(FeedReply {
+                entries: entries.iter().skip(start).cloned().collect(),
+                cursor: cursor(entries.len() as u64),
+                more: false,
+            })
+        }
+
+        async fn ack(&self, _module: &str, through: &Cursor) -> Result<(), FeedError> {
+            {
+                let mut acked = self.acked.lock().unwrap();
+                *acked = (*acked).max(through.seq);
+            }
+            self.acks
+                .lock()
+                .unwrap()
+                .push((through.seq, tokio::time::Instant::now()));
+            self.changed.notify_waiters();
+            Ok(())
+        }
+    }
+
+    /// A session actor that loses the first resume request, as an actor that does not keep a
+    /// request arriving while its run is still pausing would. Every later request resumes the
+    /// paused batch, whose held call waits in its slot again.
+    struct LosesFirstResume {
+        slots: Arc<crate::held_slots::HeldSlots>,
+        lose_next: std::sync::atomic::AtomicBool,
+        resumes: Mutex<Vec<(bool, tokio::time::Instant)>>,
+        taken_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+        call_key: String,
+    }
+
+    #[async_trait]
+    impl crate::held_slots::HeldRunResumer for LosesFirstResume {
+        async fn resume_for_late_result(&self, session: &BindIdentity) -> Result<(), String> {
+            use broca_core::tool_plane::ProviderHeldLifecycle as _;
+            let lost = self
+                .lose_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            self.resumes
+                .lock()
+                .unwrap()
+                .push((lost, tokio::time::Instant::now()));
+            if lost {
+                return Ok(());
+            }
+            let slots = Arc::clone(&self.slots);
+            let taken_at = Arc::clone(&self.taken_at);
+            let bind = session.clone();
+            let call_key = self.call_key.clone();
+            tokio::spawn(async move {
+                let ctx = broca_core::tool_plane::BatchCtx {
+                    batch_id: BatchId("b".into()),
+                    bind,
+                    run_id: RunId("run".into()),
+                    scope: None,
+                    media_capture: None,
+                };
+                let call = broca_protocol::ToolCall {
+                    tool_call_id: ToolCallId("a".into()),
+                    tool_name: "ask".into(),
+                    input: json!({}),
+                    thought_signature: None,
+                };
+                let reply = broca_core::tool_plane::ProviderHeldReply {
+                    tool_call_id: ToolCallId("a".into()),
+                    call_key,
+                    module: "tools".into(),
+                    reason: "running".into(),
+                    detail_digest: None,
+                };
+                let _ = slots.wait(&ctx, &call, &reply).await;
+                *taken_at.lock().unwrap() = Some(tokio::time::Instant::now());
+                slots.terminal_synced(&ctx, &call.tool_call_id).await;
+            });
+            Ok(())
+        }
+    }
+
+    /// The whole delivery chain on a paused clock: the spawned puller loop, `HeldSlots` and
+    /// `SlotDelivery`. The entry is published before the first pull, and the first resume
+    /// request is lost, so the first delivery times out and pins the entry. The next pull after
+    /// the timeout delivers it from the pin and acks it once; later pulls read from the acked
+    /// position instead of re-reading the feed from its start.
+    #[tokio::test(start_paused = true)]
+    async fn a_delivery_that_times_out_is_delivered_from_its_pin_and_acked() {
+        let call_key = "lineage:4";
+        let bind = session("held");
+        let root = rig_root("timed-out-delivery");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let wal = Arc::new(FileWalStore::new(root.join("wal")));
+        write_wal(&wal, &bind, &held_records(call_key, "tools", &bind));
+        let store = Arc::new(LateResultsStore::open(&root.join("late-results.db")).unwrap());
+        register_more(&store, &[registration(call_key, "tools", &bind)]).await;
+        let slots = crate::held_slots::HeldSlots::new();
+        let taken_at = Arc::new(Mutex::new(None));
+        let actor = Arc::new(LosesFirstResume {
+            slots: Arc::clone(&slots),
+            lose_next: std::sync::atomic::AtomicBool::new(true),
+            resumes: Mutex::new(Vec::new()),
+            taken_at: Arc::clone(&taken_at),
+            call_key: call_key.into(),
+        });
+        let mapper: Arc<crate::held_slots::EntryMapper> = Arc::new(|id, _entry| {
+            Some(broca_protocol::ToolResult {
+                tool_call_id: id.clone(),
+                output: broca_protocol::ToolOutput::Text {
+                    text: "late".into(),
+                },
+                is_error: false,
+            })
+        });
+        let delivery = Arc::new(crate::held_slots::SlotDelivery::new(
+            Arc::clone(&slots),
+            Arc::clone(&actor) as Arc<dyn crate::held_slots::HeldRunResumer>,
+            mapper,
+        ));
+        let feed = Arc::new(KeepingFeed::default());
+        feed.entries
+            .lock()
+            .unwrap()
+            .push(entry(kinds::RESULT, call_key, "event-1"));
+        let intake = LateResultsIntake::new(
+            Arc::clone(&store),
+            Arc::clone(&wal),
+            "broca",
+            delivery as Arc<dyn HeldDelivery>,
+            Arc::clone(&feed) as Arc<dyn LateResultsFeed>,
+        );
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            intake.ensure_puller("tools").unwrap(),
+            StartOutcome::Started
+        );
+        // Both waits run on the paused clock, so the bound costs no real time. It only turns
+        // an ack that never comes into a failure instead of a hang.
+        let acked = tokio::time::timeout(
+            Duration::from_secs(600),
+            feed.wait_until(|feed| !feed.acks.lock().unwrap().is_empty()),
+        )
+        .await;
+        let since = |at: tokio::time::Instant| (at - start).as_millis();
+        assert!(
+            acked.is_ok(),
+            "the entry is never acked; pinned={:?} feed_row={:?}",
+            intake.puller("tools").map(|puller| puller.pinned()),
+            store.feed("tools").unwrap()
+        );
+        let fallback =
+            (crate::held_slots::SlotDelivery::DEFAULT_TIMEOUT + PULL_INTERVAL).as_millis();
+        assert_eq!(taken_at.lock().unwrap().map(since), Some(fallback));
+        let resumes: Vec<_> = actor
+            .resumes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(lost, at)| (*lost, since(*at)))
+            .collect();
+        assert_eq!(resumes, vec![(true, 0), (false, fallback)]);
+        let acks: Vec<_> = feed
+            .acks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(seq, at)| (*seq, since(*at)))
+            .collect();
+        assert_eq!(acks, vec![(1, fallback)]);
+        assert!(intake
+            .puller("tools")
+            .is_some_and(|puller| puller.pinned().is_empty()));
+        let row = store.feed("tools").unwrap().unwrap();
+        assert_eq!(row.position.map(|position| position.seq), Some(1));
+        assert!(!row.ack_owed);
+
+        // Two more rounds: both read from the acked position, and nothing is acked again.
+        let pulls_at_ack = feed.pulls.lock().unwrap().len();
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            feed.wait_until(|feed| feed.pulls.lock().unwrap().len() >= pulls_at_ack + 2),
+        )
+        .await
+        .expect("the puller keeps pulling while the call is registered as held");
+        let later: Vec<_> = feed.pulls.lock().unwrap()[pulls_at_ack..]
+            .iter()
+            .map(|(since, _)| *since)
+            .collect();
+        assert!(later.iter().all(|since| *since == Some(1)), "{later:?}");
+        assert_eq!(feed.acks.lock().unwrap().len(), 1);
+        if let Some(puller) = intake.puller("tools") {
+            puller.stop();
+        }
     }
 }
