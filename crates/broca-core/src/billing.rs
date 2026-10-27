@@ -1,11 +1,15 @@
 //! Pure billing-segment derivation from the durable WAL.
 //!
-//! A segment is opened by a `RunStarted`, `RunConfigRefrozen`, or `RunAuthRefrozen` record
-//! and is closed only when the run reaches a durable terminal record. This module
+//! A segment is opened by a `RunStarted`, `RunConfigRefrozen`, or `RunAuthRefrozen` record,
+//! or by a model call answered by another model than the open segment's (a step routed to the
+//! refusal-fallback model, or one an Anthropic server-side fallback served), and is closed only
+//! when the run reaches a durable terminal record or one of those opens the next segment. This module
 //! deliberately has no clock or filesystem access: rebuilding an export from
 //! the same WAL must reproduce the same facts byte-for-byte.
 
-use broca_protocol::{caller::RunFinishReason, BindIdentity, RunId, Usage};
+use broca_protocol::{
+    caller::RunFinishReason, request::ModelHandle, BindIdentity, RunId, StepId, Usage,
+};
 use broca_wal::{FramedRecord, WalRecord};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -271,6 +275,12 @@ struct OpenRun {
     terminal_reason: Option<RunFinishReason>,
     pause_candidate: Option<Option<u64>>,
     segment_open: bool,
+    /// The model that answered the open segment's steps when it is not the run's own: the
+    /// refusal-fallback model a step was routed to, or the model an Anthropic server-side
+    /// fallback served it with. `None` means the run's model.
+    serving: Option<ModelHandle>,
+    /// Model calls folded into the open segment.
+    segment_calls: u32,
 }
 
 impl OpenRun {
@@ -297,7 +307,43 @@ impl OpenRun {
             terminal_reason: None,
             pause_candidate: None,
             segment_open: true,
+            serving: None,
+            segment_calls: 0,
         }
+    }
+
+    /// The model a step or refused call is billed under, when it is not the run's own model.
+    fn serving_model(&self, record: &WalRecord) -> Option<ModelHandle> {
+        let variant = None;
+        let (provider, model, _) =
+            crate::refusal_fallback::usage_model(&self.config.model, variant, record)?;
+        let model = ModelHandle::new(provider, model);
+        (model != self.config.model).then_some(model)
+    }
+
+    /// Bill the calls that follow under `serving`. When that is another model than the open
+    /// segment's and the segment already holds a call, the segment closes and a new one opens
+    /// at `at_ms`, as a refreeze does; returns the retries the closed segment carried. A run
+    /// whose calls are all answered by its own model never splits here, so its segments keep
+    /// their ordinals and fact ids.
+    fn bill_under<R: ChargeBasisResolver>(
+        &mut self,
+        resolver: &R,
+        serving: Option<ModelHandle>,
+        at_ms: Option<u64>,
+    ) -> u32 {
+        if serving == self.serving {
+            return 0;
+        }
+        let mut closed_retries = 0;
+        if self.segment_calls > 0 {
+            closed_retries = self.retries_used;
+            self.close_segment(resolver, false);
+            self.freeze_ts_ms = at_ms;
+            self.segment_open = true;
+        }
+        self.serving = serving;
+        closed_retries
     }
 
     fn close_segment<R: ChargeBasisResolver>(&mut self, resolver: &R, terminal: bool) {
@@ -354,8 +400,18 @@ impl OpenRun {
             session: self.session.clone(),
             segment_ordinal,
             fact_id,
-            provider: self.config.model.provider_module_id.clone(),
-            model: self.config.model.model_id.clone(),
+            provider: self
+                .serving
+                .as_ref()
+                .unwrap_or(&self.config.model)
+                .provider_module_id
+                .clone(),
+            model: self
+                .serving
+                .as_ref()
+                .unwrap_or(&self.config.model)
+                .model_id
+                .clone(),
             auth_selection: credential_id,
             account_ref,
             resolved_credential_id,
@@ -383,6 +439,7 @@ impl OpenRun {
         self.retries_used = 0;
         self.freeze_ts_ms = None;
         self.segment_open = false;
+        self.segment_calls = 0;
     }
 
     fn finish<R: ChargeBasisResolver>(mut self, resolver: &R) -> Vec<SpendSegment> {
@@ -449,6 +506,10 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
         ),
     > = std::collections::HashMap::new();
     let mut latest_run: Option<RunId> = None;
+    // Steps routed to the refusal-fallback model: a warm that re-sends one of their requests is
+    // billed under the model it went to.
+    let mut routed_steps: std::collections::HashMap<(RunId, StepId), ModelHandle> =
+        std::collections::HashMap::new();
 
     for framed in records {
         match &framed.record {
@@ -520,13 +581,26 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                 }
             }
             WalRecord::ModelStepFinished {
+                written_at_ms,
+                step_id,
                 usage,
                 retries_used,
                 service_tier_used,
+                fallback,
                 ..
             } => {
+                if let (Some(run), Some(route)) = (latest_run.as_ref(), fallback.route.as_ref()) {
+                    routed_steps.insert((run.clone(), *step_id), route.model.clone());
+                }
                 if let Some(current) = open.as_mut() {
                     current.pause_candidate = None;
+                    let serving = current.serving_model(&framed.record);
+                    closed_retries_used = closed_retries_used.saturating_add(current.bill_under(
+                        resolver,
+                        serving,
+                        *written_at_ms,
+                    ));
+                    current.segment_calls = current.segment_calls.saturating_add(1);
                     current.usage += *usage;
                     // Only a step that reported its tier is filed under one; see
                     // `SpendSegment::usage_by_service_tier`.
@@ -537,6 +611,17 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                             .or_default() += *usage;
                     }
                     current.retries_used = current.retries_used.saturating_add(*retries_used);
+                }
+            }
+            // A refused call was billed: it joins the segment of the model that refused it.
+            WalRecord::ModelStepRefused { usage, ts_ms, .. } => {
+                if let Some(current) = open.as_mut() {
+                    current.pause_candidate = None;
+                    let serving = current.serving_model(&framed.record);
+                    closed_retries_used = closed_retries_used
+                        .saturating_add(current.bill_under(resolver, serving, *ts_ms));
+                    current.segment_calls = current.segment_calls.saturating_add(1);
+                    current.usage += *usage;
                 }
             }
             WalRecord::RunFinished {
@@ -568,6 +653,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
             }
             WalRecord::CacheWarmed {
                 run_id,
+                step_id,
                 usage,
                 sent_at_ms,
                 ..
@@ -576,11 +662,17 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                 // this WAL holds no start of has no config to bill it with, and yields no fact.
                 if let Some((session, config, scope)) = episodes.get(run_id) {
                     if target_run.is_none_or(|target| target == run_id) {
+                        // The re-sent request went to the model its step was routed to.
+                        let routed = routed_steps.get(&(run_id.clone(), *step_id)).map(|model| {
+                            let mut config = config.clone();
+                            config.model = model.clone();
+                            config
+                        });
                         let mut segment = warm_segment(
                             source_instance_id,
                             run_id,
                             session,
-                            config,
+                            routed.as_ref().unwrap_or(config),
                             *usage,
                             framed.seq,
                             *sent_at_ms,
@@ -864,6 +956,7 @@ mod tests {
         frame(
             seq,
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -888,6 +981,89 @@ mod tests {
             output_tokens: Some(output_tokens),
             ..Usage::default()
         }
+    }
+
+    /// A model call answered by another model than the run's (a refusal-fallback route) opens a
+    /// segment labelled with that model, and the next call back on the run's model opens
+    /// another; a refused call stays with the model that refused it, and a warm of a routed
+    /// step's request is billed under the model it went to.
+    #[test]
+    fn calls_answered_by_the_refusal_fallback_model_are_their_own_segment() {
+        let routed = |seq: u64, id: u64, usage: Usage, retries: u32| {
+            let mut framed = step(seq, id, usage, retries);
+            if let WalRecord::ModelStepFinished { fallback, .. } = &mut framed.record {
+                fallback.route = Some(broca_wal::StepRoute {
+                    model: ModelHandle::new("anthropic", "claude-fallback"),
+                    reason: broca_wal::StepRouteReason::Schedule,
+                });
+            }
+            framed
+        };
+        let refused: WalRecord = serde_json::from_value(json!({"type":"model_step_refused",
+            "step_id":2,"usage":{"input_tokens":30,"output_tokens":1},"discarded_blocks":1,
+            "ts_ms":150,"schedule":{"source":{"provider_module_id":"anthropic","model_id":"claude"},
+            "fallback":{"provider_module_id":"anthropic","model_id":"claude-fallback"},
+            "phase":{"kind":"fallback","remaining":10},"re_refusals":0}}))
+        .unwrap();
+        let warm: WalRecord = serde_json::from_value(json!({"type":"cache_warmed","run_id":"run",
+            "step_id":3,"request_body_sha256":"aa","warm_body_sha256":"bb",
+            "usage":{"cached_input_tokens":40},"sent_at_ms":400}))
+        .unwrap();
+        let records = vec![
+            started(1, "run", Some(100)),
+            step(2, 1, usage(10, 2), 1),
+            frame(3, refused),
+            routed(4, 2, usage(20, 3), 2),
+            routed(5, 3, usage(5, 1), 0),
+            step(6, 4, usage(7, 1), 0),
+            frame(7, warm),
+            frame(
+                8,
+                WalRecord::RunFinished {
+                    interrupt_reason: None,
+                    reason: RunFinishReason::Completed,
+                    ts_ms: Some(500),
+                    usage: usage(72, 8),
+                    error: None,
+                    retries_used: 3,
+                },
+            ),
+        ];
+        let segments = compute_segments(&records, "instance-a", &resolver);
+        let ordinary: Vec<_> = segments.iter().filter(|segment| !segment.warm).collect();
+        let summary: Vec<_> = ordinary
+            .iter()
+            .map(|segment| {
+                (
+                    segment.segment_ordinal,
+                    segment.model.as_str(),
+                    segment.usage,
+                    segment.retries_used,
+                    segment.terminal_reason,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, "claude", usage(40, 3), 1, None),
+                (1, "claude-fallback", usage(25, 4), 2, None),
+                (
+                    2,
+                    "claude",
+                    usage(7, 1),
+                    0,
+                    Some(RunFinishReason::Completed)
+                ),
+            ]
+        );
+        assert_eq!(ordinary[0].pricing_at_ms, Some(100));
+        assert!(ordinary
+            .iter()
+            .all(|segment| segment.occurred_at_ms == Some(500)));
+        let warm = segments.iter().find(|segment| segment.warm).unwrap();
+        assert_eq!(warm.model, "claude-fallback");
+        assert_eq!(warm.provider, "anthropic");
     }
 
     #[test]

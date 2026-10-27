@@ -6339,6 +6339,7 @@ async fn history_unreachable_refusal_golden_from_real_serve() {
         wal.append(
             1,
             &WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,

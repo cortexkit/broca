@@ -80,6 +80,7 @@ fn nonadvancing_projection_preserves_anchor_and_tail_read_cost() {
     wal.append(
         1,
         &WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

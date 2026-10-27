@@ -41,6 +41,7 @@ pub mod projection_plan;
 mod projection_plan_tests;
 pub mod provider;
 pub mod queue;
+pub mod refusal_fallback;
 pub mod render;
 pub mod replay;
 pub use context::StorePageReadError;

@@ -5901,6 +5901,38 @@ mod caller_message_tests {
         entry
     }
 
+    /// Anthropic's server-side fallback handoff reaches a reader as the stored part, unchanged,
+    /// at its own position: it keeps its part key and row, and never takes a tag number.
+    #[test]
+    fn a_read_passes_a_server_side_fallback_part_through_unchanged() {
+        let content = vec![
+            ContentBlock::Text {
+                text: "Let me".into(),
+            },
+            ContentBlock::ProviderFallback {
+                from_model: "claude-opus-5-5".into(),
+                to_model: "claude-opus-4-8".into(),
+            },
+            ContentBlock::Text {
+                text: " check.".into(),
+            },
+        ];
+        for entry in [
+            read_message(content.clone()),
+            computed(read_message(content), true),
+        ] {
+            let body = serde_json::to_value(&entry).unwrap();
+            assert_eq!(
+                body["message"]["content"][1],
+                json!({"type": "provider_fallback", "from_model": "claude-opus-5-5", "to_model": "claude-opus-4-8"})
+            );
+            if let Some(rows) = body["tags"].as_array().filter(|rows| !rows.is_empty()) {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(members(&rows[1]), ["part"]);
+            }
+        }
+    }
+
     /// A read shows the model's text cleaned of tag notation when the run that wrote it cleans,
     /// as written otherwise (an untagged run, a structured-output run's final text); the stored
     /// message keeps the raw text either way.

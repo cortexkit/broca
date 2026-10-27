@@ -1035,6 +1035,10 @@ impl AdmissionCheckpointV1 {
             | WalRecord::CompactionNotice { .. } => {}
             // Provider attempt evidence is informational only, skipped exactly like `Unknown`.
             WalRecord::ModelAttemptFinished { .. } => {}
+            // A refused step neither opens, pauses nor ends an episode: its re-send commits
+            // under the same step id, and the run's `RunFinished` carries the refused call's
+            // usage in its totals.
+            WalRecord::ModelStepRefused { .. } => {}
             // A resume's own account of what it found: informational, skipped like `Unknown`.
             WalRecord::ResumeStarted { .. } => {}
             // A cache warm changes no episode, queue or ownership state.
@@ -1500,6 +1504,7 @@ mod tests {
             frame(
                 3,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -1548,6 +1553,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -1780,6 +1786,7 @@ mod tests {
             frame(
                 12,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -1871,6 +1878,7 @@ mod tests {
             frame(
                 19,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -2207,6 +2215,7 @@ mod tests {
             frame(
                 2,
                 WalRecord::ModelStepFinished {
+                    fallback: Default::default(),
                     written_at_ms: None,
                     tags: None,
                     hooks: None,
@@ -2281,6 +2290,7 @@ mod tests {
         };
         config.budget = Some(budget.clone());
         let step = |id, content| WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

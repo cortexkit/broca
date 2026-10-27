@@ -32,6 +32,11 @@ pub use compaction::{
     CompactionRange, CompactionStabilityRank, CompactionStrip, CompactionViewChoice,
     CompactionWait, CompactionWaitExit, RejectedCompaction, MAX_REPLACEMENT_BYTES,
 };
+mod fallback;
+pub use fallback::{
+    RefusalFallbackPhase, RefusalFallbackSchedule, StepFallback, StepRoute, StepRouteReason,
+    UsageIteration,
+};
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -331,6 +336,38 @@ pub enum WalRecord {
         /// One tag per block of `assistant_message`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tags: Option<Box<MessageTags>>,
+        /// Server-side and client-side fallback facts about this step, flattened into the
+        /// record as top-level keys. All absent on an ordinary step, which then keeps its
+        /// exact bytes. Each present member is must-understand (see [`StepFallback`]). Boxed
+        /// so the common step pays one small allocation, not the record's size.
+        #[serde(flatten)]
+        fallback: Box<StepFallback>,
+    },
+    /// The source model refused a step (`stop_reason: "refusal"`) and the step is being re-sent
+    /// to the client-side fallback model under the same step id, with no new `StepStarted`.
+    /// Synced before the re-send, so a crash after it re-sends the step on the fallback model
+    /// and a crash before it re-sends the step on the source.
+    ///
+    /// The refused content is deliberately not stored: it must never reach a prompt or a
+    /// reader. The refused attempt's `ModelAttemptFinished` digests remain the forensic link.
+    /// Contributes nothing to the prompt; its `usage` counts toward the run's totals because the
+    /// call was billed. At most one per step. Requires `refusal-fallback/v1`.
+    ModelStepRefused {
+        /// The step being re-sent.
+        step_id: StepId,
+        /// The refused response's billed usage.
+        usage: Usage,
+        /// As on `ModelStepFinished`: the wire model a server-side fallback served the refused
+        /// response with, when it was not the requested one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
+        /// How many content blocks the refused response carried; only the count is kept.
+        discarded_blocks: u32,
+        /// The schedule after this refusal.
+        schedule: RefusalFallbackSchedule,
+        /// Wall-clock time the refusal was recorded, Unix milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ts_ms: Option<u64>,
     },
     /// Evidence for ONE provider HTTP attempt of a model step: what was sent and received, as
     /// byte lengths and SHA-256 digests, and how the attempt ended. One per attempt, failed
@@ -1462,6 +1499,16 @@ impl WalRecord {
         } else {
             base
         };
+        let base = if self.carries_provider_fallback() {
+            with_feature(base, crate::framing::PROVIDER_FALLBACK_BLOCK_FEATURE)
+        } else {
+            base
+        };
+        let base = if self.carries_refusal_fallback() {
+            with_feature(base, crate::framing::REFUSAL_FALLBACK_FEATURE)
+        } else {
+            base
+        };
         let base = if self.carries_openrouter_reasoning() {
             with_feature(base, crate::framing::OPENROUTER_REASONING_FEATURE)
         } else {
@@ -1610,6 +1657,7 @@ impl WalRecord {
                 | ContentBlock::TextWithState { .. }
                 | ContentBlock::Reasoning { .. }
                 | ContentBlock::RedactedReasoning { .. }
+                | ContentBlock::ProviderFallback { .. }
                 | ContentBlock::ToolCall(_) => false,
             })
         };
@@ -1687,6 +1735,7 @@ impl WalRecord {
             Self::CompactionMessage { replacement, .. } => messages(replacement),
             Self::CompactionViewApplied { view, .. } => view_carries_media_content(view),
             Self::ModelAttemptFinished { .. }
+            | Self::ModelStepRefused { .. }
             | Self::StepStarted { .. }
             | Self::ToolBatchStarted { .. }
             | Self::ToolBatchFinished { .. }
@@ -1830,6 +1879,45 @@ impl WalRecord {
             Self::Queued { request, .. } => messages(&request.input),
             Self::Steered { input, .. } => messages(input),
             Self::CompactionMessage { replacement, .. } => messages(replacement),
+            _ => false,
+        }
+    }
+
+    /// Whether this record carries Anthropic's server-side fallback: the `provider_fallback`
+    /// content part in any message it holds, or a step's `served_model` or `usage_iterations`.
+    fn carries_provider_fallback(&self) -> bool {
+        let blocks = |content: &[broca_protocol::content::ContentBlock]| {
+            content.iter().any(|block| {
+                matches!(
+                    block,
+                    broca_protocol::content::ContentBlock::ProviderFallback { .. }
+                )
+            })
+        };
+        let messages = |input: &[Message]| input.iter().any(|message| blocks(&message.content));
+        match self {
+            Self::RunStarted { input, .. } => messages(input),
+            Self::ModelStepFinished {
+                assistant_message,
+                fallback,
+                ..
+            } => blocks(&assistant_message.content) || fallback.carries_server_side_fallback(),
+            Self::Queued { request, .. } => messages(&request.input),
+            Self::Steered { input, .. } => messages(input),
+            Self::SendDelivered { input, .. } => {
+                input.as_deref().is_some_and(|input| messages(input))
+            }
+            Self::CompactionMessage { replacement, .. } => messages(replacement),
+            _ => false,
+        }
+    }
+
+    /// Whether this record carries client-side refusal-fallback state: a refused step, or a
+    /// step's route, schedule or refusal-after-tool-use flag.
+    fn carries_refusal_fallback(&self) -> bool {
+        match self {
+            Self::ModelStepRefused { .. } => true,
+            Self::ModelStepFinished { fallback, .. } => fallback.carries_refusal_fallback(),
             _ => false,
         }
     }
@@ -3151,6 +3239,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_arc_keeps_existing_wal_bytes() {
         let record = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3505,6 +3594,7 @@ mod schema_tests {
         // reported. A step whose response reported no tier must keep exactly these bytes, and
         // these bytes must keep decoding to the same record.
         let full = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3527,6 +3617,7 @@ mod schema_tests {
             speed_used: None,
         };
         let bare = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -3558,6 +3649,7 @@ mod schema_tests {
     #[test]
     fn old_records_default_retries_used_to_zero() {
         let model = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4106,6 +4198,7 @@ mod schema_tests {
                 submission_id: Some(SubmissionId("sub1".into())),
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -4732,6 +4825,7 @@ mod schema_tests {
     #[test]
     fn model_step_finished_preserves_signed_tool_call() {
         let rec = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -4776,6 +4870,7 @@ mod schema_tests {
         assert_eq!(decoded_call, call);
 
         let rec = WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

@@ -547,6 +547,8 @@ fn convert_content(
                 provider_format: None,
             } if echo_reasoning => Some(json!({"reasoningContent": {"redactedContent": data}})),
             ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. } => None,
+            // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
+            ContentBlock::ProviderFallback { .. } => None,
         })
         .collect()
 }

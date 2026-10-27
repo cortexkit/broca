@@ -49,6 +49,7 @@ impl RunExecutor for DispatchHeld {
             submission_id: None,
         });
         job.writer.record(WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

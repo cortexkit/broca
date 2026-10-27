@@ -212,6 +212,7 @@ mod tests {
 
     fn step(content: ContentBlock) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

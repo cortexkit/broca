@@ -5689,6 +5689,7 @@ mod tests {
 
     pub(super) fn assistant_record() -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -6347,6 +6348,7 @@ mod offset_page_tests {
 
     fn text_step(step: u64, text: &str) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,
@@ -6380,6 +6382,7 @@ mod offset_page_tests {
     fn corpus_wal() -> (Vec<u8>, Vec<WalRecord>) {
         let mut records = vec![run_started("r1", vec![user("task")]), step_started(1)];
         records.push(WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

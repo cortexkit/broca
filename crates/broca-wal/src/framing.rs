@@ -215,8 +215,10 @@ pub const KNOWN_FEATURES: &[&str] = &[
     PLAN_MANIFEST_FEATURE,
     PLAN_REFERENCE_SLOTS_FEATURE,
     PROVIDER_DECLARATIONS_FEATURE,
+    PROVIDER_FALLBACK_BLOCK_FEATURE,
     PROVIDER_HELD_FEATURE,
     PROVIDER_TEXT_STATE_FEATURE,
+    REFUSAL_FALLBACK_FEATURE,
     RESTART_PAUSE_FEATURE,
     RETENTION_FEATURE,
     RUNNER_TAGS_FEATURE,
@@ -362,6 +364,19 @@ pub const TOOL_TIMES_FEATURE: &str = "tool-times/v1";
 
 /// Preserve read-entry times across rollback; dropping them would change an already served entry.
 pub const MESSAGE_TIMES_FEATURE: &str = "message-times/v1";
+
+/// Anthropic's server-side fallback, as a step records it: the `provider_fallback` content part
+/// (the handoff block, in any record that carries messages) and a `ModelStepFinished`'s
+/// `served_model` or `usage_iterations`. An older build's closed content decoder cannot read the
+/// part, and skipping the fields would bill the step to the requested model instead of the one
+/// that served it, so all three are must-understand.
+pub const PROVIDER_FALLBACK_BLOCK_FEATURE: &str = "provider-fallback-block/v1";
+
+/// Client-side refusal fallback: the `ModelStepRefused` record and a `ModelStepFinished`'s
+/// `route`, `refusal_fallback` or `refusal_after_tool_use`. A reader that skipped them would
+/// lose the session's fallback schedule, attribute a fallback-answered step to the wrong model,
+/// and miss the refused call's billed usage, so all are must-understand.
+pub const REFUSAL_FALLBACK_FEATURE: &str = "refusal-fallback/v1";
 
 /// The feature a `RunStarted` carrying the session's frozen scope requires
 /// (`WalRecord::RunStarted::scope`). A reader without it must refuse such a WAL: skipping the
@@ -885,6 +900,9 @@ mod retention_tests;
 mod provider_held_tests;
 
 #[cfg(test)]
+mod fallback_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn message_times_require_an_understanding_reader() {
@@ -1269,8 +1287,10 @@ mod tests {
                 PLAN_MANIFEST_FEATURE,
                 PLAN_REFERENCE_SLOTS_FEATURE,
                 PROVIDER_DECLARATIONS_FEATURE,
+                PROVIDER_FALLBACK_BLOCK_FEATURE,
                 PROVIDER_HELD_FEATURE,
                 PROVIDER_TEXT_STATE_FEATURE,
+                REFUSAL_FALLBACK_FEATURE,
                 RESTART_PAUSE_FEATURE,
                 RETENTION_FEATURE,
                 RUNNER_TAGS_FEATURE,
@@ -1301,6 +1321,11 @@ mod tests {
         assert_eq!(PLAN_REFERENCE_SLOTS_FEATURE, "plan-reference-slots/v1");
         assert_eq!(PROVIDER_DECLARATIONS_FEATURE, "provider-declarations/v1");
         assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
+        assert_eq!(
+            PROVIDER_FALLBACK_BLOCK_FEATURE,
+            "provider-fallback-block/v1"
+        );
+        assert_eq!(REFUSAL_FALLBACK_FEATURE, "refusal-fallback/v1");
         assert_eq!(CHATGPT_CODEX_WIRE_FEATURE, "chatgpt-codex-wire/v1");
         assert_eq!(OPENROUTER_REASONING_FEATURE, "openrouter-reasoning/v1");
         assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");

@@ -440,6 +440,8 @@ fn convert_model_parts(
                 parts.push(part);
             }
             ContentBlock::ToolResult(_) => {}
+            // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
+            ContentBlock::ProviderFallback { .. } => {}
         }
     }
     parts

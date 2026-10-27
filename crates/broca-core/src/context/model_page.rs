@@ -1048,6 +1048,7 @@ mod episode_page_tests {
 
     fn step(step: u64, content: Vec<ContentBlock>) -> WalRecord {
         WalRecord::ModelStepFinished {
+            fallback: Default::default(),
             written_at_ms: None,
             tags: None,
             hooks: None,

@@ -406,6 +406,16 @@ pub enum ContentBlock {
     },
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    /// Anthropic's server-side fallback handoff: the server switched the response from
+    /// `from_model` to `to_model` part-way through, at this position in the message. Neither
+    /// signed nor reasoning. Only an Anthropic request whose frozen config opted into
+    /// server-side fallback may echo it back; every other renderer drops it. A WAL record
+    /// carrying it requires the `provider-fallback-block/v1` feature, because an older build's
+    /// closed content decoder cannot read it.
+    ProviderFallback {
+        from_model: String,
+        to_model: String,
+    },
 }
 
 /// An assembled, complete tool call (input is the full JSON args, not deltas).

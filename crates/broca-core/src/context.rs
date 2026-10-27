@@ -1885,6 +1885,9 @@ pub(crate) fn merge_prefix_and_tail(
         // `latest_projection_boundary`), so every unplaced steer is in the tail.
         pending_steers: tail_state.pending_steers,
         resolution: tail_state.resolution,
+        // Only what the tail recorded: the materialized prefix keeps no schedule.
+        refusal_fallback: tail_state.refusal_fallback,
+        refused_steps: tail_state.refused_steps,
         committed_tool_turns: Vec::new(),
         held: None,
     };
@@ -2445,6 +2448,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2505,6 +2509,7 @@ mod tests {
             },
             WalRecord::TurnFinished { step_id: StepId(1) },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2787,6 +2792,7 @@ mod tests {
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -2837,6 +2843,7 @@ mod tests {
             // This naturally terminal no-tool step is durable but has no RunFinished, so the
             // corpus ends with a non-empty, not-yet-materialized tail.
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,
@@ -3514,6 +3521,7 @@ mod episode_merge_regression {
         let wal = vec![
             start("a", "a-model", "episode a"),
             WalRecord::ModelStepFinished {
+                fallback: Default::default(),
                 written_at_ms: None,
                 tags: None,
                 hooks: None,

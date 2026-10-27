@@ -240,6 +240,11 @@ pub fn project(entry: &SessionReadMessage, limits: Option<&Limits>) -> DisplayRo
                 ContentBlock::RedactedReasoning { .. } => {
                     DisplayPart::Other(OtherPart::new(key, "redacted_reasoning"))
                 }
+                // Anthropic's server-side fallback handoff: shown as a typed placeholder so the
+                // part keys of the parts after it do not shift.
+                ContentBlock::ProviderFallback { .. } => {
+                    DisplayPart::Other(OtherPart::new(key, "provider_fallback"))
+                }
                 ContentBlock::Media(value) => DisplayPart::File(FilePart::media(key, media(value))),
                 ContentBlock::ToolCall(call) => DisplayPart::ToolCall(ToolCallPart::new(
                     key,
