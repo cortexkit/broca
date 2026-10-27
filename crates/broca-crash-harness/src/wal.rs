@@ -405,6 +405,14 @@ impl Wal for ObservedWal {
         Ok(seq)
     }
 
+    fn on_overhaul_root(&self) -> bool {
+        self.inner.on_overhaul_root()
+    }
+
+    fn state_root_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.state_root_path()
+    }
+
     fn append_budget(&self) -> Option<(u64, u64, u64)> {
         self.inner.append_budget()
     }

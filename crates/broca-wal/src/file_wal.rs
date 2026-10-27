@@ -565,18 +565,18 @@ struct RootMarker {
     overhaul: bool,
 }
 
-/// Every marker this process has read. A state root's file count, file kinds and marker are fixed
-/// by its format, so the answer is read once: a per-open read would change a root's identity on
-/// every writer open, which the power-loss harness compares.
+/// The markers this process has already read, one entry per state root. A root that exists keeps
+/// its format, so the file is read once and the answer reused. Each entry is the root's path and
+/// answer only, never an open handle on the root, so nothing outlives the directory it named.
 static ROOT_MARKERS: OnceLock<std::sync::Mutex<Vec<RootMarker>>> = OnceLock::new();
 
 /// Report whether the state root holding `wal_path` is an overhaul root, reading its marker the
 /// first time this process asks about that root.
 ///
 /// A missing or unreadable marker means a legacy root: reading one as overhaul would put frames
-/// on disk that its readers cannot open. A root this open created is not marked overhaul either:
-/// the overlay that creates a root writes its marker, so a root born without one holds legacy
-/// logs.
+/// on disk that its readers cannot open. An open that had to create the root's directories does
+/// not read a marker, because a root created just now cannot have been marked and a missing
+/// marker means legacy anyway.
 fn overhaul_root_cached(wal_path: &Path, created_root: bool) -> (PathBuf, bool) {
     let root = wal_path
         .parent()
