@@ -38,6 +38,7 @@ pub mod llm_tools;
 pub mod manifest;
 pub mod opencode_go_identity;
 pub mod provider_overrides;
+pub mod refusal_fallback_config;
 pub mod run_routing;
 pub mod send_audit;
 pub mod serve;

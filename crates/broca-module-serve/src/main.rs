@@ -208,6 +208,15 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let account_selection =
         broca_module_serve::account_routing::AccountSelectionConfig::load_default_path()
             .map_err(ServeIoError)?;
+    // The `refusal_fallback` section: which model a refused step is re-sent to. A malformed
+    // section refuses boot by name, like the defaults above: a mapping that was silently
+    // dropped would only be noticed when a refusal happened and nothing switched.
+    let refusal_fallback =
+        broca_module_serve::refusal_fallback_config::RefusalFallbackConfig::load_default_path()
+            .map_err(ServeIoError)?;
+    // Loaded and validated above; no run reads it yet, and this line keeps the loaded value
+    // alive until the run loop's refusal path takes it.
+    let _ = &refusal_fallback;
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
