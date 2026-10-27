@@ -220,14 +220,15 @@ pub(super) fn lookup(
     if paths.iter().any(|path| path.parent() != Some(parent)) {
         return Ok(None);
     }
-    let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+    // Stat containers outside the cache lock so concurrent lookups can validate in parallel.
     let current = match snapshot(paths) {
         Ok(current) => current,
         Err(_) => {
-            cache.remove(parent);
+            invalidate(parent);
             return Ok(None);
         }
     };
+    let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
     let index = if let Some(index) = cache.get(parent) {
         if index.containers != current {
             cache.remove(parent);
