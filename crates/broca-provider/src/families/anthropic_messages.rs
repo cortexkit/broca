@@ -1148,8 +1148,8 @@ fn convert_content(
             // Anthropic's server-side fallback handoff is echoed only to a request whose frozen
             // config opted into server-side fallback, and restored at the position it held in
             // the response. It is neither signed nor reasoning, so the echo-scope and
-            // cross-model rules above do not apply to it. Every other target drops it, which is
-            // also what the recording runtime did when it could not hand the request on.
+            // cross-model rules above do not apply to it. Every other target drops it: a request
+            // that did not ask for the handoff cannot use it.
             ContentBlock::ProviderFallback {
                 from_model,
                 to_model,

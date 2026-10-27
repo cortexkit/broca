@@ -144,9 +144,9 @@ impl StateFormatConfig {
     }
 }
 
-/// The `anthropic_fallbacks` key of `broca.jsonc`: the operator switches for the two layers of
-/// content-filter fallback on Anthropic OAuth runs. Both are off unless an operator turns them
-/// on, so a build carrying the code sends the requests it always did.
+/// The `anthropic_fallbacks` key of `broca.jsonc`: the operator switches for content-filter
+/// fallback on Anthropic OAuth runs. `server_side` is the only switch today, and it is off unless
+/// an operator turns it on, so a build carrying the code sends the requests it always did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AnthropicFallbackSwitches {
     /// `anthropic_fallbacks.server_side`: ask Anthropic to hand a content-filter refusal to

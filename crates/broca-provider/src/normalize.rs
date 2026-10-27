@@ -132,8 +132,8 @@ pub struct AnthropicNormalizer {
     /// `message.input_transformations` from `message_start`, verbatim; `None` when the
     /// response did not carry the field (it is present only under the thinking-binding beta).
     input_transformations: Option<Vec<broca_protocol::InputTransformation>>,
-    /// `message.model` from `message_start`: the model the provider says produced the
-    /// response. Others use none, so this stays `None` for them.
+    /// `message.model` from `message_start`: the model the provider says it served. Stays
+    /// `None` when the response names no model.
     reported_model: Option<String>,
     /// `usage.iterations` from the last event that reported them, verbatim. A server-side
     /// fallback splits a response into one iteration per model it ran.
@@ -304,10 +304,10 @@ impl AnthropicNormalizer {
                             start_input: cb.get("input").cloned().unwrap_or(Value::Null),
                         },
                         // Anthropic's server-side fallback handoff. Its model ids must match
-                        // the same grammar the recording client accepts (`^claude-[a-z0-9-]+$`,
-                        // at most 128 characters) because they are rendered back into a later
-                        // request; a block whose ids do not is dropped with a WARN instead of
-                        // being stored, so nothing unvalidated can reach a request body.
+                        // `^claude-[a-z0-9-]+$` and be at most 128 characters because they are
+                        // rendered back into a later request; a block whose ids do not is
+                        // dropped with a WARN instead of being stored, so nothing unvalidated
+                        // can reach a request body.
                         Some("fallback") => {
                             let model = |side: &str| {
                                 cb.get(side)

@@ -443,7 +443,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_module_serve::CacheTtlTable::load_default_path().map_err(ServeIoError)?;
     executor_impl = executor_impl.with_cache_table(cache_table);
     // The operator switches for content-filter fallback. A malformed section refuses boot by
-    // name, like the sections above; both layers stay off without one.
+    // name, like the sections above; without one, the server-side switch stays off.
     let anthropic_fallbacks = broca_module_serve::config::AnthropicFallbackSwitches::load_default()
         .map_err(ServeIoError)?;
     executor_impl = executor_impl.with_anthropic_fallbacks(anthropic_fallbacks);
@@ -2766,8 +2766,8 @@ mod executor {
         /// `broca_module_serve::claude_code_identity`). `None` admits Anthropic OAuth episodes
         /// without a persona, in the shape they had before it existed.
         claude_code_install_id: Option<String>,
-        /// The operator switches for content-filter fallback on Anthropic OAuth runs. Both are
-        /// off unless configured, so a build carrying the code sends today's requests.
+        /// The operator switches for content-filter fallback on Anthropic OAuth runs. Every
+        /// switch is off unless configured, so a build carrying the code sends today's requests.
         anthropic_fallbacks: broca_module_serve::config::AnthropicFallbackSwitches,
         /// Each session's pinned `cc_version` suffix once computed in this process (`None` when
         /// its WAL could not be read), so the WAL is read for it at most once per session.

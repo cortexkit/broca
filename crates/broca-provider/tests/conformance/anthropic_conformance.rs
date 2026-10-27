@@ -472,12 +472,12 @@ fn anthropic_usage_maps_thinking_tokens_detail_without_touching_output_or_fill()
     }
 }
 
-// ─────────────────── server-side fallback (Layer 1) ───────────────────
+// ─────────────────── server-side fallback ───────────────────
 
-/// A synthetic response shaped like the mock server's handoff capture: the runtime ran the source
-/// model, handed the request to a fallback model, and reports both parts in `usage.iterations`.
-/// The live capture (mock-anthropic.ts) may add fields; until it lands, this is the shape broca
-/// must tolerate.
+/// A synthetic response in which the runtime ran the source model, handed the request to a
+/// fallback model, and reported both parts in `usage.iterations`. It is written from the shape
+/// the provider is documented to send, not from a captured response, so the normalizer must
+/// tolerate fields it does not name.
 fn handoff_stream(fallback_block: &str, message_model: &str) -> String {
     format!(
         "event: message_start\n\
@@ -621,9 +621,9 @@ fn fallback_handoff_block_is_kept_and_echoed() {
     }
 }
 
-/// The served model follows the order the recording client uses: the handoff block's target,
-/// then the last fallback iteration, then a `message.model` that names another model. An alias of
-/// the requested id is the requested model, so an ordinary response reports nothing.
+/// The served model is chosen in this order: the handoff block's target, then the last fallback
+/// iteration, then a `message.model` that names another model. An alias of the requested id is
+/// the requested model, so an ordinary response reports nothing.
 #[test]
 fn served_model_resolution_order() {
     // The handoff block wins over everything else.

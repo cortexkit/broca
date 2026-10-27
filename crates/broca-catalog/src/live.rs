@@ -145,10 +145,10 @@ pub struct ResolveOptions<'a> {
     /// without a persona, the shape OAuth runs had before it existed. A resume passes the
     /// recorded persona through `EpisodeRenderConfig` instead.
     pub claude_code_persona: Option<&'a ClaudeCodePersona>,
-    /// The operator switch for Layer 1, Anthropic's server-side fallback: when true, an OAuth
-    /// episode whose catalog row states `capability.server_side_fallback` asks the runtime to
-    /// hand a content-filter refusal to another model itself. Default false: no request changes
-    /// until an operator turns it on, and a resume keeps whatever its bundle recorded.
+    /// The operator switch for Anthropic's server-side fallback: when true, an OAuth episode
+    /// whose catalog row states `capability.server_side_fallback` asks the runtime to hand a
+    /// content-filter refusal to another model itself. Default false: no request changes until
+    /// an operator turns it on, and a resume keeps whatever its bundle recorded.
     pub anthropic_server_side_fallback: bool,
 }
 
