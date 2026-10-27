@@ -4,17 +4,6 @@
 //! The catalog is installed from a fusiform `catalog.get` document, so every case also goes
 //! through the shipped decode of `limit.output`: a null there must reach resolution as "unknown"
 //! and select the fallback, never a zero cap.
-// A file-level `cfg` would delete this file when the feature is off, and a deleted file reports
-// "running 0 tests ... ok". Gating a module leaves this shell so the absence announces itself.
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP default_max_output: compiled without the live feature, so none of its cases exist. \
-         Re-run with `-F broca-catalog/live` to execute them."
-    );
-}
-
 #[cfg(feature = "live")]
 mod gated {
     use std::collections::BTreeMap;

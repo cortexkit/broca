@@ -22,15 +22,14 @@ pub struct NoPrivateContent;
 impl super::Asks for NoPrivateContent {
     async fn marked(
         &self,
-        _owner: subc_protocol::Principal,
         _scope_ref: &str,
+        _parent_scope_ref: Option<&str>,
     ) -> Option<broca_subc::PrivateContent> {
         None
     }
 
     async fn flow_providers(
         &self,
-        _owner: subc_protocol::Principal,
         _flow_id: &str,
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
         Err(broca_subc::FlowProvidersError::Unanswered(

@@ -520,18 +520,33 @@ async fn role_refuse_answers_are_returned_but_transport_refusals_are_not_retried
 #[tokio::test]
 async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
     let serving = start("compaction-bind-deadline", vec![], describe(), true).await;
-    let started = Instant::now();
-    assert!(serving
-        .plane
-        .setup_with_deadline(
-            "compaction-test",
-            &serving.bind,
-            setup(&serving.bind),
-            started + Duration::from_millis(100)
-        )
-        .await
-        .is_err());
-    assert!(started.elapsed() < Duration::from_secs(1));
+    let plane = serving.plane.clone();
+    let bind = serving.bind.clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let request = tokio::spawn(async move {
+        plane
+            .setup_with_deadline("compaction-test", &bind, setup(&bind), deadline)
+            .await
+    });
+    broca_test_support::wait_until("silent compaction bind reached", || async {
+        if bind_count(&serving) == 1 {
+            Ok(())
+        } else {
+            Err("bind not received".into())
+        }
+    })
+    .await;
+    // Let real socket traffic reach the provider before controlling only the deadline clock.
+    tokio::time::pause();
+    tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+    let result = broca_test_support::event_timeout("compaction bind expiry", request, || {
+        "silent bind".into()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::resume();
+    assert!(result.is_err());
     assert_eq!(op_count(&serving, "compaction.setup"), 0);
 
     let serving = start(
@@ -541,16 +556,33 @@ async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
         false,
     )
     .await;
-    assert!(serving
-        .plane
-        .setup_with_deadline(
-            "compaction-test",
-            &serving.bind,
-            setup(&serving.bind),
-            Instant::now() + Duration::from_millis(200)
-        )
-        .await
-        .is_err());
+    let plane = serving.plane.clone();
+    let bind = serving.bind.clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let request = tokio::spawn(async move {
+        plane
+            .setup_with_deadline("compaction-test", &bind, setup(&bind), deadline)
+            .await
+    });
+    broca_test_support::wait_until("silent compaction setup reached", || async {
+        if op_count(&serving, "compaction.setup") == 1 {
+            Ok(())
+        } else {
+            Err("setup not received".into())
+        }
+    })
+    .await;
+    tokio::time::pause();
+    tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+    let result = broca_test_support::event_timeout("compaction call expiry", request, || {
+        "silent setup".into()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::resume();
+    assert!(result.is_err());
+
     let plane = serving.plane.clone();
     let bind = serving.bind.clone();
     let blocked = tokio::spawn(async move {
@@ -559,34 +591,35 @@ async fn deadline_bounds_route_open_queueing_and_silent_provider_calls() {
                 "compaction-test",
                 &bind,
                 setup(&bind),
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(30),
             )
             .await
     });
-    tokio::time::timeout(Duration::from_secs(1), async {
-        // The first setup consumed the first notification; wait until the second, silent
-        // one is dispatched.
-        loop {
-            if op_count(&serving, "compaction.setup") == 2 {
-                break;
-            }
-            serving.script.seen.notified().await;
+    broca_test_support::wait_until("second silent compaction setup reached", || async {
+        if op_count(&serving, "compaction.setup") == 2 {
+            Ok(())
+        } else {
+            Err("second setup not received".into())
         }
+    })
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut queued = Box::pin(serving.plane.setup_with_deadline(
+        "compaction-test",
+        &serving.bind,
+        setup(&serving.bind),
+        deadline,
+    ));
+    assert!(futures::poll!(&mut queued).is_pending());
+    tokio::time::pause();
+    tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+    let result = broca_test_support::event_timeout("queued compaction expiry", queued, || {
+        "route busy".into()
     })
     .await
     .unwrap();
-    let started = Instant::now();
-    assert!(serving
-        .plane
-        .setup_with_deadline(
-            "compaction-test",
-            &serving.bind,
-            setup(&serving.bind),
-            started + Duration::from_millis(50)
-        )
-        .await
-        .is_err());
-    assert!(started.elapsed() < Duration::from_millis(500));
+    tokio::time::resume();
+    assert!(result.is_err());
     assert_eq!(
         op_count(&serving, "compaction.setup"),
         2,

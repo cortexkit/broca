@@ -526,8 +526,14 @@ impl SqliteStore {
                         open: true,
                         ..Projection::default()
                     };
+                    // Event projection can create the row before the actor's active-index
+                    // write. Record its session reference in the same managed transaction so
+                    // the legacy-write triggers do not invalidate a complete inventory.
+                    tx.execute("INSERT INTO agent_data_writer VALUES(1)", [])?;
+                    crate::session_refs::insert(&tx, &broca_core::session_addr(session), session)?;
                     tx.execute("INSERT OR IGNORE INTO run_index(run_id,session,submission_id,request_identity_digest,state,state_changed_ms,title) VALUES(?1,?2,?3,?4,'active',?5,?6)",
                         params![run_id.0, serde_json::to_string(session)?, submission_id.as_ref().map(|s| &s.0), request_identity_digest, ts_ms, title])?;
+                    tx.execute("DELETE FROM agent_data_writer", [])?;
                     Some(RunEventDetail::Started {})
                 }
                 WalRecord::Steered { send_id, ts_ms, .. } => {
@@ -1123,6 +1129,93 @@ mod tests {
     }
 
     #[test]
+    fn bus_outbox_ephemeral_sidekick_admission_keeps_inventory_complete() {
+        use broca_core::{FileWalStore, ReadOnlyWalReader, WalStore};
+        let root = broca_test_support::scratch_root()
+            .join(format!("bus-sidekick-completeness-{}", std::process::id(),));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("run-index.db");
+        drop(SqliteStore::open(&database).unwrap());
+        crate::session_refs::migrate(&database, &ReadOnlyWalReader::new(&root)).unwrap();
+        let store = Arc::new(SqliteStore::open(&database).unwrap());
+        store.enable_bus_events("box_test").unwrap();
+        store.begin_bus_event_period(500).unwrap();
+        assert!(store.session_refs(std::iter::empty()).unwrap().complete);
+
+        let session = BindIdentity::new(root.join("project"), "broca", "alfonso:sidekick-fixture");
+        let reference = agent_session_ref(&session);
+        let wal = FileWalStore::new(root.join("wal"));
+        wal.set_session_ref_index(store.clone());
+        let mut record = crate::conformance::run_started(
+            1,
+            "sidekick-run",
+            &session,
+            "sidekick input",
+            ModelHandle::new("test", "model"),
+        )
+        .record;
+        if let WalRecord::RunStarted {
+            retention, ts_ms, ..
+        } = &mut record
+        {
+            *retention = Some(3600);
+            *ts_ms = Some(1000);
+        }
+        let mut writer = wal.open_with_retention(&session, Some(3600)).unwrap();
+        writer.append(1, &record, true).unwrap();
+        drop(writer);
+        assert_eq!(
+            wal.resolve_live_path(&session)
+                .unwrap()
+                .unwrap()
+                .parent()
+                .unwrap(),
+            wal.ephemeral_root()
+        );
+        let known = store
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap();
+        assert!(known.complete);
+        assert_eq!(known.sessions[&reference].1, session);
+        assert!(store.lookup_run("sidekick-run").unwrap().is_none());
+
+        // The durable-event projector can run before the actor's best-effort
+        // active-index write, even though the WAL writer recorded the session reference.
+        let records = wal.read_records(&session).unwrap();
+        store
+            .project_new_bus_events(&session, "epoch", &records, 2000)
+            .unwrap();
+        let found = store
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap();
+        let flags: (u64, bool, u64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM agent_data_pending_session),
+             EXISTS(SELECT 1 FROM agent_data_census_done WHERE id=1),
+             (SELECT count(*) FROM agent_data_writer)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            found.complete,
+            "event projection invalidated inventory: {flags:?}"
+        );
+        assert_eq!(flags, (0, true, 0));
+        assert_eq!(found.sessions[&reference].1, session);
+        assert_eq!(
+            store.lookup_run("sidekick-run").unwrap().unwrap().state,
+            RunIndexState::Active
+        );
+        drop(wal);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bus_outbox_projection_is_ordered_idempotent_and_atomic_with_run_index() {
         let store = enabled();
         let records = [start(), finish(2, RunFinishReason::Completed)];
@@ -1139,6 +1232,15 @@ mod tests {
             store.lookup_run("r1").unwrap().unwrap().state,
             RunIndexState::Completed
         );
+        let reference = agent_session_ref(&session());
+        assert_eq!(
+            store
+                .session_refs([reference.as_str()].into_iter())
+                .unwrap()
+                .sessions[&reference]
+                .1,
+            session()
+        );
         for (key, _, _, body, _) in &values {
             assert_eq!(store.get_bus_event(key).unwrap().unwrap().1, *body);
             assert!(!String::from_utf8_lossy(body).contains("secret prompt"));
@@ -1152,6 +1254,20 @@ mod tests {
             .is_err());
         assert!(broken.lookup_run("r1").unwrap().is_none());
         assert_eq!(broken.bus_event_position(&session(), "epoch").unwrap(), 0);
+        assert!(broken
+            .session_refs([reference.as_str()].into_iter())
+            .unwrap()
+            .sessions
+            .is_empty());
+        let writers: u64 = broken
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM agent_data_writer", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(writers, 0);
     }
 
     struct Fake {

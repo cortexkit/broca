@@ -627,3 +627,658 @@ pub fn plan_projection(
         withdrawals_owed_runs: withdrawals_owed_runs.into_iter().collect(),
     })))
 }
+
+/// The serialized placement seed belongs only to the rebuildable database, never
+/// to a WAL record. Bump when Placement, Batch, OffsetSeed or its boundary state changes shape.
+pub const OFFSET_SEED_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProjectionBoundaryKind {
+    TurnFinished,
+    NoToolStep,
+    ZeroStepSeed,
+}
+
+impl ProjectionBoundaryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnFinished => "turn_finished",
+            Self::NoToolStep => "no_tool_step",
+            Self::ZeroStepSeed => "zero_step_seed",
+        }
+    }
+}
+
+/// Eligibility plus qualifying context, without message content or storage offsets.
+/// A terminal licenses the candidate's earlier sequence, never its own sequence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProjectionBoundaryFact {
+    pub seq: u64,
+    pub kind: ProjectionBoundaryKind,
+    pub episode: u64,
+    pub run_id: Option<String>,
+    pub step_id: Option<u64>,
+    pub batch_id: Option<String>,
+    pub qualified: bool,
+    pub terminal_seq: Option<u64>,
+}
+
+/// The single eligibility fold used by legacy projection planning and the offset
+/// index. Unqualified facts let the index retain a candidate's exact frame locator
+/// until its same-episode terminal arrives, even in a later indexing transaction.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProjectionBoundaryState {
+    pending_no_tool_steps: Vec<ProjectionBoundaryFact>,
+    pending_zero_step_seed: Option<ProjectionBoundaryFact>,
+    steer_pending: bool,
+    episode: Option<u64>,
+    run_id: Option<String>,
+    step_id: Option<u64>,
+    batch_id: Option<String>,
+}
+
+impl ProjectionBoundaryState {
+    fn candidate(&self, seq: u64, kind: ProjectionBoundaryKind) -> ProjectionBoundaryFact {
+        ProjectionBoundaryFact {
+            seq,
+            kind,
+            episode: self.episode.unwrap_or(0),
+            run_id: self.run_id.clone(),
+            step_id: self.step_id,
+            batch_id: self.batch_id.clone(),
+            qualified: false,
+            terminal_seq: None,
+        }
+    }
+
+    pub fn observe(&mut self, frame: &FramedRecord) -> Vec<ProjectionBoundaryFact> {
+        let mut facts = Vec::new();
+        match &frame.record {
+            WalRecord::RunStarted { run_id, origin, .. } => {
+                self.episode = Some(self.episode.map_or(0, |n| n + 1));
+                self.run_id = Some(run_id.0.clone());
+                self.step_id = None;
+                self.batch_id = None;
+                self.pending_no_tool_steps.clear();
+                self.pending_zero_step_seed = None;
+                if matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }) {
+                    let candidate = self.candidate(frame.seq, ProjectionBoundaryKind::ZeroStepSeed);
+                    self.pending_zero_step_seed = Some(candidate.clone());
+                    facts.push(candidate);
+                }
+            }
+            WalRecord::Steered { .. } | WalRecord::SendDelivered { input: Some(_), .. } => {
+                // Crossing this held input would exclude it from both the
+                // materialized prefix and a replay starting after the boundary.
+                self.steer_pending = true;
+            }
+            WalRecord::ModelStepFinished {
+                step_id,
+                assistant_message,
+                ..
+            } => {
+                self.pending_zero_step_seed = None;
+                self.step_id = Some(step_id.0);
+                self.batch_id = None;
+                if assistant_message.tool_calls().next().is_none() && !self.steer_pending {
+                    let candidate = self.candidate(frame.seq, ProjectionBoundaryKind::NoToolStep);
+                    self.pending_no_tool_steps.push(candidate.clone());
+                    facts.push(candidate);
+                }
+            }
+            WalRecord::StepStarted { step_id } => {
+                self.pending_zero_step_seed = None;
+                self.steer_pending = false;
+                self.step_id = Some(step_id.0);
+                self.batch_id = None;
+            }
+            WalRecord::ToolBatchStarted { batch_id, .. } => {
+                self.batch_id = Some(batch_id.0.clone())
+            }
+            WalRecord::RunFinished { .. } => {
+                self.steer_pending = false;
+                for mut candidate in self
+                    .pending_zero_step_seed
+                    .take()
+                    .into_iter()
+                    .chain(self.pending_no_tool_steps.drain(..))
+                {
+                    candidate.qualified = true;
+                    candidate.terminal_seq = Some(frame.seq);
+                    facts.push(candidate);
+                }
+            }
+            WalRecord::TurnFinished { step_id } if !self.steer_pending => {
+                self.step_id = Some(step_id.0);
+                let mut candidate = self.candidate(frame.seq, ProjectionBoundaryKind::TurnFinished);
+                candidate.qualified = true;
+                facts.push(candidate);
+            }
+            _ => {}
+        }
+        // Preamble records belong to an unattributable episode, just as they do
+        // in the offset projection. This metadata does not affect eligibility.
+        self.episode.get_or_insert(0);
+        facts
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OffsetAdmissionSeed {
+    pub run_started: Option<u64>,
+    pub refreeze: Option<u64>,
+    pub auth_refreeze: Option<u64>,
+    pub queued: std::collections::BTreeMap<String, u64>,
+    pub staged: std::collections::BTreeMap<String, u64>,
+    pub compaction: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OffsetSource {
+    pub lo_seq: u64,
+    pub lo_off: u64,
+    pub hi_off: u64,
+    pub input_start: u64,
+    pub input_end: u64,
+    pub tag_base: Option<u64>,
+    pub tag_n: u64,
+    pub tag_high: u64,
+    /// 1 = stored tags, 2 = computed tags, 4 = render, 8 = clean.
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OffsetEpisode {
+    pub n: u64,
+    pub run_id: Option<String>,
+    pub run_started_seq: Option<u64>,
+    pub run_started_off: Option<u64>,
+    pub first_ord: u64,
+    pub step_first_ord: Option<u64>,
+    pub end_ord: u64,
+    pub tag_seed: u64,
+    pub terminal_off: Option<u64>,
+    pub terminal_kind: Option<String>,
+    pub state: String,
+    pub state_seq: u64,
+    pub last_step_off: Option<u64>,
+    pub submission_id: Option<String>,
+    pub request_identity_digest: Option<String>,
+}
+
+/// A small continuation of the ordinal fold. Held inputs and open tool turns
+/// retain source offsets and tag counts, never messages, arguments or results.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OffsetSeed {
+    placement: crate::placement::Placement,
+    boundary_state: ProjectionBoundaryState,
+    pub episode: Option<OffsetEpisode>,
+    pub admission: OffsetAdmissionSeed,
+    held_steers: Vec<OffsetSource>,
+    held_assistant: Option<OffsetSource>,
+    tool_parts: Vec<OffsetSource>,
+    pub tag_high: u64,
+    tag_rules: Option<(bool, bool)>,
+    budget_digest: Option<Vec<u8>>,
+    #[serde(skip)]
+    budget_config: Option<broca_protocol::request::BudgetConfig>,
+    import_tag_high: Option<u64>,
+    pub trailing_origin: Option<u64>,
+    pub title_off: Option<u64>,
+    pub frozen_policy: Option<u64>,
+    pub last_activity_ms: Option<u64>,
+    pub last_write_ms: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub struct OffsetDelta {
+    pub messages: Vec<(u64, OffsetSource)>,
+    pub truncate: Option<u64>,
+    pub closed_episode: Option<OffsetEpisode>,
+    pub reanchor: Option<(u64, u64)>,
+    pub boundaries: Vec<ProjectionBoundaryFact>,
+}
+
+impl OffsetSeed {
+    pub fn head_ord(&self) -> u64 {
+        self.placement.next_ordinal()
+    }
+
+    pub fn encode(&self) -> Result<String, ProjectionPlanError> {
+        Ok(serde_json::to_string(&(OFFSET_SEED_VERSION, self))?)
+    }
+
+    /// Invalid or stale derived state is a cache miss, not a partial seed.
+    pub fn decode(
+        bytes: &str,
+        budget: Option<broca_protocol::request::BudgetConfig>,
+    ) -> Option<Self> {
+        let (version, mut seed): (u32, Self) = serde_json::from_str(bytes).ok()?;
+        if version != OFFSET_SEED_VERSION
+            || seed.budget_digest != offset_budget_digest(budget.as_ref()).ok()?
+        {
+            return None;
+        }
+        // A non-budgeted episode has an empty nudge domain. This fallback is
+        // only for validation; it is never restored as the episode's config.
+        let empty_budget = broca_protocol::request::BudgetConfig::default();
+        if !seed
+            .placement
+            .budget()
+            .is_valid_for(budget.as_ref().unwrap_or(&empty_budget))
+        {
+            return None;
+        }
+        seed.budget_config = budget.clone();
+        seed.placement = crate::placement::Placement::from_index_seed(seed.placement, budget);
+        Some(seed)
+    }
+
+    fn number(&mut self, source: &mut OffsetSource) -> Result<(), ProjectionPlanError> {
+        if source.flags & 2 != 0 {
+            source.tag_base = Some(self.tag_high);
+            self.tag_high = self.tag_high.checked_add(source.tag_n).ok_or(
+                ProjectionPlanError::InconsistentSnapshot("tag numbering overflow"),
+            )?;
+            source.tag_high = self.tag_high;
+        } else {
+            self.tag_high = self.tag_high.max(source.tag_high);
+        }
+        Ok(())
+    }
+
+    pub fn observe(
+        &mut self,
+        frame: &FramedRecord,
+        off: u64,
+        end: u64,
+    ) -> Result<OffsetDelta, ProjectionPlanError> {
+        use crate::placement::{AppendKind, HoldKind, PlacementAction};
+        let record = &frame.record;
+        let mut delta = OffsetDelta::default();
+        if let WalRecord::RunStarted {
+            run_id,
+            submission_id,
+            request_identity_digest,
+            retention,
+            config,
+            ..
+        } = record
+        {
+            self.budget_digest = offset_budget_digest(config.budget.as_ref())?;
+            self.budget_config = config.budget.clone();
+            self.import_tag_high = matches!(
+                record,
+                WalRecord::RunStarted {
+                    origin: broca_wal::RunOrigin::SeededFrom {
+                        origin_kind: broca_wal::SeedOriginKind::Import,
+                        ..
+                    },
+                    ..
+                }
+            )
+            .then_some(self.tag_high);
+            delta.closed_episode = self.episode.take();
+            let n = delta.closed_episode.as_ref().map_or(0, |e| e.n + 1);
+            self.tag_rules = crate::tags::computed_rules(config).map(|r| (r.render, r.clean));
+            if let Some(tags) = config.computed_tags {
+                self.tag_high = self.tag_high.max(tags.checkpoint);
+            }
+            self.episode = Some(OffsetEpisode {
+                n,
+                run_id: Some(run_id.0.clone()),
+                run_started_seq: Some(frame.seq),
+                run_started_off: Some(off),
+                first_ord: self.head_ord(),
+                end_ord: self.head_ord(),
+                tag_seed: self.tag_high,
+                state: "active".into(),
+                state_seq: frame.seq,
+                submission_id: submission_id.as_ref().map(|id| id.0.clone()),
+                request_identity_digest: request_identity_digest.clone(),
+                ..OffsetEpisode::default()
+            });
+            self.held_steers.clear();
+            self.held_assistant = None;
+            self.tool_parts.clear();
+            self.admission.run_started = Some(off);
+            self.admission.refreeze = None;
+            self.admission.auth_refreeze = None;
+            if let Some(id) = submission_id {
+                self.admission.queued.remove(&id.0);
+                self.admission.staged.remove(&id.0);
+            }
+            self.frozen_policy = match (self.frozen_policy, retention) {
+                (Some(old), Some(new)) => Some(old.min(*new)),
+                (old, new) => old.or(*new),
+            };
+        }
+        if self.episode.is_none() {
+            self.episode = Some(OffsetEpisode {
+                first_ord: self.head_ord(),
+                state: "unknown".into(),
+                ..OffsetEpisode::default()
+            });
+        }
+        if let WalRecord::Queued {
+            retention: Some(retention),
+            ..
+        }
+        | WalRecord::Steered {
+            retention: Some(retention),
+            ..
+        } = record
+        {
+            self.frozen_policy = Some(self.frozen_policy.unwrap_or(*retention).min(*retention));
+        }
+        if record.title().is_some() {
+            self.title_off = Some(off);
+        }
+        if let Some(time) = crate::context::record_time_ms(record) {
+            self.last_write_ms = Some(time);
+            self.last_activity_ms = Some(self.last_activity_ms.unwrap_or(0).max(time));
+        }
+        let tag_rules = self
+            .tag_rules
+            .map(|(render, clean)| broca_protocol::tags::ComputedRules { render, clean });
+        match record {
+            WalRecord::Queued { submission_id, .. } => {
+                self.admission.queued.insert(submission_id.0.clone(), off);
+            }
+            WalRecord::Retracted { submission_id, .. }
+            | WalRecord::SendEnded { submission_id, .. }
+            | WalRecord::SendDelivered { submission_id, .. } => {
+                self.admission.queued.remove(&submission_id.0);
+                self.admission.staged.remove(&submission_id.0);
+            }
+            WalRecord::DeliveryOrdered { submission_id, .. } => {
+                self.admission.staged.insert(submission_id.0.clone(), off);
+            }
+            WalRecord::RunConfigRefrozen { .. } => self.admission.refreeze = Some(off),
+            WalRecord::RunAuthRefrozen { .. } => self.admission.auth_refreeze = Some(off),
+            WalRecord::StepStarted { .. } => {
+                if let Some(ep) = &mut self.episode {
+                    ep.state = "active".into();
+                    ep.state_seq = frame.seq;
+                }
+            }
+            WalRecord::ModelStepFinished { .. } => {
+                self.trailing_origin = Some(off);
+                if let Some(ep) = &mut self.episode {
+                    ep.last_step_off = Some(off);
+                }
+            }
+            WalRecord::ToolBatchStarted { .. } => {
+                self.tool_parts.clear();
+            }
+            WalRecord::ToolResult { result, .. } => {
+                let message = offset_tool_message(result);
+                let source = offset_source(frame, off, end, 0, Some(&message), tag_rules)?;
+                self.tool_parts.push(source);
+            }
+            WalRecord::ToolNoDispatch {
+                tool_call_id,
+                reason,
+                ..
+            } => {
+                let message =
+                    offset_tool_message(&crate::replay::no_dispatch_result(tool_call_id, reason));
+                let source = offset_source(frame, off, end, 0, Some(&message), tag_rules)?;
+                self.tool_parts.push(source);
+            }
+            WalRecord::ApprovalRecorded {
+                closing_result: Some(result),
+                ..
+            } => {
+                let message = offset_tool_message(result);
+                let source = offset_source(frame, off, end, 0, Some(&message), tag_rules)?;
+                self.tool_parts.push(source);
+            }
+            WalRecord::RunFinished { reason, .. } => {
+                if let Some(ep) = &mut self.episode {
+                    ep.terminal_off = Some(off);
+                    ep.terminal_kind = Some(serde_json::to_string(reason)?);
+                    ep.state = reason.as_str().to_owned();
+                    ep.state_seq = frame.seq;
+                }
+            }
+            WalRecord::RunPaused { .. } => {
+                if let Some(ep) = &mut self.episode {
+                    ep.state = "paused".into();
+                    ep.state_seq = frame.seq;
+                }
+            }
+            WalRecord::CompactionMessage {
+                kind,
+                tag_checkpoint,
+                ..
+            } => {
+                self.admission.compaction.push(off);
+                if let Some(checkpoint) = tag_checkpoint
+                    .as_ref()
+                    .filter(|_| *kind == broca_wal::CompactionMessageKind::Setup)
+                {
+                    if let Some(cut) = checkpoint
+                        .cut
+                        .strip_prefix('m')
+                        .and_then(|n| n.parse::<u64>().ok())
+                    {
+                        delta.reanchor = Some((cut, checkpoint.tag_checkpoint));
+                    }
+                }
+            }
+            WalRecord::CompactionAnswer { .. } => self.admission.compaction.push(off),
+            _ => {}
+        }
+        let assistant_message = match record {
+            WalRecord::ModelStepFinished {
+                assistant_message, ..
+            } => Some(broca_protocol::Message::new(
+                broca_protocol::Role::Assistant,
+                assistant_message.content.clone(),
+            )),
+            _ => None,
+        };
+        let budget_message = if let (
+            WalRecord::BudgetFired {
+                kind,
+                threshold,
+                caller_text,
+                ..
+            },
+            Some(config),
+        ) = (record, &self.budget_config)
+        {
+            let text = match kind {
+                broca_protocol::request::BudgetKind::Nudge => config
+                    .nudges
+                    .iter()
+                    .find(|n| n.at_tool_calls == *threshold)
+                    .map(|n| &n.text),
+                broca_protocol::request::BudgetKind::Finalize => Some(&config.finalize_text),
+            }
+            .ok_or(ProjectionPlanError::InconsistentSnapshot(
+                "budget firing has no frozen text",
+            ))?;
+            if caller_text.as_ref().is_some_and(|given| given != text) {
+                return Err(ProjectionPlanError::InconsistentSnapshot(
+                    "budget firing text differs from frozen config",
+                ));
+            }
+            Some(broca_protocol::Message::new(
+                broca_protocol::Role::User,
+                vec![broca_protocol::ContentBlock::Text { text: text.clone() }],
+            ))
+        } else {
+            None
+        };
+        let actions = self
+            .placement
+            .observe(record)
+            .map_err(|_| ProjectionPlanError::InconsistentSnapshot("offset placement failed"))?;
+        for action in actions {
+            match action {
+                PlacementAction::Hold {
+                    count,
+                    kind: HoldKind::Steer,
+                } => {
+                    for i in 0..count {
+                        self.held_steers.push(offset_source(
+                            frame,
+                            off,
+                            end,
+                            i,
+                            input_message(record, i),
+                            tag_rules,
+                        )?);
+                    }
+                }
+                PlacementAction::Hold {
+                    kind: HoldKind::Assistant,
+                    ..
+                } => {
+                    let message = match record {
+                        WalRecord::ModelStepFinished { .. } => assistant_message.as_ref(),
+                        _ => None,
+                    };
+                    self.held_assistant =
+                        Some(offset_source(frame, off, end, 0, message, tag_rules)?);
+                }
+                PlacementAction::PlaceHeld { first, count } => {
+                    let sources = std::mem::take(&mut self.held_steers);
+                    if sources.len() as u64 != count {
+                        return Err(ProjectionPlanError::InconsistentSnapshot(
+                            "held steer sources disagree with placement",
+                        ));
+                    }
+                    for (i, mut source) in sources.into_iter().enumerate() {
+                        self.number(&mut source)?;
+                        delta.messages.push((first + i as u64, source));
+                    }
+                }
+                PlacementAction::Truncate { to } => {
+                    delta.truncate = Some(to);
+                    if let Some(high) = self.import_tag_high {
+                        self.tag_high = high;
+                    }
+                }
+                PlacementAction::Append { first, count, kind } => {
+                    if kind == AppendKind::ToolTurn && count != 0 {
+                        let mut assistant = self.held_assistant.take().ok_or(
+                            ProjectionPlanError::InconsistentSnapshot(
+                                "tool turn lacks assistant source",
+                            ),
+                        )?;
+                        assistant.hi_off = end;
+                        assistant.input_end = 1;
+                        let mut tools = assistant.clone();
+                        tools.input_start = 1;
+                        tools.input_end = 2;
+                        tools.tag_n = self.tool_parts.iter().map(|s| s.tag_n).sum();
+                        tools.tag_high = self
+                            .tool_parts
+                            .iter()
+                            .map(|s| s.tag_high)
+                            .max()
+                            .unwrap_or(0);
+                        tools.tag_base = self.tool_parts.iter().filter_map(|s| s.tag_base).min();
+                        self.number(&mut assistant)?;
+                        self.number(&mut tools)?;
+                        delta.messages.push((first, assistant));
+                        delta.messages.push((first + 1, tools));
+                        self.tool_parts.clear();
+                    } else {
+                        for i in 0..count {
+                            let message = match record {
+                                WalRecord::ModelStepFinished { .. } => assistant_message.as_ref(),
+                                WalRecord::BudgetFired { .. } => budget_message.as_ref(),
+                                _ => input_message(record, i),
+                            };
+                            let mut source = offset_source(frame, off, end, i, message, tag_rules)?;
+                            self.number(&mut source)?;
+                            delta.messages.push((first + i, source));
+                        }
+                    }
+                    if matches!(
+                        kind,
+                        AppendKind::Assistant | AppendKind::Finalize | AppendKind::ToolTurn
+                    ) && count != 0
+                    {
+                        if let Some(ep) = &mut self.episode {
+                            ep.step_first_ord.get_or_insert(first);
+                        }
+                    }
+                }
+            }
+        }
+        let head = self.head_ord();
+        if let Some(ep) = &mut self.episode {
+            ep.end_ord = head;
+        }
+        delta.boundaries = self.boundary_state.observe(frame);
+        Ok(delta)
+    }
+}
+
+fn offset_budget_digest(
+    budget: Option<&broca_protocol::request::BudgetConfig>,
+) -> Result<Option<Vec<u8>>, ProjectionPlanError> {
+    use sha2::Digest;
+    budget
+        .map(|budget| serde_jcs::to_vec(budget).map(|bytes| sha2::Sha256::digest(bytes).to_vec()))
+        .transpose()
+        .map_err(ProjectionPlanError::Json)
+}
+
+fn offset_tool_message(result: &broca_protocol::ToolResult) -> broca_protocol::Message {
+    broca_protocol::Message::new(
+        broca_protocol::Role::Tool,
+        vec![broca_protocol::ContentBlock::ToolResult(result.clone())],
+    )
+}
+
+fn input_message(record: &WalRecord, i: u64) -> Option<&broca_protocol::Message> {
+    match record {
+        WalRecord::RunStarted { input, .. }
+        | WalRecord::Steered { input, .. }
+        | WalRecord::SendDelivered {
+            input: Some(input), ..
+        } => input.get(i as usize),
+        _ => None,
+    }
+}
+
+fn offset_source(
+    frame: &FramedRecord,
+    off: u64,
+    end: u64,
+    i: u64,
+    message: Option<&broca_protocol::Message>,
+    rules: Option<broca_protocol::tags::ComputedRules>,
+) -> Result<OffsetSource, ProjectionPlanError> {
+    let mut source = OffsetSource {
+        lo_seq: frame.seq,
+        lo_off: off,
+        hi_off: end,
+        input_start: i,
+        input_end: i + 1,
+        ..OffsetSource::default()
+    };
+    if let Some(tags) = frame.record.runner_tags().get(i as usize) {
+        source.flags = 1;
+        source.tag_base = tags
+            .parts
+            .iter()
+            .copied()
+            .min()
+            .map(|n| n.saturating_sub(1));
+        source.tag_high = tags.max_tag().unwrap_or(0);
+        source.tag_n = tags.parts.len() as u64;
+    } else if let (Some(message), Some(rules)) = (message, rules) {
+        let mut message = message.clone();
+        broca_protocol::tags::number_message(&mut message, rules, &mut source.tag_n)
+            .map_err(|_| ProjectionPlanError::InconsistentSnapshot("tag count overflow"))?;
+        source.flags = 2 | if rules.render { 4 } else { 0 } | if rules.clean { 8 } else { 0 };
+    }
+    Ok(source)
+}

@@ -15,10 +15,14 @@ test-known-feature = []
 # Test-only hooks for dependent crates to observe file/directory syncs during
 # session moves and inject I/O failures at those filesystem boundaries.
 test-io-trace = []
+# Test-only filesystem backend override for the power-loss harness. Artifacts built
+# with this feature carry a marker that staging and placement refuse.
+fs-override = []
 
 [dependencies]
 broca-owner-only.workspace = true
 broca-protocol = { path = "../broca-protocol" }
+broca-wal-reader = { path = "../broca-wal-reader", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

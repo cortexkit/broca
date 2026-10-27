@@ -1,54 +1,7 @@
-//! Opt-in corpus measurement; fixture creation is excluded from the sweep measurements.
+//! Opt-in retention workload benchmark. It prints timings and never fails on them; fixture
+//! creation is excluded from the measured sweeps.
 use super::*;
 use broca_wal::Wal;
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-#[ignore = "creates 10 MB WALs and measures expiry polling; run explicitly"]
-async fn expiry_poll_measurement() {
-    let iterations: u64 = std::env::var("BROCA_EXPIRY_BENCH_ITERATIONS")
-        .unwrap_or_else(|_| "50".into())
-        .parse()
-        .unwrap();
-    for retained in [false, true] {
-        let rig = Rig::new();
-        let now = rig.service.clock.now_ms();
-        let retention = retained.then_some(RETAINED_SECONDS);
-        let mut wal = rig
-            .service
-            .wal
-            .open_with_retention(&rig.key, retention)
-            .unwrap();
-        wal.append(1, &started(&rig.key, "r1", retention, now), false)
-            .unwrap();
-        let record = large_expiry_step();
-        for _ in 0..100 {
-            wal.append(1, &record, false).unwrap();
-        }
-        wal.append(1, &finished(now), true).unwrap();
-        drop(wal);
-        if retained {
-            rig.service.rederive(&rig.key).unwrap();
-        }
-        let bytes = fs::metadata(
-            rig.service
-                .wal
-                .resolve_live_path(&rig.key)
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap()
-        .len();
-        let registry = rig.registry(None);
-        registry.check_expired(&rig.key, None).await.unwrap();
-        let cpu = cpu_ticks();
-        let wall = std::time::Instant::now();
-        for _ in 0..iterations {
-            registry.check_expired(&rig.key, None).await.unwrap();
-        }
-        eprintln!("EXPIRY_BENCH retained={retained} bytes={bytes} iterations={iterations} wall_us={} cpu_ticks={}", wall.elapsed().as_micros(), cpu_ticks() - cpu);
-    }
-}
 
 fn cpu_ticks() -> u64 {
     let stat = fs::read_to_string("/proc/self/stat").unwrap();
@@ -61,9 +14,13 @@ fn cpu_ticks() -> u64 {
     fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
 }
 
+/// Benchmark, not a correctness test: times boot, resume and sweep passes over 55,000
+/// retained WALs, of which 100 are due. The only assertion is the due-count sanity check, so
+/// that a run which deleted nothing cannot report a fast sweep. Due-set correctness is
+/// covered by the small active sweep tests in `retention_tests.rs`.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "creates 55,000 WALs; run explicitly for retention performance measurements"]
+#[ignore = "benchmark: creates 55,000 WALs and prints timings; run with --ignored --nocapture"]
 async fn retention_corpus_measurement() {
     let rig = Rig::new();
     fs::create_dir_all(rig.service.wal.ephemeral_root()).unwrap();

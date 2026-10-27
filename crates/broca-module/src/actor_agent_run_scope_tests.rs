@@ -120,6 +120,9 @@ async fn enabled_agent_run_refusals_write_no_wal_bytes() {
         request.scope = SendScope::Stamped(BindScope {
             scope: stamp,
             owner_authorized: true,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
         });
         let tool: broca_protocol::request::Tool = serde_json::from_value(serde_json::json!({
             "name": "edit", "description": "Edit", "input_schema": {"type": "object"},

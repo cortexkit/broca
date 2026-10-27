@@ -401,6 +401,7 @@ pub struct RetentionService {
     unreadable: Mutex<std::collections::HashSet<String>>,
     enrollment: Mutex<Enrollment>,
     deletion_recovery: Mutex<(bool, std::collections::HashSet<BindIdentity>)>,
+    archived_expiry: Mutex<ArchivedExpiry>,
     #[cfg(test)]
     file_work: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -414,6 +415,19 @@ pub struct RetentionService {
     resolver: Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>,
     #[cfg(test)]
     before_enroll: Mutex<Option<Arc<EnrollmentHook>>>,
+}
+
+#[derive(Default)]
+struct ArchivedExpiry {
+    identity: Option<broca_core::wal_writer::ArchiveIdentity>,
+    lineages: HashMap<BindIdentity, ArchivedLineage>,
+}
+
+struct ArchivedLineage {
+    id: String,
+    wal_bytes: u64,
+    policy: Option<(u64, u64, Option<u64>)>,
+    runs: std::collections::HashSet<String>,
 }
 
 #[derive(Default)]
@@ -535,6 +549,7 @@ impl RetentionService {
             unreadable: Mutex::new(std::collections::HashSet::new()),
             enrollment: Mutex::default(),
             deletion_recovery: Mutex::default(),
+            archived_expiry: Mutex::default(),
             #[cfg(test)]
             file_work: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -735,6 +750,16 @@ impl RetentionService {
         run: Option<&str>,
         head: Option<u64>,
     ) -> Result<Option<u64>, String> {
+        self.expired_head_with_meta(key, run, head, None)
+    }
+
+    pub(crate) fn expired_head_with_meta(
+        &self,
+        key: &BindIdentity,
+        run: Option<&str>,
+        head: Option<u64>,
+        meta: Option<&broca_core::AdmissionStoreSnapshot>,
+    ) -> Result<Option<u64>, String> {
         let run_meta = run.map(|run| self.index.run(run)).transpose()?.flatten();
         if let Some(meta) = &run_meta {
             if meta.expired_at_ms.is_some() {
@@ -760,6 +785,9 @@ impl RetentionService {
             .transpose()?
             .flatten();
         let path = path.filter(|_| file.is_some());
+        if path.is_some() {
+            self.archived_expiry.lock().unwrap().lineages.remove(key);
+        }
         // Retention cannot be added after the first send. Retained lineages are always
         // placed in wal-ephemeral, so portable/durable logs need no expiry replay.
         if path
@@ -768,10 +796,73 @@ impl RetentionService {
         {
             return Ok(None);
         }
-        if head.is_none() {
+        let stones = self.tombstones(key)?;
+        let mut archived_read = None;
+        if path.is_none() && head.is_none() {
+            let identity = self.wal.archive_identity().map_err(|e| e.to_string())?;
+            let mut cache = self.archived_expiry.lock().unwrap();
+            if cache.identity != identity {
+                cache.lineages.clear();
+                cache.identity = identity.clone();
+            }
+            if let Some(facts) = cache.lineages.get(key) {
+                if self
+                    .wal
+                    .resolve_live_path(key)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                {
+                    return self.expired_archived(key, run, &stones, facts);
+                }
+                cache.lineages.remove(key);
+            }
+            let archived = self
+                .wal
+                .read_archived_for_expiry(key)
+                .map_err(|e| e.to_string())?;
+            if let Some((read, wal_bytes)) = archived {
+                // Archive indexes identify addresses, not lineages. Parse the member's WAL
+                // records once to extract its lineage and policy, without caching records.
+                // Tombstones, index expiry and the clock remain fresh on every cache hit.
+                if let Some(id) = read
+                    .lineage_id
+                    .filter(|_| matches!(read.records(), broca_wal::WalRangeRecords::Complete(_)))
+                {
+                    let facts = ArchivedLineage {
+                        id: id.to_string(),
+                        wal_bytes,
+                        policy: policy(frames(&read)),
+                        runs: frames(&read)
+                            .iter()
+                            .filter_map(|frame| match &frame.record {
+                                WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                    };
+                    let verdict = self.expired_archived(key, run, &stones, &facts)?;
+                    if identity.is_some()
+                        && self.wal.archive_identity().map_err(|e| e.to_string())? == identity
+                        && self
+                            .wal
+                            .resolve_live_path(key)
+                            .map_err(|e| e.to_string())?
+                            .is_none()
+                    {
+                        // Bound memory even when a client probes arbitrarily many sessions.
+                        if cache.lineages.len() >= 16_384 {
+                            cache.lineages.clear();
+                        }
+                        cache.lineages.insert(key.clone(), facts);
+                    }
+                    return Ok(verdict);
+                }
+                archived_read = Some(read);
+            }
+        }
+        if head.is_none() && archived_read.is_none() {
             self.wal.flush_for_read(key).map_err(|e| e.to_string())?;
         }
-        let stones = self.tombstones(key)?;
         if let Some(file) = &file {
             let bytes = file.metadata().map_err(|e| e.to_string())?.len();
             if let Some(row) = self.index.live(key)?.filter(|row| row.wal_bytes == bytes) {
@@ -804,10 +895,13 @@ impl RetentionService {
                 }
             }
         }
-        let read = self
-            .wal
-            .read_records_range(key, 0, head, None)
-            .map_err(|e| e.to_string())?;
+        let read = match archived_read {
+            Some(read) => read,
+            None => self
+                .wal
+                .read_records_range(key, 0, head, None)
+                .map_err(|e| e.to_string())?,
+        };
         if matches!(read.records(), broca_wal::WalRangeRecords::Complete(_)) {
             if let Some(stone) = stones.iter().find(|s| {
                 Some(s.lineage_id.as_str())
@@ -860,7 +954,7 @@ impl RetentionService {
         }
         if self
             .wal
-            .lineage_exists(key, None)
+            .lineage_exists(key, meta)
             .map_err(|e| e.to_string())?
         {
             return Ok(None);
@@ -869,6 +963,39 @@ impl RetentionService {
             .into_iter()
             .max_by_key(|stone| stone.seq)
             .map(|stone| stone.expired_at_ms))
+    }
+
+    fn expired_archived(
+        &self,
+        key: &BindIdentity,
+        run: Option<&str>,
+        stones: &[Tombstone],
+        facts: &ArchivedLineage,
+    ) -> Result<Option<u64>, String> {
+        if let Some(stone) = stones.iter().find(|stone| stone.lineage_id == facts.id) {
+            return Ok(Some(stone.expired_at_ms));
+        }
+        if run.is_some_and(|run| !facts.runs.contains(run)) {
+            return Ok(None);
+        }
+        if let Some(row) = self
+            .index
+            .lineage(&facts.id)?
+            .filter(|row| row.session == *key)
+        {
+            if row.expired_at_ms.is_some() {
+                return Ok(row.expired_at_ms);
+            }
+            if row.wal_bytes == facts.wal_bytes {
+                return Ok(row
+                    .expires_at_ms
+                    .filter(|deadline| *deadline <= self.clock.now_ms()));
+            }
+        }
+        Ok(facts
+            .policy
+            .and_then(|(_, _, deadline)| deadline)
+            .filter(|deadline| *deadline <= self.clock.now_ms()))
     }
 
     /// Keep actor maintenance bounded; enrollment repairs longer histories under the lease.

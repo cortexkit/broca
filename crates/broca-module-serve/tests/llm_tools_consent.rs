@@ -957,11 +957,7 @@ impl ClassifierProvider for Provider {
 struct Marked;
 #[async_trait::async_trait]
 impl Asks for Marked {
-    async fn marked(
-        &self,
-        _: subc_protocol::Principal,
-        _: &str,
-    ) -> Option<broca_subc::PrivateContent> {
+    async fn marked(&self, _: &str, _: Option<&str>) -> Option<broca_subc::PrivateContent> {
         Some(broca_subc::PrivateContent {
             marked: true,
             sources: vec![broca_subc::SourceKind::PersonBrowser],
@@ -969,7 +965,6 @@ impl Asks for Marked {
     }
     async fn flow_providers(
         &self,
-        _: subc_protocol::Principal,
         _: &str,
     ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
         unreachable!("run only")
@@ -1010,6 +1005,9 @@ async fn real_tool_path_captures_card_golden_and_ordinary_or_keyless_route_never
     let stamp = SendScope::Stamped(BindScope {
         scope: scope(),
         owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
     });
     for (key, held_capability) in [(Some("ordinary"), false), (None, true)] {
         let mut request = json!({"name":"llm_classify","arguments":args("typesafe/jev-1.13.0")});
@@ -1122,6 +1120,9 @@ async fn missing_provider_display_name_refuses_before_card_or_hold_is_written() 
     let stamp = SendScope::Stamped(BindScope {
         scope: scope(),
         owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
     });
     let request = json!({"name":"llm_classify","arguments":args("typesafe/jev-1.13.0"),"call_key":"missing-provider-name"});
     let reply = tools

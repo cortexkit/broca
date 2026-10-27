@@ -700,6 +700,8 @@ async fn full_wal_resume_releases_before_its_first_request_and_preserves_guidanc
         held[0].extra_wal_input_owners, 0,
         "the complete replay's WAL frames were released"
     );
+    assert!(!expected[3..].is_empty());
+    assert_eq!(calls.len(), expected[3..].len());
     for (actual, expected) in calls.iter().zip(&expected[3..]) {
         assert_eq!(
             crate::canonical_request_bytes(actual),

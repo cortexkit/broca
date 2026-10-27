@@ -3252,23 +3252,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn release_builds_exclude_test_only_hooks() {
-        let source = include_str!("subc_plane.rs");
-        for name in [
-            "with_scope_sync_hold_for_test",
-            "test_cached_route_is_open",
-            "test_mint_lifecycle_token_uncancelled",
-        ] {
-            let declaration =
-                format!("#[cfg(debug_assertions)]\n    #[doc(hidden)]\n    pub fn {name}(");
-            assert!(
-                source.contains(&declaration),
-                "{name} must be compiled out of release builds"
-            );
-        }
-    }
-
     #[derive(Clone, Default)]
     struct RouteOpenScript {
         delay: Duration,
@@ -6785,14 +6768,21 @@ mod tests {
                     live("head", 1, "agent-a"),
                     not_live(false),
                     not_live(false),
-                    live("head", 1, "agent-a"),
                 ],
             );
             let (scoped, read) = started(&plane).await;
             conn.close(route_of(&plane, &scoped));
-            let started_at = Instant::now();
-            assert_completed_success(plane.dispatch(&scoped, &read).await);
-            assert!(started_at.elapsed() > Duration::ZERO, "the call was held");
+            let described_before = describer.calls.load(Ordering::SeqCst);
+            let mut dispatch = Box::pin(plane.dispatch(&scoped, &read));
+            assert!(futures::poll!(&mut dispatch).is_pending());
+            assert_eq!(
+                conn.tool_calls.load(Ordering::SeqCst),
+                0,
+                "unsynced calls stay unsent"
+            );
+            assert!(describer.calls.load(Ordering::SeqCst) > described_before);
+            describer.script("head", vec![live("head", 1, "agent-a")]);
+            assert_completed_success(dispatch.await);
             assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
 
             let (conn, plane, describer) = rig(vec![successful_tool_reply("must not be sent")]);

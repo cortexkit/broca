@@ -19,7 +19,7 @@ fn wait_for(path: &Path) {
     });
 }
 
-pub(super) fn before_lock(lock: &std::fs::File) {
+pub(super) fn before_lock(lock: &crate::fs_ops::File) {
     let Some((dir, role)) = probe() else {
         return;
     };

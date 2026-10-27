@@ -413,7 +413,7 @@ async fn mismatched_caller_identity_never_opens_a_route() {
 }
 
 #[tokio::test]
-async fn budget_bounds_silent_provider_and_route_open_with_250ms_tolerance() {
+async fn budget_bounds_silent_provider_and_route_open() {
     assert_eq!(STEP_TRANSFORM_HOOK_CAP, 30_000);
     for silent_bind in [false, true] {
         let serving = start(
@@ -427,18 +427,38 @@ async fn budget_bounds_silent_provider_and_route_open_with_250ms_tolerance() {
             silent_bind,
         )
         .await;
-        let started = Instant::now();
-        assert!(serving
-            .plane
-            .hook_with_deadline(
-                "transform-test",
-                &serving.bind,
-                call(&serving.bind),
-                started + Duration::from_millis(150)
-            )
-            .await
-            .is_err());
-        assert!(started.elapsed() <= Duration::from_millis(400));
+        let plane = serving.plane.clone();
+        let bind = serving.bind.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let request = tokio::spawn(async move {
+            plane
+                .hook_with_deadline("transform-test", &bind, call(&bind), deadline)
+                .await
+        });
+        broca_test_support::wait_until("silent hook provider reached", || async {
+            let reached = if silent_bind {
+                bind_count(&serving) == 1
+            } else {
+                op_count(&serving, "transform.hook") == 1
+            };
+            if reached {
+                Ok(())
+            } else {
+                Err("hook request not received".into())
+            }
+        })
+        .await;
+        // Socket delivery is observable; only the policy deadline advances virtually.
+        tokio::time::pause();
+        tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+        let result = broca_test_support::event_timeout("hook deadline expiry", request, || {
+            "silent provider".into()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::resume();
+        assert!(result.is_err());
         assert_eq!(bind_count(&serving), 1, "the real provider was reached");
         if !silent_bind {
             assert_eq!(op_count(&serving, "transform.hook"), 1);

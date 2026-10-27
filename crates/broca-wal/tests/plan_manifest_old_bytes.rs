@@ -9,6 +9,8 @@
 //! decoding these bytes and writing them back unchanged, and must not make such a record require
 //! a feature it did not require then.
 
+#![allow(clippy::disallowed_methods)] // Fixture I/O is not a production WAL path.
+
 use broca_wal::WalRecord;
 
 const FIXTURE: &str = include_str!("fixtures/plan_manifest_pre_declarations.json");

@@ -38,6 +38,7 @@ async-trait.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+tokio-tungstenite.workspace = true
 cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }
 cortexkit-bus-trait.workspace = true
 broca-wal = { path = "../broca-wal", features = ["test-io-trace"] }

@@ -3,14 +3,6 @@
 //!
 //! This is its own test binary because it replaces the process-global catalog mid-test, which
 //! would race the other suites that share one installed catalog.
-#[cfg(not(feature = "live"))]
-#[test]
-fn this_suite_needs_its_feature_enabled() {
-    eprintln!(
-        "SKIP code_assist_variant_resume: compiled without the live feature. Re-run with \
-         `-F broca-catalog/live` to execute it."
-    );
-}
 
 #[cfg(feature = "live")]
 mod gated {

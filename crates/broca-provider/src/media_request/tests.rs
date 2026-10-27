@@ -9,6 +9,8 @@ use broca_wal::WalRecord;
 use serde_json::json;
 use std::path::PathBuf;
 
+mod render_tests;
+
 struct Fixture {
     root: PathBuf,
     store: MediaStore,

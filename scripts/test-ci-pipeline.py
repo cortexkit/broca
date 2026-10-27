@@ -150,7 +150,8 @@ class WorkflowGraph(unittest.TestCase):
         self.assertEqual(self.workflow('ci.yml')['permissions']['actions'], 'read')
         self.assertEqual(set(jobs['test']['needs']),
                          {'lint', 'scripts', 'unit', 'production-features', 'store-contention-macos',
-                          'integration-build', 'fixtures', 'integration', 'linux-deploy'})
+                          'integration-build', 'fixtures', 'integration', 'linux-deploy',
+                          'wal-reader'})
 
     def test_master_and_nightly_runs_are_never_cancelled_by_each_other(self):
         """A master push cancelled the nightly run on master, or a later push cancelled an

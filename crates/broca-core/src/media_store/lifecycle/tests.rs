@@ -465,3 +465,77 @@ fn preview_preserves_all_files_and_lease_epochs_and_respects_live_writers() {
     drop(lease);
     assert_eq!(sweep(&root).unwrap().objects_removed, 1);
 }
+
+/// Counts the WAL directory barriers a removal performs. Production emits this step from
+/// `sync_wal_directories_with`, so a zero here is a real observation, not a silent seam.
+#[derive(Default)]
+struct CountingSteps {
+    synced: usize,
+}
+
+impl StorageSteps for CountingSteps {
+    fn reached(&mut self, step: Step) -> io::Result<()> {
+        if step == Step::WalDirectorySynced {
+            self.synced += 1;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn no_media_skips_wal_checks_and_barrier() {
+    let (root, store, session) = fixture();
+    let wal_dir = root.join("wal-ephemeral");
+    broca_owner_only::create_dir_all(&wal_dir).unwrap();
+    // A live WAL used to make this refuse after scanning every WAL directory. With no
+    // media entries there is nothing to drop, so removal returns before any WAL check.
+    let live = wal_dir.join(format!("{}.wal", session_addr(&session)));
+    fs::write(&live, b"live").unwrap();
+    let mut steps = CountingSteps::default();
+    store.remove_session_with(&session, &mut steps).unwrap();
+    assert_eq!(
+        steps.synced, 0,
+        "no-media deletion must skip the WAL barrier"
+    );
+}
+
+#[test]
+fn with_media_runs_the_barrier_and_drops_the_manifest() {
+    let (root, store, session) = fixture();
+    let path = accepted(&root, &store, &session);
+    fs::remove_file(path).unwrap();
+    let mut steps = CountingSteps::default();
+    store.remove_session_with(&session, &mut steps).unwrap();
+    assert!(
+        steps.synced > 0,
+        "the WAL barrier must still run before dropping media entries"
+    );
+    assert!(!manifest(&store, &session).exists());
+}
+
+#[test]
+fn deleting_exact_check_refuses_while_deleting_exists() {
+    let (root, store, session) = fixture();
+    let path = accepted(&root, &store, &session);
+    fs::remove_file(path).unwrap();
+    let address = session_addr(&session);
+    let lineage = "testlineage";
+    let expired = root
+        .join("wal-ephemeral")
+        .join(format!("{address}.expired"));
+    broca_owner_only::create_dir_all(&expired).unwrap();
+    fs::write(expired.join(lineage), br#"{"lineage_id":"testlineage"}"#).unwrap();
+    let deleting = root
+        .join("wal-ephemeral")
+        .join(format!("{address}.{lineage}.deleting"));
+    fs::write(&deleting, b"deleting").unwrap();
+    let mut steps = CountingSteps::default();
+    assert!(
+        store.remove_session_with(&session, &mut steps).is_err(),
+        "an exact .deleting match must refuse like the old prefix scan"
+    );
+    fs::remove_file(&deleting).unwrap();
+    let mut steps = CountingSteps::default();
+    store.remove_session_with(&session, &mut steps).unwrap();
+    assert!(!manifest(&store, &session).exists());
+}

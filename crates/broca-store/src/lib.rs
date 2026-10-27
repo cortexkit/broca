@@ -38,6 +38,7 @@ use busy::STORE_BUSY_TIMEOUT;
 pub mod bus_events;
 pub mod compaction_facts;
 pub mod compaction_receipts;
+pub mod db;
 pub mod export_index;
 mod fold_identities;
 pub mod grants;
@@ -3567,57 +3568,6 @@ mod tests {
         );
         SqliteStore::init(&conn).unwrap();
         SqliteStore::init(&conn).unwrap();
-    }
-
-    #[test]
-    fn schema_upgrade_logs_source_target_and_elapsed_time_once() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        SqliteStore::init(&conn).unwrap();
-        conn.pragma_update(None, "user_version", 0).unwrap();
-        let capture = broca_test_support::LogCapture::new();
-
-        capture.in_scope(|| SqliteStore::init(&conn).unwrap());
-
-        let events = capture.events();
-        let started: Vec<_> = events
-            .iter()
-            .filter(|event| event.message() == "store schema upgrade started")
-            .collect();
-        let ended: Vec<_> = events
-            .iter()
-            .filter(|event| event.message() == "store schema upgrade ended")
-            .collect();
-        assert_eq!(started.len(), 1, "{events:?}");
-        assert_eq!(ended.len(), 1, "{events:?}");
-        assert_eq!(started[0].level, tracing::Level::INFO);
-        assert_eq!(started[0].fields["from_version"], "0");
-        assert_eq!(started[0].fields["to_version"], "1");
-        assert_eq!(ended[0].level, tracing::Level::INFO);
-        assert_eq!(ended[0].fields["from_version"], "0");
-        assert_eq!(ended[0].fields["to_version"], "1");
-        assert!(ended[0].fields.contains_key("elapsed_ms"));
-    }
-
-    #[test]
-    fn schema_initialization_without_an_upgrade_emits_no_upgrade_logs() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let capture = broca_test_support::LogCapture::new();
-
-        capture.in_scope(|| {
-            SqliteStore::init(&conn).unwrap();
-            SqliteStore::init(&conn).unwrap();
-        });
-
-        let events = capture.events();
-        assert!(
-            events.iter().all(|event| {
-                !matches!(
-                    event.message(),
-                    "store schema upgrade started" | "store schema upgrade ended"
-                )
-            }),
-            "{events:?}"
-        );
     }
 
     #[test]

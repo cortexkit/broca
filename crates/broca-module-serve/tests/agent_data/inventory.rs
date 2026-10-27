@@ -574,6 +574,26 @@ async fn boot_cleans_legacy_inventory_without_a_build_or_wal_reads() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn boot_error_names_legacy_cleanup_when_the_state_root_is_missing() {
+    let rig = Rig::new("boot-missing-root", Arc::new(FakeDoor::default()));
+    std::fs::rename(&rig.root, rig.root.with_extension("moved")).unwrap();
+    let error = rig.service.reconcile_boot().await.unwrap_err();
+    assert!(error.message.starts_with("cleanup_legacy_inventory: "));
+    assert!(error.message.contains("No such file or directory"));
+}
+
+#[tokio::test]
+async fn boot_error_names_fence_rebuild_when_a_cut_is_unreadable() {
+    let rig = Rig::new("boot-unreadable-cut", Arc::new(FakeDoor::default()));
+    let cuts = rig.root.join("agent-data/cuts");
+    std::fs::create_dir_all(&cuts).unwrap();
+    std::fs::write(cuts.join("broken.json"), b"not json").unwrap();
+    let error = rig.service.reconcile_boot().await.unwrap_err();
+    assert!(error.message.starts_with("rebuild_fence_index: "));
+}
+
 #[tokio::test]
 async fn activation_registers_installed_ref_before_acknowledgment() {
     let (rig, params, bytes) = incoming_rig("projection-activation");

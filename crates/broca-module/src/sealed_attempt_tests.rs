@@ -503,14 +503,21 @@ async fn the_seal_stays_bounded_when_the_transport_never_hands_over_its_record()
 
     let elapsed = f.seal().await;
 
+    // Waiting can only lengthen `elapsed`, so this lower bound holds on any runner: the seal
+    // waited out the handover bound instead of giving up on the record early.
     assert!(
         elapsed >= SEALED_ATTEMPT_HANDOVER_BOUND,
         "the seal gave up on the record before its bound: {elapsed:?}; {:?}",
         f.registry.shutdown_report()
     );
+    // The upper bound is the actor's own: its seal deadline covers the handover wait and the
+    // terminal write, and the registry records a failure when the deadline is missed. Reading
+    // that verdict, rather than timing the whole stop from here, keeps a slow runner from
+    // failing a seal that met its bound.
+    let failures = f.registry.seal_failures();
     assert!(
-        elapsed < SHUTDOWN_SEAL_BOUND,
-        "the seal outran its per-actor bound: {elapsed:?}; {:?}",
+        failures.is_empty(),
+        "the seal must finish within its per-actor bound: {failures:?}; {:?}",
         f.registry.shutdown_report()
     );
     let records = f.records();

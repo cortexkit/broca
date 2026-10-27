@@ -61,6 +61,16 @@ impl WireFamily for OpenAiChat {
         build_request_body(frozen, opts)
     }
 
+    fn shape_with_media(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        payloads: &[crate::media_render::InlineMedia<'_>],
+    ) -> Value {
+        let media = crate::media_render::MediaRender { frozen, payloads };
+        build_request_body_with_media(frozen, opts, frozen.media.as_ref().map(|_| &media))
+    }
+
     fn endpoint(
         &self,
         frozen: &FrozenRenderConfig,
@@ -114,6 +124,14 @@ impl WireFamily for OpenAiChat {
 // ───────────────────────── request body ─────────────────────────
 
 fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
+    build_request_body_with_media(frozen, opts, None)
+}
+
+fn build_request_body_with_media(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
     // A run with structured output adds its submit tool or schema instructions here; a run
     // without renders from `opts` unchanged.
     let prepared = crate::structured_output::prepare(frozen, opts);
@@ -129,6 +147,7 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
         frozen.tool_call_content_empty_string,
         frozen.opencode_go_reasoning_signature,
         &name_map,
+        media,
     );
 
     let mut body = json!({
@@ -230,15 +249,21 @@ fn convert_messages(
     tool_call_content_empty_string: bool,
     opencode_go: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
+    media: Option<&crate::media_render::MediaRender<'_>>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
+    let mut follow_up = Vec::new();
     for m in prompt {
+        // Finish every result in a parallel tool round before inserting a synthetic user turn.
+        if m.role != Role::Tool && !follow_up.is_empty() {
+            out.push(json!({"role":"user", "content":std::mem::take(&mut follow_up)}));
+        }
         match m.role {
             Role::System => {
                 out.push(json!({ "role": "system", "content": text_content(&m.content) }))
             }
             Role::User => {
-                out.push(json!({ "role": "user", "content": user_text_content(&m.content) }))
+                out.push(json!({ "role": "user", "content": user_text_content(&m.content, media) }))
             }
             Role::Assistant => out.push(convert_assistant(
                 m,
@@ -253,14 +278,57 @@ fn convert_messages(
                         out.push(json!({
                             "role": "tool",
                             "tool_call_id": tr.tool_call_id.0,
-                            "content": tool_output_text(&tr.output),
+                            "content": tool_output_with_media(tr, media, &mut follow_up),
                         }));
                     }
                 }
             }
         }
     }
+    if !follow_up.is_empty() {
+        out.push(json!({"role":"user", "content":follow_up}));
+    }
     out
+}
+
+fn tool_output_with_media(
+    result: &broca_protocol::ToolResult,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    follow_up: &mut Vec<Value>,
+) -> String {
+    let (ToolOutput::Parts { parts }, Some(media)) = (&result.output, media) else {
+        return tool_output_text(&result.output);
+    };
+    let grammar = super::openai_media::Grammar::Chat;
+    let mut text = Vec::new();
+    let mut blocks = Vec::new();
+    for part in parts {
+        match part {
+            broca_protocol::ToolOutputPart::Text { text: part } => text.push(part.clone()),
+            broca_protocol::ToolOutputPart::Media { media: reference } => {
+                let reason = match grammar.block(
+                    reference,
+                    Some(media),
+                    true,
+                    crate::media_profile::MediaCarrier::FollowUpUserMessage,
+                ) {
+                    Ok(block) => {
+                        blocks.push(block);
+                        broca_protocol::MediaMarkerReason::Carrier
+                    }
+                    Err(reason) => reason,
+                };
+                text.push(broca_protocol::content::media_not_shown_marker(
+                    reference, reason,
+                ));
+            }
+        }
+    }
+    if !blocks.is_empty() {
+        follow_up.push(grammar.text(&format!("Media from tool call {}:", result.tool_call_id.0)));
+        follow_up.extend(blocks);
+    }
+    text.join("\n")
 }
 
 /// An assistant turn: text content (or null) + any tool calls. Reasoning blocks are
@@ -413,17 +481,41 @@ fn echo_openrouter_details(message: &Message, wire: &mut Value) {
 }
 
 // Preserve user block boundaries without changing the legacy scalar form for one text block.
-fn user_text_content(blocks: &[ContentBlock]) -> Value {
+fn user_text_content(
+    blocks: &[ContentBlock],
+    media: Option<&crate::media_render::MediaRender<'_>>,
+) -> Value {
     if blocks
         .iter()
         .any(|block| matches!(block, ContentBlock::Media(_)))
     {
-        return Value::Array(blocks.iter().filter_map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => Some(json!({"type":"text", "text":text})),
-            ContentBlock::Media(media) => Some(json!({"type":"text", "text":broca_protocol::content::media_not_shown_marker(media, broca_protocol::MediaMarkerReason::Carrier)})),
-            ContentBlock::Reasoning { .. } | ContentBlock::RedactedReasoning { .. }
-            | ContentBlock::ToolCall(_) | ContentBlock::ToolResult(_) => None,
-        }).collect());
+        return Value::Array(
+            blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                        Some(json!({"type":"text", "text":text}))
+                    }
+                    ContentBlock::Media(reference) => {
+                        let grammar = super::openai_media::Grammar::Chat;
+                        Some(
+                            grammar
+                                .block(
+                                    reference,
+                                    media,
+                                    false,
+                                    crate::media_profile::MediaCarrier::Native,
+                                )
+                                .unwrap_or_else(|reason| grammar.marker(reference, reason)),
+                        )
+                    }
+                    ContentBlock::Reasoning { .. }
+                    | ContentBlock::RedactedReasoning { .. }
+                    | ContentBlock::ToolCall(_)
+                    | ContentBlock::ToolResult(_) => None,
+                })
+                .collect(),
+        );
     }
     let texts: Vec<&str> = blocks
         .iter()
@@ -862,32 +954,47 @@ impl OpenAiChatNormalizer {
                 .and_then(Value::as_u64)
                 .or_else(|| u.get(k).and_then(Value::as_u64))
         };
-        // INCLUSIVE, SO SUBTRACTED: OpenAI's `cache_write_tokens` is part of `prompt_tokens`,
-        // exactly like `cached_tokens`. Measured live on 2026-09-28 against metered chat
-        // completions with `gpt-6-luna` and one ~3.2k-token prompt: the writing call reported
-        // prompt_tokens 3173 with cache_write_tokens 3170 and total_tokens 3177 (prompt plus 4
-        // completion), and the reading call prompt_tokens 3173 with cached_tokens 3170. The
-        // openai-python type lists it in the prompt-token breakdown ("The unadjusted number of
-        // prompt tokens written to cache"), and OpenRouter's documented example (prompt 194,
-        // write 100, total 196) fits the same reading. Leaving it inside fresh input counted
-        // every written token twice.
+        // INCLUSIVE, SO SUBTRACTED: both spellings of the cache-write count are part of
+        // `prompt_tokens`, exactly like `cached_tokens`, so each must come out of fresh input or
+        // every written token is counted twice -- once as fresh input, once as a cache write.
         //
-        // NOT SUBTRACTED: `cache_creation_input_tokens`. No captured response in this repo shows
-        // whether a gateway using that spelling (Alibaba) counts it inside `prompt_tokens`, so
-        // it is recorded without touching fresh input. Reopen this with an Alibaba capture.
-        match at("cache_write_tokens") {
+        // `cache_write_tokens` (OpenAI, OpenRouter): measured live on 2026-09-28 against metered
+        // chat completions with `gpt-6-luna` and one ~3.2k-token prompt. The writing call
+        // reported prompt_tokens 3173 with cache_write_tokens 3170 and total_tokens 3177 (prompt
+        // plus 4 completion), and the reading call prompt_tokens 3173 with cached_tokens 3170.
+        // The openai-python type lists it in the prompt-token breakdown ("The unadjusted number
+        // of prompt tokens written to cache"), and OpenRouter's documented example (prompt 194,
+        // write 100, total 196) fits the same reading.
+        //
+        // `cache_creation_input_tokens` (Alibaba / DashScope Model Studio) counts inside
+        // `prompt_tokens` too, per the provider's own documentation:
+        //
+        // - Context Cache (<https://www.alibabacloud.com/help/en/model-studio/context-cache>),
+        //   explicit-cache usage example: the first request reports prompt_tokens 2174 with cache
+        //   creation 2156 and cache hits 0, and the next request reports prompt_tokens 2174 with
+        //   creation 0 and hits 2156. The same page computes uncached input as prompt_tokens
+        //   minus creation minus hits, and its FAQ says tokens after the cache marker count in
+        //   the input total but in neither creation nor hits. Billing treats creation (about
+        //   125% of input), hits (10%) and the rest (standard) as three prices for ONE token
+        //   class, not as charges on top of each other.
+        // - Chat Completions reference
+        //   (<https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-openai-chat-completions>):
+        //   `total_tokens = prompt_tokens + completion_tokens`, and
+        //   `cache_creation_input_tokens` is listed as a detail OF `prompt_tokens`.
+        //
+        // WHEN BOTH SPELLINGS APPEAR, `cache_write_tokens` wins and the two are never added:
+        // they name the same counter, so summing them would report one write twice. A response
+        // carrying both is a gateway translating between spellings, not a provider counting two
+        // separate kinds of writes.
+        let written = at("cache_write_tokens").or_else(|| at("cache_creation_input_tokens"));
+        match written {
             Some(written) => merge_inclusive_input_tokens_with_writes(
                 &mut self.usage,
                 g("prompt_tokens"),
                 cached,
                 Some(written),
             ),
-            None => {
-                merge_inclusive_input_tokens(&mut self.usage, g("prompt_tokens"), cached);
-                if let Some(x) = at("cache_creation_input_tokens") {
-                    self.usage.cache_write_tokens = Some(x);
-                }
-            }
+            None => merge_inclusive_input_tokens(&mut self.usage, g("prompt_tokens"), cached),
         }
         let completion = g("completion_tokens");
         let reasoning = u

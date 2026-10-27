@@ -13,7 +13,7 @@ fn main() -> io::Result<()> {
     for arg in args {
         let path = PathBuf::from(arg);
         let address = path.file_stem().and_then(|s| s.to_str()).expect("WAL stem");
-        writer.append(address, &std::fs::read(&path)?)?;
+        writer.append(address, &broca_wal::fs_ops::read(&path)?)?;
     }
     writer.seal()
 }

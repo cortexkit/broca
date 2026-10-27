@@ -6,11 +6,15 @@
 //! executor) so the admission concurrency is deterministically testable; this is the real
 //! one.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{lease_key_for, LeaseError, LeaseStore, WalHandle, WalStore};
+use broca_core::lease::{OwnedWalTenure, WalLeaseDomain};
+use broca_core::{
+    lease_key_for, FileLeaseStore, LeaseError, LeaseHandle, LeaseStore, WalHandle, WalStore,
+};
 
 use crate::actor::{LineageActor, IDLE_TTL};
 use crate::executor::RunExecutor;
@@ -31,6 +35,89 @@ pub struct DefaultOpener<L: LeaseStore, W: WalStore> {
     materialized_store: Option<Arc<dyn broca_core::SessionStore>>,
     export_index: Option<Arc<dyn broca_core::ExportIndex>>,
     charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
+    /// When set, actor opens acquire an owned writer tenure from this domain instead of
+    /// a bare lease from `lease_store`, and the session writer task keeps that tenure
+    /// until its WAL closes. Unset keeps the guarded open, where the actor holds the lease.
+    lease_domain: Option<WalLeaseDomain>,
+    /// The directory `lease_store` acquires in, when the opener was built with
+    /// [`DefaultOpener::with_file_leases`]. A lease domain is accepted only for this same
+    /// directory; an opener built from an arbitrary `LeaseStore` cannot prove its root
+    /// and therefore accepts none.
+    lease_root: Option<PathBuf>,
+}
+
+/// [`DefaultOpener::with_lease_domain`] refused a domain that does not acquire in the
+/// lease store's own directory: owned and guarded acquisitions of one session would then
+/// take two different locks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseDomainRootMismatch {
+    /// The lease store's directory, or `None` when the opener cannot name it.
+    pub lease_store_root: Option<PathBuf>,
+    pub domain_root: PathBuf,
+}
+
+impl std::fmt::Display for LeaseDomainRootMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.lease_store_root {
+            Some(root) => write!(
+                f,
+                "lease domain root {} is not the lease store root {}",
+                self.domain_root.display(),
+                root.display()
+            ),
+            None => write!(
+                f,
+                "lease domain root {} cannot be matched: the opener's lease store root is unknown",
+                self.domain_root.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LeaseDomainRootMismatch {}
+
+/// The session authority an open holds between acquisition and the writer spawn.
+enum OpenAuthority {
+    /// A bare lease the actor will hold beside its writer (no lease domain configured).
+    Lease(Box<dyn LeaseHandle>),
+    /// An owned tenure the writer open consumes and the writer task keeps.
+    Tenure(OwnedWalTenure),
+}
+
+/// Refuse a tenure acquired under any lease directory but the opener's own, before the
+/// open performs any I/O with it.
+fn require_tenure_root(
+    tenure: &OwnedWalTenure,
+    lease_root: Option<&Path>,
+) -> Result<(), OpenError> {
+    if lease_root == Some(tenure.lease_root()) {
+        Ok(())
+    } else {
+        Err(OpenError::Open(format!(
+            "owned open refused: tenure acquired under {} but the opener's lease root is {}",
+            tenure.lease_root().display(),
+            lease_root.map_or_else(|| "unknown".into(), |root| root.display().to_string())
+        )))
+    }
+}
+
+impl<W: WalStore> DefaultOpener<FileLeaseStore, W> {
+    /// Build an opener whose file lease store acquires in `lease_root`. Unlike
+    /// [`DefaultOpener::new`], the opener knows that directory, so it can accept a lease
+    /// domain for the same directory through [`DefaultOpener::with_lease_domain`].
+    pub fn with_file_leases(
+        lease_root: PathBuf,
+        wal_store: Arc<W>,
+        executor: Arc<dyn RunExecutor>,
+    ) -> Self {
+        let mut opener = Self::new(
+            Arc::new(FileLeaseStore::new(lease_root.clone())),
+            wal_store,
+            executor,
+        );
+        opener.lease_root = Some(lease_root);
+        opener
+    }
 }
 
 impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
@@ -45,7 +132,28 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
             materialized_store: None,
             export_index: None,
             charge_basis_resolver: None,
+            lease_domain: None,
+            lease_root: None,
         }
+    }
+
+    /// Open actors under owned writer tenures minted by `domain`. The domain must name
+    /// the same lease directory as the lease store, so owned and guarded acquisitions
+    /// of one session contend on one lock. A domain for any other directory, or any
+    /// domain when the opener cannot name its lease store's directory, is refused here,
+    /// before anything is acquired or opened.
+    pub fn with_lease_domain(
+        mut self,
+        domain: WalLeaseDomain,
+    ) -> Result<Self, LeaseDomainRootMismatch> {
+        if self.lease_root.as_deref() != Some(domain.lease_root()) {
+            return Err(LeaseDomainRootMismatch {
+                lease_store_root: self.lease_root.clone(),
+                domain_root: domain.lease_root().to_path_buf(),
+            });
+        }
+        self.lease_domain = Some(domain);
+        Ok(self)
     }
 
     /// Override the idle-close TTL (tests use a short one to exercise the close races).
@@ -87,6 +195,18 @@ impl<L: LeaseStore, W: WalStore> DefaultOpener<L, W> {
 impl<L: LeaseStore + 'static, W: WalStore + 'static> LineageOpener for DefaultOpener<L, W> {
     fn run_index_reader(&self) -> Option<Arc<dyn broca_core::RunIndex>> {
         self.run_index.clone()
+    }
+
+    fn retire_session_transport(&self, session: &LineageKey) {
+        self.executor.retire_session_transport(session);
+    }
+
+    fn retire_idle_session_transport(&self, session: &LineageKey) {
+        self.executor.retire_idle_session_transport(session);
+    }
+
+    fn retire_all_transports(&self) {
+        self.executor.retire_all_transports();
     }
     async fn media_profile(
         &self,
@@ -219,10 +339,18 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             "DefaultOpener identity must be validated before durable key derivation"
         );
         let projection_fence = self.projection_fence(key).lock_owned().await;
-        // 1. Acquire the SESSION lease (held for the actor's whole lifetime).
-        let lease = loop {
-            match self.lease_store.acquire(&lease_key_for(key)) {
-                Ok(lease) => break lease,
+        // 1. Acquire the SESSION lease (held for the actor's whole lifetime). With a lease
+        //    domain it is an owned tenure, which the writer task will keep.
+        let authority = loop {
+            let acquired = match &self.lease_domain {
+                Some(domain) => domain.acquire(key).map(OpenAuthority::Tenure),
+                None => self
+                    .lease_store
+                    .acquire(&lease_key_for(key))
+                    .map(OpenAuthority::Lease),
+            };
+            match acquired {
+                Ok(authority) => break authority,
                 Err(LeaseError::Held { .. }) => {
                     if status {
                         return Err(OpenError::LeaseHeld(key.session.clone()));
@@ -253,13 +381,31 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         };
         drop(projection_fence);
 
+        if let OpenAuthority::Tenure(tenure) = &authority {
+            // The domain was matched to the lease store's directory when configured; check
+            // the minted tenure as well, so no open proceeds under a different lock.
+            if let Err(error) = require_tenure_root(tenure, self.lease_root.as_deref()) {
+                drop(authority);
+                return Err(error);
+            }
+            // The one move-fence validation of this tenure, before any mutation the open
+            // performs: expiry deletion, archive restore, torn-tail recovery or lineage
+            // creation. The check before acquisition proves nothing about the tenure, since
+            // a cut can freeze the session between the two; every new tenure checks again,
+            // and no clean result carries over from an earlier one.
+            if let Err(error) = self.wal_store.check_move(key, true) {
+                drop(authority);
+                return Err(OpenError::from_wal_read(error.to_string(), &error));
+            }
+        }
+
         let service = registry.retention_service();
         let store = self.materialized_store.clone();
         let wal = self.wal_store.clone();
         let session = key.clone();
         // Moving the lease into recovery prevents cancellation from releasing it while
         // deletion or admission validation still touches this address.
-        let lease = tokio::task::spawn_blocking(move || {
+        let authority = tokio::task::spawn_blocking(move || {
             if status && service.is_some() {
                 let meta = store
                     .as_ref()
@@ -331,7 +477,7 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
                 crate::retention::validate_retention(retention, current, exists)
                     .map_err(OpenError::RetentionInvalid)?;
             }
-            Ok(lease)
+            Ok(authority)
         })
         .await
         .map_err(|e| OpenError::Open(e.to_string()))??;
@@ -344,17 +490,10 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         // 3. Open + recover + prove the SESSION WAL away from the async runtime, then spawn its
         //    writer with the fan-out observer. The lease moves through that blocking operation so
         //    cancellation cannot release it while recovery still touches the WAL. A failed proof
-        //    returns no handle, and the registry cannot publish an Open slot.
-        let (writer, lease) = WalHandle::open_and_spawn_observed_with_class(
-            self.wal_store.clone(),
-            key.clone(),
-            lease,
-            Some(observer),
-            retention,
-            session_class,
-        )
-        .await
-        .map_err(|error| match error {
+        //    returns no handle, and the registry cannot publish an Open slot. An owned tenure is
+        //    consumed by the open and kept by the writer task; a bare lease comes back for the
+        //    actor to hold.
+        let map_open_error = |error: broca_core::WalOpenError| match error {
             broca_core::WalOpenError::SessionMoving { cut_id } => {
                 OpenError::SessionMoving { cut_id }
             }
@@ -366,7 +505,35 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
             // WalWriteError erases I/O and recovery/proof causes; corruption cannot be
             // retried away, so do not classify this opaque write/open failure as transient.
             broca_core::WalOpenError::Failed(error) => OpenError::Open(error.to_string()),
-        })?;
+        };
+        let (writer, lease) = match authority {
+            OpenAuthority::Lease(lease) => {
+                let (writer, lease) = WalHandle::open_and_spawn_observed_with_class(
+                    self.wal_store.clone(),
+                    key.clone(),
+                    lease,
+                    Some(observer),
+                    retention,
+                    session_class,
+                )
+                .await
+                .map_err(map_open_error)?;
+                (writer, Some(lease))
+            }
+            OpenAuthority::Tenure(tenure) => {
+                let writer = WalHandle::open_and_spawn_owned_with_class(
+                    self.wal_store.clone(),
+                    key.clone(),
+                    tenure,
+                    Some(observer),
+                    retention,
+                    session_class,
+                )
+                .await
+                .map_err(map_open_error)?;
+                (writer, None)
+            }
+        };
         if retention.is_some() || writer.is_retention_lineage() == Some(true) {
             if let Some(service) = registry.retention_service() {
                 service.remember_session(key).map_err(OpenError::Open)?;
@@ -374,22 +541,39 @@ impl<L: LeaseStore + 'static, W: WalStore + 'static> DefaultOpener<L, W> {
         }
         let writer = Arc::new(writer);
 
-        // 4. Start the actor, which owns the lease + writer + fan-out until close.
-        Ok(LineageActor::spawn_with_export(
-            key.clone(),
-            gen,
-            lease,
-            writer,
-            self.executor.clone(),
-            self.wal_store.clone(),
-            registry,
-            self.idle_ttl,
-            fanout,
-            self.run_index.clone(),
-            self.materialized_store.clone(),
-            self.export_index.clone(),
-            self.charge_basis_resolver.clone(),
-        ))
+        // 4. Start the actor, which owns the writer + fan-out (and a bare lease, if any)
+        //    until close.
+        Ok(match lease {
+            Some(lease) => LineageActor::spawn_with_export(
+                key.clone(),
+                gen,
+                lease,
+                writer,
+                self.executor.clone(),
+                self.wal_store.clone(),
+                registry,
+                self.idle_ttl,
+                fanout,
+                self.run_index.clone(),
+                self.materialized_store.clone(),
+                self.export_index.clone(),
+                self.charge_basis_resolver.clone(),
+            ),
+            None => LineageActor::spawn_owned_with_export(
+                key.clone(),
+                gen,
+                writer,
+                self.executor.clone(),
+                self.wal_store.clone(),
+                registry,
+                self.idle_ttl,
+                fanout,
+                self.run_index.clone(),
+                self.materialized_store.clone(),
+                self.export_index.clone(),
+                self.charge_basis_resolver.clone(),
+            ),
+        })
     }
 }
 
@@ -629,6 +813,281 @@ mod tests {
             );
         }
         wait_for_actor_close(&registry, &key).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file-backed store that lets a cut freeze the session right after the first
+    /// move-fence check passes, and records whether a writer open was ever attempted.
+    struct FreezeAfterFirstCheck {
+        inner: broca_core::FileWalStore,
+        state_root: std::path::PathBuf,
+        checks: AtomicUsize,
+        writer_opens: AtomicUsize,
+    }
+
+    const CUT: &str = "0123456789abcdef0123456789abcdef";
+
+    fn freeze(state_root: &std::path::Path, wal: &std::path::Path) {
+        broca_wal::migration::freeze(
+            state_root,
+            wal,
+            &broca_wal::migration::Freeze {
+                cut_id: CUT.into(),
+                end_offset: 0,
+                lineage_id: "lineage".into(),
+            },
+        )
+        .expect("publish freeze")
+        .expect("session was not frozen yet");
+    }
+
+    impl WalStore for FreezeAfterFirstCheck {
+        fn check_move(&self, session: &BindIdentity, write: bool) -> Result<(), WalError> {
+            let result = self.inner.check_move(session, write);
+            if self.checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                freeze(&self.state_root, &self.inner.wal_path(session));
+            }
+            result
+        }
+        fn open(&self, session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+            self.writer_opens.fetch_add(1, Ordering::SeqCst);
+            self.inner.open(session)
+        }
+        fn read_records(
+            &self,
+            session: &BindIdentity,
+        ) -> Result<Vec<broca_wal::FramedRecord>, WalError> {
+            self.inner.read_records(session)
+        }
+        fn open_writer(
+            &self,
+            session: &BindIdentity,
+            retention: Option<u64>,
+            session_class: Option<&str>,
+            lease: Box<dyn LeaseHandle>,
+        ) -> Result<broca_core::wal_writer::WriterAndLease, WalError> {
+            self.writer_opens.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .open_writer(session, retention, session_class, lease)
+        }
+        fn open_owned_writer(
+            &self,
+            session: &BindIdentity,
+            retention: Option<u64>,
+            session_class: Option<&str>,
+            lease: Box<dyn LeaseHandle>,
+        ) -> Result<broca_core::wal_writer::WriterAndLease, WalError> {
+            self.writer_opens.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .open_owned_writer(session, retention, session_class, lease)
+        }
+    }
+
+    /// Write a session log with one record followed by a torn frame, which a writer
+    /// open would truncate during recovery.
+    fn torn_session_log(store: &broca_core::FileWalStore, key: &BindIdentity) -> Vec<u8> {
+        let mut wal = store.open(key).expect("seed WAL");
+        wal.append(
+            1,
+            &WalRecord::StepStarted {
+                step_id: broca_protocol::StepId(1),
+            },
+            true,
+        )
+        .expect("seed record");
+        drop(wal);
+        let path = store.wal_path(key);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0x5a; 7]);
+        std::fs::write(&path, &bytes).unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn owned_open_checks_move_fence_before_recovery() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("broca-opener-owned-fence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("project")).expect("create test project");
+        let key = BindIdentity::new(root.join("project"), "runner", "session");
+        let store = Arc::new(FreezeAfterFirstCheck {
+            inner: broca_core::FileWalStore::new(root.join("wal")),
+            state_root: root.clone(),
+            checks: AtomicUsize::new(0),
+            writer_opens: AtomicUsize::new(0),
+        });
+        let torn = torn_session_log(&store.inner, &key);
+        let domain = WalLeaseDomain::new(root.join("leases"));
+        let opener = Arc::new(
+            DefaultOpener::with_file_leases(
+                root.join("leases"),
+                store.clone(),
+                Arc::new(NeverExecutor),
+            )
+            .with_lease_domain(domain.clone())
+            .expect("the domain names the lease store's directory"),
+        );
+        let registry = LineageRegistry::new(opener.clone());
+
+        // The check before acquisition passes; a cut freezes the session before the
+        // tenure is acquired. The tenure's own check must refuse before any mutation.
+        let error = match opener
+            .open_with_class(&key, 1, registry.handle(), None, None)
+            .await
+        {
+            Ok(_) => panic!("a session frozen before its tenure must not open"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, OpenError::SessionMoving { cut_id } if cut_id == CUT),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            store.checks.load(Ordering::SeqCst),
+            2,
+            "one check before acquisition, one under the tenure"
+        );
+        assert_eq!(
+            store.writer_opens.load(Ordering::SeqCst),
+            0,
+            "the refusal precedes the writer open and its recovery"
+        );
+        assert_eq!(
+            std::fs::read(store.inner.wal_path(&key)).unwrap(),
+            torn,
+            "the torn tail is untouched: no recovery truncation ran"
+        );
+        drop(
+            domain
+                .acquire(&key)
+                .expect("the refused open released its tenure"),
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn owned_tenure_reopen_rechecks_move_fence() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("broca-opener-owned-recheck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("project")).expect("create test project");
+        let key = BindIdentity::new(root.join("project"), "runner", "session");
+        let wal = Arc::new(broca_core::FileWalStore::new(root.join("wal")));
+        let domain = WalLeaseDomain::new(root.join("leases"));
+        let leases = FileLeaseStore::new(root.join("leases"));
+        let opener = Arc::new(
+            DefaultOpener::with_file_leases(
+                root.join("leases"),
+                wal.clone(),
+                Arc::new(NeverExecutor),
+            )
+            .with_lease_domain(domain.clone())
+            .expect("the domain names the lease store's directory")
+            .with_idle_ttl(Duration::from_millis(20)),
+        );
+        let registry = LineageRegistry::new(opener.clone());
+
+        // The first tenure opens clean, and its writer task keeps the lease.
+        drop(registry.actor_for(&key).await.expect("first owned open"));
+        assert!(
+            matches!(
+                leases.acquire(&lease_key_for(&key)),
+                Err(LeaseError::Held { .. })
+            ),
+            "the open actor's writer holds the session lease"
+        );
+        wait_for_actor_close(&registry, &key).await;
+        drop(
+            leases
+                .acquire(&lease_key_for(&key))
+                .expect("closing the writer released the tenure"),
+        );
+
+        // A cut freezes the session between tenures. The next tenure must find the
+        // marker itself rather than trust the earlier tenure's clean check.
+        let path = wal.wal_path(&key);
+        let before = std::fs::read(&path).unwrap();
+        freeze(&root, &path);
+        let error = match opener
+            .open_with_class(&key, 2, registry.handle(), None, None)
+            .await
+        {
+            Ok(_) => panic!("a reopened tenure must recheck the move fence"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, OpenError::SessionMoving { cut_id } if cut_id == CUT),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // Once the freeze is withdrawn, a fresh tenure opens again.
+        broca_wal::migration::abort_freeze(&path, CUT).unwrap();
+        drop(registry.actor_for(&key).await.expect("reopen after abort"));
+        wait_for_actor_close(&registry, &key).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lease_domain_for_another_directory_is_refused_before_any_io() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("broca-opener-domain-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wal = Arc::new(broca_core::FileWalStore::new(root.join("wal")));
+
+        let refused = DefaultOpener::with_file_leases(
+            root.join("leases"),
+            wal.clone(),
+            Arc::new(NeverExecutor),
+        )
+        .with_lease_domain(WalLeaseDomain::new(root.join("other-leases")))
+        .err()
+        .expect("a domain for another directory must be refused");
+        assert_eq!(
+            refused,
+            LeaseDomainRootMismatch {
+                lease_store_root: Some(root.join("leases")),
+                domain_root: root.join("other-leases"),
+            }
+        );
+
+        // An opener built from an arbitrary lease store cannot name its directory, so it
+        // accepts no domain at all, not even one for the directory it happens to use.
+        let unknown = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(root.join("leases"))),
+            wal.clone(),
+            Arc::new(NeverExecutor),
+        )
+        .with_lease_domain(WalLeaseDomain::new(root.join("leases")))
+        .err()
+        .expect("an opener with an unknown lease root accepts no domain");
+        assert_eq!(unknown.lease_store_root, None);
+
+        assert!(
+            DefaultOpener::with_file_leases(root.join("leases"), wal, Arc::new(NeverExecutor))
+                .with_lease_domain(WalLeaseDomain::new(root.join("leases")))
+                .is_ok(),
+            "the lease store's own directory is accepted"
+        );
+        assert!(!root.exists(), "configuring the opener touched no file");
+    }
+
+    #[test]
+    fn owned_open_refuses_a_tenure_acquired_under_another_lease_root() {
+        let root = broca_test_support::scratch_root()
+            .join(format!("broca-opener-tenure-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let key = BindIdentity::new(root.join("project"), "runner", "session");
+        let tenure = WalLeaseDomain::new(root.join("other-leases"))
+            .acquire(&key)
+            .expect("acquire under the other directory");
+        let leases = root.join("leases");
+        let error = require_tenure_root(&tenure, Some(&leases))
+            .expect_err("a tenure from another lease directory must not open");
+        assert!(error.to_string().contains("owned open refused"), "{error}");
+        assert!(require_tenure_root(&tenure, None).is_err());
+        assert!(require_tenure_root(&tenure, Some(&root.join("other-leases"))).is_ok());
+        drop(tenure);
         let _ = std::fs::remove_dir_all(root);
     }
 }

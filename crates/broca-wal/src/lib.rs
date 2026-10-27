@@ -6,12 +6,16 @@
 //! writer task, replay state machine, and materialized store build on top of this
 //! foundation.
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+// Test fixtures intentionally use direct I/O to prepare and inspect crash images.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub mod archive;
 mod directory_sync;
 pub mod file_wal;
 pub mod floor;
 pub mod framing;
+pub mod fs_ops;
 pub mod record;
 
 pub use file_wal::{
@@ -54,3 +58,4 @@ pub use broca_protocol::PauseReason;
 pub mod migration;
 
 pub mod size_limit;
+pub mod writer_tenure;

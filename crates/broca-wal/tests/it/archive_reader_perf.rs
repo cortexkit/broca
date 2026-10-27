@@ -1,4 +1,5 @@
-//! Opt-in release measurement against the real archive codec.
+//! Opt-in benchmark against the real archive codec. It prints read counts and timings and
+//! never fails on them; its only assertions are the payload checks in `sweep`.
 use broca_wal::archive::{ArchiveReader, ArchiveWriter};
 use std::{
     cell::Cell,
@@ -40,8 +41,11 @@ fn sweep<R: Read + Seek>(mut reader: ArchiveReader<R>, n: u64, payload: &[u8]) {
     }
 }
 
+/// Benchmark, not a correctness test: sweeps 1,024 and 4,096 production-median members through
+/// unbuffered, buffered and `ArchiveReader::open` readers. The cache and read-cost guarantees
+/// are asserted by the archive cache tests in the library.
 #[test]
-#[ignore = "release timing harness; run explicitly with --release --ignored --nocapture"]
+#[ignore = "benchmark: archive reader sweep; run with --release --ignored --nocapture"]
 fn archive_reader_population_sweep() {
     let dir = broca_test_support::scratch_root()
         .join(format!("broca-archive-perf-{}", std::process::id()));

@@ -3,6 +3,53 @@
 This document describes the module's session and run contracts, durable lineage
 model, and coordinator invariants.
 
+## Session inspection CLI
+
+`broca-session trajectory <id> [--transcript] [--out FILE]` exports JSONL directly
+from the recorded WAL, without a daemon connection. Without `--out`, JSONL goes
+to stdout. Output files are created owner-only and must not already exist. It uses
+broca's read-only WAL reader, live-first and then `wal-archive/`,
+and respects retention expiration; it never opens a recovery writer or extracts
+an archived session into the live directory.
+
+The event kinds are `run`, `run_end`, `gap`, `model_request` (one per attempt),
+`model_step`, and `tool_call`. Tool rows appear at their intent/no-dispatch record
+and include later recorded result metadata. Bash rows include recorded execution
+knobs and an `exit_code` only when the result prints a `[exit code: N]` line.
+Missing timestamps, usage, routing, and result observations remain null or absent,
+not zero. `--transcript` adds `message` rows containing text and complete tool
+arguments/results, plus a `reasoning` byte-count row per step, never reasoning text
+or provider continuation state. Message `ordinal` and `mid` use the same placement
+as `session.read`; multiple results in one tool-role message share its coordinate.
+Messages not yet visible in `session.read`, including pending inputs and open
+tool turns before dispatch, have null coordinates. Transcript rows
+stay at their source record's position, even when a later boundary places them.
+Treat transcript exports as sensitive conversation data.
+
+Task/session-name lookup is shared by trajectory, `cache-dump --session <id>`, and
+`broca-session --subc CONNECTION read <id>` (also `--session <id> read`). It tries
+the supplied name first, then `alfonso:<id>` for an unprefixed name. The lookup
+scans only the compact session-ref inventory, with the name predicate in SQL;
+it does not scan run-index history or add an index/migration. Lookup duration is
+logged at debug level. Missing names refuse with the searched spellings; an
+incomplete inventory is identified rather than claiming the session is unknown,
+and a single candidate is not treated as unique until the inventory is complete.
+Ambiguous names list up to 100 candidates' project-root, harness, and session
+values, say when more were omitted, and refuse to choose one.
+
+`--state-root DIR` overrides the normal state-root resolver for these lookups and
+offline exports. Explicit `--project-root ROOT --harness HARNESS` bypass lookup
+and keep the session name literal, as before; use the full recorded session name
+(including `alfonso:` when present) when selecting an ambiguous candidate. Existing
+read calls with only one bind flag use lookup and require that flag to match the
+recorded identity. Other daemon commands still accept their original bind flags.
+The connection file is
+only an argument; its path and contents are not printed on connection failures.
+Put the offline `trajectory` and `cache-dump` subcommands before their flags;
+prefixed global flags are refused by command name before any session lookup.
+These commands refuse `--subc` by command name,
+whether the daemon flag appears before or after the subcommand, without binding.
+
 ---
 
 ## 1. What it is

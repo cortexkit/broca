@@ -28,7 +28,7 @@ use broca_wal::{
 };
 use tokio::sync::{broadcast, oneshot};
 
-use crate::lease::LeaseHandle;
+use crate::lease::{LeaseHandle, OwnedWalTenure};
 
 mod extraction;
 mod projection_reader;
@@ -106,6 +106,21 @@ pub trait WalStore: Send + Sync {
             self.open_with_class(session, retention, session_class)?,
             lease,
         ))
+    }
+
+    /// Open a writer under the caller-owned session tenure, whose live lease is
+    /// `lease`. Unlike [`Self::open_writer`], a store may treat `lease` as the
+    /// authority for every mutation the open performs before the descriptor exists,
+    /// such as restoring an archived log to its live path. The default delegates to
+    /// `open_writer`, so a store without owned-open support keeps its guarded open.
+    fn open_owned_writer(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+        lease: Box<dyn LeaseHandle>,
+    ) -> Result<WriterAndLease, WalError> {
+        self.open_writer(session, retention, session_class, lease)
     }
 
     /// The lowest runner tag a new lineage at `session` may use. When retention deleted an
@@ -358,6 +373,22 @@ struct ArchiveLookup {
     live_present: bool,
     consulted: bool,
     member: Option<broca_wal::archive::ArchiveMember>,
+}
+
+/// Filesystem metadata identity of the archive inventory, used to validate cached
+/// expiry facts without retaining WAL record contents.
+/// Non-Unix stores cannot supply a stable identity and must not reuse those caches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveIdentity(Vec<ArchiveFileIdentity>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArchiveFileIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
 }
 
 #[cfg(test)]
@@ -837,6 +868,21 @@ impl FileWalStore {
         Ok(self.max_read_bytes)
     }
 
+    /// Wrap an open writer's lease so its release records a retention change hint.
+    fn release_hint_lease(
+        &self,
+        session: &BindIdentity,
+        lease: Box<dyn LeaseHandle>,
+        retained: Arc<AtomicBool>,
+    ) -> Box<dyn LeaseHandle> {
+        Box::new(retention_changes::ReleaseHintLease {
+            inner: Some(lease),
+            address: Arc::from(session_addr(session)),
+            changes: self.retention_changes.clone(),
+            retained,
+        })
+    }
+
     /// Choose a directory only when creating a fresh lineage. Admission validates
     /// the policy before calling this under the session lease; existing live and
     /// archived lineages keep their original directory.
@@ -854,17 +900,24 @@ impl FileWalStore {
         retention: Option<u64>,
         session_class: Option<&str>,
     ) -> Result<Box<dyn Wal + Send>, WalError> {
-        self.open_observed(session, retention, session_class)
-            .map(|(wal, _retained)| wal)
+        self.open_observed(
+            session,
+            retention,
+            session_class,
+            extraction::RestoreAuthority::GuardedStandalone,
+        )
+        .map(|(wal, _retained)| wal)
     }
 
     /// Open the writer and also return its shared retained flag. The flag is set when the WAL
     /// lives under the ephemeral root, or once a retained first run places it there.
+    /// `authority` is what permits restoring an archived log to the live path.
     fn open_observed(
         &self,
         session: &BindIdentity,
         retention: Option<u64>,
         session_class: Option<&str>,
+        authority: extraction::RestoreAuthority<'_>,
     ) -> Result<(Box<dyn Wal + Send>, Arc<AtomicBool>), WalError> {
         self.check_move(session, true)?;
         let lookup = self.archived_member(session)?;
@@ -876,7 +929,7 @@ impl FileWalStore {
             };
             // Extraction preserves the logical address and payload; session-ref
             // candidates need no location update.
-            extraction::restore(&path, &member.payload).map_err(WalError::Io)?;
+            extraction::restore(&path, &member.payload, authority).map_err(WalError::Io)?;
             path
         } else if let Some(path) = self.resolve_live_path(session)? {
             path
@@ -1035,6 +1088,55 @@ impl FileWalStore {
             }
         }
         Ok(exists.then_some(paths))
+    }
+
+    /// Expiry facts are reusable only while the archive inventory's metadata identity
+    /// is unchanged. Publication, removal and metadata-visible changes invalidate it.
+    /// This uses metadata only; it neither opens containers nor reads member payloads.
+    pub fn archive_identity(&self) -> Result<Option<ArchiveIdentity>, WalError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Some(mut paths) = self.archive_containers()? else {
+                return Ok(None);
+            };
+            paths.sort();
+            let mut files = Vec::with_capacity(paths.len());
+            for path in paths {
+                let meta = match std::fs::metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(WalError::Io(e)),
+                };
+                files.push(ArchiveFileIdentity {
+                    path,
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                    bytes: meta.len(),
+                    modified: (meta.mtime(), meta.mtime_nsec()),
+                    changed: (meta.ctime(), meta.ctime_nsec()),
+                });
+            }
+            Ok(Some(ArchiveIdentity(files)))
+        }
+        #[cfg(not(unix))]
+        Ok(None)
+    }
+
+    /// A sealed archive is already durable, so expiry needs no separate flush/read pair.
+    /// If no archived member is found, return `None` so the caller follows its normal
+    /// live-WAL read path, including the durability flush when needed.
+    pub fn read_archived_for_expiry(
+        &self,
+        session: &BindIdentity,
+    ) -> Result<Option<(WalRangeRead, u64)>, WalError> {
+        self.check_move(session, false)?;
+        self.archived_member(session)?
+            .member
+            .map(|member| {
+                member_range(&member, 0, None).map(|read| (read, member.info.payload_len))
+            })
+            .transpose()
     }
 
     /// Build the archive membership cache now, so the first new session after a restart
@@ -1438,14 +1540,34 @@ impl WalStore for FileWalStore {
         session_class: Option<&str>,
         lease: Box<dyn LeaseHandle>,
     ) -> Result<WriterAndLease, WalError> {
-        let (wal, retained) = self.open_observed(session, retention, session_class)?;
-        let lease = Box::new(retention_changes::ReleaseHintLease {
-            inner: Some(lease),
-            address: Arc::from(session_addr(session)),
-            changes: self.retention_changes.clone(),
-            retained,
-        });
-        Ok((wal, lease))
+        let (wal, retained) = self.open_observed(
+            session,
+            retention,
+            session_class,
+            extraction::RestoreAuthority::GuardedStandalone,
+        )?;
+        Ok((wal, self.release_hint_lease(session, lease, retained)))
+    }
+    fn open_owned_writer(
+        &self,
+        session: &BindIdentity,
+        retention: Option<u64>,
+        session_class: Option<&str>,
+        lease: Box<dyn LeaseHandle>,
+    ) -> Result<WriterAndLease, WalError> {
+        // The caller's tenure is the authority for restoring an archived log:
+        // extraction checks that this live lease is the session's own before it
+        // writes anything, and the same lease then moves on to the writer task.
+        let (wal, retained) = self.open_observed(
+            session,
+            retention,
+            session_class,
+            extraction::RestoreAuthority::OwnedTenure {
+                lease: lease.as_ref(),
+                session,
+            },
+        )?;
+        Ok((wal, self.release_hint_lease(session, lease, retained)))
     }
     fn read_records_tail_bounded(
         &self,
@@ -2087,6 +2209,68 @@ struct LiveTags {
     budgets: std::collections::HashMap<u64, MessageTags>,
 }
 
+/// The session lease a writer owned, returned by [`WalHandle::shutdown_into_tenure`] only
+/// after the writer thread has exited and its WAL descriptor is closed.
+///
+/// It carries no append, sync or descriptor capability: it can only keep the session
+/// locked and report its epoch, and dropping it releases the lease. It is opaque and
+/// non-`Clone`, and nothing converts a fence integer or a raw lease handle into it, so
+/// holding one proves a writer for this tenure has already closed.
+#[derive(Debug)]
+pub struct ClosedWriterTenure {
+    lease: Box<dyn LeaseHandle>,
+}
+
+impl ClosedWriterTenure {
+    /// The epoch stamped on the closed writer's frames. Inspection only.
+    pub fn epoch(&self) -> u64 {
+        self.lease.epoch()
+    }
+
+    /// The namespaced session lease key this tenure still holds.
+    pub fn key(&self) -> &cortexkit_lease::LeaseKey {
+        self.lease.key()
+    }
+}
+
+/// A writer's WAL and the session lease beside it, held together until the writer thread
+/// takes them. Dropping it closes the WAL before releasing the lease, so no early exit
+/// between a writer open and its thread start leaves a writable WAL without its lease.
+struct WriterOwner {
+    wal: Option<Box<dyn Wal + Send>>,
+    lease: Option<Box<dyn LeaseHandle>>,
+}
+
+impl WriterOwner {
+    fn wal(&self) -> &(dyn Wal + Send) {
+        self.wal
+            .as_deref()
+            .expect("writer owner holds its WAL until handoff")
+    }
+
+    fn into_parts(mut self) -> (Box<dyn Wal + Send>, Option<Box<dyn LeaseHandle>>) {
+        let wal = self
+            .wal
+            .take()
+            .expect("writer owner holds its WAL until handoff");
+        (wal, self.lease.take())
+    }
+}
+
+impl Drop for WriterOwner {
+    fn drop(&mut self) {
+        drop(self.wal.take());
+        drop(self.lease.take());
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next writer thread spawn on this thread fail, as an exhausted thread
+    /// limit would, so tests can check what an unstarted writer releases and in what order.
+    static FAIL_NEXT_WRITER_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The loop's handle to the writer task.
 pub struct WalHandle {
     /// Advisory display placement follows accepted queue order, not the lagging fsync head.
@@ -2138,7 +2322,10 @@ pub struct WalHandle {
     after_reserve_probe: Mutex<Option<AfterReserveProbe>>,
     #[cfg(test)]
     enqueue_contention_probe: Mutex<Option<EnqueueContentionProbe>>,
-    join: Option<std::thread::JoinHandle<()>>,
+    /// The writer thread hands back the session lease it owned (if any) only after
+    /// `writer_loop` has returned and dropped the WAL, so whoever joins it receives a
+    /// lease that no longer has a writable descriptor beside it.
+    join: Option<std::thread::JoinHandle<Option<Box<dyn LeaseHandle>>>>,
 }
 
 impl WalHandle {
@@ -2296,6 +2483,133 @@ impl WalHandle {
         Ok((handle, lease))
     }
 
+    /// Open and prove a session WAL under the caller-owned tenure, then start its
+    /// writer task which retains that tenure until the WAL is closed.
+    ///
+    /// The tenure is consumed: the blocking recovery closure owns it until the
+    /// descriptor exists, and the writer task owns it after that. No second
+    /// acquisition happens inside the store open; a second holder that tries to
+    /// acquire the same session while this writer lives gets `Held`. Cancellation
+    /// before the await returns leaves authority with the blocking closure until
+    /// its descriptor is gone, and cancellation after spawn leaves it with the
+    /// draining writer task. The caller gets only the handle, never a
+    /// separately droppable lease, so the lock cannot be released early while
+    /// the WAL stays writable.
+    pub async fn open_and_spawn_owned<W>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+    ) -> Result<WalHandle, WalOpenError>
+    where
+        W: WalStore + 'static,
+    {
+        Self::open_and_spawn_owned_with_retention(wal_store, session, tenure, observer, None).await
+    }
+
+    /// Like [`Self::open_and_spawn_owned`] but with admission's already-validated
+    /// first-send retention policy. The tenure remains owned through directory
+    /// selection and recovery.
+    pub async fn open_and_spawn_owned_with_retention<W>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+        retention: Option<u64>,
+    ) -> Result<WalHandle, WalOpenError>
+    where
+        W: WalStore + 'static,
+    {
+        Self::open_and_spawn_owned_with_class(wal_store, session, tenure, observer, retention, None)
+            .await
+    }
+
+    pub async fn open_and_spawn_owned_with_class<W: WalStore + 'static>(
+        wal_store: Arc<W>,
+        session: BindIdentity,
+        tenure: OwnedWalTenure,
+        observer: Option<RecordObserver>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+    ) -> Result<WalHandle, WalOpenError> {
+        // Bind before touching I/O: a wrong tenure refuses without creating
+        // directories or files, truncating a torn tail, or writing lineage.
+        // The tenure is consumed on both paths.
+        if let Err(error) = tenure.require_session(&session) {
+            return Err(WalOpenError::Failed(WalWriteError::Failed(format!(
+                "owned WAL open refused: {error}"
+            ))));
+        }
+        // The completed open, with deliberate teardown order. On cancellation
+        // the blocking task still runs to completion and its result is dropped
+        // without a receiver: this Drop closes the writable descriptor before
+        // the tenure releases, even on that path. Success moves both out and
+        // leaves this guard empty, so its drop is a no-op.
+        struct OpenedOwned {
+            wal: Option<Box<dyn Wal + Send>>,
+            lease: Option<Box<dyn LeaseHandle>>,
+            last_seq: u64,
+            fence: u64,
+        }
+        impl Drop for OpenedOwned {
+            fn drop(&mut self) {
+                let wal = self.wal.take();
+                drop(wal);
+                let lease = self.lease.take();
+                drop(lease);
+            }
+        }
+        let check_store = wal_store.clone();
+        let check_session = session.clone();
+        let opened = spawn_blocking(JobKind::WalWriter, move || {
+            // Authority stays with this closure until the descriptor is gone:
+            // no second acquisition happens here, the caller-owned lease is
+            // reused through the store open, which also uses it to authorize
+            // restoring an archived log before the descriptor exists.
+            let lease = tenure.into_lease();
+            let fence = lease.epoch();
+            let (wal, lease) = wal_store
+                .open_owned_writer(&session, retention, session_class.as_deref(), lease)
+                .map_err(WalOpenError::from_wal)?;
+            // `prove_recovery` drops the descriptor before returning its
+            // error, so by the time its Err reaches here the WAL is already
+            // closed and only the tenure remains in the guard below.
+            let (wal, last_seq) = Self::prove_recovery(wal).map_err(WalOpenError::Failed)?;
+            Ok::<_, WalOpenError>(OpenedOwned {
+                wal: Some(wal),
+                lease: Some(lease),
+                last_seq,
+                fence,
+            })
+        })
+        .await
+        .map_err(|error| {
+            WalOpenError::Failed(WalWriteError::Failed(format!(
+                "WAL open/recovery task failed: {error}"
+            )))
+        })??;
+        let mut opened = opened;
+        let wal = opened
+            .wal
+            .take()
+            .expect("owned open holds its WAL until handoff");
+        let lease = opened
+            .lease
+            .take()
+            .expect("owned open holds its tenure until handoff");
+        let (last_seq, fence) = (opened.last_seq, opened.fence);
+        // The writer task owns the lease until the WAL is closed: dropping the
+        // handle without shutdown still joins through the task, and shutdown
+        // joins before the task drops the lease. No separate lease is returned.
+        let mut handle = Self::spawn_proven_observed(wal, last_seq, fence, observer, Some(lease))
+            .map_err(WalOpenError::Failed)?;
+        handle.bind_media_capture(check_store.as_ref(), &check_session);
+        handle.move_check = Some(Arc::new(move || {
+            check_store.check_move(&check_session, true)
+        }));
+        Ok(handle)
+    }
+
     fn prove_recovery(
         wal: Box<dyn Wal + Send>,
     ) -> Result<(Box<dyn Wal + Send>, u64), WalWriteError> {
@@ -2315,6 +2629,14 @@ impl WalHandle {
         observer: Option<RecordObserver>,
         lease: Option<Box<dyn LeaseHandle>>,
     ) -> Result<WalHandle, WalWriteError> {
+        // One owner holds the WAL and its lease from here until the writer thread takes
+        // them, so a panic while preparing the handle or a failed thread spawn still
+        // closes the WAL before the lease is released.
+        let owner = WriterOwner {
+            wal: Some(wal),
+            lease,
+        };
+        let wal = owner.wal();
         // Seq is 1-based; the first record of an empty WAL is seq 1, so the next seq
         // after a durable head of `last_seq` is `last_seq + 1`.
         let next_seq = AtomicU64::new(last_seq + 1);
@@ -2339,23 +2661,36 @@ impl WalHandle {
                 })
             });
         let (tx, rx) = std_mpsc::channel::<WalCommand>();
+        let body = move || {
+            // writer_loop drops its WAL before the lease is released, even on unwind:
+            // the lease is bound outside writer_loop's frame, so an unwinding writer
+            // drops the WAL first. On a normal return the lease goes back to the
+            // joiner, which releases it or hands it over (see `shutdown_into_tenure`).
+            let (wal, lease) = owner.into_parts();
+            writer_loop(
+                wal,
+                fence,
+                rx,
+                observer,
+                writer_poisoned,
+                writer_durable_head,
+                writer_lineage_id,
+            );
+            lease
+        };
+        #[cfg(test)]
+        if FAIL_NEXT_WRITER_SPAWN.with(|fail| fail.replace(false)) {
+            // Mirrors a real spawn failure, which drops the unstarted closure.
+            drop(body);
+            return Err(WalWriteError::Failed(
+                "WAL writer thread spawn failed: injected".into(),
+            ));
+        }
         // recv() waits for the lifetime of the session, including while idle. A
         // resident writer must not consume a slot needed by finite blocking jobs.
         let join = std::thread::Builder::new()
             .name("broca-wal-writer".into())
-            .spawn(move || {
-                // writer_loop drops its WAL before the lease is released, even on unwind.
-                let _lease = lease;
-                writer_loop(
-                    wal,
-                    fence,
-                    rx,
-                    observer,
-                    writer_poisoned,
-                    writer_durable_head,
-                    writer_lineage_id,
-                )
-            })
+            .spawn(body)
             .map_err(|error| {
                 WalWriteError::Failed(format!("WAL writer thread spawn failed: {error}"))
             })?;
@@ -2916,31 +3251,76 @@ impl WalHandle {
     }
 
     fn shutdown_blocking(&mut self) -> Result<(), WalWriteError> {
+        let (result, lease) = self.shutdown_blocking_keeping_lease();
+        // The writer thread has exited and dropped its WAL; only now may the lease go.
+        drop(lease);
+        result
+    }
+
+    /// Close the writer and keep the session lease it owned.
+    ///
+    /// The writer drains, performs its final sync if dirty, and exits; its thread is
+    /// joined, so the descriptor is gone before this returns. The still-held lease comes
+    /// back as a [`ClosedWriterTenure`], which has no append or descriptor capability and
+    /// releases the lease when dropped. A failed final sync still returns the tenure,
+    /// because the descriptor is closed either way and releasing early would let another
+    /// owner open the log while the failure is being handled. A writer that never owned a
+    /// lease (the guarded standalone spawn) returns no tenure.
+    ///
+    /// A move of an idle session uses this to take over the session lease from its actor
+    /// without the lock ever being free between the writer closing and the move
+    /// publishing its markers.
+    pub async fn shutdown_into_tenure(
+        mut self,
+    ) -> (Result<(), WalWriteError>, Option<ClosedWriterTenure>) {
+        match tokio::task::spawn_blocking(move || self.shutdown_blocking_keeping_lease()).await {
+            Ok((result, lease)) => (result, lease.map(|lease| ClosedWriterTenure { lease })),
+            Err(error) => (
+                Err(WalWriteError::Failed(format!(
+                    "WAL shutdown task failed: {error}"
+                ))),
+                None,
+            ),
+        }
+    }
+
+    fn shutdown_blocking_keeping_lease(
+        &mut self,
+    ) -> (Result<(), WalWriteError>, Option<Box<dyn LeaseHandle>>) {
         let Some(join) = self.join.take() else {
-            return current_poison(&self.poisoned)
-                .map_or(Ok(()), |error| Err(WalWriteError::Failed(error)));
+            return (
+                current_poison(&self.poisoned)
+                    .map_or(Ok(()), |error| Err(WalWriteError::Failed(error))),
+                None,
+            );
         };
         let (ack, result) = std_mpsc::channel();
         let sent = self.tx.send(WalCommand::Shutdown(ack));
         // Always join, even when the channel or final sync failed. No writer may
         // survive its owning handle and continue appending under a released lease.
-        if join.join().is_err() {
-            set_poison(
-                &self.poisoned,
-                "WAL writer thread panicked during shutdown".into(),
-            );
-        }
+        let lease = match join.join() {
+            Ok(lease) => lease,
+            Err(_) => {
+                // Unwinding already dropped the WAL and then the lease.
+                set_poison(
+                    &self.poisoned,
+                    "WAL writer thread panicked during shutdown".into(),
+                );
+                None
+            }
+        };
         if sent.is_err() {
             set_poison(&self.poisoned, "WAL writer closed before shutdown".into());
         }
         if let Some(error) = current_poison(&self.poisoned) {
-            return Err(WalWriteError::Failed(error));
+            return (Err(WalWriteError::Failed(error)), lease);
         }
-        result.recv().unwrap_or_else(|_| {
+        let result = result.recv().unwrap_or_else(|_| {
             let error = "WAL writer dropped the shutdown acknowledgement".to_string();
             set_poison(&self.poisoned, error.clone());
             Err(WalWriteError::Failed(error))
-        })
+        });
+        (result, lease)
     }
 
     /// Serializes sequence reservation with the enqueue that follows it, so two appenders
@@ -3723,9 +4103,16 @@ mod tests {
             "unsynced append reached the tap"
         );
         handle.sync().await.unwrap();
-        let event = tokio::time::timeout(std::time::Duration::from_millis(200), inbox.recv()).await;
+        // The writer acknowledges the sync first and publishes to the tap afterwards, so the
+        // run loop never waits on tap work; the event arrives shortly after the ack, not before.
+        let event =
+            broca_test_support::wait_for("the durable tap after sync", inbox.recv(), || {
+                "no tap event after a successful sync".into()
+            })
+            .await
+            .expect("tap channel open");
         let _ = handle.shutdown().await;
-        assert_eq!(event.unwrap(), Some(1));
+        assert_eq!(event, 1);
         assert!(
             inbox.try_recv().is_err(),
             "tap published the same append more than once"

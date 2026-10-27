@@ -415,7 +415,13 @@ async fn a_recorded_ceiling_wait_resumes_the_same_fitting_request_at_every_cut()
         .iter()
         .position(|r| matches!(r, WalRecord::ContextCeilingWait { .. }))
         .unwrap();
+    let mut request_bearing_cuts = 0;
     for cut in first_wait + 1..=records.len() {
+        let expected_requests = usize::from(
+            !records[..cut]
+                .iter()
+                .any(|record| matches!(record, WalRecord::ModelStepFinished { .. })),
+        );
         let resumed = Shared::with_records(records[..cut].to_vec());
         let (summary, model) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -424,8 +430,12 @@ async fn a_recorded_ceiling_wait_resumes_the_same_fitting_request_at_every_cut()
         .await
         .expect("ceiling recovery must not extend or restart the wait");
         assert_eq!(summary.reason, RunFinishReason::Completed, "cut {cut}");
-        for call in model.calls() {
+        let calls = model.calls();
+        assert_eq!(calls.len(), expected_requests, "cut {cut}");
+        request_bearing_cuts += expected_requests;
+        for call in calls {
             assert_eq!(crate::canonical_request_bytes(&call), sent, "cut {cut}");
         }
     }
+    assert!(request_bearing_cuts > 0);
 }

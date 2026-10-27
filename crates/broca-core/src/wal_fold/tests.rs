@@ -2,6 +2,7 @@ use super::*;
 use crate::{FileWalStore, WalStore};
 use broca_protocol::{RunId, StepId};
 use broca_wal::{RunConfig, RunOrigin};
+use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const START: u64 = COLD_MS * 3;

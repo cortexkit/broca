@@ -133,6 +133,57 @@ impl SqliteStore {
         &self,
         refs: impl Iterator<Item = &'a str>,
     ) -> Result<SessionRefs, StoreError> {
+        self.read_session_refs(|tx| {
+            let mut sessions = BTreeMap::new();
+            let mut statement = tx.prepare_cached(
+                "SELECT DISTINCT address,project_root,harness,session FROM agent_data_session_ref
+                 WHERE session_ref=?1 OR address IN
+                   (SELECT address FROM agent_data_session_ref_v2 WHERE session_ref=?1)",
+            )?;
+            for reference in refs {
+                let entries = statement
+                    .query_map([reference], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            BindIdentity::new(
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ),
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if entries.len() > 1 {
+                    return Err(StoreError::InconsistentSnapshot("session_ref_ambiguous"));
+                }
+                if let Some(entry) = entries.into_iter().next() {
+                    sessions.insert(reference.to_owned(), entry);
+                }
+            }
+            Ok(sessions)
+        })
+    }
+
+    /// Scan only the compact bind inventory, never the much larger run history.
+    /// The limit bounds candidate decoding; callers must refuse a full result page.
+    pub fn session_refs_named(&self, name: &str, limit: u32) -> Result<SessionRefs, StoreError> {
+        self.read_session_refs(|tx| {
+            let mut statement = tx.prepare_cached(
+                "SELECT session_ref,address,project_root,harness,session FROM agent_data_session_ref WHERE session=?1 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(rusqlite::params![name, limit], |row| {
+                Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, BindIdentity::new(
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?,
+                ))))
+            })?;
+            rows.collect::<Result<BTreeMap<_, _>, _>>().map_err(StoreError::from)
+        })
+    }
+
+    fn read_session_refs(
+        &self,
+        select: impl FnOnce(&Connection) -> Result<BTreeMap<String, (String, BindIdentity)>, StoreError>,
+    ) -> Result<SessionRefs, StoreError> {
         let mut conn = self.conn.lock().unwrap();
         let root = conn
             .path()
@@ -162,34 +213,7 @@ impl SqliteStore {
             [],
             |row| row.get(0),
         )?;
-        let mut sessions = BTreeMap::new();
-        {
-            let mut statement = tx.prepare_cached(
-                "SELECT DISTINCT address,project_root,harness,session FROM agent_data_session_ref
-                 WHERE session_ref=?1 OR address IN
-                   (SELECT address FROM agent_data_session_ref_v2 WHERE session_ref=?1)",
-            )?;
-            for reference in refs {
-                let entries = statement
-                    .query_map([reference], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            BindIdentity::new(
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                            ),
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                if entries.len() > 1 {
-                    return Err(StoreError::InconsistentSnapshot("session_ref_ambiguous"));
-                }
-                if let Some(entry) = entries.into_iter().next() {
-                    sessions.insert(reference.to_owned(), entry);
-                }
-            }
-        }
+        let sessions = select(&tx)?;
         tx.commit()?;
         Ok(SessionRefs {
             sessions,
@@ -199,12 +223,26 @@ impl SqliteStore {
 }
 
 /// Remove only obsolete inventory artifacts, never follow symlinks or recurse.
-/// Failure aborts boot rather than silently leaving the old write-heavy cache behind.
+/// Errors other than vanished entries are returned so cleanup cannot silently continue after a failure.
 pub fn cleanup_legacy_inventory(root: &std::path::Path) -> std::io::Result<(u64, u64)> {
+    cleanup_legacy_inventory_with(
+        root,
+        |path| std::fs::symlink_metadata(path),
+        |path| std::fs::remove_file(path),
+    )
+}
+
+fn cleanup_legacy_inventory_with(
+    root: &std::path::Path,
+    mut metadata: impl FnMut(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
+    mut remove: impl FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<(u64, u64)> {
     let mut count = 0;
     let mut bytes = 0;
     for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
+        let Some(entry) = listed_inventory_entry(root, entry)? else {
+            continue;
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -212,16 +250,36 @@ pub fn cleanup_legacy_inventory(root: &std::path::Path) -> std::io::Result<(u64,
         if name != "move-inventory.json" && !name.starts_with("move-inventory.tmp-") {
             continue;
         }
-        let metadata = std::fs::symlink_metadata(entry.path())?;
+        let Some(metadata) = listed_inventory_entry(root, metadata(&entry.path()))? else {
+            continue;
+        };
         if metadata.is_dir() {
             continue;
         }
-        std::fs::remove_file(entry.path())?;
+        if listed_inventory_entry(root, remove(&entry.path()))?.is_none() {
+            continue;
+        }
         count += 1;
         bytes += metadata.len();
     }
     tracing::info!(count, bytes, "removed obsolete move inventory files");
     Ok((count, bytes))
+}
+
+fn listed_inventory_entry<T>(
+    root: &std::path::Path,
+    result: std::io::Result<T>,
+) -> std::io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A vanished inventory artifact needs no cleanup, just like an absent one,
+            // provided the inventory root is still readable.
+            std::fs::read_dir(root)?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

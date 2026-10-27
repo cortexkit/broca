@@ -193,6 +193,109 @@ fn legacy_cleanup_removes_only_inventory_artifacts() {
 }
 
 #[test]
+fn legacy_cleanup_skips_an_entry_vanished_before_metadata() {
+    let root = broca_test_support::scratch_root().join("inventory-vanished-before-metadata");
+    std::fs::create_dir_all(&root).unwrap();
+    let vanished = root.join("move-inventory.tmp-vanished");
+    std::fs::write(&vanished, b"gone").unwrap();
+    std::fs::write(root.join("move-inventory.json"), b"kept").unwrap();
+    let mut removed = false;
+    let result = cleanup_legacy_inventory_with(
+        &root,
+        |path| {
+            if !removed {
+                std::fs::remove_file(path).unwrap();
+                removed = true;
+            }
+            std::fs::symlink_metadata(path)
+        },
+        |path| std::fs::remove_file(path),
+    );
+    assert!(removed);
+    assert_eq!(result.unwrap(), (1, 4));
+    assert!(!vanished.exists());
+    assert!(!root.join("move-inventory.json").exists());
+}
+
+#[test]
+fn legacy_cleanup_skips_an_entry_vanished_before_removal() {
+    let root = broca_test_support::scratch_root().join("inventory-vanished-before-removal");
+    std::fs::create_dir_all(&root).unwrap();
+    let vanished = root.join("move-inventory.tmp-vanished");
+    std::fs::write(&vanished, b"gone").unwrap();
+    std::fs::write(root.join("move-inventory.json"), b"kept").unwrap();
+    let mut removed = false;
+    let result = cleanup_legacy_inventory_with(
+        &root,
+        |path| std::fs::symlink_metadata(path),
+        |path| {
+            if !removed {
+                std::fs::remove_file(path).unwrap();
+                removed = true;
+            }
+            std::fs::remove_file(path)
+        },
+    );
+    assert!(removed);
+    assert_eq!(result.unwrap(), (1, 4));
+    assert!(!vanished.exists());
+    assert!(!root.join("move-inventory.json").exists());
+}
+
+#[test]
+fn legacy_cleanup_preserves_permission_errors() {
+    for fail_metadata in [true, false] {
+        let root = broca_test_support::scratch_root().join("inventory-permission-error");
+        std::fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("move-inventory.json");
+        std::fs::write(&artifact, b"kept").unwrap();
+        let result = cleanup_legacy_inventory_with(
+            &root,
+            |path| {
+                if fail_metadata {
+                    Err(std::io::ErrorKind::PermissionDenied.into())
+                } else {
+                    std::fs::symlink_metadata(path)
+                }
+            },
+            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(artifact.exists());
+    }
+}
+
+#[test]
+fn legacy_cleanup_rejects_missing_or_non_directory_roots() {
+    let root = broca_test_support::scratch_root().join("inventory-missing-root");
+    assert_eq!(
+        cleanup_legacy_inventory(&root).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    std::fs::write(&root, b"not a directory").unwrap();
+    assert!(cleanup_legacy_inventory(&root).is_err());
+}
+
+#[test]
+fn legacy_cleanup_rejects_a_root_vanished_during_scan() {
+    let root = broca_test_support::scratch_root().join("inventory-root-vanished");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("move-inventory.json"), b"gone").unwrap();
+    let result = cleanup_legacy_inventory_with(
+        &root,
+        |path| {
+            std::fs::remove_dir_all(&root).unwrap();
+            std::fs::symlink_metadata(path)
+        },
+        |path| std::fs::remove_file(path),
+    );
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
 fn locked_projection_keeps_admission_and_repair_recovers_session() {
     let root = broca_test_support::scratch_root()
         .join(format!("session-ref-locked-{}", std::process::id()));

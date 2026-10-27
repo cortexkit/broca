@@ -4,10 +4,10 @@
 //! The route asks cerebellum and Basal, so the rig has to answer as both. It does that with
 //! `fake-surface`, a stand-in module (its own package under `tests/support/fake-surface`) that
 //! declares the two management operations and serves them from a fixture file. `Stub::Answering`
-//! gives it a fixture; a fixture whose value is an error body is returned as the module's own
-//! refusal, which is how Basal's `flow_not_approved` and an unreadable cerebellum answer are
-//! delivered. The `owner` and `cingulate` stand-ins are `fake-aft-stub`, which declares no
-//! management surface, so the daemon refuses a request aimed at either of them.
+//! gives it a fixture. Cerebellum's answers and outcome refusals are bare response bodies;
+//! Basal's error bodies use error frames. The `owner` and `cingulate` stand-ins are
+//! `fake-aft-stub`, which declares no management surface, so the daemon refuses a request
+//! aimed at either of them.
 
 // The handoff uses /bin/sh and records kernel process identities for cleanup.
 // Those identity helpers are implemented only on Linux and macOS.
@@ -22,6 +22,18 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MODEL: &str = "typesafe/jev-1.13.0";
+
+// Cerebellum fbcc6766, docs/contracts/private-content-query-v1.md. These reply bodies come from
+// the following vectors; SHA-256s identify whole golden-file documents for provenance only:
+// crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json
+// whole-file SHA-256 eb4c452cadd0b5d48e8855db366c599c3dcccb3408da1ea403fa5d8703032d1c
+// crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json
+// whole-file SHA-256 e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2
+// crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json
+// whole-file SHA-256 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc
+const CEREBELLUM_MARKED: &str = r#"{"private_content":true,"sources":["signed_in_site"]}"#;
+const CEREBELLUM_UNMARKED: &str = r#"{"private_content":false,"sources":[]}"#;
+const CEREBELLUM_REFUSAL: &str = r#"{"context":null,"detail":{"field":"owner","reason_code":"unknown_field"},"outcome":"invalid_request","session":null}"#;
 
 #[derive(Default)]
 struct Provider {
@@ -87,8 +99,8 @@ enum Stub {
     /// what a module that does not serve the operation answers, except `private_content.query`,
     /// which gets the stand-in's default answer (see `fake-surface`).
     Unreachable,
-    /// Use this JSON as the matching fixture's `stdout`: an error body refuses the request, any
-    /// other value is wrapped in `{result}`.
+    /// Use this JSON as the matching fixture's wire body. Basal's success includes `{result}`;
+    /// its error bodies use error frames. Cerebellum's answers and refusals use response frames.
     Answering(&'static str),
 }
 
@@ -871,9 +883,7 @@ async fn unreachable_cerebellum_counts_as_marked_and_asks_again_on_every_call() 
     // treat as "no answer".
     let Some(rig) = Rig::start(
         "unreachable",
-        Stub::Answering(
-            r#"{"code":"private_content_unavailable","message":"cerebellum cannot tell"}"#,
-        ),
+        Stub::Answering(CEREBELLUM_REFUSAL),
         Stub::Unreachable,
     )
     .await
@@ -911,8 +921,8 @@ async fn unreachable_cerebellum_counts_as_marked_and_asks_again_on_every_call() 
 async fn an_unmarked_run_calls_an_unlisted_provider() {
     let Some(rig) = Rig::start(
         "unmarked",
-        Stub::Answering(r#"{"private_content":false,"sources":[]}"#),
-        Stub::Answering(r#"{"flow_id":"tool-flow","version":"1","code_hash":"00","providers":[]}"#),
+        Stub::Answering(CEREBELLUM_UNMARKED),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
     )
     .await
     else {
@@ -922,14 +932,23 @@ async fn an_unmarked_run_calls_an_unlisted_provider() {
     let result = admitted_with_retry(&rig, &route, "unmarked").await;
     assert!(result["cost_usd"].is_number());
     assert_eq!(rig.cerebellum_queries(), 1);
+    let requests = std::fs::read_to_string(rig.root.join("cerebellum.requests")).unwrap();
+    let params: Value = serde_json::from_str(
+        requests
+            .lines()
+            .find_map(|line| line.strip_prefix("private_content.query "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(params, json!({"scope_ref": "run"}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_marked_run_ends_not_started_consent_required_and_files_nothing() {
     let Some(rig) = Rig::start(
         "marked",
-        Stub::Answering(r#"{"private_content":true,"sources":["person_browser"]}"#),
-        Stub::Answering(r#"{"flow_id":"tool-flow","version":"1","code_hash":"00","providers":[]}"#),
+        Stub::Answering(CEREBELLUM_MARKED),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
     )
     .await
     else {
@@ -952,7 +971,7 @@ async fn a_marked_run_with_an_unknown_source_files_no_card() {
         // A marked answer whose only source kind broca does not know, so a card would have no
         // source to name and the call files none.
         Stub::Answering(r#"{"private_content":true,"sources":["future_source"]}"#),
-        Stub::Answering(r#"{"flow_id":"tool-flow","version":"1","code_hash":"00","providers":[]}"#),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
     )
     .await
     else {
@@ -963,6 +982,108 @@ async fn a_marked_run_with_an_unknown_source_files_no_card() {
     let error = refused_once_the_route_is_served(&rig, &route, "unknown-source").await;
     assert_eq!(error["detail"]["consent"], "private_content_unknown");
     assert_eq!(rig.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marked_flow_uses_basals_approved_version_and_ownerless_request() {
+    let Some(rig) = Rig::start(
+        "approved-flow",
+        Stub::Answering(CEREBELLUM_MARKED),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":["typesafe","openai"]}}"#),
+    ).await else { return; };
+    let route = rig.open("flow", true).await;
+    let result = admitted_with_retry(&rig, &route, "approved-flow").await;
+    assert!(result["cost_usd"].is_number());
+    assert_eq!(rig.calls(), 1);
+    let requests = std::fs::read_to_string(rig.root.join("basal.requests")).unwrap();
+    let params: Value = serde_json::from_str(
+        requests
+            .lines()
+            .find_map(|line| line.strip_prefix("flow.private_content_providers "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(params, json!({"flow_id": "tool-flow"}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marked_flow_with_no_declared_providers_gets_no_extra_provider() {
+    let Some(rig) = Rig::start(
+        "empty-flow",
+        Stub::Answering(CEREBELLUM_MARKED),
+        Stub::Answering(r#"{"result":{"flow_id":"tool-flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#),
+    ).await else { return; };
+    let route = rig.open("flow", true).await;
+    for key in ["empty-flow", "empty-flow-again", "empty-flow-cached"] {
+        let error = refused_without_writes(&rig, &route, key).await;
+        assert_eq!(error["code"], "provider_not_allowed");
+    }
+    assert_eq!(
+        requests(&rig, "basal", "flow.private_content_providers"),
+        1,
+        "the empty approved provider set is a cacheable policy, not a lookup error"
+    );
+    assert_eq!(rig.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn basal_error_frames_never_authorize_extra_providers_or_cache_a_failure() {
+    for (name, fixture, expected) in [
+        (
+            "not-approved",
+            r#"{"code":"flow_not_approved","message":"flow has no approved version"}"#,
+            "flow_not_approved",
+        ),
+        (
+            "not-permitted",
+            r#"{"code":"not_permitted","message":"caller is not permitted"}"#,
+            "provider_not_allowed",
+        ),
+        (
+            "invalid-params",
+            r#"{"code":"invalid_params","message":"unknown parameter"}"#,
+            "provider_not_allowed",
+        ),
+        (
+            "warming",
+            r#"{"code":"module_warming","message":"module is warming"}"#,
+            "provider_not_allowed",
+        ),
+        (
+            "storage",
+            r#"{"code":"storage_unavailable","message":"storage is unavailable"}"#,
+            "provider_not_allowed",
+        ),
+    ] {
+        let Some(rig) = Rig::start(
+            name,
+            Stub::Answering(CEREBELLUM_MARKED),
+            Stub::Answering(fixture),
+        )
+        .await
+        else {
+            return;
+        };
+        let route = rig.open("flow", true).await;
+        let error = broca_test_support::wait_until("a Basal error frame", || async {
+            let error = refused_without_writes(&rig, &route, "flow-refused").await;
+            if requests(&rig, "basal", "flow.private_content_providers") == 0 {
+                Err("Basal has not served its management route yet".to_string())
+            } else {
+                Ok(error)
+            }
+        })
+        .await;
+        assert_eq!(error["code"], expected);
+        let before = requests(&rig, "basal", "flow.private_content_providers");
+        let error = refused_without_writes(&rig, &route, "flow-refused-again").await;
+        assert_eq!(error["code"], expected);
+        assert_eq!(
+            requests(&rig, "basal", "flow.private_content_providers"),
+            before + 1
+        );
+        assert_eq!(rig.calls(), 0);
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1070,6 +1191,10 @@ fn private_content_handoff() {
                 .arg(format!(
                     "--SURFACE_REQUESTS={}",
                     std::env::var("PRIVATE_CONTENT_REQUESTS").unwrap()
+                ))
+                .arg(format!(
+                    "--SURFACE_NONCE_PATH={}",
+                    hex(&root.join(format!("{module}.nonce")))
                 ));
             command
         };

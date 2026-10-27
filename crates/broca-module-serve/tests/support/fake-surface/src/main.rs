@@ -14,10 +14,10 @@
 //! - `SURFACE_FIXTURES`: a file holding one fixture or an array of them, each
 //!   `{"match": {"method", "scope_ref"?}, "stdout"}`. A request whose method matches (and whose
 //!   `scope_ref` equals the fixture's, when it names one) is answered with that fixture's
-//!   `stdout`, decoded as JSON and wrapped as `{"result": ...}`; a fixture whose `stdout`
-//!   decodes as an `ErrorBody` refuses the request with it instead. A `private_content.query`
+//!   `stdout` bytes after JSON validation. Basal `ErrorBody` fixtures use error frames;
+//!   Cerebellum's answers and outcome refusals use response frames. A `private_content.query`
 //!   with no matching fixture is answered marked, with no sources, when the file names a
-//!   `person_browser` fixture, and unmarked when it does not; any other unmatched operation is
+//!   recognized source kind, and unmarked when it does not; any other unmatched operation is
 //!   refused `unknown_method`.
 //! - `SURFACE_REQUESTS`: a file this process appends one line to per request, so a test can
 //!   count how often broca asked.
@@ -163,6 +163,12 @@ fn stand_in_value(name: &str) -> String {
 
 async fn serve() -> Result<(), String> {
     let (module_id, nonce) = identity()?;
+    // A flow caller must connect under Basal's daemon-issued identity, not the scope owner's.
+    // The rig uses the optional nonce file to open that additional consumer connection.
+    if std::env::args().any(|arg| arg.starts_with("--SURFACE_NONCE_PATH=")) {
+        std::fs::write(stand_in_value("SURFACE_NONCE_PATH"), &nonce)
+            .map_err(|error| format!("write the consumer nonce: {error}"))?;
+    }
     let fixtures = PathBuf::from(stand_in_value("SURFACE_FIXTURES"));
     let requests = PathBuf::from(stand_in_value("SURFACE_REQUESTS"));
     let info = subc_transport::read_for_client(env("SUBC_CONNECTION"))
@@ -306,6 +312,25 @@ fn manifest(module_id: &str) -> ModuleManifest {
 }
 
 fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Result<Vec<u8>, Vec<u8>> {
+    if method == "flow.private_content_providers"
+        && (params["flow_id"].as_str().is_none()
+            || params.as_object().is_none_or(|params| params.keys().any(|key| key != "flow_id")))
+    {
+        return Err(br#"{"code":"invalid_params","message":"params must contain only flow_id"}"#.to_vec());
+    }
+    if method == "private_content.query" {
+        if let Some(field) = params.as_object().and_then(|params| {
+            params
+                .keys()
+                .find(|key| !matches!(key.as_str(), "scope_ref" | "parent_scope_ref"))
+        }) {
+            return Ok(serde_json::to_vec(&serde_json::json!({
+                "outcome": "invalid_request", "context": null, "session": null,
+                "detail": {"field": field, "reason_code": "unknown_field"}
+            }))
+            .unwrap());
+        }
+    }
     let refused = |code: &str, message: String| {
         serde_json::to_vec(&ErrorBody::new(code, message)).unwrap_or_default()
     };
@@ -338,19 +363,24 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
             Ok(value) => value,
             Err(error) => return Err(refused("internal_error", format!("bad fixture: {error}"))),
         };
-        // A fixture that reads as an error is the module refusing the operation.
-        if value.get("code").is_some() {
-            return Err(serde_json::to_vec(&value).unwrap_or_default());
+        // Cerebellum sends both answers and refusals as bare response bodies. Preserve the
+        // fixture bytes so the rig cannot hide a client that expects a result envelope.
+        if method == "private_content.query" {
+            return Ok(raw.as_bytes().to_vec());
         }
-        return Ok(serde_json::to_vec(&serde_json::json!({ "result": value })).unwrap_or_default());
+        // Basal refuses with an error frame, while its successful fixture includes result.
+        if value.get("code").is_some() {
+            return Err(raw.as_bytes().to_vec());
+        }
+        return Ok(raw.as_bytes().to_vec());
     }
-    // A cerebellum stand-in answers a scope it has no fixture for. The file naming any
-    // `person_browser` fixture marks it as the whole file's answer, which is how a test says
-    // that this cerebellum keeps finding more private content.
+    // An unmatched private-content query returns marked=true if the fixture file names any
+    // recognized source. This lets a test model Cerebellum continuing to find private content.
     if method == "private_content.query" {
-        let marked = text.contains("person_browser");
+        let marked = ["person_browser", "desktop_app", "signed_in_site"]
+            .iter().any(|source| text.contains(source));
         return Ok(serde_json::to_vec(&serde_json::json!({
-            "result": {"private_content": marked, "sources": []}
+            "private_content": marked, "sources": []
         }))
         .unwrap_or_default());
     }
@@ -359,7 +389,6 @@ fn answer(fixtures: &PathBuf, method: &str, params: &serde_json::Value) -> Resul
         format!("the stand-in surface does not serve {method}"),
     ))
 }
-
 fn append(path: &PathBuf, line: &str) -> Result<(), String> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -368,4 +397,106 @@ fn append(path: &PathBuf, line: &str) -> Result<(), String> {
         .map_err(|error| format!("open the request log: {error}"))?;
     file.write_all(line.as_bytes())
         .map_err(|error| format!("write the request log: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_content_rejects_unknown_params_with_a_normal_refusal_body() {
+        let response = answer(
+            &PathBuf::new(),
+            "private_content.query",
+            &serde_json::json!({
+                "scope_ref": "run", "owner": {"kind": "reserved", "module_id": "broca"}
+            }),
+        )
+        .unwrap();
+        // Cerebellum fbcc6766, crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json.
+        // Whole-file SHA-256 (provenance only, not body bytes):
+        // 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc.
+        assert_eq!(response, br#"{"context":null,"detail":{"field":"owner","reason_code":"unknown_field"},"outcome":"invalid_request","session":null}"#);
+    }
+
+    #[test]
+    fn private_content_default_answer_is_bare() {
+        let response = answer(
+            &PathBuf::new(),
+            "private_content.query",
+            &serde_json::json!({
+                "scope_ref": "run", "parent_scope_ref": "head"
+            }),
+        )
+        .unwrap();
+        // Cerebellum fbcc6766, crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json.
+        // Whole-file SHA-256 (provenance only, not body bytes):
+        // e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2.
+        assert_eq!(response, br#"{"private_content":false,"sources":[]}"#);
+    }
+
+    #[test]
+    fn cerebellum_fixtures_preserve_pinned_reply_bytes() {
+        // Cerebellum fbcc6766. These reply bodies come from the following vectors; SHA-256s
+        // identify whole golden-file documents for provenance only, not the body bytes:
+        // crates/cerebellum/tests/vectors/private-content-query-v1/success-marked.json
+        // whole-file SHA-256 eb4c452cadd0b5d48e8855db366c599c3dcccb3408da1ea403fa5d8703032d1c
+        // crates/cerebellum/tests/vectors/private-content-query-v1/success-unmarked.json
+        // whole-file SHA-256 e860efcd7db12298f7af82758e8a72bc66b5e0ede81ada0c7fba40c1aa29acb2
+        // crates/cerebellum/tests/vectors/private-content-query-v1/unknown-field.json
+        // whole-file SHA-256 7cc2ec06859a700a91c1e6a1a57643c66ab9af848debcf9b4beb6ecaa7aeb2bc
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/scratch/cerebellum-fixtures-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = root.join("fixtures.json");
+        for body in [
+            r#"{"private_content":true,"sources":["signed_in_site"]}"#,
+            r#"{"private_content":false,"sources":[]}"#,
+            r#"{"context":null,"detail":{"field":"owner","reason_code":"unknown_field"},"outcome":"invalid_request","session":null}"#,
+        ] {
+            std::fs::write(&fixture, serde_json::json!([{
+                "match": {"method": "private_content.query", "scope_ref": "test-session"}, "stdout": body
+            }]).to_string()).unwrap();
+            let bytes = answer(&fixture, "private_content.query", &serde_json::json!({"scope_ref": "test-session"})).unwrap();
+            assert_eq!(bytes, body.as_bytes());
+            if body.contains("signed_in_site") {
+                let fallback = answer(&fixture, "private_content.query", &serde_json::json!({"scope_ref": "other-scope"})).unwrap();
+                assert_eq!(fallback, br#"{"private_content":true,"sources":[]}"#);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn basal_rejects_unknown_params_in_an_error_frame() {
+        for params in [
+            serde_json::json!({"flow_id": "flow", "owner": {"kind": "reserved", "module_id": "broca"}}),
+            serde_json::json!({"flow_id": "flow", "future_field": true}),
+        ] {
+            let bytes = answer(&PathBuf::new(), "flow.private_content_providers", &params).unwrap_err();
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error, serde_json::json!({"code": "invalid_params", "message": "params must contain only flow_id"}));
+        }
+    }
+
+    #[test]
+    fn basal_fixtures_preserve_wrapped_successes_and_error_frames() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/scratch/basal-fixtures-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = root.join("fixtures.json");
+        for (body, refused) in [
+            (r#"{"result":{"flow_id":"flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":["typesafe","openai"]}}"#, false),
+            (r#"{"result":{"flow_id":"flow","version":7,"code_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","providers":[]}}"#, false),
+            (r#"{"code":"storage_unavailable","message":"storage is unavailable"}"#, true),
+        ] {
+            std::fs::write(&fixture, serde_json::json!([{
+                "match": {"method": "flow.private_content_providers"}, "stdout": body
+            }]).to_string()).unwrap();
+            let response = answer(&fixture, "flow.private_content_providers", &serde_json::json!({"flow_id": "flow"}));
+            let bytes = if refused { response.unwrap_err() } else { response.unwrap() };
+            assert_eq!(bytes, body.as_bytes());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

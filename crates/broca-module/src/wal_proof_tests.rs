@@ -226,7 +226,7 @@ impl broca_wal::Wal for RefusingWal {
 
 impl Fixture {
     async fn refuse_next_append(&mut self, clear_at_sync: usize) {
-        self.actor.shutdown_writer().await;
+        let _ = self.actor.shutdown_writer().await;
         let writer = Arc::new(std::sync::Mutex::new(std::sync::Weak::new()));
         let handle = Arc::new(
             WalHandle::spawn(
@@ -374,7 +374,7 @@ impl Fixture {
             actor_jobs: Arc::default(),
             key,
             gen: 1,
-            lease: Some(lease),
+            lease: Some(ActorTenure::Lease(lease)),
             writer: Some(writer),
             executor: executor.clone(),
             wal_store,
@@ -456,7 +456,7 @@ impl Fixture {
     }
 
     async fn close(mut self) {
-        self.actor.shutdown_writer().await;
+        let _ = self.actor.shutdown_writer().await;
         drop(self.actor.lease.take());
         std::fs::remove_dir_all(self.root).unwrap();
     }
@@ -668,7 +668,7 @@ async fn long_retention_sync_is_bounded_and_repair_survives_restart() {
     // The actor's lease defers enrollment repair; repeated syncs enqueue one retry path.
     assert_eq!(service.enroll_changes().unwrap(), 0);
     drop(writer);
-    fixture.actor.shutdown_writer().await;
+    let _ = fixture.actor.shutdown_writer().await;
     drop(fixture.actor.lease.take());
     let restarted = crate::retention::RetentionService::new(
         service.wal.clone(),
@@ -775,7 +775,7 @@ async fn retained_first_send_cut_before_its_index_sync_is_recovered_at_boot() {
         .unwrap();
     writer.sync().await.unwrap();
     drop(writer);
-    fixture.actor.shutdown_writer().await;
+    let _ = fixture.actor.shutdown_writer().await;
     drop(fixture.actor.lease.take());
     assert!(
         service.wal.ephemeral_wal_path(&key).exists(),
@@ -880,7 +880,7 @@ async fn stale_retention_summary_never_schedules_early_deletion() {
             old
         );
         drop(writer);
-        fixture.actor.shutdown_writer().await;
+        let _ = fixture.actor.shutdown_writer().await;
         drop(fixture.actor.lease.take());
         assert_eq!(service.enroll_changes().unwrap(), 1);
         let repaired = service.index.live(&fixture.actor.key).unwrap().unwrap();

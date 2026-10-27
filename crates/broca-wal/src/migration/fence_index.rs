@@ -90,7 +90,7 @@ pub(super) fn before<'a>(
     bytes: &[u8],
 ) -> io::Result<Option<Publication<'a>>> {
     if path.parent() != Some(state_root.join("agent-data/cuts").as_path())
-        || !ready(state_root).try_exists()?
+        || !fs::try_exists(&ready(state_root))?
     {
         return Ok(None);
     }
@@ -114,22 +114,38 @@ pub(super) fn before<'a>(
 }
 
 pub fn rebuild(state_root: &Path) -> io::Result<()> {
+    rebuild_with_read_dir(state_root, |path| fs::read_dir(path))
+}
+
+fn rebuild_with_read_dir(
+    state_root: &Path,
+    mut read_dir: impl FnMut(&Path) -> io::Result<fs::ReadDir>,
+) -> io::Result<()> {
     let _lock = WRITE.lock().unwrap_or_else(|error| error.into_inner());
-    if ready(state_root).try_exists()? {
+    if fs::try_exists(&ready(state_root))? {
         unlink(&ready(state_root))?;
     }
     durable_dir(state_root, &root(state_root))?;
-    for entry in fs::read_dir(root(state_root))? {
-        unlink(&entry?.path())?;
+    let fences = root(state_root);
+    for entry in read_dir(&fences)? {
+        let Some(entry) = listed_boot_entry(&fences, entry)? else {
+            continue;
+        };
+        unlink(&entry.path())?;
     }
     let cuts = state_root.join("agent-data/cuts");
-    match fs::read_dir(&cuts) {
+    match read_dir(&cuts) {
         Ok(entries) => {
             for entry in entries {
-                let path = entry?.path();
+                let Some(entry) = listed_boot_entry(&cuts, entry)? else {
+                    continue;
+                };
+                let path = entry.path();
                 if path.extension().is_none_or(|extension| extension != "json") {
                     continue;
                 }
+                // A listed cut is fencing authority, so losing it before reading must
+                // fail closed rather than publish an incomplete index.
                 let state: Value = read_json(&path)?
                     .ok_or_else(|| invalid("cut disappeared during fence initialization"))?;
                 let cut_id = path
@@ -145,9 +161,25 @@ pub fn rebuild(state_root: &Path) -> io::Result<()> {
     atomic_json(state_root, &ready(state_root), &true)
 }
 
+fn listed_boot_entry(
+    directory: &Path,
+    entry: io::Result<fs::DirEntry>,
+) -> io::Result<Option<fs::DirEntry>> {
+    match entry {
+        Ok(entry) => Ok(Some(entry)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // An entry lost during enumeration contributes no path to scan, unlike a known
+            // cut lost during reading, so skip it only while the scan root remains readable.
+            fs::read_dir(directory)?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn check(wal_root: &Path, reference: &str) -> io::Result<Option<Option<String>>> {
     let state_root = wal_root.parent().unwrap_or(Path::new("."));
-    if !ready(state_root).try_exists()? {
+    if !fs::try_exists(&ready(state_root))? {
         return Ok(None);
     }
     if reference.len() != 32 || !reference.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -155,3 +187,6 @@ pub(super) fn check(wal_root: &Path, reference: &str) -> io::Result<Option<Optio
     }
     Ok(Some(read_json(&root(state_root).join(reference))?))
 }
+
+#[cfg(test)]
+mod tests;
