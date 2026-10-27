@@ -32,8 +32,8 @@ pub struct ConsumerRoutes {
     /// The credential vault, present only when runs resolve credentials through it.
     pub vault_module: Option<String>,
     /// The routing module broca asks which provider account a run uses and reports each run's
-    /// account evidence to. Present exactly on the vault path: that is when the route is
-    /// opened, since which account serves a send is always routing's decision there.
+    /// account evidence to. Present only on the vault path with account selection active
+    /// (`account_selection.legacy_static` off): that is when the route is opened.
     pub routing_module: Option<String>,
     pub bus_events: bool,
 }
@@ -57,15 +57,13 @@ impl ConsumerRoutes {
     }
 
     /// Name the routing module `account_selection` configures, when this configuration opens a
-    /// route to it: always alongside the vault, and never without it (a mock provider resolves
-    /// no accounts).
+    /// route to it: only alongside the vault, and never with `legacy_static` on, which bypasses
+    /// routing entirely.
     pub fn with_account_selection(
         mut self,
         config: &crate::account_routing::AccountSelectionConfig,
     ) -> Self {
-        self.routing_module = self
-            .vault_module
-            .is_some()
+        self.routing_module = (self.vault_module.is_some() && !config.legacy_static)
             .then(|| config.routing_module.clone());
         self
     }

@@ -108,29 +108,22 @@ fn client(routing: &Arc<FakeRouting>) -> RoutingClient {
     )
 }
 
-/// A listed credential with the metadata the vault sends: the provider it serves and how it
-/// authenticates. The id is an opaque record name; nothing reads it for either.
-fn row(id: &str, account_id: Option<&str>, provider: &str, method: &str) -> ScopedCredential {
+fn row(id: &str, account_id: Option<&str>) -> ScopedCredential {
     ScopedCredential {
         id: id.into(),
-        categories: vec![format!("{provider}-native")],
-        credential_type: method.into(),
-        serves: vec![provider.into()],
-        refresh_adapter: Some(provider.into()),
+        categories: vec!["anthropic-native".into()],
+        credential_type: "oauth".into(),
+        serves: vec!["anthropic".into()],
+        refresh_adapter: Some("anthropic".into()),
         state: "active".into(),
         record_version: 1,
         operations: vec!["read".into()],
         account_id: account_id.map(str::to_string),
         email: None,
         org_name: None,
-        provider_ids: vec![provider.into()],
-        auth_method: Some(method.into()),
+        provider_ids: Vec::new(),
+        auth_method: None,
     }
-}
-
-/// An anthropic subscription login, as the vault lists one.
-fn anthropic(id: &str, account_id: &str) -> ScopedCredential {
-    row(id, Some(account_id), "anthropic", "oauth")
 }
 
 fn listing(rows: Vec<ScopedCredential>) -> Arc<ScopedList> {
@@ -144,10 +137,10 @@ fn listing(rows: Vec<ScopedCredential>) -> Arc<ScopedList> {
 
 fn two_accounts() -> Arc<ScopedList> {
     listing(vec![
-        anthropic("oauth:anthropic", "acct-a"),
-        anthropic("oauth:anthropic:acct-b", "acct-b"),
-        row("apikey:anthropic", None, "anthropic", "apikey"),
-        row("chatgpt:openai", Some("acct-c"), "openai", "chatgpt"),
+        row("oauth:anthropic", Some("acct-a")),
+        row("oauth:anthropic:acct-b", Some("acct-b")),
+        row("apikey:anthropic", None),
+        row("chatgpt:openai", Some("acct-c")),
     ])
 }
 
@@ -160,7 +153,7 @@ async fn choose(
     static_credential: &str,
     caller_named_account: bool,
     listing: Option<Arc<ScopedList>>,
-) -> Result<AccountChoice, ChoiceRefusal> {
+) -> Result<AccountChoice, AccountSelectionRefusal> {
     let static_credential = CredentialId::parse(static_credential).unwrap();
     choose_account(
         client,
@@ -212,28 +205,21 @@ async fn account_selection_disabled_takes_the_static_pick_without_retrying() {
     assert_eq!(client.counters.get("disabled"), 1);
 }
 
-/// Routing being down refuses the send, typed and transient, instead of admitting it on an
-/// account routing never chose. Asked once, never retried here: the caller retries the send.
 #[tokio::test]
-async fn routing_unreachable_refuses_the_send_routing_unavailable() {
+async fn routing_unreachable_falls_back_with_the_counter_raised() {
     let routing = FakeRouting::answering(Err("route.open refused: target_unavailable".into()));
     let client = client(&routing);
-    let refusal = choose(&client, "oauth:anthropic", false, Some(two_accounts()))
+    let choice = choose(&client, "oauth:anthropic", false, Some(two_accounts()))
         .await
-        .expect_err("broca never picks an account when routing cannot answer");
-    assert_eq!(
-        refusal,
-        ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable())
-    );
-    let error = broca_core::RunError::from(refusal);
-    assert_eq!(error.admission_error_class(), ErrorClass::Transient);
-    assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
+        .expect("routing being down never refuses an admission");
+    assert_eq!(path_of(&choice), "unreachable");
+    assert!(matches!(choice, AccountChoice::Static(_)));
     assert_eq!(client.counters.get("unreachable"), 1);
     assert_eq!(client.counters.snapshot()["unreachable"], 1);
 }
 
 #[tokio::test]
-async fn a_malformed_routing_reply_is_refused_as_unreachable() {
+async fn a_malformed_routing_reply_falls_back_as_unreachable() {
     for reply in [
         Ok(Ok(b"not json".to_vec())),
         Ok(Ok(br#"{"result":{"account":{}}}"#.to_vec())),
@@ -244,13 +230,10 @@ async fn a_malformed_routing_reply_is_refused_as_unreachable() {
     ] {
         let routing = FakeRouting::answering(reply);
         let client = client(&routing);
-        let refusal = choose(&client, "oauth:anthropic", false, Some(two_accounts()))
+        let choice = choose(&client, "oauth:anthropic", false, Some(two_accounts()))
             .await
-            .unwrap_err();
-        assert_eq!(
-            refusal,
-            ChoiceRefusal::Unavailable(RoutingUnavailable::unreachable())
-        );
+            .unwrap();
+        assert_eq!(path_of(&choice), "unreachable");
     }
 }
 
@@ -280,15 +263,9 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
         tokio::time::Instant::now() + budget,
     ))
     .await;
-    let refusal = choice.unwrap_err();
+    let choice = choice.unwrap();
     let elapsed = started.elapsed();
-    assert_eq!(
-        refusal,
-        ChoiceRefusal::Unavailable(RoutingUnavailable::no_decision_within_budget(
-            ADMISSION_BUDGET.as_millis() as u64
-        ))
-    );
-    assert_eq!(client.counters.get("no_decision_within_budget"), 1);
+    assert_eq!(path_of(&choice), "unreachable");
     assert_eq!(
         routing.methods(),
         vec![ACCOUNT_FOR_OP],
@@ -300,8 +277,8 @@ async fn a_hung_routing_costs_at_most_the_admission_budget() {
     );
     assert!(events.iter().any(|event| {
         event.target == "routing"
-            && event.level == tracing::Level::WARN
-            && event.message().contains("is refused routing_unavailable")
+            && event.level == tracing::Level::INFO
+            && event.message().contains("takes the static account")
     }));
     // The production budget leaves the caller's 10 s send deadline room for a 5 s vault read.
     assert!(ADMISSION_BUDGET <= Duration::from_secs(2));
@@ -360,13 +337,31 @@ async fn one_candidate_account_asks_nothing() {
     let client = client(&routing);
     // Two records of ONE account are one candidate.
     let one = listing(vec![
-        anthropic("oauth:anthropic", "acct-a"),
-        anthropic("oauth:anthropic:again", "acct-a"),
+        row("oauth:anthropic", Some("acct-a")),
+        row("oauth:anthropic:again", Some("acct-a")),
     ]);
     let choice = choose(&client, "oauth:anthropic", false, Some(one))
         .await
         .unwrap();
     assert_eq!(path_of(&choice), "single_candidate");
+    assert!(routing.methods().is_empty());
+}
+
+#[tokio::test]
+async fn legacy_static_neither_asks_nor_reports() {
+    let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
+    let client = RoutingClient::new(
+        Arc::clone(&routing) as Arc<dyn RoutingTransport>,
+        AccountSelectionConfig {
+            legacy_static: true,
+            ..AccountSelectionConfig::default()
+        },
+    );
+    let choice = choose(&client, "oauth:anthropic", false, Some(two_accounts()))
+        .await
+        .unwrap();
+    assert_eq!(path_of(&choice), "legacy_static");
+    assert_eq!(choice.decision().unwrap().admission_id, None);
     assert!(routing.methods().is_empty());
 }
 
@@ -393,7 +388,6 @@ async fn a_routing_answer_names_the_credential_and_the_decision() {
         AccountChoice::Routed {
             account_id: "acct-b".into(),
             credential_id: "oauth:anthropic:acct-b".into(),
-            method: AuthMethod::Oauth,
             decision: AccountDecision {
                 conversation_key: Some(conversation_key(&session())),
                 conversation_key_source: Some(broca_wal::ConversationKeySource::Session),
@@ -468,187 +462,14 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
     );
 }
 
-/// A pick broca did not offer (here another provider's credential) is a routing defect: the
-/// send is refused `routing_unavailable` with reason `invalid_pick`, still transient, and one
-/// ERROR names the candidate count and the picked id.
 #[tokio::test]
-async fn a_routing_pick_broca_did_not_offer_is_refused_and_logged_as_an_error() {
+async fn a_routing_answer_for_another_provider_is_not_used() {
     let routing = FakeRouting::choosing("acct-c", "chatgpt:openai");
     let client = client(&routing);
-    let (result, events) = broca_test_support::capture_logs(choose(
-        &client,
-        "oauth:anthropic",
-        false,
-        Some(two_accounts()),
-    ))
-    .await;
-    let refusal = result.unwrap_err();
-    assert_eq!(
-        refusal,
-        ChoiceRefusal::Unavailable(RoutingUnavailable::invalid_pick())
-    );
-    assert_eq!(
-        broca_core::RunError::from(refusal).admission_error_class(),
-        ErrorClass::Transient
-    );
-    assert_eq!(client.counters.get("invalid_pick"), 1);
-    let errors: Vec<_> = events
-        .iter()
-        .filter(|event| event.level == tracing::Level::ERROR)
-        .collect();
-    assert_eq!(errors.len(), 1, "one ERROR per occurrence");
-    let message = errors[0].message();
-    assert!(message.contains("chatgpt:openai"), "{message}");
-    assert!(message.contains("not one of the 2 candidates"), "{message}");
-}
-
-/// An offered credential under another account than the one routing names is not a pick broca
-/// offered either.
-#[tokio::test]
-async fn a_pick_pairing_an_offered_credential_with_another_account_is_invalid() {
-    let routing = FakeRouting::choosing("acct-a", "oauth:anthropic:acct-b");
-    let client = client(&routing);
-    let refusal = choose(&client, "oauth:anthropic", false, Some(two_accounts()))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        refusal,
-        ChoiceRefusal::Unavailable(RoutingUnavailable::invalid_pick())
-    );
-}
-
-/// Provider and method come from the vault's metadata, never from the credential id. The ids
-/// here would parse to other providers and methods; the metadata says anthropic/oauth, so they
-/// are anthropic's candidates and routing's pick of one is used verbatim. A row whose id reads
-/// as an anthropic oauth login but whose metadata says otherwise is not offered.
-#[tokio::test]
-async fn candidates_and_the_routed_pick_come_from_vault_metadata_not_the_id() {
-    let routing = FakeRouting::choosing("acct-y", "apikey:openai:work");
-    let client = client(&routing);
-    let rows = listing(vec![
-        anthropic("oauth:openai:personal", "acct-x"),
-        anthropic("apikey:openai:work", "acct-y"),
-        row(
-            "oauth:anthropic:looks-right",
-            Some("acct-z"),
-            "openai",
-            "oauth",
-        ),
-        row(
-            "oauth:anthropic:apikey",
-            Some("acct-w"),
-            "anthropic",
-            "apikey",
-        ),
-    ]);
-    let choice = choose(&client, "oauth:anthropic", false, Some(rows))
+    let choice = choose(&client, "oauth:anthropic", false, Some(two_accounts()))
         .await
         .unwrap();
-    let request = routing.requests.lock().unwrap()[0].clone();
-    assert_eq!(
-        request["params"]["candidates"]["accounts"],
-        json!([
-            { "account_id": "acct-y", "credential_id": "apikey:openai:work" },
-            { "account_id": "acct-x", "credential_id": "oauth:openai:personal" },
-        ])
-    );
-    match choice {
-        AccountChoice::Routed {
-            credential_id,
-            method,
-            ..
-        } => {
-            assert_eq!(
-                credential_id, "apikey:openai:work",
-                "the vault id, verbatim"
-            );
-            assert_eq!(method, AuthMethod::Oauth, "the method from metadata");
-        }
-        other => panic!("expected a routed choice, got {other:?}"),
-    }
-}
-
-/// A listed credential missing `provider_ids` or `auth_method` is never offered: it is not
-/// guessed from its id. Each is warned about once (naming only the id and the missing field)
-/// for as long as it stays unmapped, not once per admission, and counted; one that gains its
-/// metadata leaves the count.
-#[tokio::test]
-async fn an_unmapped_credential_is_never_offered_warned_once_and_counted() {
-    let mut no_providers = anthropic("oauth:anthropic:acct-c", "acct-c");
-    no_providers.provider_ids.clear();
-    let mut no_method = anthropic("oauth:anthropic:acct-d", "acct-d");
-    no_method.auth_method = None;
-    let rows = listing(vec![
-        anthropic("oauth:anthropic", "acct-a"),
-        anthropic("oauth:anthropic:acct-b", "acct-b"),
-        no_providers.clone(),
-        no_method,
-    ]);
-    let cache = ListingCache::default();
-    let (_, events) = broca_test_support::capture_logs(async {
-        for _ in 0..3 {
-            cache.store((*rows).clone());
-        }
-    })
-    .await;
-    assert_eq!(cache.unmapped().count(), 2);
-    let warnings: Vec<String> = events
-        .iter()
-        .filter(|event| event.level == tracing::Level::WARN)
-        .map(|event| event.message().to_owned())
-        .collect();
-    assert_eq!(warnings.len(), 2, "{warnings:?}");
-    assert!(warnings
-        .iter()
-        .any(|w| w.contains("oauth:anthropic:acct-c") && w.contains("no provider_ids")));
-    assert!(warnings
-        .iter()
-        .any(|w| w.contains("oauth:anthropic:acct-d") && w.contains("no auth_method")));
-
-    let routing = FakeRouting::choosing("acct-b", "oauth:anthropic:acct-b");
-    let client = client(&routing);
-    choose(&client, "oauth:anthropic", false, Some(rows.clone()))
-        .await
-        .unwrap();
-    assert_eq!(
-        routing.requests.lock().unwrap()[0]["params"]["candidates"]["accounts"],
-        json!([
-            { "account_id": "acct-a", "credential_id": "oauth:anthropic" },
-            { "account_id": "acct-b", "credential_id": "oauth:anthropic:acct-b" },
-        ]),
-        "unmapped credentials are not routed"
-    );
-
-    // Routing picking an unmapped credential anyway is a pick broca did not offer.
-    let routing = FakeRouting::choosing("acct-c", "oauth:anthropic:acct-c");
-    let client = self::client(&routing);
-    assert_eq!(
-        choose(&client, "oauth:anthropic", false, Some(rows.clone()))
-            .await
-            .unwrap_err(),
-        ChoiceRefusal::Unavailable(RoutingUnavailable::invalid_pick())
-    );
-
-    let mut fixed = (*rows).clone();
-    fixed.credentials[2].provider_ids = vec!["anthropic".into()];
-    cache.store(fixed);
-    assert_eq!(cache.unmapped().count(), 1);
-}
-
-/// `health.check` reports the unmapped count inside the account-selection block.
-#[test]
-fn health_reports_the_unmapped_count_in_the_account_block() {
-    let routing = FakeRouting::refusing(SELECTION_DISABLED, json!({}));
-    let client = client(&routing);
-    let cache = ListingCache::default();
-    let mut unmapped = anthropic("oauth:anthropic:acct-c", "acct-c");
-    unmapped.auth_method = None;
-    cache.store((*listing(vec![anthropic("oauth:anthropic", "acct-a"), unmapped])).clone());
-    publish_counters(client.counters());
-    publish_unmapped(cache.unmapped());
-    let metrics = published_metrics();
-    assert_eq!(metrics["unmapped_credentials"], 1);
-    assert_eq!(metrics["routed"], 0, "the counters stay in the same block");
+    assert_eq!(path_of(&choice), "unreachable");
 }
 
 #[tokio::test]
@@ -711,10 +532,7 @@ async fn refusal_for(code: &str) -> AccountSelectionRefusal {
         .expect_err("refused");
     assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP], "asked once");
     assert_eq!(client.counters.get(&format!("refused.{code}")), 1);
-    match refusal {
-        ChoiceRefusal::Refused(refusal) => refusal,
-        other => panic!("expected routing's refusal, got {other:?}"),
-    }
+    refusal
 }
 
 #[tokio::test]
@@ -749,10 +567,7 @@ async fn refusal_log_names_send_and_routing_decision() {
     ))
     .await;
 
-    let ChoiceRefusal::Refused(refusal) = result.expect_err("routing refusal passes through")
-    else {
-        panic!("expected routing's refusal")
-    };
+    let refusal = result.expect_err("routing refusal passes through");
     assert_eq!(refusal.routing_code, "account_hold");
     assert_eq!(refusal.class, ErrorClass::Transient);
     assert_eq!(refusal.retry_after_s, Some(1260));
@@ -866,29 +681,21 @@ fn a_refusal_without_a_wait_or_decision_copies_their_absence() {
 
 // ---- configuration --------------------------------------------------------------------------
 
-/// There is no switch that bypasses routing. The removed `legacy_static` key, on or off, is
-/// refused by the strict loader like any unknown key, so a leftover setting fails the load
-/// loudly instead of being silently ignored.
 #[test]
-fn the_removed_break_glass_and_any_unknown_key_are_refused() {
+fn the_break_glass_defaults_off_and_a_misspelling_is_refused() {
     assert_eq!(
         AccountSelectionConfig::parse("{}").unwrap(),
         AccountSelectionConfig::default()
     );
-    let named = AccountSelectionConfig::parse(
-        r#"{ // a routing module of its own
-            "account_selection": { "routing_module": "routing-b", },
+    assert!(!AccountSelectionConfig::default().legacy_static);
+    let on = AccountSelectionConfig::parse(
+        r#"{ // operator break-glass
+            "account_selection": { "legacy_static": true, "routing_module": "routing-b", },
             "providers": {} }"#,
     )
     .unwrap();
-    assert_eq!(named.routing_module, "routing-b");
-    for leftover in [
-        r#"{"account_selection":{"legacy_static":true}}"#,
-        r#"{"account_selection":{"legacy_static":false,"routing_module":"routing-b"}}"#,
-    ] {
-        let error = AccountSelectionConfig::parse(leftover).unwrap_err();
-        assert!(error.contains("unknown field `legacy_static`"), "{error}");
-    }
+    assert!(on.legacy_static);
+    assert_eq!(on.routing_module, "routing-b");
     let error = AccountSelectionConfig::parse(r#"{"account_selection":{"legacy_statc":true}}"#)
         .unwrap_err();
     assert!(error.contains("unknown field"), "{error}");
@@ -1354,7 +1161,7 @@ async fn a_scoped_not_found_is_reported_and_a_still_listed_credential_alarms() {
         "run-2".into(),
         "oauth:anthropic:acct-b".into(),
         "vault-view-1".into(),
-        async { Some(listing(vec![anthropic("oauth:anthropic", "acct-a")])) },
+        async { Some(listing(vec![row("oauth:anthropic", Some("acct-a"))])) },
     );
     settle(&routing, 2).await;
     assert_eq!(client.counters.get("scoped_not_found_still_listed"), 1);

@@ -1,1 +1,0 @@
-{"code":"routing_unavailable","message":"the routing module chose an account broca did not offer for this send; nothing was written, retry the send","detail":{"reason":"invalid_pick","class":"transient"}}

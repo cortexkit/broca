@@ -157,12 +157,12 @@ broca specifics:
   and `sender_not_owner.json`; the class is mapped by `ErrorClass::shared_class()` before
   serialization.
 
-  Two served admission refusals about account selection carry their class in their detail:
+  One served admission refusal carries its class in its detail, because its class depends on
+  which refusal routing sent:
 
   | Code | Class | Detail |
   |---|---|---|
   | `account_selection_refused` | `detail.class`: `transient` or `permanent` | `{routing_code, class, retry_after_s?, retry_after_secs?, decision_id?}` |
-  | `routing_unavailable` | `detail.class`: always `transient` | `{reason, class, budget_ms?}` |
 
   The fetch-plan admission refusal `scoped_tools_require_plan` is permanent and carries
   `detail: {class: "permanent"}`. A new send declaring non-empty legacy `tools` on a stamped
@@ -182,18 +182,6 @@ broca specifics:
   `admission_conflict` and `invalid_request`. Callers branch on `routing_code` and `class`,
   never on the message. The bodies are pinned by
   `crates/broca-wire/tests/golden/account_selection_refused.*.json`.
-
-  `routing_unavailable` means broca got no usable account decision from the routing module
-  for a send that needs one: nothing was written and broca did not pick an account itself.
-  It is broca's statement, not routing's, so it never appears as a `routing_code`.
-  `detail.reason` is `unreachable` (the route failed, the connection was lost, the reply could
-  not be decoded, or routing answered a code outside its vocabulary),
-  `no_decision_within_budget` (the admission budget ran out; `budget_ms` names it) or
-  `invalid_pick` (routing chose an account broca had not offered). Always `transient`: the
-  caller retries the same send. A run already admitted keeps its frozen selection on resume
-  and is never routed again. The bodies are pinned by
-  `crates/broca-wire/tests/golden/routing_unavailable.*.json`, which the real serve path's
-  replies are compared with.
 
   `wal_newer_writer` means the session's WAL holds a complete frame that requires WAL
   features this build does not know: a newer broca wrote it. The bytes are intact and

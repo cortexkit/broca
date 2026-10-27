@@ -1,7 +1,6 @@
 //! Records written by the builds that introduce `auth-selection-method/v1` and
-//! `tool-schema-pins/v1`, read by a build that knows both names. A fresh admission that
-//! routing chose an account for freezes that credential's auth method beside its vault id, and
-//! a resumed run re-freezes the method it already carried. Each
+//! `tool-schema-pins/v1`, read by a build that knows both names. A fresh admission here adds
+//! neither; only a resumed run can re-freeze an auth method that run already carried. Each
 //! record here is pinned as the bytes those builds write: it must decode on this build,
 //! re-encode to exactly the same bytes and keep its feature requirements. A reader whose
 //! feature table lacks the two names (every build before this one) must refuse it by name.

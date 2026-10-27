@@ -1653,13 +1653,12 @@ async fn routed_chatgpt_choice() -> AccountChoice {
             id: id.into(), categories: vec!["openai".into()], credential_type: "chatgpt".into(),
             serves: vec!["openai".into()], refresh_adapter: Some("openai".into()), state: "active".into(),
             record_version: 1, operations: vec!["read".into()], account_id: Some(account.into()),
-            email: None, org_name: None,
-            provider_ids: vec!["openai".into()], auth_method: Some("chatgpt".into()),
+            email: None, org_name: None, provider_ids: Vec::new(), auth_method: None,
         }).collect();
     let listing = Arc::new(broca_subc::vault::ScopedList {
         credentials: candidates, grants: 1, grant_tuples: Vec::new(), view: "chatgpt-view".into(),
     });
-    let credential = broca_module_serve::CredentialId::parse("chatgpt:openai").unwrap();
+    let credential = CredentialId::parse("chatgpt:openai").unwrap();
     let choice = choose_account(&client, ChoiceInputs {
         conversation_key: None, inherited_conversation_key: None,
         static_credential: &credential, caller_named_account: false,
@@ -1689,8 +1688,6 @@ async fn routed_chatgpt_reads_the_second_credential_and_freezes_the_decision() {
     let selection = resolved.selection.unwrap();
     assert_eq!(selection.credential_id, "chatgpt:openai:second");
     assert_eq!(selection.account_ref.as_deref(), Some("chatgpt-b"));
-    // Routing chose it by the vault's own id, so the selection freezes the metadata's method.
-    assert_eq!(selection.auth_method.as_deref(), Some("chatgpt"));
     let frozen = serde_json::to_value(selection).unwrap();
     assert_eq!(frozen["account_decision"]["path"], "routed");
     assert_eq!(frozen["account_decision"]["decision_id"], "chatgpt-decision");
