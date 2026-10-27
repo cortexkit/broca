@@ -7,6 +7,7 @@ pub mod held;
 mod held_images;
 #[cfg(test)]
 mod held_images_tests;
+mod observed;
 pub mod permissions;
 mod private_content;
 mod route;

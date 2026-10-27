@@ -2212,6 +2212,10 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // would wait out its drain ceiling.
         "system_one_batches_in_flight",
         "system_one",
+        // Private-content verdicts and marked-call outcomes for the llm_classify route. Null
+        // here because this rig serves no model-tool route; the counters themselves are
+        // asserted through the route in llm_tools_consent.
+        "llm_tools_consent",
         // This process's WAL fsyncs by cause. Asserted below: its four counters exist, and a
         // writer that lost its channel without a shutdown (`disconnect`) never happens here.
         "wal_fsyncs",
@@ -2318,6 +2322,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         serde_json::json!(0)
     );
     assert_eq!(metrics["account_selection"], serde_json::Value::Null);
+    assert_eq!(metrics["llm_tools_consent"], serde_json::Value::Null);
     // Zero on a healthy daemon: any other number is a retained session kept past its expiry.
     // The count belongs to this registry's retention service, so other tests cannot raise it.
     assert_eq!(

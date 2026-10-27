@@ -2076,6 +2076,12 @@ async fn handle_control_request(
             // routing nothing.
             "account_selection": crate::account_routing::published_metrics(),
             "system_one": routes.system_one.as_ref().map(|service| service.health()),
+            // What the private-content check concluded for each llm_classify call and how the
+            // calls it found marked ended: released by a standing grant, held behind a card,
+            // denied, or refused. This is what tells "cerebellum said unmarked" apart from "a
+            // grant let a private call through" when a call went out without a card. Null when
+            // this process serves no model-tool route.
+            "llm_tools_consent": routes.llm_tools.as_ref().map(|tools| tools.consent_health()),
                 });
             if let Some(Ok(catalog)) = catalog_health {
                 // Staleness is ordinary operation: expose its age and provenance while leaving
