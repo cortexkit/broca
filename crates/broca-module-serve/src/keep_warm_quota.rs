@@ -114,11 +114,6 @@ pub async fn automatic_warm_quota(
             code: "account_unknown".into(),
         };
     };
-    if client.config().legacy_static {
-        return QuotaDecision::Stop {
-            code: "account_selection_disabled".into(),
-        };
-    }
     let deadline = tokio::time::Instant::now() + ADMISSION_BUDGET;
     match client.account_status(provider, account_id, deadline).await {
         StatusOutcome::Answer(status) => {

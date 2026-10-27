@@ -2071,9 +2071,11 @@ async fn handle_control_request(
             "charge_basis_override_rows": crate::billing_routing::published_overrides()
                 .map(|published| published.rows),
             // How each new run's provider account was chosen (asked of routing, routing
-            // switched off or unreachable, pinned by the caller...) and how the run's reports to
-            // routing fared. Null in a process with no vault credential source, which asks
-            // routing nothing.
+            // switched off, refused because routing was unreachable, pinned by the caller...),
+            // how the run's reports to routing fared, and `unmapped_credentials`: listed vault
+            // credentials without the provider_ids or auth_method metadata account selection
+            // needs, which are never routed. Null in a process with no vault credential source,
+            // which asks routing nothing.
             "account_selection": crate::account_routing::published_metrics(),
             "system_one": routes.system_one.as_ref().map(|service| service.health()),
                 });
@@ -4173,6 +4175,7 @@ fn refused_send_code(error: &ServeError) -> String {
         }
         ServeError::PlanRefused(refusal) => refusal.code().into(),
         ServeError::AccountSelectionRefused(refusal) => refusal.routing_code.clone(),
+        ServeError::RoutingUnavailable(_) => broca_wire::ROUTING_UNAVAILABLE.into(),
         ServeError::WarmRefused(refusal) => refusal.code.clone(),
         ServeError::RunPaused(_) => "run_paused".into(),
         ServeError::PreUserUnavailable { .. } => broca_module::serve::PRE_USER_UNAVAILABLE.into(),
@@ -4195,7 +4198,8 @@ fn refused_send_class(error: &ServeError) -> &'static str {
     match error {
         ServeError::Open(_, Some(class)) => shared_class_name(*class),
         ServeError::AccountSelectionRefused(refusal) => shared_class_name(refusal.class),
-        ServeError::Transient(_)
+        ServeError::RoutingUnavailable(_)
+        | ServeError::Transient(_)
         | ServeError::TagsAwaitSetup
         | ServeError::SessionMoving { .. }
         | ServeError::SessionMoved { .. }
@@ -4378,6 +4382,15 @@ async fn send_serve_error(
                 refusal.class,
                 refusal.retry_after_s,
                 refusal.decision_id.clone(),
+            ))
+            .map_err(|e| ServeIoError(e.to_string()))?;
+            return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
+        }
+        ServeError::RoutingUnavailable(unavailable) => {
+            // Sent exactly as the broca-wire type serializes: the bytes its golden files pin.
+            let body = serde_json::to_vec(&broca_wire::RoutingUnavailable::new(
+                unavailable.reason.as_str(),
+                unavailable.budget_ms,
             ))
             .map_err(|e| ServeIoError(e.to_string()))?;
             return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
