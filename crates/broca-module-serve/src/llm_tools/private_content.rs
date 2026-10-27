@@ -194,6 +194,8 @@ struct ConsentDetail<'a> {
     class: ErrorClass,
     provider: &'a str,
     consent: &'a str,
+    /// Always `true`: these refusals end the call before any provider attempt.
+    no_spend: bool,
 }
 
 /// The decisions and the cache they produce, for the life of one `LlmTools`.
@@ -433,7 +435,8 @@ fn encoded_refusal(code: &str, message: String, consent: Option<(&str, &str)>) -
             let mut detail = RefusalDetail::new(ErrorClass::Permanent);
             detail.field = Some("model".into());
             let refusal = Refusal::new(code, message).with_detail(detail);
-            serde_json::to_vec(&refusal).expect("a refusal encodes")
+            serde_json::to_vec(&super::spend::Spend::Nothing.mark(refusal))
+                .expect("a refusal encodes")
         }
         Some((provider, consent)) => serde_json::to_vec(&ConsentRefusal {
             code,
@@ -442,6 +445,7 @@ fn encoded_refusal(code: &str, message: String, consent: Option<(&str, &str)>) -
                 class: ErrorClass::Permanent,
                 provider,
                 consent,
+                no_spend: true,
             },
         })
         .expect("a consent refusal encodes"),
