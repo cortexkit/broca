@@ -411,7 +411,10 @@ impl WireFamily for AnthropicMessages {
             // The body renders `max_tokens` from this same field, so an output-ceiling error
             // names the cap the provider actually enforced.
             inner: AnthropicNormalizer::new(step_id)
-                .with_max_output_tokens(frozen.max_output_tokens),
+                .with_max_output_tokens(frozen.max_output_tokens)
+                // Only an episode that froze a refusal fallback commits a refusal after a
+                // tool call as a tool step; every other episode assembles it as before.
+                .with_refusal_tool_use_trim(frozen.refusal_fallback.is_some()),
         })
     }
 

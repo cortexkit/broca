@@ -919,6 +919,75 @@ async fn post_assistant_record_control_next_prompt_and_display_all_use_final_mes
 }
 
 #[tokio::test]
+async fn post_assistant_hook_never_sees_refused_message() {
+    let manifest = Arc::new(frozen(
+        vec![vec![sub("post_assistant", None, "pass")]],
+        None,
+        false,
+    ));
+    let (plane, seen) = scripted(|_, _| Reply::Answer(HookAnswer::Pass));
+    let control = RunControl {
+        manifest: Some(manifest),
+        hook_plane: Some(plane),
+        ..Default::default()
+    };
+    let answer = |text: &str, finish_reason| {
+        vec![
+            NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                message: AssistantMessage {
+                    message_id: broca_protocol::MessageId(text.into()),
+                    content: vec![ContentBlock::Text { text: text.into() }],
+                },
+            }),
+            NormalizedEvent::Control(ProviderControl::Finished {
+                usage: Usage::default(),
+                finish_reason,
+                retries_used: 0,
+            }),
+        ]
+    };
+    let provider = crate::StubProvider::new(vec![
+        answer("refused content", FinishReason::ContentFilter),
+        answer("fallback answer", FinishReason::Stop),
+    ])
+    .with_refusal_fallback(
+        broca_protocol::request::ModelHandle::new("anthropic", "claude-opus-4-8"),
+        None,
+    );
+    let (writer, records) = writer();
+    let (out, _events) = mpsc::channel(128);
+    run_body(
+        &mut request(),
+        crate::replay::replay(&[]).unwrap(),
+        None,
+        false,
+        false,
+        false,
+        &control,
+        &provider,
+        &crate::StubToolPlane::new().with_canned_text("edit", "ok"),
+        &crate::AllowAll,
+        &writer,
+        || Ok(false),
+        None,
+        &out,
+        None,
+    )
+    .await
+    .unwrap();
+    // The hook ran once, on the fallback's answer; the refused message never reached it.
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1.subject.blocks().unwrap(), ["fallback answer"]);
+    let records = records.lock().unwrap().clone();
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, WalRecord::ModelStepRefused { .. })));
+    assert!(!format!("{records:?}").contains("refused content"));
+    let _ = writer.shutdown().await;
+}
+
+#[tokio::test]
 async fn frozen_transform_resume_without_plane_neither_dispatches_nor_writes() {
     // Make a real admitted prefix, then cut at the durable model step. The resumed
     // state is otherwise executable, so an absent-plane check cannot pass merely
