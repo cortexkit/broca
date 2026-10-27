@@ -913,6 +913,19 @@ impl FileWalStore {
             // Extraction preserves the logical address and payload; session-ref
             // candidates need no location update.
             extraction::restore(&path, &member.payload, authority).map_err(WalError::Io)?;
+            let archive = if lookup.durable {
+                "wal-archive-durable"
+            } else {
+                "wal-archive"
+            };
+            broca_wal::archive::invalidate_restored_member(
+                &self
+                    .root
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .join(archive),
+                &session_addr(session),
+            );
             path
         } else if let Some(path) = self.resolve_live_path(session)? {
             path
@@ -1160,11 +1173,9 @@ impl FileWalStore {
             while let Some(path) =
                 paths.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
             {
-                if let Err(error) = broca_wal::archive::read_newest_member(
-                    std::slice::from_ref(path),
-                    "0000000000000000",
-                    self.max_read_bytes,
-                ) {
+                if let Err(error) =
+                    broca_wal::archive::prewarm_container_membership(path, self.max_read_bytes)
+                {
                     first_error
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
