@@ -180,6 +180,7 @@ fn request(
     opts.step_context = Some(StepContext {
         run_id: scope.into(),
         step_index: step,
+        max_output_tokens: None,
         session_address: None,
         credential_id: None,
         account_ref: None,

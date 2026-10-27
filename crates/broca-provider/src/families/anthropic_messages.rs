@@ -1321,6 +1321,7 @@ mod tests {
             account_ref: None,
             run_id: "run-1".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         opts
     }

@@ -590,6 +590,23 @@ pub enum WalRecord {
         step_id: StepId,
         detail: Option<broca_protocol::ContextCeilingDetail>,
     },
+    /// A step's output-token cap, lowered below the run's frozen cap before any model I/O so
+    /// that the estimated input plus the output reservation stays inside the run's context
+    /// limit. Written (and synced) only for a step whose cap was lowered; a step sent with the
+    /// frozen cap writes nothing, so its WAL bytes are as before. The step's request, and every
+    /// re-render of it (a resume, a cache warm, a cache dump), renders `max_output_tokens`
+    /// instead of the frozen cap. Must-understand: `output-reservation/v1`, because a build that
+    /// skipped the record would resume the step with the frozen cap, a different request from
+    /// the one recorded.
+    OutputReservationClamped {
+        step_id: StepId,
+        /// The cap the step's request carries.
+        max_output_tokens: u32,
+        /// The input-token estimate the cap was derived from, kept for diagnosis only.
+        estimated_input_tokens: u64,
+        /// The run's frozen context limit the estimate was checked against.
+        context_limit: u64,
+    },
     /// A rewrite ride (compaction-provider 0.5.1 §8) whose answer has been pending for
     /// `COMPACTION_WAIT_REPORT_AFTER_MS` (llm-runner 0.5.2 §6): the step waits for it until
     /// `deadline_ms`, the absolute time the ride's deadline ends, and the run reports
@@ -1696,6 +1713,7 @@ impl WalRecord {
             | Self::InputTokenBudgetExhausted { .. }
             | Self::ContextCeilingWait { .. }
             | Self::ContextCeilingDecided { .. }
+            | Self::OutputReservationClamped { .. }
             | Self::StructuredOutputDowngraded { .. }
             | Self::StructuredOutputResult { .. }
             | Self::RunFinished { .. }
@@ -1926,6 +1944,9 @@ impl WalRecord {
             } => &[crate::framing::CONTEXT_CEILING_FEATURE],
             WalRecord::StructuredOutputDowngraded { .. } => {
                 &[crate::framing::STRUCTURED_OUTPUT_DOWNGRADE_FEATURE]
+            }
+            WalRecord::OutputReservationClamped { .. } => {
+                &[crate::framing::OUTPUT_RESERVATION_FEATURE]
             }
             WalRecord::RunCancelRequested { .. } => &[crate::framing::RUN_CANCEL_AT_FEATURE],
             WalRecord::CompactionRequest { .. }

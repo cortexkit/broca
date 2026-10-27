@@ -42,6 +42,7 @@ mod audit {
             account_ref: None,
             run_id: "url-parity".into(),
             step_index: 0,
+            max_output_tokens: None,
         });
         let renderer = wire_family(family).unwrap();
         renderer

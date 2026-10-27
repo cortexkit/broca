@@ -52,6 +52,7 @@ mod tests {
             account_ref: None,
             run_id: run.into(),
             step_index: step,
+            max_output_tokens: None,
         });
         GoogleCodeAssist.render(&frozen, &opts)
     }

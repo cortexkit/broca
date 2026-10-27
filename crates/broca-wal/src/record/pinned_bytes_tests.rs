@@ -163,6 +163,7 @@ fn tag_of(record: &WalRecord) -> &'static str {
         WalRecord::InputTokenBudgetExhausted { .. } => "input_token_budget_exhausted",
         WalRecord::ContextCeilingWait { .. } => "context_ceiling_wait",
         WalRecord::ContextCeilingDecided { .. } => "context_ceiling_decided",
+        WalRecord::OutputReservationClamped { .. } => "output_reservation_clamped",
         WalRecord::CompactionRideWait { .. } => "compaction_ride_wait",
         WalRecord::CompactionRideWaitEnded { .. } => "compaction_ride_wait_ended",
         WalRecord::StructuredOutputResult { .. } => "structured_output_result",
@@ -234,6 +235,36 @@ const PINNED: &[&str] = &[
     r#"{"type":"cache_warmed","run_id":"r","step_id":2,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{"input_tokens":3,"cached_input_tokens":4000,"cache_write_tokens":0},"served_account_ref":"acct-1","ratelimit_headers":{"anthropic-ratelimit-unified-5h-utilization":"0.2","anthropic-ratelimit-unified-status":"allowed"},"sent_at_ms":1790000000000,"ttl_ms":3600000,"expires_at_ms":1790003600000}"#,
     r#"{"type":"cache_warmed","run_id":"r","step_id":2,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{},"sent_at_ms":1790000000000}"#,
 ];
+
+const OUTPUT_RESERVATION_PINNED: &[&str] = &[
+    r#"{"type":"output_reservation_clamped","step_id":175,"max_output_tokens":124990,"estimated_input_tokens":919490,"context_limit":1048576}"#,
+];
+
+/// A lowered output cap is written in a gated frame requiring `output-reservation/v1`: a build
+/// that does not know the kind must refuse the WAL rather than resume the step with the frozen
+/// cap, which would be a different request from the one recorded.
+#[test]
+fn an_output_reservation_record_keeps_its_bytes_and_requires_its_feature() {
+    use crate::framing::{encode, GATED_FRAMING_VERSION, HEADER_LEN, OUTPUT_RESERVATION_FEATURE};
+    for pinned in OUTPUT_RESERVATION_PINNED {
+        let record: WalRecord = serde_json::from_str(pinned).unwrap();
+        assert!(matches!(
+            record,
+            WalRecord::OutputReservationClamped {
+                max_output_tokens: 124_990,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
+        assert_eq!(record.required_features(), &[OUTPUT_RESERVATION_FEATURE]);
+        let frame = encode(7, 3, &record).unwrap();
+        assert_eq!(frame[4], GATED_FRAMING_VERSION);
+        assert_eq!(
+            &frame[HEADER_LEN..],
+            format!(r#"{{"requires":["output-reservation/v1"],"record":{pinned}}}"#).as_bytes()
+        );
+    }
+}
 
 const INPUT_CAP_PINNED: &[&str] = &[
     r#"{"type":"input_token_cap_frozen","limit":150}"#,
@@ -581,6 +612,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         .chain(STRUCTURED_OUTPUT_PINNED.iter().copied())
         .chain(COMPACTION_VIEW_PINNED.iter().copied())
         .chain(RIDE_WAIT_PINNED.iter().copied())
+        .chain(OUTPUT_RESERVATION_PINNED.iter().copied())
         .map(|bytes| tag_of(&serde_json::from_str::<WalRecord>(bytes).unwrap()))
         .collect();
     // The tag of every arm of the exhaustive `tag_of` except `WalRecord::Unknown`, the
@@ -633,6 +665,7 @@ fn the_pinned_bytes_cover_every_record_kind() {
         "send_delivered",
         "compaction_ride_wait",
         "compaction_ride_wait_ended",
+        "output_reservation_clamped",
     ];
     assert_eq!(pinned, every_kind.into_iter().collect());
     assert_eq!(tag_of(&WalRecord::Unknown), "unknown");

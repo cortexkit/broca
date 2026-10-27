@@ -1848,6 +1848,7 @@ pub(crate) fn merge_prefix_and_tail(
         open_tool_run: tail_state.open_tool_run,
         compaction: tail_state.compaction,
         compaction_history: tail_state.compaction_history,
+        output_reservation: tail_state.output_reservation,
         compaction_notice_floor: 1,
         manifest: None,
         on_restart: tail_state.on_restart,
