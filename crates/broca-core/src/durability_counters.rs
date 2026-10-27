@@ -5,18 +5,23 @@
 //! loop issues its `Wal::sync` calls from four paths — an explicit barrier,
 //! the fired deadline, a clean shutdown, and a channel disconnect — and every
 //! call is counted here by the path that issued it, so health can report the
-//! cost of each. Counts are cumulative per process and keyed by the writer's
-//! fence; totals never reset while the process lives, matching the other
-//! lifetime counters health reports.
+//! cost of each. Counts are process totals in plain atomics: in production the
+//! fsync path never takes a lock, and health never scans per-writer rows.
+//! (Test builds additionally record fence-keyed counts under a mutex, so one
+//! test's assertions cannot observe another test's writer.)
 //!
-//! The monotonic source lives here too, keyed by fence for tests: one test's
-//! fake clock advances only its own writer's deadline and never disturbs
-//! another writer's real one. Production writers never register an override,
-//! so their hot path pays a single atomic load.
+//! The monotonic source lives here too. Its scripted overrides exist only in
+//! test builds and are keyed by the writer's fence, so one test's fake clock
+//! never disturbs another writer's real deadline. Production pays nothing for
+//! the override machinery: it is compiled out, and the loop reads no clock
+//! while clean.
 
+#[cfg(test)]
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// D, the writer sync deadline: dirty data waits at most this long for a
@@ -74,19 +79,44 @@ fn cause_index(cause: FsyncCause) -> usize {
     }
 }
 
-fn counts() -> &'static Mutex<HashMap<u64, [u64; 4]>> {
+/// Process-wide fsync totals by cause. Plain atomics: production recording
+/// never blocks, and readers never contend with the fsync path. Test builds
+/// additionally update fence-keyed rows under a mutex (see below).
+static TOTALS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Record one `Wal::sync` the writer loop issued, attributed to the path that
+/// issued it. Counts calls the loop actually made: a poisoned or clean path
+/// that skips the call counts nothing.
+pub fn record_fsync(cause: FsyncCause, fence: u64) {
+    TOTALS[cause_index(cause)].fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    record_fence_fsync(cause, fence);
+    #[cfg(not(test))]
+    let _ = fence;
+}
+
+/// Cumulative totals across every writer, for health.
+pub fn snapshot() -> DurabilitySnapshot {
+    DurabilitySnapshot {
+        barrier: TOTALS[0].load(Ordering::Relaxed),
+        deadline: TOTALS[1].load(Ordering::Relaxed),
+        shutdown: TOTALS[2].load(Ordering::Relaxed),
+        disconnect: TOTALS[3].load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+fn fence_counts() -> &'static Mutex<HashMap<u64, [u64; 4]>> {
     static COUNTS: OnceLock<Mutex<HashMap<u64, [u64; 4]>>> = OnceLock::new();
     COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Record one `Wal::sync` the writer loop issued, attributed to its cause and
-/// writer. Syncs only happen on fsync paths (barriers, deadlines, closes), so
-/// taking the table lock here never touches append throughput.
-pub fn record_fsync(cause: FsyncCause, fence: u64) {
-    let mut counts = counts().lock().unwrap();
-    counts.entry(fence).or_default()[cause_index(cause)] += 1;
-}
-
+#[cfg(test)]
 fn snapshot_row(entry: Option<&[u64; 4]>) -> DurabilitySnapshot {
     match entry {
         Some(entry) => DurabilitySnapshot {
@@ -99,82 +129,81 @@ fn snapshot_row(entry: Option<&[u64; 4]>) -> DurabilitySnapshot {
     }
 }
 
-/// Cumulative totals across every writer, for health.
-pub fn snapshot() -> DurabilitySnapshot {
-    let counts = counts().lock().unwrap();
-    let mut out = DurabilitySnapshot::default();
-    for entry in counts.values() {
-        out.barrier += entry[0];
-        out.deadline += entry[1];
-        out.shutdown += entry[2];
-        out.disconnect += entry[3];
-    }
-    out
+/// Per-writer totals, for tests only: concurrent writers in other tests also
+/// record process totals, so only a fence-keyed row isolates one test's
+/// writer. Production keeps no per-writer rows.
+#[cfg(test)]
+fn record_fence_fsync(cause: FsyncCause, fence: u64) {
+    let mut counts = fence_counts().lock().unwrap();
+    counts.entry(fence).or_default()[cause_index(cause)] += 1;
 }
 
-/// Totals for one writer, for tests that must not observe other writers'
-/// concurrent barriers.
+/// Totals for one writer's fence. Test-only, for the reason above.
+#[cfg(test)]
 pub fn counts_for_fence(fence: u64) -> DurabilitySnapshot {
-    let counts = counts().lock().unwrap();
+    let counts = fence_counts().lock().unwrap();
     snapshot_row(counts.get(&fence))
 }
 
 /// A fence-keyed test override: a fake monotonic now, a replacement deadline,
 /// or both. `None` in either field keeps the real value for that part.
+#[cfg(test)]
 struct FenceOverride {
     now_ms: Option<u64>,
     deadline_ms: Option<u64>,
 }
 
+#[cfg(test)]
 fn overrides() -> &'static Mutex<HashMap<u64, FenceOverride>> {
     static OVERRIDES: OnceLock<Mutex<HashMap<u64, FenceOverride>>> = OnceLock::new();
     OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// How many fences hold any override. The clock fast path skips the table
-/// entirely while this is zero, so production pays one atomic load.
-static OVERRIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
-
 #[cfg(test)]
-fn note_overrides_changed(overrides: &HashMap<u64, FenceOverride>) {
-    OVERRIDE_COUNT.store(overrides.len(), Ordering::SeqCst);
+fn override_now_ms_for(fence: u64) -> Option<u64> {
+    overrides()
+        .lock()
+        .unwrap()
+        .get(&fence)
+        .and_then(|over| over.now_ms)
 }
 
-fn boot() -> Instant {
-    static BOOT: OnceLock<Instant> = OnceLock::new();
-    *BOOT.get_or_init(Instant::now)
+#[cfg(test)]
+fn override_deadline_ms_for(fence: u64) -> Option<u64> {
+    overrides()
+        .lock()
+        .unwrap()
+        .get(&fence)
+        .and_then(|over| over.deadline_ms)
 }
 
 /// This process's monotonic now, in milliseconds. Never the wall clock and
 /// never a record stamp: only deadline arithmetic reads it.
 pub(crate) fn monotonic_now_ms_for(fence: u64) -> u64 {
-    if OVERRIDE_COUNT.load(Ordering::Relaxed) > 0 {
-        if let Some(now) = overrides()
-            .lock()
-            .unwrap()
-            .get(&fence)
-            .and_then(|over| over.now_ms)
-        {
-            return now;
-        }
+    #[cfg(test)]
+    if let Some(now) = override_now_ms_for(fence) {
+        return now;
     }
+    #[cfg(not(test))]
+    let _ = fence;
     boot().elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 /// The sync deadline in milliseconds for one writer: D unless a test
 /// replaced it for that fence.
 pub(crate) fn deadline_ms_for(fence: u64) -> u64 {
-    if OVERRIDE_COUNT.load(Ordering::Relaxed) > 0 {
-        if let Some(deadline) = overrides()
-            .lock()
-            .unwrap()
-            .get(&fence)
-            .and_then(|over| over.deadline_ms)
-        {
-            return deadline;
-        }
+    #[cfg(test)]
+    if let Some(deadline) = override_deadline_ms_for(fence) {
+        return deadline;
     }
+    #[cfg(not(test))]
+    let _ = fence;
     SYNC_DEADLINE_MS
+}
+
+fn boot() -> Instant {
+    static BOOT: OnceLock<Instant> = OnceLock::new();
+    *BOOT.get_or_init(Instant::now)
 }
 
 #[cfg(test)]
@@ -194,7 +223,6 @@ pub(crate) fn set_fake_monotonic_ms_for_test(fence: u64, now_ms: u64) {
         .entry(fence)
         .or_insert_with(blank_override_for_test)
         .now_ms = Some(now_ms);
-    note_overrides_changed(&overrides);
 }
 
 /// Move one writer's fake clock forward without touching its deadline.
@@ -206,7 +234,6 @@ pub(crate) fn advance_fake_monotonic_ms_for_test(fence: u64, delta_ms: u64) {
         .or_insert_with(blank_override_for_test);
     let now = entry.now_ms.unwrap_or(0);
     entry.now_ms = Some(now.saturating_add(delta_ms));
-    note_overrides_changed(&overrides);
 }
 
 /// Replace one writer's deadline, so a test can watch a real timeout fire
@@ -218,13 +245,10 @@ pub(crate) fn set_deadline_ms_for_test(fence: u64, deadline_ms: u64) {
         .entry(fence)
         .or_insert_with(blank_override_for_test)
         .deadline_ms = Some(deadline_ms);
-    note_overrides_changed(&overrides);
 }
 
 /// Drop every override for one fence, handing the writer back to the real clock.
 #[cfg(test)]
 pub(crate) fn clear_fence_overrides_for_test(fence: u64) {
-    let mut overrides = overrides().lock().unwrap();
-    overrides.remove(&fence);
-    note_overrides_changed(&overrides);
+    overrides().lock().unwrap().remove(&fence);
 }

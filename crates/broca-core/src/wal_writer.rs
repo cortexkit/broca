@@ -3420,26 +3420,77 @@ fn writer_loop(
     }
 
     loop {
-        // Wait for the next command, bounded by the deadline while dirty. A clean
-        // writer blocks; a dirty writer wakes at its deadline even when nothing else
-        // arrives. A dirty writer with no deadline is poisoned (its sync already
-        // failed), so it idles like a clean one until close.
+        // One clock sample per dirty iteration; clean writers read no clock.
+        // The deadline is checked before every command on that sample: at most
+        // one command is handled past the deadline, so a queue that never
+        // empties still syncs on time. The same sample bounds the wait, so a
+        // dirty writer wakes at its deadline even when nothing arrives. A dirty
+        // writer with no deadline is poisoned (its sync already failed), so it
+        // idles like a clean one until close.
         let wait = if dirty {
-            match deadline_at_ms {
-                Some(deadline) => {
-                    let now = monotonic_now_ms_for(fence);
-                    match rx.recv_timeout(std::time::Duration::from_millis(
-                        deadline.saturating_sub(now),
-                    )) {
-                        Ok(command) => Wait::Command(command),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Wait::Empty,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Wait::Gone,
+            let now = monotonic_now_ms_for(fence);
+            if deadline_at_ms.is_some_and(|deadline| now >= deadline) {
+                let poison = current_poison(&poisoned);
+                if poison.is_none() {
+                    // Every fsync is counted by the path that issued it, for health.
+                    record_fsync(FsyncCause::Deadline, fence);
+                }
+                match sync_result(&*wal, &poison) {
+                    Ok(()) => {
+                        last_fsynced_seq = last_appended_seq;
+                        durable_head.store(last_fsynced_seq, Ordering::Release);
+                        dirty = false;
+                        deadline_at_ms = None;
+                        if let Some(obs) = &observer {
+                            if has_tap {
+                                for (seq, record) in &pending_observed {
+                                    obs.observe(*seq, fence, record);
+                                }
+                            } else {
+                                for (seq, record) in pending_observed.drain(..) {
+                                    obs.observe(seq, fence, &record);
+                                }
+                            }
+                        }
+                        if has_tap {
+                            if let Some(obs) = &observer {
+                                for (seq, record) in pending_observed.drain(..) {
+                                    obs.observe_tap(seq, fence, wal.lineage_id(), &record);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        set_poison(&poisoned, error);
+                        deadline_at_ms = None;
                     }
                 }
-                None => match rx.recv() {
+            }
+            // Wait for the next command. The bound reuses the sample above: a
+            // still-installed deadline postdates it by definition (a due one
+            // just synced). A writer that just went clean or poisoned has no
+            // deadline, so it blocks in `recv()` until a command arrives.
+            if dirty {
+                match deadline_at_ms {
+                    Some(deadline) => {
+                        match rx.recv_timeout(std::time::Duration::from_millis(
+                            deadline.saturating_sub(now),
+                        )) {
+                            Ok(command) => Wait::Command(command),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Wait::Empty,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Wait::Gone,
+                        }
+                    }
+                    None => match rx.recv() {
+                        Ok(command) => Wait::Command(command),
+                        Err(_) => Wait::Gone,
+                    },
+                }
+            } else {
+                match rx.recv() {
                     Ok(command) => Wait::Command(command),
                     Err(_) => Wait::Gone,
-                },
+                }
             }
         } else {
             match rx.recv() {
@@ -3473,46 +3524,8 @@ fn writer_loop(
             }
             break;
         }
-        // The sync deadline, checked before every command on the monotonic clock:
-        // at most one command is handled past the deadline, so a queue that never
-        // empties still syncs on time. Group commit is unchanged: one sync still
-        // covers every append that preceded it.
-        if dirty && deadline_at_ms.is_some_and(|deadline| monotonic_now_ms_for(fence) >= deadline) {
-            let poison = current_poison(&poisoned);
-            if poison.is_none() {
-                record_fsync(FsyncCause::Deadline, fence);
-            }
-            match sync_result(&*wal, &poison) {
-                Ok(()) => {
-                    last_fsynced_seq = last_appended_seq;
-                    durable_head.store(last_fsynced_seq, Ordering::Release);
-                    dirty = false;
-                    deadline_at_ms = None;
-                    if let Some(obs) = &observer {
-                        if has_tap {
-                            for (seq, record) in &pending_observed {
-                                obs.observe(*seq, fence, record);
-                            }
-                        } else {
-                            for (seq, record) in pending_observed.drain(..) {
-                                obs.observe(seq, fence, &record);
-                            }
-                        }
-                    }
-                    if has_tap {
-                        if let Some(obs) = &observer {
-                            for (seq, record) in pending_observed.drain(..) {
-                                obs.observe_tap(seq, fence, wal.lineage_id(), &record);
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    set_poison(&poisoned, error);
-                    deadline_at_ms = None;
-                }
-            }
-        }
+        // Group commit is unchanged: one sync still covers every append that
+        // preceded it.
         let Wait::Command(cmd) = wait else {
             continue;
         };
@@ -3597,6 +3610,9 @@ fn writer_loop(
                 };
                 let res = res.map_err(|e| {
                     set_poison(&poisoned, e.clone());
+                    // The writer is poisoned now: drop the deadline with it, so
+                    // the loop idles instead of retrying a sync that cannot succeed.
+                    deadline_at_ms = None;
                     WalWriteError::Failed(e)
                 });
                 let durable = res.is_ok();

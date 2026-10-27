@@ -368,7 +368,14 @@ fn projection_health_report(failures: u64, behind_sessions: u64) -> ProjectionHe
 /// on its own, and the final sync of each close path. A healthy writer that
 /// appends without barriers shows deadline syncs and little else.
 fn wal_fsync_health_metrics() -> serde_json::Value {
-    let snapshot = broca_core::durability_counters::snapshot();
+    wal_fsync_health_json(broca_core::durability_counters::snapshot())
+}
+
+/// Render one durability snapshot as the `wal_fsyncs` health object. Pure so
+/// tests can pin the exact shape and values.
+fn wal_fsync_health_json(
+    snapshot: broca_core::durability_counters::DurabilitySnapshot,
+) -> serde_json::Value {
     serde_json::json!({
         "barrier": snapshot.barrier,
         "deadline": snapshot.deadline,
@@ -5629,13 +5636,22 @@ mod tests {
 
     #[test]
     fn wal_fsync_health_metrics_reports_named_causes() {
-        let metrics = wal_fsync_health_metrics();
-        for cause in ["barrier", "deadline", "shutdown", "disconnect"] {
-            assert!(
-                metrics.get(cause).is_some_and(|value| value.is_u64()),
-                "health reports a u64 wal_fsyncs.{cause} total: {metrics}"
-            );
-        }
+        let metrics = wal_fsync_health_json(broca_core::durability_counters::DurabilitySnapshot {
+            barrier: 2,
+            deadline: 3,
+            shutdown: 1,
+            disconnect: 4,
+        });
+        assert_eq!(
+            metrics,
+            serde_json::json!({
+                "barrier": 2,
+                "deadline": 3,
+                "shutdown": 1,
+                "disconnect": 4,
+            }),
+            "health reports each fsync cause with its exact total"
+        );
     }
 
     #[tokio::test]
