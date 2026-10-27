@@ -11,6 +11,7 @@ use subc_protocol::tool_call::ToolCallRequest;
 use tokio::sync::watch;
 
 use super::admission::{admit, hash, refusal, Admission};
+use super::observed::Outcome as ConsentOutcome;
 use super::private_content::PrivateContent;
 use super::spend::Spend;
 
@@ -101,6 +102,9 @@ pub struct LlmTools {
     consent: Option<Arc<super::consent::Consent>>,
     consent_workers: Mutex<std::collections::HashSet<String>>,
     consent_stop: tokio_util::sync::CancellationToken,
+    /// Grants that have already released a call in this process. Only the first release by
+    /// each grant is logged, so a run of calls under one grant writes one line.
+    released_grants: Mutex<std::collections::HashSet<String>>,
 }
 
 impl LlmTools {
@@ -122,6 +126,7 @@ impl LlmTools {
             consent: None,
             consent_workers: Mutex::new(std::collections::HashSet::new()),
             consent_stop: tokio_util::sync::CancellationToken::new(),
+            released_grants: Mutex::new(std::collections::HashSet::new()),
             held: Arc::new(super::held::HeldCalls::new(
                 Arc::new(GrantsStore::open_in_memory().expect("in-memory grants store opens")),
                 crate::serve::process_launch_id().into(),
@@ -132,6 +137,54 @@ impl LlmTools {
     pub fn with_held(mut self, held: Arc<super::held::HeldCalls>) -> Self {
         self.held = held;
         self
+    }
+
+    /// The private-content counters `health.check` reports: each call's verdict and how the
+    /// calls found marked ended at the consent step. Counts only; they start at zero with the
+    /// process.
+    pub fn consent_health(&self) -> Value {
+        self.private_content.counters.health()
+    }
+
+    fn count(&self, outcome: ConsentOutcome) {
+        self.private_content.counters.outcome(outcome);
+    }
+
+    /// `consent_error`, counted as the consent step failing.
+    fn consent_unavailable(&self, error: impl std::fmt::Display) -> Vec<u8> {
+        self.count(ConsentOutcome::ConsentUnavailable);
+        consent_error(error)
+    }
+
+    /// Log the first call `grant` releases in this process. It names who holds the grant, for
+    /// which provider, how long it lasts and which run used it, and nothing from the call.
+    fn note_release(&self, grant: &broca_store::grants::Grant, scope_ref: &str) {
+        let first = self
+            .released_grants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(grant.id.clone());
+        if !first {
+            return;
+        }
+        let kind = match grant.kind {
+            broca_store::grants::GrantKind::Run => "run",
+            broca_store::grants::GrantKind::Hours24 => "24_hours",
+        };
+        // A run grant has no clock expiry: it lasts while its run is live.
+        let expires_at_ms = grant
+            .expires_at_ms
+            .map_or_else(|| "run_end".to_owned(), |expiry| expiry.to_string());
+        tracing::info!(
+            target: "llm_tools.consent",
+            grant_id = %grant.id,
+            agent_id = %grant.holder,
+            provider = %grant.provider,
+            kind,
+            %expires_at_ms,
+            scope_ref,
+            "a standing grant released a private-content call without a consent card"
+        );
     }
 
     pub(crate) fn permissions(&self) -> super::permissions::Permissions {
@@ -610,12 +663,19 @@ impl LlmTools {
                     consent_reason,
                     "consent_required" | "private_content_unknown" | "private_content_unreachable"
                 ) {
+                    // A marked flow asking for a provider outside its approved set. The other
+                    // refusals here come before any verdict and are not a marked call's outcome.
+                    if reason["code"] == "provider_not_allowed" {
+                        self.count(ConsentOutcome::RefusedByFlowPolicy);
+                    }
                     return Err(refusal);
                 }
                 let Some(consent) = &self.consent else {
+                    self.count(ConsentOutcome::refused(consent_reason));
                     return Err(refusal);
                 };
                 let SendScope::Stamped(bind) = scope else {
+                    self.count(ConsentOutcome::refused(consent_reason));
                     return Err(refusal);
                 };
                 let agent = bind.scope.agent_id.as_deref().unwrap_or("");
@@ -624,43 +684,51 @@ impl LlmTools {
                 if consent
                     .store
                     .denied(agent, &identity, &admission.provider)
-                    .map_err(consent_error)?
+                    .map_err(|e| self.consent_unavailable(e))?
                 {
+                    self.count(ConsentOutcome::DeniedByStandingDeny);
                     return Err(super::held::not_started("denied").into_bytes());
                 }
-                if !consent
-                    .granted(&bind.scope, &admission.provider, now)
+                let grant = consent
+                    .releasing_grant(&bind.scope, &admission.provider, now)
                     .await
-                    .map_err(consent_error)?
-                {
+                    .map_err(|e| self.consent_unavailable(e))?;
+                if let Some(grant) = &grant {
+                    self.count(ConsentOutcome::ReleasedByGrant);
+                    self.note_release(grant, &bind.scope.scope_ref);
+                } else {
                     if consent_reason != "consent_required" {
+                        self.count(ConsentOutcome::refused(consent_reason));
                         return Err(refusal);
                     }
                     let Some((principal, call_key)) = hold_caller else {
+                        self.count(ConsentOutcome::RefusedConsentRequired);
                         return Err(refusal);
                     };
-                    let params: Value =
-                        serde_json::from_str(&admission.params).map_err(consent_error)?;
+                    let params: Value = serde_json::from_str(&admission.params)
+                        .map_err(|e| self.consent_unavailable(e))?;
                     let model = params["model"].as_str().unwrap_or("");
                     let display_row = self.system.tool_model_row(model);
                     let Some((provider_label, model_label)) = display_row
                         .as_ref()
                         .and_then(crate::system_one::consent_model_labels)
                     else {
+                        self.count(ConsentOutcome::ConsentUnavailable);
                         return Err(super::held::not_started("consent_unavailable").into_bytes());
                     };
                     let sources = self.private_content.card_sources(scope).await;
                     let dedup_key = consent
                         .dedup_key(agent, &admission.provider, &identity)
-                        .map_err(consent_error)?;
+                        .map_err(|e| self.consent_unavailable(e))?;
                     let body = broca_subc::consent_card::private_content_card(
                         provider_label,
                         model_label,
                         &sources,
                         &dedup_key,
                     )
-                    .map_err(consent_error)?;
-                    let frozen = serde_json::to_value(&pricing).map_err(consent_error)?;
+                    .map_err(|e| self.consent_unavailable(e))?;
+                    let frozen =
+                        serde_json::to_value(&pricing).map_err(|e| self.consent_unavailable(e))?;
                     let row = consent
                         .file_with_admission(
                             HoldRequest {
@@ -691,7 +759,8 @@ impl LlmTools {
                             },
                         )
                         .await
-                        .map_err(consent_error)?;
+                        .map_err(|e| self.consent_unavailable(e))?;
+                    self.count(ConsentOutcome::CardFiled);
                     self.watch_consent(dedup_key);
                     return match row.state {
                         HeldState::Final => super::held::HeldCalls::final_reply(&row),
