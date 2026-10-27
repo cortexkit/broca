@@ -22,6 +22,10 @@ pub struct StepRuntime {
     pub deadline: Option<Instant>,
     pub seal: Option<crate::ShutdownSeal>,
     pub progress: Option<LiveStepProgress>,
+    /// The ordinal the step's first attempt in this call is recorded with. Zero for an
+    /// ordinary step; a step re-sent within the same step id (to the refusal-fallback model)
+    /// starts after the attempts already recorded, so ordinals stay unique within the step.
+    pub first_attempt: u32,
 }
 
 #[async_trait]
@@ -78,6 +82,25 @@ pub trait Provider: Send + Sync {
     /// Runtime break-glass policy for the ChatGPT socket. Evaluated per attempt, off the
     /// rendering/cache domain; providers for other families ignore it.
     fn set_chatgpt_https_policy(&self, _policy: Arc<dyn Fn() -> bool + Send + Sync>) {}
+
+    /// The model a step the source model refuses is re-sent to, when this episode froze a
+    /// client-side refusal fallback at admission. `None`, the default, means the run is not
+    /// eligible and a refusal commits as the step's answer.
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::request::ModelHandle> {
+        None
+    }
+
+    /// The fallback model's context window, when [`Self::refusal_fallback_model`] is `Some` and
+    /// the catalog knew it at admission.
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// Send the following steps, renders and warms to `route`'s model. Only the request this
+    /// provider renders changes: the recorded render config, its renderer version and the
+    /// frozen-config blob always describe the episode's own (source) model. A provider without
+    /// a refusal fallback ignores it.
+    fn set_step_route(&self, _route: crate::refusal_fallback::StepRoute) {}
 
     /// Run ONE model step for `opts`. The returned receiver streams normalized
     /// events until the provider's terminal `Finished`/`Error`.
@@ -251,6 +274,18 @@ impl Provider for Box<dyn Provider> {
         (**self).set_chatgpt_https_policy(policy);
     }
 
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::request::ModelHandle> {
+        (**self).refusal_fallback_model()
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        (**self).refusal_fallback_context_limit()
+    }
+
+    fn set_step_route(&self, route: crate::refusal_fallback::StepRoute) {
+        (**self).set_step_route(route);
+    }
+
     async fn step(&self, step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         (**self).step(step_id, opts).await
     }
@@ -336,6 +371,9 @@ impl Provider for Box<dyn Provider> {
 pub struct StubProvider {
     scripts: Arc<Mutex<VecDeque<Vec<NormalizedEvent>>>>,
     calls: Arc<Mutex<Vec<CallOptions>>>,
+    refusal_fallback: Option<(broca_protocol::request::ModelHandle, Option<u64>)>,
+    route: Arc<Mutex<crate::refusal_fallback::StepRoute>>,
+    routes: Arc<Mutex<Vec<crate::refusal_fallback::StepRoute>>>,
 }
 
 impl StubProvider {
@@ -344,19 +382,53 @@ impl StubProvider {
         Self {
             scripts: Arc::new(Mutex::new(scripts.into())),
             calls: Arc::new(Mutex::new(Vec::new())),
+            refusal_fallback: None,
+            route: Arc::new(Mutex::new(crate::refusal_fallback::StepRoute::Source)),
+            routes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Act as an episode that froze `model` (with `context_limit`) as its refusal fallback.
+    pub fn with_refusal_fallback(
+        mut self,
+        model: broca_protocol::request::ModelHandle,
+        context_limit: Option<u64>,
+    ) -> Self {
+        self.refusal_fallback = Some((model, context_limit));
+        self
     }
 
     /// Provider call options in invocation order.
     pub fn calls(&self) -> Vec<CallOptions> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// The route each call was sent on, in invocation order.
+    pub fn routes(&self) -> Vec<crate::refusal_fallback::StepRoute> {
+        self.routes.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl Provider for StubProvider {
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::request::ModelHandle> {
+        self.refusal_fallback
+            .as_ref()
+            .map(|(model, _)| model.clone())
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        self.refusal_fallback.as_ref().and_then(|(_, limit)| *limit)
+    }
+
+    fn set_step_route(&self, route: crate::refusal_fallback::StepRoute) {
+        *self.route.lock().unwrap() = route;
+    }
+
     async fn step(&self, _step_id: StepId, opts: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
         self.calls.lock().unwrap().push(opts.clone());
+        let route = *self.route.lock().unwrap();
+        self.routes.lock().unwrap().push(route);
         let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {

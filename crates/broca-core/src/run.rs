@@ -7546,6 +7546,7 @@ async fn run_step<P: Provider>(
                 deadline,
                 seal: shutdown_seal.cloned(),
                 progress,
+                first_attempt: 0,
             },
         )
         .await;

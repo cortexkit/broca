@@ -267,6 +267,33 @@ pub struct FrozenRenderConfig {
     /// absent, so it is not a must-understand field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<crate::media_profile::MediaProfile>,
+    /// The model a step the source model refuses is re-sent to, frozen at admission with its own
+    /// complete render config. Present only on an Anthropic OAuth episode that was eligible
+    /// for the client-side refusal fallback when it was admitted; absent on every other
+    /// config, which then serializes exactly as before the field existed.
+    ///
+    /// It lives inside the source config so it is restored with the recorded bundle on resume
+    /// and covered by the frozen-config drift check: an older build that drops the unknown
+    /// field re-serializes a different blob and refuses the resume instead of losing the
+    /// fallback. The fallback config itself never carries one, so a fallback cannot chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_fallback: Option<Box<RefusalFallbackConfig>>,
+}
+
+/// The client-side refusal fallback an episode froze: which model a refused step goes to, that
+/// model's context window, and the render config its requests are rendered with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefusalFallbackConfig {
+    /// The fallback model's catalog handle, recorded on the steps it answers.
+    pub model: broca_protocol::request::ModelHandle,
+    /// The fallback model's catalog context window, when known. A step whose prompt already
+    /// fills it is not sent there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u64>,
+    /// The fallback model's own render config: the same account, persona, cache policy and
+    /// structured output as the source, with the fallback's wire model id and its own output
+    /// cap.
+    pub frozen: FrozenRenderConfig,
 }
 
 /// Conversation identity and episode-local request numbering for the Antigravity envelope.

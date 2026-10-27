@@ -4016,6 +4016,7 @@ mod executor {
                     .as_ref()
                     .map(|refresh| refresh.refresher.clone()),
                 structured_output: job.req.structured_output.as_ref().filter(|_| fresh_episode),
+                refusal_fallback_model: None,
             };
             let chatgpt_wire = broca_module_serve::chatgpt_identity::for_episode(
                 family_override.filter(|_| fresh_episode),
@@ -4877,6 +4878,7 @@ mod executor {
                     structured_output: None,
                     frozen_account_ref: None,
                     clock: None,
+                    refusal_fallback_model: None,
                 },
             );
             match result {
@@ -4905,6 +4907,7 @@ mod executor {
                 structured_output: None,
                 frozen_account_ref: None,
                 clock: None,
+                refusal_fallback_model: None,
             };
             let paused = AuthResolution {
                 mode: AuthMode::None,
