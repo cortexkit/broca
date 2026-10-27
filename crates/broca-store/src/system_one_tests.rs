@@ -339,7 +339,7 @@ fn paid_outcome_and_outbox_survive_reopen_and_publish_only_once() {
     let context = FactContext {
         source_instance_id: export.source_instance_id().into(),
         provider: "typesafe".into(),
-        model: "typesafe/jev-1.13.0".into(),
+        model: "jev-1.13.0".into(),
         auth_selection: Some("apikey:typesafe:paid".into()),
         account_ref: Some("paid".into()),
         charge_basis: broca_core::ChargeBasis::MeteredApi,
