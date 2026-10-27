@@ -226,7 +226,9 @@ mod tests {
     #[test]
     fn child_process_that_sleeps() {
         if std::env::var_os(CHILD_SLEEP_ENV).is_some() {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            // Longer than the shared hang guard the parent waits under, so the child outlives
+            // that whole wait.
+            std::thread::sleep(std::time::Duration::from_secs(120));
         }
     }
 
@@ -251,7 +253,18 @@ mod tests {
             .spawn()
             .expect("spawn the sleeping child");
         drop(lock);
-        let reacquired = acquire(&root);
+        // Another test in this process can fork a child while this lock is held. That child
+        // keeps a copy of the descriptor until its exec closes it, so the root can read as
+        // held for a moment. A copy our own child inherited would instead keep the root held
+        // for the child's whole life, which outlasts this wait, and fail it.
+        let reacquired =
+            broca_test_support::wait_until_sync("the released root can be locked again", || {
+                match acquire(&root) {
+                    Ok(lock) => Ok(Ok(lock)),
+                    Err(error @ StateRootLockError::Held { .. }) => Err(error.to_string()),
+                    Err(error) => Ok(Err(error)),
+                }
+            });
         let child_alive = child.try_wait().expect("poll the child").is_none();
         let _ = child.kill();
         let _ = child.wait();
