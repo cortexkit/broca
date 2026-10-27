@@ -693,6 +693,10 @@ impl ClassifierSubject for Subject<'_> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(unix),
+    ignore = "the stand-in Cerebellum (fake-surface) uses Unix-only APIs and is not built on Windows"
+)]
 async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
     let Some(surface) = std::env::var_os("FAKE_SURFACE_BIN")
         .map(PathBuf::from)
