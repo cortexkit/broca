@@ -57,7 +57,10 @@ fn archived_expiry_checks_bound_member_decodes() {
         keys.len(), start.elapsed()
     );
     assert!(decodes <= keys.len() as u64, "{decodes} member decodes");
-    assert!(opens <= keys.len() as u64, "{opens} archive opens");
+    // One open per session's member read, plus one per container the archive member index
+    // reads once to build itself (this rig seals a single container). The bound is what
+    // matters: opens track sessions and containers, never the 1,000 checks.
+    assert!(opens <= keys.len() as u64 + 1, "{opens} archive opens");
 }
 
 #[tokio::test]
