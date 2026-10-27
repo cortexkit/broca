@@ -10,6 +10,7 @@ mod held_images_tests;
 pub mod permissions;
 mod private_content;
 mod route;
+pub(crate) mod spend;
 
 pub use private_content::{Asks, SubcAsks};
 pub use route::{ConsumerFormat, LlmTools, NoPrivateContent, CLASSIFY_TOOL_NAME, TOOL_RESULT_V1};

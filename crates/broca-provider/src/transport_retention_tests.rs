@@ -22,6 +22,7 @@ fn options(ephemeral_session: bool) -> CallOptions {
         account_ref: None,
         run_id: "retention-diagnostic-test".into(),
         step_index: 1,
+        max_output_tokens: None,
     });
     opts
 }

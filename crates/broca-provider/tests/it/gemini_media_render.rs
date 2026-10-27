@@ -64,6 +64,7 @@ fn request(role: Role, content: Vec<ContentBlock>) -> CallOptions {
     opts.step_context = Some(StepContext {
         run_id: "run".into(),
         step_index: 1,
+        max_output_tokens: None,
         session_address: None,
         credential_id: None,
         account_ref: None,

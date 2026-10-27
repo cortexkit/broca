@@ -619,6 +619,15 @@ impl StreamNormalizer for ToolNameRestoringNormalizer {
     }
 }
 
+/// `frozen` with the step's lowered output cap applied (see [`FrozenRenderConfig::for_step`]);
+/// the same allocation when the step keeps the frozen cap.
+fn step_frozen(frozen: Arc<FrozenRenderConfig>, opts: &CallOptions) -> Arc<FrozenRenderConfig> {
+    match frozen.for_step(opts) {
+        std::borrow::Cow::Borrowed(_) => frozen,
+        std::borrow::Cow::Owned(lowered) => Arc::new(lowered),
+    }
+}
+
 fn build_retry_normalizer<F: WireFamily>(
     family: &F,
     frozen: &FrozenRenderConfig,
@@ -662,10 +671,11 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         Arc::new(frozen)
     }
 
-    /// The config the next step is rendered and normalized with: the refusal-fallback model's
-    /// while the route says so, otherwise [`Self::effective_frozen`]. A grammar downgrade applies
-    /// to the fallback's structured output too, which admission froze identical to the source's.
-    fn step_frozen(&self) -> Arc<FrozenRenderConfig> {
+    /// The base config the next step is rendered with, before the step's own output cap is
+    /// applied (see [`step_frozen`]): the refusal-fallback model's while the route says so,
+    /// otherwise [`Self::effective_frozen`]. A grammar downgrade applies to the fallback's
+    /// structured output too, which admission froze identical to the source's.
+    fn route_frozen(&self) -> Arc<FrozenRenderConfig> {
         let Some(fallback) = self.routed_fallback() else {
             return self.effective_frozen();
         };
@@ -827,11 +837,10 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             });
             return rx;
         }
-        let step_frozen = self.step_frozen();
         let render_job = RenderJob {
             auth_revision: served.revision,
             family: Arc::clone(&self.family),
-            frozen: Arc::clone(&step_frozen),
+            frozen: step_frozen(self.route_frozen(), &opts),
             auth: served.auth,
             opts,
             step_id,
@@ -855,12 +864,13 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             self.client.clone(),
             self.clock.clone(),
             Arc::clone(&self.family),
-            // The route's config: a fallback step's response is normalized, and its retries
-            // re-addressed, for the model that answers it.
+            // The normalizer reports an output-ceiling cut with the cap this step was sent with.
+            // A fallback step's response is normalized, and its retries re-addressed, with the
+            // config it was rendered with, so they name the model that answers it.
             if route == broca_core::refusal_fallback::StepRoute::Fallback {
-                step_frozen
+                Arc::clone(&render_job.frozen)
             } else {
-                Arc::clone(&self.frozen)
+                step_frozen(Arc::clone(&self.frozen), &render_job.opts)
             },
             route,
             render_job,
@@ -1023,7 +1033,8 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
     }
 
     fn render_request(&self, opts: &CallOptions) -> Vec<u8> {
-        self.family.render(&self.step_frozen(), opts)
+        self.family
+            .render(&self.route_frozen().for_step(opts), opts)
     }
 
     fn renderer_version(&self) -> u32 {
@@ -5083,6 +5094,7 @@ mod tests {
             account_ref: None,
             run_id: "render-job-run".into(),
             step_index: 7,
+            max_output_tokens: None,
         });
         opts.target_model = Some(ModelHandle::new("target-provider", "target-model"));
         opts
@@ -5154,6 +5166,7 @@ mod tests {
             account_ref: None,
             run_id: "panic-translation".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         let mut rx = provider.start_step(StepId(1), Arc::new(opts), CancellationToken::new(), None);
         let event = rx
@@ -10348,6 +10361,7 @@ mod tests {
                 account_ref: None,
                 run_id: "run-abc".into(),
                 step_index: 7,
+                max_output_tokens: None,
             }),
             "ignored",
             1,

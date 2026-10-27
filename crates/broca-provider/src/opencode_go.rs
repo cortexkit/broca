@@ -426,6 +426,7 @@ mod tests {
             account_ref: None,
             run_id: "identity-header-test".into(),
             step_index: 1,
+            max_output_tokens: None,
         });
         let endpoint = |family: &dyn WireFamily, frozen: FrozenRenderConfig| {
             let body = family.render(&frozen, &options);

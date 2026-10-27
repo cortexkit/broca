@@ -3477,6 +3477,9 @@ where
     // between boundaries estimates the next one.
     let mut notice_request_bytes = 0usize;
     let mut compaction_history = prior.compaction_history.clone();
+    // The output cap this run recorded for a step it may now resume; kept current below from
+    // the run and step records this run writes, exactly as replay folds them.
+    let mut output_history = prior.output_reservation.clone();
     let compaction_item = frozen_hooks
         .map(|manifest| crate::compaction::item(manifest))
         .transpose()
@@ -4401,6 +4404,7 @@ where
         // Read once: the record carries it, and the refusal-fallback admission rules below
         // compare the schedule against the same value replay will.
         let admitted_at_ms = control.now_ms();
+        output_history.start_run();
         let (run_started_seq, input_tags) = writer.record_tagged(WalRecord::RunStarted {
             written_at_ms: req
                 .input_written_at_ms
@@ -5127,6 +5131,7 @@ where
         opts_mut.step_context = Some(broca_protocol::StepContext {
             run_id: resolved_run_id.0.clone(),
             step_index: step_id.0,
+            max_output_tokens: None,
             session_address: Some(session_addr(&req.session)),
             credential_id: run_credential_id.clone(),
             account_ref: run_account_ref.clone(),
@@ -5405,6 +5410,17 @@ where
                     .as_ref()
                     .map_or(0, |history| history.retained_base_len()),
             );
+        }
+        // A cap this step already recorded is what an earlier attempt of it sent, so a resume
+        // renders it again.
+        if let Some(cap) = output_history.recorded_for(step_id) {
+            let sent = match model_opts.as_mut() {
+                Some(model_opts) => Arc::make_mut(model_opts),
+                None => mutable_call_options(&mut opts),
+            };
+            if let Some(step_context) = sent.step_context.as_mut() {
+                step_context.max_output_tokens = Some(cap);
+            }
         }
         let sent_opts = model_opts.as_ref().unwrap_or(&opts);
         if boundary_cancelled(control) && compaction_runtime.is_some() {
@@ -5713,6 +5729,7 @@ where
                 total_usage += usage;
                 input_budget.observe(usage);
                 input_budget.limit = writer.input_token_limit().or(input_budget.limit);
+                output_history.note_step();
                 if let Some(bytes) = sent_bytes {
                     compaction_history.previous_native_usage = Some(usage);
                     compaction_history.previous_provider_code = None;

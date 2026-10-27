@@ -250,3 +250,111 @@ async fn a_fallback_step_sends_the_fallback_request_and_continues_the_attempt_or
     assert_eq!(attempts[0].attempt, 3);
     assert_eq!(attempts[0].outcome, AttemptOutcome::Complete);
 }
+
+/// `options()` carrying a step whose output cap the run recorded lowered to `cap`.
+fn options_with_recorded_cap(cap: u32) -> CallOptions {
+    let mut opts = options();
+    opts.step_context = Some(broca_protocol::request::StepContext {
+        run_id: "run".into(),
+        step_index: 1,
+        session_address: None,
+        credential_id: None,
+        account_ref: None,
+        max_output_tokens: Some(cap),
+    });
+    opts
+}
+
+#[test]
+fn a_fallback_step_renders_the_fallback_model_with_its_recorded_output_cap() {
+    let (source, fallback) = source_with_fallback(None);
+    let provider = LiveProvider::new(AnthropicMessages, source.clone(), AuthHandle::None);
+    // Below both models' frozen caps (source 2000, fallback 1000).
+    let opts = options_with_recorded_cap(600);
+
+    // The source route renders exactly what a provider without a fallback renders: the source
+    // config with the recorded cap applied.
+    let source_bytes = provider.render_request(&opts);
+    let without_fallback = LiveProvider::new(
+        AnthropicMessages,
+        anthropic_oauth(SOURCE, 2_000, None),
+        AuthHandle::None,
+    );
+    assert_eq!(source_bytes, without_fallback.render_request(&opts));
+    assert_eq!(
+        source_bytes,
+        AnthropicMessages.render(&source.for_step(&opts), &opts)
+    );
+    assert_eq!(body(&source_bytes)["max_tokens"], 600);
+
+    provider.set_step_route(StepRoute::Fallback);
+    let fallback_bytes = provider.render_request(&opts);
+    assert_eq!(
+        fallback_bytes,
+        AnthropicMessages.render(&fallback.for_step(&opts), &opts)
+    );
+    let rendered = body(&fallback_bytes);
+    assert_eq!(rendered["model"], FALLBACK);
+    assert_eq!(rendered["max_tokens"], 600, "the step's recorded cap");
+
+    // A recorded cap above the fallback's own frozen cap leaves the fallback's cap in place.
+    let above = options_with_recorded_cap(1_500);
+    assert_eq!(body(&provider.render_request(&above))["max_tokens"], 1_000);
+
+    provider.set_step_route(StepRoute::Source);
+    assert_eq!(provider.render_request(&opts), source_bytes);
+}
+
+#[tokio::test]
+async fn a_fallback_step_sends_the_fallback_model_with_its_recorded_output_cap() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(serve_one(listener));
+    let (source, _) = source_with_fallback(Some(&base_url));
+    let provider = LiveProvider::new(
+        AnthropicMessages,
+        source,
+        AuthHandle::Bearer("token".into()),
+    );
+    provider.set_step_route(StepRoute::Fallback);
+    let opts = Arc::new(options_with_recorded_cap(600));
+    let expected_body = provider.render_request(&opts);
+
+    let mut rx = provider
+        .step_with_runtime(
+            StepId(2),
+            Arc::clone(&opts),
+            broca_core::provider::StepRuntime {
+                cancel: CancellationToken::new(),
+                deadline: None,
+                seal: None,
+                progress: None,
+                first_attempt: 0,
+            },
+        )
+        .await;
+    let mut finished = false;
+    while let Some(event) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the step ends")
+    {
+        match event {
+            NormalizedEvent::Control(ProviderControl::Finished { .. }) => finished = true,
+            NormalizedEvent::Control(ProviderControl::Error { error, .. }) => {
+                panic!("the fallback step failed: {error:?}")
+            }
+            _ => {}
+        }
+    }
+    assert!(finished);
+    let (_, sent) = server.await.unwrap();
+    assert_eq!(
+        sent, expected_body,
+        "the bytes sent are the fallback render"
+    );
+    let sent = body(&sent);
+    assert_eq!(sent["model"], FALLBACK);
+    assert_eq!(sent["max_tokens"], 600, "the step's recorded cap");
+}

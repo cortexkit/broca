@@ -51,6 +51,7 @@ fn base_request() -> CallOptions {
         account_ref: None,
         run_id: "run-generation-01".into(),
         step_index: 2,
+        max_output_tokens: None,
     });
     opts
 }

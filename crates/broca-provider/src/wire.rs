@@ -296,6 +296,28 @@ pub struct RefusalFallbackConfig {
     pub frozen: FrozenRenderConfig,
 }
 
+impl FrozenRenderConfig {
+    /// The config one step renders with: this config, with `max_output_tokens` lowered to the
+    /// step's own cap (`StepContext::max_output_tokens`) when the run loop lowered it to keep the
+    /// request inside the context limit. Every renderer reads the cap from the config, so this is
+    /// the one place a step's cap enters the bytes. A step without a lower cap borrows the config
+    /// unchanged and renders exactly as before.
+    pub fn for_step(&self, opts: &CallOptions) -> std::borrow::Cow<'_, Self> {
+        match opts
+            .step_context
+            .as_ref()
+            .and_then(|step| step.max_output_tokens)
+        {
+            Some(cap) if cap < self.max_output_tokens => {
+                let mut lowered = self.clone();
+                lowered.max_output_tokens = cap;
+                std::borrow::Cow::Owned(lowered)
+            }
+            _ => std::borrow::Cow::Borrowed(self),
+        }
+    }
+}
+
 /// Conversation identity and episode-local request numbering for the Antigravity envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeAssistIdentity {
@@ -1037,5 +1059,70 @@ mod tests {
         let restored: FrozenRenderConfig =
             serde_json::from_str(&serialized).expect("old-shaped frozen config deserializes");
         assert_eq!(restored.cache, None);
+    }
+}
+
+#[cfg(test)]
+mod output_cap_tests {
+    use super::*;
+    use crate::families::frozen_config_for_family;
+    use broca_protocol::{ContentBlock, Message, Role, StepContext};
+
+    fn opts(cap: Option<u32>) -> CallOptions {
+        let mut opts = CallOptions::new(vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: "hi".into() }],
+        )]);
+        opts.step_context = Some(StepContext {
+            run_id: "r".into(),
+            step_index: 1,
+            session_address: None,
+            credential_id: None,
+            account_ref: None,
+            max_output_tokens: cap,
+        });
+        opts
+    }
+
+    /// The families whose body carries the frozen cap: a step without a lower cap renders the
+    /// frozen config byte for byte, and a step with one renders that cap in place of it.
+    #[test]
+    fn a_step_cap_replaces_the_frozen_cap_and_its_absence_changes_nothing() {
+        for family_id in [
+            WireFamilyId::AnthropicMessages,
+            WireFamilyId::OpenAiResponses,
+            WireFamilyId::OpenAiChat,
+            WireFamilyId::Gemini,
+            WireFamilyId::BedrockConverse,
+        ] {
+            let frozen = frozen_config_for_family(family_id, "m");
+            let family = crate::registry::wire_family(family_id).unwrap();
+            let unchanged = opts(None);
+            assert!(matches!(
+                frozen.for_step(&unchanged),
+                std::borrow::Cow::Borrowed(_)
+            ));
+            assert_eq!(
+                family.render(&frozen.for_step(&unchanged), &unchanged),
+                family.render(&frozen, &unchanged),
+                "{family_id:?}"
+            );
+            // A cap at or above the frozen one is not a lowering.
+            let higher = opts(Some(frozen.max_output_tokens + 1));
+            assert!(matches!(
+                frozen.for_step(&higher),
+                std::borrow::Cow::Borrowed(_)
+            ));
+
+            let cap = frozen.max_output_tokens - 7;
+            let lowered = opts(Some(cap));
+            let body =
+                String::from_utf8(family.render(&frozen.for_step(&lowered), &lowered)).unwrap();
+            assert!(body.contains(&format!(":{cap}")), "{family_id:?}: {body}");
+            assert!(
+                !body.contains(&format!(":{}", frozen.max_output_tokens)),
+                "{family_id:?}: {body}"
+            );
+        }
     }
 }

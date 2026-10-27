@@ -1,0 +1,28 @@
+{
+  "case": "success",
+  "contract": "image-resolve-v1",
+  "handle": "ih0123456789abcdef0123456789abcdef",
+  "principal": "reserved:broca",
+  "reply": {
+    "binary": true,
+    "body_file": "success.bin",
+    "body_length": 136,
+    "body_sha256": "ed64ad5167f73e24c77d7a4bd5d75d286344a4a13b67294855038fa27fef1670",
+    "channel": 9,
+    "corr": 11,
+    "epoch": 1,
+    "flags": 3,
+    "type": "Response",
+    "wire_hex": "880000000201030900010000000b00000000000000000000747b22636f6e74656e745f74797065223a22696d6167652f706e67222c226c656e677468223a31362c22736861323536223a2230326133653239386631353333663632353538633538653463373065646361623961663561353064363264393235666435333930393432303230666230666238227d89504e470d0a1a0a0000000d49484452"
+  },
+  "request": {
+    "body_length": 109,
+    "body_utf8": "{\"method\":\"image.resolve\",\"params\":{\"handle\":\"ih0123456789abcdef0123456789abcdef\",\"scope_ref\":\"vector-head\"}}",
+    "channel": 9,
+    "corr": 11,
+    "epoch": 1,
+    "type": "Request",
+    "wire_hex": "6d0000000200020900010000000b000000000000007b226d6574686f64223a22696d6167652e7265736f6c7665222c22706172616d73223a7b2268616e646c65223a2269683031323334353637383961626364656630313233343536373839616263646566222c2273636f70655f726566223a22766563746f722d68656164227d7d"
+  },
+  "state": "a screenshot handle resolves to exactly the bytes the reply carried"
+}

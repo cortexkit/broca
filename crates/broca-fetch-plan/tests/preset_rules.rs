@@ -27,20 +27,20 @@ fn absent_tool_preset_is_left_off_the_catalog_request() {
 }
 
 #[test]
-fn absent_system_text_preset_is_refused_by_name() {
+fn absent_system_text_preset_is_preserved_for_catalog_gated_admission() {
     let mut raw = plan();
     raw["system_text_items"][0]
         .as_object_mut()
         .unwrap()
         .remove("preset");
-    let refusal =
+    let parsed =
         broca_fetch_plan::parse_plan(&raw, broca_fetch_plan::CompactionSupport::Unsupported)
-            .unwrap_err();
-    assert_eq!(refusal.code(), "invalid_params");
-    assert_eq!(
-        refusal.detail(),
-        json!({"field":"plan.system_text_items[0].preset"})
-    );
+            .unwrap();
+    let request =
+        broca_fetch_plan::admit::catalog_request(&parsed, None, Some(&parsed.system_text_items[0]));
+    assert!(serde_json::to_value(request).unwrap()["system_text"]
+        .get("preset")
+        .is_none());
 }
 
 #[test]

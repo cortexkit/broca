@@ -173,13 +173,23 @@ impl IndeterminateToolCalls {
     }
 }
 
-/// Context needed when records are projected incrementally. Placement keeps absolute
-/// lineage ordinals across episodes; the other fields describe the current episode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveCallIdentity {
+    seq: u64,
+    schema_pin: Option<String>,
+    recorded_key: Option<String>,
+    dispatched: bool,
+}
+
+/// Context for incremental projection. Placement and log identity survive episode
+/// boundaries; call facts are bounded to the current tool batch.
 ///
-/// Batch replay can construct this state internally, while the live projector keeps one instance
-/// across observed records so a later `RunFinished` can describe its last model step and dispatches.
+/// Batch replay constructs this state internally, while the live projector keeps
+/// an instance so later records retain their run, message and call identities.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ControlProjectionState {
+    wal_lineage_id: Option<broca_wal::WalLineageId>,
+    call_identities: std::collections::HashMap<ToolCallId, LiveCallIdentity>,
     placement: crate::placement::Placement,
     placement_error: Option<String>,
     assistant_ordinal: Option<u64>,
@@ -211,6 +221,8 @@ impl ControlProjectionState {
         run_id: Option<RunId>,
     ) -> Self {
         Self {
+            wal_lineage_id: None,
+            call_identities: Default::default(),
             run_id,
             final_step_finish_reason,
             has_completed_step: completed_steps > 0,
@@ -273,6 +285,14 @@ impl ControlProjectionState {
         &self.placement
     }
 
+    /// Supply the log header identity read with the records, never a file-system
+    /// inode or the separate visible-history lineage.
+    pub fn set_wal_lineage_id(&mut self, lineage: Option<broca_wal::WalLineageId>) {
+        if lineage.is_some() {
+            self.wal_lineage_id = lineage;
+        }
+    }
+
     pub fn placement_error(&self) -> Option<&str> {
         self.placement_error.as_deref()
     }
@@ -287,6 +307,7 @@ impl ControlProjectionState {
         self.assistant_message = None;
         self.assistant_started = false;
         self.started_tools.clear();
+        self.call_identities.clear();
         self.cancelled = false;
         self.pending_inputs.clear();
     }
@@ -313,7 +334,32 @@ pub fn project_control_with_mids(
 ) -> Result<Vec<PlacedControlUnit>, String> {
     let mut sink = PlacedUnitSink::default();
     for framed in records {
+        let first = sink.units.len();
         project_control_record(framed, state, &mut sink);
+        for frame in &mut sink.units[first..] {
+            let (id, key, pin) = match &mut frame.event {
+                cortexkit_role_llm_runner::live::LiveEvent::ToolStarted(event) => (
+                    &event.tool_call_id,
+                    &mut event.call_key,
+                    &mut event.schema_pin,
+                ),
+                cortexkit_role_llm_runner::live::LiveEvent::ToolFinished(event) => (
+                    &event.tool_call_id,
+                    &mut event.call_key,
+                    &mut event.schema_pin,
+                ),
+                _ => continue,
+            };
+            if let Some(identity) = state.call_identities.get(&ToolCallId(id.clone())) {
+                let lineage = state.wal_lineage_id.map(|lineage| lineage.to_string());
+                *key = crate::context::tool_call_key(
+                    lineage.as_deref(),
+                    identity.seq,
+                    identity.recorded_key.as_deref(),
+                );
+                pin.clone_from(&identity.schema_pin);
+            }
+        }
         if let Some(error) = &state.placement_error {
             return Err(error.clone());
         }
@@ -524,6 +570,7 @@ fn project_control_record<S: ControlProjectionSink>(
             state.assistant_message = None;
             state.assistant_started = true;
             state.started_tools.clear();
+            state.call_identities.clear();
             record_sink.ordinal = state.assistant_ordinal;
             push!(
                 ControlUnit::StepStarted { step_id: *step_id },
@@ -577,6 +624,7 @@ fn project_control_record<S: ControlProjectionSink>(
             state.tool_result_ordinal = state.placement.held_tool_result_ordinal();
             state.assistant_message = Some(Arc::clone(assistant_message));
             state.started_tools.clear();
+            state.call_identities.clear();
             let already_started = std::mem::take(&mut state.assistant_started);
             record_sink.ordinal = state.assistant_ordinal;
             state.final_step_finish_reason = *finish_reason;
@@ -748,6 +796,7 @@ fn project_control_record<S: ControlProjectionSink>(
             state.assistant_message = None;
             state.assistant_started = false;
             state.started_tools.clear();
+            state.call_identities.clear();
             state.cancelled = false;
         }
         WalRecord::RunPaused {
@@ -807,6 +856,8 @@ fn project_control_record<S: ControlProjectionSink>(
             tool_name,
             args,
             dispatched_at_ms,
+            schema_pin,
+            call_key,
             ..
         } => {
             state
@@ -819,6 +870,32 @@ fn project_control_record<S: ControlProjectionSink>(
                     .find(|call| &call.tool_call_id == tool_call_id)
             });
             if let (Some(ordinal), Some(call)) = (state.assistant_ordinal, call) {
+                let schema = schema_pin.as_ref().and_then(|pin| {
+                    cortexkit_role_tool_provider::call::SchemaPin::new(
+                        tool_name.as_deref().unwrap_or(&call.tool_name),
+                        &pin.schema_digest,
+                        pin.semantics,
+                    )
+                    .encode()
+                    .ok()
+                });
+                let identity = LiveCallIdentity {
+                    seq: framed.seq,
+                    schema_pin: schema,
+                    recorded_key: call_key.clone(),
+                    dispatched: true,
+                };
+                match state.call_identities.entry(tool_call_id.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(identity);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry)
+                        if !entry.get().dispatched =>
+                    {
+                        entry.insert(identity);
+                    }
+                    _ => {}
+                }
                 if state.started_tools.insert(tool_call_id.clone()) {
                     record_sink.boundary(ordinal, || {
                         tool_started_event(
@@ -868,7 +945,9 @@ fn project_control_record<S: ControlProjectionSink>(
                 });
             }
         }
-        WalRecord::ContextCeilingWait { .. } | WalRecord::ContextCeilingDecided { .. } => {}
+        WalRecord::ContextCeilingWait { .. }
+        | WalRecord::ContextCeilingDecided { .. }
+        | WalRecord::OutputReservationClamped { .. } => {}
         WalRecord::CompactionRideWait { deadline_ms, .. } => {
             if let Some(run_id) = &state.run_id {
                 push!(ControlUnit::CompactionWait {
@@ -954,6 +1033,17 @@ fn project_control_record<S: ControlProjectionSink>(
                     .find(|call| &call.tool_call_id == call_id)
             });
             if let (Some(ordinal), Some(call)) = (state.assistant_ordinal, call) {
+                // Preparation has a durable key, but no dispatched definition yet.
+                // The later intent supplies the pin without changing the prepared key.
+                state
+                    .call_identities
+                    .entry(call_id.clone())
+                    .or_insert(LiveCallIdentity {
+                        seq: framed.seq,
+                        schema_pin: None,
+                        recorded_key: None,
+                        dispatched: false,
+                    });
                 if state.started_tools.insert(call_id.clone()) {
                     record_sink.boundary(ordinal, || {
                         let mut event = live::ToolStarted::new(
@@ -1030,6 +1120,7 @@ fn project_control_record<S: ControlProjectionSink>(
                 state.tool_result_ordinal = None;
                 state.assistant_message = None;
                 state.started_tools.clear();
+                state.call_identities.clear();
             }
             _ => {}
         }
@@ -1238,10 +1329,21 @@ pub struct EpisodeReplay {
 pub fn first_record_offset(
     read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
 ) -> std::io::Result<u64> {
+    log_header_info(read_at).map(|(offset, _)| offset)
+}
+
+/// Read the initial log header once, keeping its identity beside the record offset.
+/// Headerless legacy sources retain offset zero and an unknown identity.
+pub fn log_header_info(
+    read_at: &dyn Fn(u64, u64) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<(u64, Option<broca_wal::WalLineageId>)> {
     let header = read_at(0, broca_wal::framing::LINEAGE_FRAME_LEN as u64)?;
     Ok(match broca_wal::framing::decode_next(&header) {
-        broca_wal::framing::DecodeStep::Lineage { consumed, .. } => consumed as u64,
-        _ => 0,
+        broca_wal::framing::DecodeStep::Lineage {
+            consumed,
+            lineage_id,
+        } => (consumed as u64, Some(lineage_id)),
+        _ => (0, None),
     })
 }
 

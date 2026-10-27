@@ -70,32 +70,32 @@ sha2 = "0.10"
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", default-features = false, features = ["deflate"] }
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", default-features = false, features = ["handshake", "connect", "rustls-tls-webpki-roots"] }
 # Exact released versions keep the benchmark and production on the same envelope.
-subc-protocol = "=0.32.4"
-subc-transport = "=0.13.0"
-subc-control = "=0.31.0"
-subc-client-rs = "=0.29.3"
+subc-protocol = "=0.33.0"
+subc-transport = "=0.14.0"
+subc-control = "=0.33.0"
+subc-client-rs = "=0.31.0"
 subc-os = "=0.1.14"
 cortexkit-lease = "=0.1.2"
 cortexkit-log = "=0.3.5"
 cortexkit-role-harness = "=0.1.0"
-cortexkit-role-tool-provider = "=0.10.6"
-cortexkit-llm-tools = "=0.2.0"
+cortexkit-role-tool-provider = "=0.12.1"
+cortexkit-llm-tools = "=0.2.1"
 cortexkit-role-tool-provider-conformance = "=0.10.1"
-cortexkit-role-llm-runner = "=0.6.13"
+cortexkit-role-llm-runner = "=0.7.5"
 cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-trait = "=0.3.0"
 cortexkit-bus-nats = "=0.3.0"
-cortexkit-role-llm-runner-conformance = "=0.12.9"
+cortexkit-role-llm-runner-conformance = "=0.15.6"
 # Draft 2020-12 validation of structured-output values. Default features are off so the
 # validator has no HTTP or file retriever: a schema can never make broca fetch anything.
 jsonschema = { version = "=0.58.6", default-features = false }
 cortexkit-role-agent-data = "=0.2.2"
 cortexkit-role-step-transform-provider = "=0.3.3"
-cortexkit-role-compaction-provider = "=0.6.0"
+cortexkit-role-compaction-provider = "=0.7.1"
 # System One: the one-pass decision-model role and the batch rules it shares with extraction.
 cortexkit-role-classifier = "=0.5.0"
 cortexkit-role-classifier-conformance = "=0.6.0"
-cortexkit-model-batch = "=0.3.0"
+cortexkit-model-batch = "=0.3.2"
 
 # The logging facade every crate here emits through. The records are formatted and
 # written by cortexkit-log, which the daemon binary installs as the process-global
