@@ -3344,13 +3344,28 @@ where
                 break None;
             };
             // A closed gate is the module's outage, already seen by another open: the outage
-            // patience runs from here.
-            if !patience_started && current.is_closed() {
-                start_patience(&mut retry_deadline);
-                patience_started = true;
+            // patience runs from here, and the gate's refusal is this open's evidence of it.
+            // Kept as the last refusal, so a wait that ends while this open's own probe is
+            // still in flight reports the module and its code, not a bare transport failure.
+            if !patience_started {
+                if let Some(refusal) = current.closed_refusal() {
+                    start_patience(&mut retry_deadline);
+                    patience_started = true;
+                    last_refusal = Some(refusal);
+                }
             }
             match current.admit(retry_deadline, cancel).await {
                 GateAdmission::Admitted(ticket) => break Some(ticket),
+                // The gate closed between the check above and the admission (another open was
+                // refused in between), so this outage-waiting open was admitted with no wait
+                // at all. It is the same outage, met a moment later: start the patience now
+                // and ask again, so this open waits exactly like one that found the gate
+                // closed.
+                GateAdmission::Refused(refusal) if !patience_started => {
+                    start_patience(&mut retry_deadline);
+                    patience_started = true;
+                    last_refusal = Some(refusal);
+                }
                 GateAdmission::Refused(refusal) => {
                     return Err(RouteOpenError::Conn(ConnError::Rejected(refusal)))
                 }
@@ -3537,7 +3552,16 @@ pub(crate) struct ModuleGate {
     /// with a label logs its outages: one line when the target starts refusing, one when it
     /// recovers, whatever route kinds the other gates pace.
     tool_module: Option<String>,
+    /// Runs once at the start of the next [`ModuleGate::admit`], before the gate's state is
+    /// read: lets a test change the gate at exactly the moment an open arrives at it, such as
+    /// another open's refusal closing it just after this open checked it was open.
+    #[cfg(test)]
+    admit_hook: Mutex<Option<AdmitHook>>,
 }
+
+/// See [`ModuleGate`]'s `admit_hook`.
+#[cfg(test)]
+type AdmitHook = Box<dyn FnOnce(&ModuleGate) + Send>;
 
 struct GateState {
     /// Bumped on every close and every reopen.
@@ -3641,6 +3665,8 @@ impl ModuleGate {
             jitter: Box::new(jitter),
             retired,
             tool_module: None,
+            #[cfg(test)]
+            admit_hook: Mutex::new(None),
         }
     }
 
@@ -3657,6 +3683,20 @@ impl ModuleGate {
         !self.is_retired() && self.state.borrow().closed.is_some()
     }
 
+    /// The gate's latest availability refusal while it is closed and still pacing opens;
+    /// `None` while it is open or retired. Read in one step, so a closed gate always comes
+    /// with the evidence that closed it.
+    pub(crate) fn closed_refusal(&self) -> Option<RejectedMessage> {
+        if self.is_retired() {
+            return None;
+        }
+        self.state
+            .borrow()
+            .closed
+            .as_ref()
+            .map(|closed| closed.refusal.clone())
+    }
+
     /// Whether the connection generation this gate belongs to has ended.
     pub(crate) fn is_retired(&self) -> bool {
         self.retired.is_cancelled()
@@ -3671,6 +3711,13 @@ impl ModuleGate {
         wait_until: Option<time::Instant>,
         cancel: Option<&CancellationToken>,
     ) -> GateAdmission {
+        #[cfg(test)]
+        {
+            let hook = self.admit_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
         let mut rx = self.state.subscribe();
         // The refusal this caller was told while it waited, once it has waited at all. A caller
         // that has waited must not be admitted after its deadline, even when the gate opens or
@@ -7724,6 +7771,95 @@ mod module_gate_tests {
             result,
             Err(RouteOpenError::Conn(ConnError::Rejected(message))) if message.code() == TARGET_UNAVAILABLE
         ));
+    }
+
+    fn tool_dispatch_wait() -> OutageWait {
+        OutageWait {
+            patience: Duration::from_secs(90),
+            max_interval: ROUTE_OPEN_RETRY_MAX_INTERVAL,
+            deadline: None,
+        }
+    }
+
+    /// A tool open checks the gate and finds it open, and another open's availability refusal
+    /// closes it before this open is admitted. The open meets the same outage a moment later,
+    /// so it waits it out like an open that found the gate closed: its patience starts there,
+    /// it takes the gate's next probe turn, and it opens. It is not refused without waiting.
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_wait_that_meets_a_closing_gate_waits_like_one_that_met_it_closed() {
+        let gate = Arc::new(ModuleGate::with_jitter(
+            whole_envelope,
+            CancellationToken::new(),
+        ));
+        // Another open's refusal lands just as this open reaches the gate.
+        *gate.admit_hook.lock().unwrap() = Some(Box::new(|gate: &ModuleGate| {
+            gate.observe(&Err(refused(TARGET_UNAVAILABLE)), 0, None);
+        }));
+        let start = time::Instant::now();
+        let attempts_at = Mutex::new(Vec::new());
+        let result = retry_route_open_waiting_out_outage(
+            tool_dispatch_wait(),
+            None,
+            None,
+            || Some(Arc::clone(&gate)),
+            || {
+                attempts_at.lock().unwrap().push(start.elapsed());
+                async { Ok(RouteHandle::synthetic(4)) }
+            },
+        )
+        .await;
+        assert_eq!(
+            result
+                .expect("the open waits for the gate instead of being refused")
+                .channel,
+            4
+        );
+        assert_eq!(
+            attempts_at.into_inner().unwrap(),
+            [Duration::from_millis(100)],
+            "one attempt, on the gate's first probe turn"
+        );
+        assert!(!gate.is_closed(), "the probe's route reopened the gate");
+    }
+
+    /// A tool open that joins a gate already closed by another open's refusal, and whose own
+    /// probe is still in flight when its patience runs out, ends with the gate's refusal: the
+    /// module's code and detail, proven undelivered. Not a bare transport failure, which would
+    /// lose the module and the code the caller reports.
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_wait_that_joined_a_closed_gate_ends_with_the_gates_refusal() {
+        let gate = closed_gate(CancellationToken::new());
+        let start = time::Instant::now();
+        let calls = AtomicUsize::new(0);
+        let result = retry_route_open_waiting_out_outage(
+            tool_dispatch_wait(),
+            None,
+            None,
+            || Some(Arc::clone(&gate)),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // This open's probe never answers.
+                std::future::pending::<ConnResult<RouteHandle>>()
+            },
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "its own probe went out and was still in flight"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(90),
+            "the patience ran from joining the closed gate"
+        );
+        match result {
+            Err(RouteOpenError::Conn(ConnError::Rejected(message))) => {
+                assert_eq!(message.code(), TARGET_UNAVAILABLE);
+                assert_eq!(message.detail(), "not now");
+            }
+            other => panic!("expected the gate's availability refusal, got {other:?}"),
+        }
     }
 
     /// Fifty opens for fifty DIFFERENT routes to one module stopped for ten seconds, arriving

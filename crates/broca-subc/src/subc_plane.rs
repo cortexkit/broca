@@ -693,6 +693,11 @@ pub struct SubcToolPlane {
     /// Reads a scope's current state (`scope.describe`) over broca's module connection, once the
     /// serve loop has registered one; see [`Self::set_scope_describer`].
     describer: Mutex<Option<Arc<dyn ScopeDescriber>>>,
+    /// Calls re-opening a route after their first request was refused before it reached the
+    /// tool, by route key, each as the token that fires when that call has finished. A call
+    /// that was waiting for credit on the same route, and finds it replaced once it gets the
+    /// credit, sends only after these have finished: on a serial route, batch order holds.
+    resend_turns: Mutex<HashMap<RouteKey, Vec<CancellationToken>>>,
 }
 
 /// What the batch's frozen plan declared about one provider: whether it serves the `content/v1`
@@ -823,8 +828,9 @@ impl SubcToolPlane {
             };
         }
         if let Some(args) = args {
-            // This is after every route, permit and stale-route recovery wait.
-            // Only approved calls carry run signals; ordinary dispatch is unchanged.
+            // This is after every route, permit and stale-route recovery wait. An approved
+            // call stopped here keeps the existing `approved_dispatch_stopped_before_send`
+            // reason.
             if args.signals.interrupted() {
                 return SendAttempt::NotSent {
                     reason: "approved_dispatch_stopped_before_send".into(),
@@ -897,6 +903,7 @@ impl SubcToolPlane {
             run_latches: Mutex::new(HashMap::new()),
             scope_sync_hold: SCOPE_SYNC_HOLD,
             describer: Mutex::new(None),
+            resend_turns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1249,7 +1256,7 @@ impl SubcToolPlane {
     ///   returned and latched for the run.
     /// - The scope is live, or its state cannot be told: ordinary route loss. The closed routes
     ///   are forgotten, the batch re-opens, and that open checks the scope again.
-    async fn gone_since_last_batch(&self, ctx: &BatchCtx) -> Option<String> {
+    async fn gone_since_last_batch(&self, ctx: &BatchCtx, guard: &ToolOpenGuard) -> Option<String> {
         let scope = ctx.scope.as_ref()?;
         let session = Self::session_key(&ctx.bind);
         let key_scope = scope_key(Some(scope));
@@ -1271,8 +1278,14 @@ impl SubcToolPlane {
         for (module_id, handle) in &closed {
             self.forget_route(ctx, module_id, *handle);
         }
+        // Nothing of the batch is sent yet, so run cancel and stop end the hold as well as the
+        // session close; the batch's opens then see the interrupted run.
         let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
-        match self.read_scope(scope, &lifecycle, true).await {
+        let wait = WaitCancel::link(&lifecycle, guard);
+        match self
+            .read_scope(scope, wait.token(), guard.deadline, true)
+            .await
+        {
             ScopeReading::Gone(reason) => {
                 self.latch_gone(ctx, reason);
                 Some(reason.to_owned())
@@ -1326,11 +1339,17 @@ impl SubcToolPlane {
     /// against the epoch it was frozen at. With `hold`, an owner that has not synced since the
     /// daemon started is waited for, with backoff, inside [`SCOPE_SYNC_HOLD`], as a
     /// `scope_not_synced` open is; past the hold, or without `hold`, that is "can't tell".
-    /// A session close ends the wait at once.
+    /// The hold also ends at `until` when that comes first. `cancel` ends the wait between
+    /// describes at once (a describe already in flight finishes or reaches its own timeout
+    /// first): the caller passes the session close, linked with the run's cancel and stop when
+    /// the reading is for a call not yet sent, so a stopped run never sits out the hold. A hold
+    /// that ends early reads as "can't tell"; callers that hold a run guard check it to report
+    /// the call as stopped before send.
     async fn read_scope(
         &self,
         scope: &SessionScope,
-        lifecycle: &CancellationToken,
+        cancel: &CancellationToken,
+        until: Option<Instant>,
         hold: bool,
     ) -> ScopeReading {
         let Some(describer) = self.describer.lock().unwrap().clone() else {
@@ -1342,7 +1361,8 @@ impl SubcToolPlane {
             Ok(owner) => owner,
             Err(detail) => return ScopeReading::Unverifiable(detail),
         };
-        let deadline = Instant::now() + self.scope_sync_hold;
+        let hold_end = Instant::now() + self.scope_sync_hold;
+        let deadline = until.map_or(hold_end, |until| until.min(hold_end));
         let mut attempt = 0u32;
         loop {
             let reading = match describer.describe(&owner, &scope.scope_ref).await {
@@ -1364,8 +1384,8 @@ impl SubcToolPlane {
                 .min(SCOPE_SYNC_HOLD_MAX_INTERVAL)
                 .min(remaining);
             tokio::select! {
-                _ = lifecycle.cancelled() => {
-                    return ScopeReading::Unverifiable("the session closed during the hold".into());
+                _ = cancel.cancelled() => {
+                    return ScopeReading::Unverifiable("the wait ended during the hold".into());
                 }
                 _ = sleep(wait) => {}
             }
@@ -1386,6 +1406,9 @@ impl SubcToolPlane {
     ///   `scope_epoch` and the same agent as `composed_under`, the stamp of the route the call
     ///   was composed under. Otherwise `route_drained` as `scope_agent_changed`, or as the
     ///   refusal the re-open met.
+    ///
+    /// `earlier` are the calls re-opening on the same route that this call must not send
+    /// ahead of (see [`SubcToolPlane::begin_resend_turn`]); the send waits until they finish.
     #[allow(clippy::too_many_arguments)]
     async fn resend_or_drain(
         &self,
@@ -1398,6 +1421,7 @@ impl SubcToolPlane {
         guard: &ToolOpenGuard,
         fence_key: FenceKey,
         key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        earlier: &[CancellationToken],
     ) -> DispatchResult {
         let Some(scope) = ctx.scope.as_ref() else {
             unreachable!("only a scoped call is resolved by describing its scope");
@@ -1409,10 +1433,20 @@ impl SubcToolPlane {
             sent: false,
         };
         let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
-        match self.read_scope(scope, &lifecycle, true).await {
+        // The call is not sent yet: run cancel and stop end the hold too, not only the session
+        // close, and a run they stopped reports the call as stopped before send.
+        let reading = {
+            let wait = WaitCancel::link(&lifecycle, guard);
+            self.read_scope(scope, wait.token(), guard.deadline, true)
+                .await
+        };
+        match reading {
             ScopeReading::Gone(reason) => {
                 self.latch_gone(ctx, reason);
                 return drained(reason);
+            }
+            ScopeReading::Unverifiable(_) | ScopeReading::NotSynced if guard.interrupted() => {
+                return self.stopped_before_send(ctx, call);
             }
             ScopeReading::Unverifiable(_) | ScopeReading::NotSynced => {
                 return drained(SCOPE_UNVERIFIABLE)
@@ -1469,6 +1503,9 @@ impl SubcToolPlane {
             return drained(SCOPE_AGENT_CHANGED);
         }
         if guard.interrupted() {
+            return self.stopped_before_send(ctx, call);
+        }
+        if !Self::wait_for_resend_turns(earlier, guard).await {
             return self.stopped_before_send(ctx, call);
         }
         let _permit = match sem.acquire_owned().await {
@@ -1752,7 +1789,7 @@ impl SubcToolPlane {
         let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
         // Do not wait for an unsynced owner here: the call's outcome is already decided, and
         // waiting would only delay reporting it.
-        let reason = match self.read_scope(scope, &lifecycle, false).await {
+        let reason = match self.read_scope(scope, &lifecycle, None, false).await {
             ScopeReading::Gone(reason) => {
                 self.latch_gone(ctx, reason);
                 reason
@@ -1834,6 +1871,51 @@ impl SubcToolPlane {
     fn route_is_current(&self, key: &RouteKey, handle: RouteHandle, sem: &Arc<Semaphore>) -> bool {
         let routes = self.routes.lock().unwrap();
         route_matches(&routes, key, handle, sem)
+    }
+
+    /// Record that a call on `key` is about to give its credit back and re-open, because its
+    /// first request was refused before it reached the tool. The turn ends when the returned
+    /// value is dropped: when that call has finished, sent or not.
+    fn begin_resend_turn(&self, key: &RouteKey) -> ResendTurn<'_> {
+        let done = CancellationToken::new();
+        let mut turns = self.resend_turns.lock().unwrap();
+        let entry = turns.entry(key.clone()).or_default();
+        entry.retain(|turn| !turn.is_cancelled());
+        entry.push(done.clone());
+        ResendTurn {
+            turns: &self.resend_turns,
+            key: key.clone(),
+            done,
+        }
+    }
+
+    /// The re-opening calls on `key` that have not finished yet.
+    fn resend_turns_in_progress(&self, key: &RouteKey) -> Vec<CancellationToken> {
+        self.resend_turns
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|turns| {
+                turns
+                    .iter()
+                    .filter(|turn| !turn.is_cancelled())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Wait until every call in `earlier` has finished. False when the run was cancelled or
+    /// stopped first.
+    async fn wait_for_resend_turns(earlier: &[CancellationToken], guard: &ToolOpenGuard) -> bool {
+        for turn in earlier {
+            tokio::select! {
+                biased;
+                () = guard.cancelled() => return false,
+                () = turn.cancelled() => {}
+            }
+        }
+        !guard.interrupted()
     }
 
     /// Resolve the window for a SPECIFIC provider (`module_id`) from its catalog entry,
@@ -1963,7 +2045,9 @@ impl SubcToolPlane {
         let selector = self.scoped_selector(scope).await?;
         // The hold is bounded by the scope hold and by the caller's own deadline, whichever
         // comes first. Inside a run there is no caller deadline, so the hold alone bounds it; a
-        // session close ends it at once through `lifecycle`.
+        // session close, run cancel or stop ends it at once through the linked `cancel`. The
+        // same token ends the scope-sync waits of the describes that bracket the open; a
+        // describe already in flight finishes or times out first.
         let hold_cap = Instant::now() + self.scope_sync_hold;
         let hold = ScopeHold {
             deadline: retry_deadline.map_or(hold_cap, |caller| caller.min(hold_cap)),
@@ -1981,13 +2065,17 @@ impl SubcToolPlane {
         // pair that disagrees means the route may have been bound under either, so it is
         // closed and opened again.
         for _ in 0..MAX_STAMP_BRACKET_ATTEMPTS {
-            let before = match self.read_scope(scope, lifecycle, true).await {
+            let before = match self.read_scope(scope, cancel, guard.deadline, true).await {
                 ScopeReading::Live(stamp) => stamp,
                 ScopeReading::Gone(reason) => {
                     return Err(refused(
                         reason,
                         format!("scope.describe says the scope is gone ({reason})"),
                     ))
+                }
+                // The run was cancelled or stopped while the describe held: nothing is open yet.
+                ScopeReading::NotSynced | ScopeReading::Unverifiable(_) if guard.interrupted() => {
+                    return Err(cancelled())
                 }
                 ScopeReading::NotSynced => {
                     return Err(refused(
@@ -2039,9 +2127,15 @@ impl SubcToolPlane {
                 RouteOpenError::Conn(error) => RouteEnsureError::Connection(error),
                 RouteOpenError::Cancelled => cancelled(),
             })?;
-            match self.read_scope(scope, lifecycle, true).await {
+            match self.read_scope(scope, cancel, guard.deadline, true).await {
                 ScopeReading::Live(after) if may_resend_under(&before, &after) => {
                     return Ok((handle, Some(after)));
+                }
+                // The run was cancelled or stopped while the describe held: the route opened
+                // but carries nothing, so close it.
+                ScopeReading::NotSynced | ScopeReading::Unverifiable(_) if guard.interrupted() => {
+                    let _ = self.conn.route_close(&handle).await;
+                    return Err(cancelled());
                 }
                 ScopeReading::Live(_) => {
                     // The scope's stamp changed while the route was opening, so the route may
@@ -2340,7 +2434,7 @@ impl SubcToolPlane {
             if let Some(latch) = self.run_latch(ctx) {
                 return Err(latch.into_plane_error());
             }
-            if let Some(reason) = self.gone_since_last_batch(ctx).await {
+            if let Some(reason) = self.gone_since_last_batch(ctx, guard).await {
                 return Err(ToolPlaneError::ScopeDrained { reason });
             }
         }
@@ -2561,6 +2655,7 @@ impl SubcToolPlane {
                             guard,
                             fence_key,
                             key,
+                            &[],
                         )
                         .await;
                 }
@@ -2612,13 +2707,35 @@ impl SubcToolPlane {
         };
 
         // Another task may have invalidated/re-opened the session route while this task was
-        // waiting for flow-control credit. This check runs strictly before the send, so it is
-        // safe to report NotSent: we only avoid a stale dispatch when the captured route is no
-        // longer the live cached route, and we never reclassify an already-sent request.
+        // waiting for flow-control credit. This check runs strictly before the send, so the
+        // call has sent nothing: it re-opens once, as its first send, rather than fail the
+        // turn. That is what a sibling meets when the call ahead of it on a serial route was
+        // refused for a module restart and gave its credit back to re-open.
         if !self.route_is_current(&route_key, route_handle, &sem) {
-            return DispatchResult::NotSent {
-                reason: "cached route changed before send".into(),
-            };
+            // The calls re-opening on this route now, which this call must not send ahead of.
+            let earlier = self.resend_turns_in_progress(&route_key);
+            drop(first_permit);
+            if scope.is_some() {
+                // A scoped call keeps the scope check of any re-open: a fresh route must carry
+                // the epoch and agent the call was composed under.
+                return self
+                    .resend_or_drain(
+                        ctx,
+                        call,
+                        &module_id,
+                        route_handle,
+                        composed_under,
+                        TOOL_DISPATCH_PATIENCE,
+                        guard,
+                        fence_key,
+                        key,
+                        &earlier,
+                    )
+                    .await;
+            }
+            return self
+                .send_on_replaced_route(ctx, call, &module_id, fence_key, key, guard, &earlier)
+                .await;
         }
         if scope.is_some() {
             let current = self.cached_stamp(&ctx.bind, scope, &module_id, route_handle);
@@ -2700,7 +2817,10 @@ impl SubcToolPlane {
         }
         // The first request was refused before it reached the tool, so it holds no window
         // credit any more. Give the permit back before re-opening: the re-open may wait out a
-        // module restart, and on a serial route a sibling must not wait behind that.
+        // module restart, and on a serial route a sibling must not wait behind that. The
+        // sibling then re-opens alongside this call, but sends only after this call has
+        // finished (the resend turn), so a serial route keeps batch order.
+        let _resend_turn = self.begin_resend_turn(&route_key);
         drop(first_permit);
         // A scoped call caught before send is never re-sent blindly. The scope's current state
         // decides, and so does whether a fresh route would carry the same epoch and agent as
@@ -2717,6 +2837,7 @@ impl SubcToolPlane {
                     guard,
                     fence_key,
                     key,
+                    &[],
                 )
                 .await;
         }
@@ -2800,6 +2921,92 @@ impl SubcToolPlane {
             fence_key,
             fresh_handle,
             composed_under,
+            outcome,
+            key,
+            fresh_permit,
+        )
+        .await
+    }
+
+    /// An unscoped call that waited for credit on a route and found it replaced once it got
+    /// the credit: nothing was sent, so it opens the route again once, through the same
+    /// tool-dispatch open (the module's gate, `guard`, the outage patience), and sends there
+    /// as its first send. It sends only after `earlier`, the calls re-opening on the same route
+    /// ahead of it, have finished. A module still down after the patience ends it with the
+    /// attributed outage result, never sent.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_on_replaced_route(
+        &self,
+        ctx: &BatchCtx,
+        call: &ToolCall,
+        module_id: &str,
+        fence_key: FenceKey,
+        key: Option<broca_core::tool_plane::DispatchKey<'_>>,
+        guard: &ToolOpenGuard,
+        earlier: &[CancellationToken],
+    ) -> DispatchResult {
+        let route_key = Self::route_key(&ctx.bind, None, module_id);
+        let (fresh_handle, fresh_sem) = match self
+            .ensure_route(&ctx.bind, None, module_id, guard)
+            .await
+        {
+            Ok(route) => route,
+            Err(_) if guard.interrupted() => return self.stopped_before_send(ctx, call),
+            Err(ToolPlaneError::ModuleUnavailable {
+                module,
+                code,
+                detail,
+            }) => {
+                return self
+                    .module_unavailable_result(ctx, call, &module, &code, &detail, &fence_key);
+            }
+            Err(error) => {
+                self.latch_open_refusal(ctx, &error);
+                return DispatchResult::NotSent {
+                    reason: format!("route re-open after the cached route changed failed: {error}"),
+                };
+            }
+        };
+        if !Self::wait_for_resend_turns(earlier, guard).await {
+            return self.stopped_before_send(ctx, call);
+        }
+        let fresh_permit = match Arc::clone(&fresh_sem).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return DispatchResult::NotSent {
+                    reason: "route semaphore closed".into(),
+                }
+            }
+        };
+        // One re-open only: a route replaced again while this call waited is not chased.
+        if !self.route_is_current(&route_key, fresh_handle, &fresh_sem) {
+            return DispatchResult::NotSent {
+                reason: "cached route changed before send".into(),
+            };
+        }
+        let reply_deadline = self.reply_deadline(ctx, module_id, call);
+        let outcome = match self
+            .send_call(
+                ctx,
+                module_id,
+                &fresh_handle,
+                call,
+                reply_deadline,
+                key,
+                &guard.signals(),
+            )
+            .await
+        {
+            SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
+            SendAttempt::Reply(reply) => reply,
+        };
+        self.finish_dispatch(
+            ctx,
+            call,
+            module_id,
+            fence_key,
+            fresh_handle,
+            None,
             outcome,
             key,
             fresh_permit,
@@ -3302,6 +3509,28 @@ fn map_tool_open_refusal(error: RouteEnsureError, module_id: &str) -> ToolPlaneE
             }
         }
         error => error.into_plane(),
+    }
+}
+
+/// One call's turn in [`SubcToolPlane::begin_resend_turn`]: while it lives, a call that
+/// finds the same route replaced waits for it before sending. Dropping it ends the turn and
+/// forgets it.
+struct ResendTurn<'a> {
+    turns: &'a Mutex<HashMap<RouteKey, Vec<CancellationToken>>>,
+    key: RouteKey,
+    done: CancellationToken,
+}
+
+impl Drop for ResendTurn<'_> {
+    fn drop(&mut self) {
+        self.done.cancel();
+        let mut turns = self.turns.lock().unwrap();
+        if let Some(entry) = turns.get_mut(&self.key) {
+            entry.retain(|turn| !turn.is_cancelled());
+            if entry.is_empty() {
+                turns.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -7341,6 +7570,85 @@ mod tests {
             assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
         }
 
+        /// Run cancel while an unsent scoped call holds for an unsynced owner (its route closed
+        /// and `scope.describe` says the owner has not synced) ends the hold at once: the call
+        /// is stopped before send, not held to the scope-sync bound and then drained.
+        #[tokio::test(start_paused = true)]
+        async fn run_cancel_ends_the_describe_hold_of_an_unsent_scoped_call() {
+            let (conn, plane, describer) = rig(vec![successful_tool_reply("must not be sent")]);
+            describer.script(
+                "head",
+                vec![
+                    live("head", 1, "agent-a"),
+                    live("head", 1, "agent-a"),
+                    not_live(false),
+                ],
+            );
+            let (scoped, read) = started(&plane).await;
+            conn.close(route_of(&plane, &scoped));
+            let cancel = CancellationToken::new();
+            let guard = ToolOpenGuard::new(Some(&cancel), None);
+            let started_at = Instant::now();
+            let interrupt = async {
+                sleep(Duration::from_secs(1)).await;
+                cancel.cancel();
+            };
+            let (result, ()) = tokio::join!(
+                plane.dispatch_guarded(&scoped, &read, None, &guard),
+                interrupt
+            );
+            let waited = started_at.elapsed();
+            assert!(
+                waited < Duration::from_secs(2),
+                "the cancel ends the hold: {waited:?}"
+            );
+            assert!(
+                matches!(&result, DispatchResult::NotSent { reason } if reason == "dispatch_stopped_before_send"),
+                "{result:?}"
+            );
+            assert_eq!(
+                conn.tool_calls.load(Ordering::SeqCst),
+                0,
+                "nothing was sent"
+            );
+        }
+
+        /// Run cancel while a scoped batch's open holds on its first describe (the owner has not
+        /// synced) ends the hold at once: the batch fails as interrupted and nothing opens.
+        #[tokio::test(start_paused = true)]
+        async fn run_cancel_ends_the_describe_hold_before_a_scoped_open() {
+            let (conn, plane, describer) = rig(Vec::new());
+            describer.script("head", vec![not_live(false)]);
+            let scoped = ctx("r-b1", "s", "r", Some(scope("head", 1)));
+            let cancel = CancellationToken::new();
+            let guard = ToolOpenGuard::new(Some(&cancel), None);
+            let started_at = Instant::now();
+            let interrupt = async {
+                sleep(Duration::from_secs(1)).await;
+                cancel.cancel();
+            };
+            let calls = [call("read")];
+            let manifest = manifest();
+            let (result, ()) = tokio::join!(
+                plane.batch_started_guarded(&scoped, &calls, &manifest, &guard),
+                interrupt
+            );
+            let waited = started_at.elapsed();
+            assert!(
+                waited < Duration::from_secs(2),
+                "the cancel ends the hold: {waited:?}"
+            );
+            assert!(
+                matches!(&result, Err(ToolPlaneError::Unavailable(message)) if message.contains("run cancelled or stopped")),
+                "{result:?}"
+            );
+            assert_eq!(
+                conn.route_open_calls.load(Ordering::SeqCst),
+                0,
+                "nothing opened"
+            );
+        }
+
         /// When asking the daemon about the scope fails, nothing shows that a fresh route would
         /// carry the same epoch and agent, so the unsent call is drained as `scope_unverifiable`
         /// and never re-sent.
@@ -7767,6 +8075,69 @@ mod approved_queue_contract_tests {
                     .iter()
                     .all(|frame| frame.header.ty == subc_protocol::FrameType::Ping),
                 "no tool request or provider cancel may be enqueued before the send boundary"
+            );
+            assert_eq!(module.pending_count_for_test(), 0);
+            tokio::task::yield_now().await;
+            assert!(module.take_written_for_test().is_empty());
+        }
+    }
+
+    /// An ordinary (not approved) call goes through the real writer queue with its run's
+    /// signals: a cancel or stop that trips while the request waits for writer capacity, after
+    /// the open and the permit, leaves it unsent, and no request frame is ever written.
+    #[tokio::test]
+    async fn ordinary_cancel_and_stop_while_writer_queue_is_full_are_not_sent() {
+        for cancel in [true, false] {
+            let (conn, route, mut module) = SubcConnection::in_process_full_writer_for_test(5, 3);
+            let plane = SubcToolPlane::new(conn, "aft");
+            let ctx = BatchCtx {
+                media_capture: None,
+                batch_id: broca_protocol::BatchId("ordinary-queue".into()),
+                bind: BindIdentity::new("/project", "test", "ordinary-queue"),
+                run_id: broca_protocol::RunId("run".into()),
+                scope: None,
+            };
+            plane.routes.lock().unwrap().insert(
+                SubcToolPlane::route_key(&ctx.bind, None, "aft"),
+                RouteState {
+                    handle: route,
+                    sem: Arc::new(Semaphore::new(1)),
+                    stamp: None,
+                },
+            );
+            let call = ToolCall {
+                tool_call_id: broca_protocol::ToolCallId("ordinary".into()),
+                tool_name: "read".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            };
+            let token = CancellationToken::new();
+            let guard = ToolOpenGuard::new(
+                if cancel { Some(&token) } else { None },
+                if cancel { None } else { Some(&token) },
+            );
+            let mut dispatch = Box::pin(plane.dispatch_guarded(&ctx, &call, None, &guard));
+            assert!(dispatch.as_mut().now_or_never().is_none());
+            assert_eq!(
+                module.pending_count_for_test(),
+                1,
+                "the real tool request must already be waiting for writer capacity"
+            );
+            token.cancel();
+            let result = tokio::time::timeout(Duration::from_millis(250), dispatch)
+                .await
+                .expect("an interrupted enqueue must not wait for writer capacity");
+            assert!(
+                matches!(&result, DispatchResult::NotSent { reason } if reason == "dispatch_stopped_before_send"),
+                "an interruption before the push is typed not-sent, never unknown: {result:?}"
+            );
+            let frames = module.take_written_for_test();
+            assert_eq!(frames.len(), 256);
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame.header.ty == subc_protocol::FrameType::Ping),
+                "no tool request may be enqueued once the run is interrupted"
             );
             assert_eq!(module.pending_count_for_test(), 0);
             tokio::task::yield_now().await;
