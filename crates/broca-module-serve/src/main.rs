@@ -687,6 +687,17 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record
     // is its own file; `run-index.db` is a rebuildable projection and cannot hold an authority.
+    let llm_tools_config =
+        broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?;
+    let llm_tools_identity = broca_protocol::BindIdentity::new(
+        state_root.to_string_lossy().to_string(),
+        "broca",
+        "llm-tools",
+    );
+    let cerebellum = Arc::new(broca_subc::PrivateContentClient::new(
+        plan_conn.clone(),
+        llm_tools_identity.clone(),
+    ));
     let system_one = {
         let store = Arc::new(
             broca_store::SystemOneStore::open(state_root.join("system-one.db"))
@@ -724,6 +735,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             registry.batches_in_flight_gauge(),
         );
+        let service = if llm_tools_config.image_references {
+            service.with_image_resolver(cerebellum.clone())
+        } else {
+            service
+        };
         // System One's export bridge into the usage export. An overhaul root exports nothing.
         let service = Arc::new(if state_format.runs(BackgroundTask::UsageExport) {
             service.with_export(run_index.clone(), charge_basis_table)
@@ -748,16 +764,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // content and Basal which providers a flow's approved version allows. Both questions ride
     // the module connection `plan_conn` presents under broca's own principal; cerebellum and
     // Basal admit only `reserved:broca`.
-    let llm_tools_identity = broca_protocol::BindIdentity::new(
-        state_root.to_string_lossy().to_string(),
-        "broca",
-        "llm-tools",
-    );
     let llm_tools_asks = Arc::new(broca_module_serve::llm_tools::SubcAsks::new(
-        Arc::new(broca_subc::PrivateContentClient::new(
-            plan_conn.clone(),
-            llm_tools_identity.clone(),
-        )),
+        cerebellum,
         Arc::new(broca_subc::FlowProvidersClient::new(
             plan_conn.clone(),
             llm_tools_identity.clone(),
@@ -777,7 +785,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let llm_tools = Arc::new(
         broca_module_serve::llm_tools::LlmTools::new(
             Arc::new(system_one.fork_for_tools()),
-            broca_module_serve::config::LlmToolsConfig::load_default().map_err(ServeIoError)?,
+            llm_tools_config,
             llm_tools_asks,
         )
         .with_held(held_calls.clone())

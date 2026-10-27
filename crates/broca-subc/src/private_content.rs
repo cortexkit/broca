@@ -27,8 +27,7 @@ use crate::connection::{ConnError, RouteOpenRetry, SubcConnection};
 /// The module whose management surface answers `private_content.query`.
 pub const CEREBELLUM_MODULE: &str = "cerebellum";
 
-/// The one operation broca calls on cerebellum's management surface. Cerebellum refuses every
-/// other operation on a route bound as `reserved:broca`; broca never asks for one.
+/// The private-content operation on cerebellum's `reserved:broca` management surface.
 pub const PRIVATE_CONTENT_QUERY: &str = "private_content.query";
 
 /// How long one query waits for its reply. The daemon and cerebellum answer from their own
@@ -151,15 +150,65 @@ struct Answer {
     sources: Vec<String>,
 }
 
-/// Asks cerebellum one `private_content.query`.
+/// Cerebellum management client for privacy marks and screenshot resolution.
 pub struct PrivateContentClient {
     conn: Arc<SubcConnection>,
     identity: BindIdentity,
 }
 
+/// Image bytes stay in memory until the provider request completes; never persist or log them.
+#[derive(Deserialize)]
+pub struct ResolvedImage {
+    pub mime: String,
+    pub sha256: String,
+    pub bytes: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageResolveError {
+    Unavailable,
+    SourceUnavailable,
+    InvalidReply,
+}
+
 impl PrivateContentClient {
     pub fn new(conn: Arc<SubcConnection>, identity: BindIdentity) -> Self {
         Self { conn, identity }
+    }
+
+    /// Resolve only refs from the daemon stamp, never scope names supplied by tool arguments.
+    pub async fn resolve_image(
+        &self,
+        handle: &str,
+        scope_ref: &str,
+        parent_scope_ref: Option<&str>,
+    ) -> Result<ResolvedImage, ImageResolveError> {
+        let route = self
+            .conn
+            .route_open_management_within(
+                CEREBELLUM_MODULE,
+                &self.identity,
+                RouteOpenRetry::within(Duration::ZERO, Duration::ZERO),
+            )
+            .await
+            .map_err(|_| ImageResolveError::SourceUnavailable)?;
+        let mut params = json!({"handle":handle,"scope_ref":scope_ref});
+        if let Some(parent) = parent_scope_ref {
+            params["parent_scope_ref"] = json!(parent);
+        }
+        let body = serde_json::to_vec(&json!({"method":"image.resolve","params":params}))
+            .expect("image resolution request encodes");
+        let reply = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            self.conn.route_unary_reply(&route, body, QUERY_TIMEOUT),
+        )
+        .await;
+        let _ = self.conn.route_close(&route).await;
+        match reply {
+            Ok(Ok(Ok(bytes))) => decode_image(&bytes),
+            Ok(Ok(Err(_))) => Err(ImageResolveError::Unavailable),
+            _ => Err(ImageResolveError::SourceUnavailable),
+        }
     }
 
     /// Ask whether `scope_ref` read the person's private content.
@@ -204,6 +253,15 @@ impl PrivateContentClient {
         let _ = self.conn.route_close(&route).await;
         reply
     }
+}
+
+fn decode_image(bytes: &[u8]) -> Result<ResolvedImage, ImageResolveError> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| ImageResolveError::InvalidReply)?;
+    if value.get("outcome").is_some() {
+        return Err(ImageResolveError::Unavailable);
+    }
+    serde_json::from_value(value).map_err(|_| ImageResolveError::InvalidReply)
 }
 
 fn request_body(
@@ -288,6 +346,114 @@ fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn image_resolve_uses_cerebellum_management_and_omits_absent_parent() {
+        for parent in [Some("stamped-parent"), None] {
+            let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+            let client = PrivateContentClient::new(
+                Arc::new(conn),
+                BindIdentity::new("project", "test", "images"),
+            );
+            let (reply, ()) = tokio::join!(
+                client.resolve_image(
+                    "ih0123456789abcdef0123456789abcdef",
+                    "stamped-scope",
+                    parent
+                ),
+                async {
+                    let open = module.next_request().await;
+                    let control: subc_control::ClientControlRequest =
+                        serde_json::from_slice(&open.body).unwrap();
+                    let subc_control::ClientControlRequest::RouteOpen { target, .. } = control
+                    else {
+                        panic!("not a route open")
+                    };
+                    assert_eq!(
+                        target,
+                        subc_protocol::RouteTarget::ManagementSurface {
+                            module_id: "cerebellum".into()
+                        }
+                    );
+                    assert!(module.reply(
+                        &open,
+                        serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
+                            route_channel: route.channel,
+                            route_epoch: route.epoch
+                        })
+                        .unwrap()
+                    ));
+                    let request = module.next_request().await;
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["method"], "image.resolve");
+                    assert_eq!(
+                        body["params"]["handle"],
+                        "ih0123456789abcdef0123456789abcdef"
+                    );
+                    assert_eq!(body["params"]["scope_ref"], "stamped-scope");
+                    if let Some(parent) = parent {
+                        assert_eq!(body["params"]["parent_scope_ref"], parent);
+                    } else {
+                        assert!(body["params"].get("parent_scope_ref").is_none());
+                    }
+                    assert!(module.reply(
+                        &request,
+                        br#"{"mime":"image/png","sha256":"digest","bytes":"YWJj"}"#.to_vec()
+                    ));
+                }
+            );
+            let reply = reply.unwrap();
+            assert_eq!(reply.mime, "image/png");
+            assert_eq!(reply.sha256, "digest");
+            assert_eq!(reply.bytes, "YWJj");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn image_resolve_refusal_timeout_and_invalid_shape_are_distinct() {
+        for case in ["refused", "outcome", "invalid", "timeout", "route"] {
+            let (conn, route, mut module) = SubcConnection::in_process_for_test(5, 3);
+            let client = PrivateContentClient::new(
+                Arc::new(conn),
+                BindIdentity::new("project", "test", "images"),
+            );
+            let (reply, ()) = tokio::join!(client.resolve_image("handle", "scope", None), async {
+                let open = module.next_request().await;
+                if case == "route" {
+                    assert!(module.refuse(&open, "module_unavailable"));
+                    return;
+                }
+                assert!(module.reply(
+                    &open,
+                    serde_json::to_vec(&subc_control::ClientControlResponse::RouteOpen {
+                        route_channel: route.channel,
+                        route_epoch: route.epoch
+                    })
+                    .unwrap()
+                ));
+                let request = module.next_request().await;
+                match case {
+                    "refused" => {
+                        assert!(module.refuse(&request, "image_unavailable"));
+                    }
+                    "outcome" => {
+                        assert!(module.reply(&request, br#"{"outcome":"unavailable"}"#.to_vec()));
+                    }
+                    "invalid" => {
+                        assert!(module.reply(&request, br#"{"bytes":"YWJj"}"#.to_vec()));
+                    }
+                    "timeout" => tokio::time::advance(QUERY_TIMEOUT + Duration::from_secs(1)).await,
+                    _ => unreachable!(),
+                }
+            });
+            let expected = match case {
+                "refused" | "outcome" => ImageResolveError::Unavailable,
+                "invalid" => ImageResolveError::InvalidReply,
+                _ => ImageResolveError::SourceUnavailable,
+            };
+            assert!(matches!(reply, Err(error) if error == expected), "{case}");
+        }
+    }
 
     // Cerebellum fbcc6766, docs/contracts/private-content-query-v1.md.
     // These are reply bodies from the vectors below. Hashes identify the whole golden-file

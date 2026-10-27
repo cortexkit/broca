@@ -286,15 +286,15 @@ impl LlmTools {
                     scope,
                     envelope.arguments,
                     call.call_key.as_deref(),
+                    self.system.image_references(),
                 )
                 .map_err(error)?;
                 let pin = cortexkit_role_tool_provider::call::check_call(&call)
                     .map_err(|error| serde_json::to_vec(&error).expect("call refusal encodes"))?;
                 if let Some(pin) = pin {
-                    let digest = cortexkit_role_tool_provider::catalog::schema_digest(
-                        &classify::input_schema(),
-                    )
-                    .expect("contract schema has a digest");
+                    let digest =
+                        cortexkit_role_tool_provider::catalog::schema_digest(&self.input_schema())
+                            .expect("contract schema has a digest");
                     if pin.schema_digest != digest {
                         return Err(serde_json::to_vec(&json!({"code":"tool_schema_changed", "message":"the pinned tool schema is no longer served", "detail":{"tool":call.name, "expected":pin.schema_digest, "current":digest}})).expect("refusal encodes"));
                     }
@@ -352,7 +352,7 @@ impl LlmTools {
                 "model tools supply no system text".into(),
             ));
         }
-        let schema = classify::input_schema();
+        let schema = self.input_schema();
         let mut tool = json!({
             "name":CLASSIFY_TOOL_NAME, "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).expect("contract schema has a digest"),
             "semantics":1, "capabilities":[], "description":"Classify one item with a decision model.",
@@ -377,6 +377,14 @@ impl LlmTools {
         }
         answer["catalog_digest"] = json!(digest);
         raw(answer)
+    }
+
+    fn input_schema(&self) -> Value {
+        if self.system.image_references() {
+            classify::input_schema_with_image_references()
+        } else {
+            classify::input_schema()
+        }
     }
 
     async fn call(
@@ -460,6 +468,11 @@ impl LlmTools {
         if let Some(receiver) = running {
             return await_flight(receiver).await;
         }
+        let images = self
+            .system
+            .prepare_images(&admission.params, scope, stored.as_ref())
+            .await
+            .map_err(error)?;
         let pricing = if let Some(row) = &held {
             serde_json::from_value(json!({"frozen_row":row.frozen_row})).map_err(|_| {
                 error(crate::system_one::internal_refusal(
@@ -599,6 +612,7 @@ impl LlmTools {
                                 admission.args_digest,
                                 pricing,
                                 admitted_at,
+                                images,
                             )
                             .await
                     })

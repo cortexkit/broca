@@ -525,6 +525,7 @@ mod tests {
     fn listed() -> LlmToolsConfig {
         LlmToolsConfig {
             advertise_tags: false,
+            image_references: false,
             private_content_providers: vec!["anthropic".into(), "anthropic-platform".into()],
         }
     }

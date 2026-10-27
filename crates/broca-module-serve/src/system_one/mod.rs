@@ -24,6 +24,8 @@
 //!   existing grace, and never longer.
 
 mod classify;
+mod images;
+pub use images::ImageResolver;
 pub mod credential;
 pub mod typesafe;
 pub mod workers_ai;
@@ -250,6 +252,7 @@ impl ModelPin {
 
 /// The System One service: the batch store, the routing pins, and the concurrency caps.
 pub struct SystemOne {
+    image_resolver: Option<Arc<dyn ImageResolver>>,
     store: Arc<SystemOneStore>,
     /// The store role every batch this service claims, records and releases is keyed under.
     role: String,
@@ -316,6 +319,7 @@ impl SystemOne {
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
         Self {
+            image_resolver: None,
             store,
             role: STORE_ROLE.to_owned(),
             owner: owner.into(),
@@ -422,6 +426,7 @@ impl SystemOne {
         .with_clock(self.clock.clone());
         service.export = self.export.clone();
         service.charge_basis = self.charge_basis.clone();
+        service.image_resolver = self.image_resolver.clone();
         service
     }
 
@@ -459,6 +464,7 @@ impl SystemOne {
         args_digest: String,
         admission: ToolAdmission,
         admitted_at_ms: Option<i64>,
+        images: images::PreparedImages,
     ) -> Result<Box<RawValue>, Refusal> {
         self.sweep()
             .await
@@ -473,6 +479,7 @@ impl SystemOne {
             &scope,
             admitted_at_ms,
             Some((&args_digest, &admission)),
+            Some(&images),
         )
         .await
     }
@@ -594,10 +601,16 @@ impl SystemOne {
                 classify::is_classifier_row(&row).then(|| self.model_entry(pin, &row))
             })
             .collect();
-        RoleDescribe::new(
+        let describe = RoleDescribe::new(
             Limits::new(self.config.max_items, self.config.max_request_bytes),
             models,
-        )
+        );
+        if self.image_references() {
+            describe
+                .with_image_reference(cortexkit_model_batch::image::ImageReferenceSupport::new())
+        } else {
+            describe
+        }
     }
 
     /// Answer one request on a classifier route. The reply is the `result` text, or the body
@@ -646,7 +659,27 @@ impl SystemOne {
                         .batches_failed += 1;
                     refusal_body(&e)
                 })?;
-                self.spawn_call(params.to_owned(), scope).await
+                let stored = if self.image_references() {
+                    let request = cortexkit_role_classifier::request::parse_request(params)
+                        .map_err(|e| refusal_body(&e))?;
+                    self.stored_batch(&request.batch_id)
+                        .await
+                        .map_err(|_| {
+                            refusal_body(&internal_refusal("batch replay is unavailable"))
+                        })?
+                        .filter(|stored| {
+                            (self.clock)().saturating_sub(stored.admitted_at_ms)
+                                < broca_store::system_one::RETENTION_MS
+                        })
+                } else {
+                    None
+                };
+                let images = self
+                    .prepare_images(params, send, stored.as_ref())
+                    .await
+                    .map_err(|e| refusal_body(&e))?;
+                self.spawn_call_with_images(params.to_owned(), scope, None, images)
+                    .await
             }
             other => Err(error_body(
                 "unknown_method",
@@ -675,6 +708,22 @@ impl SystemOne {
         scope: broca_store::system_one::BatchScope,
         admitted_at_ms: Option<i64>,
     ) -> Result<Box<RawValue>, Vec<u8>> {
+        self.spawn_call_with_images(
+            params,
+            scope,
+            admitted_at_ms,
+            images::PreparedImages::default(),
+        )
+        .await
+    }
+
+    async fn spawn_call_with_images(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+        admitted_at_ms: Option<i64>,
+        images: images::PreparedImages,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
         // Raised here and lowered by the task itself, so a caller that stops waiting (its
         // route closed) does not hide a call that is still running.
         let gauge = Arc::clone(&self.in_flight);
@@ -684,7 +733,19 @@ impl SystemOne {
         let task = tokio::spawn(async move {
             let _lowered = lowered;
             let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
-            classify::run(&service, &params, &scope, admitted_at_ms).await
+            if images.0.is_empty() {
+                classify::run(&service, &params, &scope, admitted_at_ms).await
+            } else {
+                classify::run_inner(
+                    &service,
+                    &params,
+                    &scope,
+                    admitted_at_ms,
+                    None,
+                    Some(&images),
+                )
+                .await
+            }
         });
         let result = match task.await {
             Ok(Ok(reply)) => Ok(reply),
@@ -839,7 +900,14 @@ mod tool_admission_tests {
         };
         service
             .clone()
-            .execute_tool(params, scope, "digest".into(), admission, Some(1000))
+            .execute_tool(
+                params,
+                scope,
+                "digest".into(),
+                admission,
+                Some(1000),
+                images::PreparedImages::default(),
+            )
             .await
             .unwrap();
         let stored = service.stored_batch("held").await.unwrap().unwrap();

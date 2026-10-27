@@ -1003,9 +1003,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-llm-tools"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "233083985c55934bba91982bc4650719895ae236e00ebe48e4db8e52e0dd2d32"
+checksum = "dfe4b1a9a7f128c7a60da0600a5a0608035c9180c38cdc41057bc3f6579c94d4"
 dependencies = [
  "cortexkit-model-batch",
  "cortexkit-role-classifier",
@@ -1031,9 +1031,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-model-batch"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ba8a82cd36445c06658fc3383334fc9cdc45c936bf68b7b6d0f13b07b154571"
+checksum = "c566ae8de589e7be4deccb1fa677a2afca9e731d090057830a38fa184fcca0b6"
 dependencies = [
  "base64",
  "serde",
@@ -1063,9 +1063,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95b013902af700747a64b9da9d529643bbe320095deb5fc4ae0c5e071fdae264"
+checksum = "3a432f735acd51eb8c537fab43d76cde6dcc1276d9206ffdb622276186119ec7"
 dependencies = [
  "cortexkit-model-batch",
  "indexmap",
@@ -1075,9 +1075,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-classifier-conformance"
-version = "0.4.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea68d608cb119118be7b83205b8f107248dd6defb2c5644c1fa974d1737a7d2a"
+checksum = "d4ad45935958f8388ffaeb6e9c80030555cf718f54f97ccec22d5230bfe145d9"
 dependencies = [
  "async-trait",
  "cortexkit-role-classifier",
@@ -1085,7 +1085,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
- "subc-protocol 0.32.4",
+ "subc-protocol 0.33.0",
 ]
 
 [[package]]
@@ -1103,9 +1103,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-extractor"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62372f03db4c981cd47da7530ec28e0a55a3a11a022ddb3a1526e0774f1d04a7"
+checksum = "0edf6c7d961829fc58395bb8011ec0c6381c362bbb1940a2d056b9f524866866"
 dependencies = [
  "cortexkit-model-batch",
  "indexmap",
