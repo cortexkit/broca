@@ -326,12 +326,17 @@ pub enum EarlierRendererVersion {
 pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, EarlierRendererVersion)] {
     use EarlierRendererVersion::{NotReproducible, Reproducible};
     match family {
-        WireFamilyId::AnthropicMessages => &[(
-            1,
-            NotReproducible(
-                "v2 renders CallOptions.generation (temperature, top_p, stop_sequences)",
+        WireFamilyId::AnthropicMessages => &[
+            (
+                1,
+                NotReproducible(
+                    "v2 renders CallOptions.generation (temperature, top_p, stop_sequences)",
+                ),
             ),
-        )],
+            // v3's `fallbacks: "default"` is enabled only by a flag added to new frozen
+            // configs; v2 configs omit it and keep their prior bytes.
+            (2, Reproducible),
+        ],
         WireFamilyId::OpenAiChat => &[
             (
                 1,
@@ -623,6 +628,7 @@ pub fn resolve_frozen(
         bedrock_reasoning: provider.wire_family == WireFamilyId::BedrockConverse,
         structured_output: None,
         claude_code_persona: None,
+        server_side_fallback: false,
         opencode_go_session_id: None,
         opencode_go_reasoning_signature: false,
         opencode_go_qwen_thinking: false,
@@ -638,7 +644,9 @@ pub fn resolve_frozen(
 /// rendered request shape — a change means a resume can't reproduce the original
 /// request bytes.
 /// v2: render `CallOptions.generation` (`temperature`, `top_p`, `stop_sequences`).
-pub const ANTHROPIC_RENDERER_VERSION: u32 = 2;
+/// v3: ask the runtime for server-side fallback (`fallbacks: "default"`) when the frozen
+/// config opts in.
+pub const ANTHROPIC_RENDERER_VERSION: u32 = 3;
 
 /// The required identity that must lead the Anthropic system content under the
 /// Claude-subscription OAuth shape — the provider rejects the request without it.
@@ -693,6 +701,7 @@ fn frozen_from_family_defaults(
         bedrock_reasoning: family == WireFamilyId::BedrockConverse,
         structured_output: None,
         claude_code_persona: None,
+        server_side_fallback: false,
         opencode_go_session_id: None,
         opencode_go_reasoning_signature: false,
         opencode_go_qwen_thinking: false,
@@ -778,6 +787,11 @@ pub fn apply_anthropic_apikey_quirks(frozen: &mut FrozenRenderConfig) {
     // are both absent):
     frozen.system_prompt = SystemPromptPolicy::TopLevelField;
     frozen.reasoning = ReasoningPolicy::None;
+    // Server-side fallback is a subscription-route capability, and the catalog states it per
+    // provider/model row, which both auth methods share. Clearing it here is what makes "an
+    // API-key config never opts in" hold even if the flag were set before this shape was
+    // chosen, rather than depending on every caller getting the order right.
+    frozen.server_side_fallback = false;
 }
 
 /// The OpenAI-Chat family render ABI version. Bump on ANY change to the rendered

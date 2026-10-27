@@ -5,7 +5,6 @@
 
 use broca_protocol::request::ModelHandle;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 
 use super::is_false;
 
@@ -52,30 +51,9 @@ impl StepFallback {
     }
 }
 
-/// One entry of an Anthropic response's `usage.iterations`: the source model's part of the
-/// response and, after a server-side fallback, the fallback model's. The named members are the
-/// ones broca reads; any other member is kept in `other` as the provider sent it, so a split
-/// that needs it later can still be computed from the WAL alone.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct UsageIteration {
-    /// `message` or `fallback_message` in the shapes seen so far; kept open.
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    /// The model id the provider reported, kept even when it is not a valid id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_input_tokens: Option<u64>,
-    /// Every other member of the entry.
-    #[serde(flatten)]
-    pub other: Map<String, Value>,
-}
+/// One entry of an Anthropic response's `usage.iterations`, kept as reported so a later split of
+/// one step's usage across the models that ran can be computed from the WAL alone.
+pub use broca_protocol::usage::UsageIteration;
 
 /// Which model a step was sent to when it was not the episode's own model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

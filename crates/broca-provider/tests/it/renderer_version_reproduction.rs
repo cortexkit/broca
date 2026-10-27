@@ -274,7 +274,9 @@ fn anthropic_and_bedrock_without_media_keep_their_pinned_old_version_bytes() {
     let pins: Vec<Value> =
         serde_json::from_str(include_str!("../fixtures/pre_native_media.json")).unwrap();
     let opts = legacy_call_options();
-    let mut checked = Vec::new();
+    // A v2 Anthropic config appears twice: once as the family's no-media pin and once as the
+    // v2 proof in the renderer-version table. One entry per (family, version) is the claim.
+    let mut checked = std::collections::BTreeSet::new();
     for case in pins {
         let frozen: FrozenRenderConfig = serde_json::from_value(case["frozen"].clone()).unwrap();
         assert!(frozen.media.is_none());
@@ -295,14 +297,24 @@ fn anthropic_and_bedrock_without_media_keep_their_pinned_old_version_bytes() {
             .unwrap(),
             expected,
         );
-        checked.push((frozen.family_id, frozen.renderer_version));
+        let expected = match frozen.family_id {
+            WireFamilyId::AnthropicMessages => (WireFamilyId::AnthropicMessages, 2),
+            WireFamilyId::BedrockConverse => (WireFamilyId::BedrockConverse, 4),
+            other => panic!("{other:?} is not pinned v2/v4 by this test"),
+        };
+        assert_eq!(
+            (frozen.family_id, frozen.renderer_version),
+            expected,
+            "the pin is not at the version this test claims"
+        );
+        checked.insert(format!("{:?}", frozen.family_id));
     }
     assert_eq!(
         checked,
-        vec![
-            (WireFamilyId::AnthropicMessages, 2),
-            (WireFamilyId::BedrockConverse, 4),
-        ],
+        BTreeSet::from([
+            format!("{:?}", WireFamilyId::AnthropicMessages),
+            format!("{:?}", WireFamilyId::BedrockConverse),
+        ]),
     );
 }
 

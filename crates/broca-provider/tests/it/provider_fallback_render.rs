@@ -1,8 +1,7 @@
 //! Anthropic's server-side fallback handoff (`ContentBlock::ProviderFallback`) is stored in the
-//! transcript but rendered by no family yet: an Anthropic request may echo it only when its
-//! frozen config opted into server-side fallback, and no config can opt in. Every family must
-//! render a transcript holding the part byte for byte as it renders the same transcript
-//! without it.
+//! transcript. Only an Anthropic request whose frozen config opted into server-side fallback may
+//! echo it; every other target drops it, and must render a transcript holding the part byte for
+//! byte as it renders the same transcript without it.
 
 use broca_protocol::{
     content::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult},
@@ -104,12 +103,38 @@ fn assert_dropped<F: WireFamily>(family: &F, frozen: &FrozenRenderConfig, name: 
 }
 
 #[test]
-fn anthropic_oauth_drops_the_handoff_until_a_config_can_opt_in() {
+fn anthropic_oauth_without_the_opt_in_drops_the_handoff() {
     assert_dropped(
         &AnthropicMessages,
         &anthropic_frozen_config("claude-opus-5-5"),
         "anthropic oauth",
     );
+}
+
+#[test]
+fn anthropic_with_the_opt_in_echoes_the_handoff_at_its_position() {
+    let mut frozen = anthropic_frozen_config("claude-opus-5-5");
+    frozen.server_side_fallback = true;
+    let body: serde_json::Value =
+        serde_json::from_slice(&AnthropicMessages.render(&frozen, &prompt(true))).unwrap();
+    let message = &body["messages"][1];
+    assert_eq!(message["role"], "assistant");
+    let content = message["content"].as_array().unwrap();
+    // The tool turn's text, the handoff between its two parts, then the tool call.
+    assert_eq!(content[0]["text"], "Let me");
+    assert_eq!(
+        content[1],
+        serde_json::json!({
+            "type": "fallback",
+            "from": { "model": "claude-handoff-source-9" },
+            "to": { "model": TO_MODEL },
+        })
+    );
+    assert_eq!(content[2]["text"], " check.");
+    assert_eq!(content[3]["type"], "tool_use");
+    // Every assistant message carrying it is rendered, not just the current turn's.
+    let last = &body["messages"][3]["content"].as_array().unwrap()[0];
+    assert_eq!(last["type"], "fallback");
 }
 
 #[test]

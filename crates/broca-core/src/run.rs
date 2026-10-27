@@ -5507,8 +5507,18 @@ where
                 mut finish_reason,
                 service_tier_used,
                 speed_used,
+                served_model,
+                usage_iterations,
                 tool_args_cuts,
             } => {
+                // The server-side fallback facts this step's record carries. All of them are
+                // absent on an ordinary step, which then writes exactly the bytes it did
+                // before they existed.
+                let step_fallback = || broca_wal::StepFallback {
+                    served_model: served_model.clone(),
+                    usage_iterations: usage_iterations.clone(),
+                    ..Default::default()
+                };
                 for cut in tool_args_cuts {
                     tracing::warn!(session = %req.session.session, step = step_id.0,
                         tool_name = %cut.tool_name, json_bytes = cut.json_bytes,
@@ -5596,7 +5606,7 @@ where
                                     false,
                                 );
                                 let mut records = vec![WalRecord::ModelStepFinished {
-                                    fallback: Default::default(),
+                                    fallback: Box::new(step_fallback()),
                                     written_at_ms: step_written_at_ms,
                                     tags: None,
                                     hooks: metadata,
@@ -5703,7 +5713,7 @@ where
                         hooks.is_some(),
                         writer,
                         WalRecord::ModelStepFinished {
-                            fallback: Default::default(),
+                            fallback: Box::new(step_fallback()),
                             written_at_ms: step_written_at_ms,
                             tags: None,
                             hooks: message_hooks,
@@ -5738,7 +5748,7 @@ where
                 // extraction. The prompt reclaims ownership only after the turn is durable.
                 let message = Arc::new(message);
                 let model_record = WalRecord::ModelStepFinished {
-                    fallback: Default::default(),
+                    fallback: Box::new(step_fallback()),
                     written_at_ms: step_written_at_ms,
                     tags: None,
                     hooks: message_hooks,
@@ -7340,6 +7350,12 @@ enum StepOutcome {
         service_tier_used: Option<String>,
         /// Anthropic's reported `usage.speed`, verbatim; `None` when not reported.
         speed_used: Option<String>,
+        /// The wire model id that produced this answer when the provider handed the request to
+        /// another model itself, and that model differs from the requested one. `None` when the
+        /// requested model answered.
+        served_model: Option<String>,
+        /// The response's `usage.iterations`, verbatim, when the provider reported them.
+        usage_iterations: Option<Vec<broca_protocol::usage::UsageIteration>>,
     },
     Failed {
         error: ProviderError,
@@ -7557,6 +7573,8 @@ async fn run_step<P: Provider>(
     let mut finish_reason: Option<FinishReason> = None;
     let mut service_tier_used: Option<String> = None;
     let mut speed_used: Option<String> = None;
+    let mut served_model: Option<String> = None;
+    let mut usage_iterations: Option<Vec<broca_protocol::usage::UsageIteration>> = None;
     let mut retries_used = 0;
     let mut finished = false;
     while let Some(ev) = rx.recv().await {
@@ -7572,6 +7590,8 @@ async fn run_step<P: Provider>(
                     finish_reason: fr,
                     service_tier_used: tier,
                     speed_used: speed,
+                    served_model: served,
+                    usage_iterations: iterations,
                     ..
                 } => {
                     usage = u;
@@ -7579,6 +7599,8 @@ async fn run_step<P: Provider>(
                     // Recorded exactly as the provider reported it; absent stays absent.
                     service_tier_used = tier;
                     speed_used = speed;
+                    served_model = served;
+                    usage_iterations = iterations;
                 }
                 ProviderControl::Finished {
                     usage: u,
@@ -7620,6 +7642,8 @@ async fn run_step<P: Provider>(
             finish_reason,
             service_tier_used,
             speed_used,
+            served_model,
+            usage_iterations,
         },
         // A message is valid only after the provider emits the protocol's final Finished control.
         // HTTP transports retry a missing final control; other providers fail safely here.
@@ -10140,6 +10164,8 @@ mod tests {
             finish_reason: None,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         });
         assert!(matches!(
             attribute_step_failure_to_cancel(completed, true),

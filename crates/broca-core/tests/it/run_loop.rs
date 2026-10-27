@@ -76,6 +76,8 @@ fn text_step_with_usage(text: &str, step_usage: Usage) -> Vec<NormalizedEvent> {
             finish_reason: FinishReason::Stop,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: step_usage,
@@ -101,6 +103,8 @@ fn length_step(text: &str) -> Vec<NormalizedEvent> {
             finish_reason: FinishReason::Length,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: usage(10, 4096),
@@ -137,6 +141,8 @@ fn tool_step(calls: &[(&str, &str, serde_json::Value)]) -> Vec<NormalizedEvent> 
             finish_reason: FinishReason::ToolCalls,
             service_tier_used: None,
             speed_used: None,
+            served_model: None,
+            usage_iterations: None,
         }),
         ctrl(ProviderControl::Finished {
             usage: usage(10, 8),
@@ -2972,6 +2978,8 @@ async fn run_usage_accumulates_across_steps() {
                     finish_reason,
                     service_tier_used: None,
                     speed_used: None,
+                    served_model: None,
+                    usage_iterations: None,
                 }),
                 NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) => {
                     ctrl(ProviderControl::Finished {
@@ -2999,6 +3007,8 @@ async fn run_usage_accumulates_across_steps() {
                     finish_reason,
                     service_tier_used: None,
                     speed_used: None,
+                    served_model: None,
+                    usage_iterations: None,
                 }),
                 NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) => {
                     ctrl(ProviderControl::Finished {

@@ -94,6 +94,8 @@ impl Provider for Model {
                 finish_reason,
                 service_tier_used: None,
                 speed_used: None,
+                served_model: None,
+                usage_iterations: None,
             },
             ProviderControl::Finished {
                 usage: Default::default(),

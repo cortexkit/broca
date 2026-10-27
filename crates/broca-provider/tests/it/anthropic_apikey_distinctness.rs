@@ -193,3 +193,41 @@ fn anthropic_auth_shapes_keep_exact_master_header_lists() {
         );
     }
 }
+
+/// Server-side fallback is an OAuth capability: the api-key shape never asks the runtime to hand
+/// a refusal on, even if the flag were somehow set on its config, because the same provider row
+/// serves both auth methods and only the subscription route implements the handoff.
+#[test]
+fn api_key_never_sends_fallbacks() {
+    let request = request();
+    // The force-on case is applied before the api-key quirks, the order catalog resolution
+    // uses: the quirks must clear it, not merely never set it.
+    let mut apikey = anthropic_frozen_config("claude-opus-5-5");
+    apikey.server_side_fallback = true;
+    broca_provider::families::apply_anthropic_apikey_quirks(&mut apikey);
+    let bytes = AnthropicMessages.render(&apikey, &request);
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        body.get("fallbacks").is_none(),
+        "the api-key shape must not opt in to server-side fallback: {body}"
+    );
+    let endpoint = AnthropicMessages.endpoint(&apikey, &AuthHandle::None, bytes.clone());
+    assert!(
+        !endpoint
+            .headers
+            .iter()
+            .any(|(_, value)| value.contains("server-side-fallback")),
+        "the api-key shape must not send the fallback beta"
+    );
+    // The forcing flag alone decides nothing: clearing it leaves the same bytes.
+    apikey.server_side_fallback = false;
+    assert_eq!(AnthropicMessages.render(&apikey, &request), bytes);
+
+    // The OAuth shape does send it, so the rows above prove the api-key rule rather than a
+    // renderer that ignores the flag.
+    let mut oauth = anthropic_frozen_config("claude-opus-5-5");
+    oauth.server_side_fallback = true;
+    let oauth_body: Value =
+        serde_json::from_slice(&AnthropicMessages.render(&oauth, &request)).unwrap();
+    assert_eq!(oauth_body["fallbacks"], "default");
+}

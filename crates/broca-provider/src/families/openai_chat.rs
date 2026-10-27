@@ -1183,6 +1183,9 @@ impl StreamNormalizer for OpenAiChatNormalizer {
                 finish_reason,
                 service_tier_used: self.service_tier_used.clone(),
                 speed_used: None,
+                // No non-Anthropic family reports a server-side fallback or per-model usage.
+                served_model: None,
+                usage_iterations: None,
             }),
             NormalizedEvent::Control(ProviderControl::Finished {
                 usage: self.usage,
